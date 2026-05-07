@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+import re
+import sqlite3
+
+from hymem.dreaming.canonicalize import normalize
+
+_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_\-\.]{1,40}")
+
+
+def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
+    """Return canonical ids that the user message references.
+
+    Strategy: tokenize the message, normalize each token, and look it up against
+    the alias table and the graph's existing canonical names. Cheap, deterministic,
+    and the graph is its own dictionary — no LLM call needed at query time.
+    """
+    raw_tokens = {m.group(0) for m in _TOKEN.finditer(message)}
+    candidates = {normalize(t) for t in raw_tokens if len(t) >= 2}
+
+    # Also try multi-word phrases (up to 3-grams) to catch "local dev environment".
+    words = [w for w in re.split(r"\s+", message.strip()) if w]
+    for n in (2, 3):
+        for i in range(len(words) - n + 1):
+            phrase = " ".join(words[i : i + n])
+            candidates.add(normalize(phrase))
+
+    if not candidates:
+        return []
+
+    candidates_list = list(candidates)
+    placeholders = ",".join("?" * len(candidates_list))
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT canonical FROM entity_aliases WHERE alias IN ({placeholders})
+        UNION
+        SELECT DISTINCT subject_canonical FROM knowledge_graph WHERE subject_canonical IN ({placeholders})
+        UNION
+        SELECT DISTINCT object_canonical FROM knowledge_graph WHERE object_canonical IN ({placeholders})
+        """,
+        candidates_list + candidates_list + candidates_list,
+    ).fetchall()
+    return [r[0] for r in rows]

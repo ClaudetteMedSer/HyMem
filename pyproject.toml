@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hymem"
+version = "0.1.0"
+description = "Hybrid memory module for the Hermes agent: SQLite knowledge graph + delimited Markdown sections + dreaming consolidation."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev    = ["pytest>=8"]
+server = ["mcp>=1.0", "openai>=1.0"]
+
+[project.scripts]
+hymem-server = "hymem.server:main"
+
+[tool.setuptools.packages.find]
+include = ["hymem*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

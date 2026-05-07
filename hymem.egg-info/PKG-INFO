@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: hymem
+Version: 0.1.0
+Summary: Hybrid memory module for the Hermes agent: SQLite knowledge graph + delimited Markdown sections + dreaming consolidation.
+Requires-Python: >=3.11
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
