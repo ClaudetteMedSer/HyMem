@@ -125,6 +125,17 @@ CREATE TABLE IF NOT EXISTS profile_entries (
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Honcho peer registry: maps Honcho peer_id → HyMem role.
+-- Populated by the Honcho-compatible server when Hermes registers peers.
+CREATE TABLE IF NOT EXISTS peers (
+    id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL DEFAULT 'hermes',
+    role TEXT NOT NULL DEFAULT 'user',
+    metadata TEXT NOT NULL DEFAULT '{}',
+    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, workspace_id)
+);
+
 -- Run lock so dreaming cycles don't overlap.
 CREATE TABLE IF NOT EXISTS run_lock (
     name TEXT PRIMARY KEY,

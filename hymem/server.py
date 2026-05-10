@@ -1,7 +1,8 @@
 """MCP server for HyMem.
 
-Exposes four tools to the Hermes Agent platform:
-  hymem_log      — log one conversational turn
+Exposes five tools to the Hermes Agent platform:
+  hymem_capture  — log a full conversation at once + optionally dream (preferred)
+  hymem_log      — log one conversational turn (fallback for turn-by-turn use)
   hymem_dream    — run a dreaming cycle (extract, consolidate, decay)
   hymem_augment  — retrieve graph facts + FTS context for a user message
   hymem_alias    — register a surface-form alias for an entity
@@ -24,6 +25,7 @@ Key variables:
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -54,6 +56,61 @@ def _get_mcp():
 
 
 mcp = _get_mcp()
+
+
+@mcp.tool()
+def hymem_capture(session_id: str, messages: str, dream: bool = True) -> str:
+    """Log a full conversation and optionally run dreaming. Preferred over hymem_log.
+
+    Call this ONCE at the end of every conversation instead of calling hymem_log
+    after each individual turn. This is far more reliable because it requires only
+    a single tool call per session rather than one per exchange.
+
+    Arguments:
+        session_id  — unique id for this conversation, e.g. "2026-05-10-db-migration"
+        messages    — JSON array of {role, content} objects representing the full
+                      conversation in order, e.g.:
+                      '[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]'
+        dream       — if true (default), run a dreaming cycle immediately after
+                      logging so MEMORY.md and USER.md are updated right away.
+
+    Returns a summary of what was logged and, if dream=true, what was extracted.
+    """
+    try:
+        turns = json.loads(messages)
+    except json.JSONDecodeError as e:
+        return f"error: messages must be a JSON array — {e}"
+
+    if not isinstance(turns, list):
+        return "error: messages must be a JSON array"
+
+    _hy.open_session(session_id)
+    logged = 0
+    for turn in turns:
+        role = turn.get("role", "")
+        content = turn.get("content", "")
+        if role not in {"user", "assistant", "system", "tool"}:
+            continue
+        if not content:
+            continue
+        _hy.log_message(session_id, role, content)
+        logged += 1
+    _hy.close_session(session_id)
+
+    if not dream:
+        return f"logged {logged} turns for session {session_id!r}"
+
+    report = _hy.dream(session_ids=[session_id])
+    if report.skipped_locked:
+        return (
+            f"logged {logged} turns for session {session_id!r}; "
+            "dreaming skipped (another cycle is running — will pick up via cron)"
+        )
+    return (
+        f"logged {logged} turns for session {session_id!r}; "
+        f"dreaming complete — {report.chunks_processed}/{report.chunks_seen} chunks, "
+        f"{report.triples_extracted} triples, {report.markers_extracted} markers"
+    )
 
 
 @mcp.tool()

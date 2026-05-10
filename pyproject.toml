@@ -11,10 +11,11 @@ dependencies = []
 
 [project.optional-dependencies]
 dev    = ["pytest>=8"]
-server = ["mcp>=1.0", "openai>=1.0"]
+server = ["mcp>=1.0", "openai>=1.0", "fastapi>=0.115", "uvicorn>=0.30"]
 
 [project.scripts]
 hymem-server = "hymem.server:main"
+hymem-honcho = "hymem.honcho_server:main"
 
 [tool.setuptools.packages.find]
 include = ["hymem*"]
