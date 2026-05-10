@@ -5,3 +5,8 @@ Summary: Hybrid memory module for the Hermes agent: SQLite knowledge graph + del
 Requires-Python: >=3.11
 Provides-Extra: dev
 Requires-Dist: pytest>=8; extra == "dev"
+Provides-Extra: server
+Requires-Dist: mcp>=1.0; extra == "server"
+Requires-Dist: openai>=1.0; extra == "server"
+Requires-Dist: fastapi>=0.115; extra == "server"
+Requires-Dist: uvicorn>=0.30; extra == "server"

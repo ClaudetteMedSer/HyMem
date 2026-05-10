@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import sqlite3
 from importlib.resources import files
 from pathlib import Path
 from typing import Iterator
+
+log = logging.getLogger("hymem.core.db")
 
 
 def _load_schema() -> str:
@@ -41,3 +44,26 @@ def schema_version(conn: sqlite3.Connection) -> int:
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
     return int(row["value"]) if row else 0
+
+
+def backfill_entity_mentions(conn: sqlite3.Connection) -> None:
+    """Idempotent backfill: populate entity_mentions from existing chunks if empty.
+
+    No-op if the table already has rows or if there are no chunks.
+    """
+    has_mentions = conn.execute(
+        "SELECT 1 FROM entity_mentions LIMIT 1"
+    ).fetchone()
+    if has_mentions:
+        return
+    chunk_count = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
+    if not chunk_count:
+        return
+
+    from hymem.dreaming.mentions import index_chunk_mentions
+
+    rows = conn.execute("SELECT id, text FROM chunks").fetchall()
+    total = 0
+    for row in rows:
+        total += index_chunk_mentions(conn, row["id"], row["text"])
+    log.info("backfilled entity_mentions: chunks=%d mentions=%d", len(rows), total)

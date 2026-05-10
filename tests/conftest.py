@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from hymem import HyMem, HyMemConfig
+from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.extraction.llm import StubLLMClient
 
 
@@ -20,8 +20,22 @@ def stub_llm() -> StubLLMClient:
 
 
 @pytest.fixture
+def embed_stub() -> StubEmbeddingClient:
+    return StubEmbeddingClient()
+
+
+@pytest.fixture
 def hy(cfg: HyMemConfig, stub_llm: StubLLMClient):
     instance = HyMem(cfg, llm=stub_llm)
+    yield instance
+    instance.close()
+
+
+@pytest.fixture
+def hy_with_embed(
+    cfg: HyMemConfig, stub_llm: StubLLMClient, embed_stub: StubEmbeddingClient
+):
+    instance = HyMem(cfg, llm=stub_llm, embedding_client=embed_stub)
     yield instance
     instance.close()
 

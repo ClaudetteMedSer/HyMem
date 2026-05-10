@@ -11,7 +11,11 @@ from dataclasses import dataclass
 _CORRECTION_PATTERNS = re.compile(
     r"\bno,"
     r"|\b(actually|not\s+(?:quite|really|exactly)|don'?t\s+use|"
-    r"stopped\s+using|switched\s+(?:to|from)|replaced|moved\s+(?:off|away))\b",
+    r"stopped\s+using|switched\s+(?:to|from)|replaced|moved\s+(?:off|away))\b"
+    r"|\bthat'?s\s+wrong\b|\bwrong\b|\bincorrect\b|\bfix:"
+    r"|\bthe\s+right\s+(?:answer|way)\b"
+    r"|\binstead\s+of\b|\brather\s+than\b"
+    r"|\buse\s+\S+\s+not\s+\S+",
     re.IGNORECASE,
 )
 _PREFERENCE_PATTERNS = re.compile(

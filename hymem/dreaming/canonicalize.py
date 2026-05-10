@@ -14,6 +14,8 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 def normalize(surface: str) -> str:
     """Deterministic surface -> canonical key. Pure function, no DB needed."""
     s = unicodedata.normalize("NFKD", surface).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+    s = re.sub(r'([a-z])([A-Z])', r'\1_\2', s)
     s = s.strip().lower()
     s = _TRAILING_PAREN.sub("", s)
     s = _LEADING_ARTICLES.sub("", s)

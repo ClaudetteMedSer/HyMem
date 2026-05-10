@@ -11,6 +11,22 @@ def test_normalize_strips_articles_punct_and_paren():
     assert normalize("Café") == "cafe"
 
 
+def test_normalize_splits_camelcase():
+    assert normalize("MedFlow") == "med_flow"
+    assert normalize("med-flow") == "med_flow"
+    assert normalize("MedFlow") == normalize("med-flow")
+    assert normalize("FastAPI") == "fast_api"
+    assert normalize("HyMem") == "hy_mem"
+
+
+def test_normalize_splits_acronym_prefix():
+    assert normalize("JSONParser") == "json_parser"
+    assert normalize("XMLHttpRequest") == "xml_http_request"
+    assert normalize("URLParser") == "url_parser"
+    assert normalize("API") == "api"
+    assert normalize("JSONParser") == normalize("json parser")
+
+
 def test_resolve_uses_alias_when_present(hy):
     conn = hy.conn
     register_alias(conn, "DockerCE", "docker")

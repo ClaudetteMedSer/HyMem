@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 from hymem.dreaming import canonicalize
@@ -7,6 +8,8 @@ from hymem.dreaming.chunks import Chunk
 from hymem.extraction.llm import LLMClient
 from hymem.extraction.markers import Marker, extract_markers
 from hymem.extraction.triples import Triple, extract_triples
+
+log = logging.getLogger("hymem.dreaming.phase1")
 
 
 def process_chunk(
@@ -30,8 +33,16 @@ def process_chunk(
     triples = extract_triples(llm, chunk.text)
     markers = extract_markers(llm, chunk.text)
 
+    mentioned: set[str] = set()
     for t in triples:
-        _upsert_triple(conn, chunk.id, t)
+        subj_canon, obj_canon = _upsert_triple(conn, chunk.id, t)
+        mentioned.add(subj_canon)
+        mentioned.add(obj_canon)
+    if mentioned:
+        conn.executemany(
+            "INSERT OR IGNORE INTO entity_mentions(chunk_id, entity_canonical) VALUES (?, ?)",
+            [(chunk.id, e) for e in mentioned],
+        )
     for m in markers:
         conn.execute(
             "INSERT INTO behavioral_markers(kind, statement, chunk_id) VALUES (?, ?, ?)",
@@ -42,10 +53,16 @@ def process_chunk(
         "INSERT OR IGNORE INTO processed_chunks(chunk_id, prompt_version) VALUES (?, ?)",
         (chunk.id, prompt_version),
     )
+    log.debug(
+        "phase1.chunk chunk_id=%s triples=%d markers=%d",
+        chunk.id,
+        len(triples),
+        len(markers),
+    )
     return triples, markers
 
 
-def _upsert_triple(conn: sqlite3.Connection, chunk_id: str, triple: Triple) -> None:
+def _upsert_triple(conn: sqlite3.Connection, chunk_id: str, triple: Triple) -> tuple[str, str]:
     subj_canon = canonicalize.resolve(conn, triple.subject)
     obj_canon = canonicalize.resolve(conn, triple.object)
 
@@ -104,3 +121,5 @@ def _upsert_triple(conn: sqlite3.Connection, chunk_id: str, triple: Triple) -> N
         """,
         (edge_id, chunk_id, triple.polarity, triple.subject, triple.object),
     )
+
+    return subj_canon, obj_canon

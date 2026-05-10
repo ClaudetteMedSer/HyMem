@@ -61,18 +61,3 @@ MARKER_USER_TEMPLATE = """Excerpt:
 \"\"\"
 
 Return the JSON array now."""
-
-
-PROFILE_EDIT_SYSTEM = """You maintain a structured behavioral profile for a single user.
-
-You are given the current profile (a JSON array) and a list of new behavioral
-markers. Output a JSON object: {"add": [...], "remove": [int ids], "modify": [{"id": int, "text": "..."}]}.
-
-Rules:
-- Prefer modify over add when the new marker reinforces an existing entry.
-- Use remove only when a new marker directly contradicts an existing entry.
-- Do not edit entries that are unrelated to the new markers.
-- Each added entry has fields: kind (preference|avoidance|style|context) and text (one short sentence).
-- Keep the profile under {max_entries} entries; if the cap would be exceeded,
-  drop the oldest contradicted or weakest entries via 'remove'.
-- Never invent markers that aren't in the input."""

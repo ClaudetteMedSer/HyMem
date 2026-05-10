@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 
 from hymem.config import HyMemConfig
 from hymem.core import markdown_io
+
+log = logging.getLogger("hymem.dreaming.phase2")
 
 
 def confidence(pos: int, neg: int) -> float:

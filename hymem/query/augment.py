@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import math
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
+from hymem.extraction.embeddings import EmbeddingClient
 from hymem.query.entities import match_known_entities
 
 
@@ -24,6 +27,7 @@ class FtsHit:
     session_id: str
     text: str
     score: float
+    score_kind: str = "bm25"
 
 
 @dataclass
@@ -32,6 +36,10 @@ class AugmentedContext:
 
     Hermes decides ordering, headers, and token budget — HyMem only returns
     the pieces. This keeps prompt assembly out of the memory module.
+
+    `fts_hits[i].score` carries different units depending on `score_kind`:
+        - "bm25": SQLite FTS5 BM25 score (lower = better, often negative)
+        - "rrf":  reciprocal rank fusion score from FTS+vector merge (higher = better)
     """
 
     user_md: str = ""
@@ -45,6 +53,8 @@ def augment(
     conn: sqlite3.Connection,
     cfg: HyMemConfig,
     user_message: str,
+    *,
+    embedding_client: EmbeddingClient | None = None,
 ) -> AugmentedContext:
     ctx = AugmentedContext()
     if cfg.user_md_path.exists():
@@ -52,7 +62,19 @@ def augment(
     if cfg.memory_md_path.exists():
         ctx.memory_md = cfg.memory_md_path.read_text(encoding="utf-8")
 
-    ctx.fts_hits = _fts_search(conn, user_message, top_k=cfg.fts_top_k)
+    fts = _fts_search(conn, user_message, top_k=cfg.fts_top_k)
+    if embedding_client is not None:
+        vec = _vector_search(
+            conn,
+            embedding_client,
+            user_message,
+            top_k=cfg.fts_top_k,
+            max_scan=cfg.embedding_max_scan,
+        )
+        ctx.fts_hits = _rrf_merge(fts, vec, top_k=cfg.fts_top_k)
+    else:
+        ctx.fts_hits = fts
+
     ctx.matched_entities = match_known_entities(conn, user_message)
     if ctx.matched_entities:
         ctx.graph_facts = _graph_lookup(
@@ -100,6 +122,75 @@ def _fts_search(conn: sqlite3.Connection, query: str, *, top_k: int) -> list[Fts
             score=float(r["score"]),
         )
         for r in rows
+    ]
+
+
+def _vector_search(
+    conn: sqlite3.Connection,
+    embedder: EmbeddingClient,
+    query: str,
+    *,
+    top_k: int,
+    max_scan: int,
+) -> list[FtsHit]:
+    # TODO: O(n) Python cosine over all rows is fine up to ~5K chunks. Beyond that,
+    # consider: (1) sqlite-vec extension for native ANN, (2) numpy batched dot product,
+    # (3) periodic pruning of old embeddings.
+    rows = conn.execute(
+        """
+        SELECT c.id AS chunk_id, c.session_id, c.text, e.vector_json
+        FROM chunk_embeddings e
+        JOIN chunks c ON c.id = e.chunk_id
+        ORDER BY c.created_at DESC
+        LIMIT ?
+        """,
+        (max_scan,),
+    ).fetchall()
+    if not rows:
+        return []
+
+    qvec = embedder.embed([query])[0]
+    qnorm = math.sqrt(sum(x * x for x in qvec)) or 1.0
+
+    scored: list[tuple[float, sqlite3.Row]] = []
+    for r in rows:
+        vec = json.loads(r["vector_json"])
+        if len(vec) != len(qvec):
+            continue
+        dot = sum(a * b for a, b in zip(qvec, vec))
+        vnorm = math.sqrt(sum(x * x for x in vec)) or 1.0
+        sim = dot / (qnorm * vnorm)
+        scored.append((sim, r))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    return [
+        FtsHit(
+            chunk_id=r["chunk_id"],
+            session_id=r["session_id"],
+            text=r["text"],
+            score=float(sim),
+        )
+        for sim, r in scored[:top_k]
+    ]
+
+
+def _rrf_merge(
+    fts: list[FtsHit], vec: list[FtsHit], *, top_k: int, k: int = 60
+) -> list[FtsHit]:
+    # Reciprocal rank fusion: score = sum(1 / (k + rank)) across each list.
+    by_id: dict[str, FtsHit] = {}
+    scores: dict[str, float] = {}
+    for rank, hit in enumerate(fts, start=1):
+        scores[hit.chunk_id] = scores.get(hit.chunk_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.chunk_id, hit)
+    for rank, hit in enumerate(vec, start=1):
+        scores[hit.chunk_id] = scores.get(hit.chunk_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.chunk_id, hit)
+
+    ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [
+        replace(by_id[cid], score=score, score_kind="rrf")
+        for cid, score in ordered[:top_k]
     ]
 
 

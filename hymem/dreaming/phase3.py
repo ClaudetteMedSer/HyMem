@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 from hymem.config import HyMemConfig
+from hymem.core.db import backfill_entity_mentions
+
+log = logging.getLogger("hymem.dreaming.phase3")
 
 
 def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
@@ -18,6 +22,9 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
     object surface form. If yes -> decay; if no -> leave alone.
     """
     cutoff_arg = f"-{int(cfg.decay_window_days)} days"
+
+    # Catch chunks that exist but were never indexed (e.g. pre-upgrade DBs).
+    backfill_entity_mentions(conn)
 
     rows = conn.execute(
         """
@@ -36,15 +43,16 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
         recent_mention = conn.execute(
             """
-            SELECT 1 FROM chunks
-            WHERE created_at >= datetime('now', ?)
-              AND (LOWER(text) LIKE '%' || ? || '%' OR LOWER(text) LIKE '%' || ? || '%')
-              AND id NOT IN (
+            SELECT 1 FROM entity_mentions em
+            JOIN chunks c ON c.id = em.chunk_id
+            WHERE em.entity_canonical IN (?, ?)
+              AND c.created_at >= datetime('now', ?)
+              AND em.chunk_id NOT IN (
                   SELECT chunk_id FROM kg_evidence WHERE edge_id = ?
               )
             LIMIT 1
             """,
-            (cutoff_arg, subj.replace("_", " "), obj.replace("_", " "), edge_id),
+            (subj, obj, cutoff_arg, edge_id),
         ).fetchone()
 
         if not recent_mention:

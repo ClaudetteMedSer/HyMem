@@ -1,3 +1,9 @@
 
 [dev]
 pytest>=8
+
+[server]
+mcp>=1.0
+openai>=1.0
+fastapi>=0.115
+uvicorn>=0.30

@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_id);
 
+-- Inverted index: which canonical entities does each chunk mention?
+-- Populated after canonicalization runs and entities are known.
+CREATE TABLE IF NOT EXISTS entity_mentions (
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    entity_canonical TEXT NOT NULL,
+    PRIMARY KEY (chunk_id, entity_canonical)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_mentions_canonical ON entity_mentions(entity_canonical);
+CREATE INDEX IF NOT EXISTS idx_entity_mentions_chunk ON entity_mentions(chunk_id);
+
 -- FTS over chunk text. External-content table keeps storage tight.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     text,
@@ -51,6 +61,16 @@ END;
 CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks BEGIN
     INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
 END;
+
+-- Embedding vectors for chunks. JSON-encoded floats; cosine similarity
+-- is computed in Python at query time.
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    vector_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Idempotency: each chunk processed at most once per prompt_version.
 CREATE TABLE IF NOT EXISTS processed_chunks (
@@ -142,3 +162,21 @@ CREATE TABLE IF NOT EXISTS run_lock (
     acquired_at TIMESTAMP NOT NULL,
     holder TEXT NOT NULL
 );
+
+-- Per-cycle dreaming run record. Populated by runner.run_dreaming for every
+-- invocation (success, lock-skip, or error) so operators can observe cadence
+-- and extraction quality over time.
+CREATE TABLE IF NOT EXISTS dream_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TIMESTAMP NOT NULL,
+    ended_at TIMESTAMP,
+    sessions_processed INTEGER NOT NULL DEFAULT 0,
+    chunks_seen INTEGER NOT NULL DEFAULT 0,
+    chunks_processed INTEGER NOT NULL DEFAULT 0,
+    chunks_embedded INTEGER NOT NULL DEFAULT 0,
+    triples_extracted INTEGER NOT NULL DEFAULT 0,
+    markers_extracted INTEGER NOT NULL DEFAULT 0,
+    skipped_locked INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dream_runs_started ON dream_runs(started_at);

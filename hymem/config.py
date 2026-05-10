@@ -9,11 +9,12 @@ class HyMemConfig:
     root: Path
     """Directory holding hymem.sqlite, MEMORY.md, USER.md."""
 
-    salience_min_chars: int = 80
+    salience_min_chars: int = 30
     """Minimum chunk size before extraction is attempted."""
 
     fts_top_k: int = 5
     graph_top_k_per_entity: int = 3
+    embedding_max_scan: int = 5000
 
     decay_window_days: int = 30
     decay_factor: float = 0.9
