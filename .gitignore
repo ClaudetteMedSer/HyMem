@@ -52,3 +52,25 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.pytype/
+.dmypy.json
+dmypy.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pyenv / tooling
+.python-version
+.envrc
+
+# Pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Local Claude settings
+.claude/settings.local.json
