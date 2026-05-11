@@ -45,7 +45,7 @@ from typing import Any
 
 try:
     import uvicorn
-    from fastapi import BackgroundTasks, FastAPI, HTTPException
+    from fastapi import BackgroundTasks, FastAPI, File, Form, UploadFile
     from pydantic import BaseModel
 except ImportError as exc:  # pragma: no cover
     raise ImportError("pip install 'hymem[server]'") from exc
@@ -120,34 +120,17 @@ class AddPeersRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    queries: list[str]
+    query: str
+    target: str | None = None
     session_id: str | None = None
+    reasoning_level: str | None = None
     stream: bool = False
 
 
-class WorkspaceCreate(BaseModel):
+class WorkspaceCreateRequest(BaseModel):
     id: str
     metadata: dict[str, Any] | None = None
     configuration: dict[str, Any] | None = None
-
-
-class PeerCreate(BaseModel):
-    id: str
-    metadata: dict[str, Any] | None = None
-    configuration: dict[str, Any] | None = None
-
-
-class SessionCreate(BaseModel):
-    id: str
-    metadata: dict[str, Any] | None = None
-    configuration: dict[str, Any] | None = None
-    peer_names: dict[str, dict] | None = None
-
-
-class ListRequest(BaseModel):
-    filters: dict[str, Any] | None = None
-    page: int = 1
-    size: int = 50
 
 
 # ── peer → role inference ─────────────────────────────────────────────────────
@@ -230,24 +213,89 @@ def health() -> dict:
     return {"status": "ok", "backend": "hymem"}
 
 
-# ── workspaces (stateless get-or-create) ─────────────────────────────────────
+# ── workspace (get-or-create) ──────────────────────────────────────────────────
 
-@app.post("/v3/workspaces", status_code=201)
-def create_workspace(body: WorkspaceCreate) -> dict:
+def _workspace_response(workspace_id: str, metadata: dict | None = None,
+                        created_at: str | None = None) -> dict:
+    """Build a WorkspaceResponse dict matching Honcho SDK expectations."""
     return {
-        "id": body.id,
-        "metadata": body.metadata or {},
-        "configuration": body.configuration or {},
-        "created_at": _now(),
+        "id": workspace_id,
+        "metadata": metadata or {},
+        "configuration": {},
+        "created_at": created_at or _now(),
     }
+
+
+@app.post("/v3/workspaces")
+def create_workspace(body: WorkspaceCreateRequest) -> dict:
+    """Get-or-create a workspace (Honcho v3 compatible).
+
+    The Honcho SDK calls this once per client instance via _ensure_workspace().
+    """
+    hy = _get_hy()
+    hy.conn.execute(
+        "INSERT OR IGNORE INTO sessions(id, started_at) VALUES (?, ?)",
+        (f"ws:{body.id}", _now()),
+    )
+    return _workspace_response(body.id, body.metadata)
 
 
 @app.get("/v3/workspaces/{workspace_id}")
 def get_workspace(workspace_id: str) -> dict:
+    """Get a workspace by ID."""
+    return _workspace_response(workspace_id)
+
+
+# ── peers (get-or-create) ────────────────────────────────────────────────────
+
+@app.post("/v3/workspaces/{workspace_id}/peers")
+def create_peer(workspace_id: str, body: dict[str, Any]) -> dict:
+    """Get-or-create a peer (Honcho v3 compatible).
+
+    Called by client.peer(id). The SDK expects PeerResponse:
+    id, workspace_id, created_at, metadata, configuration.
+    """
+    hy = _get_hy()
+    peer_id = body.get("id", "")
+    metadata = body.get("metadata") or {}
+    # configuration is optional; SDK may pass PeerConfig as dict
+    hy.conn.execute(
+        "INSERT OR IGNORE INTO peers(id, workspace_id, role, metadata, registered_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (peer_id, workspace_id, _infer_role(peer_id),
+         json.dumps(metadata), _now()),
+    )
     return {
-        "id": workspace_id,
-        "metadata": {},
-        "configuration": {},
+        "id": peer_id,
+        "workspace_id": workspace_id,
+        "created_at": _now(),
+        "metadata": metadata,
+        "configuration": body.get("configuration") or {},
+    }
+
+
+# ── sessions (get-or-create) ─────────────────────────────────────────────────
+
+@app.post("/v3/workspaces/{workspace_id}/sessions")
+def create_session(workspace_id: str, body: dict[str, Any]) -> dict:
+    """Get-or-create a session (Honcho v3 compatible).
+
+    Called by client.session(id). The SDK expects SessionResponse:
+    id, is_active, workspace_id, metadata, configuration, created_at.
+    """
+    hy = _get_hy()
+    session_id = body.get("id", "")
+    metadata = body.get("metadata") or {}
+    hy.conn.execute(
+        "INSERT OR IGNORE INTO sessions(id, started_at) VALUES (?, ?)",
+        (session_id, _now()),
+    )
+    return {
+        "id": session_id,
+        "is_active": True,
+        "workspace_id": workspace_id,
+        "metadata": metadata,
+        "configuration": body.get("configuration") or {},
         "created_at": _now(),
     }
 
@@ -276,6 +324,26 @@ def add_messages(
     if _kick_dream_if_due():
         background_tasks.add_task(_background_dream)
     return responses
+
+
+@app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/messages/upload")
+async def upload_file(
+    workspace_id: str,
+    session_id: str,
+    peer_id: str = Form(...),
+    file: UploadFile = File(...),
+) -> list[dict]:
+    """Upload a file as a peer message (Honcho v3 compatible).
+
+    Used by HonchoSessionManager.migrate_memory_files() to upload
+    MEMORY.md and USER.md as conversation messages.
+    """
+    hy = _get_hy()
+    hy.open_session(session_id)
+    content = (await file.read()).decode("utf-8", errors="replace")
+    role = _infer_role(peer_id)
+    msg_id = hy.log_message(session_id, role, content)
+    return [_msg(msg_id, content, peer_id, session_id, workspace_id)]
 
 
 @app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/search")
@@ -308,32 +376,6 @@ def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> 
     return results
 
 
-@app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/messages/list")
-def list_messages(workspace_id: str, session_id: str, body: ListRequest) -> dict:
-    hy = _get_hy()
-    page = max(1, body.page)
-    size = max(1, min(body.size, 500))
-    offset = (page - 1) * size
-
-    total = hy.conn.execute(
-        "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
-        (session_id,),
-    ).fetchone()["n"]
-
-    rows = hy.conn.execute(
-        "SELECT id, role, content, created_at FROM messages "
-        "WHERE session_id = ? ORDER BY id LIMIT ? OFFSET ?",
-        (session_id, size, offset),
-    ).fetchall()
-    items = [
-        _msg(r["id"], r["content"], r["role"], session_id, workspace_id,
-             created_at=r["created_at"])
-        for r in rows
-    ]
-    pages = (total + size - 1) // size if total else 0
-    return {"items": items, "total": total, "page": page, "size": size, "pages": pages}
-
-
 # ── context ───────────────────────────────────────────────────────────────────
 
 @app.get("/v3/workspaces/{workspace_id}/sessions/{session_id}/context")
@@ -353,105 +395,85 @@ def get_context(
         "WHERE session_id = ? ORDER BY id DESC LIMIT 20",
         (session_id,),
     ).fetchall()
-    recent = [
-        _msg(r["id"], r["content"], r["role"], session_id, workspace_id,
-             created_at=r["created_at"])
-        for r in reversed(rows)
-    ]
+
+    # Format messages as MessageResponse-compatible dicts
+    messages = []
+    for r in reversed(rows):
+        messages.append(_msg(
+            r["id"], r["content"], r["role"], session_id, workspace_id,
+            created_at=r["created_at"],
+        ))
+
+    # Summary: SDK expects dict with {content, message_id, summary_type, created_at, token_count}
+    # or None. We wrap the memory text in the expected shape.
+    summary_obj = None
+    if summary and memory_text.strip():
+        summary_obj = {
+            "content": memory_text,
+            "message_id": "summary_mem",
+            "summary_type": "memory",
+            "created_at": _now(),
+            "token_count": max(1, len(memory_text.split())),
+        }
 
     return {
-        "summary": memory_text,
-        "messages": recent,
-        "peers": [{"id": "user", "representation": user_text, "card": user_text}],
-    }
-
-
-# ── sessions (get-or-create + read) ──────────────────────────────────────────
-
-@app.post("/v3/workspaces/{workspace_id}/sessions", status_code=201)
-def create_session(workspace_id: str, body: SessionCreate) -> dict:
-    hy = _get_hy()
-    hy.open_session(body.id)
-    if body.peer_names:
-        for peer_id, meta in body.peer_names.items():
-            role = _infer_role(peer_id)
-            hy.conn.execute(
-                "INSERT OR IGNORE INTO peers(id, workspace_id, role, metadata) VALUES (?, ?, ?, ?)",
-                (peer_id, workspace_id, role, json.dumps(meta or {})),
-            )
-    return {
-        "id": body.id,
-        "workspace_id": workspace_id,
-        "metadata": body.metadata or {},
-        "configuration": body.configuration or {},
-        "peer_names": body.peer_names or {},
-    }
-
-
-@app.get("/v3/workspaces/{workspace_id}/sessions/{session_id}")
-def get_session(workspace_id: str, session_id: str) -> dict:
-    row = _get_hy().conn.execute(
-        "SELECT id, started_at, ended_at FROM sessions WHERE id = ?",
-        (session_id,),
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id!r} not found")
-    return {
-        "id": row["id"],
-        "workspace_id": workspace_id,
-        "metadata": {},
-        "is_active": row["ended_at"] is None,
-        "created_at": row["started_at"],
+        "summary": summary_obj,
+        "messages": messages,
+        "peer_representation": user_text,
     }
 
 
 # ── peers ─────────────────────────────────────────────────────────────────────
 
-@app.post("/v3/workspaces/{workspace_id}/peers", status_code=201)
-def create_peer(workspace_id: str, body: PeerCreate) -> dict:
-    role = _infer_role(body.id)
-    _get_hy().conn.execute(
-        "INSERT OR IGNORE INTO peers(id, workspace_id, role, metadata) VALUES (?, ?, ?, ?)",
-        (body.id, workspace_id, role, json.dumps(body.metadata or {})),
-    )
-    return {
-        "id": body.id,
-        "workspace_id": workspace_id,
-        "metadata": body.metadata or {},
-        "configuration": body.configuration or {},
-    }
-
-
-@app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}")
-def get_peer(workspace_id: str, peer_id: str) -> dict:
-    row = _get_hy().conn.execute(
-        "SELECT id, workspace_id, metadata FROM peers WHERE id = ? AND workspace_id = ?",
-        (peer_id, workspace_id),
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"peer {peer_id!r} not found")
-    try:
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
-    except json.JSONDecodeError:
-        meta = {}
-    return {"id": row["id"], "workspace_id": row["workspace_id"], "metadata": meta}
-
-
 @app.post(
     "/v3/workspaces/{workspace_id}/sessions/{session_id}/peers",
     status_code=201,
 )
-def add_peers(workspace_id: str, session_id: str, body: AddPeersRequest) -> list[dict]:
+def add_peers(workspace_id: str, session_id: str, body: dict[str, Any]) -> list[dict]:
+    """Add peers to a session with per-peer config (Honcho v3 compatible).
+
+    Expects body: {peer_id: {observe_me: bool, observe_others: bool}, ...}
+    This is the format produced by the Honcho SDK's normalize_peers_to_dict().
+    """
     hy = _get_hy()
     responses: list[dict] = []
-    for peer in body.peers:
-        role = _infer_role(peer.id)
+    for peer_id, config in body.items():
+        role = _infer_role(peer_id)
+        observe_me = config.get("observe_me", True) if isinstance(config, dict) else True
+        observe_others = config.get("observe_others", True) if isinstance(config, dict) else True
         hy.conn.execute(
             "INSERT OR REPLACE INTO peers(id, workspace_id, role, metadata) VALUES (?, ?, ?, ?)",
-            (peer.id, workspace_id, role, json.dumps(peer.metadata or {})),
+            (peer_id, workspace_id, role, json.dumps({
+                "observe_me": observe_me,
+                "observe_others": observe_others,
+            })),
         )
-        responses.append({"id": peer.id, "workspace_id": workspace_id, "metadata": peer.metadata or {}})
+        responses.append({
+            "id": peer_id,
+            "workspace_id": workspace_id,
+            "metadata": {"observe_me": observe_me, "observe_others": observe_others},
+        })
     return responses
+
+
+@app.get("/v3/workspaces/{workspace_id}/sessions/{session_id}/peers/{peer_id}/config")
+def get_peer_config(workspace_id: str, session_id: str, peer_id: str) -> dict:
+    """Get per-session peer configuration (Honcho v3 compatible)."""
+    hy = _get_hy()
+    row = hy.conn.execute(
+        "SELECT metadata FROM peers WHERE id = ? AND workspace_id = ?",
+        (peer_id, workspace_id),
+    ).fetchone()
+    if row and row["metadata"]:
+        try:
+            meta = json.loads(row["metadata"])
+            return {
+                "observe_me": meta.get("observe_me", True),
+                "observe_others": meta.get("observe_others", True),
+            }
+        except json.JSONDecodeError:
+            pass
+    return {"observe_me": True, "observe_others": True}
 
 
 @app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}/card")
@@ -461,12 +483,97 @@ def get_peer_card(workspace_id: str, peer_id: str) -> dict:
     return {"id": peer_id, "workspace_id": workspace_id, "content": content, "updated_at": _now()}
 
 
+@app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}/context")
+def get_peer_context(
+    workspace_id: str,
+    peer_id: str,
+    target: str | None = None,
+    search_query: str | None = None,
+    limit_to_session: bool = False,
+    summary: bool = True,
+) -> dict:
+    """Peer-scoped context with optional semantic search.
+
+    Called by Honcho SDK's search() and context() methods.
+    When search_query is present, runs augment() and returns scored results.
+    Otherwise returns the peer's representation and recent messages.
+    """
+    hy = _get_hy()
+    cfg = hy.config
+
+    peer_representation = ""
+    if cfg.user_md_path.exists():
+        peer_representation = cfg.user_md_path.read_text(encoding="utf-8")
+
+    messages = []
+    if search_query:
+        ctx = hy.augment(search_query)
+        for hit in ctx.fts_hits:
+            row = hy.conn.execute(
+                "SELECT role FROM messages WHERE id = ? AND session_id = ?",
+                (f"msg_{hit.chunk_id}", hit.session_id),
+            ).fetchone()
+            role = row["role"] if row else "assistant"
+            messages.append(_msg(
+                hit.chunk_id, hit.text[:600], role,
+                hit.session_id, workspace_id,
+                {"type": "fts_hit", "score": getattr(hit, "score", 0.0)},
+            ))
+        for fact in ctx.graph_facts:
+            content = (
+                f"{fact.subject} {fact.predicate} {fact.object} "
+                f"(confidence: {fact.confidence:.2f})"
+            )
+            messages.append(_msg(
+                f"kg_{fact.subject}_{fact.predicate}_{fact.object}",
+                content, "hymem-kg", "", workspace_id,
+                {"type": "graph_fact"},
+            ))
+
+    summary_obj = None
+    if summary:
+        memory_text = cfg.memory_md_path.read_text(encoding="utf-8") if cfg.memory_md_path.exists() else ""
+        if memory_text.strip():
+            summary_obj = {
+                "content": memory_text,
+                "message_id": "summary_mem",
+                "summary_type": "memory",
+                "created_at": _now(),
+                "token_count": max(1, len(memory_text.split())),
+            }
+
+    return {
+        "summary": summary_obj,
+        "messages": messages,
+        "peer_representation": peer_representation,
+    }
+
+
+@app.post("/v3/workspaces/{workspace_id}/peers/{peer_id}/representation")
+async def update_peer_representation(
+    workspace_id: str,
+    peer_id: str,
+    body: dict[str, Any],
+) -> dict:
+    """Update peer representation (behavioral profile).
+
+    Called by Honcho SDK's update_peer_representation() to persist
+    behavioral profile updates to USER.md.
+    Expects: {content: "..."}
+    """
+    hy = _get_hy()
+    cfg = hy.config
+    content = body.get("content", "")
+    if content:
+        cfg.user_md_path.write_text(content, encoding="utf-8")
+    return {"status": "ok", "peer_id": peer_id}
+
+
 # ── dialectic (honcho_reasoning) ─────────────────────────────────────────────
 
 @app.post("/v3/workspaces/{workspace_id}/peers/{peer_id}/chat")
 def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest) -> dict:
-    query = " ".join(body.queries)
-    ctx   = _get_hy().augment(query)
+    ctx   = _get_hy().augment(body.query)
     parts: list[str] = []
 
     if ctx.graph_facts:
@@ -480,7 +587,7 @@ def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest) -> dict:
         parts.append("From conversation history:\n" + "\n".join(snippets))
 
     answer = "\n\n".join(parts) if parts else "No relevant information found in memory."
-    return {"response": answer, "queries": body.queries}
+    return {"content": answer}
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
