@@ -205,3 +205,140 @@ def test_resolve_role_uses_peers_table_when_present(client, hy_with_embed):
     assert hsrv._resolve_role("hermes", "ambiguous-id") == "assistant"
     # Falls back to inference for unknown ids.
     assert hsrv._resolve_role("hermes", "user-fresh") == "user"
+
+
+# ── get-or-create lifecycle endpoints ────────────────────────────────────────
+
+
+def test_create_workspace_echoes_id_and_metadata(client):
+    r = client.post("/v3/workspaces", json={"id": "hermes", "metadata": {"k": "v"}})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["id"] == "hermes"
+    assert body["metadata"] == {"k": "v"}
+    assert "created_at" in body
+
+
+def test_create_workspace_is_idempotent(client):
+    r1 = client.post("/v3/workspaces", json={"id": "hermes"})
+    r2 = client.post("/v3/workspaces", json={"id": "hermes"})
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+    assert r1.json()["id"] == r2.json()["id"] == "hermes"
+
+
+def test_get_workspace_returns_stateless_echo(client):
+    r = client.get("/v3/workspaces/hermes")
+    assert r.status_code == 200
+    assert r.json()["id"] == "hermes"
+
+
+def test_create_peer_inserts_row_and_is_idempotent(client, hy_with_embed):
+    r1 = client.post(
+        "/v3/workspaces/hermes/peers",
+        json={"id": "user-42", "metadata": {"name": "Alice"}},
+    )
+    r2 = client.post("/v3/workspaces/hermes/peers", json={"id": "user-42"})
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+    rows = hy_with_embed.conn.execute(
+        "SELECT id, workspace_id, role FROM peers WHERE id = 'user-42'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["role"] == "user"
+    assert rows[0]["workspace_id"] == "hermes"
+
+
+def test_get_peer_round_trip_and_404(client):
+    client.post("/v3/workspaces/hermes/peers", json={"id": "user-7", "metadata": {"n": 1}})
+    r = client.get("/v3/workspaces/hermes/peers/user-7")
+    assert r.status_code == 200
+    assert r.json()["id"] == "user-7"
+    assert r.json()["metadata"] == {"n": 1}
+
+    miss = client.get("/v3/workspaces/hermes/peers/nobody")
+    assert miss.status_code == 404
+
+
+def test_create_session_opens_session_and_links_peers(client, hy_with_embed):
+    r = client.post(
+        "/v3/workspaces/hermes/sessions",
+        json={
+            "id": "sess-A",
+            "metadata": {"topic": "demo"},
+            "peer_names": {"user-1": {}, "agent-main": {}},
+        },
+    )
+    assert r.status_code == 201
+    assert r.json()["id"] == "sess-A"
+
+    sess_row = hy_with_embed.conn.execute(
+        "SELECT id FROM sessions WHERE id = 'sess-A'"
+    ).fetchone()
+    assert sess_row is not None
+
+    peer_ids = {
+        row["id"]
+        for row in hy_with_embed.conn.execute(
+            "SELECT id FROM peers WHERE workspace_id = 'hermes'"
+        )
+    }
+    assert {"user-1", "agent-main"} <= peer_ids
+
+
+def test_create_session_is_idempotent(client):
+    r1 = client.post("/v3/workspaces/hermes/sessions", json={"id": "sess-B"})
+    r2 = client.post("/v3/workspaces/hermes/sessions", json={"id": "sess-B"})
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+
+
+def test_get_session_round_trip_and_404(client, hy_with_embed):
+    client.post("/v3/workspaces/hermes/sessions", json={"id": "sess-C"})
+    r = client.get("/v3/workspaces/hermes/sessions/sess-C")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == "sess-C"
+    assert body["is_active"] is True
+
+    miss = client.get("/v3/workspaces/hermes/sessions/missing")
+    assert miss.status_code == 404
+
+
+# ── messages list (pagination) ───────────────────────────────────────────────
+
+
+def test_list_messages_paginates(client, hy_with_embed):
+    sid = "sess-list"
+    hy_with_embed.open_session(sid)
+    for i in range(5):
+        hy_with_embed.log_message(sid, "user", f"msg-{i}")
+
+    r = client.post(
+        f"/v3/workspaces/hermes/sessions/{sid}/messages/list",
+        json={"page": 1, "size": 2},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 5
+    assert body["size"] == 2
+    assert body["pages"] == 3
+    assert len(body["items"]) == 2
+    assert body["items"][0]["content"] == "msg-0"
+
+    r2 = client.post(
+        f"/v3/workspaces/hermes/sessions/{sid}/messages/list",
+        json={"page": 3, "size": 2},
+    )
+    assert r2.json()["items"][0]["content"] == "msg-4"
+    assert len(r2.json()["items"]) == 1
+
+
+def test_list_messages_empty_session(client, hy_with_embed):
+    hy_with_embed.open_session("empty-sid")
+    r = client.post(
+        "/v3/workspaces/hermes/sessions/empty-sid/messages/list",
+        json={},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"items": [], "total": 0, "page": 1, "size": 50, "pages": 0}

@@ -45,7 +45,7 @@ from typing import Any
 
 try:
     import uvicorn
-    from fastapi import BackgroundTasks, FastAPI
+    from fastapi import BackgroundTasks, FastAPI, HTTPException
     from pydantic import BaseModel
 except ImportError as exc:  # pragma: no cover
     raise ImportError("pip install 'hymem[server]'") from exc
@@ -123,6 +123,31 @@ class ChatRequest(BaseModel):
     queries: list[str]
     session_id: str | None = None
     stream: bool = False
+
+
+class WorkspaceCreate(BaseModel):
+    id: str
+    metadata: dict[str, Any] | None = None
+    configuration: dict[str, Any] | None = None
+
+
+class PeerCreate(BaseModel):
+    id: str
+    metadata: dict[str, Any] | None = None
+    configuration: dict[str, Any] | None = None
+
+
+class SessionCreate(BaseModel):
+    id: str
+    metadata: dict[str, Any] | None = None
+    configuration: dict[str, Any] | None = None
+    peer_names: dict[str, dict] | None = None
+
+
+class ListRequest(BaseModel):
+    filters: dict[str, Any] | None = None
+    page: int = 1
+    size: int = 50
 
 
 # ── peer → role inference ─────────────────────────────────────────────────────
@@ -205,6 +230,28 @@ def health() -> dict:
     return {"status": "ok", "backend": "hymem"}
 
 
+# ── workspaces (stateless get-or-create) ─────────────────────────────────────
+
+@app.post("/v3/workspaces", status_code=201)
+def create_workspace(body: WorkspaceCreate) -> dict:
+    return {
+        "id": body.id,
+        "metadata": body.metadata or {},
+        "configuration": body.configuration or {},
+        "created_at": _now(),
+    }
+
+
+@app.get("/v3/workspaces/{workspace_id}")
+def get_workspace(workspace_id: str) -> dict:
+    return {
+        "id": workspace_id,
+        "metadata": {},
+        "configuration": {},
+        "created_at": _now(),
+    }
+
+
 # ── messages ──────────────────────────────────────────────────────────────────
 
 @app.post(
@@ -261,6 +308,32 @@ def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> 
     return results
 
 
+@app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/messages/list")
+def list_messages(workspace_id: str, session_id: str, body: ListRequest) -> dict:
+    hy = _get_hy()
+    page = max(1, body.page)
+    size = max(1, min(body.size, 500))
+    offset = (page - 1) * size
+
+    total = hy.conn.execute(
+        "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()["n"]
+
+    rows = hy.conn.execute(
+        "SELECT id, role, content, created_at FROM messages "
+        "WHERE session_id = ? ORDER BY id LIMIT ? OFFSET ?",
+        (session_id, size, offset),
+    ).fetchall()
+    items = [
+        _msg(r["id"], r["content"], r["role"], session_id, workspace_id,
+             created_at=r["created_at"])
+        for r in rows
+    ]
+    pages = (total + size - 1) // size if total else 0
+    return {"items": items, "total": total, "page": page, "size": size, "pages": pages}
+
+
 # ── context ───────────────────────────────────────────────────────────────────
 
 @app.get("/v3/workspaces/{workspace_id}/sessions/{session_id}/context")
@@ -293,7 +366,76 @@ def get_context(
     }
 
 
+# ── sessions (get-or-create + read) ──────────────────────────────────────────
+
+@app.post("/v3/workspaces/{workspace_id}/sessions", status_code=201)
+def create_session(workspace_id: str, body: SessionCreate) -> dict:
+    hy = _get_hy()
+    hy.open_session(body.id)
+    if body.peer_names:
+        for peer_id, meta in body.peer_names.items():
+            role = _infer_role(peer_id)
+            hy.conn.execute(
+                "INSERT OR IGNORE INTO peers(id, workspace_id, role, metadata) VALUES (?, ?, ?, ?)",
+                (peer_id, workspace_id, role, json.dumps(meta or {})),
+            )
+    return {
+        "id": body.id,
+        "workspace_id": workspace_id,
+        "metadata": body.metadata or {},
+        "configuration": body.configuration or {},
+        "peer_names": body.peer_names or {},
+    }
+
+
+@app.get("/v3/workspaces/{workspace_id}/sessions/{session_id}")
+def get_session(workspace_id: str, session_id: str) -> dict:
+    row = _get_hy().conn.execute(
+        "SELECT id, started_at, ended_at FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id!r} not found")
+    return {
+        "id": row["id"],
+        "workspace_id": workspace_id,
+        "metadata": {},
+        "is_active": row["ended_at"] is None,
+        "created_at": row["started_at"],
+    }
+
+
 # ── peers ─────────────────────────────────────────────────────────────────────
+
+@app.post("/v3/workspaces/{workspace_id}/peers", status_code=201)
+def create_peer(workspace_id: str, body: PeerCreate) -> dict:
+    role = _infer_role(body.id)
+    _get_hy().conn.execute(
+        "INSERT OR IGNORE INTO peers(id, workspace_id, role, metadata) VALUES (?, ?, ?, ?)",
+        (body.id, workspace_id, role, json.dumps(body.metadata or {})),
+    )
+    return {
+        "id": body.id,
+        "workspace_id": workspace_id,
+        "metadata": body.metadata or {},
+        "configuration": body.configuration or {},
+    }
+
+
+@app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}")
+def get_peer(workspace_id: str, peer_id: str) -> dict:
+    row = _get_hy().conn.execute(
+        "SELECT id, workspace_id, metadata FROM peers WHERE id = ? AND workspace_id = ?",
+        (peer_id, workspace_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"peer {peer_id!r} not found")
+    try:
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+    except json.JSONDecodeError:
+        meta = {}
+    return {"id": row["id"], "workspace_id": row["workspace_id"], "metadata": meta}
+
 
 @app.post(
     "/v3/workspaces/{workspace_id}/sessions/{session_id}/peers",
