@@ -14,6 +14,14 @@ ALLOWED_PREDICATES = (
     "deploys_to",
     "part_of",
     "equivalent_to",
+    "implements",
+    "contains",
+    "configured_with",
+    "requires_version",
+    "runs_on",
+    "connects_to",
+    "generates",
+    "tested_by",
 )
 
 TRIPLE_SYSTEM = """You extract structured technical relationships from conversation excerpts.
@@ -21,7 +29,31 @@ TRIPLE_SYSTEM = """You extract structured technical relationships from conversat
 Rules:
 - Output a strict JSON array. No prose, no markdown, no code fences.
 - Each item has exactly: subject (string), predicate (string), object (string), polarity (1 or -1).
+- Optional fields (include only when applicable):
+    value_text (string): numeric value, version string, or quantity mentioned
+    value_numeric (number): parsed numeric value if available
+    value_unit (string): unit for numeric values ("seconds", "MB", "rps")
+    temporal_scope (string): time context ("since 2024", "during migration", "temporarily")
 - predicate MUST be one of: {predicates}.
+- Predicate meanings:
+    uses: A employs or utilizes B
+    depends_on: A requires B to function
+    prefers: A favors B over alternatives
+    rejects: A explicitly refuses or negates B
+    avoids: A steers clear of B
+    replaces: A supersedes or substitutes B
+    conflicts_with: A is incompatible with B
+    deploys_to: A is deployed or released to B
+    part_of: A is a component or sub-part of B
+    equivalent_to: A is synonymous or interchangeable with B
+    implements: A realizes or fulfills interface/contract/spec B
+    contains: A holds, owns, or includes B as a subcomponent
+    configured_with: A is parameterized or set up using B
+    requires_version: A needs a specific version of B
+    runs_on: A executes or operates on platform/runtime B
+    connects_to: A has a network or data-flow connection to B
+    generates: A produces, outputs, or creates B
+    tested_by: A is tested or verified using B
 - polarity is -1 only when the speaker negates or retracts the relationship
   ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
   Mapping for negations: "no longer uses" -> uses with polarity -1.

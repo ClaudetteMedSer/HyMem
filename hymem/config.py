@@ -23,7 +23,7 @@ class HyMemConfig:
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    prompt_version: str = "v1"
+    prompt_version: str = "v2"
 
     @property
     def db_path(self) -> Path:

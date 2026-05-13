@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import sqlite3
+import struct
 from importlib.resources import files
 from pathlib import Path
 from typing import Iterator
@@ -23,8 +25,130 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _load_vec_extension(conn: sqlite3.Connection) -> bool:
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        return True
+    except ImportError:
+        return False
+    except Exception as exc:
+        log.info("sqlite-vec failed to load (%s); using Python cosine search", exc)
+        return False
+
+
 def initialize(conn: sqlite3.Connection) -> None:
     conn.executescript(_load_schema())
+    _load_vec_extension(conn)
+    _run_migrations(conn)
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    cur = schema_version(conn)
+    if cur < 2:
+        _migrate_v2(conn)
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    for col, col_type in [
+        ("value_text", "TEXT"),
+        ("value_numeric", "REAL"),
+        ("value_unit", "TEXT"),
+        ("temporal_scope", "TEXT"),
+    ]:
+        try:
+            conn.execute(
+                f"ALTER TABLE kg_evidence ADD COLUMN {col} {col_type}"
+            )
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '2')"
+    )
+    log.info("migrated schema to v2 (numeric/temporal columns)")
+
+
+def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
+    if not _load_vec_extension(conn):
+        return
+    try:
+        existing_dim = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
+        ).fetchone()
+        if existing_dim and int(existing_dim["value"]) == dim:
+            return
+        if existing_dim:
+            conn.execute("DELETE FROM schema_meta WHERE key = 'vec_dim'")
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("DROP TABLE IF EXISTS vec_chunks")
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[{dim}])"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('vec_dim', ?)",
+            (str(dim),),
+        )
+        _backfill_vec(conn, dim)
+    except sqlite3.OperationalError:
+        log.info("vec_chunks table unavailable; using Python cosine search")
+
+
+def _backfill_vec(conn: sqlite3.Connection, dim: int) -> None:
+    rows = conn.execute(
+        "SELECT c.rowid, e.vector_json FROM chunk_embeddings e "
+        "JOIN chunks c ON c.id = e.chunk_id ORDER BY c.rowid"
+    ).fetchall()
+    if not rows:
+        return
+    count = conn.execute("SELECT COUNT(*) AS c FROM vec_chunks").fetchone()["c"]
+    if count >= len(rows):
+        return
+
+    for r in rows:
+        try:
+            vec = json.loads(r["vector_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(vec) != dim:
+            vec = list(vec) + [0.0] * (dim - len(vec))
+        conn.execute(
+            "INSERT OR IGNORE INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
+            (r["rowid"], _pack_vector(vec)),
+        )
+    log.info("backfilled vec_chunks with %d existing embeddings", len(rows))
+
+
+def _pack_vector(vec: list[float]) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def vec_search(
+    conn: sqlite3.Connection, query_vector: list[float], top_k: int
+) -> list[tuple[int, float]]:
+    if not _load_vec_extension(conn):
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT rowid, distance
+            FROM vec_chunks
+            WHERE embedding MATCH ?
+            ORDER BY distance
+            LIMIT ?
+            """,
+            (_pack_vector(query_vector), top_k),
+        ).fetchall()
+        return [(int(r["rowid"]), float(r["distance"])) for r in rows]
+    except (sqlite3.OperationalError, TypeError):
+        return []
+
+
+def has_vec_table(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
+    ).fetchone()
+    return row is not None
 
 
 @contextlib.contextmanager

@@ -17,6 +17,10 @@ class Triple:
     predicate: str
     object: str
     polarity: int  # +1 or -1
+    value_text: str | None = None
+    value_numeric: float | None = None
+    value_unit: str | None = None
+    temporal_scope: str | None = None
 
 
 def extract_triples(client: LLMClient, text: str) -> list[Triple]:
@@ -58,12 +62,20 @@ def _parse(raw: str) -> list[Triple]:
             continue
         if not subject.strip() or not obj.strip():
             continue
+        value_text = item.get("value_text")
+        value_numeric = item.get("value_numeric")
+        value_unit = item.get("value_unit")
+        temporal_scope = item.get("temporal_scope")
         triples.append(
             Triple(
                 subject=subject.strip(),
                 predicate=predicate,
                 object=obj.strip(),
                 polarity=polarity,
+                value_text=value_text.strip() if isinstance(value_text, str) and value_text.strip() else None,
+                value_numeric=float(value_numeric) if isinstance(value_numeric, (int, float)) else None,
+                value_unit=value_unit.strip() if isinstance(value_unit, str) and value_unit.strip() else None,
+                temporal_scope=temporal_scope.strip() if isinstance(temporal_scope, str) and temporal_scope.strip() else None,
             )
         )
     return triples

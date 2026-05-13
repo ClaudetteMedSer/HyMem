@@ -116,10 +116,12 @@ def _upsert_triple(conn: sqlite3.Connection, chunk_id: str, triple: Triple) -> t
     conn.execute(
         """
         INSERT OR IGNORE INTO kg_evidence(
-            edge_id, chunk_id, polarity, surface_subject, surface_object
-        ) VALUES (?, ?, ?, ?, ?)
+            edge_id, chunk_id, polarity, surface_subject, surface_object,
+            value_text, value_numeric, value_unit, temporal_scope
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (edge_id, chunk_id, triple.polarity, triple.subject, triple.object),
+        (edge_id, chunk_id, triple.polarity, triple.subject, triple.object,
+         triple.value_text, triple.value_numeric, triple.value_unit, triple.temporal_scope),
     )
 
     return subj_canon, obj_canon

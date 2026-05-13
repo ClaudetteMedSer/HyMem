@@ -133,9 +133,51 @@ def _vector_search(
     top_k: int,
     max_scan: int,
 ) -> list[FtsHit]:
-    # TODO: O(n) Python cosine over all rows is fine up to ~5K chunks. Beyond that,
-    # consider: (1) sqlite-vec extension for native ANN, (2) numpy batched dot product,
-    # (3) periodic pruning of old embeddings.
+    from hymem.core import db as core_db
+
+    if core_db.has_vec_table(conn):
+        return _vec_search(conn, embedder, query, top_k=top_k)
+    return _python_cosine_search(conn, embedder, query, top_k=top_k, max_scan=max_scan)
+
+
+def _vec_search(
+    conn: sqlite3.Connection,
+    embedder: EmbeddingClient,
+    query: str,
+    *,
+    top_k: int,
+) -> list[FtsHit]:
+    from hymem.core import db as core_db
+
+    qvec = embedder.embed([query])[0]
+    hits = core_db.vec_search(conn, qvec, top_k)
+
+    result: list[FtsHit] = []
+    for chunk_rowid, distance in hits:
+        row = conn.execute(
+            "SELECT id AS chunk_id, session_id, text FROM chunks WHERE rowid = ?",
+            (chunk_rowid,),
+        ).fetchone()
+        if row:
+            result.append(
+                FtsHit(
+                    chunk_id=row["chunk_id"],
+                    session_id=row["session_id"],
+                    text=row["text"],
+                    score=float(1.0 / (1.0 + distance)),
+                )
+            )
+    return result
+
+
+def _python_cosine_search(
+    conn: sqlite3.Connection,
+    embedder: EmbeddingClient,
+    query: str,
+    *,
+    top_k: int,
+    max_scan: int,
+) -> list[FtsHit]:
     rows = conn.execute(
         """
         SELECT c.id AS chunk_id, c.session_id, c.text, e.vector_json

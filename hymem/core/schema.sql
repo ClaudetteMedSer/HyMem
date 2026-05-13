@@ -93,7 +93,9 @@ CREATE TABLE IF NOT EXISTS knowledge_graph (
     subject_canonical TEXT NOT NULL,
     predicate TEXT NOT NULL CHECK (predicate IN (
         'uses','depends_on','prefers','rejects','avoids',
-        'replaces','conflicts_with','deploys_to','part_of','equivalent_to'
+        'replaces','conflicts_with','deploys_to','part_of','equivalent_to',
+        'implements','contains','configured_with','requires_version',
+        'runs_on','connects_to','generates','tested_by'
     )),
     object_canonical TEXT NOT NULL,
     pos_evidence INTEGER NOT NULL DEFAULT 0,
@@ -117,6 +119,10 @@ CREATE TABLE IF NOT EXISTS kg_evidence (
     polarity INTEGER NOT NULL CHECK (polarity IN (-1, 1)),
     surface_subject TEXT,
     surface_object TEXT,
+    value_text TEXT,
+    value_numeric REAL,
+    value_unit TEXT,
+    temporal_scope TEXT,
     extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(edge_id, chunk_id, polarity)
 );

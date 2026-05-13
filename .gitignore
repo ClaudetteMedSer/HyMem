@@ -76,3 +76,4 @@ pip-delete-this-directory.txt
 .claude/settings.local.json
 *.pyc
 *.pyc
+*.pyc
