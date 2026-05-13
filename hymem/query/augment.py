@@ -24,6 +24,7 @@ class GraphFact:
     confidence: float
     pos_evidence: int
     neg_evidence: int
+    derived: bool = False
 
 
 @dataclass
@@ -45,6 +46,16 @@ class FtsHit:
 
 
 @dataclass
+class ProcedureHit:
+    procedure_id: str
+    session_id: str
+    name: str
+    description: str
+    steps: list[dict]
+    score: float
+
+
+@dataclass
 class AugmentedContext:
     """Structured context for the host (Hermes) to assemble into its prompt.
 
@@ -61,6 +72,7 @@ class AugmentedContext:
     fts_hits: list[FtsHit] = field(default_factory=list)
     graph_facts: list[GraphFact] = field(default_factory=list)
     episodes: list[EpisodeHit] = field(default_factory=list)
+    procedures: list[ProcedureHit] = field(default_factory=list)
     matched_entities: list[str] = field(default_factory=list)
 
 
@@ -99,6 +111,8 @@ def augment(
         log.debug("rerank.skipped")
 
     ctx.episodes = _episode_search(conn, user_message, top_k=cfg.fts_top_k)
+
+    ctx.procedures = _procedure_search(conn, user_message, top_k=cfg.fts_top_k)
 
     ctx.matched_entities = match_known_entities(conn, user_message)
     ctx.matched_entities = _expand_entities_by_type(conn, ctx.matched_entities)
@@ -147,7 +161,7 @@ def _fts_search(conn: sqlite3.Connection, query: str, *, top_k: int) -> list[Fts
     tokens = [t for t in cleaned.split() if len(t) >= 2]
     if not tokens:
         return []
-    fts_query = " OR ".join(tokens)
+    fts_query = " OR ".join(f'"{t}"' for t in tokens)
 
     try:
         # bm25() is an FTS5 built-in; schema.sql declares chunks_fts with fts5.
@@ -297,7 +311,7 @@ def _graph_lookup(
         rows = conn.execute(
             """
             SELECT subject_canonical AS s, predicate AS p, object_canonical AS o,
-                   pos_evidence AS pos, neg_evidence AS neg,
+                   pos_evidence AS pos, neg_evidence AS neg, derived,
                    (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) AS conf
             FROM knowledge_graph
             WHERE status = 'active'
@@ -318,6 +332,7 @@ def _graph_lookup(
                 confidence=float(r["conf"]),
                 pos_evidence=int(r["pos"]),
                 neg_evidence=int(r["neg"]),
+                derived=bool(r["derived"]),
             )
     return list(facts.values())
 
@@ -329,7 +344,7 @@ def _episode_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> lis
     tokens = [t for t in cleaned.split() if len(t) >= 2]
     if not tokens:
         return []
-    fts_query = " OR ".join(tokens)
+    fts_query = " OR ".join(f'"{t}"' for t in tokens)
 
     try:
         rows = conn.execute(
@@ -354,6 +369,46 @@ def _episode_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> lis
         )
         for r in rows
     ]
+
+
+def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[ProcedureHit]:
+    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    if not cleaned:
+        return []
+    tokens = [t for t in cleaned.split() if len(t) >= 2]
+    if not tokens:
+        return []
+    fts_query = " OR ".join(f'"{t}"' for t in tokens)
+
+    try:
+        rows = conn.execute(
+            """SELECT p.id, p.session_id, p.name, p.description, p.steps,
+                      bm25(procedures_fts) AS score
+               FROM procedures_fts
+               JOIN procedures p ON p.rowid = procedures_fts.rowid
+               WHERE procedures_fts MATCH ?
+               ORDER BY score
+               LIMIT ?""",
+            (fts_query, top_k),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    result: list[ProcedureHit] = []
+    for r in rows:
+        try:
+            steps = json.loads(r["steps"]) if r["steps"] else []
+        except json.JSONDecodeError:
+            steps = []
+        result.append(ProcedureHit(
+            procedure_id=r["id"],
+            session_id=r["session_id"],
+            name=r["name"],
+            description=r["description"] or "",
+            steps=steps,
+            score=float(r["score"]),
+        ))
+    return result
 
 
 def _expand_entities_by_type(

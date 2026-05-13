@@ -88,7 +88,7 @@ def _get_mcp():
     return FastMCP("hymem")
 
 
-mcp = _get_mcp()
+mcp = None
 
 
 # ── tool implementations (callable directly in tests) ────────────────────────
@@ -194,7 +194,6 @@ def _do_retract(subject: str, predicate: str, object: str) -> str:
 
 # ── MCP tool registration ─────────────────────────────────────────────────────
 
-@mcp.tool()
 def hymem_capture(session_id: str, messages: str, dream: bool = True) -> str:
     """Log a full conversation and optionally run dreaming. Preferred over hymem_log.
 
@@ -215,7 +214,6 @@ def hymem_capture(session_id: str, messages: str, dream: bool = True) -> str:
     return _do_capture(session_id, messages, dream)
 
 
-@mcp.tool()
 def hymem_log(session_id: str, role: str, content: str) -> str:
     """Log one conversational turn to HyMem.
 
@@ -227,7 +225,6 @@ def hymem_log(session_id: str, role: str, content: str) -> str:
     return _do_log(session_id, role, content)
 
 
-@mcp.tool()
 def hymem_dream() -> str:
     """Run a full dreaming cycle.
 
@@ -241,7 +238,6 @@ def hymem_dream() -> str:
     return _do_dream()
 
 
-@mcp.tool()
 def hymem_augment(message: str) -> str:
     """Return structured knowledge and relevant past context for a user message.
 
@@ -252,7 +248,6 @@ def hymem_augment(message: str) -> str:
     return _do_augment(message)
 
 
-@mcp.tool()
 def hymem_profile() -> str:
     """Return the user's behavioral profile and project insights.
 
@@ -266,7 +261,6 @@ def hymem_profile() -> str:
     return _do_profile()
 
 
-@mcp.tool()
 def hymem_alias(surface: str, canonical: str) -> str:
     """Register that two names refer to the same entity.
 
@@ -276,7 +270,6 @@ def hymem_alias(surface: str, canonical: str) -> str:
     return _do_alias(surface, canonical)
 
 
-@mcp.tool()
 def hymem_retract(subject: str, predicate: str, object: str) -> str:
     """Retract a knowledge graph edge that was wrongly extracted.
 
@@ -289,7 +282,15 @@ def hymem_retract(subject: str, predicate: str, object: str) -> str:
 
 
 def main() -> None:
-    mcp.run()
+    mcp_instance = _get_mcp()
+    mcp_instance.tool()(hymem_capture)
+    mcp_instance.tool()(hymem_log)
+    mcp_instance.tool()(hymem_dream)
+    mcp_instance.tool()(hymem_augment)
+    mcp_instance.tool()(hymem_profile)
+    mcp_instance.tool()(hymem_alias)
+    mcp_instance.tool()(hymem_retract)
+    mcp_instance.run()
 
 
 if __name__ == "__main__":

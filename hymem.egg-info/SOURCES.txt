@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 hymem/__init__.py
 hymem/api.py
@@ -21,11 +22,16 @@ hymem/dreaming/__init__.py
 hymem/dreaming/canonicalize.py
 hymem/dreaming/chunks.py
 hymem/dreaming/embeddings.py
+hymem/dreaming/episodes.py
+hymem/dreaming/inference.py
 hymem/dreaming/mentions.py
 hymem/dreaming/phase1.py
 hymem/dreaming/phase2.py
 hymem/dreaming/phase3.py
+hymem/dreaming/procedures.py
+hymem/dreaming/retention.py
 hymem/dreaming/runner.py
+hymem/dreaming/summary.py
 hymem/extraction/__init__.py
 hymem/extraction/embeddings.py
 hymem/extraction/llm.py
@@ -42,6 +48,9 @@ tests/test_dream_runs.py
 tests/test_dreaming.py
 tests/test_embeddings.py
 tests/test_extraction.py
+tests/test_honcho_server.py
+tests/test_integration.py
 tests/test_markdown_io.py
+tests/test_mcp_server.py
 tests/test_phase3_perf.py
 tests/test_retract.py

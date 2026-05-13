@@ -24,7 +24,7 @@ ALLOWED_PREDICATES = (
     "tested_by",
 )
 
-TRIPLE_SYSTEM = """You extract structured technical relationships from conversation excerpts.
+_TRIPLE_SYSTEM_TEMPLATE = """You extract structured technical relationships from conversation excerpts.
 
 Rules:
 - Output a strict JSON array. No prose, no markdown, no code fences.
@@ -57,6 +57,7 @@ Rules:
     connects_to: A has a network or data-flow connection to B
     generates: A produces, outputs, or creates B
     tested_by: A is tested or verified using B
+{negative_examples}
 - polarity is -1 only when the speaker negates or retracts the relationship
   ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
   Mapping for negations: "no longer uses" -> uses with polarity -1.
@@ -64,7 +65,27 @@ Rules:
 - Skip relationships you are not confident about. An empty array [] is a valid answer.
 - Subject and object should be concrete named things (tools, libraries, services,
   files, modules, environments). Do not invent abstractions like "the system".
-""".format(predicates=", ".join(ALLOWED_PREDICATES))
+"""
+
+
+def build_triple_system(negative_examples: str = "") -> str:
+    """Build the triple extraction system prompt with optional negative examples."""
+    neg_section = ""
+    if negative_examples:
+        neg_section = (
+            "\nCRITICAL: The following triples were previously extracted INCORRECTLY "
+            "from similar conversation contexts. DO NOT extract these exact "
+            "relationships or close variants:\n"
+            + negative_examples
+            + "\n"
+        )
+    return _TRIPLE_SYSTEM_TEMPLATE.format(
+        predicates=", ".join(ALLOWED_PREDICATES),
+        negative_examples=neg_section,
+    )
+
+
+TRIPLE_SYSTEM = build_triple_system()
 
 
 TRIPLE_USER_TEMPLATE = """Excerpt:
@@ -112,6 +133,47 @@ Empty array [] is valid if the conversation has no clear episodes.
 """
 
 EPISODE_USER_TEMPLATE = """Conversation session:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON array now."""
+
+
+SESSION_SUMMARY_SYSTEM = """You write a one-sentence summary of a conversation session.
+
+Focus on: what was accomplished, decisions made, problems solved, topics covered.
+Be specific about tools, technologies, and concrete outcomes mentioned.
+Do NOT add "The user" or "The assistant" — use passive voice or implicit subject.
+Output ONLY the summary text, no JSON, no markdown, no quotes.
+"""
+
+SESSION_SUMMARY_USER_TEMPLATE = """Conversation:
+\"\"\"
+{text}
+\"\"\"
+
+One-sentence summary:"""
+
+
+PROCEDURE_SYSTEM = """You identify step-by-step procedures described in a conversation.
+
+A procedure is an ordered sequence of actions needed to accomplish a specific technical task — like deploying, configuring, debugging, setting up, or testing something.
+
+Output a strict JSON array. Each item:
+- name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging", "Set up local dev", "Debug Postgres connection pool"
+- description (string): 1 sentence describing what the procedure accomplishes
+- steps (list of objects): Ordered steps, each with:
+    order (integer): Step number starting at 1
+    action (string): What to do, imperative form
+    tool (string or null): Tool/command/CLI used, if mentioned explicitly
+- triggers (list of strings): Words/phrases someone might use to ask about this procedure. e.g., ["deploy", "ship it", "release", "push to staging"]
+- entities_involved (list of strings): Named tools, services, platforms, files involved
+
+Only extract procedures that are EXPLICITLY described. Do not invent procedures from general discussion. Empty array [] is valid.
+"""
+
+PROCEDURE_USER_TEMPLATE = """Conversation:
 \"\"\"
 {text}
 \"\"\"

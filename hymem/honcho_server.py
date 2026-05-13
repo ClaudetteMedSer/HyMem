@@ -37,6 +37,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -45,7 +46,7 @@ from typing import Any
 
 try:
     import uvicorn
-    from fastapi import BackgroundTasks, FastAPI, File, Form, UploadFile
+    from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
     from pydantic import BaseModel
 except ImportError as exc:  # pragma: no cover
     raise ImportError("pip install 'hymem[server]'") from exc
@@ -226,7 +227,7 @@ def _workspace_response(workspace_id: str, metadata: dict | None = None,
     }
 
 
-@app.post("/v3/workspaces")
+@app.post("/v3/workspaces", status_code=201)
 def create_workspace(body: WorkspaceCreateRequest) -> dict:
     """Get-or-create a workspace (Honcho v3 compatible).
 
@@ -248,7 +249,7 @@ def get_workspace(workspace_id: str) -> dict:
 
 # ── peers (get-or-create) ────────────────────────────────────────────────────
 
-@app.post("/v3/workspaces/{workspace_id}/peers")
+@app.post("/v3/workspaces/{workspace_id}/peers", status_code=201)
 def create_peer(workspace_id: str, body: dict[str, Any]) -> dict:
     """Get-or-create a peer (Honcho v3 compatible).
 
@@ -274,9 +275,31 @@ def create_peer(workspace_id: str, body: dict[str, Any]) -> dict:
     }
 
 
+@app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}")
+def get_peer(workspace_id: str, peer_id: str) -> dict:
+    hy = _get_hy()
+    row = hy.conn.execute(
+        "SELECT id, workspace_id, metadata FROM peers WHERE id = ? AND workspace_id = ?",
+        (peer_id, workspace_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Peer not found")
+    metadata: dict[str, Any] = {}
+    if row["metadata"]:
+        try:
+            metadata = json.loads(row["metadata"])
+        except json.JSONDecodeError:
+            pass
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "metadata": metadata,
+    }
+
+
 # ── sessions (get-or-create) ─────────────────────────────────────────────────
 
-@app.post("/v3/workspaces/{workspace_id}/sessions")
+@app.post("/v3/workspaces/{workspace_id}/sessions", status_code=201)
 def create_session(workspace_id: str, body: dict[str, Any]) -> dict:
     """Get-or-create a session (Honcho v3 compatible).
 
@@ -290,6 +313,15 @@ def create_session(workspace_id: str, body: dict[str, Any]) -> dict:
         "INSERT OR IGNORE INTO sessions(id, started_at) VALUES (?, ?)",
         (session_id, _now()),
     )
+    peer_names = body.get("peer_names")
+    if peer_names and isinstance(peer_names, dict):
+        for peer_name in peer_names:
+            role = _infer_role(peer_name)
+            hy.conn.execute(
+                "INSERT OR IGNORE INTO peers(id, workspace_id, role, metadata, registered_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (peer_name, workspace_id, role, json.dumps({}), _now()),
+            )
     return {
         "id": session_id,
         "is_active": True,
@@ -297,6 +329,24 @@ def create_session(workspace_id: str, body: dict[str, Any]) -> dict:
         "metadata": metadata,
         "configuration": body.get("configuration") or {},
         "created_at": _now(),
+    }
+
+
+@app.get("/v3/workspaces/{workspace_id}/sessions/{session_id}")
+def get_session(workspace_id: str, session_id: str) -> dict:
+    hy = _get_hy()
+    row = hy.conn.execute(
+        "SELECT started_at, ended_at FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "id": session_id,
+        "is_active": row["ended_at"] is None,
+        "workspace_id": workspace_id,
+        "metadata": {},
+        "created_at": row["started_at"],
     }
 
 
@@ -346,6 +396,44 @@ async def upload_file(
     return [_msg(msg_id, content, peer_id, session_id, workspace_id)]
 
 
+@app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/messages/list")
+def list_messages(workspace_id: str, session_id: str, body: dict[str, Any] | None = None) -> dict:
+    body = body or {}
+    hy = _get_hy()
+    page = max(1, body.get("page", 1))
+    size = body.get("size", 50)
+
+    total_row = hy.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    total = total_row[0] if total_row else 0
+
+    offset = (page - 1) * size
+    rows = hy.conn.execute(
+        "SELECT id, content, role, session_id, created_at FROM messages "
+        "WHERE session_id = ? ORDER BY id LIMIT ? OFFSET ?",
+        (session_id, size, offset),
+    ).fetchall()
+
+    items = []
+    for row in rows:
+        items.append(_msg(
+            row["id"], row["content"], row["role"], row["session_id"], workspace_id,
+            created_at=row["created_at"],
+        ))
+
+    pages = math.ceil(total / size) if total > 0 else 0
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": pages,
+    }
+
+
 @app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/search")
 def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> list[dict]:
     ctx = _get_hy().augment(body.query)
@@ -390,6 +478,11 @@ def get_context(
     memory_text = cfg.memory_md_path.read_text(encoding="utf-8") if cfg.memory_md_path.exists() else ""
     user_text   = cfg.user_md_path.read_text(encoding="utf-8")   if cfg.user_md_path.exists()   else ""
 
+    session_row = hy.conn.execute(
+        "SELECT summary FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    session_summary = session_row["summary"] if session_row and session_row["summary"] else ""
+
     rows = hy.conn.execute(
         "SELECT id, role, content, created_at FROM messages "
         "WHERE session_id = ? ORDER BY id DESC LIMIT 20",
@@ -404,16 +497,16 @@ def get_context(
             created_at=r["created_at"],
         ))
 
-    # Summary: SDK expects dict with {content, message_id, summary_type, created_at, token_count}
-    # or None. We wrap the memory text in the expected shape.
     summary_obj = None
-    if summary and memory_text.strip():
+    if summary and (session_summary or memory_text.strip()):
+        summary_content = session_summary if session_summary else memory_text
+        summary_type = "session" if session_summary else "memory"
         summary_obj = {
-            "content": memory_text,
+            "content": summary_content,
             "message_id": "summary_mem",
-            "summary_type": "memory",
+            "summary_type": summary_type,
             "created_at": _now(),
-            "token_count": max(1, len(memory_text.split())),
+            "token_count": max(1, len(summary_content.split())),
         }
 
     return {

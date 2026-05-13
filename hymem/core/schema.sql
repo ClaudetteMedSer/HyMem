@@ -13,7 +13,8 @@ INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ended_at TIMESTAMP
+    ended_at TIMESTAMP,
+    summary TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -115,6 +116,7 @@ CREATE TABLE IF NOT EXISTS knowledge_graph (
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_reinforced TIMESTAMP,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','stale','retracted')),
+    derived BOOLEAN NOT NULL DEFAULT 0,
     UNIQUE(subject_canonical, predicate, object_canonical)
 );
 CREATE INDEX IF NOT EXISTS idx_kg_subject ON knowledge_graph(subject_canonical);
@@ -207,6 +209,52 @@ END;
 CREATE TRIGGER IF NOT EXISTS episodes_fts_delete AFTER DELETE ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
 END;
+
+-- Procedural memory: step-by-step workflows extracted from conversations.
+CREATE TABLE IF NOT EXISTS procedures (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT,
+    steps TEXT NOT NULL DEFAULT '[]',
+    triggers TEXT NOT NULL DEFAULT '[]',
+    entities_involved TEXT NOT NULL DEFAULT '[]',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);
+CREATE INDEX IF NOT EXISTS idx_procedures_entities ON procedures(entities_involved);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS procedures_fts USING fts5(
+    name, description, steps,
+    content='procedures', content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS procedures_fts_insert AFTER INSERT ON procedures BEGIN
+    INSERT INTO procedures_fts(rowid, name, description, steps) VALUES (new.rowid, new.name, new.description, new.steps);
+END;
+CREATE TRIGGER IF NOT EXISTS procedures_fts_delete AFTER DELETE ON procedures BEGIN
+    INSERT INTO procedures_fts(procedures_fts, rowid, name, description, steps) VALUES ('delete', old.rowid, old.name, old.description, old.steps);
+END;
+CREATE TRIGGER IF NOT EXISTS procedures_fts_update AFTER UPDATE ON procedures BEGIN
+    INSERT INTO procedures_fts(procedures_fts, rowid, name, description, steps) VALUES ('delete', old.rowid, old.name, old.description, old.steps);
+    INSERT INTO procedures_fts(rowid, name, description, steps) VALUES (new.rowid, new.name, new.description, new.steps);
+END;
+
+-- Extraction feedback: stores wrongly-extracted triples so future extractions
+-- can learn from past mistakes.
+CREATE TABLE IF NOT EXISTS extraction_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+    chunk_text_snippet TEXT NOT NULL,
+    extracted_subject TEXT NOT NULL,
+    extracted_predicate TEXT NOT NULL,
+    extracted_object TEXT NOT NULL,
+    feedback_type TEXT NOT NULL DEFAULT 'retracted',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON extraction_feedback(created_at);
 
 -- Per-cycle dreaming run record. Populated by runner.run_dreaming for every
 -- invocation (success, lock-skip, or error) so operators can observe cadence

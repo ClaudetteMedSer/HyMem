@@ -11,6 +11,8 @@ from typing import Iterator
 
 log = logging.getLogger("hymem.core.db")
 
+EXPECTED_SCHEMA_VERSION = 5
+
 
 def _load_schema() -> str:
     return (files("hymem.core") / "schema.sql").read_text(encoding="utf-8")
@@ -41,6 +43,12 @@ def _load_vec_extension(conn: sqlite3.Connection) -> bool:
 def initialize(conn: sqlite3.Connection) -> None:
     conn.executescript(_load_schema())
     _load_vec_extension(conn)
+    cur = schema_version(conn)
+    if cur > EXPECTED_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema version {cur} is newer than code expects ({EXPECTED_SCHEMA_VERSION}). "
+            f"Downgrading is not supported. Use a newer version of HyMem."
+        )
     _run_migrations(conn)
 
 
@@ -48,6 +56,12 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     cur = schema_version(conn)
     if cur < 2:
         _migrate_v2(conn)
+    if cur < 3:
+        _migrate_v3(conn)
+    if cur < 4:
+        _migrate_v4(conn)
+    if cur < 5:
+        _migrate_v5(conn)
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
@@ -67,6 +81,52 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '2')"
     )
     log.info("migrated schema to v2 (numeric/temporal columns)")
+
+
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN summary TEXT")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3')"
+    )
+    log.info("migrated schema to v3 (session summary column)")
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ALTER TABLE knowledge_graph ADD COLUMN derived BOOLEAN NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4')"
+    )
+    log.info("migrated schema to v4 (derived knowledge graph edges)")
+
+
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS extraction_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+            chunk_text_snippet TEXT NOT NULL,
+            extracted_subject TEXT NOT NULL,
+            extracted_predicate TEXT NOT NULL,
+            extracted_object TEXT NOT NULL,
+            feedback_type TEXT NOT NULL DEFAULT 'retracted',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_feedback_created ON extraction_feedback(created_at)"
+        )
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '5')"
+    )
+    log.info("migrated schema to v5 (extraction feedback table)")
 
 
 def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:

@@ -162,4 +162,24 @@ class HyMem:
                 "WHERE id = ?",
                 (row["id"],),
             )
+            # Store feedback for future extraction improvement
+            evidence_rows = self.conn.execute(
+                """SELECT chunk_id FROM kg_evidence 
+                   WHERE edge_id = ? AND polarity = 1
+                   ORDER BY extracted_at DESC LIMIT 5""",
+                (row["id"],),
+            ).fetchall()
+            for er in evidence_rows:
+                chunk_row = self.conn.execute(
+                    "SELECT text FROM chunks WHERE id = ?", (er["chunk_id"],)
+                ).fetchone()
+                if chunk_row:
+                    snippet = chunk_row["text"][:600]
+                    self.conn.execute(
+                        """INSERT OR IGNORE INTO extraction_feedback
+                           (chunk_id, chunk_text_snippet, extracted_subject, 
+                            extracted_predicate, extracted_object, feedback_type)
+                           VALUES (?, ?, ?, ?, ?, 'retracted')""",
+                        (er["chunk_id"], snippet, subject, predicate, object),
+                    )
             return True

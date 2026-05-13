@@ -31,6 +31,7 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         SELECT id, subject_canonical, object_canonical
         FROM knowledge_graph
         WHERE status = 'active'
+          AND derived = 0
           AND (last_reinforced IS NULL OR last_reinforced < datetime('now', ?))
         """,
         (cutoff_arg,),
@@ -71,6 +72,7 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         UPDATE knowledge_graph
         SET status = 'retracted'
         WHERE status = 'active'
+          AND derived = 0
           AND (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) < ?
         """,
         (cfg.retract_threshold,),

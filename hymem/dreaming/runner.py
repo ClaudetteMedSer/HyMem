@@ -10,11 +10,14 @@ from dataclasses import dataclass
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
 from hymem.dreaming import phase1, phase2, phase3
+from hymem.dreaming.inference import infer_transitive_edges
 from hymem.dreaming.chunks import extract_high_salience_chunks, persist_chunks
 from hymem.dreaming.embeddings import embed_pending_chunks
 from hymem.dreaming.episodes import extract_episodes_for_session
+from hymem.dreaming.procedures import extract_procedures_for_session
 from hymem.dreaming.mentions import index_chunk_mentions
 from hymem.dreaming.retention import prune_chunks
+from hymem.dreaming.summary import summarize_session
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 
@@ -66,6 +69,20 @@ def run_dreaming(
             "dream.start run_id=%d sessions=%d", run_id, len(target_sessions)
         )
 
+        # Load recent extraction feedback for few-shot negative examples
+        feedback_rows = conn.execute(
+            """SELECT extracted_subject, extracted_predicate, extracted_object
+               FROM extraction_feedback
+               ORDER BY created_at DESC LIMIT 10"""
+        ).fetchall()
+        negative_examples = ""
+        if feedback_rows:
+            lines = [
+                f"- \"{r['extracted_subject']} {r['extracted_predicate']} {r['extracted_object']}\" was WRONG. Do not extract this relationship."
+                for r in feedback_rows
+            ]
+            negative_examples = "\n".join(lines)
+
         chunks_remaining = cfg.dream_budget
 
         for session_id in target_sessions:
@@ -89,7 +106,8 @@ def run_dreaming(
                 try:
                     with core_db.transaction(conn):
                         triples, markers = phase1.process_chunk(
-                            conn, chunk, llm, prompt_version=cfg.prompt_version
+                            conn, chunk, llm, prompt_version=cfg.prompt_version,
+                            negative_examples=negative_examples,
                         )
                         if triples or markers:
                             report.chunks_processed += 1
@@ -105,6 +123,22 @@ def run_dreaming(
                     log.debug("episodes session_id=%s count=%d", session_id, episodes)
             except Exception:
                 log.exception("episodes.extraction_failure session_id=%s", session_id)
+
+            try:
+                with core_db.transaction(conn):
+                    summary = summarize_session(conn, session_id, llm)
+                    if summary:
+                        log.debug("summary session_id=%s", session_id)
+            except Exception:
+                log.exception("summary.failure session_id=%s", session_id)
+
+            try:
+                with core_db.transaction(conn):
+                    procs = extract_procedures_for_session(conn, session_id, llm)
+                    if procs:
+                        log.debug("procedures session_id=%s count=%d", session_id, procs)
+            except Exception:
+                log.exception("procedures.extraction_failure session_id=%s", session_id)
 
             if chunks_remaining <= 0:
                 report.budget_exhausted = True
@@ -134,6 +168,9 @@ def run_dreaming(
         ).fetchone()["c"]
         with core_db.transaction(conn):
             phase3.decay(conn, cfg)
+            derived = infer_transitive_edges(conn, cfg)
+            if derived:
+                log.info("inference.derived count=%d", derived)
             prune_chunks(conn, cfg)
             phase2.consolidate_insights(conn, cfg)  # refresh after decay
         after_retracted = conn.execute(

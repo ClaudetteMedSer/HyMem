@@ -96,8 +96,9 @@ def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
                COUNT(*) AS cnt
         FROM knowledge_graph
         WHERE predicate = 'depends_on'
-          AND status = 'active'
-          AND (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) > 0.6
+           AND status = 'active'
+           AND derived = 0
+           AND (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) > 0.6
         GROUP BY object_canonical
         HAVING cnt >= 2
         ORDER BY cnt DESC, obj ASC
@@ -117,8 +118,9 @@ def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
                pos_evidence AS pos, neg_evidence AS neg, last_reinforced
         FROM knowledge_graph
         WHERE predicate IN ('prefers','rejects','avoids')
-          AND status = 'active'
-          AND (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) > 0.7
+           AND status = 'active'
+           AND derived = 0
+           AND (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) > 0.7
         ORDER BY pos_evidence DESC, last_reinforced DESC
         LIMIT ?
         """,
@@ -134,7 +136,7 @@ def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         SELECT subject_canonical AS s, predicate AS p, object_canonical AS o,
                pos_evidence AS pos, neg_evidence AS neg
         FROM knowledge_graph
-        WHERE pos_evidence >= 1 AND neg_evidence >= 1 AND status = 'active'
+        WHERE pos_evidence >= 1 AND neg_evidence >= 1 AND status = 'active' AND derived = 0
         ORDER BY (pos_evidence + neg_evidence) DESC
         LIMIT 5
         """

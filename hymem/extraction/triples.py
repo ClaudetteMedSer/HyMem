@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import (
     ALLOWED_PREDICATES,
-    TRIPLE_SYSTEM,
+    build_triple_system,
     TRIPLE_USER_TEMPLATE,
 )
 
@@ -23,7 +23,11 @@ class Triple:
     temporal_scope: str | None = None
 
 
-def extract_triples(client: LLMClient, text: str) -> tuple[list[Triple], dict[str, str]]:
+def extract_triples(
+    client: LLMClient, 
+    text: str, 
+    negative_examples: str = "",
+) -> tuple[list[Triple], dict[str, str]]:
     """Run the locked-vocabulary triple prompt and validate the output.
 
     Returns parsed triples and any entity type hints extracted from the same
@@ -32,8 +36,9 @@ def extract_triples(client: LLMClient, text: str) -> tuple[list[Triple], dict[st
     Anything malformed or off-vocabulary is silently dropped — the LLM is allowed
     to be wrong, but we never propagate garbage into the graph.
     """
+    system = build_triple_system(negative_examples)
     request = LLMRequest(
-        system=TRIPLE_SYSTEM,
+        system=system,
         user=TRIPLE_USER_TEMPLATE.format(text=text),
         response_format="json",
     )

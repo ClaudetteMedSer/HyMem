@@ -18,6 +18,7 @@ def process_chunk(
     llm: LLMClient,
     *,
     prompt_version: str,
+    negative_examples: str = "",
 ) -> tuple[list[Triple], list[Marker]]:
     """Phase 1 work for a single chunk. Idempotent under (chunk_id, prompt_version).
 
@@ -30,7 +31,7 @@ def process_chunk(
     if already:
         return [], []
 
-    triples, entity_type_hints = extract_triples(llm, chunk.text)
+    triples, entity_type_hints = extract_triples(llm, chunk.text, negative_examples)
     markers = extract_markers(llm, chunk.text)
 
     for entity_name, entity_type in entity_type_hints.items():
