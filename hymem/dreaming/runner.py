@@ -102,6 +102,15 @@ def run_dreaming(
             for chunk in chunks:
                 if chunks_remaining <= 0:
                     break
+                # Skip chunks already processed with the current prompt version
+                # without consuming the budget, so unprocessed chunks at the tail
+                # of the session list don't get starved.
+                already = conn.execute(
+                    "SELECT 1 FROM processed_chunks WHERE chunk_id = ? AND prompt_version = ?",
+                    (chunk.id, cfg.prompt_version),
+                ).fetchone()
+                if already:
+                    continue
                 chunks_remaining -= 1
                 try:
                     with core_db.transaction(conn):
