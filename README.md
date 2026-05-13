@@ -10,7 +10,7 @@
 
 **Two deployment modes:** an MCP tools server for direct agent integration, and a **Honcho v3-compatible HTTP server** so Hermes can use the standard `honcho-ai` SDK and treat HyMem as a drop-in replacement for Honcho's managed cloud service.
 
-**~3,200 lines of Python**, 71 tests (62 passing core + 9 Honcho with minor endpoint gaps), zero npm, zero Docker required.
+**~4,500 lines of Python**, 84 tests (100% passing), zero npm, zero Docker required.
 
 ---
 
@@ -21,7 +21,8 @@ HyMem solves a specific problem: **AI agents forget everything between sessions.
 - **What tools/libraries/services the user uses** (knowledge graph triples)
 - **What the user prefers, rejects, or avoids** (behavioral profile)
 - **What the project's architecture looks like** (dependency hubs, tool preferences)
-- **What was discussed in past conversations** (full-text searchable chunks)
+- **What was discussed in past conversations** (full-text searchable chunks, episodes, procedures)
+- **How tasks are performed** (step-by-step procedural memory)
 
 All of this is surfaced automatically to Hermes before each user message via the `augment()` call, so the agent can answer "We should use uv instead of Docker" without being reminded.
 
@@ -42,7 +43,7 @@ All of this is surfaced automatically to Hermes before each user message via the
            ▼                      ▼
     ┌──────────────┐    ┌────────────────────┐
     │  server.py   │    │  honcho_server.py  │
-    │  7 MCP tools │    │  15 HTTP endpoints │
+    │  7 MCP tools │    │  18 HTTP endpoints │
     └──────┬───────┘    └─────────┬──────────┘
            │                      │
            └──────────┬───────────┘
@@ -78,32 +79,38 @@ hymem/
 ├── session.py          Session lifecycle (open/close) and message logging
 ├── server.py           MCP server — 7 tools (capture, log, dream, augment,
 │                         profile, alias, retract)
-├── honcho_server.py    FastAPI HTTP server — Honcho v3 protocol, 15 endpoints
+├── honcho_server.py    FastAPI HTTP server — Honcho v3 protocol, 18 endpoints
 │
 ├── core/
 │   ├── db.py           SQLite connection management, schema init, migrations
-│   ├── schema.sql      15 tables + FTS5 virtual table + triggers
+│   ├── schema.sql      18 tables + FTS5 virtual tables + triggers
 │   └── markdown_io.py  Read/write HTML-comment-delimited sections in MD files
 │
 ├── dreaming/
-│   ├── runner.py       Orchestrates full 3-phase pipeline with advisory lock
+│   ├── runner.py       Orchestrates full pipeline with advisory lock
 │   ├── chunks.py       Regex-based high-salience chunk extraction
 │   ├── canonicalize.py Deterministic entity name normalization + aliases
 │   ├── mentions.py     Entity mention indexing for decay calculations
-│   ├── embeddings.py   Batch embedding of chunks (JSON vectors in SQLite)
+│   ├── embeddings.py   Batch embedding of chunks (JSON + sqlite-vec)
 │   ├── phase1.py       LLM extraction: triples + behavioral markers
 │   ├── phase2.py       Consolidation: markers→profile, graph→MEMORY.md
-│   └── phase3.py       Co-occurrence-aware decay + retraction
+│   ├── phase3.py       Co-occurrence-aware decay + retraction
+│   ├── inference.py    Transitive closure over depends_on edges
+│   ├── episodes.py     LLM-powered episodic memory extraction
+│   ├── procedures.py   LLM-powered procedural memory extraction
+│   ├── summary.py      LLM-powered session summarization
+│   └── retention.py    Chunk pruning with graph-aware eviction
 │
 ├── extraction/
 │   ├── llm.py          LLMClient Protocol + StubLLMClient (for tests)
 │   ├── embeddings.py   EmbeddingClient Protocol + StubEmbeddingClient
 │   ├── triples.py      LLM prompt → (subject, predicate, object, polarity)
 │   ├── markers.py      LLM prompt → behavioral markers
-│   └── prompts/        Locked-vocabulary system/user prompts for extraction
+│   └── prompts/        System/user prompts for extraction, episodes, procedures,
+│                         summaries, and reranking
 │
 ├── query/
-│   ├── augment.py      FTS5 + vector search + RRF merge + graph lookup
+│   ├── augment.py      FTS5 + vector + RRF merge + LLM rerank + graph lookup
 │   └── entities.py     Token-based entity matching against knowledge graph
 │
 └── contrib/
@@ -113,10 +120,10 @@ hymem/
 
 ---
 
-## 4. The Data Model (15 SQLite Tables)
+## 4. The Data Model (18 SQLite Tables)
 
 **Conversation storage:**
-- `sessions` — session ID + start/end timestamps
+- `sessions` — session ID + start/end timestamps + LLM-generated summary
 - `messages` — raw turns (user, assistant, system, tool)
 
 **Extraction artifacts:**
@@ -125,15 +132,25 @@ hymem/
 - `chunk_embeddings` — JSON-encoded embedding vectors
 - `processed_chunks` — idempotency tracking per (chunk_id, prompt_version)
 - `entity_mentions` — inverted index: chunk → canonical entity
+- `entity_types` — canonical entity → type classification (language, framework, database, etc.)
 
 **Knowledge graph:**
-- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted)
-- `kg_evidence` — per-source provenance linking edges to chunks
+- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges
+- `kg_evidence` — per-source provenance linking edges to chunks, with value/text/temporal metadata
 - `entity_aliases` — surface form → canonical entity mapping
 
 **Behavioral profiling:**
 - `behavioral_markers` — raw extracted signals (correction, preference, rejection, style)
 - `profile_entries` — structured profile with evidence tracking
+
+**Episodic & procedural memory:**
+- `episodes` — named, summarized conversation segments with outcomes and entities
+- `episodes_fts` — FTS5 search over episode titles and summaries
+- `procedures` — step-by-step workflows with triggers and involved entities
+- `procedures_fts` — FTS5 search over procedure names, descriptions, and steps
+
+**Self-improvement:**
+- `extraction_feedback` — wrongly-extracted triples stored as negative examples for future extraction
 
 **Operational:**
 - `peers` — Honcho peer registry (peer_id → role mapping)
@@ -151,11 +168,21 @@ Dreaming is the offline process that converts raw chat logs into structured know
 1. **Chunking**: Regex-based salience detection extracts high-signal conversation segments (min 30 chars). Chunks are persisted with a `salience_reason` field.
 2. **Entity mention indexing**: Each chunk's text is scanned for known entity surface forms, populating the `entity_mentions` inverted index.
 3. **LLM extraction**: Each unprocessed chunk is sent to the LLM with a locked-vocabulary prompt:
-   - **Triples**: `{subject, predicate, object, polarity}` where predicate must be one of 10: `uses`, `depends_on`, `prefers`, `rejects`, `avoids`, `replaces`, `conflicts_with`, `deploys_to`, `part_of`, `equivalent_to`. Polarity is +1 (assertion) or -1 (negation/retraction).
+   - **Triples**: `{subject, predicate, object, polarity}` where predicate must be one of 18: `uses`, `depends_on`, `prefers`, `rejects`, `avoids`, `replaces`, `conflicts_with`, `deploys_to`, `part_of`, `equivalent_to`, `implements`, `contains`, `configured_with`, `requires_version`, `runs_on`, `connects_to`, `generates`, `tested_by`. Polarity is +1 (assertion) or -1 (negation/retraction). Optional fields: `value_text`, `value_numeric`, `value_unit`, `temporal_scope`.
    - **Markers**: `{kind, statement}` where kind is one of: `correction`, `preference`, `rejection`, `style`. Only explicit behavioral signals — no mood/emotion inference.
-4. **Entity canonicalization**: Surface forms (e.g., "Postgres", "PostgreSQL", "postgresql") are normalized via Unicode folding, CamelCase splitting, article/parenthetical stripping, and an alias table.
-5. **Knowledge graph upsert**: New triples insert edges, repeated triples reinforce evidence counters. Negations add negative evidence.
-6. **Idempotency**: Each chunk is processed at most once per `prompt_version`. Bump the version string in config and all chunks reprocess with new prompts.
+   - **Entity types**: LLM also infers entity type labels (language, framework, database, service, tool, etc.) for query expansion.
+4. **Feedback-driven extraction**: Before processing, the runner loads up to 10 recently retracted triples from `extraction_feedback` and injects them into the prompt as negative examples: "DO NOT extract these relationships." This self-corrects past hallucination patterns.
+5. **Entity canonicalization**: Surface forms (e.g., "Postgres", "PostgreSQL", "postgresql") are normalized via Unicode folding, CamelCase splitting, article/parenthetical stripping, and an alias table.
+6. **Knowledge graph upsert**: New triples insert edges, repeated triples reinforce evidence counters. Negations add negative evidence.
+7. **Idempotency**: Each chunk is processed at most once per `prompt_version`. Bump the version string in config and all chunks reprocess with new prompts.
+
+### Inter-Phase Steps (`dreaming/runner.py`)
+
+After chunk extraction per session, three additional LLM-powered steps run before Phase 2:
+
+- **Episode extraction** (`episodes.py`): Groups adjacent chunks from the same session, asks the LLM to identify distinct episodes with titles, summaries, outcomes, and key entities. Stored in `episodes` (FTS5-searchable).
+- **Session summarization** (`summary.py`): Generates a one-sentence summary of what was accomplished in the session. Stored in `sessions.summary` and surfaced via Honcho's context endpoint.
+- **Procedure extraction** (`procedures.py`): Detects step-by-step workflows described in the conversation (e.g., "Deploy to staging"), extracts ordered steps with tools and triggers, and stores them in `procedures` (FTS5-searchable).
 
 ### Phase 2 — Consolidation (`dreaming/phase2.py`)
 
@@ -164,23 +191,25 @@ Dreaming is the offline process that converts raw chat logs into structured know
 **Profile consolidation**: Unconsolidated behavioral markers are promoted into `profile_entries`. Repeats reinforce (+1 to `pos_evidence`), contradictions create separate entries rather than silently overwriting. Entries are capped at `profile_max_entries` (default: 16), dropping the weakest. The `USER.md` auto-section is rewritten via `markdown_io.write_section()`.
 
 **Insight generation**: The knowledge graph is queried for:
-- **Dependency hubs** — objects depended on by 2+ subjects with confidence > 0.6 (e.g., "`uv` is a shared dependency of: local_dev, ci_pipeline")
+- **Dependency hubs** — objects depended on by 2+ subjects with confidence > 0.6 (e.g., "`uv` is a shared dependency of: local_dev, ci_pipeline"). Only non-derived (direct) edges are considered.
 - **Strong preferences/rejections** — edges with confidence > 0.7
 - **Contradictions** — edges with both positive and negative evidence
 
 Results are written to `MEMORY.md`'s auto-section, capped at `insights_max_entries` (default: 12).
 
-### Phase 3 — Decay (`dreaming/phase3.py`)
+### Phase 3 — Decay + Inference (`dreaming/phase3.py`, `inference.py`)
 
-**Co-occurrence-aware decay.** The key insight: an edge should only lose confidence if the topic was re-discussed and the relationship wasn't restated. Dormant topics are left alone.
+**Co-occurrence-aware decay.** The key insight: an edge should only lose confidence if the topic was re-discussed and the relationship wasn't restated. Dormant topics are left alone. Only non-derived edges decay — derived edges are recomputed from scratch.
 
-1. For each active edge whose `last_reinforced` is older than the decay window (default: 30 days):
+1. For each active, non-derived edge whose `last_reinforced` is older than the decay window (default: 30 days):
    - Check if any chunk in the decay window mentions the edge's subject or object **without** providing evidence for the edge
    - If yes → add 1 to `neg_evidence` (soft contradiction)
    - If no → leave alone (topic hasn't resurfaced)
 2. Any edge whose Laplace-smoothed confidence `(pos+1)/(pos+neg+2)` drops below the retract threshold (default: 0.15) gets `status = 'retracted'` — kept for audit but excluded from query results.
 
-After decay, Phase 2 insights are refreshed to reflect the new graph state.
+**Transitive inference** (`inference.py`): After decay, computes transitive closure over `depends_on` edges via BFS. For each entity, discovers 2+-hop dependency paths and inserts derived edges with `derived=1`. Confidence is the product of edge confidences along the path. Edges below the retract threshold are filtered out.
+
+After inference, Phase 2 insights are refreshed to reflect the new graph state, and old unreferenced chunks are pruned via `retention.py`.
 
 ---
 
@@ -190,22 +219,28 @@ When Hermes receives a user message, it calls `hy.augment(user_message)` which r
 
 ```
 AugmentedContext(
-    user_md: str,           # USER.md content
-    memory_md: str,         # MEMORY.md content
-    fts_hits: list[FtsHit], # Ranked relevant chunks
-    graph_facts: list[GraphFact],  # Matching knowledge graph edges
-    matched_entities: list[str],   # Entities found in user message
+    user_md: str,              # USER.md content
+    memory_md: str,            # MEMORY.md content
+    fts_hits: list[FtsHit],    # Ranked relevant chunks
+    graph_facts: list[GraphFact],     # Matching knowledge graph edges
+    episodes: list[EpisodeHit],       # Matching episodes
+    procedures: list[ProcedureHit],   # Matching procedures
+    matched_entities: list[str],      # Entities found in user message
 )
 ```
 
 **How it works:**
 
 1. **Load profile + insights** from `USER.md` and `MEMORY.md` (file read, instant)
-2. **Keyword search** (`_fts_search`): Sanitize the query, tokenize it, build an OR query across tokens, run against SQLite FTS5 with BM25 scoring. Returns top-k chunks (default: 5).
-3. **Vector search** (`_vector_search`, optional): If an embedding client is available, embed the user message, compute cosine similarity against all stored chunk embeddings (O(n) in Python, capped at `embedding_max_scan` default 5000), return top-k.
+2. **Keyword search** (`_fts_search`): Sanitize the query, tokenize it, wrap each token in FTS5-safe quotes, build an OR query, run against SQLite FTS5 with BM25 scoring. Returns top-k chunks (default: 5).
+3. **Vector search** (`_vector_search`, optional): If an embedding client is available, uses sqlite-vec ANN if available or falls back to Python cosine similarity (capped at `embedding_max_scan` default 5000). Returns top-k.
 4. **Reciprocal rank fusion** (`_rrf_merge`): Merge FTS and vector results via RRF: `score = sum(1/(60 + rank))` across each list. This hybrid approach captures both keyword relevance and semantic similarity.
-5. **Entity matching** (`match_known_entities`): Tokenize the user message, lookup each word against `entity_aliases`, return canonical IDs.
-6. **Graph lookup** (`_graph_lookup`): For each matched entity, query `knowledge_graph` for active edges where the entity appears as subject or object. Up to `graph_top_k_per_entity` (default: 3) facts per entity, ranked by confidence and recency.
+5. **LLM reranking** (`_rerank`, optional): When FTS and vector disagree on the #1 result enough to trigger ambiguity (configurable threshold), the LLM scores each candidate's relevance to the query on a 1-5 scale. RRF and LLM scores are combined for final ranking.
+6. **Episode search** (`_episode_search`): FTS5 search over episode titles and summaries for the query.
+7. **Procedure search** (`_procedure_search`): FTS5 search over procedure names, descriptions, and steps.
+8. **Entity matching** (`match_known_entities`): Tokenize the user message (including 2-3 word n-grams), lookup each token against `entity_aliases`, return canonical IDs.
+9. **Entity type expansion** (`_expand_entities_by_type`): For matched entities, find other entities of the same type (e.g., if user mentions `uv`, also surface `pip` and `poetry` since they're all `package_manager` type).
+10. **Graph lookup** (`_graph_lookup`): For each matched/expanded entity, query `knowledge_graph` for active edges (including derived transitive edges) where the entity appears as subject or object. Up to `graph_top_k_per_entity` (default: 3) facts per entity, ranked by confidence and recency.
 
 Hermes then assembles the prompt with this context — HyMem never dictates prompt structure.
 
@@ -229,18 +264,21 @@ Exposes 7 tools via the Model Context Protocol:
 
 ### Honcho HTTP Server (`hymem-honcho` → `honcho_server.py`)
 
-A FastAPI server implementing the **Honcho v3 REST protocol** — 629 lines, 15 endpoints. Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
+A FastAPI server implementing the **full Honcho v3 REST protocol** — 721 lines, 18 endpoints. Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
 
 | Endpoint | Maps to | Notes |
 |---|---|---|
 | `POST /v3/workspaces` | Get-or-create workspace | SDK auto-calls via `_ensure_workspace()` |
 | `GET /v3/workspaces/{wid}` | Get workspace | |
 | `POST /v3/workspaces/{wid}/peers` | Get-or-create peer | Role auto-inferred from peer_id pattern |
-| `POST /v3/workspaces/{wid}/sessions` | Get-or-create session | |
+| `GET /v3/workspaces/{wid}/peers/{pid}` | Get peer by ID | Returns role + metadata |
+| `POST /v3/workspaces/{wid}/sessions` | Get-or-create session | Registers peers from `peer_names` |
+| `GET /v3/workspaces/{wid}/sessions/{sid}` | Get session by ID | Returns is_active, metadata |
 | `POST .../sessions/{sid}/messages` | Log turns + bg dream | Dream cooldown: 60s default |
 | `POST .../sessions/{sid}/messages/upload` | File upload as message | For migrating MEMORY.md/USER.md |
+| `POST .../sessions/{sid}/messages/list` | Paginated message listing | page + size, returns total/pages |
 | `POST .../sessions/{sid}/search` | `hy.augment()` as Message objects | Graph facts + FTS hits |
-| `GET .../sessions/{sid}/context` | MEMORY.md + USER.md + recent turns | |
+| `GET .../sessions/{sid}/context` | MEMORY.md + USER.md + recent turns + summary | Session summary from dreaming |
 | `POST .../sessions/{sid}/peers` | Register peers + role mappings | |
 | `GET .../sessions/{sid}/peers/{pid}/config` | Per-session peer config | |
 | `GET .../peers/{pid}/card` | USER.md behavioral profile | |
@@ -258,7 +296,7 @@ A FastAPI server implementing the **Honcho v3 REST protocol** — 629 lines, 15 
 
 ## 8. Key Design Decisions
 
-**Locked vocabulary (10 predicates).** No open-ended relation extraction. This means the knowledge graph is clean, queryable, and predictable — no hallucinated "loves" or "feels" edges. The tradeoff: some relationships won't fit the schema, but the system errs on the side of silence rather than noise.
+**Locked vocabulary (18 predicates).** No open-ended relation extraction. This means the knowledge graph is clean, queryable, and predictable — no hallucinated "loves" or "feels" edges. The predicate set covers technical relationships comprehensively: usage, dependency, preference, rejection, replacement, deployment, composition, configuration, versioning, runtime, connectivity, generation, testing, and interface conformance. The tradeoff: some relationships won't fit the schema, but the system errs on the side of silence rather than noise.
 
 **Host-agent responsibility split.** Hermes owns *when* to call HyMem; HyMem owns *how* memory works. HyMem never assembles prompts, never decides token budgets, never injects itself into the agent's reasoning loop. It just returns structured pieces.
 
@@ -266,9 +304,15 @@ A FastAPI server implementing the **Honcho v3 REST protocol** — 629 lines, 15 
 
 **Co-occurrence-aware decay.** Unlike simple TTL-based decay (which would kill all old facts regardless of relevance), HyMem only decays edges whose entities have been re-discussed without reinforcement. This keeps the graph accurate without requiring constant LLM re-extraction.
 
+**Transitive inference.** `depends_on` edges are transitively closed via BFS after each dreaming cycle. If `api depends_on postgres` and `postgres depends_on docker`, a derived edge `api depends_on docker` is added (marked `derived=1`, confidence = product of edge confidences). Derived edges are recomputed from scratch each cycle and excluded from decay.
+
+**Feedback-driven extraction.** When an edge is retracted, its chunk text and the extracted triple are stored in `extraction_feedback`. Before the next dreaming cycle, up to 10 recent retractions are injected as negative examples into the extraction prompt, teaching the LLM to avoid repeating past mistakes.
+
 **Prompt-versioned idempotency.** Changing `prompt_version` in config causes automatic reprocessing of all chunks with the new prompts. Backward-incompatible prompt changes are trivial.
 
-**No external dependencies at core.** The `hymem` package itself has zero dependencies beyond Python stdlib + SQLite. LLM clients and FastAPI are optional extras (`hymem[server]`). The `contrib/` layer provides OpenAI-compatible clients but can be swapped via the `LLMClient` and `EmbeddingClient` Protocols.
+**Schema version guard.** The database schema version is checked against an expected constant. If a newer-schema DB is opened with older code, initialization raises a clear error rather than silently corrupting data.
+
+**No external dependencies at core.** The `hymem` package itself has zero dependencies beyond Python stdlib + SQLite. LLM clients, FastAPI, and sqlite-vec are optional extras (`hymem[server]`). The `contrib/` layer provides OpenAI-compatible clients but can be swapped via the `LLMClient` and `EmbeddingClient` Protocols.
 
 **Managed Markdown sections.** `USER.md` and `MEMORY.md` use HTML comment delimiters (`<!-- HyMem:auto:section:start -->` / `<!-- HyMem:auto:section:end -->`). Humans can edit everything outside these sections; HyMem only touches its auto-sections. Atomic writes via tempfile + `os.replace()` prevent corruption.
 
@@ -300,41 +344,37 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `salience_min_chars` | 30 | Min chunk size before extraction |
 | `fts_top_k` | 5 | FTS results to return |
 | `graph_top_k_per_entity` | 3 | Graph facts per matched entity |
-| `embedding_max_scan` | 5000 | Max embeddings to scan (O(n)) |
+| `embedding_max_scan` | 5000 | Max embeddings to scan in Python fallback |
 | `decay_window_days` | 30 | Decay look-back window |
 | `decay_factor` | 0.9 | (reserved, not yet used) |
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
 | `profile_max_entries` | 16 | Max profile entries in USER.md |
 | `insights_max_entries` | 12 | Max insights in MEMORY.md |
-| `prompt_version` | `"v1"` | Bump to force full reprocessing |
+| `prompt_version` | `"v3"` | Bump to force full reprocessing |
+| `dream_budget` | 50 | Max chunks to process per dreaming cycle |
+| `max_chunks` | 50000 | Soft cap on total stored chunks |
+| `retention_days` | 90 | Chunks newer than this always kept |
+| `rerank_ambiguity_threshold` | 0.6 | Min RRF score drop to skip LLM reranking |
 
 ---
 
 ## 10. Test Coverage
 
-**71 tests total, 62 passing fully, 9 with minor Honcho server gaps.**
+**84 tests total, 100% passing** across 14 test files:
 
-The core test suite (62 tests) passes completely across 14 test files:
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling
 - `test_canonicalize.py` — Entity normalization, alias resolution, merging
 - `test_chunks.py` — Salience detection, chunk persistence
-- `test_embeddings.py` — Embedding creation and query
+- `test_embeddings.py` — Embedding creation and query, stub determinism
 - `test_augment.py` — FTS search, vector search, RRF merge, graph lookup
 - `test_markdown_io.py` — Section read/write atomicity
-- `test_integration.py` — End-to-end capture→dream→augment flow
-- `test_phase3_perf.py` — Decay performance benchmarks
-- `test_mcp_server.py` — MCP tool correctness
-- `test_retract.py` — Edge retraction and idempotency
-- `test_dream_runs.py` — Audit log correctness
-- `test_honcho_server.py` — Honcho v3 protocol (18 tests, 9 passing)
-
-The 9 failing Honcho tests are:
-- 3 missing GET endpoints (`GET /peers/{pid}`, `GET /sessions/{sid}`)
-- 1 missing POST endpoint (`POST /sessions/{sid}/messages/list` pagination)
-- 5 status code mismatches (server returns 200 where tests expect 201 on create endpoints)
-
-Core functionality — add_messages, search, context, chat, peer card, dream cooldown — all tested and passing.
+- `test_integration.py` — End-to-end capture→dream→augment, retract workflow
+- `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
+- `test_mcp_server.py` — MCP tool correctness (all 7 tools)
+- `test_retract.py` — Edge retraction, alias resolution, idempotency
+- `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording
+- `test_honcho_server.py` — Full Honcho v3 protocol (18 endpoints, all passing)
 
 ---
 
@@ -346,28 +386,28 @@ Core functionality — add_messages, search, context, chat, peer card, dream coo
 | **Architecture** | Embedded library (SQLite + 2 servers) | Client-server (FastAPI + Postgres + Redis + workers) |
 | **Storage** | 1 SQLite file + 2 Markdown files | Postgres + pgvector + Redis cache |
 | **Entity model** | Simple: user + assistant roles | Peer paradigm: all participants are "peers" |
-| **Memory extraction** | "Dreaming" — 3-phase LLM pipeline with locked vocabulary | "Deriver" — background workers doing representation, summarization, peer cards |
-| **Ontology** | Locked 10-predicate vocabulary | Open-ended reasoning, no fixed ontology |
-| **Query interface** | FTS5 + vector + graph → structured context | Chat API (natural language), context (token-budgeted), hybrid search |
+| **Memory extraction** | "Dreaming" — multi-phase LLM pipeline with locked vocabulary, transitive inference, episode/procedure extraction, feedback learning | "Deriver" — background workers doing representation, summarization, peer cards |
+| **Ontology** | Locked 18-predicate vocabulary + entity types | Open-ended reasoning, no fixed ontology |
+| **Query interface** | FTS5 + vector + RRF + LLM rerank + graph lookup + episode/procedure search | Chat API (natural language), context (token-budgeted), hybrid search |
 | **Decay** | Co-occurrence-aware with confidence thresholds | Continual representation updates (implicit) |
-| **Honcho SDK compat** | Full v3 protocol via honcho_server.py | Native |
+| **Self-improvement** | Feedback-driven extraction (negative examples from retractions) | Not available |
+| **Honcho SDK compat** | Full v3 protocol via honcho_server.py (18/18 endpoints) | Native |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
 | **SDKs** | Python + MCP + Honcho SDK | Python + TypeScript |
-| **Maturity** | v0.1.0, ~3,200 lines, 8 commits | v3.0.6, 514 commits, 3.4k stars |
+| **Maturity** | v0.1.0, ~4,500 lines | v3.0.6, 514 commits, 3.4k stars |
 | **License** | Not specified | AGPL-3.0 |
 
-**The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary and co-occurrence-aware decay are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
+**The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
 
-**HyMem can self-host the Honcho experience.** With the Honcho server functional, Hermes can use the standard `honcho-ai` SDK and get the same API surface as Honcho's cloud — search, context, chat, peer management, sessions — without leaving the machine. This is HyMem's headline feature: **Honcho compatibility without any infrastructure.**
+**HyMem can self-host the Honcho experience.** With the Honcho server fully functional (18/18 endpoints), Hermes can use the standard `honcho-ai` SDK and get the same API surface as Honcho's cloud — search, context, chat, peer management, sessions, pagination — without leaving the machine. This is HyMem's headline feature: **Honcho compatibility without any infrastructure.**
 
 ---
 
 ## 12. Limitations & Known Gaps
 
-- **O(n) vector search**: Cosine similarity is computed in pure Python over all stored embeddings (capped at 5,000). Not viable beyond ~10K chunks. Future options: sqlite-vec extension, numpy batching, periodic pruning.
+- **O(n) vector search fallback**: Cosine similarity in pure Python is slow beyond ~5K chunks (capped at `embedding_max_scan`). sqlite-vec is integrated for ANN but not available on all platforms.
 - **No streaming**: The Honcho server doesn't implement SSE streaming for chat responses.
 - **Single database lock**: SQLite's single-writer model means concurrent dreaming + heavy querying will contend. Fine for a single-agent setup, not for multi-tenant.
-- **3 missing Honcho endpoints**: GET peer by ID, GET session by ID, POST messages/list pagination. The SDK's `_ensure_peer()`, `_ensure_session()`, and paginated message listing paths will 404.
 - **No authentication**: Both MCP and Honcho servers are unauthenticated — they assume localhost-only access.
-- **No migration framework**: Schema evolution is manual. The `schema_version` key in `schema_meta` exists but isn't checked programmatically.
 - **English-only**: Chunking, canonicalization, and the LLM prompts assume English text.
+- **LLM-dependent extraction quality**: While feedback learning helps, extraction quality ultimately depends on the LLM's capabilities. A weak LLM will produce noisy graphs.
