@@ -184,8 +184,16 @@ def _msg(
 
 
 def _background_dream() -> None:
+    """Run a dream cycle on its own HyMem instance to avoid SQLite
+    transaction collisions with concurrent add_messages calls."""
     try:
-        _get_hy().dream()
+        import time as _time
+        start = _time.monotonic()
+        dream_hy = _build()
+        dream_hy.dream()
+        dream_hy.close()
+        elapsed = _time.monotonic() - start
+        log.info("background_dream completed in %.1fs", elapsed)
     except Exception:
         log.exception("background dreaming failed")
 
