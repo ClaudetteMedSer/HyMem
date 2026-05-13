@@ -87,6 +87,17 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
 );
 CREATE INDEX IF NOT EXISTS idx_aliases_canonical ON entity_aliases(canonical);
 
+-- Entity types: maps canonical entities to type labels.
+CREATE TABLE IF NOT EXISTS entity_types (
+    entity_canonical TEXT NOT NULL,
+    type TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    source_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+    PRIMARY KEY (entity_canonical, type)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_types_type ON entity_types(type);
+CREATE INDEX IF NOT EXISTS idx_entity_types_entity ON entity_types(entity_canonical);
+
 -- Knowledge graph. Confidence is derived: (pos+1)/(pos+neg+2). Predicates locked.
 CREATE TABLE IF NOT EXISTS knowledge_graph (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +179,34 @@ CREATE TABLE IF NOT EXISTS run_lock (
     acquired_at TIMESTAMP NOT NULL,
     holder TEXT NOT NULL
 );
+
+-- Episodic memory: session summaries broken into named episodes.
+CREATE TABLE IF NOT EXISTS episodes (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    participants TEXT NOT NULL DEFAULT '[]',
+    start_message_id INTEGER,
+    end_message_id INTEGER,
+    outcome TEXT,
+    key_entities TEXT NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
+    title, summary,
+    content='episodes', content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS episodes_fts_insert AFTER INSERT ON episodes BEGIN
+    INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS episodes_fts_delete AFTER DELETE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+END;
 
 -- Per-cycle dreaming run record. Populated by runner.run_dreaming for every
 -- invocation (success, lock-skip, or error) so operators can observe cadence

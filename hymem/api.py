@@ -38,6 +38,7 @@ class HyMem:
         self._llm = llm
         self._embed = embedding_client
         self._conn: sqlite3.Connection | None = None
+        self._read_conn: sqlite3.Connection | None = None
         self._initialized = False
 
     # ---- lifecycle ---------------------------------------------------
@@ -52,7 +53,18 @@ class HyMem:
             self._initialized = True
         return self._conn
 
+    @property
+    def read_conn(self) -> sqlite3.Connection:
+        if self._read_conn is None:
+            self.conn  # ensure the write connection is initialized first
+            self._read_conn = core_db.connect(self.config.db_path)
+            self._read_conn.execute("PRAGMA query_only = ON")
+        return self._read_conn
+
     def close(self) -> None:
+        if self._read_conn is not None:
+            self._read_conn.close()
+            self._read_conn = None
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -83,7 +95,9 @@ class HyMem:
 
     def augment(self, user_message: str) -> AugmentedContext:
         return augment(
-            self.conn, self.config, user_message, embedding_client=self._embed
+            self.read_conn, self.config, user_message,
+            embedding_client=self._embed,
+            llm=self._llm,
         )
 
     # ---- dreaming ----------------------------------------------------

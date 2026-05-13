@@ -23,7 +23,20 @@ class HyMemConfig:
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    prompt_version: str = "v2"
+    prompt_version: str = "v3"
+
+    dream_budget: int = 50
+    """Maximum number of chunks to process per dreaming cycle."""
+
+    max_chunks: int = 50000
+    """Soft cap on total stored chunks. Excess unreferenced chunks are pruned."""
+
+    retention_days: int = 90
+    """Chunks newer than this are always kept regardless of graph references."""
+
+    rerank_ambiguity_threshold: float = 0.6
+    """Minimum RRF score drop between #1/#2 results to consider them clear
+    (skip reranking). Higher = more reranking."""
 
     @property
     def db_path(self) -> Path:

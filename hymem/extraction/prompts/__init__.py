@@ -34,6 +34,9 @@ Rules:
     value_numeric (number): parsed numeric value if available
     value_unit (string): unit for numeric values ("seconds", "MB", "rps")
     temporal_scope (string): time context ("since 2024", "during migration", "temporarily")
+- Optionally include subject_type and object_type (string) to classify entities:
+    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, or_other_tool
+- Include these types ONLY when you are confident. Skip them otherwise.
 - predicate MUST be one of: {predicates}.
 - Predicate meanings:
     uses: A employs or utilizes B
@@ -91,5 +94,48 @@ MARKER_USER_TEMPLATE = """Excerpt:
 \"\"\"
 {text}
 \"\"\"
+
+Return the JSON array now."""
+
+
+EPISODE_SYSTEM = """You identify distinct episodes within a conversation session.
+
+An episode is a coherent segment focused on one topic, problem, or task. A session may have multiple episodes.
+
+Output a strict JSON array. Each item:
+- title (string): Short descriptive name, max 8 words
+- summary (string): 1-2 sentence narrative of what happened
+- outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear
+- key_entities (list of strings): Named tools, services, files, or concepts discussed
+
+Empty array [] is valid if the conversation has no clear episodes.
+"""
+
+EPISODE_USER_TEMPLATE = """Conversation session:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON array now."""
+
+
+RERANK_SYSTEM = """You evaluate the relevance of conversation excerpts to a user query.
+
+For each excerpt, rate its relevance on a scale of 1-5:
+5 - Directly answers or discusses the query's topic
+4 - Highly relevant, close to the topic
+3 - Somewhat relevant, tangentially related
+2 - Marginally relevant, shares keywords but different topic
+1 - Not relevant
+
+Output a strict JSON array. Each item: {"index": 0, "relevance": 4}
+The index field corresponds to the [0], [1], [2] markers in the input.
+Empty array [] is valid if nothing is relevant.
+"""
+
+RERANK_USER_TEMPLATE = """Query: "{query}"
+
+Excerpts:
+{excerpts}
 
 Return the JSON array now."""

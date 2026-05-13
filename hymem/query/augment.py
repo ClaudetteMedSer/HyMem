@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -8,7 +9,11 @@ from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
 from hymem.extraction.embeddings import EmbeddingClient
+from hymem.extraction.llm import LLMClient, LLMRequest
+from hymem.extraction.prompts import RERANK_SYSTEM, RERANK_USER_TEMPLATE
 from hymem.query.entities import match_known_entities
+
+log = logging.getLogger("hymem.query.augment")
 
 
 @dataclass
@@ -19,6 +24,15 @@ class GraphFact:
     confidence: float
     pos_evidence: int
     neg_evidence: int
+
+
+@dataclass
+class EpisodeHit:
+    episode_id: str
+    session_id: str
+    title: str
+    summary: str
+    score: float
 
 
 @dataclass
@@ -46,6 +60,7 @@ class AugmentedContext:
     memory_md: str = ""
     fts_hits: list[FtsHit] = field(default_factory=list)
     graph_facts: list[GraphFact] = field(default_factory=list)
+    episodes: list[EpisodeHit] = field(default_factory=list)
     matched_entities: list[str] = field(default_factory=list)
 
 
@@ -55,6 +70,7 @@ def augment(
     user_message: str,
     *,
     embedding_client: EmbeddingClient | None = None,
+    llm: LLMClient | None = None,
 ) -> AugmentedContext:
     ctx = AugmentedContext()
     if cfg.user_md_path.exists():
@@ -63,6 +79,7 @@ def augment(
         ctx.memory_md = cfg.memory_md_path.read_text(encoding="utf-8")
 
     fts = _fts_search(conn, user_message, top_k=cfg.fts_top_k)
+    vec: list[FtsHit] = []
     if embedding_client is not None:
         vec = _vector_search(
             conn,
@@ -75,12 +92,48 @@ def augment(
     else:
         ctx.fts_hits = fts
 
+    if llm is not None and should_rerank(fts, vec, ctx.fts_hits, cfg.rerank_ambiguity_threshold):
+        log.debug("rerank.triggered")
+        ctx.fts_hits = _rerank(user_message, list(ctx.fts_hits), llm, top_k=cfg.fts_top_k)
+    else:
+        log.debug("rerank.skipped")
+
+    ctx.episodes = _episode_search(conn, user_message, top_k=cfg.fts_top_k)
+
     ctx.matched_entities = match_known_entities(conn, user_message)
+    ctx.matched_entities = _expand_entities_by_type(conn, ctx.matched_entities)
     if ctx.matched_entities:
         ctx.graph_facts = _graph_lookup(
             conn, ctx.matched_entities, top_k_per_entity=cfg.graph_top_k_per_entity
         )
     return ctx
+
+
+def should_rerank(
+    fts_hits: list[FtsHit],
+    vec_hits: list[FtsHit],
+    fused: list[FtsHit],
+    threshold: float,
+) -> bool:
+    if not fts_hits or not vec_hits:
+        return False
+
+    if fts_hits and vec_hits:
+        if fts_hits[0].chunk_id == vec_hits[0].chunk_id:
+            return False
+
+    if len(fused) < 2:
+        return False
+
+    score_1 = fused[0].score
+    score_2 = fused[1].score
+    if score_1 <= 0:
+        return False
+    drop = 1.0 - (score_2 / score_1)
+    if drop > threshold:
+        return False
+
+    return True
 
 
 _FTS_SAFE = re.compile(r"[^A-Za-z0-9_\- ]+")
@@ -267,3 +320,118 @@ def _graph_lookup(
                 neg_evidence=int(r["neg"]),
             )
     return list(facts.values())
+
+
+def _episode_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[EpisodeHit]:
+    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    if not cleaned:
+        return []
+    tokens = [t for t in cleaned.split() if len(t) >= 2]
+    if not tokens:
+        return []
+    fts_query = " OR ".join(tokens)
+
+    try:
+        rows = conn.execute(
+            """SELECT e.id, e.session_id, e.title, e.summary, bm25(episodes_fts) AS score
+               FROM episodes_fts
+               JOIN episodes e ON e.rowid = episodes_fts.rowid
+               WHERE episodes_fts MATCH ?
+               ORDER BY score
+               LIMIT ?""",
+            (fts_query, top_k),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    return [
+        EpisodeHit(
+            episode_id=r["id"],
+            session_id=r["session_id"],
+            title=r["title"],
+            summary=r["summary"][:300],
+            score=float(r["score"]),
+        )
+        for r in rows
+    ]
+
+
+def _expand_entities_by_type(
+    conn: sqlite3.Connection,
+    entities: list[str],
+    max_expanded: int = 10,
+) -> list[str]:
+    """For matched entities, find other entities of the same type."""
+    if not entities:
+        return entities
+
+    placeholders = ",".join("?" * len(entities))
+    type_rows = conn.execute(
+        f"SELECT DISTINCT type FROM entity_types WHERE entity_canonical IN ({placeholders})",
+        entities,
+    ).fetchall()
+    if not type_rows:
+        return entities
+
+    types = [r[0] for r in type_rows]
+    type_placeholders = ",".join("?" * len(types))
+
+    expanded_rows = conn.execute(
+        f"""SELECT DISTINCT entity_canonical FROM entity_types
+            WHERE type IN ({type_placeholders})
+            AND entity_canonical NOT IN ({placeholders})
+            LIMIT ?""",
+        types + entities + [max_expanded],
+    ).fetchall()
+
+    return entities + [r[0] for r in expanded_rows]
+
+
+def _rerank(
+    query: str,
+    candidates: list[FtsHit],
+    llm: LLMClient,
+    top_k: int,
+) -> list[FtsHit]:
+    if not candidates:
+        return candidates
+
+    excerpts_lines = []
+    for i, hit in enumerate(candidates):
+        excerpts_lines.append(f"[{i}] {hit.text[:400]}")
+    excerpts = "\n\n".join(excerpts_lines)
+
+    request = LLMRequest(
+        system=RERANK_SYSTEM,
+        user=RERANK_USER_TEMPLATE.format(query=query, excerpts=excerpts),
+        response_format="json",
+    )
+    raw = llm.complete(request)
+
+    try:
+        ratings = json.loads(raw)
+    except json.JSONDecodeError:
+        return candidates[:top_k]
+
+    if not isinstance(ratings, list):
+        return candidates[:top_k]
+
+    relevance: dict[int, int] = {}
+    for item in ratings:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        score = item.get("relevance")
+        if isinstance(idx, int) and isinstance(score, (int, float)) and 0 <= idx < len(candidates):
+            relevance[idx] = int(score)
+
+    scored = []
+    for i, hit in enumerate(candidates):
+        rrf_score = hit.score if hit.score_kind == "rrf" else 0.0
+        llm_score = relevance.get(i, 3)
+        combined = llm_score * 100 + rrf_score
+        scored.append((combined, hit))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [replace(hit, score=float(score), score_kind="reranked")
+            for score, hit in scored[:top_k]]

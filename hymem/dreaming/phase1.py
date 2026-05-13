@@ -30,8 +30,16 @@ def process_chunk(
     if already:
         return [], []
 
-    triples = extract_triples(llm, chunk.text)
+    triples, entity_type_hints = extract_triples(llm, chunk.text)
     markers = extract_markers(llm, chunk.text)
+
+    for entity_name, entity_type in entity_type_hints.items():
+        entity_canon = canonicalize.resolve(conn, entity_name)
+        conn.execute(
+            """INSERT OR IGNORE INTO entity_types(entity_canonical, type, confidence, source_chunk_id)
+               VALUES (?, ?, 1.0, ?)""",
+            (entity_canon, entity_type, chunk.id),
+        )
 
     mentioned: set[str] = set()
     for t in triples:

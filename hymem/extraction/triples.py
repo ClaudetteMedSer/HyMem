@@ -23,8 +23,11 @@ class Triple:
     temporal_scope: str | None = None
 
 
-def extract_triples(client: LLMClient, text: str) -> list[Triple]:
+def extract_triples(client: LLMClient, text: str) -> tuple[list[Triple], dict[str, str]]:
     """Run the locked-vocabulary triple prompt and validate the output.
+
+    Returns parsed triples and any entity type hints extracted from the same
+    LLM response.
 
     Anything malformed or off-vocabulary is silently dropped — the LLM is allowed
     to be wrong, but we never propagate garbage into the graph.
@@ -35,7 +38,37 @@ def extract_triples(client: LLMClient, text: str) -> list[Triple]:
         response_format="json",
     )
     raw = client.complete(request)
-    return _parse(raw)
+    return _parse(raw), extract_entity_types(raw)
+
+
+def extract_entity_types(raw: str) -> dict[str, str]:
+    """Extract entity type hints from the same LLM response."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, list):
+        return {}
+
+    types: dict[str, str] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        subject = item.get("subject")
+        obj = item.get("object")
+        subj_type = item.get("subject_type")
+        obj_type = item.get("object_type")
+        valid_types = {
+            "language", "framework", "database", "service", "tool", "library",
+            "file", "environment", "protocol", "container", "package_manager",
+            "api", "platform", "config_file", "testing_framework", "ci_tool",
+            "monitoring_tool", "identity_provider", "message_broker", "or_other_tool"
+        }
+        if isinstance(subject, str) and isinstance(subj_type, str) and subj_type in valid_types:
+            types[subject.strip()] = subj_type
+        if isinstance(obj, str) and isinstance(obj_type, str) and obj_type in valid_types:
+            types[obj.strip()] = obj_type
+    return types
 
 
 def _parse(raw: str) -> list[Triple]:

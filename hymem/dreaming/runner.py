@@ -12,7 +12,9 @@ from hymem.core import db as core_db
 from hymem.dreaming import phase1, phase2, phase3
 from hymem.dreaming.chunks import extract_high_salience_chunks, persist_chunks
 from hymem.dreaming.embeddings import embed_pending_chunks
+from hymem.dreaming.episodes import extract_episodes_for_session
 from hymem.dreaming.mentions import index_chunk_mentions
+from hymem.dreaming.retention import prune_chunks
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 
@@ -28,6 +30,7 @@ class DreamReport:
     markers_extracted: int = 0
     chunks_embedded: int = 0
     skipped_locked: bool = False
+    budget_exhausted: bool = False
 
 
 def run_dreaming(
@@ -63,6 +66,8 @@ def run_dreaming(
             "dream.start run_id=%d sessions=%d", run_id, len(target_sessions)
         )
 
+        chunks_remaining = cfg.dream_budget
+
         for session_id in target_sessions:
             report.sessions_processed += 1
             chunks = extract_high_salience_chunks(
@@ -78,6 +83,9 @@ def run_dreaming(
                     index_chunk_mentions(conn, chunk.id, chunk.text)
 
             for chunk in chunks:
+                if chunks_remaining <= 0:
+                    break
+                chunks_remaining -= 1
                 try:
                     with core_db.transaction(conn):
                         triples, markers = phase1.process_chunk(
@@ -90,6 +98,18 @@ def run_dreaming(
                 except Exception:
                     log.exception("phase1.llm_failure chunk_id=%s", chunk.id)
                     continue
+
+            try:
+                with core_db.transaction(conn):
+                    episodes = extract_episodes_for_session(conn, session_id, llm)
+                    log.debug("episodes session_id=%s count=%d", session_id, episodes)
+            except Exception:
+                log.exception("episodes.extraction_failure session_id=%s", session_id)
+
+            if chunks_remaining <= 0:
+                report.budget_exhausted = True
+                log.info("dream.budget_exhausted budget=%d", cfg.dream_budget)
+                break
 
         if embedding_client is not None:
             with core_db.transaction(conn):
@@ -114,6 +134,7 @@ def run_dreaming(
         ).fetchone()["c"]
         with core_db.transaction(conn):
             phase3.decay(conn, cfg)
+            prune_chunks(conn, cfg)
             phase2.consolidate_insights(conn, cfg)  # refresh after decay
         after_retracted = conn.execute(
             "SELECT COUNT(*) AS c FROM knowledge_graph WHERE status = 'retracted'"
@@ -144,13 +165,14 @@ def run_dreaming(
             ),
         )
         log.info(
-            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d",
+            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d budget_exhausted=%s",
             run_id,
             report.sessions_processed,
             report.chunks_processed,
             report.chunks_seen,
             report.triples_extracted,
             report.markers_extracted,
+            report.budget_exhausted,
         )
         return report
     except Exception as exc:
