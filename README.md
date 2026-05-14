@@ -4,7 +4,7 @@
 
 ## TL;DR / Executive Summary
 
-**HyMem** is a local-first, embedded memory system for AI agents. It gives the **Hermes** agent persistent memory across conversations by extracting a structured SQLite knowledge graph from chat logs during idle "dreaming" cycles, then making that knowledge queryable at conversation time via keyword search, vector search, and entity lookup. It also auto-maintains two Markdown files (`MEMORY.md` and `USER.md`) that the agent reads before each conversation.
+**HyMem** is a local-first, embedded memory system for AI agents. It gives the **Hermes** agent persistent memory across conversations by extracting a structured SQLite knowledge graph from chat logs during idle "dreaming" cycles, then making that knowledge queryable at conversation time via keyword search, vector search, semantic graph search, and entity lookup. It also auto-maintains two Markdown files (`MEMORY.md` and `USER.md`) that the agent reads before each conversation.
 
 **No cloud, no Postgres, no 500MB Docker images.** One SQLite file, two Markdown files, and a Python library. The LLM is only called during dreaming — query-time retrieval uses only FTS5 + cosine similarity + graph traversal, zero LLM calls.
 
@@ -124,7 +124,7 @@ hymem/
 │
 ├── core/
 │   ├── db.py           SQLite connection management (WAL), schema init, migrations
-│   ├── schema.sql      18 tables + FTS5 virtual tables + triggers
+│   ├── schema.sql      19 tables + FTS5 virtual tables + triggers
 │   └── markdown_io.py  Read/write HTML-comment-delimited sections in MD files
 │
 ├── dreaming/
@@ -132,7 +132,7 @@ hymem/
 │   ├── chunks.py       Regex-based high-salience chunk extraction
 │   ├── canonicalize.py Deterministic entity name normalization + aliases
 │   ├── mentions.py     Entity mention indexing for decay calculations
-│   ├── embeddings.py   Batch embedding of chunks (JSON + sqlite-vec)
+│   ├── embeddings.py   Batch embedding of chunks + knowledge-graph edges (JSON + sqlite-vec)
 │   ├── phase1.py       LLM extraction: triples + behavioral markers
 │   ├── phase2.py       Consolidation: markers→profile, graph→MEMORY.md
 │   ├── phase3.py       Co-occurrence-aware decay + retraction
@@ -151,7 +151,9 @@ hymem/
 │                         summaries, and reranking
 │
 ├── query/
-│   ├── augment.py      FTS5 + vector + RRF merge + LLM rerank + graph lookup
+│   ├── augment.py      FTS5 + vector + RRF merge + LLM rerank + hybrid graph ranker
+│   ├── predicate_routing.py  Keyword → predicate mapping for query expansion
+│   ├── conflicts.py    Contradiction detection over the knowledge graph
 │   └── entities.py     Token-based entity matching against knowledge graph
 │
 └── contrib/
@@ -161,7 +163,7 @@ hymem/
 
 ---
 
-## 4. The Data Model (18 SQLite Tables)
+## 4. The Data Model (19 SQLite Tables)
 
 **Conversation storage:**
 - `sessions` — session ID + start/end timestamps + LLM-generated summary
@@ -178,6 +180,7 @@ hymem/
 **Knowledge graph:**
 - `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges
 - `kg_evidence` — per-source provenance linking edges to chunks, with value/text/temporal metadata
+- `edge_embeddings` — JSON-encoded embedding vectors for knowledge graph edges, keyed on triple text so churning derived edges reuse cached vectors
 - `entity_aliases` — surface form → canonical entity mapping
 
 **Behavioral profiling:**
@@ -252,6 +255,8 @@ Results are written to `MEMORY.md`'s auto-section, capped at `insights_max_entri
 
 After inference, Phase 2 insights are refreshed to reflect the new graph state, and old unreferenced chunks are pruned via `retention.py`.
 
+**Edge embedding** (`embeddings.py`): Once the graph has settled, every active edge — base and derived — is embedded as `"{subject} {predicate} {object}"` text into `edge_embeddings` and the `vec_edges` sqlite-vec table, so the query layer can do semantic search against the graph (see §6). The cache is keyed on triple text, not edge id: derived edges are deleted and recreated every cycle with fresh ids, so keying on text means a recreated edge reuses its cached vector instead of re-hitting the embedding API. Only genuinely new triple texts cost an embedding call. Skipped entirely when no embedding client is configured.
+
 ---
 
 ## 6. Query-Time Augmentation (How Memory Gets Used)
@@ -263,12 +268,14 @@ AugmentedContext(
     user_md: str,              # USER.md content
     memory_md: str,            # MEMORY.md content
     fts_hits: list[FtsHit],    # Ranked relevant chunks
-    graph_facts: list[GraphFact],     # Matching knowledge graph edges
+    graph_facts: list[GraphFact],     # Ranked knowledge graph edges (see below)
     episodes: list[EpisodeHit],       # Matching episodes
     procedures: list[ProcedureHit],   # Matching procedures
     matched_entities: list[str],      # Entities found in user message
 )
 ```
+
+Each `GraphFact` carries the edge (`subject`, `predicate`, `object`), its `confidence`, evidence counters, `derived` flag, the final `score`, and a `why_retrieved` list of reason codes explaining *why* the edge surfaced — e.g. `["semantic_0.84", "predicate:uses", "entity_type:framework", "recency_3d", "entity_match"]`. The reason codes are the ranking formula itself, so the agent gets an explanation with zero extra LLM calls.
 
 **How it works:**
 
@@ -280,10 +287,27 @@ AugmentedContext(
 6. **Episode search** (`_episode_search`): FTS5 search over episode titles and summaries for the query.
 7. **Procedure search** (`_procedure_search`): FTS5 search over procedure names, descriptions, and steps.
 8. **Entity matching** (`match_known_entities`): Tokenize the user message (including 2-3 word n-grams), lookup each token against `entity_aliases`, return canonical IDs.
-9. **Entity type expansion** (`_expand_entities_by_type`): For matched entities, find other entities of the same type (e.g., if user mentions `uv`, also surface `pip` and `poetry` since they're all `package_manager` type).
-10. **Graph lookup** (`_graph_lookup`): For each matched/expanded entity, query `knowledge_graph` for active edges (including derived transitive edges) where the entity appears as subject or object. Up to `graph_top_k_per_entity` (default: 3) facts per entity, ranked by confidence and recency.
+9. **Entity type expansion** (`_expand_entities_by_type`): For matched entities, find other entities of the same type (e.g., if user mentions `uv`, also surface `pip` and `poetry` since they're all `package_manager` type). Records which type surfaced each expanded entity for the `entity_type:` reason code.
+10. **Predicate routing** (`predicate_routing.py`): Map natural-language cues in the query to typed predicates — "what technologies" → `uses`/`runs_on`, "depends on" → `depends_on`, "configured" → `configured_with`, etc. Routing only ever *adds* signal: matching predicates get a score boost and a `predicate:` reason code, but no edge is ever filtered out.
+11. **Hybrid graph ranker** (`_graph_lookup`): Gathers candidate edges from three sources — entity-anchored lookup (the entity appears as subject/object), semantic KNN against `vec_edges` (the query is embedded and matched against edge embeddings; falls back to Python cosine over `edge_embeddings` when sqlite-vec is unavailable), and predicate-routed lookup. Each unique edge is then scored:
+
+    ```
+    score = confidence × recency_weight × semantic_score × predicate_boost
+    recency_weight = exp(-days_since_last_seen / graph_recency_half_life_days)
+    ```
+
+    With no embedding client the semantic term drops out and the score collapses to `confidence × recency × predicate_boost` — close to the prior confidence-and-recency leaderboard. The top `graph_top_k` (default: 8) edges are returned, each with its `why_retrieved` reason codes.
 
 Hermes then assembles the prompt with this context — HyMem never dictates prompt structure.
+
+### Contradiction detection (`conflicts.py`)
+
+Separately from `augment()`, `hy.conflicts()` scans the knowledge graph for contradictions and returns a list of `Conflict` objects. Two kinds are surfaced:
+
+- **competing_object** — the same subject pointing at different objects under a mutually-exclusive predicate (e.g. `atta [prefers] english` vs `atta [prefers] dutch`).
+- **opposing_predicate** — the same subject/object pair joined by an opposing predicate pair (e.g. `team [prefers] docker` vs `team [rejects] docker`).
+
+It's pure SQL over the existing schema — no LLM call — and ignores retracted and derived edges.
 
 ---
 
@@ -351,6 +375,8 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 
 **Transitive inference.** `depends_on` edges are transitively closed via BFS after each dreaming cycle. If `api depends_on postgres` and `postgres depends_on docker`, a derived edge `api depends_on docker` is added (marked `derived=1`, confidence = product of edge confidences). Derived edges are recomputed from scratch each cycle and excluded from decay.
 
+**Semantic, explainable graph retrieval.** The knowledge graph isn't just keyword-matched — edges are embedded during dreaming, so `augment()` ranks them against the query by `semantic × confidence × recency × predicate_boost`. Every returned fact carries `why_retrieved` reason codes derived directly from that formula, so the agent sees *why* a fact was surfaced without a second LLM call. When no embedding client is configured the ranker degrades gracefully to confidence-and-recency ordering.
+
 **Feedback-driven extraction.** When an edge is retracted, its chunk text and the extracted triple are stored in `extraction_feedback`. Before the next dreaming cycle, up to 10 recent retractions are injected as negative examples into the extraction prompt, teaching the LLM to avoid repeating past mistakes.
 
 **Prompt-versioned idempotency.** Changing `prompt_version` in config causes automatic reprocessing of all chunks with the new prompts. Backward-incompatible prompt changes are trivial.
@@ -395,8 +421,14 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 |---|---|---|
 | `salience_min_chars` | 30 | Min chunk size before extraction |
 | `fts_top_k` | 5 | FTS results to return |
-| `graph_top_k_per_entity` | 3 | Graph facts per matched entity |
+| `graph_top_k_per_entity` | 3 | Entity-anchored graph facts per matched entity |
 | `embedding_max_scan` | 5000 | Max embeddings to scan in Python fallback |
+| `graph_semantic_top_k` | 10 | KNN candidates pulled from `vec_edges` |
+| `graph_predicate_top_k` | 10 | Edges pulled per predicate-routed query |
+| `graph_top_k` | 8 | Final graph facts returned by `augment()` |
+| `graph_recency_half_life_days` | 30.0 | Half-life for edge recency decay |
+| `graph_recency_recent_days` | 7.0 | `days_since` under this emits a `recency_Nd` reason code |
+| `graph_predicate_boost` | 1.5 | Score multiplier for routed-predicate edges |
 | `decay_window_days` | 30 | Decay look-back window |
 | `decay_factor` | 0.9 | (reserved, not yet used) |
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
@@ -412,7 +444,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**100 tests total, 100% passing** across 16 test files:
+**113 tests total, 100% passing** across 17 test files:
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling
@@ -420,6 +452,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_chunks.py` — Salience detection, chunk persistence
 - `test_embeddings.py` — Embedding creation and query, stub determinism
 - `test_augment.py` — FTS search, vector search, RRF merge, graph lookup
+- `test_graph_semantic.py` — Edge embedding, hybrid graph ranker, `why_retrieved` codes, predicate routing, contradiction detection
 - `test_markdown_io.py` — Section read/write atomicity
 - `test_integration.py` — End-to-end capture→dream→augment, retract workflow
 - `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
@@ -442,8 +475,9 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | **Entity model** | Simple: user + assistant roles | Peer paradigm: all participants are "peers" |
 | **Memory extraction** | "Dreaming" — multi-phase LLM pipeline with locked vocabulary, transitive inference, episode/procedure extraction, feedback learning | "Deriver" — background workers doing representation, summarization, peer cards |
 | **Ontology** | Locked 18-predicate vocabulary + entity types | Open-ended reasoning, no fixed ontology |
-| **Query interface** | FTS5 + vector + RRF + LLM rerank + graph lookup + episode/procedure search | Chat API (natural language), context (token-budgeted), hybrid search |
+| **Query interface** | FTS5 + vector + RRF + LLM rerank + semantic graph ranking (with `why_retrieved` explainability) + predicate routing + episode/procedure search | Chat API (natural language), context (token-budgeted), hybrid search |
 | **Decay** | Co-occurrence-aware with confidence thresholds | Continual representation updates (implicit) |
+| **Contradiction detection** | `conflicts()` surfaces competing-object and opposing-predicate edges (pure SQL) | Not available |
 | **Self-improvement** | Feedback-driven extraction (negative examples from retractions) | Not available |
 | **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (18 endpoints, real-SDK contract tests) | Native |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
@@ -451,7 +485,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | **Maturity** | v0.1.0, ~4,500 lines | v3.0.6, 514 commits, 3.4k stars |
 | **License** | Not specified | AGPL-3.0 |
 
-**The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
+**The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, semantic-and-explainable graph ranking, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
 
 **HyMem can self-host the Honcho experience.** With the Honcho server fully functional (18 endpoints, verified against the pinned `honcho-ai` SDK), Hermes can use the standard `honcho-ai` SDK and get the same API surface as Honcho's cloud — search, context, chat, peer management, sessions, pagination — without leaving the machine. This is HyMem's headline feature: **Honcho compatibility without any infrastructure.**
 

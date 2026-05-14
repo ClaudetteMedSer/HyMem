@@ -40,6 +40,31 @@ def hy_with_embed(
     instance.close()
 
 
+def seed_edge(
+    conn,
+    subject: str,
+    predicate: str,
+    obj: str,
+    *,
+    pos: int = 1,
+    neg: int = 0,
+    days_ago: int = 0,
+    derived: int = 0,
+    status: str = "active",
+) -> None:
+    """Insert a knowledge_graph edge directly, with last_seen `days_ago` in the past."""
+    conn.execute(
+        """INSERT INTO knowledge_graph
+           (subject_canonical, predicate, object_canonical, pos_evidence,
+            neg_evidence, last_seen, last_reinforced, status, derived)
+           VALUES (?, ?, ?, ?, ?, datetime('now', ?), datetime('now', ?), ?, ?)""",
+        (
+            subject, predicate, obj, pos, neg,
+            f"-{days_ago} days", f"-{days_ago} days", status, derived,
+        ),
+    )
+
+
 def make_routed_llm(triples: list[dict], markers: list[dict]) -> StubLLMClient:
     """Stub that routes triple prompts to one payload and marker prompts to another.
 

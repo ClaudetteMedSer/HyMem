@@ -16,6 +16,24 @@ class HyMemConfig:
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 
+    graph_semantic_top_k: int = 10
+    """KNN candidates pulled from vec_edges during semantic graph lookup."""
+
+    graph_predicate_top_k: int = 10
+    """Edges pulled per predicate-routed query."""
+
+    graph_top_k: int = 8
+    """Final number of GraphFacts returned by augment()."""
+
+    graph_recency_half_life_days: float = 30.0
+    """Half-life for edge recency decay: weight = exp(-days_since_last_seen / half_life)."""
+
+    graph_recency_recent_days: float = 7.0
+    """Edges with days_since_last_seen <= this emit a recency_Nd reason code."""
+
+    graph_predicate_boost: float = 1.5
+    """Score multiplier applied to edges whose predicate matches a routed predicate."""
+
     decay_window_days: int = 30
     decay_factor: float = 0.9
     retract_threshold: float = 0.15

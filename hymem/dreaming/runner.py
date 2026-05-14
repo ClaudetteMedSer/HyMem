@@ -12,7 +12,7 @@ from hymem.core import db as core_db
 from hymem.dreaming import phase1, phase2, phase3
 from hymem.dreaming.inference import infer_transitive_edges
 from hymem.dreaming.chunks import extract_high_salience_chunks, persist_chunks
-from hymem.dreaming.embeddings import embed_pending_chunks
+from hymem.dreaming.embeddings import embed_pending_chunks, embed_pending_edges
 from hymem.dreaming.episodes import extract_episodes_for_session
 from hymem.dreaming.procedures import extract_procedures_for_session
 from hymem.dreaming.mentions import index_chunk_mentions
@@ -32,6 +32,7 @@ class DreamReport:
     triples_extracted: int = 0
     markers_extracted: int = 0
     chunks_embedded: int = 0
+    edges_embedded: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
 
@@ -182,6 +183,8 @@ def run_dreaming(
                 log.info("inference.derived count=%d", derived)
             prune_chunks(conn, cfg)
             phase2.consolidate_insights(conn, cfg)  # refresh after decay
+            if embedding_client is not None:
+                report.edges_embedded = embed_pending_edges(conn, embedding_client)
         after_retracted = conn.execute(
             "SELECT COUNT(*) AS c FROM knowledge_graph WHERE status = 'retracted'"
         ).fetchone()["c"]
@@ -195,6 +198,7 @@ def run_dreaming(
                 chunks_seen = ?,
                 chunks_processed = ?,
                 chunks_embedded = ?,
+                edges_embedded = ?,
                 triples_extracted = ?,
                 markers_extracted = ?,
                 skipped_locked = 0
@@ -205,6 +209,7 @@ def run_dreaming(
                 report.chunks_seen,
                 report.chunks_processed,
                 report.chunks_embedded,
+                report.edges_embedded,
                 report.triples_extracted,
                 report.markers_extracted,
                 run_id,

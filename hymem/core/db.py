@@ -11,7 +11,7 @@ from typing import Iterator
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 5
+EXPECTED_SCHEMA_VERSION = 6
 
 
 def _load_schema() -> str:
@@ -67,6 +67,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         _migrate_v4(conn)
     if cur < 5:
         _migrate_v5(conn)
+    if cur < 6:
+        _migrate_v6(conn)
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
@@ -134,7 +136,45 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
     log.info("migrated schema to v5 (extraction feedback table)")
 
 
+def _migrate_v6(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS edge_embeddings (
+            edge_text TEXT PRIMARY KEY,
+            vector_json TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+    try:
+        conn.execute(
+            "ALTER TABLE dream_runs ADD COLUMN edges_embedded INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6')"
+    )
+    log.info("migrated schema to v6 (edge embeddings table)")
+
+
+_VEC_TABLES = frozenset({"vec_chunks", "vec_edges"})
+
+
+def _ensure_vec_table_named(conn: sqlite3.Connection, name: str, dim: int) -> None:
+    if name not in _VEC_TABLES:
+        raise ValueError(f"unknown vec table: {name}")
+    conn.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING vec0(embedding float[{dim}])"
+    )
+
+
 def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
+    """Ensure both vec_chunks and vec_edges exist at the given dim.
+
+    The two virtual tables share the single 'vec_dim' schema_meta key, so on a
+    dimension change they are dropped and rebuilt in lockstep, then backfilled
+    from their JSON mirror tables (chunk_embeddings / edge_embeddings).
+    """
     if not _load_vec_extension(conn):
         return
     try:
@@ -142,21 +182,27 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
             "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
         ).fetchone()
         if existing_dim and int(existing_dim["value"]) == dim:
+            # Dim unchanged — still ensure vec_edges exists and is populated for
+            # DBs that embedded chunks before vec_edges was introduced.
+            _ensure_vec_table_named(conn, "vec_edges", dim)
+            _backfill_vec_edges(conn, dim)
             return
         if existing_dim:
             conn.execute("DELETE FROM schema_meta WHERE key = 'vec_dim'")
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("DROP TABLE IF EXISTS vec_chunks")
-        conn.execute(
-            f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[{dim}])"
-        )
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("DROP TABLE IF EXISTS vec_edges")
+        _ensure_vec_table_named(conn, "vec_chunks", dim)
+        _ensure_vec_table_named(conn, "vec_edges", dim)
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('vec_dim', ?)",
             (str(dim),),
         )
         _backfill_vec(conn, dim)
+        _backfill_vec_edges(conn, dim)
     except sqlite3.OperationalError:
-        log.info("vec_chunks table unavailable; using Python cosine search")
+        log.info("vec tables unavailable; using Python cosine search")
 
 
 def _backfill_vec(conn: sqlite3.Connection, dim: int) -> None:
@@ -184,20 +230,66 @@ def _backfill_vec(conn: sqlite3.Connection, dim: int) -> None:
     log.info("backfilled vec_chunks with %d existing embeddings", len(rows))
 
 
+def _backfill_vec_edges(conn: sqlite3.Connection, dim: int) -> None:
+    """Populate vec_edges (rowid = knowledge_graph.id) from cached edge vectors.
+
+    Best-effort: embed_pending_edges is the authoritative refresh. This handles
+    cold-start, dim changes, and pre-v6 DBs.
+    """
+    rows = conn.execute(
+        """
+        SELECT kg.id AS edge_id,
+               kg.subject_canonical || ' ' || kg.predicate || ' '
+                   || kg.object_canonical AS edge_text
+        FROM knowledge_graph kg
+        WHERE kg.status = 'active'
+        """
+    ).fetchall()
+    if not rows:
+        return
+    have = conn.execute("SELECT COUNT(*) AS c FROM vec_edges").fetchone()["c"]
+    if have >= len(rows):
+        return
+    for r in rows:
+        emb = conn.execute(
+            "SELECT vector_json FROM edge_embeddings WHERE edge_text = ?",
+            (r["edge_text"],),
+        ).fetchone()
+        if emb is None:
+            continue
+        try:
+            vec = json.loads(emb["vector_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(vec) != dim:
+            vec = list(vec) + [0.0] * (dim - len(vec))
+        conn.execute(
+            "INSERT OR IGNORE INTO vec_edges(rowid, embedding) VALUES (?, ?)",
+            (r["edge_id"], _pack_vector(vec)),
+        )
+    log.info("backfilled vec_edges from %d edge rows", len(rows))
+
+
 def _pack_vector(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
 def vec_search(
-    conn: sqlite3.Connection, query_vector: list[float], top_k: int
+    conn: sqlite3.Connection,
+    query_vector: list[float],
+    top_k: int,
+    *,
+    table: str = "vec_chunks",
 ) -> list[tuple[int, float]]:
+    if table not in _VEC_TABLES:
+        raise ValueError(f"unknown vec table: {table}")
     if not _load_vec_extension(conn):
         return []
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT rowid, distance
-            FROM vec_chunks
+            FROM {table}
             WHERE embedding MATCH ?
             ORDER BY distance
             LIMIT ?
@@ -209,9 +301,12 @@ def vec_search(
         return []
 
 
-def has_vec_table(conn: sqlite3.Connection) -> bool:
+def has_vec_table(conn: sqlite3.Connection, table: str = "vec_chunks") -> bool:
+    if table not in _VEC_TABLES:
+        raise ValueError(f"unknown vec table: {table}")
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
     ).fetchone()
     return row is not None
 

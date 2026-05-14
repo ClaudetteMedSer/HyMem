@@ -12,6 +12,7 @@ from hymem.dreaming.runner import DreamReport, run_dreaming
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.augment import AugmentedContext, augment
+from hymem.query.conflicts import Conflict, find_conflicts
 
 log = logging.getLogger("hymem.api")
 
@@ -122,6 +123,14 @@ class HyMem:
             embedding_client=self._embed,
             llm=self._llm,
         )
+
+    def conflicts(self) -> list[Conflict]:
+        """Return detected contradictions in the knowledge graph. Read-only.
+
+        Surfaces edges that disagree — competing objects under an exclusive
+        predicate, or a subject/object pair joined by opposing predicates.
+        """
+        return find_conflicts(self.read_conn)
 
     # ---- dreaming ----------------------------------------------------
 

@@ -12,6 +12,7 @@ from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import RERANK_SYSTEM, RERANK_USER_TEMPLATE
 from hymem.query.entities import match_known_entities
+from hymem.query.predicate_routing import route_predicates
 
 log = logging.getLogger("hymem.query.augment")
 
@@ -25,6 +26,8 @@ class GraphFact:
     pos_evidence: int
     neg_evidence: int
     derived: bool = False
+    why_retrieved: list[str] = field(default_factory=list)
+    score: float = 0.0
 
 
 @dataclass
@@ -114,11 +117,13 @@ def augment(
 
     ctx.procedures = _procedure_search(conn, user_message, top_k=cfg.fts_top_k)
 
-    ctx.matched_entities = match_known_entities(conn, user_message)
-    ctx.matched_entities = _expand_entities_by_type(conn, ctx.matched_entities)
-    if ctx.matched_entities:
+    matched = match_known_entities(conn, user_message)
+    ctx.matched_entities, expansion_info = _expand_entities_by_type(conn, matched)
+    routed = route_predicates(user_message)
+    if ctx.matched_entities or embedding_client is not None or routed:
         ctx.graph_facts = _graph_lookup(
-            conn, ctx.matched_entities, top_k_per_entity=cfg.graph_top_k_per_entity
+            conn, cfg, user_message, ctx.matched_entities, expansion_info, routed,
+            embedding_client=embedding_client,
         )
     return ctx
 
@@ -303,38 +308,209 @@ def _rrf_merge(
     ]
 
 
+_EDGE_SELECT = """
+    SELECT id, subject_canonical AS s, predicate AS p, object_canonical AS o,
+           pos_evidence AS pos, neg_evidence AS neg, derived,
+           (julianday('now') - julianday(last_seen)) AS days_since
+    FROM knowledge_graph
+"""
+
+
 def _graph_lookup(
-    conn: sqlite3.Connection, entities: list[str], *, top_k_per_entity: int
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+    query: str,
+    entities: list[str],
+    expansion_info: dict[str, str],
+    routed: frozenset[str],
+    *,
+    embedding_client: EmbeddingClient | None = None,
 ) -> list[GraphFact]:
-    facts: dict[tuple[str, str, str], GraphFact] = {}
+    """Hybrid edge ranker: gathers candidates from entity matches, semantic KNN,
+    and predicate routing, then scores by semantic × confidence × recency × boost.
+
+    With no embedding client the semantic source is skipped and the score
+    collapses to confidence × recency × predicate_boost — close to the prior
+    entity-anchored leaderboard behaviour.
+    """
+    candidates: dict[tuple[str, str, str], dict] = {}
+
+    def _ensure(row: sqlite3.Row) -> dict:
+        key = (row["s"], row["p"], row["o"])
+        c = candidates.get(key)
+        if c is None:
+            c = {
+                "edge_id": int(row["id"]),
+                "s": row["s"],
+                "p": row["p"],
+                "o": row["o"],
+                "pos": int(row["pos"]),
+                "neg": int(row["neg"]),
+                "derived": bool(row["derived"]),
+                "days_since": (
+                    float(row["days_since"]) if row["days_since"] is not None else 0.0
+                ),
+                "semantic_score": 0.0,
+                "entity_match": False,
+                "entity_types": set(),
+            }
+            candidates[key] = c
+        return c
+
+    # Source 1 — entity-anchored (always).
     for entity in entities:
         rows = conn.execute(
-            """
-            SELECT subject_canonical AS s, predicate AS p, object_canonical AS o,
-                   pos_evidence AS pos, neg_evidence AS neg, derived,
-                   (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) AS conf
-            FROM knowledge_graph
+            _EDGE_SELECT
+            + """
             WHERE status = 'active'
               AND (subject_canonical = ? OR object_canonical = ?)
-            ORDER BY conf DESC, last_reinforced DESC
+            ORDER BY (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) DESC,
+                     last_reinforced DESC
             LIMIT ?
             """,
-            (entity, entity, top_k_per_entity),
+            (entity, entity, cfg.graph_top_k_per_entity),
         ).fetchall()
         for r in rows:
-            key = (r["s"], r["p"], r["o"])
-            if key in facts:
+            c = _ensure(r)
+            c["entity_match"] = True
+            if entity in expansion_info:
+                c["entity_types"].add(expansion_info[entity])
+
+    # Source 2 — semantic KNN (only with an embedding client).
+    if embedding_client is not None:
+        for edge_id, semantic_score in _semantic_edge_hits(
+            conn, cfg, embedding_client, query
+        ):
+            row = conn.execute(
+                _EDGE_SELECT + " WHERE id = ? AND status = 'active'",
+                (edge_id,),
+            ).fetchone()
+            if row is None:
                 continue
-            facts[key] = GraphFact(
-                subject=r["s"],
-                predicate=r["p"],
-                object=r["o"],
-                confidence=float(r["conf"]),
-                pos_evidence=int(r["pos"]),
-                neg_evidence=int(r["neg"]),
-                derived=bool(r["derived"]),
+            c = _ensure(row)
+            c["semantic_score"] = max(c["semantic_score"], semantic_score)
+
+    # Source 3 — predicate-routed.
+    if routed:
+        pred_placeholders = ",".join("?" * len(routed))
+        rows = conn.execute(
+            _EDGE_SELECT
+            + f"""
+            WHERE status = 'active' AND predicate IN ({pred_placeholders})
+            ORDER BY (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) DESC,
+                     last_seen DESC
+            LIMIT ?
+            """,
+            list(routed) + [cfg.graph_predicate_top_k],
+        ).fetchall()
+        for r in rows:
+            _ensure(r)
+
+    results: list[GraphFact] = []
+    for c in candidates.values():
+        confidence = (c["pos"] + 1.0) / (c["pos"] + c["neg"] + 2.0)
+        recency_weight = math.exp(-c["days_since"] / cfg.graph_recency_half_life_days)
+        semantic_score = c["semantic_score"]
+        in_routed = c["p"] in routed
+        predicate_boost = cfg.graph_predicate_boost if in_routed else 1.0
+        score = (
+            confidence
+            * recency_weight
+            * (semantic_score if semantic_score > 0 else 1.0)
+            * predicate_boost
+        )
+
+        why: list[str] = []
+        if semantic_score > 0:
+            why.append(f"semantic_{semantic_score:.2f}")
+        if in_routed:
+            why.append(f"predicate:{c['p']}")
+        for entity_type in sorted(c["entity_types"]):
+            why.append(f"entity_type:{entity_type}")
+        if c["days_since"] <= cfg.graph_recency_recent_days:
+            why.append(f"recency_{round(c['days_since'])}d")
+        if c["entity_match"]:
+            why.append("entity_match")
+
+        results.append(
+            GraphFact(
+                subject=c["s"],
+                predicate=c["p"],
+                object=c["o"],
+                confidence=confidence,
+                pos_evidence=c["pos"],
+                neg_evidence=c["neg"],
+                derived=c["derived"],
+                why_retrieved=why,
+                score=score,
             )
-    return list(facts.values())
+        )
+
+    results.sort(key=lambda f: f.score, reverse=True)
+    return results[: cfg.graph_top_k]
+
+
+def _semantic_edge_hits(
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+    embedder: EmbeddingClient,
+    query: str,
+) -> list[tuple[int, float]]:
+    """Return (edge_id, semantic_score) pairs for edges similar to the query."""
+    from hymem.core import db as core_db
+
+    if core_db._load_vec_extension(conn) and core_db.has_vec_table(
+        conn, table="vec_edges"
+    ):
+        qvec = embedder.embed([query])[0]
+        hits = core_db.vec_search(
+            conn, qvec, cfg.graph_semantic_top_k, table="vec_edges"
+        )
+        return [(edge_id, 1.0 / (1.0 + distance)) for edge_id, distance in hits]
+    return _python_cosine_edge_search(
+        conn, embedder, query,
+        top_k=cfg.graph_semantic_top_k, max_scan=cfg.embedding_max_scan,
+    )
+
+
+def _python_cosine_edge_search(
+    conn: sqlite3.Connection,
+    embedder: EmbeddingClient,
+    query: str,
+    *,
+    top_k: int,
+    max_scan: int,
+) -> list[tuple[int, float]]:
+    rows = conn.execute(
+        """
+        SELECT kg.id AS edge_id, e.vector_json
+        FROM knowledge_graph kg
+        JOIN edge_embeddings e
+          ON e.edge_text = kg.subject_canonical || ' ' || kg.predicate || ' '
+                           || kg.object_canonical
+        WHERE kg.status = 'active'
+        ORDER BY kg.last_seen DESC
+        LIMIT ?
+        """,
+        (max_scan,),
+    ).fetchall()
+    if not rows:
+        return []
+
+    qvec = embedder.embed([query])[0]
+    qnorm = math.sqrt(sum(x * x for x in qvec)) or 1.0
+
+    scored: list[tuple[float, int]] = []
+    for r in rows:
+        vec = json.loads(r["vector_json"])
+        if len(vec) != len(qvec):
+            continue
+        dot = sum(a * b for a, b in zip(qvec, vec))
+        vnorm = math.sqrt(sum(x * x for x in vec)) or 1.0
+        sim = max(0.0, dot / (qnorm * vnorm))
+        scored.append((sim, r["edge_id"]))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(edge_id, sim) for sim, edge_id in scored[:top_k]]
 
 
 def _episode_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[EpisodeHit]:
@@ -415,10 +591,15 @@ def _expand_entities_by_type(
     conn: sqlite3.Connection,
     entities: list[str],
     max_expanded: int = 10,
-) -> list[str]:
-    """For matched entities, find other entities of the same type."""
+) -> tuple[list[str], dict[str, str]]:
+    """For matched entities, find other entities of the same type.
+
+    Returns (all_entities, expansion_info) where expansion_info maps each
+    expanded entity to the type label that surfaced it (used for the
+    `entity_type:` reason code).
+    """
     if not entities:
-        return entities
+        return entities, {}
 
     placeholders = ",".join("?" * len(entities))
     type_rows = conn.execute(
@@ -426,20 +607,28 @@ def _expand_entities_by_type(
         entities,
     ).fetchall()
     if not type_rows:
-        return entities
+        return entities, {}
 
     types = [r[0] for r in type_rows]
     type_placeholders = ",".join("?" * len(types))
 
     expanded_rows = conn.execute(
-        f"""SELECT DISTINCT entity_canonical FROM entity_types
+        f"""SELECT DISTINCT entity_canonical, type FROM entity_types
             WHERE type IN ({type_placeholders})
             AND entity_canonical NOT IN ({placeholders})
             LIMIT ?""",
         types + entities + [max_expanded],
     ).fetchall()
 
-    return entities + [r[0] for r in expanded_rows]
+    expansion_info: dict[str, str] = {}
+    expanded: list[str] = []
+    for r in expanded_rows:
+        ent = r["entity_canonical"]
+        if ent not in expansion_info:
+            expansion_info[ent] = r["type"]
+            expanded.append(ent)
+
+    return entities + expanded, expansion_info
 
 
 def _rerank(

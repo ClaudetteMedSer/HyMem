@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Embedding vectors for knowledge-graph edges. Keyed on the triple text
+-- "{subject} {predicate} {object}" (not edge id) so derived edges, whose ids
+-- churn every dream run, reuse a cached vector instead of re-embedding.
+CREATE TABLE IF NOT EXISTS edge_embeddings (
+    edge_text TEXT PRIMARY KEY,
+    vector_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Idempotency: each chunk processed at most once per prompt_version.
 CREATE TABLE IF NOT EXISTS processed_chunks (
     chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
@@ -267,6 +278,7 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     chunks_seen INTEGER NOT NULL DEFAULT 0,
     chunks_processed INTEGER NOT NULL DEFAULT 0,
     chunks_embedded INTEGER NOT NULL DEFAULT 0,
+    edges_embedded INTEGER NOT NULL DEFAULT 0,
     triples_extracted INTEGER NOT NULL DEFAULT 0,
     markers_extracted INTEGER NOT NULL DEFAULT 0,
     skipped_locked INTEGER NOT NULL DEFAULT 0,
