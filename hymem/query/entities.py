@@ -5,7 +5,11 @@ import sqlite3
 
 from hymem.dreaming.canonicalize import normalize
 
-_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_\-\.]{1,40}")
+# First char must be a Unicode letter (so accented Latin words like "préfère"
+# tokenize whole instead of being shredded at the accent); body allows letters,
+# digits, underscore, hyphen, dot. normalize() then folds it consistently with
+# how the entity was stored.
+_TOKEN = re.compile(r"[^\W\d_][\w\-.]{1,40}")
 
 
 def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:

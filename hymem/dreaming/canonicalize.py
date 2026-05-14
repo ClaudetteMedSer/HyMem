@@ -6,7 +6,19 @@ import unicodedata
 
 # Strip leading articles, trailing parentheticals like "(container)", and
 # punctuation. Lowercase. ASCII-fold. Collapse whitespace and underscores.
-_LEADING_ARTICLES = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
+# Articles cover common Latin-script European languages; this runs after the
+# string is already lowercased and accent-folded.
+_LEADING_ARTICLES = re.compile(
+    r"^(the|an?|"                       # English
+    r"de|het|een|"                      # Dutch
+    r"der|die|das|dem|den|ein|eine|"    # German
+    r"le|la|les|un|une|des|"            # French
+    r"el|los|las|una|unos|unas|"        # Spanish
+    r"il|lo|gli|uno|"                   # Italian
+    r"os|as|um|uma"                     # Portuguese
+    r")\s+",
+    re.IGNORECASE,
+)
 _TRAILING_PAREN = re.compile(r"\s*\([^)]*\)\s*$")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 

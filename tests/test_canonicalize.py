@@ -11,6 +11,28 @@ def test_normalize_strips_articles_punct_and_paren():
     assert normalize("Café") == "cafe"
 
 
+def test_normalize_strips_latin_script_articles():
+    # Leading articles across common Latin-script European languages.
+    assert normalize("de Docker") == "docker"
+    assert normalize("het Platform") == "platform"
+    assert normalize("der Server") == "server"
+    assert normalize("le Cache") == "cache"
+    assert normalize("el Servidor") == "servidor"
+    # Accent-folding stays consistent whether or not an article leads.
+    assert normalize("de café-server") == normalize("café-server") == "cafe_server"
+
+
+def test_match_known_entities_handles_accented_tokens(hy):
+    from hymem.query.entities import match_known_entities
+
+    conn = hy.conn
+    register_alias(conn, "préfère-tool", "prefere_tool")
+    # The accented mention must tokenize whole and resolve — not shred at the
+    # accent (which the old [A-Za-z] tokenizer did).
+    hits = match_known_entities(conn, "do we still use préfère-tool here?")
+    assert "prefere_tool" in hits
+
+
 def test_normalize_splits_camelcase():
     assert normalize("MedFlow") == "med_flow"
     assert normalize("med-flow") == "med_flow"

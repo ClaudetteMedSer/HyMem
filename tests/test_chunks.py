@@ -63,3 +63,25 @@ def test_short_ack_excluded(conn):
     _add_user(conn, "ok thanks")
     out = _reasons(conn)
     assert out == []
+
+
+def test_dutch_correction_trigger(conn):
+    # Short Dutch correction — caught by trigger, not the length fallback.
+    _add_user(conn, "Nee, gebruik uv.")
+    out = _reasons(conn)
+    assert len(out) == 1
+    assert out[0][0] == "correction_or_preference_trigger"
+
+
+def test_dutch_preference_trigger(conn):
+    _add_user(conn, "Ik heb een voorkeur voor uv.")
+    out = _reasons(conn)
+    assert len(out) == 1
+    assert out[0][0] == "correction_or_preference_trigger"
+
+
+def test_dutch_we_gebruiken_trigger(conn):
+    _add_user(conn, "We gebruiken uv.")
+    out = _reasons(conn)
+    assert len(out) == 1
+    assert out[0][0] == "correction_or_preference_trigger"

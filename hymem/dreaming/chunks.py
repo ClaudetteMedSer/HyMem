@@ -9,18 +9,32 @@ from dataclasses import dataclass
 # extraction step is the real filter. We err on the side of "include" — it's
 # better to extract zero triples from a chunk than to silently miss a correction.
 _CORRECTION_PATTERNS = re.compile(
+    # English
     r"\bno,"
     r"|\b(actually|not\s+(?:quite|really|exactly)|don'?t\s+use|"
     r"stopped\s+using|switched\s+(?:to|from)|replaced|moved\s+(?:off|away))\b"
     r"|\bthat'?s\s+wrong\b|\bwrong\b|\bincorrect\b|\bfix:"
     r"|\bthe\s+right\s+(?:answer|way)\b"
     r"|\binstead\s+of\b|\brather\s+than\b"
-    r"|\buse\s+\S+\s+not\s+\S+",
+    r"|\buse\s+\S+\s+not\s+\S+"
+    # Dutch
+    r"|\bnee,"
+    r"|\b(eigenlijk|gebruik\s+geen|niet\s+gebruiken|gestopt\s+met|"
+    r"overgestapt(?:\s+(?:van|naar|op))?|vervangen)\b"
+    r"|\b(?:dat\s+klopt\s+niet|niet\s+correct|verkeerd|fout)\b"
+    r"|\bde\s+juiste\s+(?:manier|antwoord)\b"
+    r"|\bin\s+plaats\s+van\b|\bliever\s+dan\b",
     re.IGNORECASE,
 )
 _PREFERENCE_PATTERNS = re.compile(
+    # English
     r"\b(i\s+prefer|i\s+like|i\s+want|we\s+use|we\s+chose|let'?s\s+use|"
-    r"we\s+rely\s+on|we\s+depend\s+on)\b",
+    r"we\s+rely\s+on|we\s+depend\s+on)\b"
+    # Dutch
+    r"|\b(ik\s+prefereer|ik\s+heb\s+(?:een\s+)?voorkeur\s+voor|ik\s+wil|"
+    r"ik\s+gebruik\s+graag|(?:we|wij)\s+gebruiken|we\s+kozen(?:\s+voor)?|"
+    r"we\s+hebben\s+gekozen|laten\s+we\s+\S+\s+gebruiken|"
+    r"we\s+vertrouwen\s+op|we\s+zijn\s+afhankelijk\s+van)\b",
     re.IGNORECASE,
 )
 

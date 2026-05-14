@@ -65,6 +65,9 @@ Rules:
 - Skip relationships you are not confident about. An empty array [] is a valid answer.
 - Subject and object should be concrete named things (tools, libraries, services,
   files, modules, environments). Do not invent abstractions like "the system".
+- Excerpts may be written in languages other than English (e.g. Dutch, German,
+  French, Spanish). Extract relationships regardless; keep subject and object in
+  the original language as they appear in the text.
 """
 
 
@@ -99,6 +102,7 @@ Return the JSON array now."""
 MARKER_SYSTEM = """You identify EXPLICIT behavioral signals from a user in a conversation excerpt.
 
 Only include signals that are stated outright. Do NOT infer mood or sentiment.
+Excerpts may be in languages other than English; identify signals regardless.
 
 Allowed kinds:
 - correction: user told the assistant it was wrong about something specific.

@@ -402,7 +402,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
 | `profile_max_entries` | 16 | Max profile entries in USER.md |
 | `insights_max_entries` | 12 | Max insights in MEMORY.md |
-| `prompt_version` | `"v3"` | Bump to force full reprocessing |
+| `prompt_version` | `"v4"` | Bump to force full reprocessing |
 | `dream_budget` | 50 | Max chunks to process per dreaming cycle |
 | `max_chunks` | 50000 | Soft cap on total stored chunks |
 | `retention_days` | 90 | Chunks newer than this always kept |
@@ -412,7 +412,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**94 tests total, 100% passing** across 16 test files:
+**100 tests total, 100% passing** across 16 test files:
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling
@@ -463,5 +463,5 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - **No streaming**: The Honcho server doesn't implement SSE streaming for chat responses.
 - **Single-writer database**: WAL mode lets reads run concurrently with the writer, and dreaming/ingestion run on separate connections, but SQLite still serializes the two writers. Fine for a single-agent setup, not for multi-tenant.
 - **No authentication**: Both MCP and Honcho servers are unauthenticated — they assume localhost-only access.
-- **English-only**: Chunking, canonicalization, and the LLM prompts assume English text.
+- **Latin-script only**: Canonicalization, query-time entity matching, and the LLM prompts handle Latin-script languages (English, Dutch, French, German, Spanish, etc.) — accents are folded into canonical keys. Chunking salience triggers are tuned for English and Dutch; other languages fall back to length-based salience (the LLM is still the real filter). Non-Latin scripts (CJK, Cyrillic, Arabic) are not supported.
 - **LLM-dependent extraction quality**: While feedback learning helps, extraction quality ultimately depends on the LLM's capabilities. A weak LLM will produce noisy graphs.
