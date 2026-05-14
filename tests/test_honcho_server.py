@@ -6,7 +6,8 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
-import hymem.honcho_server as hsrv
+import hymem.honcho.app as hsrv
+from hymem.honcho.adapters import infer_role
 from tests.conftest import make_routed_llm
 
 
@@ -148,11 +149,11 @@ def test_peer_chat_returns_response_for_query(client, hy_with_embed):
 
 
 def test_role_inference_from_peer_id():
-    assert hsrv._infer_role("user-123") == "user"
-    assert hsrv._infer_role("agent-main") == "assistant"
-    assert hsrv._infer_role("hermes") == "assistant"
-    assert hsrv._infer_role("telegram-12345") == "user"
-    assert hsrv._infer_role("ai-bot") == "assistant"
+    assert infer_role("user-123") == "user"
+    assert infer_role("agent-main") == "assistant"
+    assert infer_role("hermes") == "assistant"
+    assert infer_role("telegram-12345") == "user"
+    assert infer_role("ai-bot") == "assistant"
 
 
 def test_dream_cooldown_throttles_back_to_back_calls(client, hy_with_embed):
@@ -342,3 +343,13 @@ def test_list_messages_empty_session(client, hy_with_embed):
     )
     assert r.status_code == 200
     assert r.json() == {"items": [], "total": 0, "page": 1, "size": 50, "pages": 0}
+
+
+def test_list_messages_rejects_zero_size(client, hy_with_embed):
+    # size=0 would divide-by-zero in page-count math — must be a clean 422.
+    hy_with_embed.open_session("zero-sid")
+    r = client.post(
+        "/v3/workspaces/hermes/sessions/zero-sid/messages/list",
+        json={"size": 0},
+    )
+    assert r.status_code == 422

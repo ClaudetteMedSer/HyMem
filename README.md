@@ -10,7 +10,37 @@
 
 **Two deployment modes:** an MCP tools server for direct agent integration, and a **Honcho v3-compatible HTTP server** so Hermes can use the standard `honcho-ai` SDK and treat HyMem as a drop-in replacement for Honcho's managed cloud service.
 
-**~4,500 lines of Python**, 84 tests (100% passing), zero npm, zero Docker required.
+**~4,500 lines of Python**, zero npm, zero Docker required.
+
+---
+
+## Quickstart
+
+`pip install` HyMem, point it at your model provider with environment
+variables, and run a server — no config files.
+
+```bash
+pip install 'hymem[server]'
+
+export HYMEM_LLM_API_KEY=sk-...        # extraction LLM (DeepSeek/OpenAI/...)
+export HYMEM_EMBEDDING_API_KEY=sk-...  # optional — omit for FTS-only retrieval
+export HYMEM_ROOT=~/.hermes            # optional — SQLite + Markdown live here
+
+hymem-doctor      # preflight: verify config before launching
+hymem-honcho      # Honcho v3-compatible HTTP server on :8765
+# or
+hymem-server      # MCP tools server
+```
+
+`hymem-doctor` prints the resolved provider/model/URLs and checks that the
+keys work, the endpoints are reachable, `sqlite-vec` loads, the schema
+migrates, and the embedding dimension matches any existing vector table. If the
+LLM key is missing the servers refuse to start with a clear message rather than
+failing deep inside the first request.
+
+Defaults target DeepSeek; override `HYMEM_LLM_BASE_URL` / `HYMEM_LLM_MODEL`
+(and the `HYMEM_EMBEDDING_*` equivalents) for OpenAI or any OpenAI-compatible
+endpoint. Full inventory in [§9 Configuration](#9-configuration).
 
 ---
 
@@ -322,7 +352,10 @@ A FastAPI server implementing the **full Honcho v3 REST protocol** — 721 lines
 
 ## 9. Configuration
 
-All runtime config via environment variables. No config files.
+All runtime config via environment variables. No config files. Run
+`hymem-doctor` to print the resolved configuration and preflight every check
+(keys, endpoint reachability, `sqlite-vec`, schema migration, embedding
+dimension).
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -360,7 +393,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**84 tests total, 100% passing** across 14 test files:
+**94 tests total, 100% passing** across 16 test files:
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling
@@ -375,6 +408,8 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_retract.py` — Edge retraction, alias resolution, idempotency
 - `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording
 - `test_honcho_server.py` — Full Honcho v3 protocol (18 endpoints, all passing)
+- `test_honcho_contract.py` — Real honcho-ai SDK driven against a live server (response-parse contract)
+- `test_concurrency.py` — Dreaming + ingestion + reads coexisting under WAL
 
 ---
 

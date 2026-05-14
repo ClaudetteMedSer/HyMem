@@ -35,47 +35,10 @@ is affected.
 from __future__ import annotations
 
 import json
-import logging
-import os
-from pathlib import Path
 
-from hymem import HyMem, HyMemConfig
-from hymem.contrib.openai_client import OpenAICompatibleClient
-from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
-
-log = logging.getLogger("hymem.server")
-
-
-def _build() -> HyMem:
-    root = Path(os.environ.get("HYMEM_ROOT", Path.home() / ".hermes"))
-
-    embedder = None
-    try:
-        embedder = OpenAICompatibleEmbeddingClient()
-    except Exception as e:
-        log.info("embeddings disabled (FTS-only retrieval): %s", e)
-
-    return HyMem(
-        HyMemConfig(root=root),
-        llm=OpenAICompatibleClient(),
-        embedding_client=embedder,
-    )
-
-
-_hy_instance: HyMem | None = None
-
-
-def _get_hy() -> HyMem:
-    global _hy_instance
-    if _hy_instance is None:
-        _hy_instance = _build()
-    return _hy_instance
-
-
-def set_hy(instance: HyMem) -> None:
-    """Test/integration helper: inject a pre-built HyMem instance."""
-    global _hy_instance
-    _hy_instance = instance
+# Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
+# Re-exported here under the historical names used by tests and tool helpers.
+from hymem.bootstrap import get_instance as _get_hy, set_instance as set_hy
 
 
 def _get_mcp():

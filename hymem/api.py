@@ -76,6 +76,15 @@ class HyMem:
     def set_embedding_client(self, embedding_client: EmbeddingClient) -> None:
         self._embed = embedding_client
 
+    def fork(self) -> "HyMem":
+        """Return a new HyMem on the same database with its own SQLite
+        connection, reusing this instance's LLM and embedding clients.
+
+        Used to run background dreaming on a separate connection so it does
+        not collide with live ingestion on the primary connection.
+        """
+        return HyMem(self.config, llm=self._llm, embedding_client=self._embed)
+
     # ---- session log -------------------------------------------------
 
     def open_session(self, session_id: str) -> None:
@@ -90,6 +99,20 @@ class HyMem:
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
             return session_log.append_message(self.conn, session_id, role, content)
+
+    def log_messages(
+        self, session_id: str, turns: Iterable[tuple[str, str]]
+    ) -> list[int]:
+        """Append a batch of (role, content) turns in a single transaction.
+
+        One BEGIN IMMEDIATE for the whole batch instead of one per message.
+        """
+        with core_db.transaction(self.conn):
+            session_log.open_session(self.conn, session_id)
+            return [
+                session_log.append_message(self.conn, session_id, role, content)
+                for role, content in turns
+            ]
 
     # ---- query-time --------------------------------------------------
 
