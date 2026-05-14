@@ -47,13 +47,21 @@ def _check_llm(cfg: EnvConfig) -> _Result:
             "no API key — set HYMEM_LLM_API_KEY (or DEEPSEEK_API_KEY / OPENAI_API_KEY)",
         )
     try:
-        from openai import OpenAI
+        from hymem.contrib.openai_client import OpenAICompatibleClient
+        from hymem.extraction.llm import LLMRequest
     except ImportError:
         return _Result(WARN, "extraction LLM",
                        "key present; openai package not installed, cannot verify")
+    # Probe with a minimal chat completion — the capability HyMem actually
+    # uses. /v1/models is not exposed by every OpenAI-compatible proxy, so a
+    # models.list() failure would be a false negative.
     try:
-        client = OpenAI(api_key=cfg.llm_api_key, base_url=cfg.llm_base_url)
-        client.models.list()
+        client = OpenAICompatibleClient(
+            api_key=cfg.llm_api_key, base_url=cfg.llm_base_url, model=cfg.llm_model,
+        )
+        client.complete(LLMRequest(
+            system="", user="ping", response_format="text", max_tokens=1,
+        ))
         return _Result(OK, "extraction LLM",
                        f"{cfg.llm_model} @ {cfg.llm_base_url} (reachable)")
     except Exception as exc:  # noqa: BLE001
