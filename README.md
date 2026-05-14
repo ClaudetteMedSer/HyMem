@@ -72,12 +72,16 @@ All of this is surfaced automatically to Hermes before each user message via the
            │                      │
            ▼                      ▼
     ┌──────────────┐    ┌────────────────────┐
-    │  server.py   │    │  honcho_server.py  │
+    │  server.py   │    │  honcho/  package  │
     │  7 MCP tools │    │  18 HTTP endpoints │
     └──────┬───────┘    └─────────┬──────────┘
            │                      │
            └──────────┬───────────┘
                       ▼
+              ┌──────────────┐
+              │ bootstrap.py  │  env → HyMem (shared singleton)
+              └──────┬────────┘
+                     ▼
               ┌──────────────┐
               │   api.py      │
               │  HyMem class  │
@@ -107,12 +111,19 @@ hymem/
 ├── api.py              Public HyMem class — single entry point for all ops
 ├── config.py           HyMemConfig dataclass — all tunable parameters
 ├── session.py          Session lifecycle (open/close) and message logging
+├── bootstrap.py        Env-var resolution + build_from_env() + shared singleton
+├── doctor.py           hymem-doctor — preflight diagnostics
 ├── server.py           MCP server — 7 tools (capture, log, dream, augment,
 │                         profile, alias, retract)
-├── honcho_server.py    FastAPI HTTP server — Honcho v3 protocol, 18 endpoints
+├── honcho_server.py    Back-compat shim → hymem.honcho
+│
+├── honcho/             Honcho v3-compatible HTTP server
+│   ├── app.py          FastAPI routes (18 endpoints) + entry point
+│   ├── models.py       Typed Pydantic request models (one per endpoint body)
+│   └── adapters.py     Response shaping + request-shape normalization
 │
 ├── core/
-│   ├── db.py           SQLite connection management, schema init, migrations
+│   ├── db.py           SQLite connection management (WAL), schema init, migrations
 │   ├── schema.sql      18 tables + FTS5 virtual tables + triggers
 │   └── markdown_io.py  Read/write HTML-comment-delimited sections in MD files
 │
@@ -292,9 +303,11 @@ Exposes 7 tools via the Model Context Protocol:
 | `hymem_alias` | Register surface-form→canonical mapping |
 | `hymem_retract` | Retract a wrongly extracted edge |
 
-### Honcho HTTP Server (`hymem-honcho` → `honcho_server.py`)
+### Honcho HTTP Server (`hymem-honcho` → `hymem/honcho/`)
 
-A FastAPI server implementing the **full Honcho v3 REST protocol** — 721 lines, 18 endpoints. Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
+A FastAPI server implementing a **Honcho v3-compatible REST protocol** — 18 endpoints. Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
+
+The server is a small package, not a monolith: `models.py` holds the typed Pydantic request models (so an SDK shape mismatch is a clean 422, not an `AttributeError` deep in a handler), `adapters.py` owns all response shaping and request-shape normalization (one place that knows "what shape the SDK expects"), and `app.py` holds the routes. The pinned `honcho-ai` SDK is exercised end-to-end against a live server in `test_honcho_contract.py`.
 
 | Endpoint | Maps to | Notes |
 |---|---|---|
@@ -319,6 +332,8 @@ A FastAPI server implementing the **full Honcho v3 REST protocol** — 721 lines
 
 **Key design choices in the Honcho server:**
 - **Dream cooldown**: Background dreaming kicks at most once per configurable cooldown (env: `HYMEM_DREAM_COOLDOWN_SECONDS`, default 60s). Uses FastAPI `BackgroundTasks` so the HTTP response isn't blocked.
+- **Background dreaming on a forked connection**: `_background_dream` runs on `HyMem.fork()` — a fresh SQLite connection that reuses the live instance's LLM/embedding clients — so a dream cycle never collides with concurrent `add_messages` writes.
+- **Batched ingestion**: `add_messages` logs a whole batch under one transaction via `HyMem.log_messages()` rather than one `BEGIN IMMEDIATE` per turn.
 - **Role inference**: Peer IDs matching `user[-_]|human|client|telegram|discord|slack` → user role, `agent|hermes|assistant|ai[-_]|bot|llm` → assistant role.
 - **No LLM in query path**: Search, context, and chat endpoints only call `hy.augment()` — zero LLM calls, zero latency beyond SQLite reads.
 
@@ -342,7 +357,11 @@ A FastAPI server implementing the **full Honcho v3 REST protocol** — 721 lines
 
 **Schema version guard.** The database schema version is checked against an expected constant. If a newer-schema DB is opened with older code, initialization raises a clear error rather than silently corrupting data.
 
-**No external dependencies at core.** The `hymem` package itself has zero dependencies beyond Python stdlib + SQLite. LLM clients, FastAPI, and sqlite-vec are optional extras (`hymem[server]`). The `contrib/` layer provides OpenAI-compatible clients but can be swapped via the `LLMClient` and `EmbeddingClient` Protocols.
+**WAL by default.** Every connection is opened in WAL mode with `synchronous=NORMAL` and a 10s busy timeout, set in `connect()` so it applies before any migration runs. Background dreaming and live message ingestion run on separate connections without blocking each other or query-time reads — exercised directly by `test_concurrency.py`.
+
+**Zero-config startup.** `bootstrap.build_from_env()` is the single source of truth for environment-variable resolution; both server entry points and `hymem-doctor` build on it. A missing extraction-LLM key fails fast at startup with an actionable message instead of surfacing deep inside the first request. `hymem-doctor` runs the full preflight (keys, endpoint reachability, sqlite-vec, schema migration, embedding-dimension drift) and prints the resolved provider/model/URLs.
+
+**No external dependencies at core.** The `hymem` package itself has zero dependencies beyond Python stdlib + SQLite. LLM clients, FastAPI, and sqlite-vec are optional extras (`hymem[server]`); the pinned `honcho-ai` SDK used by the contract tests is the `hymem[honcho]` extra. The `contrib/` layer provides OpenAI-compatible clients but can be swapped via the `LLMClient` and `EmbeddingClient` Protocols.
 
 **Managed Markdown sections.** `USER.md` and `MEMORY.md` use HTML comment delimiters (`<!-- HyMem:auto:section:start -->` / `<!-- HyMem:auto:section:end -->`). Humans can edit everything outside these sections; HyMem only touches its auto-sections. Atomic writes via tempfile + `os.replace()` prevent corruption.
 
@@ -426,7 +445,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | **Query interface** | FTS5 + vector + RRF + LLM rerank + graph lookup + episode/procedure search | Chat API (natural language), context (token-budgeted), hybrid search |
 | **Decay** | Co-occurrence-aware with confidence thresholds | Continual representation updates (implicit) |
 | **Self-improvement** | Feedback-driven extraction (negative examples from retractions) | Not available |
-| **Honcho SDK compat** | Full v3 protocol via honcho_server.py (18/18 endpoints) | Native |
+| **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (18 endpoints, real-SDK contract tests) | Native |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
 | **SDKs** | Python + MCP + Honcho SDK | Python + TypeScript |
 | **Maturity** | v0.1.0, ~4,500 lines | v3.0.6, 514 commits, 3.4k stars |
@@ -434,7 +453,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 **The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
 
-**HyMem can self-host the Honcho experience.** With the Honcho server fully functional (18/18 endpoints), Hermes can use the standard `honcho-ai` SDK and get the same API surface as Honcho's cloud — search, context, chat, peer management, sessions, pagination — without leaving the machine. This is HyMem's headline feature: **Honcho compatibility without any infrastructure.**
+**HyMem can self-host the Honcho experience.** With the Honcho server fully functional (18 endpoints, verified against the pinned `honcho-ai` SDK), Hermes can use the standard `honcho-ai` SDK and get the same API surface as Honcho's cloud — search, context, chat, peer management, sessions, pagination — without leaving the machine. This is HyMem's headline feature: **Honcho compatibility without any infrastructure.**
 
 ---
 
@@ -442,7 +461,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 - **O(n) vector search fallback**: Cosine similarity in pure Python is slow beyond ~5K chunks (capped at `embedding_max_scan`). sqlite-vec is integrated for ANN but not available on all platforms.
 - **No streaming**: The Honcho server doesn't implement SSE streaming for chat responses.
-- **Single database lock**: SQLite's single-writer model means concurrent dreaming + heavy querying will contend. Fine for a single-agent setup, not for multi-tenant.
+- **Single-writer database**: WAL mode lets reads run concurrently with the writer, and dreaming/ingestion run on separate connections, but SQLite still serializes the two writers. Fine for a single-agent setup, not for multi-tenant.
 - **No authentication**: Both MCP and Honcho servers are unauthenticated — they assume localhost-only access.
 - **English-only**: Chunking, canonicalization, and the LLM prompts assume English text.
 - **LLM-dependent extraction quality**: While feedback learning helps, extraction quality ultimately depends on the LLM's capabilities. A weak LLM will produce noisy graphs.
