@@ -98,6 +98,76 @@ def test_no_embedder_path_uses_entity_match(hy):
     assert not any(r.startswith("semantic_") for r in fact.why_retrieved)
 
 
+def test_no_predicate_fallback_uses_semantic_branch(hy_with_embed):
+    """When no predicate routes, every fact carries the fallback:semantic
+    reason code, proving the pure-similarity branch ran instead of the old
+    `1.0` placeholder scoring."""
+    sid = "s1"
+    hy_with_embed.open_session(sid)
+    hy_with_embed.log_message(sid, "user", "The backend talks to the storage layer.")
+    hy_with_embed.close_session(sid)
+    triples = [
+        {"subject": "backend", "predicate": "part_of", "object": "platform", "polarity": 1},
+        {"subject": "alpha", "predicate": "part_of", "object": "ecosystem", "polarity": 1},
+    ]
+    hy_with_embed.set_llm(make_routed_llm(triples, []))
+    hy_with_embed.dream()
+
+    # "tell me about the backend" hits no predicate keyword but matches the
+    # `backend` entity, so we exercise the no-predicate fallback with both
+    # entity-anchored and semantic sources contributing candidates.
+    assert route_predicates("tell me about the backend") == frozenset()
+    ctx = hy_with_embed.augment("tell me about the backend")
+    assert ctx.graph_facts
+    for fact in ctx.graph_facts:
+        assert "fallback:semantic" in fact.why_retrieved
+        # The old `1.0` placeholder reason code must not leak through.
+        assert "predicate:" not in " ".join(fact.why_retrieved)
+
+
+def test_no_predicate_entity_match_emits_boost_codes(hy_with_embed):
+    """Entity-anchored edges in the no-predicate fallback still surface with
+    both `entity_match` and `fallback:semantic`, confirming the additive
+    boost path runs alongside the semantic ranking."""
+    sid = "s1"
+    hy_with_embed.open_session(sid)
+    hy_with_embed.log_message(sid, "user", "Backend service has a part_of relationship.")
+    hy_with_embed.close_session(sid)
+    triples = [
+        {"subject": "backend", "predicate": "part_of", "object": "platform", "polarity": 1},
+    ]
+    hy_with_embed.set_llm(make_routed_llm(triples, []))
+    hy_with_embed.dream()
+
+    ctx = hy_with_embed.augment("tell me about the backend")
+    assert ctx.graph_facts
+    anchored = next(
+        (f for f in ctx.graph_facts if f.subject == "backend"), None
+    )
+    assert anchored is not None
+    assert "entity_match" in anchored.why_retrieved
+    assert "fallback:semantic" in anchored.why_retrieved
+
+
+def test_no_predicate_no_embeddings_falls_back_to_recency(hy):
+    """With no embedder and no entity match, the fallback still returns
+    recent edges ranked by confidence × recency, tagged fallback:recency."""
+    conn = hy.conn
+    seed_edge(conn, "library_recent", "part_of", "ecosystem", days_ago=1)
+    seed_edge(conn, "library_stale", "part_of", "ecosystem", days_ago=400)
+
+    # No predicate cues, no entity tokens that overlap the seeded subjects.
+    assert route_predicates("hello world this is a generic query") == frozenset()
+    ctx = hy.augment("hello world this is a generic query")
+    assert ctx.matched_entities == []
+    assert ctx.graph_facts
+    for fact in ctx.graph_facts:
+        assert "fallback:recency" in fact.why_retrieved
+    by_subj = {f.subject: f for f in ctx.graph_facts}
+    assert "library_recent" in by_subj and "library_stale" in by_subj
+    assert by_subj["library_recent"].score > by_subj["library_stale"].score
+
+
 def test_recency_reason_code(hy):
     conn = hy.conn
     seed_edge(conn, "alpha", "uses", "recent_lib", days_ago=2)

@@ -34,6 +34,11 @@ class HyMemConfig:
     graph_predicate_boost: float = 1.5
     """Score multiplier applied to edges whose predicate matches a routed predicate."""
 
+    graph_entity_match_boost: float = 0.1
+    """Additive bonus added to similarity for entity-anchored edges in the
+    no-predicate fallback. Keeps entity matches relevant without letting them
+    override semantic ranking."""
+
     decay_window_days: int = 30
     decay_factor: float = 0.9
     retract_threshold: float = 0.15

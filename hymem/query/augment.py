@@ -120,11 +120,10 @@ def augment(
     matched = match_known_entities(conn, user_message)
     ctx.matched_entities, expansion_info = _expand_entities_by_type(conn, matched)
     routed = route_predicates(user_message)
-    if ctx.matched_entities or embedding_client is not None or routed:
-        ctx.graph_facts = _graph_lookup(
-            conn, cfg, user_message, ctx.matched_entities, expansion_info, routed,
-            embedding_client=embedding_client,
-        )
+    ctx.graph_facts = _graph_lookup(
+        conn, cfg, user_message, ctx.matched_entities, expansion_info, routed,
+        embedding_client=embedding_client,
+    )
     return ctx
 
 
@@ -332,7 +331,16 @@ def _graph_lookup(
     With no embedding client the semantic source is skipped and the score
     collapses to confidence × recency × predicate_boost — close to the prior
     entity-anchored leaderboard behaviour.
+
+    When no predicate routes (`routed` is empty), the ranker switches into a
+    pure-similarity fallback: edges are ranked by cosine similarity to the
+    query, with entity-match contributing only a small additive bonus. This
+    prevents entity-anchored-only edges from crowding out semantically
+    relevant ones via the old `1.0` placeholder multiplier. If no candidate
+    has a semantic score (e.g. dreaming hasn't embedded any edges yet), the
+    fallback degrades to recency × confidence so something is still shown.
     """
+    fallback = not routed
     candidates: dict[tuple[str, str, str], dict] = {}
 
     def _ensure(row: sqlite3.Row) -> dict:
@@ -406,21 +414,42 @@ def _graph_lookup(
         for r in rows:
             _ensure(r)
 
+    has_semantic = any(c["semantic_score"] > 0 for c in candidates.values())
+
+    # Recency-only seeding: if the fallback path has no candidates at all
+    # (no entity match, no semantic hit), pull a small set of recent active
+    # edges so the graph_facts list isn't empty when something could be shown.
+    if fallback and not candidates:
+        for row in _recency_edges(conn, cfg.graph_top_k):
+            _ensure(row)
+
     results: list[GraphFact] = []
     for c in candidates.values():
         confidence = (c["pos"] + 1.0) / (c["pos"] + c["neg"] + 2.0)
         recency_weight = math.exp(-c["days_since"] / cfg.graph_recency_half_life_days)
         semantic_score = c["semantic_score"]
         in_routed = c["p"] in routed
-        predicate_boost = cfg.graph_predicate_boost if in_routed else 1.0
-        score = (
-            confidence
-            * recency_weight
-            * (semantic_score if semantic_score > 0 else 1.0)
-            * predicate_boost
-        )
 
         why: list[str] = []
+        if fallback:
+            if has_semantic:
+                entity_bonus = (
+                    cfg.graph_entity_match_boost if c["entity_match"] else 0.0
+                )
+                score = (semantic_score + entity_bonus) * confidence * recency_weight
+                why.append("fallback:semantic")
+            else:
+                score = confidence * recency_weight
+                why.append("fallback:recency")
+        else:
+            predicate_boost = cfg.graph_predicate_boost if in_routed else 1.0
+            score = (
+                confidence
+                * recency_weight
+                * (semantic_score if semantic_score > 0 else 1.0)
+                * predicate_boost
+            )
+
         if semantic_score > 0:
             why.append(f"semantic_{semantic_score:.2f}")
         if in_routed:
@@ -448,6 +477,24 @@ def _graph_lookup(
 
     results.sort(key=lambda f: f.score, reverse=True)
     return results[: cfg.graph_top_k]
+
+
+def _recency_edges(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Pull the most recent active edges by confidence × recency.
+
+    Used by the no-predicate fallback when neither entity match nor semantic
+    KNN produced any candidates, so something graph-shaped is still returned.
+    """
+    return conn.execute(
+        _EDGE_SELECT
+        + """
+        WHERE status = 'active'
+        ORDER BY (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) DESC,
+                 last_seen DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
 
 
 def _semantic_edge_hits(
