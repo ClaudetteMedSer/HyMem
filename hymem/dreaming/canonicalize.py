@@ -52,6 +52,90 @@ def register_alias(conn: sqlite3.Connection, surface: str, canonical: str) -> No
     )
 
 
+def find_canonical_drift(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Return values stored in canonical columns that fail `normalize(v) == v`.
+
+    Read-only. Surfaces write-path drift — rows that got into the DB without
+    flowing through normalize() (e.g. direct SQL writes, third-party tools,
+    or older code paths). Each item is (location, value) where location is
+    one of "entity_aliases.canonical", "entity_aliases.alias",
+    "knowledge_graph.subject_canonical", "knowledge_graph.object_canonical".
+    """
+    findings: list[tuple[str, str]] = []
+    for query, location in (
+        ("SELECT DISTINCT canonical AS v FROM entity_aliases", "entity_aliases.canonical"),
+        ("SELECT DISTINCT alias AS v FROM entity_aliases", "entity_aliases.alias"),
+        (
+            "SELECT DISTINCT subject_canonical AS v FROM knowledge_graph",
+            "knowledge_graph.subject_canonical",
+        ),
+        (
+            "SELECT DISTINCT object_canonical AS v FROM knowledge_graph",
+            "knowledge_graph.object_canonical",
+        ),
+    ):
+        for row in conn.execute(query).fetchall():
+            v = row["v"]
+            if v != normalize(v):
+                findings.append((location, v))
+    return findings
+
+
+def repair_canonical_drift(conn: sqlite3.Connection) -> list[dict]:
+    """Rewrite drifted canonicals to their normalized form.
+
+    Detects every value that fails `normalize(v) == v` across the four
+    canonical columns, then rewrites references in place. When the normalized
+    form already exists as a different canonical, edges with the same
+    (subject, predicate, object) collapse via evidence summing — the same
+    semantics as `merge()`. Caller controls the transaction.
+
+    Returns a list of `{column, from, to, collision?}` records describing
+    the fixes applied.
+    """
+    fixes: list[dict] = []
+
+    drifted_canonicals: set[str] = set()
+    for query in (
+        "SELECT DISTINCT canonical AS v FROM entity_aliases",
+        "SELECT DISTINCT subject_canonical AS v FROM knowledge_graph",
+        "SELECT DISTINCT object_canonical AS v FROM knowledge_graph",
+    ):
+        for row in conn.execute(query).fetchall():
+            v = row["v"]
+            if v != normalize(v):
+                drifted_canonicals.add(v)
+
+    for drift in sorted(drifted_canonicals):
+        target = normalize(drift)
+        merge(conn, keep=target, drop=drift)
+        # merge() preserves the drifted surface form as an alias key. We don't
+        # want un-normalized alias keys in the table — drop that artifact.
+        conn.execute("DELETE FROM entity_aliases WHERE alias = ?", (drift,))
+        fixes.append({"column": "canonical", "from": drift, "to": target})
+
+    for row in conn.execute("SELECT alias FROM entity_aliases").fetchall():
+        alias = row["alias"]
+        norm = normalize(alias)
+        if alias == norm:
+            continue
+        existing = conn.execute(
+            "SELECT 1 FROM entity_aliases WHERE alias = ?", (norm,)
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "UPDATE entity_aliases SET alias = ? WHERE alias = ?", (norm, alias)
+            )
+            fixes.append({"column": "alias", "from": alias, "to": norm})
+        else:
+            conn.execute("DELETE FROM entity_aliases WHERE alias = ?", (alias,))
+            fixes.append(
+                {"column": "alias", "from": alias, "to": norm, "collision": True}
+            )
+
+    return fixes
+
+
 def merge(conn: sqlite3.Connection, keep: str, drop: str) -> None:
     """Fold all edges and aliases referencing `drop` into `keep`.
 

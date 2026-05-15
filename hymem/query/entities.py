@@ -34,13 +34,36 @@ def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
 
     candidates_list = list(candidates)
     placeholders = ",".join("?" * len(candidates_list))
+    # The object-canonical branch applies a shape filter: an object only counts
+    # as a known entity if it looks entity-shaped — appears as a subject
+    # somewhere, has an entity_types record, or shows up as an object in more
+    # than one edge. This suppresses one-off LLM extractions where a gerund or
+    # verb form ("working") landed as an object and would otherwise match any
+    # query containing that word. The alias and subject branches pass through
+    # unfiltered: an explicit alias registration or subject-position usage are
+    # already strong entity-shape signals.
     rows = conn.execute(
         f"""
         SELECT DISTINCT canonical FROM entity_aliases WHERE alias IN ({placeholders})
         UNION
         SELECT DISTINCT subject_canonical FROM knowledge_graph WHERE subject_canonical IN ({placeholders})
         UNION
-        SELECT DISTINCT object_canonical FROM knowledge_graph WHERE object_canonical IN ({placeholders})
+        SELECT DISTINCT object_canonical FROM knowledge_graph kg
+        WHERE object_canonical IN ({placeholders})
+          AND (
+            EXISTS (
+              SELECT 1 FROM knowledge_graph
+              WHERE subject_canonical = kg.object_canonical
+            )
+            OR EXISTS (
+              SELECT 1 FROM entity_types
+              WHERE entity_canonical = kg.object_canonical
+            )
+            OR EXISTS (
+              SELECT 1 FROM knowledge_graph kg2
+              WHERE kg2.object_canonical = kg.object_canonical AND kg2.id != kg.id
+            )
+          )
         """,
         candidates_list + candidates_list + candidates_list,
     ).fetchall()

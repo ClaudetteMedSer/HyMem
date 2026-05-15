@@ -162,6 +162,39 @@ def _check_schema_and_dim(cfg: EnvConfig, live_dim: int | None) -> list[_Result]
     return results
 
 
+def _check_canonical_drift(cfg: EnvConfig) -> _Result:
+    """Surface canonicals that fail normalize(v) == v. Advisory only — auto-
+    repair can collide with existing rows and needs the operator's judgement.
+    See `hymem.dreaming.canonicalize.repair_canonical_drift` for the fix."""
+    from hymem.dreaming.canonicalize import find_canonical_drift
+
+    hy_cfg = HyMemConfig(root=cfg.root)
+    try:
+        conn = core_db.connect(hy_cfg.db_path)
+        core_db.initialize(conn)
+        findings = find_canonical_drift(conn)
+    except Exception as exc:  # noqa: BLE001
+        return _Result(WARN, "canonical drift", f"could not check: {exc}")
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not findings:
+        return _Result(OK, "canonical drift", "all canonicals are normalized")
+    by_loc: dict[str, int] = {}
+    for loc, _ in findings:
+        by_loc[loc] = by_loc.get(loc, 0) + 1
+    sample = ", ".join(f"{v!r} in {loc}" for loc, v in findings[:3])
+    breakdown = ", ".join(f"{n} in {loc}" for loc, n in sorted(by_loc.items()))
+    return _Result(
+        WARN, "canonical drift",
+        f"{len(findings)} drifted value(s) ({breakdown}); sample: {sample}. "
+        f"Run hymem.dreaming.canonicalize.repair_canonical_drift(conn) to fix.",
+    )
+
+
 def run_doctor() -> int:
     cfg = resolve_env()
 
@@ -180,6 +213,7 @@ def run_doctor() -> int:
     embedding_result, live_dim = _check_embedding(cfg)
     results.append(embedding_result)
     results.extend(_check_schema_and_dim(cfg, live_dim))
+    results.append(_check_canonical_drift(cfg))
 
     for r in results:
         print(r.render())
