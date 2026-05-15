@@ -310,6 +310,42 @@ def test_overlap_only_edges_score_lower_with_distinct_reason_code(hy):
     assert overlap.score == pytest.approx(direct.score * 0.5, rel=0.05)
 
 
+def test_token_overlap_index_cached_across_augments(hy):
+    """The token-overlap index is built once and reused — repeated augments
+    share the same dict object on the HyMem instance."""
+    seed_edge(hy.conn, "atta_van_westreenen", "prefers", "dutch")
+    seed_edge(hy.conn, "medflow", "part_of", "atta_projects")
+
+    hy.augment("tell me about atta_van_westreenen")
+    first = hy._token_overlap_index
+    assert first is not None
+    hy.augment("anything else about atta_van_westreenen")
+    hy.augment("a third call")
+    # Same object identity → no rebuild between calls.
+    assert hy._token_overlap_index is first
+
+
+def test_token_overlap_index_invalidated_after_merge(hy):
+    """In-process maintenance ops invalidate the cached index."""
+    seed_edge(hy.conn, "atta_van_westreenen", "prefers", "dutch")
+    seed_edge(hy.conn, "medflow", "part_of", "atta_projects")
+
+    hy.augment("tell me about atta_van_westreenen")
+    assert hy._token_overlap_index is not None
+
+    hy.merge_canonical(keep="atta_van_westreenen", drop="atta_projects")
+    assert hy._token_overlap_index is None
+
+
+def test_invalidate_query_caches_clears_index(hy):
+    seed_edge(hy.conn, "atta_van_westreenen", "prefers", "dutch")
+    hy.augment("tell me about atta_van_westreenen")
+    assert hy._token_overlap_index is not None
+
+    hy.invalidate_query_caches()
+    assert hy._token_overlap_index is None
+
+
 def test_overlap_skipped_when_token_too_common_end_to_end(hy):
     """With many canonicals sharing a token, token-overlap expansion declines
     to surface them — no `fallback:entity_anchored:overlap` codes appear."""

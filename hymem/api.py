@@ -11,7 +11,7 @@ from hymem.dreaming import canonicalize as canon
 from hymem.dreaming.runner import DreamReport, run_dreaming
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
-from hymem.query.augment import AugmentedContext, augment
+from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
 from hymem.query.conflicts import Conflict, find_conflicts
 
 log = logging.getLogger("hymem.api")
@@ -41,6 +41,10 @@ class HyMem:
         self._conn: sqlite3.Connection | None = None
         self._read_conn: sqlite3.Connection | None = None
         self._initialized = False
+        # Token-overlap index for entity expansion in augment(). Built lazily
+        # on first augment, invalidated after dreaming since dreaming is the
+        # only thing that mutates the canonical set.
+        self._token_overlap_index: dict[str, list[str]] | None = None
 
     # ---- lifecycle ---------------------------------------------------
 
@@ -118,10 +122,13 @@ class HyMem:
     # ---- query-time --------------------------------------------------
 
     def augment(self, user_message: str) -> AugmentedContext:
+        if self._token_overlap_index is None:
+            self._token_overlap_index = build_token_overlap_index(self.read_conn)
         return augment(
             self.read_conn, self.config, user_message,
             embedding_client=self._embed,
             llm=self._llm,
+            token_overlap_index=self._token_overlap_index,
         )
 
     def conflicts(self) -> list[Conflict]:
@@ -141,13 +148,27 @@ class HyMem:
                 "or call set_llm() before dreaming."
             )
         ids = list(session_ids) if session_ids is not None else None
-        return run_dreaming(
+        report = run_dreaming(
             self.conn,
             self.config,
             self._llm,
             session_ids=ids,
             embedding_client=self._embed,
         )
+        # Dreaming may have added, retracted, or merged canonicals — invalidate
+        # the token-overlap index so the next augment() rebuilds it.
+        self._token_overlap_index = None
+        return report
+
+    def invalidate_query_caches(self) -> None:
+        """Clear query-side caches (token-overlap index).
+
+        Call after an *external* write to the DB — e.g. a forked HyMem instance
+        completed a background dream cycle — so this instance's next augment()
+        rebuilds the index from fresh state. In-process `dream()`,
+        `merge_canonical()`, and `retract_edge()` already self-invalidate.
+        """
+        self._token_overlap_index = None
 
     def recent_dream_runs(self, limit: int = 20) -> list[dict]:
         """Return the last N dream_runs rows as dicts, newest first."""
@@ -165,6 +186,7 @@ class HyMem:
     def merge_canonical(self, keep: str, drop: str) -> None:
         with core_db.transaction(self.conn):
             canon.merge(self.conn, keep, drop)
+        self._token_overlap_index = None
 
     def retract_edge(self, subject: str, predicate: str, object: str) -> bool:
         """Mark an edge as retracted. Idempotent. Returns True if an edge was found and updated, False otherwise.
@@ -209,9 +231,10 @@ class HyMem:
                     snippet = chunk_row["text"][:600]
                     self.conn.execute(
                         """INSERT OR IGNORE INTO extraction_feedback
-                           (chunk_id, chunk_text_snippet, extracted_subject, 
+                           (chunk_id, chunk_text_snippet, extracted_subject,
                             extracted_predicate, extracted_object, feedback_type)
                            VALUES (?, ?, ?, ?, ?, 'retracted')""",
                         (er["chunk_id"], snippet, subject, predicate, object),
                     )
-            return True
+        self._token_overlap_index = None
+        return True

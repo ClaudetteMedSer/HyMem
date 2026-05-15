@@ -4,6 +4,7 @@ import json
 
 from hymem.extraction.llm import StubLLMClient
 from hymem.extraction.markers import extract_markers
+from hymem.extraction.prompts import TRIPLE_SYSTEM, build_triple_system
 from hymem.extraction.triples import extract_triples
 
 
@@ -36,6 +37,33 @@ def test_triples_handles_garbage_output():
 
     llm = StubLLMClient(default=json.dumps({"not": "an array"}))
     assert extract_triples(llm, "x") == ([], {})
+
+
+def test_triple_prompt_includes_identity_artifact_linking_nudge():
+    """The prompt must explicitly authorise people/teams/projects as entities
+    and demonstrate the linking-edge pattern, so identity-to-artifact
+    relationships ('Atta works on MedFlow') become real graph edges instead of
+    fuzzy text matches across sibling canonicals. Guard against future
+    refactors silently stripping the nudge."""
+    prompt = TRIPLE_SYSTEM
+    # Entities expanded beyond pure tech.
+    assert "people" in prompt and "teams" in prompt and "projects" in prompt
+    # Explicit linking-example pattern (subject person/team -> part_of/contains -> artifact).
+    assert "part_of" in prompt and "contains" in prompt
+    # Worked example anchors the LLM on the intended structure.
+    assert "(atta, part_of, medflow)" in prompt
+    # Entity-type vocabulary covers the new categories.
+    assert "person" in prompt and "team" in prompt and "codebase" in prompt
+
+
+def test_triple_prompt_preserves_nudge_with_negative_examples():
+    """Negative-example injection (feedback-driven extraction) must not
+    overwrite or hide the identity-artifact rule."""
+    prompt = build_triple_system(
+        negative_examples="- (foo, uses, bar) [retracted]\n"
+    )
+    assert "(atta, part_of, medflow)" in prompt
+    assert "DO NOT extract" in prompt
 
 
 def test_markers_filters_unknown_kinds():

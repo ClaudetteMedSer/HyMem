@@ -79,6 +79,9 @@ def _background_dream() -> None:
             dream_hy.dream()
         finally:
             dream_hy.close()
+        # Forked dream wrote to the shared DB; clear query caches on the
+        # live instance so the next augment() sees the fresh canonical set.
+        _get_hy().invalidate_query_caches()
         log.info("background_dream completed in %.1fs", time.monotonic() - start)
     except Exception:
         log.exception("background dreaming failed")

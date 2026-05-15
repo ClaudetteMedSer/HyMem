@@ -98,10 +98,13 @@ def build_from_env() -> HyMem:
     embedder = None
     if cfg.has_embedding_key:
         try:
-            embedder = OpenAICompatibleEmbeddingClient(
-                api_key=cfg.embedding_api_key,
-                base_url=cfg.embedding_base_url,
-                model=cfg.embedding_model,
+            from hymem.extraction.embeddings import CachedEmbeddingClient
+            embedder = CachedEmbeddingClient(
+                OpenAICompatibleEmbeddingClient(
+                    api_key=cfg.embedding_api_key,
+                    base_url=cfg.embedding_base_url,
+                    model=cfg.embedding_model,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - degrade gracefully
             log.warning("embeddings disabled (FTS-only retrieval): %s", exc)

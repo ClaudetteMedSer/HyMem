@@ -35,7 +35,7 @@ Rules:
     value_unit (string): unit for numeric values ("seconds", "MB", "rps")
     temporal_scope (string): time context ("since 2024", "during migration", "temporarily")
 - Optionally include subject_type and object_type (string) to classify entities:
-    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, or_other_tool
+    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, or_other_tool
 - Include these types ONLY when you are confident. Skip them otherwise.
 - predicate MUST be one of: {predicates}.
 - Predicate meanings:
@@ -63,8 +63,15 @@ Rules:
   Mapping for negations: "no longer uses" -> uses with polarity -1.
   Statements like "we avoid X" use predicate 'avoids' with polarity 1, NOT 'uses' with -1.
 - Skip relationships you are not confident about. An empty array [] is a valid answer.
-- Subject and object should be concrete named things (tools, libraries, services,
-  files, modules, environments). Do not invent abstractions like "the system".
+- Subject and object should be concrete named things — tools, libraries, services,
+  files, modules, environments, AND people, teams, projects, or codebases by name.
+  Do not invent abstractions like "the system".
+- When a chunk names a person or team alongside a project, codebase, or artifact
+  they own, work on, or belong to, extract the linking edge explicitly. Examples:
+    "Atta is working on MedFlow"             -> (atta, part_of, medflow)
+    "The platform team owns the auth service" -> (platform_team, contains, auth_service)
+  This makes identity-to-artifact relationships queryable as 1-hop graph edges
+  rather than fuzzy text matches across sibling canonicals.
 - Excerpts may be written in languages other than English (e.g. Dutch, German,
   French, Spanish). Extract relationships regardless; keep subject and object in
   the original language as they appear in the text.

@@ -54,7 +54,7 @@ class HyMemConfig:
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    prompt_version: str = "v4"
+    prompt_version: str = "v5"
 
     dream_budget: int = 50
     """Maximum number of chunks to process per dreaming cycle."""

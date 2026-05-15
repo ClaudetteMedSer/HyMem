@@ -86,6 +86,7 @@ def augment(
     *,
     embedding_client: EmbeddingClient | None = None,
     llm: LLMClient | None = None,
+    token_overlap_index: dict[str, list[str]] | None = None,
 ) -> AugmentedContext:
     ctx = AugmentedContext()
     if cfg.user_md_path.exists():
@@ -123,6 +124,7 @@ def augment(
         conn, matched,
         max_per_entity=cfg.graph_token_overlap_max_per_entity,
         common_token_threshold=cfg.graph_token_overlap_threshold,
+        token_index=token_overlap_index,
     )
     combined = list(type_expanded)
     for e in overlap_expanded:
@@ -670,12 +672,37 @@ def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> l
     return result
 
 
+def build_token_overlap_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Map every underscore-segment token to the active canonicals containing
+    it. Caller-cacheable; rebuild after a dream cycle that may have added,
+    retracted, or merged edges.
+
+    Public (no leading underscore) so callers — HyMem instances, background
+    workers — can build, stash, and pass it back through `augment()` to avoid
+    re-scanning the canonical set on every query. At a few hundred canonicals
+    the scan is sub-millisecond; at tens of thousands it begins to matter.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT subject_canonical AS c FROM knowledge_graph WHERE status='active' "
+        "UNION "
+        "SELECT DISTINCT object_canonical FROM knowledge_graph WHERE status='active'"
+    ).fetchall()
+    by_token: dict[str, list[str]] = {}
+    for r in rows:
+        c = r["c"]
+        for tok in c.split("_"):
+            if tok:
+                by_token.setdefault(tok, []).append(c)
+    return by_token
+
+
 def _expand_entities_by_token_overlap(
     conn: sqlite3.Connection,
     entities: list[str],
     *,
     max_per_entity: int = 5,
     common_token_threshold: int = 20,
+    token_index: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Find other canonicals sharing a rare token segment with matched entities.
 
@@ -688,6 +715,10 @@ def _expand_entities_by_token_overlap(
     dropped as noise. Returns the new entities to consider for Source 1, plus
     an `{entity: token}` map for the `overlap_via:` reason code.
 
+    Pass `token_index` to reuse a prebuilt token-segment index (see
+    `build_token_overlap_index`) so repeated `augment()` calls do not re-scan
+    the canonical set. Falls back to an on-the-fly build when None.
+
     Returns ([], {}) when no input is multi-segment or no co-occurrence is
     found in the active graph. Single-token canonicals never trigger expansion
     — there is nothing to overlap on.
@@ -699,19 +730,7 @@ def _expand_entities_by_token_overlap(
     if not multi_token:
         return [], {}
 
-    # One sweep over distinct active canonicals; build token -> [canonicals].
-    rows = conn.execute(
-        "SELECT DISTINCT subject_canonical AS c FROM knowledge_graph WHERE status='active' "
-        "UNION "
-        "SELECT DISTINCT object_canonical FROM knowledge_graph WHERE status='active'"
-    ).fetchall()
-
-    by_token: dict[str, list[str]] = {}
-    for r in rows:
-        c = r["c"]
-        for tok in c.split("_"):
-            if tok:
-                by_token.setdefault(tok, []).append(c)
+    by_token = token_index if token_index is not None else build_token_overlap_index(conn)
 
     matched_set = set(entities)
     seen: set[str] = set(matched_set)

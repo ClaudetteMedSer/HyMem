@@ -4,6 +4,7 @@ import json
 import math
 
 from hymem import HyMem, StubEmbeddingClient
+from hymem.extraction.embeddings import CachedEmbeddingClient
 from hymem.extraction.llm import StubLLMClient
 from hymem.core import db as core_db
 from hymem.query.augment import _vector_search
@@ -151,6 +152,67 @@ def test_augment_with_embedding_client_ranks_semantic_match_higher(cfg):
             assert ranks[target_hit.chunk_id] < ranks[other_hit.chunk_id]
     finally:
         hy.close()
+
+
+def test_cached_embedding_client_skips_repeat_calls():
+    """Second embed of the same text hits the cache — inner client not called."""
+    inner = StubEmbeddingClient()
+    cached = CachedEmbeddingClient(inner)
+
+    v1 = cached.embed(["hello world"])
+    v2 = cached.embed(["hello world"])
+    assert v1 == v2
+    # Inner stub saw the request once; the second call was served from cache.
+    assert len(inner.calls) == 1
+    assert cached.hits == 1
+    assert cached.misses == 1
+
+
+def test_cached_embedding_client_batch_splits_hits_and_misses():
+    """A mixed batch forwards only uncached texts and re-stitches in order."""
+    inner = StubEmbeddingClient()
+    cached = CachedEmbeddingClient(inner)
+    cached.embed(["alpha", "beta"])  # warm cache
+    inner.calls.clear()
+
+    out = cached.embed(["alpha", "gamma", "beta", "delta"])
+    # Inner only sees the misses (gamma, delta) in their input order.
+    assert inner.calls == [["gamma", "delta"]]
+    assert len(out) == 4
+    # Each output aligns with the input text — verify by recomputing on a
+    # fresh stub (deterministic hash → same vector).
+    fresh = StubEmbeddingClient()
+    expected = fresh.embed(["alpha", "gamma", "beta", "delta"])
+    assert out == expected
+
+
+def test_cached_embedding_client_lru_evicts_oldest():
+    inner = StubEmbeddingClient()
+    cached = CachedEmbeddingClient(inner, max_size=2)
+    cached.embed(["a"])      # cache order: [a]
+    cached.embed(["b"])      # cache order: [a, b]
+    cached.embed(["a"])      # HIT → cache order: [b, a]
+    cached.embed(["c"])      # MISS, evicts b (oldest) → cache: [a, c]
+    inner.calls.clear()
+
+    cached.embed(["a"])      # HIT — survives because it was just used.
+    assert inner.calls == []
+    cached.embed(["b"])      # MISS — b was the one evicted.
+    assert inner.calls == [["b"]]
+
+
+def test_cached_embedding_client_preserves_model_and_dim():
+    inner = StubEmbeddingClient()
+    cached = CachedEmbeddingClient(inner)
+    assert cached.model == inner.model
+    assert cached.dim == inner.dim
+
+
+def test_cached_embedding_client_empty_batch_short_circuits():
+    inner = StubEmbeddingClient()
+    cached = CachedEmbeddingClient(inner)
+    assert cached.embed([]) == []
+    assert inner.calls == []
 
 
 def test_vector_search_respects_embedding_max_scan(cfg):

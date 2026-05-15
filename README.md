@@ -10,7 +10,7 @@
 
 **Two deployment modes:** an MCP tools server for direct agent integration, and a **Honcho v3-compatible HTTP server** so Hermes can use the standard `honcho-ai` SDK and treat HyMem as a drop-in replacement for Honcho's managed cloud service.
 
-**~4,500 lines of Python**, zero npm, zero Docker required.
+**~5,700 lines of Python**, zero npm, zero Docker required.
 
 ---
 
@@ -112,7 +112,8 @@ hymem/
 ├── config.py           HyMemConfig dataclass — all tunable parameters
 ├── session.py          Session lifecycle (open/close) and message logging
 ├── bootstrap.py        Env-var resolution + build_from_env() + shared singleton
-├── doctor.py           hymem-doctor — preflight diagnostics
+├── doctor.py           hymem-doctor — preflight diagnostics (keys, endpoints,
+│                         sqlite-vec, schema, embedding-dim drift, canonical drift)
 ├── server.py           MCP server — 7 tools (capture, log, dream, augment,
 │                         profile, alias, retract)
 ├── honcho_server.py    Back-compat shim → hymem.honcho
@@ -130,7 +131,8 @@ hymem/
 ├── dreaming/
 │   ├── runner.py       Orchestrates full pipeline with advisory lock
 │   ├── chunks.py       Regex-based high-salience chunk extraction
-│   ├── canonicalize.py Deterministic entity name normalization + aliases
+│   ├── canonicalize.py Deterministic entity name normalization + aliases +
+│   │                   drift detection/repair (find_/repair_canonical_drift)
 │   ├── mentions.py     Entity mention indexing for decay calculations
 │   ├── embeddings.py   Batch embedding of chunks + knowledge-graph edges (JSON + sqlite-vec)
 │   ├── phase1.py       LLM extraction: triples + behavioral markers
@@ -144,17 +146,21 @@ hymem/
 │
 ├── extraction/
 │   ├── llm.py          LLMClient Protocol + StubLLMClient (for tests)
-│   ├── embeddings.py   EmbeddingClient Protocol + StubEmbeddingClient
+│   ├── embeddings.py   EmbeddingClient Protocol + StubEmbeddingClient +
+│   │                   CachedEmbeddingClient (LRU over (model, text))
 │   ├── triples.py      LLM prompt → (subject, predicate, object, polarity)
 │   ├── markers.py      LLM prompt → behavioral markers
 │   └── prompts/        System/user prompts for extraction, episodes, procedures,
 │                         summaries, and reranking
 │
 ├── query/
-│   ├── augment.py      FTS5 + vector + RRF merge + LLM rerank + hybrid graph ranker
+│   ├── augment.py      FTS5 + vector + RRF merge + LLM rerank + hybrid graph
+│   │                   ranker (routed + per-candidate fallback branches,
+│   │                   token-overlap entity expansion)
 │   ├── predicate_routing.py  Keyword → predicate mapping for query expansion
 │   ├── conflicts.py    Contradiction detection over the knowledge graph
 │   └── entities.py     Token-based entity matching against knowledge graph
+│                       (shape filter suppresses one-off gerund objects)
 │
 └── contrib/
     ├── openai_client.py          OpenAI-compatible LLM client (DeepSeek default)
@@ -212,7 +218,7 @@ Dreaming is the offline process that converts raw chat logs into structured know
 1. **Chunking**: Regex-based salience detection extracts high-signal conversation segments (min 30 chars). Chunks are persisted with a `salience_reason` field.
 2. **Entity mention indexing**: Each chunk's text is scanned for known entity surface forms, populating the `entity_mentions` inverted index.
 3. **LLM extraction**: Each unprocessed chunk is sent to the LLM with a locked-vocabulary prompt:
-   - **Triples**: `{subject, predicate, object, polarity}` where predicate must be one of 18: `uses`, `depends_on`, `prefers`, `rejects`, `avoids`, `replaces`, `conflicts_with`, `deploys_to`, `part_of`, `equivalent_to`, `implements`, `contains`, `configured_with`, `requires_version`, `runs_on`, `connects_to`, `generates`, `tested_by`. Polarity is +1 (assertion) or -1 (negation/retraction). Optional fields: `value_text`, `value_numeric`, `value_unit`, `temporal_scope`.
+   - **Triples**: `{subject, predicate, object, polarity}` where predicate must be one of 18: `uses`, `depends_on`, `prefers`, `rejects`, `avoids`, `replaces`, `conflicts_with`, `deploys_to`, `part_of`, `equivalent_to`, `implements`, `contains`, `configured_with`, `requires_version`, `runs_on`, `connects_to`, `generates`, `tested_by`. Polarity is +1 (assertion) or -1 (negation/retraction). Optional fields: `value_text`, `value_numeric`, `value_unit`, `temporal_scope`. The prompt explicitly authorises people, teams, projects, and codebases as subjects/objects, with a worked linking example — `"Atta is working on MedFlow"` → `(atta, part_of, medflow)` — so identity↔artifact relationships land as 1-hop graph edges instead of sibling canonicals that only a fuzzy text match could connect.
    - **Markers**: `{kind, statement}` where kind is one of: `correction`, `preference`, `rejection`, `style`. Only explicit behavioral signals — no mood/emotion inference.
    - **Entity types**: LLM also infers entity type labels (language, framework, database, service, tool, etc.) for query expansion.
 4. **Feedback-driven extraction**: Before processing, the runner loads up to 10 recently retracted triples from `extraction_feedback` and injects them into the prompt as negative examples: "DO NOT extract these relationships." This self-corrects past hallucination patterns.
@@ -402,6 +408,10 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 
 **No external dependencies at core.** The `hymem` package itself has zero dependencies beyond Python stdlib + SQLite. LLM clients, FastAPI, and sqlite-vec are optional extras (`hymem[server]`); the pinned `honcho-ai` SDK used by the contract tests is the `hymem[honcho]` extra. The `contrib/` layer provides OpenAI-compatible clients but can be swapped via the `LLMClient` and `EmbeddingClient` Protocols.
 
+**LRU-cached embeddings.** Cold queries are dominated by the first `embed([query])` API call. `CachedEmbeddingClient` wraps any `EmbeddingClient` with a (model, text) → vector LRU (default 128 entries) so the same query reused across Source 2 KNN + chunk vector search inside one `augment()` call — and across follow-up turns within a session — hits the cache instead of the API. `bootstrap.build_from_env()` wraps the real embedding client automatically; stub-based tests stay un-cached so they can assert against batch counts directly. Embeddings are pure functions of (model, text), so the cache needs no TTL: changing the embedding model produces a different key, and the model dimension is already guarded by `hymem-doctor`.
+
+**Token-overlap index cached on the HyMem instance.** The token→canonicals map used by `_expand_entities_by_token_overlap` is built once per HyMem instance and reused across augments, then invalidated whenever the canonical set could have shifted (`dream()`, `merge_canonical()`, `retract_edge()`). External writers — e.g. a forked HyMem completing a background dream — call `invalidate_query_caches()` on the live instance so the cooldown is observable across both connections. At a few hundred canonicals the scan is sub-millisecond; the cache exists for graphs of tens of thousands of entities where the scan begins to matter.
+
 **Managed Markdown sections.** `USER.md` and `MEMORY.md` use HTML comment delimiters (`<!-- HyMem:auto:section:start -->` / `<!-- HyMem:auto:section:end -->`). Humans can edit everything outside these sections; HyMem only touches its auto-sections. Atomic writes via tempfile + `os.replace()` prevent corruption.
 
 **Advisory lock with stale takeover.** The `run_lock` table prevents concurrent dreaming cycles. If a holder process crashes, the lock is released after 5 minutes of inactivity so the system doesn't deadlock.
@@ -450,7 +460,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
 | `profile_max_entries` | 16 | Max profile entries in USER.md |
 | `insights_max_entries` | 12 | Max insights in MEMORY.md |
-| `prompt_version` | `"v4"` | Bump to force full reprocessing |
+| `prompt_version` | `"v5"` | Bump to force full reprocessing |
 | `dream_budget` | 50 | Max chunks to process per dreaming cycle |
 | `max_chunks` | 50000 | Soft cap on total stored chunks |
 | `retention_days` | 90 | Chunks newer than this always kept |
@@ -460,15 +470,15 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**138 tests total, 100% passing** across 17 test files:
+**148 tests total, 100% passing** across 17 test files:
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling
 - `test_canonicalize.py` — Entity normalization, alias resolution, merging, canonical-drift detection and repair, entity-shape filter for object-canonical matches
 - `test_chunks.py` — Salience detection, chunk persistence
-- `test_embeddings.py` — Embedding creation and query, stub determinism
+- `test_embeddings.py` — Embedding creation and query, stub determinism, LRU cache (hit/miss accounting, batch split, eviction policy)
 - `test_augment.py` — FTS search, vector search, RRF merge, graph lookup
-- `test_graph_semantic.py` — Edge embedding, hybrid graph ranker (routed + per-candidate fallback branches), `why_retrieved` codes, predicate routing, contradiction detection
+- `test_graph_semantic.py` — Edge embedding, hybrid graph ranker (routed + per-candidate fallback branches), `why_retrieved` codes, predicate routing, contradiction detection, token-overlap entity expansion, token-overlap index cache + invalidation
 - `test_markdown_io.py` — Section read/write atomicity
 - `test_integration.py` — End-to-end capture→dream→augment, retract workflow
 - `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
@@ -498,7 +508,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (19 endpoints, real-SDK contract tests) | Native |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
 | **SDKs** | Python + MCP + Honcho SDK | Python + TypeScript |
-| **Maturity** | v0.1.0, ~4,500 lines | v3.0.6, 514 commits, 3.4k stars |
+| **Maturity** | v0.1.0, ~5,700 lines | v3.0.6, 514 commits, 3.4k stars |
 | **License** | Not specified | AGPL-3.0 |
 
 **The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, semantic-and-explainable graph ranking, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
