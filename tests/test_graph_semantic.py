@@ -98,47 +98,21 @@ def test_no_embedder_path_uses_entity_match(hy):
     assert not any(r.startswith("semantic_") for r in fact.why_retrieved)
 
 
-def test_no_predicate_fallback_uses_semantic_branch(hy_with_embed):
-    """When no predicate routes, every fact carries the fallback:semantic
-    reason code, proving the pure-similarity branch ran instead of the old
-    `1.0` placeholder scoring."""
+def test_no_predicate_entity_match_uses_entity_anchored_branch(hy_with_embed):
+    """When entities match in the no-predicate fallback, candidates score by
+    confidence × recency and carry `fallback:entity_anchored`. Source 2 is
+    skipped, so no `fallback:semantic` or `semantic_*` codes leak through."""
     sid = "s1"
     hy_with_embed.open_session(sid)
-    hy_with_embed.log_message(sid, "user", "The backend talks to the storage layer.")
+    hy_with_embed.log_message(sid, "user", "The backend is part of the platform.")
     hy_with_embed.close_session(sid)
     triples = [
         {"subject": "backend", "predicate": "part_of", "object": "platform", "polarity": 1},
-        {"subject": "alpha", "predicate": "part_of", "object": "ecosystem", "polarity": 1},
     ]
     hy_with_embed.set_llm(make_routed_llm(triples, []))
     hy_with_embed.dream()
 
-    # "tell me about the backend" hits no predicate keyword but matches the
-    # `backend` entity, so we exercise the no-predicate fallback with both
-    # entity-anchored and semantic sources contributing candidates.
     assert route_predicates("tell me about the backend") == frozenset()
-    ctx = hy_with_embed.augment("tell me about the backend")
-    assert ctx.graph_facts
-    for fact in ctx.graph_facts:
-        assert "fallback:semantic" in fact.why_retrieved
-        # The old `1.0` placeholder reason code must not leak through.
-        assert "predicate:" not in " ".join(fact.why_retrieved)
-
-
-def test_no_predicate_entity_match_emits_boost_codes(hy_with_embed):
-    """Entity-anchored edges in the no-predicate fallback still surface with
-    both `entity_match` and `fallback:semantic`, confirming the additive
-    boost path runs alongside the semantic ranking."""
-    sid = "s1"
-    hy_with_embed.open_session(sid)
-    hy_with_embed.log_message(sid, "user", "Backend service has a part_of relationship.")
-    hy_with_embed.close_session(sid)
-    triples = [
-        {"subject": "backend", "predicate": "part_of", "object": "platform", "polarity": 1},
-    ]
-    hy_with_embed.set_llm(make_routed_llm(triples, []))
-    hy_with_embed.dream()
-
     ctx = hy_with_embed.augment("tell me about the backend")
     assert ctx.graph_facts
     anchored = next(
@@ -146,7 +120,81 @@ def test_no_predicate_entity_match_emits_boost_codes(hy_with_embed):
     )
     assert anchored is not None
     assert "entity_match" in anchored.why_retrieved
-    assert "fallback:semantic" in anchored.why_retrieved
+    assert "fallback:entity_anchored" in anchored.why_retrieved
+    for fact in ctx.graph_facts:
+        assert "fallback:semantic" not in fact.why_retrieved
+        assert not any(r.startswith("semantic_") for r in fact.why_retrieved)
+
+
+def test_no_predicate_no_entities_uses_semantic_branch(hy_with_embed, monkeypatch):
+    """When no entity matches in the no-predicate fallback, Source 2 still
+    runs and ranks edges by pure similarity with `fallback:semantic`."""
+    sid = "s1"
+    hy_with_embed.open_session(sid)
+    hy_with_embed.log_message(sid, "user", "The backend is part of the platform.")
+    hy_with_embed.close_session(sid)
+    triples = [
+        {"subject": "backend", "predicate": "part_of", "object": "platform", "polarity": 1},
+    ]
+    hy_with_embed.set_llm(make_routed_llm(triples, []))
+    hy_with_embed.dream()
+
+    # Force Source 2 to produce a high-similarity candidate deterministically:
+    # return the only seeded edge's id with sim=1.0. The query is generic and
+    # matches no entity, so entity-anchored branch can't fire.
+    edge_id = hy_with_embed.conn.execute(
+        "SELECT id FROM knowledge_graph WHERE subject_canonical = 'backend'"
+    ).fetchone()["id"]
+    from hymem.query import augment as augment_mod
+    monkeypatch.setattr(
+        augment_mod, "_semantic_edge_hits",
+        lambda conn, cfg, embedder, query: [(edge_id, 1.0)],
+    )
+
+    query = "hello world generic phrase"
+    assert route_predicates(query) == frozenset()
+    ctx = hy_with_embed.augment(query)
+    assert ctx.matched_entities == []
+    assert ctx.graph_facts
+    for fact in ctx.graph_facts:
+        assert "fallback:semantic" in fact.why_retrieved
+    assert any(r.startswith("semantic_") for f in ctx.graph_facts for r in f.why_retrieved)
+
+
+def test_fallback_skips_semantic_knn_when_entities_match(hy_with_embed, monkeypatch):
+    """Regression for the YantrikDB failure: when entities match in the
+    fallback path, noisy edge-level KNN must not run at all. Otherwise a
+    surface-similarity edge like `deepseek_embedding rejects working` can
+    out-score the genuinely entity-anchored `medflow part_of atta_projects`.
+    """
+    sid = "s1"
+    hy_with_embed.open_session(sid)
+    hy_with_embed.log_message(
+        sid, "user", "Atta is part of the medflow project team."
+    )
+    hy_with_embed.close_session(sid)
+    triples = [
+        {"subject": "atta", "predicate": "part_of", "object": "medflow", "polarity": 1},
+    ]
+    hy_with_embed.set_llm(make_routed_llm(triples, []))
+    hy_with_embed.dream()
+
+    from hymem.query import augment as augment_mod
+
+    def _explode(*args, **kwargs):
+        raise AssertionError(
+            "_semantic_edge_hits must not run when entities match in fallback"
+        )
+
+    monkeypatch.setattr(augment_mod, "_semantic_edge_hits", _explode)
+
+    query = "tell me about atta"
+    assert route_predicates(query) == frozenset()
+    ctx = hy_with_embed.augment(query)
+    assert ctx.matched_entities == ["atta"]
+    assert ctx.graph_facts
+    for fact in ctx.graph_facts:
+        assert "fallback:entity_anchored" in fact.why_retrieved
 
 
 def test_no_predicate_no_embeddings_falls_back_to_recency(hy):
@@ -236,13 +284,23 @@ def test_semantic_fallback_without_sqlite_vec(hy_with_embed, monkeypatch):
     _dream_with_edges(hy_with_embed)
     # Force the Python-cosine edge path.
     monkeypatch.setattr(core_db, "_load_vec_extension", lambda conn: False)
-    ctx = hy_with_embed.augment("what does the backend use")
+
+    # Spy on the python-cosine search to verify it was actually exercised.
+    # A routed query keeps Source 2 active (it isn't skipped in the routed
+    # branch, only in the no-predicate entity-anchored fallback).
+    from hymem.query import augment as augment_mod
+    calls: list[bool] = []
+    orig = augment_mod._python_cosine_edge_search
+
+    def _spy(*args, **kwargs):
+        calls.append(True)
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(augment_mod, "_python_cosine_edge_search", _spy)
+
+    ctx = hy_with_embed.augment("what technologies does the backend use")
     assert ctx.graph_facts
-    assert any(
-        r.startswith("semantic_")
-        for f in ctx.graph_facts
-        for r in f.why_retrieved
-    )
+    assert calls, "python-cosine edge search should run when vec extension is off"
 
 
 def test_recency_weight_math():

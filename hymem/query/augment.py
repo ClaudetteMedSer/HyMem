@@ -333,12 +333,15 @@ def _graph_lookup(
     entity-anchored leaderboard behaviour.
 
     When no predicate routes (`routed` is empty), the ranker switches into a
-    pure-similarity fallback: edges are ranked by cosine similarity to the
-    query, with entity-match contributing only a small additive bonus. This
-    prevents entity-anchored-only edges from crowding out semantically
-    relevant ones via the old `1.0` placeholder multiplier. If no candidate
-    has a semantic score (e.g. dreaming hasn't embedded any edges yet), the
-    fallback degrades to recency × confidence so something is still shown.
+    fallback with per-candidate scoring:
+      - Entity-anchored candidates score by confidence × recency. Edge-level
+        embeddings are too noisy ("rejects working" matches "projects working"
+        for surface reasons) to compete with a deterministic entity hit, so
+        Source 2 is skipped entirely when entities matched.
+      - Semantic-only candidates (only present when no entity matched) score
+        by similarity × confidence × recency.
+      - Otherwise (no signal at all) score collapses to confidence × recency
+        over a recent-edges seed so something graph-shaped is still shown.
     """
     fallback = not routed
     candidates: dict[tuple[str, str, str], dict] = {}
@@ -384,8 +387,11 @@ def _graph_lookup(
             if entity in expansion_info:
                 c["entity_types"].add(expansion_info[entity])
 
-    # Source 2 — semantic KNN (only with an embedding client).
-    if embedding_client is not None:
+    # Source 2 — semantic KNN. Skipped in the fallback path when entities
+    # matched: edge-level embeddings are short and noisy, so they crowd out
+    # entity-anchored candidates when the user named a known entity.
+    skip_semantic = fallback and bool(entities)
+    if embedding_client is not None and not skip_semantic:
         for edge_id, semantic_score in _semantic_edge_hits(
             conn, cfg, embedding_client, query
         ):
@@ -414,8 +420,6 @@ def _graph_lookup(
         for r in rows:
             _ensure(r)
 
-    has_semantic = any(c["semantic_score"] > 0 for c in candidates.values())
-
     # Recency-only seeding: if the fallback path has no candidates at all
     # (no entity match, no semantic hit), pull a small set of recent active
     # edges so the graph_facts list isn't empty when something could be shown.
@@ -432,11 +436,11 @@ def _graph_lookup(
 
         why: list[str] = []
         if fallback:
-            if has_semantic:
-                entity_bonus = (
-                    cfg.graph_entity_match_boost if c["entity_match"] else 0.0
-                )
-                score = (semantic_score + entity_bonus) * confidence * recency_weight
+            if c["entity_match"]:
+                score = confidence * recency_weight
+                why.append("fallback:entity_anchored")
+            elif semantic_score > 0:
+                score = semantic_score * confidence * recency_weight
                 why.append("fallback:semantic")
             else:
                 score = confidence * recency_weight
