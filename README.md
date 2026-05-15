@@ -73,7 +73,7 @@ All of this is surfaced automatically to Hermes before each user message via the
            ▼                      ▼
     ┌──────────────┐    ┌────────────────────┐
     │  server.py   │    │  honcho/  package  │
-    │  7 MCP tools │    │  18 HTTP endpoints │
+    │  7 MCP tools │    │  19 HTTP endpoints │
     └──────┬───────┘    └─────────┬──────────┘
            │                      │
            └──────────┬───────────┘
@@ -118,7 +118,7 @@ hymem/
 ├── honcho_server.py    Back-compat shim → hymem.honcho
 │
 ├── honcho/             Honcho v3-compatible HTTP server
-│   ├── app.py          FastAPI routes (18 endpoints) + entry point
+│   ├── app.py          FastAPI routes (19 endpoints) + entry point
 │   ├── models.py       Typed Pydantic request models (one per endpoint body)
 │   └── adapters.py     Response shaping + request-shape normalization
 │
@@ -286,17 +286,26 @@ Each `GraphFact` carries the edge (`subject`, `predicate`, `object`), its `confi
 5. **LLM reranking** (`_rerank`, optional): When FTS and vector disagree on the #1 result enough to trigger ambiguity (configurable threshold), the LLM scores each candidate's relevance to the query on a 1-5 scale. RRF and LLM scores are combined for final ranking.
 6. **Episode search** (`_episode_search`): FTS5 search over episode titles and summaries for the query.
 7. **Procedure search** (`_procedure_search`): FTS5 search over procedure names, descriptions, and steps.
-8. **Entity matching** (`match_known_entities`): Tokenize the user message (including 2-3 word n-grams), lookup each token against `entity_aliases`, return canonical IDs.
-9. **Entity type expansion** (`_expand_entities_by_type`): For matched entities, find other entities of the same type (e.g., if user mentions `uv`, also surface `pip` and `poetry` since they're all `package_manager` type). Records which type surfaced each expanded entity for the `entity_type:` reason code.
+8. **Entity matching** (`match_known_entities`): Tokenize the user message (including 2-3 word n-grams), normalize each, and look them up against `entity_aliases` and the graph's canonical names. The object-canonical branch applies a *shape filter* — an object only counts as a known entity if it also appears as a subject, has an `entity_types` record, or shows up as an object in more than one edge. This suppresses one-off LLM extractions where a gerund or verb form (e.g. "working") landed as an edge object and would otherwise match any query containing that word.
+9. **Entity expansion** — two complementary fuzzy-link layers:
+    - **Type expansion** (`_expand_entities_by_type`): for each matched entity, find other entities of the same type (e.g., if user mentions `uv`, also surface `pip` and `poetry` since they're all `package_manager`). Records the type for the `entity_type:` reason code.
+    - **Token-overlap expansion** (`_expand_entities_by_token_overlap`): for each multi-segment matched canonical (e.g. `atta_van_westreenen`), look up other canonicals that share a *rare* underscore-segment as a complete token. Common tokens (`system`, `data`, … — anything appearing in more than `graph_token_overlap_threshold` canonicals) are dropped as noise. Closes the gap where the LLM extracted sibling canonicals (`atta_van_westreenen` and `atta_projects`) without a linking edge. Edges anchored *only* via this fuzzy link score at `graph_token_overlap_weight × confidence × recency` and carry `fallback:entity_anchored:overlap` + `overlap_via:{token}` reason codes, so they surface without out-ranking direct entity matches.
 10. **Predicate routing** (`predicate_routing.py`): Map natural-language cues in the query to typed predicates — "what technologies" → `uses`/`runs_on`, "depends on" → `depends_on`, "configured" → `configured_with`, etc. Routing only ever *adds* signal: matching predicates get a score boost and a `predicate:` reason code, but no edge is ever filtered out.
-11. **Hybrid graph ranker** (`_graph_lookup`): Gathers candidate edges from three sources — entity-anchored lookup (the entity appears as subject/object), semantic KNN against `vec_edges` (the query is embedded and matched against edge embeddings; falls back to Python cosine over `edge_embeddings` when sqlite-vec is unavailable), and predicate-routed lookup. Each unique edge is then scored:
+11. **Hybrid graph ranker** (`_graph_lookup`): Gathers candidate edges from three sources — entity-anchored lookup (the entity appears as subject/object), semantic KNN against `vec_edges` (Python cosine over `edge_embeddings` when sqlite-vec is unavailable), and predicate-routed lookup. Scoring branches on whether the query routed any predicate.
 
+    **Routed path** — at least one predicate keyword matched:
     ```
-    score = confidence × recency_weight × semantic_score × predicate_boost
-    recency_weight = exp(-days_since_last_seen / graph_recency_half_life_days)
+    score = confidence × recency_weight × (semantic_score if > 0 else 1.0) × predicate_boost
     ```
+    All three sources merge; predicate-matched edges get the `graph_predicate_boost` multiplier (default 1.5×).
 
-    With no embedding client the semantic term drops out and the score collapses to `confidence × recency × predicate_boost` — close to the prior confidence-and-recency leaderboard. The top `graph_top_k` (default: 8) edges are returned, each with its `why_retrieved` reason codes.
+    **Fallback path** — no predicate routed. Source 2 KNN is *skipped when entities matched* (edge-level embeddings over `"subject predicate object"` strings are short and noisy enough that they crowd out a deterministic entity hit), and each candidate scores by its own signal:
+    - `fallback:entity_anchored` — entity-matched edges score `confidence × recency_weight`.
+    - `fallback:entity_anchored:overlap` — same, but the edge was reached *only* via token-overlap expansion (no direct or type-expanded anchor): `graph_token_overlap_weight × confidence × recency_weight`. The triggering token is surfaced as `overlap_via:{token}`.
+    - `fallback:semantic` — no entity matched, embedder present, KNN returned candidates: `semantic_score × confidence × recency_weight`.
+    - `fallback:recency` — nothing else fired (e.g. dreaming hasn't embedded yet): `confidence × recency_weight` over a recent-edges seed so something graph-shaped is still shown.
+
+    `recency_weight = exp(-days_since_last_seen / graph_recency_half_life_days)`. The top `graph_top_k` (default: 8) edges are returned, each tagged with its branch in `why_retrieved` alongside accumulated codes (`semantic_X.XX`, `predicate:p`, `entity_type:t`, `recency_Nd`, `entity_match`).
 
 Hermes then assembles the prompt with this context — HyMem never dictates prompt structure.
 
@@ -329,7 +338,7 @@ Exposes 7 tools via the Model Context Protocol:
 
 ### Honcho HTTP Server (`hymem-honcho` → `hymem/honcho/`)
 
-A FastAPI server implementing a **Honcho v3-compatible REST protocol** — 18 endpoints. Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
+A FastAPI server implementing a **Honcho v3-compatible REST protocol** — 19 endpoints. Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
 
 The server is a small package, not a monolith: `models.py` holds the typed Pydantic request models (so an SDK shape mismatch is a clean 422, not an `AttributeError` deep in a handler), `adapters.py` owns all response shaping and request-shape normalization (one place that knows "what shape the SDK expects"), and `app.py` holds the routes. The pinned `honcho-ai` SDK is exercised end-to-end against a live server in `test_honcho_contract.py`.
 
@@ -351,7 +360,8 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 | `GET .../peers/{pid}/card` | USER.md behavioral profile | |
 | `GET .../peers/{pid}/context` | Peer-scoped context with optional search | |
 | `POST .../peers/{pid}/representation` | Update peer representation | |
-| `POST .../peers/{pid}/chat` | Dialectic Q&A via `hy.augment()` | Natural language queries |
+| `POST .../peers/{pid}/chat` | Dialectic Q&A via `hy.augment()` | Returns prose + structured `facts[]` with `why` |
+| `GET /v3/workspaces/{wid}/conflicts` | `hy.conflicts()` over the graph | Pure SQL, no LLM call |
 | `GET /health` | Health check | |
 
 **Key design choices in the Honcho server:**
@@ -360,6 +370,7 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 - **Batched ingestion**: `add_messages` logs a whole batch under one transaction via `HyMem.log_messages()` rather than one `BEGIN IMMEDIATE` per turn.
 - **Role inference**: Peer IDs matching `user[-_]|human|client|telegram|discord|slack` → user role, `agent|hermes|assistant|ai[-_]|bot|llm` → assistant role.
 - **No LLM in query path**: Search, context, and chat endpoints only call `hy.augment()` — zero LLM calls, zero latency beyond SQLite reads.
+- **Explainability surfaced as metadata, not prose**: `graph_fact` results carry `metadata.why` with the ranker's reason codes (`fallback:entity_anchored`, `semantic_0.83`, `predicate:uses`, `recency_3d`, …). The `/chat` endpoint returns clean prose alongside a structured `facts[]` array — Hermes-friendly text without losing the trail.
 
 ---
 
@@ -375,7 +386,7 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 
 **Transitive inference.** `depends_on` edges are transitively closed via BFS after each dreaming cycle. If `api depends_on postgres` and `postgres depends_on docker`, a derived edge `api depends_on docker` is added (marked `derived=1`, confidence = product of edge confidences). Derived edges are recomputed from scratch each cycle and excluded from decay.
 
-**Semantic, explainable graph retrieval.** The knowledge graph isn't just keyword-matched — edges are embedded during dreaming, so `augment()` ranks them against the query by `semantic × confidence × recency × predicate_boost`. Every returned fact carries `why_retrieved` reason codes derived directly from that formula, so the agent sees *why* a fact was surfaced without a second LLM call. When no embedding client is configured the ranker degrades gracefully to confidence-and-recency ordering.
+**Semantic, explainable graph retrieval.** The knowledge graph isn't just keyword-matched — edges are embedded during dreaming, so `augment()` ranks them against the query. When a predicate routes, scoring is `semantic × confidence × recency × predicate_boost`; otherwise a per-candidate fallback fires (`fallback:entity_anchored`, `fallback:semantic`, or `fallback:recency`) that won't let noisy edge-level KNN drown out a deterministic entity hit. Every returned fact carries `why_retrieved` reason codes derived directly from whichever branch fired, so the agent sees *why* a fact was surfaced without a second LLM call. With no embedding client the ranker degrades gracefully to confidence-and-recency ordering.
 
 **Feedback-driven extraction.** When an edge is retracted, its chunk text and the extracted triple are stored in `extraction_feedback`. Before the next dreaming cycle, up to 10 recent retractions are injected as negative examples into the extraction prompt, teaching the LLM to avoid repeating past mistakes.
 
@@ -383,9 +394,11 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 
 **Schema version guard.** The database schema version is checked against an expected constant. If a newer-schema DB is opened with older code, initialization raises a clear error rather than silently corrupting data.
 
+**Canonical normalization at write, drift check at read.** Every entity name flowing into `entity_aliases` and `knowledge_graph` goes through `canonicalize.normalize()`. If a third-party tool or older code path ever writes around it, `find_canonical_drift()` surfaces the rows where `normalize(v) != v` and `hymem-doctor` flags them. `repair_canonical_drift()` rewrites drifted canonicals with `merge()` semantics — evidence sums on collision so two drifted forms of the same entity collapse cleanly. Auto-repair is opt-in; the doctor only reports, because rewriting a canonical can collide with an existing row and merge decisions belong to the operator.
+
 **WAL by default.** Every connection is opened in WAL mode with `synchronous=NORMAL` and a 10s busy timeout, set in `connect()` so it applies before any migration runs. Background dreaming and live message ingestion run on separate connections without blocking each other or query-time reads — exercised directly by `test_concurrency.py`.
 
-**Zero-config startup.** `bootstrap.build_from_env()` is the single source of truth for environment-variable resolution; both server entry points and `hymem-doctor` build on it. A missing extraction-LLM key fails fast at startup with an actionable message instead of surfacing deep inside the first request. `hymem-doctor` runs the full preflight (keys, endpoint reachability, sqlite-vec, schema migration, embedding-dimension drift) and prints the resolved provider/model/URLs.
+**Zero-config startup.** `bootstrap.build_from_env()` is the single source of truth for environment-variable resolution; both server entry points and `hymem-doctor` build on it. A missing extraction-LLM key fails fast at startup with an actionable message instead of surfacing deep inside the first request. `hymem-doctor` runs the full preflight (keys, endpoint reachability, sqlite-vec, schema migration, embedding-dimension drift, canonical-form drift in `entity_aliases` / `knowledge_graph`) and prints the resolved provider/model/URLs.
 
 **No external dependencies at core.** The `hymem` package itself has zero dependencies beyond Python stdlib + SQLite. LLM clients, FastAPI, and sqlite-vec are optional extras (`hymem[server]`); the pinned `honcho-ai` SDK used by the contract tests is the `hymem[honcho]` extra. The `contrib/` layer provides OpenAI-compatible clients but can be swapped via the `LLMClient` and `EmbeddingClient` Protocols.
 
@@ -429,6 +442,9 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `graph_recency_half_life_days` | 30.0 | Half-life for edge recency decay |
 | `graph_recency_recent_days` | 7.0 | `days_since` under this emits a `recency_Nd` reason code |
 | `graph_predicate_boost` | 1.5 | Score multiplier for routed-predicate edges |
+| `graph_token_overlap_weight` | 0.5 | Score multiplier for overlap-only entity-anchored edges |
+| `graph_token_overlap_threshold` | 20 | Token segment shared by more than this many canonicals is treated as common-token noise |
+| `graph_token_overlap_max_per_entity` | 5 | Max token-overlap expansions per matched canonical |
 | `decay_window_days` | 30 | Decay look-back window |
 | `decay_factor` | 0.9 | (reserved, not yet used) |
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
@@ -444,22 +460,22 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**113 tests total, 100% passing** across 17 test files:
+**138 tests total, 100% passing** across 17 test files:
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling
-- `test_canonicalize.py` — Entity normalization, alias resolution, merging
+- `test_canonicalize.py` — Entity normalization, alias resolution, merging, canonical-drift detection and repair, entity-shape filter for object-canonical matches
 - `test_chunks.py` — Salience detection, chunk persistence
 - `test_embeddings.py` — Embedding creation and query, stub determinism
 - `test_augment.py` — FTS search, vector search, RRF merge, graph lookup
-- `test_graph_semantic.py` — Edge embedding, hybrid graph ranker, `why_retrieved` codes, predicate routing, contradiction detection
+- `test_graph_semantic.py` — Edge embedding, hybrid graph ranker (routed + per-candidate fallback branches), `why_retrieved` codes, predicate routing, contradiction detection
 - `test_markdown_io.py` — Section read/write atomicity
 - `test_integration.py` — End-to-end capture→dream→augment, retract workflow
 - `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
 - `test_mcp_server.py` — MCP tool correctness (all 7 tools)
 - `test_retract.py` — Edge retraction, alias resolution, idempotency
 - `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording
-- `test_honcho_server.py` — Full Honcho v3 protocol (18 endpoints, all passing)
+- `test_honcho_server.py` — Full Honcho v3 protocol (19 endpoints, all passing)
 - `test_honcho_contract.py` — Real honcho-ai SDK driven against a live server (response-parse contract)
 - `test_concurrency.py` — Dreaming + ingestion + reads coexisting under WAL
 
@@ -479,7 +495,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | **Decay** | Co-occurrence-aware with confidence thresholds | Continual representation updates (implicit) |
 | **Contradiction detection** | `conflicts()` surfaces competing-object and opposing-predicate edges (pure SQL) | Not available |
 | **Self-improvement** | Feedback-driven extraction (negative examples from retractions) | Not available |
-| **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (18 endpoints, real-SDK contract tests) | Native |
+| **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (19 endpoints, real-SDK contract tests) | Native |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
 | **SDKs** | Python + MCP + Honcho SDK | Python + TypeScript |
 | **Maturity** | v0.1.0, ~4,500 lines | v3.0.6, 514 commits, 3.4k stars |
@@ -487,7 +503,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 **The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, semantic-and-explainable graph ranking, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
 
-**HyMem can self-host the Honcho experience.** With the Honcho server fully functional (18 endpoints, verified against the pinned `honcho-ai` SDK), Hermes can use the standard `honcho-ai` SDK and get the same API surface as Honcho's cloud — search, context, chat, peer management, sessions, pagination — without leaving the machine. This is HyMem's headline feature: **Honcho compatibility without any infrastructure.**
+**HyMem can self-host the Honcho experience.** With the Honcho server fully functional (19 endpoints, verified against the pinned `honcho-ai` SDK), Hermes can use the standard `honcho-ai` SDK and get the same API surface as Honcho's cloud — search, context, chat, peer management, sessions, pagination — without leaving the machine. This is HyMem's headline feature: **Honcho compatibility without any infrastructure.**
 
 ---
 

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from hymem.core import db as core_db
+from hymem.dreaming.canonicalize import register_alias
+from hymem.query.augment import _expand_entities_by_token_overlap
 from hymem.query.conflicts import find_conflicts
 from hymem.query.predicate_routing import route_predicates
 from tests.conftest import make_routed_llm, seed_edge
@@ -229,6 +233,96 @@ def test_recency_reason_code(hy):
     )
     # Recent edge outranks the stale one.
     assert by_obj["recent_lib"].score > by_obj["old_lib"].score
+
+
+# --- token-overlap entity expansion ----------------------------------------
+
+
+def test_token_overlap_finds_compound_via_rare_segment(hy):
+    """The Q3 case: a matched person entity surfaces the related project
+    entity via the shared rare token segment."""
+    conn = hy.conn
+    seed_edge(conn, "atta_van_westreenen", "prefers", "dutch")
+    seed_edge(conn, "medflow", "part_of", "atta_projects")
+
+    expansions, overlap_info = _expand_entities_by_token_overlap(
+        conn, ["atta_van_westreenen"],
+        max_per_entity=5, common_token_threshold=20,
+    )
+    assert "atta_projects" in expansions
+    assert overlap_info["atta_projects"] == "atta"
+
+
+def test_token_overlap_skips_common_tokens(hy):
+    """Tokens appearing in more than `common_token_threshold` canonicals are
+    treated as noise and do not drive expansion."""
+    conn = hy.conn
+    seed_edge(conn, "system_a", "uses", "x")
+    seed_edge(conn, "system_b", "uses", "y")
+    seed_edge(conn, "system_c", "uses", "z")
+
+    expansions, _ = _expand_entities_by_token_overlap(
+        conn, ["system_a"], max_per_entity=5, common_token_threshold=2,
+    )
+    assert expansions == []
+
+
+def test_token_overlap_skips_single_token_input(hy):
+    """A single-segment canonical has no token to overlap on."""
+    conn = hy.conn
+    seed_edge(conn, "atta_projects", "uses", "x")
+
+    expansions, _ = _expand_entities_by_token_overlap(conn, ["atta"])
+    assert expansions == []
+
+
+def test_overlap_only_edges_score_lower_with_distinct_reason_code(hy):
+    """End-to-end: edges anchored only via token-overlap expansion get
+    `fallback:entity_anchored:overlap` and a downweighted score vs directly-
+    anchored edges in the same query."""
+    conn = hy.conn
+    register_alias(conn, "atta", "atta_van_westreenen")
+    seed_edge(conn, "atta_van_westreenen", "prefers", "dutch")
+    seed_edge(conn, "medflow", "part_of", "atta_projects")
+
+    ctx = hy.augment("tell me about atta")
+
+    direct = next(
+        (f for f in ctx.graph_facts if f.subject == "atta_van_westreenen"),
+        None,
+    )
+    overlap = next(
+        (f for f in ctx.graph_facts if f.object == "atta_projects"),
+        None,
+    )
+    assert direct is not None, "directly-matched edge should be present"
+    assert overlap is not None, "overlap-expanded edge should be present"
+
+    assert "fallback:entity_anchored" in direct.why_retrieved
+    assert "fallback:entity_anchored:overlap" not in direct.why_retrieved
+
+    assert "fallback:entity_anchored:overlap" in overlap.why_retrieved
+    assert "overlap_via:atta" in overlap.why_retrieved
+
+    # Default overlap weight is 0.5 — same confidence and recency, so the
+    # overlap edge should score roughly half the directly-anchored one.
+    assert overlap.score < direct.score
+    assert overlap.score == pytest.approx(direct.score * 0.5, rel=0.05)
+
+
+def test_overlap_skipped_when_token_too_common_end_to_end(hy):
+    """With many canonicals sharing a token, token-overlap expansion declines
+    to surface them — no `fallback:entity_anchored:overlap` codes appear."""
+    conn = hy.conn
+    register_alias(conn, "atta", "atta_van_westreenen")
+    seed_edge(conn, "atta_van_westreenen", "prefers", "dutch")
+    # Seed 25 canonicals all containing token "atta" → "atta" is too common.
+    for i in range(25):
+        seed_edge(conn, f"atta_other_{i}", "part_of", f"obj_{i}")
+
+    ctx = hy.augment("tell me about atta")
+    for fact in ctx.graph_facts:
+        assert "fallback:entity_anchored:overlap" not in fact.why_retrieved
 
 
 # --- predicate routing (pure) ----------------------------------------------

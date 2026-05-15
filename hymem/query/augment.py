@@ -118,10 +118,21 @@ def augment(
     ctx.procedures = _procedure_search(conn, user_message, top_k=cfg.fts_top_k)
 
     matched = match_known_entities(conn, user_message)
-    ctx.matched_entities, expansion_info = _expand_entities_by_type(conn, matched)
+    type_expanded, expansion_info = _expand_entities_by_type(conn, matched)
+    overlap_expanded, overlap_info = _expand_entities_by_token_overlap(
+        conn, matched,
+        max_per_entity=cfg.graph_token_overlap_max_per_entity,
+        common_token_threshold=cfg.graph_token_overlap_threshold,
+    )
+    combined = list(type_expanded)
+    for e in overlap_expanded:
+        if e not in combined:
+            combined.append(e)
+    ctx.matched_entities = combined
     routed = route_predicates(user_message)
     ctx.graph_facts = _graph_lookup(
         conn, cfg, user_message, ctx.matched_entities, expansion_info, routed,
+        overlap_info=overlap_info,
         embedding_client=embedding_client,
     )
     return ctx
@@ -323,6 +334,7 @@ def _graph_lookup(
     expansion_info: dict[str, str],
     routed: frozenset[str],
     *,
+    overlap_info: dict[str, str] | None = None,
     embedding_client: EmbeddingClient | None = None,
 ) -> list[GraphFact]:
     """Hybrid edge ranker: gathers candidates from entity matches, semantic KNN,
@@ -344,6 +356,7 @@ def _graph_lookup(
         over a recent-edges seed so something graph-shaped is still shown.
     """
     fallback = not routed
+    overlap_info = overlap_info or {}
     candidates: dict[tuple[str, str, str], dict] = {}
 
     def _ensure(row: sqlite3.Row) -> dict:
@@ -364,6 +377,8 @@ def _graph_lookup(
                 "semantic_score": 0.0,
                 "entity_match": False,
                 "entity_types": set(),
+                "overlap_tokens": set(),
+                "direct_anchor": False,
             }
             candidates[key] = c
         return c
@@ -386,6 +401,12 @@ def _graph_lookup(
             c["entity_match"] = True
             if entity in expansion_info:
                 c["entity_types"].add(expansion_info[entity])
+            if entity in overlap_info:
+                c["overlap_tokens"].add(overlap_info[entity])
+            else:
+                # Any non-overlap anchor (direct match or type expansion) means
+                # the edge isn't *only* surfaced via token-overlap — full weight.
+                c["direct_anchor"] = True
 
     # Source 2 — semantic KNN. Skipped in the fallback path when entities
     # matched: edge-level embeddings are short and noisy, so they crowd out
@@ -437,8 +458,19 @@ def _graph_lookup(
         why: list[str] = []
         if fallback:
             if c["entity_match"]:
-                score = confidence * recency_weight
-                why.append("fallback:entity_anchored")
+                overlap_only = not c["direct_anchor"]
+                if overlap_only:
+                    score = (
+                        cfg.graph_token_overlap_weight
+                        * confidence
+                        * recency_weight
+                    )
+                    why.append("fallback:entity_anchored:overlap")
+                    for tok in sorted(c["overlap_tokens"]):
+                        why.append(f"overlap_via:{tok}")
+                else:
+                    score = confidence * recency_weight
+                    why.append("fallback:entity_anchored")
             elif semantic_score > 0:
                 score = semantic_score * confidence * recency_weight
                 why.append("fallback:semantic")
@@ -636,6 +668,74 @@ def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> l
             score=float(r["score"]),
         ))
     return result
+
+
+def _expand_entities_by_token_overlap(
+    conn: sqlite3.Connection,
+    entities: list[str],
+    *,
+    max_per_entity: int = 5,
+    common_token_threshold: int = 20,
+) -> tuple[list[str], dict[str, str]]:
+    """Find other canonicals sharing a rare token segment with matched entities.
+
+    A matched canonical like `atta_van_westreenen` has segments `atta`, `van`,
+    `westreenen`. For each segment, look up other canonicals containing that
+    token as a complete underscore-delimited segment — so `atta_projects`
+    surfaces via the `atta` token while keeping single-prefix collisions like
+    `attach_handler` out (different segment). Common tokens appearing in more
+    than `common_token_threshold` canonicals (`system`, `service`, `data`) are
+    dropped as noise. Returns the new entities to consider for Source 1, plus
+    an `{entity: token}` map for the `overlap_via:` reason code.
+
+    Returns ([], {}) when no input is multi-segment or no co-occurrence is
+    found in the active graph. Single-token canonicals never trigger expansion
+    — there is nothing to overlap on.
+    """
+    if not entities:
+        return [], {}
+
+    multi_token = [e for e in entities if "_" in e]
+    if not multi_token:
+        return [], {}
+
+    # One sweep over distinct active canonicals; build token -> [canonicals].
+    rows = conn.execute(
+        "SELECT DISTINCT subject_canonical AS c FROM knowledge_graph WHERE status='active' "
+        "UNION "
+        "SELECT DISTINCT object_canonical FROM knowledge_graph WHERE status='active'"
+    ).fetchall()
+
+    by_token: dict[str, list[str]] = {}
+    for r in rows:
+        c = r["c"]
+        for tok in c.split("_"):
+            if tok:
+                by_token.setdefault(tok, []).append(c)
+
+    matched_set = set(entities)
+    seen: set[str] = set(matched_set)
+    expansions: list[str] = []
+    overlap_info: dict[str, str] = {}
+
+    for entity in multi_token:
+        added = 0
+        for tok in entity.split("_"):
+            if not tok or added >= max_per_entity:
+                continue
+            holders = by_token.get(tok, [])
+            if len(holders) > common_token_threshold:
+                continue  # common-token noise (`system`, `data`, …)
+            for c in holders:
+                if c in seen:
+                    continue
+                seen.add(c)
+                expansions.append(c)
+                overlap_info[c] = tok
+                added += 1
+                if added >= max_per_entity:
+                    break
+    return expansions, overlap_info
 
 
 def _expand_entities_by_type(

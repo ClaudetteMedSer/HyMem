@@ -34,6 +34,19 @@ class HyMemConfig:
     graph_predicate_boost: float = 1.5
     """Score multiplier applied to edges whose predicate matches a routed predicate."""
 
+    graph_token_overlap_weight: float = 0.5
+    """Score multiplier for entity-anchored edges in the fallback path when the
+    anchoring entity was reached only via token-overlap expansion (and not via
+    direct entity match or type expansion). Keeps fuzzy entity links present
+    without letting them outrank direct hits."""
+
+    graph_token_overlap_threshold: int = 20
+    """A token segment shared by more than this many canonicals is considered
+    too common to drive token-overlap expansion (e.g. `system`, `service`)."""
+
+    graph_token_overlap_max_per_entity: int = 5
+    """Max token-overlap expansions allowed per matched canonical."""
+
     decay_window_days: int = 30
     decay_factor: float = 0.9
     retract_threshold: float = 0.15

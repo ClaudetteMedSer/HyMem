@@ -127,6 +127,33 @@ def get_workspace(workspace_id: str) -> dict:
     return adapters.workspace_response(workspace_id)
 
 
+@app.get("/v3/workspaces/{workspace_id}/conflicts")
+def list_conflicts(workspace_id: str) -> dict:
+    """Surface knowledge-graph contradictions for the workspace.
+
+    Wraps `hy.conflicts()` — pure SQL, no LLM call. Two kinds are reported:
+    `competing_object` (same subject+predicate, different objects under a
+    mutually-exclusive predicate) and `opposing_predicate` (same subject+object
+    joined by an opposing predicate pair like prefers/rejects).
+    """
+    conflicts = _get_hy().conflicts()
+    return {
+        "workspace_id": workspace_id,
+        "conflicts": [
+            {
+                "kind": c.kind,
+                "subject": c.subject,
+                "edge_a": list(c.edge_a),
+                "edge_b": list(c.edge_b),
+                "confidence_a": c.confidence_a,
+                "confidence_b": c.confidence_b,
+                "detail": c.detail,
+            }
+            for c in conflicts
+        ],
+    }
+
+
 # ── peers (get-or-create) ────────────────────────────────────────────────────
 
 @app.post("/v3/workspaces/{workspace_id}/peers", status_code=201)
@@ -302,7 +329,12 @@ def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> 
         results.append(msg(
             f"kg_{fact.subject}_{fact.predicate}_{fact.object}",
             content, "hymem-kg", session_id, workspace_id,
-            {"type": "graph_fact", "+": fact.pos_evidence, "-": fact.neg_evidence},
+            {
+                "type": "graph_fact",
+                "+": fact.pos_evidence,
+                "-": fact.neg_evidence,
+                "why": list(fact.why_retrieved),
+            },
         ))
 
     for hit in ctx.fts_hits:
@@ -477,7 +509,7 @@ def get_peer_context(
             messages.append(msg(
                 f"kg_{fact.subject}_{fact.predicate}_{fact.object}",
                 content, "hymem-kg", "", workspace_id,
-                {"type": "graph_fact"},
+                {"type": "graph_fact", "why": list(fact.why_retrieved)},
             ))
 
     summary_obj = None
@@ -515,10 +547,12 @@ async def update_peer_representation(
 def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest) -> dict:
     queries = body.queries or [body.query]
     responses: list[str] = []
+    facts_per_query: list[list[dict]] = []
 
     for q in queries:
         if not q.strip():
             responses.append("")
+            facts_per_query.append([])
             continue
         ctx = _get_hy().augment(q)
         parts: list[str] = []
@@ -533,8 +567,26 @@ def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest) -> dict:
             parts.append("From conversation history:\n" + "\n".join(snippets))
         answer = "\n\n".join(parts) if parts else "No relevant information found in memory."
         responses.append(answer)
+        facts_per_query.append([
+            {
+                "subject": f.subject,
+                "predicate": f.predicate,
+                "object": f.object,
+                "confidence": f.confidence,
+                "why": list(f.why_retrieved),
+            }
+            for f in ctx.graph_facts
+        ])
 
-    return {"response": responses[0], "queries": queries}
+    # `facts` is additive metadata for SDK consumers that want the structured
+    # why_retrieved trail without parsing prose. Aligns with `response` (first
+    # query); `facts_by_query` carries the full per-query breakdown.
+    return {
+        "response": responses[0],
+        "queries": queries,
+        "facts": facts_per_query[0] if facts_per_query else [],
+        "facts_by_query": facts_per_query,
+    }
 
 
 # ── entry point ──────────────────────────────────────────────────────────────

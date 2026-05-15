@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 import hymem.honcho.app as hsrv
 from hymem.honcho.adapters import infer_role
-from tests.conftest import make_routed_llm
+from tests.conftest import make_routed_llm, seed_edge
 
 
 @pytest.fixture
@@ -353,3 +353,110 @@ def test_list_messages_rejects_zero_size(client, hy_with_embed):
         json={"size": 0},
     )
     assert r.status_code == 422
+
+
+# ── why_retrieved surfaced as metadata.why ───────────────────────────────────
+
+
+def _seed_dreamed_graph(hy_with_embed):
+    sid = "s-why"
+    hy_with_embed.open_session(sid)
+    hy_with_embed.log_message(
+        sid, "user", "We use fast_api for the backend service."
+    )
+    hy_with_embed.close_session(sid)
+    triples = [
+        {"subject": "backend", "predicate": "uses", "object": "fast_api", "polarity": 1},
+    ]
+    hy_with_embed.set_llm(make_routed_llm(triples, []))
+    hy_with_embed.dream()
+
+
+def test_search_graph_fact_metadata_includes_why(client, hy_with_embed):
+    _seed_dreamed_graph(hy_with_embed)
+    r = client.post(
+        "/v3/workspaces/hermes/sessions/s-why/search",
+        json={"query": "what technologies does the backend use"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    kg_items = [m for m in body if m["peer_id"] == "hymem-kg"]
+    assert kg_items, "expected at least one graph_fact in search results"
+    for item in kg_items:
+        assert "why" in item["metadata"]
+        assert isinstance(item["metadata"]["why"], list)
+        assert item["metadata"]["why"], "why_retrieved should be non-empty"
+
+
+def test_peer_context_graph_fact_metadata_includes_why(client, hy_with_embed):
+    _seed_dreamed_graph(hy_with_embed)
+    r = client.get(
+        "/v3/workspaces/hermes/peers/agent-main/context",
+        params={"search_query": "what technologies does the backend use"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    kg_items = [m for m in body["messages"] if m["peer_id"] == "hymem-kg"]
+    assert kg_items, "expected at least one graph_fact in peer-context messages"
+    for item in kg_items:
+        assert "why" in item["metadata"]
+        assert isinstance(item["metadata"]["why"], list)
+        assert item["metadata"]["why"], "why_retrieved should be non-empty"
+
+
+def test_peer_chat_returns_structured_facts_with_why(client, hy_with_embed):
+    _seed_dreamed_graph(hy_with_embed)
+    r = client.post(
+        "/v3/workspaces/hermes/peers/agent-main/chat",
+        json={"query": "what technologies does the backend use"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # Prose response stays clean — no reason-code leakage into the text.
+    assert "fallback:" not in body["response"]
+    assert "semantic_" not in body["response"]
+    # Structured facts carry why_retrieved alongside the prose.
+    assert "facts" in body and body["facts"], "facts should accompany prose response"
+    for fact in body["facts"]:
+        assert {"subject", "predicate", "object", "confidence", "why"} <= fact.keys()
+        assert isinstance(fact["why"], list) and fact["why"]
+
+
+# ── /conflicts endpoint ──────────────────────────────────────────────────────
+
+
+def test_list_conflicts_returns_empty_on_clean_graph(client):
+    r = client.get("/v3/workspaces/hermes/conflicts")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["workspace_id"] == "hermes"
+    assert body["conflicts"] == []
+
+
+def test_list_conflicts_surfaces_competing_object(client, hy_with_embed):
+    conn = hy_with_embed.conn
+    seed_edge(conn, "atta", "prefers", "english")
+    seed_edge(conn, "atta", "prefers", "dutch")
+
+    r = client.get("/v3/workspaces/hermes/conflicts")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["conflicts"]) == 1
+    c = body["conflicts"][0]
+    assert c["kind"] == "competing_object"
+    assert c["subject"] == "atta"
+    assert set(c["edge_a"]) >= {"atta", "prefers"}
+    assert set(c["edge_b"]) >= {"atta", "prefers"}
+    assert "detail" in c and c["detail"]
+
+
+def test_list_conflicts_surfaces_opposing_predicate(client, hy_with_embed):
+    conn = hy_with_embed.conn
+    seed_edge(conn, "team", "prefers", "docker")
+    seed_edge(conn, "team", "rejects", "docker")
+
+    r = client.get("/v3/workspaces/hermes/conflicts")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["conflicts"]) == 1
+    assert body["conflicts"][0]["kind"] == "opposing_predicate"
