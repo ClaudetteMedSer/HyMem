@@ -6,8 +6,10 @@ so configuration behaviour stays consistent across every surface.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -114,7 +116,28 @@ def build_from_env() -> HyMem:
             "(set HYMEM_EMBEDDING_API_KEY to enable vector search)"
         )
 
-    return HyMem(HyMemConfig(root=cfg.root), llm=llm, embedding_client=embedder)
+    instance = HyMem(HyMemConfig(root=cfg.root), llm=llm, embedding_client=embedder)
+    _clear_orphaned_dream_lock(instance.conn)
+    return instance
+
+
+def _clear_orphaned_dream_lock(conn: sqlite3.Connection) -> None:
+    """Clear the dreaming run_lock left by a previous unclean shutdown.
+
+    run_dreaming releases its lock in a ``finally`` block, but SIGKILL,
+    container OOM, or a hard crash skip that. Without this, the next dream
+    cycles return ``skipped_locked=True`` until the 5-minute TTL fallback
+    in ``_acquire_lock`` kicks in. Safe under the single-writer assumption
+    enforced by ``get_instance``.
+    """
+    with contextlib.suppress(sqlite3.Error):
+        cur = conn.execute("DELETE FROM run_lock WHERE name = 'dreaming'")
+        if cur.rowcount > 0:
+            conn.execute(
+                "UPDATE dream_runs SET ended_at = CURRENT_TIMESTAMP, "
+                "error = 'cleared at startup' WHERE ended_at IS NULL"
+            )
+            log.warning("dream.cleared_orphaned_lock from previous unclean shutdown")
 
 
 # ── shared singleton ─────────────────────────────────────────────────────────
