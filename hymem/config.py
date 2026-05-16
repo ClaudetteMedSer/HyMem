@@ -52,9 +52,12 @@ class HyMemConfig:
     retract_threshold: float = 0.15
 
     zombie_neg_threshold: int = 2
-    """Edges with pos_evidence=0 and neg_evidence>=this are retracted regardless
-    of the smoothed-confidence threshold. Catches facts the LLM extracted once
-    then contradicted, which otherwise need ~6 negatives to fall below 0.15."""
+    """Negative-dominance offset in the auto-retract rule
+    `neg_evidence >= 2 * pos_evidence + zombie_neg_threshold`. At pos=0 this
+    reduces to `neg >= threshold` (catches classic zombies); at pos=1 it
+    fires at neg=threshold+2 (catches edges where one positive is buried
+    under many negatives). Keep small; raising shields more edges from
+    retraction."""
 
     reinforce_window_days: int = 30
     """Window for soft positive reinforcement from co-mention. Symmetric to

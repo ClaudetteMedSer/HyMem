@@ -10,15 +10,15 @@ log = logging.getLogger("hymem.dreaming.phase3")
 
 
 def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
-    """Co-occurrence-aware decay + zero-positive retraction.
+    """Co-occurrence-aware decay + negative-dominance retraction.
 
     Two retraction paths:
       1. Topic re-mentioned without reinforcement -> bump neg_evidence, then
          retract if smoothed confidence falls below cfg.retract_threshold.
-      2. Edge has pos_evidence=0 and neg_evidence>=cfg.zombie_neg_threshold ->
-         retract immediately. Catches facts extracted once and contradicted
-         every time after, which the smoothed formula leaves stranded for
-         several more cycles.
+      2. neg_evidence >= 2*pos_evidence + cfg.zombie_neg_threshold -> retract
+         immediately. Catches edges where negatives clearly dominate but the
+         smoothed-confidence rule would leave them stranded for several more
+         cycles (e.g. +0/-2, +1/-4, +2/-6).
 
     Stable facts in dormant topics are left alone.
     """
@@ -67,8 +67,13 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         )
 
     # Find every edge that will be retracted this pass — either by smoothed
-    # confidence falling below the threshold, or by the zero-positive rule. We
-    # select first so we can log feedback before flipping status.
+    # confidence falling below the threshold, or by the negative-dominance
+    # rule (neg >= 2*pos + zombie_neg_threshold). The dominance rule
+    # generalizes the original zero-positive zombie rule: at pos=0 it reduces
+    # to neg>=threshold (catching the historical 55 zombies), and at pos=1 it
+    # fires at neg>=threshold+2 (catching gray-zone edges like
+    # `hook uses nohup` +1/-4 that the smoothed-confidence rule misses).
+    # We select first so we can log feedback before flipping status.
     to_retract = conn.execute(
         """
         SELECT id, subject_canonical, predicate, object_canonical
@@ -77,7 +82,7 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
           AND derived = 0
           AND (
               (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) < ?
-              OR (pos_evidence = 0 AND neg_evidence >= ?)
+              OR neg_evidence >= 2 * pos_evidence + ?
           )
         """,
         (cfg.retract_threshold, cfg.zombie_neg_threshold),
@@ -157,16 +162,17 @@ def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
 
 def _record_retraction_feedback(conn: sqlite3.Connection, edge: sqlite3.Row) -> None:
-    """Insert a row into extraction_feedback for the most recent positive
-    evidence chunk of an edge that is about to be auto-retracted. Mirrors the
-    pattern used by HyMem.retract_edge so few-shot negatives include both
-    manually and automatically retracted facts.
+    """Insert a row into extraction_feedback for an edge about to be
+    auto-retracted. Prefer the most recent positive-evidence chunk (the chunk
+    that produced the wrong extraction), but fall back to negative evidence —
+    zombie edges only have polarity=-1 rows, and skipping them was leaving
+    extraction_feedback permanently empty for the most useful negative cases.
     """
     evidence = conn.execute(
         """
         SELECT chunk_id FROM kg_evidence
-        WHERE edge_id = ? AND polarity = 1
-        ORDER BY extracted_at DESC LIMIT 1
+        WHERE edge_id = ?
+        ORDER BY polarity DESC, extracted_at DESC LIMIT 1
         """,
         (edge["id"],),
     ).fetchone()

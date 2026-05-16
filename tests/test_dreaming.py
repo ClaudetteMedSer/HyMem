@@ -117,3 +117,79 @@ def test_phase3_decay_only_affects_re_mentioned_topics(hy):
     assert rows[("app", "postgres")]["neg_evidence"] == 0
     # fastapi edge: subject 'api' mentioned recently without reinforcement → decayed.
     assert rows[("api", "fastapi")]["neg_evidence"] >= 1
+
+
+def test_phase3_negative_dominance_retracts_gray_zone(hy):
+    """Edges where negatives clearly dominate (e.g. pos=1, neg=4) must retract
+    even though their smoothed confidence (0.33) is above retract_threshold."""
+    conn = hy.conn
+    # Classic zombie: pos=0, neg=2 — smoothed 0.25, above 0.15 threshold.
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES ('hook', 'uses', 'nohup_zombie', 0, 2, datetime('now'))"
+    )
+    # Gray-zone: pos=1, neg=4 — smoothed 0.33, above threshold but neg dominates.
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES ('hook', 'uses', 'nohup_grayzone', 1, 4, datetime('now'))"
+    )
+    # Mixed but not dominated: pos=2, neg=4 — should NOT retract.
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES ('hook', 'uses', 'mixed_signal', 2, 4, datetime('now'))"
+    )
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    statuses = {
+        r["object_canonical"]: r["status"]
+        for r in conn.execute(
+            "SELECT object_canonical, status FROM knowledge_graph"
+        ).fetchall()
+    }
+    assert statuses["nohup_zombie"] == "retracted"
+    assert statuses["nohup_grayzone"] == "retracted"
+    assert statuses["mixed_signal"] == "active"
+
+
+def test_phase3_retraction_feedback_falls_back_to_negative_evidence(hy):
+    """Auto-retracted zombie edges only have polarity=-1 evidence rows.
+    extraction_feedback must still get populated so the prompt has few-shot
+    negatives — the prior bug skipped these entirely."""
+    conn = hy.conn
+    conn.execute("INSERT INTO sessions(id) VALUES ('s_zombie')")
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) "
+        "VALUES ('c_zombie', 's_zombie', 1, 1, 'correction_or_preference_trigger', "
+        "'no, the gateway does not run on pid_77')"
+    )
+    cur = conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES ('gateway', 'runs_on', 'pid_77', 0, 2, datetime('now'))"
+    )
+    edge_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, 'c_zombie', -1)",
+        (edge_id,),
+    )
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    row = conn.execute(
+        "SELECT extracted_subject, extracted_predicate, extracted_object, "
+        "       chunk_text_snippet, feedback_type "
+        "FROM extraction_feedback"
+    ).fetchone()
+    assert row is not None
+    assert row["extracted_subject"] == "gateway"
+    assert row["extracted_predicate"] == "runs_on"
+    assert row["extracted_object"] == "pid_77"
+    assert row["feedback_type"] == "retracted"
+    assert "pid_77" in row["chunk_text_snippet"]
