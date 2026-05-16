@@ -14,7 +14,13 @@ from tests.conftest import make_routed_llm, seed_edge
 @pytest.fixture
 def client(hy_with_embed):
     hsrv.set_hy(hy_with_embed)
-    return TestClient(hsrv.app)
+    # Stop any scheduler leaked from a prior test before TestClient triggers
+    # lifespan startup (which creates a new one).
+    if hsrv._scheduler is not None:
+        hsrv._scheduler.stop()
+        hsrv.set_scheduler(None)
+    with TestClient(hsrv.app) as c:
+        yield c
 
 
 def test_health_endpoint(client):
@@ -156,9 +162,18 @@ def test_role_inference_from_peer_id():
     assert infer_role("ai-bot") == "assistant"
 
 
+def _install_scheduler(hy, cooldown: float):
+    from hymem.dreaming.scheduler import DreamScheduler
+    if hsrv._scheduler is not None:
+        hsrv._scheduler.stop()
+    sched = DreamScheduler(hy, cooldown=cooldown)
+    sched.start()
+    hsrv.set_scheduler(sched)
+    return sched
+
+
 def test_dream_cooldown_throttles_back_to_back_calls(client, hy_with_embed):
-    hsrv._last_dream_kick = 0.0
-    hsrv._DREAM_COOLDOWN_SECONDS = 60.0
+    sched = _install_scheduler(hy_with_embed, cooldown=60.0)
 
     payload = {
         "messages": [
@@ -171,6 +186,9 @@ def test_dream_cooldown_throttles_back_to_back_calls(client, hy_with_embed):
     assert r1.status_code == 201
     assert r2.status_code == 201
 
+    # First kick runs immediately; second is gated by cooldown.
+    assert sched.wait_for_cycle(1, timeout=5.0)
+
     count = hy_with_embed.conn.execute(
         "SELECT COUNT(*) FROM dream_runs"
     ).fetchone()[0]
@@ -178,8 +196,7 @@ def test_dream_cooldown_throttles_back_to_back_calls(client, hy_with_embed):
 
 
 def test_dream_cooldown_allows_after_window(client, hy_with_embed):
-    hsrv._last_dream_kick = 0.0
-    hsrv._DREAM_COOLDOWN_SECONDS = 0.0
+    sched = _install_scheduler(hy_with_embed, cooldown=0.0)
 
     payload = {
         "messages": [
@@ -191,6 +208,8 @@ def test_dream_cooldown_allows_after_window(client, hy_with_embed):
     r2 = client.post("/v3/workspaces/hermes/sessions/cool-2/messages", json=payload)
     assert r1.status_code == 201
     assert r2.status_code == 201
+
+    assert sched.wait_for_cycle(2, timeout=5.0)
 
     count = hy_with_embed.conn.execute(
         "SELECT COUNT(*) FROM dream_runs"

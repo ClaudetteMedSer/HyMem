@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from dataclasses import dataclass, field
 
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import PROCEDURE_SYSTEM, PROCEDURE_USER_TEMPLATE
@@ -10,12 +11,22 @@ from hymem.extraction.prompts import PROCEDURE_SYSTEM, PROCEDURE_USER_TEMPLATE
 log = logging.getLogger("hymem.dreaming.procedures")
 
 
+@dataclass
+class ProceduresExtraction:
+    """Validated procedure items ready to persist. Each item carries the
+    normalized name, description, steps, triggers, and entities lists."""
+    items: list[dict] = field(default_factory=list)
+
+
 def extract_procedures_for_session(
     conn: sqlite3.Connection,
     session_id: str,
     llm: LLMClient,
-) -> int:
-    """Extract procedures from a session's chunks and episodes. Returns count created."""
+) -> ProceduresExtraction | None:
+    """Read the session's chunks and episodes and run the procedure-extraction
+    LLM call. Returns None when there is nothing to extract from. No write
+    transaction held; persist via persist_procedures inside one.
+    """
     chunks = conn.execute(
         "SELECT id, text FROM chunks WHERE session_id = ? ORDER BY start_message_id",
         (session_id,),
@@ -33,7 +44,7 @@ def extract_procedures_for_session(
         parts.append(f"[episode: {e['title']}] {e['summary']}")
 
     if not parts:
-        return 0
+        return None
 
     combined = "\n\n---\n\n".join(parts)
     if len(combined) > 12000:
@@ -49,12 +60,12 @@ def extract_procedures_for_session(
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return 0
+        return ProceduresExtraction()
 
     if not isinstance(data, list):
-        return 0
+        return ProceduresExtraction()
 
-    count = 0
+    items: list[dict] = []
     for item in data:
         if not isinstance(item, dict):
             continue
@@ -67,7 +78,7 @@ def extract_procedures_for_session(
         if not isinstance(steps_list, list):
             continue
 
-        valid_steps = []
+        valid_steps: list[dict] = []
         for s in steps_list:
             if not isinstance(s, dict):
                 continue
@@ -100,8 +111,26 @@ def extract_procedures_for_session(
         else:
             entities = []
 
-        procedure_id = f"{session_id}@proc{count}"
+        items.append({
+            "name": name.strip(),
+            "description": description.strip()[:500] if description else None,
+            "steps": valid_steps,
+            "triggers": triggers,
+            "entities_involved": entities,
+        })
 
+    return ProceduresExtraction(items=items)
+
+
+def persist_procedures(
+    conn: sqlite3.Connection,
+    session_id: str,
+    extraction: ProceduresExtraction,
+) -> int:
+    """Insert validated procedures. Caller wraps in core_db.transaction()."""
+    count = 0
+    for item in extraction.items:
+        procedure_id = f"{session_id}@proc{count}"
         conn.execute(
             """INSERT OR IGNORE INTO procedures(id, session_id, name, description,
                steps, triggers, entities_involved)
@@ -109,15 +138,15 @@ def extract_procedures_for_session(
             (
                 procedure_id,
                 session_id,
-                name.strip(),
-                description.strip()[:500] if description else None,
-                json.dumps(valid_steps),
-                json.dumps(triggers),
-                json.dumps(entities),
+                item["name"],
+                item["description"],
+                json.dumps(item["steps"]),
+                json.dumps(item["triggers"]),
+                json.dumps(item["entities_involved"]),
             ),
         )
         count += 1
 
     if count:
-        log.debug("procedures.extracted session_id=%s count=%d", session_id, count)
+        log.debug("procedures.persisted session_id=%s count=%d", session_id, count)
     return count

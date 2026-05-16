@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from dataclasses import dataclass, field
 
 from hymem.dreaming import canonicalize
 from hymem.dreaming.chunks import Chunk
@@ -12,29 +13,47 @@ from hymem.extraction.triples import Triple, extract_triples
 log = logging.getLogger("hymem.dreaming.phase1")
 
 
-def process_chunk(
+@dataclass
+class ChunkExtraction:
+    """Raw phase-1 output: ready to persist, no DB writes performed yet."""
+    triples: list[Triple]
+    markers: list[Marker]
+    entity_type_hints: dict[str, str] = field(default_factory=dict)
+
+
+def extract_chunk_results(
     conn: sqlite3.Connection,
     chunk: Chunk,
     llm: LLMClient,
     *,
     prompt_version: str,
     negative_examples: str = "",
-) -> tuple[list[Triple], list[Marker]]:
-    """Phase 1 work for a single chunk. Idempotent under (chunk_id, prompt_version).
-
-    Caller wraps this in a transaction. Returns the raw extractions for logging.
+) -> ChunkExtraction | None:
+    """Run phase-1 LLM extraction for a chunk. Returns None if already processed
+    under the same prompt_version. No write transaction held; the LLM call
+    runs outside any BEGIN IMMEDIATE so concurrent writers aren't blocked.
     """
     already = conn.execute(
         "SELECT 1 FROM processed_chunks WHERE chunk_id = ? AND prompt_version = ?",
         (chunk.id, prompt_version),
     ).fetchone()
     if already:
-        return [], []
+        return None
 
     triples, entity_type_hints = extract_triples(llm, chunk.text, negative_examples)
     markers = extract_markers(llm, chunk.text)
+    return ChunkExtraction(triples=triples, markers=markers, entity_type_hints=entity_type_hints)
 
-    for entity_name, entity_type in entity_type_hints.items():
+
+def persist_chunk_results(
+    conn: sqlite3.Connection,
+    chunk: Chunk,
+    extraction: ChunkExtraction,
+    *,
+    prompt_version: str,
+) -> None:
+    """Persist a ChunkExtraction. Caller wraps in core_db.transaction()."""
+    for entity_name, entity_type in extraction.entity_type_hints.items():
         entity_canon = canonicalize.resolve(conn, entity_name)
         conn.execute(
             """INSERT OR IGNORE INTO entity_types(entity_canonical, type, confidence, source_chunk_id)
@@ -43,7 +62,7 @@ def process_chunk(
         )
 
     mentioned: set[str] = set()
-    for t in triples:
+    for t in extraction.triples:
         subj_canon, obj_canon = _upsert_triple(conn, chunk.id, t)
         mentioned.add(subj_canon)
         mentioned.add(obj_canon)
@@ -52,7 +71,7 @@ def process_chunk(
             "INSERT OR IGNORE INTO entity_mentions(chunk_id, entity_canonical) VALUES (?, ?)",
             [(chunk.id, e) for e in mentioned],
         )
-    for m in markers:
+    for m in extraction.markers:
         conn.execute(
             "INSERT INTO behavioral_markers(kind, statement, chunk_id) VALUES (?, ?, ?)",
             (m.kind, m.statement, chunk.id),
@@ -65,10 +84,9 @@ def process_chunk(
     log.debug(
         "phase1.chunk chunk_id=%s triples=%d markers=%d",
         chunk.id,
-        len(triples),
-        len(markers),
+        len(extraction.triples),
+        len(extraction.markers),
     )
-    return triples, markers
 
 
 def _upsert_triple(conn: sqlite3.Connection, chunk_id: str, triple: Triple) -> tuple[str, str]:

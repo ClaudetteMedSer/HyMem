@@ -9,16 +9,20 @@ from hymem.extraction.prompts import SESSION_SUMMARY_SYSTEM, SESSION_SUMMARY_USE
 log = logging.getLogger("hymem.dreaming.summary")
 
 
-def summarize_session(
+def extract_session_summary(
     conn: sqlite3.Connection,
     session_id: str,
     llm: LLMClient,
 ) -> str | None:
+    """Run the session-summary LLM call. Returns the new summary string,
+    or None when nothing new is needed (already summarized, no content, or
+    LLM output rejected). No write transaction held.
+    """
     existing = conn.execute(
         "SELECT summary FROM sessions WHERE id = ?", (session_id,)
     ).fetchone()
     if existing and existing["summary"]:
-        return existing["summary"]
+        return None
 
     chunks = conn.execute(
         "SELECT text FROM chunks WHERE session_id = ? ORDER BY start_message_id",
@@ -54,9 +58,17 @@ def summarize_session(
     if not summary or len(summary) < 10:
         return None
 
+    return summary[:500]
+
+
+def persist_session_summary(
+    conn: sqlite3.Connection,
+    session_id: str,
+    summary: str,
+) -> None:
+    """Write a session summary. Caller wraps in core_db.transaction()."""
     conn.execute(
         "UPDATE sessions SET summary = ? WHERE id = ?",
-        (summary[:500], session_id),
+        (summary, session_id),
     )
-    log.debug("summary session_id=%s len=%d", session_id, len(summary))
-    return summary[:500]
+    log.debug("summary.persisted session_id=%s len=%d", session_id, len(summary))

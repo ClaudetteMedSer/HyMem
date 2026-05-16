@@ -16,12 +16,17 @@ from hymem.dreaming.chunks import (
     extract_high_salience_chunks,
     persist_chunks,
 )
-from hymem.dreaming.embeddings import embed_pending_chunks, embed_pending_edges
-from hymem.dreaming.episodes import extract_episodes_for_session
-from hymem.dreaming.procedures import extract_procedures_for_session
+from hymem.dreaming.embeddings import (
+    fetch_chunk_embeddings,
+    fetch_edge_embeddings,
+    persist_chunk_embeddings,
+    persist_edge_embeddings,
+)
+from hymem.dreaming.episodes import extract_episodes_for_session, persist_episodes
+from hymem.dreaming.procedures import extract_procedures_for_session, persist_procedures
 from hymem.dreaming.mentions import index_chunk_mentions
 from hymem.dreaming.retention import prune_chunks
-from hymem.dreaming.summary import summarize_session
+from hymem.dreaming.summary import extract_session_summary, persist_session_summary
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 
@@ -117,18 +122,24 @@ def run_dreaming(
                     continue
                 chunks_remaining -= 1
                 try:
-                    with core_db.transaction(conn):
-                        triples, markers = phase1.process_chunk(
-                            conn, chunk, llm, prompt_version=cfg.prompt_version,
-                            negative_examples=negative_examples,
-                        )
-                        if triples or markers:
-                            report.chunks_processed += 1
-                            report.triples_extracted += len(triples)
-                            report.markers_extracted += len(markers)
+                    extraction = phase1.extract_chunk_results(
+                        conn, chunk, llm,
+                        prompt_version=cfg.prompt_version,
+                        negative_examples=negative_examples,
+                    )
                 except Exception:
                     log.exception("phase1.llm_failure chunk_id=%s", chunk.id)
                     continue
+                if extraction is None:
+                    continue
+                with core_db.transaction(conn):
+                    phase1.persist_chunk_results(
+                        conn, chunk, extraction, prompt_version=cfg.prompt_version,
+                    )
+                if extraction.triples or extraction.markers:
+                    report.chunks_processed += 1
+                    report.triples_extracted += len(extraction.triples)
+                    report.markers_extracted += len(extraction.markers)
 
             # Baseline backstop: if budget remains after the salience tier,
             # pull plain chunks (newest first) so every chunk eventually flows
@@ -154,22 +165,28 @@ def run_dreaming(
                             break
                         chunks_remaining -= 1
                         try:
-                            with core_db.transaction(conn):
-                                triples, markers = phase1.process_chunk(
-                                    conn, chunk, llm,
-                                    prompt_version=cfg.prompt_version,
-                                    negative_examples=negative_examples,
-                                )
-                                if triples or markers:
-                                    report.chunks_processed += 1
-                                    report.triples_extracted += len(triples)
-                                    report.markers_extracted += len(markers)
+                            extraction = phase1.extract_chunk_results(
+                                conn, chunk, llm,
+                                prompt_version=cfg.prompt_version,
+                                negative_examples=negative_examples,
+                            )
                         except Exception:
                             log.exception(
                                 "phase1.llm_failure chunk_id=%s tier=baseline",
                                 chunk.id,
                             )
                             continue
+                        if extraction is None:
+                            continue
+                        with core_db.transaction(conn):
+                            phase1.persist_chunk_results(
+                                conn, chunk, extraction,
+                                prompt_version=cfg.prompt_version,
+                            )
+                        if extraction.triples or extraction.markers:
+                            report.chunks_processed += 1
+                            report.triples_extracted += len(extraction.triples)
+                            report.markers_extracted += len(extraction.markers)
 
             # Sessions with no content in either tier skip the per-session tail
             # blocks — matches the pre-baseline behavior and avoids wasted LLM
@@ -178,27 +195,34 @@ def run_dreaming(
                 continue
 
             try:
-                with core_db.transaction(conn):
-                    episodes = extract_episodes_for_session(conn, session_id, llm)
-                    log.debug("episodes session_id=%s count=%d", session_id, episodes)
+                episodes_ext = extract_episodes_for_session(conn, session_id, llm)
             except Exception:
                 log.exception("episodes.extraction_failure session_id=%s", session_id)
+            else:
+                if episodes_ext is not None and episodes_ext.items:
+                    with core_db.transaction(conn):
+                        count = persist_episodes(conn, session_id, episodes_ext)
+                    log.debug("episodes session_id=%s count=%d", session_id, count)
 
             try:
-                with core_db.transaction(conn):
-                    summary = summarize_session(conn, session_id, llm)
-                    if summary:
-                        log.debug("summary session_id=%s", session_id)
+                summary = extract_session_summary(conn, session_id, llm)
             except Exception:
                 log.exception("summary.failure session_id=%s", session_id)
+            else:
+                if summary:
+                    with core_db.transaction(conn):
+                        persist_session_summary(conn, session_id, summary)
+                    log.debug("summary session_id=%s", session_id)
 
             try:
-                with core_db.transaction(conn):
-                    procs = extract_procedures_for_session(conn, session_id, llm)
-                    if procs:
-                        log.debug("procedures session_id=%s count=%d", session_id, procs)
+                procedures_ext = extract_procedures_for_session(conn, session_id, llm)
             except Exception:
                 log.exception("procedures.extraction_failure session_id=%s", session_id)
+            else:
+                if procedures_ext is not None and procedures_ext.items:
+                    with core_db.transaction(conn):
+                        count = persist_procedures(conn, session_id, procedures_ext)
+                    log.debug("procedures session_id=%s count=%d", session_id, count)
 
             if chunks_remaining <= 0:
                 report.budget_exhausted = True
@@ -206,8 +230,10 @@ def run_dreaming(
                 break
 
         if embedding_client is not None:
-            with core_db.transaction(conn):
-                report.chunks_embedded = embed_pending_chunks(conn, embedding_client)
+            pending_chunks = fetch_chunk_embeddings(conn, embedding_client)
+            if pending_chunks is not None:
+                with core_db.transaction(conn):
+                    report.chunks_embedded = persist_chunk_embeddings(conn, pending_chunks)
 
         log.info("phase2.start")
         with core_db.transaction(conn):
@@ -234,8 +260,12 @@ def run_dreaming(
                 log.info("inference.derived count=%d", derived)
             prune_chunks(conn, cfg)
             phase2.consolidate_insights(conn, cfg)  # refresh after decay
-            if embedding_client is not None:
-                report.edges_embedded = embed_pending_edges(conn, embedding_client)
+
+        if embedding_client is not None:
+            pending_edges = fetch_edge_embeddings(conn, embedding_client)
+            if pending_edges is not None:
+                with core_db.transaction(conn):
+                    report.edges_embedded = persist_edge_embeddings(conn, pending_edges)
         after_retracted = conn.execute(
             "SELECT COUNT(*) AS c FROM knowledge_graph WHERE status = 'retracted'"
         ).fetchone()["c"]

@@ -25,18 +25,19 @@ import json
 import logging
 import math
 import os
-import time
 from typing import Any
 
 try:
     import uvicorn
-    from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 except ImportError as exc:  # pragma: no cover
     raise ImportError("pip install 'hymem[server]'") from exc
 
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
 from hymem.bootstrap import get_instance as _get_hy, set_instance as set_hy
 from hymem.core import db as core_db
+from hymem.dreaming.scheduler import DreamScheduler
 from hymem.honcho import adapters
 from hymem.honcho.adapters import infer_role, msg, now
 from hymem.honcho.models import (
@@ -52,7 +53,7 @@ from hymem.honcho.models import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["app", "main", "set_hy"]
+__all__ = ["app", "main", "set_hy", "set_scheduler"]
 
 
 # ── role resolution ──────────────────────────────────────────────────────────
@@ -68,42 +69,42 @@ def _resolve_role(workspace_id: str, peer_id: str) -> str:
 
 # ── background dreaming ──────────────────────────────────────────────────────
 
-def _background_dream() -> None:
-    """Run a dream cycle on a forked HyMem instance (separate SQLite
-    connection) to avoid write-transaction collisions with concurrent
-    add_messages calls. Reuses the live instance's LLM/embedding clients."""
-    try:
-        start = time.monotonic()
-        dream_hy = _get_hy().fork()
-        try:
-            dream_hy.dream()
-        finally:
-            dream_hy.close()
-        # Forked dream wrote to the shared DB; clear query caches on the
-        # live instance so the next augment() sees the fresh canonical set.
-        _get_hy().invalidate_query_caches()
-        log.info("background_dream completed in %.1fs", time.monotonic() - start)
-    except Exception:
-        log.exception("background dreaming failed")
-
-
-_last_dream_kick: float = 0.0
 _DREAM_COOLDOWN_SECONDS = float(os.environ.get("HYMEM_DREAM_COOLDOWN_SECONDS", "60"))
+_scheduler: DreamScheduler | None = None
 
 
-def _kick_dream_if_due() -> bool:
-    """Return True at most once per cooldown window. Updates timestamp on True."""
-    global _last_dream_kick
-    current = time.monotonic()
-    if current - _last_dream_kick >= _DREAM_COOLDOWN_SECONDS:
-        _last_dream_kick = current
-        return True
-    return False
+def _get_scheduler() -> DreamScheduler:
+    """Lazy scheduler init. Lifespan startup primes this; the fallback covers
+    test entry points (TestClient) that bypass startup events."""
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = DreamScheduler(_get_hy(), _DREAM_COOLDOWN_SECONDS)
+        _scheduler.start()
+    return _scheduler
+
+
+def set_scheduler(scheduler: DreamScheduler | None) -> None:
+    """Inject (or clear) the scheduler — used by tests that want to control
+    dream timing without spinning up a real thread."""
+    global _scheduler
+    _scheduler = scheduler
 
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
-app = FastAPI(title="HyMem Honcho-compatible server", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    _get_scheduler()
+    try:
+        yield
+    finally:
+        global _scheduler
+        if _scheduler is not None:
+            _scheduler.stop()
+            _scheduler = None
+
+
+app = FastAPI(title="HyMem Honcho-compatible server", version="1.0.0", lifespan=_lifespan)
 
 
 @app.get("/health")
@@ -244,7 +245,6 @@ def add_messages(
     workspace_id: str,
     session_id: str,
     body: AddMessagesRequest,
-    background_tasks: BackgroundTasks,
 ) -> list[dict]:
     hy = _get_hy()
     roles = [_resolve_role(workspace_id, m.peer_id) for m in body.messages]
@@ -257,9 +257,8 @@ def add_messages(
             m.metadata, m.created_at)
         for msg_id, m in zip(msg_ids, body.messages)
     ]
-    # Dreaming is non-blocking; the run-lock prevents concurrent cycles.
-    if _kick_dream_if_due():
-        background_tasks.add_task(_background_dream)
+    # Fire-and-forget; scheduler owns cooldown and concurrency.
+    _get_scheduler().kick()
     return responses
 
 
