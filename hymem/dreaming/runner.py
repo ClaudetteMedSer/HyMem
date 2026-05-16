@@ -11,7 +11,11 @@ from hymem.config import HyMemConfig
 from hymem.core import db as core_db
 from hymem.dreaming import phase1, phase2, phase3
 from hymem.dreaming.inference import infer_transitive_edges
-from hymem.dreaming.chunks import extract_high_salience_chunks, persist_chunks
+from hymem.dreaming.chunks import (
+    extract_baseline_chunks,
+    extract_high_salience_chunks,
+    persist_chunks,
+)
 from hymem.dreaming.embeddings import embed_pending_chunks, embed_pending_edges
 from hymem.dreaming.episodes import extract_episodes_for_session
 from hymem.dreaming.procedures import extract_procedures_for_session
@@ -92,13 +96,12 @@ def run_dreaming(
                 conn, session_id, min_chars=cfg.salience_min_chars
             )
             report.chunks_seen += len(chunks)
-            if not chunks:
-                continue
 
-            with core_db.transaction(conn):
-                persist_chunks(conn, chunks)
-                for chunk in chunks:
-                    index_chunk_mentions(conn, chunk.id, chunk.text)
+            if chunks:
+                with core_db.transaction(conn):
+                    persist_chunks(conn, chunks)
+                    for chunk in chunks:
+                        index_chunk_mentions(conn, chunk.id, chunk.text)
 
             for chunk in chunks:
                 if chunks_remaining <= 0:
@@ -126,6 +129,53 @@ def run_dreaming(
                 except Exception:
                     log.exception("phase1.llm_failure chunk_id=%s", chunk.id)
                     continue
+
+            # Baseline backstop: if budget remains after the salience tier,
+            # pull plain chunks (newest first) so every chunk eventually flows
+            # through extraction. Capped per cycle by dream_baseline_budget.
+            baseline: list = []
+            if chunks_remaining > 0:
+                baseline_cap = min(chunks_remaining, cfg.dream_baseline_budget)
+                baseline = extract_baseline_chunks(
+                    conn,
+                    session_id,
+                    prompt_version=cfg.prompt_version,
+                    limit=baseline_cap,
+                    min_chars=cfg.salience_min_chars,
+                )
+                if baseline:
+                    report.chunks_seen += len(baseline)
+                    with core_db.transaction(conn):
+                        persist_chunks(conn, baseline)
+                        for chunk in baseline:
+                            index_chunk_mentions(conn, chunk.id, chunk.text)
+                    for chunk in baseline:
+                        if chunks_remaining <= 0:
+                            break
+                        chunks_remaining -= 1
+                        try:
+                            with core_db.transaction(conn):
+                                triples, markers = phase1.process_chunk(
+                                    conn, chunk, llm,
+                                    prompt_version=cfg.prompt_version,
+                                    negative_examples=negative_examples,
+                                )
+                                if triples or markers:
+                                    report.chunks_processed += 1
+                                    report.triples_extracted += len(triples)
+                                    report.markers_extracted += len(markers)
+                        except Exception:
+                            log.exception(
+                                "phase1.llm_failure chunk_id=%s tier=baseline",
+                                chunk.id,
+                            )
+                            continue
+
+            # Sessions with no content in either tier skip the per-session tail
+            # blocks — matches the pre-baseline behavior and avoids wasted LLM
+            # calls on empty sessions.
+            if not chunks and not baseline:
+                continue
 
             try:
                 with core_db.transaction(conn):
@@ -177,6 +227,7 @@ def run_dreaming(
             "SELECT COUNT(*) AS c FROM knowledge_graph WHERE status = 'retracted'"
         ).fetchone()["c"]
         with core_db.transaction(conn):
+            phase3.reinforce(conn, cfg)
             phase3.decay(conn, cfg)
             derived = infer_transitive_edges(conn, cfg)
             if derived:

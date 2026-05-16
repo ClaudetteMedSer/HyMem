@@ -375,12 +375,22 @@ def test_route_predicates():
 
 def test_conflicts_competing_objects(hy):
     conn = hy.conn
-    seed_edge(conn, "atta", "prefers", "english")
-    seed_edge(conn, "atta", "prefers", "dutch")
+    # `runs_on` is functional: a service can only run on one runtime at a time.
+    seed_edge(conn, "service_a", "runs_on", "python3")
+    seed_edge(conn, "service_a", "runs_on", "python2")
     conflicts = hy.conflicts()
     assert len(conflicts) == 1
     assert conflicts[0].kind == "competing_object"
-    assert conflicts[0].subject == "atta"
+    assert conflicts[0].subject == "service_a"
+
+
+def test_conflicts_prefers_is_not_competing(hy):
+    """`prefers` is multi-valued — a subject can prefer many objects without
+    contradicting itself. This was the dominant source of conflict-noise pre-fix."""
+    conn = hy.conn
+    seed_edge(conn, "atta", "prefers", "english")
+    seed_edge(conn, "atta", "prefers", "dutch")
+    assert hy.conflicts() == []
 
 
 def test_conflicts_opposing_predicates(hy):

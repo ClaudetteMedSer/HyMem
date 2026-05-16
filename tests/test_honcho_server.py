@@ -435,8 +435,9 @@ def test_list_conflicts_returns_empty_on_clean_graph(client):
 
 def test_list_conflicts_surfaces_competing_object(client, hy_with_embed):
     conn = hy_with_embed.conn
-    seed_edge(conn, "atta", "prefers", "english")
-    seed_edge(conn, "atta", "prefers", "dutch")
+    # `runs_on` is functional; multiple runtimes for one service is a true conflict.
+    seed_edge(conn, "service_a", "runs_on", "python3")
+    seed_edge(conn, "service_a", "runs_on", "python2")
 
     r = client.get("/v3/workspaces/hermes/conflicts")
     assert r.status_code == 200
@@ -444,9 +445,9 @@ def test_list_conflicts_surfaces_competing_object(client, hy_with_embed):
     assert len(body["conflicts"]) == 1
     c = body["conflicts"][0]
     assert c["kind"] == "competing_object"
-    assert c["subject"] == "atta"
-    assert set(c["edge_a"]) >= {"atta", "prefers"}
-    assert set(c["edge_b"]) >= {"atta", "prefers"}
+    assert c["subject"] == "service_a"
+    assert set(c["edge_a"]) >= {"service_a", "runs_on"}
+    assert set(c["edge_b"]) >= {"service_a", "runs_on"}
     assert "detail" in c and c["detail"]
 
 

@@ -67,9 +67,19 @@ Rules:
   files, modules, environments, AND people, teams, projects, or codebases by name.
   Do not invent abstractions like "the system".
 - When a chunk names a person or team alongside a project, codebase, or artifact
-  they own, work on, or belong to, extract the linking edge explicitly. Examples:
-    "Atta is working on MedFlow"             -> (atta, part_of, medflow)
-    "The platform team owns the auth service" -> (platform_team, contains, auth_service)
+  they own, work on, or belong to, extract the linking edge explicitly. This is
+  high-priority: identity-to-artifact links are the most underrepresented and
+  most useful triples in the graph. Strong examples (extract eagerly when the
+  chunk supports them):
+    "Atta is working on MedFlow"                   -> (atta, part_of, medflow)
+    "I'm building HyMem"                            -> (atta, part_of, hymem)
+    "We use HyMem for the memory layer"             -> (atta, uses, hymem)
+    "The platform team owns the auth service"       -> (platform_team, contains, auth_service)
+    "Sara maintains the ingest pipeline"            -> (sara, part_of, ingest_pipeline)
+  When the speaker is the user themselves ("I'm working on X", "we shipped Y"),
+  resolve the implicit subject to the user's canonical name when known from
+  context; otherwise use a first-person handle and let canonicalization resolve
+  it. Do NOT skip these just because the speaker is implicit.
   This makes identity-to-artifact relationships queryable as 1-hop graph edges
   rather than fuzzy text matches across sibling canonicals.
 - Excerpts may be written in languages other than English (e.g. Dutch, German,

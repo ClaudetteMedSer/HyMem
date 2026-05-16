@@ -2,10 +2,16 @@
 
 Surfaces two kinds of contradiction among active edges:
   - competing_object:    same subject + predicate, different objects, for
-                         predicates where that is mutually exclusive-ish
-                         (e.g. `prefers atta english` vs `prefers atta dutch`).
+                         predicates that are FUNCTIONAL (single-valued by
+                         nature) — e.g. `runs_on python3` vs `runs_on python2`.
   - opposing_predicate:  same subject + object joined by an opposing predicate
                          pair (e.g. `prefers X Y` vs `rejects X Y`).
+
+Note: `prefers` is intentionally NOT in _EXCLUSIVE_PREDICATES. Preferences are
+multi-valued — a subject can prefer many things — so treating
+`(subj, prefers, *)` pairs as competing objects produces a quadratic explosion
+of false positives. Genuine preference contradictions still surface via
+_OPPOSING_PAIRS when `prefers X` and `rejects X` share the same object.
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ import sqlite3
 from dataclasses import dataclass
 
 # Predicates where a single subject pointing at multiple objects is contradictory.
-_EXCLUSIVE_PREDICATES = ("prefers", "runs_on", "requires_version", "deploys_to")
+_EXCLUSIVE_PREDICATES = ("runs_on", "requires_version", "deploys_to")
 
 # Predicate pairs that contradict each other when they share subject + object.
 _OPPOSING_PAIRS = frozenset(

@@ -51,13 +51,27 @@ class HyMemConfig:
     decay_factor: float = 0.9
     retract_threshold: float = 0.15
 
+    zombie_neg_threshold: int = 2
+    """Edges with pos_evidence=0 and neg_evidence>=this are retracted regardless
+    of the smoothed-confidence threshold. Catches facts the LLM extracted once
+    then contradicted, which otherwise need ~6 negatives to fall below 0.15."""
+
+    reinforce_window_days: int = 30
+    """Window for soft positive reinforcement from co-mention. Symmetric to
+    decay_window_days."""
+
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    prompt_version: str = "v5"
+    prompt_version: str = "v6"
 
     dream_budget: int = 50
     """Maximum number of chunks to process per dreaming cycle."""
+
+    dream_baseline_budget: int = 10
+    """If the salience tier leaves budget unspent, drain up to this many
+    non-salience-marked chunks (newest first) per cycle. Guarantees every chunk
+    eventually flows through extraction even if it didn't trip the regexes."""
 
     max_chunks: int = 50000
     """Soft cap on total stored chunks. Excess unreferenced chunks are pruned."""

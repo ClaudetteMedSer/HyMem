@@ -107,6 +107,78 @@ def extract_high_salience_chunks(
     return chunks
 
 
+def extract_baseline_chunks(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    prompt_version: str,
+    limit: int,
+    min_chars: int,
+) -> list[Chunk]:
+    """Build chunks from any user turn (no salience filter) that hasn't been
+    processed under the current prompt_version. Newest first.
+
+    Backstop for the high-salience tier: most chunks don't trip the
+    correction/preference regexes, so without this they never reach the LLM
+    and the graph can't reinforce existing edges via re-mention.
+
+    Caller is expected to use this only when high-salience tier has unspent
+    budget — that's enforced upstream in the runner, not here.
+    """
+    candidates: list[Chunk] = []
+    last_assistant: sqlite3.Row | None = None
+
+    for row in conn.execute(
+        "SELECT id, role, content FROM messages WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    ):
+        role = row["role"]
+        content = row["content"] or ""
+        if role == "assistant":
+            last_assistant = row
+            continue
+        if role != "user":
+            continue
+        if len(content) < min_chars:
+            continue
+
+        start_id = last_assistant["id"] if last_assistant is not None else row["id"]
+        end_id = row["id"]
+        chunk_id = _chunk_id(session_id, start_id, end_id)
+
+        pieces = []
+        if last_assistant is not None:
+            pieces.append(f"assistant: {last_assistant['content']}")
+        pieces.append(f"user: {content}")
+        text = "\n".join(pieces)
+
+        candidates.append(
+            Chunk(
+                id=chunk_id,
+                session_id=session_id,
+                start_message_id=start_id,
+                end_message_id=end_id,
+                salience_reason="baseline_backstop",
+                text=text,
+            )
+        )
+
+    # Newest first, then drop already-processed and cap to limit.
+    candidates.reverse()
+    result: list[Chunk] = []
+    for chunk in candidates:
+        already = conn.execute(
+            "SELECT 1 FROM processed_chunks WHERE chunk_id = ? AND prompt_version = ?",
+            (chunk.id, prompt_version),
+        ).fetchone()
+        if already:
+            continue
+        result.append(chunk)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def persist_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
     for c in chunks:
         conn.execute(
