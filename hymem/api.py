@@ -123,7 +123,9 @@ class HyMem:
 
     def augment(self, user_message: str) -> AugmentedContext:
         if self._token_overlap_index is None:
-            self._token_overlap_index = build_token_overlap_index(self.read_conn)
+            self._token_overlap_index = build_token_overlap_index(
+                self.read_conn, write_conn=self.conn
+            )
         return augment(
             self.read_conn, self.config, user_message,
             embedding_client=self._embed,
@@ -186,6 +188,9 @@ class HyMem:
     def merge_canonical(self, keep: str, drop: str) -> None:
         with core_db.transaction(self.conn):
             canon.merge(self.conn, keep, drop)
+            self.conn.execute(
+                "DELETE FROM token_overlap_index WHERE canonical = ?", (drop,)
+            )
         self._token_overlap_index = None
 
     def retract_edge(self, subject: str, predicate: str, object: str) -> bool:
@@ -235,6 +240,17 @@ class HyMem:
                             extracted_predicate, extracted_object, feedback_type)
                            VALUES (?, ?, ?, ?, ?, 'retracted')""",
                         (er["chunk_id"], snippet, subject, predicate, object),
+                    )
+            for c in (subj, obj):
+                still_active = self.conn.execute(
+                    "SELECT 1 FROM knowledge_graph "
+                    "WHERE (subject_canonical = ? OR object_canonical = ?) "
+                    "AND status = 'active' LIMIT 1",
+                    (c, c),
+                ).fetchone()
+                if still_active is None:
+                    self.conn.execute(
+                        "DELETE FROM token_overlap_index WHERE canonical = ?", (c,)
                     )
         self._token_overlap_index = None
         return True

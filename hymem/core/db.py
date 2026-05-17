@@ -11,7 +11,7 @@ from typing import Iterator
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 6
+EXPECTED_SCHEMA_VERSION = 7
 
 
 def _load_schema() -> str:
@@ -69,6 +69,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         _migrate_v5(conn)
     if cur < 6:
         _migrate_v6(conn)
+    if cur < 7:
+        _migrate_v7(conn)
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
@@ -155,6 +157,25 @@ def _migrate_v6(conn: sqlite3.Connection) -> None:
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6')"
     )
     log.info("migrated schema to v6 (edge embeddings table)")
+
+
+def _migrate_v7(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS token_overlap_index (
+            token TEXT NOT NULL,
+            canonical TEXT NOT NULL,
+            PRIMARY KEY (token, canonical)
+        )""")
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_overlap_token ON token_overlap_index(token)"
+        )
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '7')"
+    )
+    log.info("migrated schema to v7 (token overlap index table)")
 
 
 _VEC_TABLES = frozenset({"vec_chunks", "vec_edges"})

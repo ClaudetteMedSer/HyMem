@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from typing import cast
 
 from hymem.core import db as core_db
-from hymem.extraction.embeddings import EmbeddingClient
+from hymem.extraction.embeddings import EmbeddingClient, normalize_text
 
 
 @dataclass
@@ -15,20 +17,25 @@ class PendingChunkEmbeddings:
     vectors: list[list[float]]
     dim: int
     model: str
+    text_hashes: list[str]
+    from_cache: list[bool]
+    cache_hits: int = 0
 
 
 @dataclass
 class PendingEdgeEmbeddings:
     edge_text_by_id: dict[int, str]
     new_text_vectors: dict[str, list[float]] = field(default_factory=dict)
+    truly_new_texts: set[str] = field(default_factory=set)
     dim: int = 0
     model: str = ""
+    cache_hits: int = 0
 
 
 def fetch_chunk_embeddings(
     conn: sqlite3.Connection, embedder: EmbeddingClient
 ) -> PendingChunkEmbeddings | None:
-    """Read pending chunks and call the embedder. No write transaction held.
+    """Read pending chunks and embed them, consulting embedding_cache first.
 
     Returns None when there are no chunks to embed.
     """
@@ -46,27 +53,89 @@ def fetch_chunk_embeddings(
     ids = [r["id"] for r in rows]
     chunk_rowids = [r["rowid"] for r in rows]
     texts = [r["text"] for r in rows]
-    vectors = embedder.embed(texts)
-    if len(vectors) != len(ids):
-        raise RuntimeError(
-            f"embedding client returned {len(vectors)} vectors for {len(ids)} chunks"
-        )
+    model = embedder.model
+
+    text_hashes = [
+        hashlib.sha256(normalize_text(t).encode()).hexdigest() for t in texts
+    ]
+    cached_by_hash = _fetch_cached_vectors(conn, text_hashes, model)
+
+    vectors_out: list[list[float] | None] = [None] * len(texts)
+    from_cache = [False] * len(texts)
+    miss_indices: list[int] = []
+    miss_texts: list[str] = []
+
+    for i, text_hash in enumerate(text_hashes):
+        cached = cached_by_hash.get(text_hash)
+        if cached is not None:
+            vectors_out[i] = cached
+            from_cache[i] = True
+        else:
+            miss_indices.append(i)
+            miss_texts.append(texts[i])
+
+    if miss_texts:
+        embedded = embedder.embed(miss_texts)
+        if len(embedded) != len(miss_texts):
+            raise RuntimeError(
+                f"embedding client returned {len(embedded)} vectors for {len(miss_texts)} chunks"
+            )
+        for idx, vec in zip(miss_indices, embedded):
+            vectors_out[idx] = vec
+
+    assert all(v is not None for v in vectors_out), "chunk embedding slot unfilled"
+    final_vectors = cast(list[list[float]], vectors_out)
+
     return PendingChunkEmbeddings(
         ids=ids,
         chunk_rowids=chunk_rowids,
-        vectors=vectors,
+        vectors=final_vectors,
         dim=embedder.dim,
-        model=embedder.model,
+        model=model,
+        text_hashes=text_hashes,
+        from_cache=from_cache,
+        cache_hits=sum(from_cache),
     )
+
+
+def _fetch_cached_vectors(
+    conn: sqlite3.Connection, text_hashes: list[str], model: str
+) -> dict[str, list[float]]:
+    """Single batched lookup against embedding_cache for the given hashes."""
+    unique_hashes = list({h for h in text_hashes})
+    if not unique_hashes:
+        return {}
+    placeholders = ",".join("?" * len(unique_hashes))
+    rows = conn.execute(
+        f"SELECT text_hash, vector_json FROM embedding_cache "
+        f"WHERE model = ? AND text_hash IN ({placeholders})",
+        (model, *unique_hashes),
+    ).fetchall()
+    return {r["text_hash"]: json.loads(r["vector_json"]) for r in rows}
 
 
 def persist_chunk_embeddings(
     conn: sqlite3.Connection, pending: PendingChunkEmbeddings
 ) -> int:
     """Insert pending chunk vectors into chunk_embeddings + vec_chunks.
+    Cache misses are also written to embedding_cache.
     Caller wraps in core_db.transaction()."""
     core_db.ensure_vec_table(conn, pending.dim)
-    for chunk_id, chunk_rowid, vec in zip(pending.ids, pending.chunk_rowids, pending.vectors):
+    for chunk_id, chunk_rowid, vec, text_hash, is_cached in zip(
+        pending.ids,
+        pending.chunk_rowids,
+        pending.vectors,
+        pending.text_hashes,
+        pending.from_cache,
+    ):
+        if not is_cached:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO embedding_cache(text_hash, model, vector_json, dim)
+                VALUES (?, ?, ?, ?)
+                """,
+                (text_hash, pending.model, json.dumps(vec), len(vec)),
+            )
         conn.execute(
             """
             INSERT OR REPLACE INTO chunk_embeddings(chunk_id, vector_json, model, dim)
@@ -117,20 +186,45 @@ def fetch_edge_embeddings(
     )
 
     new_text_vectors: dict[str, list[float]] = {}
+    truly_new_texts: set[str] = set()
+    cache_hits = 0
+    model = embedder.model
+
     if pending_texts:
-        vectors = embedder.embed(pending_texts)
-        if len(vectors) != len(pending_texts):
-            raise RuntimeError(
-                f"embedding client returned {len(vectors)} vectors "
-                f"for {len(pending_texts)} edges"
-            )
-        new_text_vectors = dict(zip(pending_texts, vectors))
+        text_hashes = {
+            text: hashlib.sha256(normalize_text(text).encode()).hexdigest()
+            for text in pending_texts
+        }
+        cached_by_hash = _fetch_cached_vectors(
+            conn, list(text_hashes.values()), model
+        )
+
+        miss_texts: list[str] = []
+        for text in pending_texts:
+            cached = cached_by_hash.get(text_hashes[text])
+            if cached is not None:
+                new_text_vectors[text] = cached
+                cache_hits += 1
+            else:
+                miss_texts.append(text)
+
+        if miss_texts:
+            vectors = embedder.embed(miss_texts)
+            if len(vectors) != len(miss_texts):
+                raise RuntimeError(
+                    f"embedding client returned {len(vectors)} vectors "
+                    f"for {len(miss_texts)} edges"
+                )
+            new_text_vectors.update(dict(zip(miss_texts, vectors)))
+            truly_new_texts = set(miss_texts)
 
     return PendingEdgeEmbeddings(
         edge_text_by_id=edge_text_by_id,
         new_text_vectors=new_text_vectors,
+        truly_new_texts=truly_new_texts,
         dim=embedder.dim,
-        model=embedder.model,
+        model=model,
+        cache_hits=cache_hits,
     )
 
 
@@ -138,8 +232,18 @@ def persist_edge_embeddings(
     conn: sqlite3.Connection, pending: PendingEdgeEmbeddings
 ) -> int:
     """Persist newly embedded triple texts and rebuild vec_edges from cache.
+    True embedding misses are also written to embedding_cache.
     Caller wraps in core_db.transaction()."""
     for text, vec in pending.new_text_vectors.items():
+        if text in pending.truly_new_texts:
+            text_hash = hashlib.sha256(normalize_text(text).encode()).hexdigest()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO embedding_cache(text_hash, model, vector_json, dim)
+                VALUES (?, ?, ?, ?)
+                """,
+                (text_hash, pending.model, json.dumps(vec), len(vec)),
+            )
         conn.execute(
             """
             INSERT OR REPLACE INTO edge_embeddings(edge_text, vector_json, model, dim)

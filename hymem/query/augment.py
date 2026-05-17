@@ -672,27 +672,62 @@ def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> l
     return result
 
 
-def build_token_overlap_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
+def build_token_overlap_index(
+    conn: sqlite3.Connection,
+    *,
+    write_conn: sqlite3.Connection | None = None,
+) -> dict[str, list[str]]:
     """Map every underscore-segment token to the active canonicals containing
     it. Caller-cacheable; rebuild after a dream cycle that may have added,
     retracted, or merged edges.
+
+    On a warm database the persistent ``token_overlap_index`` table is read
+    directly (O(index rows) instead of O(active edges)). When the table is
+    empty — cold start, post-migration, or after runner invalidated it —
+    the function falls back to the full canonical scan and, if *write_conn* is
+    provided, persists the result so the next cold start is fast.
 
     Public (no leading underscore) so callers — HyMem instances, background
     workers — can build, stash, and pass it back through `augment()` to avoid
     re-scanning the canonical set on every query. At a few hundred canonicals
     the scan is sub-millisecond; at tens of thousands it begins to matter.
     """
+    persisted = conn.execute(
+        "SELECT token, canonical FROM token_overlap_index"
+    ).fetchall()
+    if persisted:
+        by_token: dict[str, list[str]] = {}
+        for r in persisted:
+            by_token.setdefault(r["token"], []).append(r["canonical"])
+        return by_token
+
     rows = conn.execute(
         "SELECT DISTINCT subject_canonical AS c FROM knowledge_graph WHERE status='active' "
         "UNION "
         "SELECT DISTINCT object_canonical FROM knowledge_graph WHERE status='active'"
     ).fetchall()
-    by_token: dict[str, list[str]] = {}
+    by_token = {}
     for r in rows:
         c = r["c"]
         for tok in c.split("_"):
             if tok:
                 by_token.setdefault(tok, []).append(c)
+
+    if write_conn is not None and by_token:
+        # isolation_level=None means autocommit — wrap explicitly so a partial
+        # write doesn't leave a half-populated table that subsequent cold starts
+        # would trust as complete.
+        write_conn.execute("BEGIN IMMEDIATE")
+        try:
+            write_conn.executemany(
+                "INSERT OR IGNORE INTO token_overlap_index(token, canonical) VALUES (?, ?)",
+                [(tok, c) for tok, canons in by_token.items() for c in canons],
+            )
+            write_conn.execute("COMMIT")
+        except Exception:
+            write_conn.execute("ROLLBACK")
+            raise
+
     return by_token
 
 

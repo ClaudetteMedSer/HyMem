@@ -41,7 +41,9 @@ class DreamReport:
     triples_extracted: int = 0
     markers_extracted: int = 0
     chunks_embedded: int = 0
+    chunks_embedded_from_cache: int = 0
     edges_embedded: int = 0
+    edges_embedded_from_cache: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
 
@@ -234,6 +236,7 @@ def run_dreaming(
             if pending_chunks is not None:
                 with core_db.transaction(conn):
                     report.chunks_embedded = persist_chunk_embeddings(conn, pending_chunks)
+                report.chunks_embedded_from_cache = pending_chunks.cache_hits
 
         log.info("phase2.start")
         with core_db.transaction(conn):
@@ -260,12 +263,30 @@ def run_dreaming(
                 log.info("inference.derived count=%d", derived)
             prune_chunks(conn, cfg)
             phase2.consolidate_insights(conn, cfg)  # refresh after decay
+            conn.execute("DELETE FROM token_overlap_index")
+            _canon_rows = conn.execute(
+                "SELECT DISTINCT subject_canonical AS c FROM knowledge_graph WHERE status='active' "
+                "UNION "
+                "SELECT DISTINCT object_canonical FROM knowledge_graph WHERE status='active'"
+            ).fetchall()
+            _index_data = []
+            for _r in _canon_rows:
+                _c = _r["c"]
+                for _tok in _c.split("_"):
+                    if _tok:
+                        _index_data.append((_tok, _c))
+            if _index_data:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO token_overlap_index(token, canonical) VALUES (?, ?)",
+                    _index_data,
+                )
 
         if embedding_client is not None:
             pending_edges = fetch_edge_embeddings(conn, embedding_client)
             if pending_edges is not None:
                 with core_db.transaction(conn):
                     report.edges_embedded = persist_edge_embeddings(conn, pending_edges)
+                report.edges_embedded_from_cache = pending_edges.cache_hits
         after_retracted = conn.execute(
             "SELECT COUNT(*) AS c FROM knowledge_graph WHERE status = 'retracted'"
         ).fetchone()["c"]
@@ -297,13 +318,15 @@ def run_dreaming(
             ),
         )
         log.info(
-            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d budget_exhausted=%s",
+            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d budget_exhausted=%s",
             run_id,
             report.sessions_processed,
             report.chunks_processed,
             report.chunks_seen,
             report.triples_extracted,
             report.markers_extracted,
+            report.chunks_embedded_from_cache,
+            report.edges_embedded_from_cache,
             report.budget_exhausted,
         )
         return report

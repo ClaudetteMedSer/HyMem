@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Protocol, Sequence
+
+
+def normalize_text(text: str) -> str:
+    """Canonical form used for content-addressed embedding cache lookups."""
+    return re.sub(r"\s+", " ", text.strip()).lower()
 
 
 class EmbeddingClient(Protocol):

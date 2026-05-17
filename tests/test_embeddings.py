@@ -4,7 +4,7 @@ import json
 import math
 
 from hymem import HyMem, StubEmbeddingClient
-from hymem.extraction.embeddings import CachedEmbeddingClient
+from hymem.extraction.embeddings import CachedEmbeddingClient, normalize_text
 from hymem.extraction.llm import StubLLMClient
 from hymem.core import db as core_db
 from hymem.query.augment import _vector_search
@@ -213,6 +213,50 @@ def test_cached_embedding_client_empty_batch_short_circuits():
     cached = CachedEmbeddingClient(inner)
     assert cached.embed([]) == []
     assert inner.calls == []
+
+
+def test_normalize_text_strips_collapses_lowercases():
+    assert normalize_text("  Hello   World  ") == "hello world"
+    assert normalize_text("\tHELLO\nworld\n") == "hello world"
+    assert normalize_text("same") == normalize_text(" SAME ")
+
+
+def test_embedding_cache_skips_repeat_chunk_text_across_dreams(cfg):
+    """Two chunks with identical text in separate dream runs embed once: the
+    second run reads the vector from embedding_cache."""
+    embed = StubEmbeddingClient()
+    llm = StubLLMClient(default="[]")
+    hy = HyMem(cfg, llm=llm, embedding_client=embed)
+    try:
+        text = (
+            "I prefer fastapi for my web services because it is async and modern."
+        )
+        hy.open_session("s1")
+        hy.log_message("s1", "assistant", "anything")
+        hy.log_message("s1", "user", text)
+        hy.close_session("s1")
+        report1 = hy.dream()
+        assert report1.chunks_embedded >= 1
+        assert report1.chunks_embedded_from_cache == 0
+
+        embed.calls.clear()
+
+        hy.open_session("s2")
+        hy.log_message("s2", "assistant", "anything")
+        hy.log_message("s2", "user", text)
+        hy.close_session("s2")
+        report2 = hy.dream()
+        assert report2.chunks_embedded >= 1
+        assert report2.chunks_embedded_from_cache >= 1
+        # The duplicate text must not appear in any embedder batch on run 2.
+        assert all(text not in batch for batch in embed.calls)
+
+        cache_rows = hy.conn.execute(
+            "SELECT COUNT(*) AS c FROM embedding_cache"
+        ).fetchone()["c"]
+        assert cache_rows >= 1
+    finally:
+        hy.close()
 
 
 def test_vector_search_respects_embedding_max_scan(cfg):

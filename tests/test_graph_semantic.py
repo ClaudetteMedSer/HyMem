@@ -17,7 +17,7 @@ from tests.conftest import make_routed_llm, seed_edge
 
 def test_migration_v6_creates_edge_embeddings(hy):
     conn = hy.conn
-    assert core_db.schema_version(conn) == 6
+    assert core_db.schema_version(conn) == 7
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edge_embeddings'"
     ).fetchone()
@@ -344,6 +344,32 @@ def test_invalidate_query_caches_clears_index(hy):
 
     hy.invalidate_query_caches()
     assert hy._token_overlap_index is None
+
+
+def test_token_overlap_index_persisted_and_read_by_cold_instance(cfg, stub_llm):
+    """Cold HyMem instance reads the persisted token_overlap_index table instead
+    of scanning knowledge_graph — verifies the cross-instance warm path."""
+    from hymem import HyMem
+
+    # First instance: populate edges, run augment to trigger a cold-start write.
+    h1 = HyMem(cfg, llm=stub_llm)
+    seed_edge(h1.conn, "atta_van_westreenen", "prefers", "dutch")
+    seed_edge(h1.conn, "medflow", "part_of", "atta_projects")
+    h1.augment("anything")
+    # After augment, the table must be populated.
+    rows = h1.conn.execute("SELECT COUNT(*) AS n FROM token_overlap_index").fetchone()
+    assert rows["n"] > 0
+    h1.close()
+
+    # Second instance against the same DB — starts cold (no in-memory cache).
+    h2 = HyMem(cfg, llm=stub_llm)
+    assert h2._token_overlap_index is None
+    # Query for atta_van_westreenen (a subject_canonical, so match_known_entities
+    # finds it). Overlap expansion on the "atta" token should then surface
+    # atta_projects, proving the persisted table was used.
+    ctx = h2.augment("atta_van_westreenen")
+    assert "atta_projects" in ctx.matched_entities
+    h2.close()
 
 
 def test_overlap_skipped_when_token_too_common_end_to_end(hy):

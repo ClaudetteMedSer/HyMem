@@ -84,6 +84,17 @@ CREATE TABLE IF NOT EXISTS edge_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Content-addressed embedding cache. Deduplicates API/model calls when two
+-- chunks or edges share the same normalized text.
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    text_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    vector_json TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (text_hash, model)
+);
+
 -- Idempotency: each chunk processed at most once per prompt_version.
 CREATE TABLE IF NOT EXISTS processed_chunks (
     chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
@@ -266,6 +277,17 @@ CREATE TABLE IF NOT EXISTS extraction_feedback (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_created ON extraction_feedback(created_at);
+
+-- Persistent token-overlap index for entity expansion in augment().
+-- Rebuilt atomically at the end of every dream cycle; updated incrementally
+-- by merge_canonical and retract_edge. Empty table signals a cold start —
+-- build_token_overlap_index will scan canonicals and repopulate it.
+CREATE TABLE IF NOT EXISTS token_overlap_index (
+    token TEXT NOT NULL,
+    canonical TEXT NOT NULL,
+    PRIMARY KEY (token, canonical)
+);
+CREATE INDEX IF NOT EXISTS idx_token_overlap_token ON token_overlap_index(token);
 
 -- Per-cycle dreaming run record. Populated by runner.run_dreaming for every
 -- invocation (success, lock-skip, or error) so operators can observe cadence
