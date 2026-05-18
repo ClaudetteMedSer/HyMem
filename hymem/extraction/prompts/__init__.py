@@ -37,6 +37,11 @@ Rules:
 - Optionally include subject_type and object_type (string) to classify entities:
     language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, or_other_tool
 - Include these types ONLY when you are confident. Skip them otherwise.
+- Optionally include subject_properties and/or object_properties (object of
+  string->string pairs) to capture stable attributes of the entity, e.g.
+  {{"language": "python", "category": "build_tool", "runtime": "node"}}.
+  Keep keys short and lowercase (language, runtime, category, vendor, role).
+  At most 4 properties per entity; skip when not clearly stated.
 - predicate MUST be one of: {predicates}.
 - Predicate meanings:
     uses: A employs or utilizes B

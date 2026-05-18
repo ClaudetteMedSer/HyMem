@@ -121,6 +121,22 @@ CREATE TABLE IF NOT EXISTS entity_types (
 CREATE INDEX IF NOT EXISTS idx_entity_types_type ON entity_types(type);
 CREATE INDEX IF NOT EXISTS idx_entity_types_entity ON entity_types(entity_canonical);
 
+-- Entity properties: free-form key/value attributes for canonical entities
+-- (e.g. language=python, runtime=node, category=build_tool). Populated
+-- alongside entity_types during phase-1 extraction; one (entity, key) wins,
+-- last write replaces. Source chunk is retained so a property can be traced
+-- back to the LLM extraction that introduced it.
+CREATE TABLE IF NOT EXISTS entity_properties (
+    entity_canonical TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    source_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (entity_canonical, key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_properties_key ON entity_properties(key);
+CREATE INDEX IF NOT EXISTS idx_entity_properties_value ON entity_properties(value);
+
 -- Knowledge graph. Confidence is derived: (pos+1)/(pos+neg+2). Predicates locked.
 CREATE TABLE IF NOT EXISTS knowledge_graph (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

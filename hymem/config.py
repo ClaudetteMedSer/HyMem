@@ -66,7 +66,7 @@ class HyMemConfig:
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    prompt_version: str = "v6"
+    prompt_version: str = "v7"
 
     dream_budget: int = 50
     """Maximum number of chunks to process per dreaming cycle."""
@@ -85,6 +85,21 @@ class HyMemConfig:
     rerank_ambiguity_threshold: float = 0.6
     """Minimum RRF score drop between #1/#2 results to consider them clear
     (skip reranking). Higher = more reranking."""
+
+    rerank_top_k: int = 20
+    """Size of the candidate pool sent to the reranker. After rerank the
+    list is truncated to ``fts_top_k``. Larger gives the reranker more room
+    to reorder beyond the top of the fused list at the cost of latency
+    (LLM tokens or cross-encoder forward passes)."""
+
+    rerank_model: str = "llm"
+    """Rerank backend. ``"llm"`` reuses the host-provided LLM client (one
+    extra request per query). ``"cross-encoder"`` uses a local
+    sentence-transformers cross-encoder if installed; otherwise falls back
+    to the LLM (or to the un-reranked candidates if no LLM is wired)."""
+
+    rerank_cross_encoder_model: str = "mixedbread-ai/mxbai-rerank-base-v1"
+    """HuggingFace model id used when ``rerank_model="cross-encoder"``."""
 
     hedge_confidence_threshold: float = 0.75
     """Below this Laplace-smoothed confidence, a GraphFact is flagged

@@ -19,6 +19,7 @@ class ChunkExtraction:
     triples: list[Triple]
     markers: list[Marker]
     entity_type_hints: dict[str, str] = field(default_factory=dict)
+    entity_property_hints: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 def extract_chunk_results(
@@ -40,9 +41,16 @@ def extract_chunk_results(
     if already:
         return None
 
-    triples, entity_type_hints = extract_triples(llm, chunk.text, negative_examples)
+    triples, entity_type_hints, entity_property_hints = extract_triples(
+        llm, chunk.text, negative_examples
+    )
     markers = extract_markers(llm, chunk.text)
-    return ChunkExtraction(triples=triples, markers=markers, entity_type_hints=entity_type_hints)
+    return ChunkExtraction(
+        triples=triples,
+        markers=markers,
+        entity_type_hints=entity_type_hints,
+        entity_property_hints=entity_property_hints,
+    )
 
 
 def persist_chunk_results(
@@ -60,6 +68,22 @@ def persist_chunk_results(
                VALUES (?, ?, 1.0, ?)""",
             (entity_canon, entity_type, chunk.id),
         )
+
+    for entity_name, kv in extraction.entity_property_hints.items():
+        if not kv:
+            continue
+        entity_canon = canonicalize.resolve(conn, entity_name)
+        for key, value in kv.items():
+            conn.execute(
+                """INSERT INTO entity_properties(
+                       entity_canonical, key, value, source_chunk_id, updated_at
+                   ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(entity_canonical, key) DO UPDATE SET
+                       value = excluded.value,
+                       source_chunk_id = excluded.source_chunk_id,
+                       updated_at = CURRENT_TIMESTAMP""",
+                (entity_canon, key, value, chunk.id),
+            )
 
     mentioned: set[str] = set()
     for t in extraction.triples:

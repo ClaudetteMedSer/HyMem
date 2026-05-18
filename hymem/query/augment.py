@@ -9,10 +9,10 @@ from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
 from hymem.extraction.embeddings import EmbeddingClient
-from hymem.extraction.llm import LLMClient, LLMRequest
-from hymem.extraction.prompts import RERANK_SYSTEM, RERANK_USER_TEMPLATE
+from hymem.extraction.llm import LLMClient
 from hymem.query.entities import match_known_entities
 from hymem.query.predicate_routing import route_predicates
+from hymem.query.rerank import rerank as run_rerank
 
 log = logging.getLogger("hymem.query.augment")
 
@@ -102,25 +102,40 @@ def augment(
     if cfg.memory_md_path.exists():
         ctx.memory_md = cfg.memory_md_path.read_text(encoding="utf-8")
 
-    fts = _fts_search(conn, user_message, top_k=cfg.fts_top_k)
+    # Pull a wider candidate pool when reranking is likely so the reranker
+    # has room to reorder beyond the top-fts_top_k window; the final result
+    # is still trimmed to fts_top_k after rerank.
+    candidate_k = max(cfg.fts_top_k, cfg.rerank_top_k)
+    fts = _fts_search(conn, user_message, top_k=candidate_k)
     vec: list[FtsHit] = []
     if embedding_client is not None:
         vec = _vector_search(
             conn,
             embedding_client,
             user_message,
-            top_k=cfg.fts_top_k,
+            top_k=candidate_k,
             max_scan=cfg.embedding_max_scan,
         )
-        ctx.fts_hits = _rrf_merge(fts, vec, top_k=cfg.fts_top_k)
+        ctx.fts_hits = _rrf_merge(fts, vec, top_k=candidate_k)
     else:
         ctx.fts_hits = fts
 
-    if llm is not None and should_rerank(fts, vec, ctx.fts_hits, cfg.rerank_ambiguity_threshold):
-        log.debug("rerank.triggered")
-        ctx.fts_hits = _rerank(user_message, list(ctx.fts_hits), llm, top_k=cfg.fts_top_k)
+    rerank_enabled = (
+        cfg.rerank_model == "cross-encoder" or llm is not None
+    )
+    if rerank_enabled and should_rerank(fts, vec, ctx.fts_hits, cfg.rerank_ambiguity_threshold):
+        log.debug("rerank.triggered model=%s", cfg.rerank_model)
+        ctx.fts_hits = run_rerank(
+            user_message,
+            list(ctx.fts_hits[: cfg.rerank_top_k]),
+            top_k=cfg.fts_top_k,
+            model=cfg.rerank_model,
+            llm=llm,
+            cross_encoder_model=cfg.rerank_cross_encoder_model,
+        )
     else:
         log.debug("rerank.skipped")
+        ctx.fts_hits = ctx.fts_hits[: cfg.fts_top_k]
 
     ctx.episodes = _episode_search(
         conn, user_message,
@@ -132,6 +147,14 @@ def augment(
 
     matched = match_known_entities(conn, user_message)
     type_expanded, expansion_info = _expand_entities_by_type(conn, matched)
+    # Free-text type/property expansion: the user may ask "what build tools
+    # do we use?" without naming any specific entity. Map type/property
+    # keywords in the message to canonicals tagged with that type or
+    # property; merge into the entity set so Source 1 of the graph lookup
+    # picks them up.
+    query_type_expanded, query_type_info = _expand_entities_from_query(
+        conn, user_message
+    )
     overlap_expanded, overlap_info = _expand_entities_by_token_overlap(
         conn, matched,
         max_per_entity=cfg.graph_token_overlap_max_per_entity,
@@ -139,6 +162,12 @@ def augment(
         token_index=token_overlap_index,
     )
     combined = list(type_expanded)
+    for e in query_type_expanded:
+        if e not in combined:
+            combined.append(e)
+        # Surface the type label that justified the addition through the same
+        # `entity_type:` reason channel as direct-entity type expansion.
+        expansion_info.setdefault(e, query_type_info[e])
     for e in overlap_expanded:
         if e not in combined:
             combined.append(e)
@@ -887,6 +916,107 @@ def _expand_entities_by_token_overlap(
     return expansions, overlap_info
 
 
+# Maps category-style query phrases to the entity-type labels emitted by the
+# extraction prompt. Lets "what build tools do we use?" pull every canonical
+# tagged `package_manager` even when no specific package manager is named.
+# Phrases match against a normalised, lowercased copy of the user message.
+_TYPE_QUERY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "package_manager": (
+        "package manager", "package management", "build tool", "build tools",
+        "dependency manager", "dependency management",
+    ),
+    "database": ("database", "databases", "datastore", "data store"),
+    "language": ("programming language", "languages", "language stack"),
+    "framework": ("framework", "frameworks", "web framework"),
+    "service": ("service", "services", "microservice", "microservices"),
+    "container": ("container", "containers", "containerization", "containerisation"),
+    "platform": ("platform", "platforms", "cloud platform"),
+    "testing_framework": ("test framework", "testing framework", "test runner", "test tooling"),
+    "ci_tool": ("ci tool", "ci tools", "ci/cd", "ci pipeline", "continuous integration"),
+    "monitoring_tool": ("monitoring", "observability", "metrics tool"),
+    "config_file": ("config file", "configuration file", "config files"),
+    "identity_provider": ("identity provider", "auth provider", "sso", "single sign-on"),
+    "message_broker": ("message broker", "message queue", "queue system", "pubsub", "pub/sub"),
+    "protocol": ("protocol", "protocols"),
+    "environment": ("environment", "environments", "deployment environment"),
+    "api": ("api", "apis"),
+    "library": ("library", "libraries", "dependency", "dependencies"),
+    "tool": ("tooling", "dev tool", "dev tools"),
+}
+
+# Maps category-style query phrases to entity_properties (key, value) filters.
+# Lets a question about "build tools" also surface entities the LLM tagged
+# with `category=build_tool` even if they have no entity_types row.
+_PROPERTY_QUERY_KEYWORDS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("category", "build_tool"): ("build tool", "build tools"),
+    ("category", "database"): ("database", "databases"),
+    ("category", "testing"): ("test framework", "testing framework", "test runner"),
+    ("category", "deployment"): ("deployment", "deploy tool"),
+    ("category", "observability"): ("monitoring", "observability"),
+}
+
+
+def _expand_entities_from_query(
+    conn: sqlite3.Connection,
+    user_message: str,
+    *,
+    max_per_type: int = 10,
+) -> tuple[list[str], dict[str, str]]:
+    """Pull canonicals whose type or property matches a category-style query.
+
+    Scans the lowercased message for the configured keyword phrases. For each
+    hit, returns up to ``max_per_type`` canonicals tagged with that type (via
+    ``entity_types``) or carrying the matching ``(key, value)`` pair in
+    ``entity_properties``. Returns ``(canonicals, {canonical: type_label})``
+    where the label is the type or ``"key=value"`` rendering of the property.
+    """
+    msg = user_message.lower()
+    matched_types: set[str] = set()
+    for type_label, phrases in _TYPE_QUERY_KEYWORDS.items():
+        if any(p in msg for p in phrases):
+            matched_types.add(type_label)
+
+    matched_props: list[tuple[str, str]] = []
+    for (key, value), phrases in _PROPERTY_QUERY_KEYWORDS.items():
+        if any(p in msg for p in phrases):
+            matched_props.append((key, value))
+
+    if not matched_types and not matched_props:
+        return [], {}
+
+    seen: set[str] = set()
+    out: list[str] = []
+    info: dict[str, str] = {}
+
+    for type_label in sorted(matched_types):
+        rows = conn.execute(
+            "SELECT entity_canonical FROM entity_types WHERE type = ? LIMIT ?",
+            (type_label, max_per_type),
+        ).fetchall()
+        for r in rows:
+            ent = r["entity_canonical"]
+            if ent in seen:
+                continue
+            seen.add(ent)
+            out.append(ent)
+            info[ent] = type_label
+
+    for key, value in matched_props:
+        rows = conn.execute(
+            "SELECT entity_canonical FROM entity_properties WHERE key = ? AND value = ? LIMIT ?",
+            (key, value, max_per_type),
+        ).fetchall()
+        for r in rows:
+            ent = r["entity_canonical"]
+            if ent in seen:
+                continue
+            seen.add(ent)
+            out.append(ent)
+            info[ent] = f"{key}={value}"
+
+    return out, info
+
+
 def _expand_entities_by_type(
     conn: sqlite3.Connection,
     entities: list[str],
@@ -931,51 +1061,3 @@ def _expand_entities_by_type(
     return entities + expanded, expansion_info
 
 
-def _rerank(
-    query: str,
-    candidates: list[FtsHit],
-    llm: LLMClient,
-    top_k: int,
-) -> list[FtsHit]:
-    if not candidates:
-        return candidates
-
-    excerpts_lines = []
-    for i, hit in enumerate(candidates):
-        excerpts_lines.append(f"[{i}] {hit.text[:400]}")
-    excerpts = "\n\n".join(excerpts_lines)
-
-    request = LLMRequest(
-        system=RERANK_SYSTEM,
-        user=RERANK_USER_TEMPLATE.format(query=query, excerpts=excerpts),
-        response_format="json",
-    )
-    raw = llm.complete(request)
-
-    try:
-        ratings = json.loads(raw)
-    except json.JSONDecodeError:
-        return candidates[:top_k]
-
-    if not isinstance(ratings, list):
-        return candidates[:top_k]
-
-    relevance: dict[int, int] = {}
-    for item in ratings:
-        if not isinstance(item, dict):
-            continue
-        idx = item.get("index")
-        score = item.get("relevance")
-        if isinstance(idx, int) and isinstance(score, (int, float)) and 0 <= idx < len(candidates):
-            relevance[idx] = int(score)
-
-    scored = []
-    for i, hit in enumerate(candidates):
-        rrf_score = hit.score if hit.score_kind == "rrf" else 0.0
-        llm_score = relevance.get(i, 3)
-        combined = llm_score * 100 + rrf_score
-        scored.append((combined, hit))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [replace(hit, score=float(score), score_kind="reranked")
-            for score, hit in scored[:top_k]]

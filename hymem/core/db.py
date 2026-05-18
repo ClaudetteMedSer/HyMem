@@ -11,7 +11,7 @@ from typing import Iterator
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 8
+EXPECTED_SCHEMA_VERSION = 9
 
 
 def _load_schema() -> str:
@@ -73,6 +73,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         _migrate_v7(conn)
     if cur < 8:
         _migrate_v8(conn)
+    if cur < 9:
+        _migrate_v9(conn)
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
@@ -194,6 +196,34 @@ def _migrate_v8(conn: sqlite3.Connection) -> None:
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '8')"
     )
     log.info("migrated schema to v8 (episode embeddings + FTS update trigger)")
+
+
+def _migrate_v9(conn: sqlite3.Connection) -> None:
+    """Add entity_properties table for key/value attributes per canonical entity."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entity_properties (
+            entity_canonical TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (entity_canonical, key)
+        )
+        """
+    )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entity_properties_key ON entity_properties(key)"
+        )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entity_properties_value ON entity_properties(value)"
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '9')"
+    )
+    log.info("migrated schema to v9 (entity_properties table)")
 
 
 def _migrate_v7(conn: sqlite3.Connection) -> None:
