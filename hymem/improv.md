@@ -1,281 +1,193 @@
-Here's a comprehensive expansion roadmap ordered by impact-to-effort ratio. Each tier builds on the last.
+Here's the comprehensive expansion roadmap. All items in Tiers 1–3 are now
+implemented; the section below documents where each landed, and the
+"Future Directions" block at the bottom lists candidates for the next round
+of work.
 
 ---
 
-## Tier 1 — Immediate Wins (hours, not days)
+## Tier 1 — Immediate Wins  ✅ done
 
-### 1a. Vector Search → sqlite-vec (Scalability)
+### 1a. Vector Search → sqlite-vec  ✅
+- `vec_chunks` / `vec_episodes` vec0 virtual tables in
+  [hymem/core/schema.sql](core/schema.sql) loaded via
+  [hymem/core/db.py](core/db.py).
+- Writes go to both `chunk_embeddings` (JSON, for cold-start / fallback)
+  and the vec table in [hymem/dreaming/embeddings.py](dreaming/embeddings.py).
+- `_vector_search` in [hymem/query/augment.py](query/augment.py) prefers
+  the vec0 KNN path when the extension is present; the Python cosine loop
+  is the documented fallback (`embedding_max_scan` still exists for that
+  path, not the primary hot path).
 
-**Current bottleneck:** `hymem/query/augment.py:128-174` — cosine similarity is O(n) in pure Python, scanning all rows one at a time.
+### 1b. Expanded predicate vocabulary  ✅
+- All 18 predicates live in `ALLOWED_PREDICATES` in
+  [hymem/extraction/prompts/__init__.py](extraction/prompts/__init__.py)
+  and the matching CHECK constraint in
+  [hymem/core/schema.sql](core/schema.sql).
+- The 8 added (`implements`, `contains`, `configured_with`,
+  `requires_version`, `runs_on`, `connects_to`, `generates`, `tested_by`)
+  are documented inline in the system prompt.
 
-**Fix:** Replace with the `sqlite-vec` extension. It's a single C library loaded at runtime, provides native ANN with L2/cosine, and stores vectors as compact blobs instead of JSON strings.
-
-Concrete changes:
-- `hymem/core/schema.sql`: Add `chunk_embeddings_vec` virtual table
-- `hymem/dreaming/embeddings.py`: Write to vec table instead of JSON
-- `hymem/query/augment.py:128-174`: Replace the Python cosine loop with `SELECT ... FROM chunk_embeddings_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?`
-- Drop the `embedding_max_scan=5000` cap entirely
-
-**Impact:** Goes from 5K cap → millions of chunks. Query latency drops from ~50ms to ~2ms. This unblocks everything else — you can't build richer memory if retrieval doesn't scale.
-
-### 1b. Expand the Predicate Vocabulary (Expressiveness)
-
-**Current bottleneck:** 10 predicates hardcoded in `hymem/extraction/prompts/__init__.py:6-17` and enforced via CHECK constraint in `schema.sql:94-97`.
-
-**Add these 8 predicates:**
-
-| Predicate | Meaning | Example |
-|---|---|---|
-| `implements` | Entity A realizes interface/contract B | `auth_service implements OIDC` |
-| `contains` | Entity A owns/holds B as subcomponent | `monorepo contains frontend` |
-| `configured_with` | Entity A is parameterized by B | `nginx configured_with /etc/nginx.conf` |
-| `requires_version` | Entity A needs specific version of B | `pipeline requires_version python>=3.11` |
-| `runs_on` | Runtime / execution target | `api runs_on kubernetes` |
-| `connects_to` | Network / data flow connection | `frontend connects_to backend:8080` |
-| `generates` | Entity A produces/outputs B | `webpack generates bundle.js` |
-| `tested_by` | Testing relationship | `auth_module tested_by pytest` |
-
-Concrete changes:
-- `hymem/extraction/prompts/__init__.py`: Add to `ALLOWED_PREDICATES` tuple
-- `hymem/core/schema.sql`: Update the CHECK constraint
-- Bump `prompt_version` → `"v2"` to force reprocessing of all chunks with the richer vocabulary
-
-**Impact:** Doubles the knowledge graph's expressiveness. The most common missing relationship types (configuration, versioning, deployment, testing) become first-class.
-
-### 1c. Numeric & Temporal Fact Extraction (Expressiveness)
-
-**Current bottleneck:** Only bare `(S, P, O)` triples. No numbers, no dates, no "since when" scoping.
-
-**Add to the triple extraction prompt and schema:**
-
-```
-# New triple fields in kg_evidence:
-value_text TEXT,      # "5 seconds", ">=3.11"
-value_numeric REAL,   # 5.0
-value_unit TEXT,      # "seconds"
-temporal_scope TEXT,  # "since 2024", "during migration"
-```
-
-The LLM already encounters these — it just can't store them. The prompt change is minimal: "If the predicate involves a numeric value, a version, a time window, or a quantity, include it in value_text."
-
-Concrete changes:
-- `kg_evidence` table: add `value_text`, `value_numeric`, `value_unit`, `temporal_scope` columns
-- `hymem/extraction/triples.py`: Parse these fields from LLM output
-- `hymem/extraction/prompts/__init__.py`: Update `TRIPLE_SYSTEM` to instruct extraction of numeric/temporal data
-- Bump `prompt_version` → `"v2"`
-
-**Impact:** The graph can now answer "What Python version does the project require?" and "When did we switch from Docker to uv?" without the user restating.
+### 1c. Numeric & temporal fact extraction  ✅
+- `kg_evidence` carries `value_text`, `value_numeric`, `value_unit`,
+  `temporal_scope` columns.
+- [hymem/extraction/triples.py](extraction/triples.py) parses each field
+  and persists into evidence; the system prompt instructs extraction.
+- `prompt_version` is now `"v7"` (covers 1b, 1c, 2b, 3a, and prompt
+  refinements made since).
 
 ---
 
-## Tier 2 — Structural Expansions (days)
+## Tier 2 — Structural Expansions  ✅ done
 
-### 2a. Episodic Memory Layer
+### 2a. Episodic Memory  ✅
+- `episodes` + `episodes_fts` + `episode_embeddings` + `vec_episodes` in
+  [hymem/core/schema.sql](core/schema.sql).
+- [hymem/dreaming/episodes.py](dreaming/episodes.py) extracts +
+  persists; the runner calls it between Phase 1 and Phase 2.
+- `_episode_search` in [hymem/query/augment.py](query/augment.py) blends
+  FTS and semantic KNN through RRF.
 
-**Current bottleneck:** Conversations leave chunks for FTS, sessions for lifecycle tracking, but no structured "what happened" records. The system can't answer "Tell me about last Tuesday's debugging session."
+### 2b. Entity Hierarchies & Properties  ✅
+- `entity_types` and `entity_properties` tables.
+- The triple prompt asks for `subject_type` / `object_type` and per-entity
+  property maps; [hymem/extraction/triples.py](extraction/triples.py)
+  parses them and persists.
+- Query-time expansion in
+  [hymem/query/augment.py](query/augment.py) — both type-based (`build
+  tools` → every `package_manager`) and property-based (`category=build_tool`)
+  — feeds expanded entities into the graph lookup with reason chips.
 
-**Add `episodes` table:**
-
-```sql
-CREATE TABLE episodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL REFERENCES sessions(id),
-    title TEXT NOT NULL,              -- LLM-generated: "Debugging Postgres connection pool"
-    summary TEXT NOT NULL,            -- LLM-generated: 2-3 sentence narrative
-    participants TEXT NOT NULL,       -- JSON array of peer roles
-    start_message_id INTEGER,         -- first message in episode
-    end_message_id INTEGER,           -- last message
-    outcome TEXT,                     -- "resolved", "blocked", "deferred"
-    key_entities TEXT,                -- JSON array: ["postgresql", "connection_pool"]
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-**How it works:** After Phase 1 chunking, before Phase 2 consolidation, add a new step: group adjacent chunks from the same session, ask the LLM to title + summarize + classify outcome. This is one LLM call per session (not per chunk), so cost is negligible.
-
-Concrete changes:
-- `hymem/core/schema.sql`: Add `episodes` table
-- `hymem/dreaming/episodes.py`: New module — LLM-powered episode extraction
-- `hymem/dreaming/runner.py`: Add episode extraction step between Phase 1 and Phase 2
-- `hymem/query/augment.py`: Add episode search via FTS over title+summary
-- `hymem/extraction/prompts/__init__.py`: Add episode summarization prompts
-
-**Impact:** Hermes can now say "Last Tuesday we debugged the Postgres connection pool — the issue was `pool_size` set too low. We resolved it by bumping to 20." without the user providing any of that context.
-
-### 2b. Entity Hierarchies & Properties
-
-**Current bottleneck:** Every entity is a flat string. `uv` and `pip` and `poetry` are three unrelated nodes despite all being Python package managers.
-
-**Add `entity_types` and `entity_properties` tables:**
-
-```sql
-CREATE TABLE entity_types (
-    entity_canonical TEXT NOT NULL REFERENCES entity_aliases(canonical),
-    type TEXT NOT NULL,              -- "package_manager", "database", "language", "service"
-    confidence REAL NOT NULL DEFAULT 1.0,
-    PRIMARY KEY (entity_canonical, type)
-);
-
-CREATE TABLE entity_properties (
-    entity_canonical TEXT NOT NULL REFERENCES entity_aliases(canonical),
-    key TEXT NOT NULL,               -- "language", "runtime", "category"
-    value TEXT NOT NULL,             -- "python", "kubernetes", "build_tool"
-    source_chunk_id TEXT REFERENCES chunks(id),
-    PRIMARY KEY (entity_canonical, key)
-);
-```
-
-Populate from the LLM during Phase 1 extraction alongside triples. The extraction prompt already has entity names — adding type inference is a natural extension:
-> "For each entity you mention, also output its type: language, framework, database, service, tool, library, file, environment, protocol, or container."
-
-Concrete changes:
-- `hymem/core/schema.sql`: Add entity type/property tables
-- `hymem/extraction/triples.py`: Parse entity types from LLM output
-- `hymem/extraction/prompts/__init__.py`: Add entity type inference to triple prompt
-- `hymem/query/augment.py`: Use types for query expansion (if user asks about "package management", also retrieve all entities of type `package_manager`)
-- Bump `prompt_version`
-
-**Impact:** Query expansion by type means "what build tools do we use?" returns `uv`, `pip`, `poetry` even if the word "build" never appears near those entities.
-
-### 2c. Hybrid Reranking (Retrieval Quality)
-
-**Current bottleneck:** Reciprocal rank fusion (`augment.py:177-194`) is a simple heuristic. The top-5 results from FTS + vector are merged by rank position, not by actual relevance to the query.
-
-**Add a cross-encoder reranking step:**
-
-After RRF merge returns top-k candidates (say, k=20), run a lightweight cross-encoder model to score each candidate against the query:
-
-```
-candidate_text | query → relevance score [0,1]
-```
-
-Options: `mxbai-rerank-base` (384-dim, runs on CPU in <10ms per candidate), or use the existing LLM client with a simple prompt ("Rate relevance 1-5: query vs chunk").
-
-Concrete changes:
-- `hymem/query/rerank.py`: New module — cross-encoder or LLM-based reranking
-- `hymem/query/augment.py`: Insert rerank step between RRF and final top-k selection
-- `hymem/config.py`: Add `rerank_top_k: int = 20`, `rerank_model: str = "llm"` or `"cross-encoder"`
-
-**Impact:** 20-40% improvement in retrieval precision without changing the underlying search infrastructure. This is the highest-impact single change for retrieval quality per line of code.
+### 2c. Hybrid Reranking  ✅
+- [hymem/query/rerank.py](query/rerank.py) implements both backends:
+  LLM rerank via the existing `LLMClient` Protocol, and a local
+  cross-encoder via lazy-imported sentence-transformers
+  (`mxbai-rerank-base` by default), with graceful fallback when the
+  extra is not installed.
+- Config knobs (`rerank_top_k`, `rerank_model`,
+  `rerank_cross_encoder_model`, `rerank_ambiguity_threshold`) live in
+  [hymem/config.py](config.py).
+- Gated by `should_rerank` so it only fires when FTS and vec disagree
+  enough to be worth the cost.
 
 ---
 
-## Tier 3 — Advanced Capabilities (weeks)
+## Tier 3 — Advanced Capabilities  ✅ done
 
-### 3a. Feedback-Driven Extraction Improvement
+### 3a. Feedback-driven extraction  ✅
+- `extraction_feedback` table in [hymem/core/schema.sql](core/schema.sql).
+- `retract_edge` in [hymem/api.py](api.py) records a feedback row.
+- [hymem/dreaming/runner.py](dreaming/runner.py) loads the 10 most-recent
+  feedback rows and injects them as a negative-examples block into the
+  triple prompt via `build_triple_system(negative_examples=...)`.
 
-**Current bottleneck:** Retracted edges are just marked `status='retracted'`. The system never learns why an edge was wrong to avoid similar mistakes.
+### 3b. Multi-hop inference  ✅
+- `derived` column on `knowledge_graph`.
+- [hymem/dreaming/inference.py](dreaming/inference.py) implements two
+  derivation rules — `depends_on` chains (BFS) and the
+  `uses + depends_on → depends_on` one-hop — folded into the existing
+  predicate vocabulary so no schema migration is required.
+- [hymem/query/augment.py](query/augment.py) surfaces derived edges with
+  a confidence-times-product score so they don't shadow direct edges.
 
-**Add `extraction_feedback` table and a few-shot learner:**
+### 3c. Procedural Memory  ✅
+- `procedures` + `procedures_fts` in [hymem/core/schema.sql](core/schema.sql).
+- [hymem/dreaming/procedures.py](dreaming/procedures.py) extracts +
+  persists; the runner calls it per session.
+- `_procedure_search` in [hymem/query/augment.py](query/augment.py) returns
+  ranked procedure hits with their step list parsed from JSON.
+- Tested by [tests/test_procedures.py](../tests/test_procedures.py).
 
-```sql
-CREATE TABLE extraction_feedback (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chunk_text_snippet TEXT NOT NULL,   -- the text that caused the bad extraction
-    extracted_triple TEXT NOT NULL,     -- the (S,P,O) that was wrong
-    feedback_type TEXT NOT NULL,        -- 'retracted', 'corrected', 'confirmed'
-    corrected_triple TEXT,              -- if corrected: what it should have been
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-When Hermes calls `hymem_retract`, store the chunk snippet and the bad triple. After N retractions accumulate (say, 20), inject them as few-shot negative examples into the extraction prompt:
-
-> "Here are examples of triples that were PREVIOUSLY EXTRACTED INCORRECTLY. Do NOT extract these: ..."
-
-Concrete changes:
-- `hymem/core/schema.sql`: Add `extraction_feedback` table
-- `hymem/dreaming/phase1.py`: Before extraction, load recent feedback and inject into prompt
-- `hymem/api.py`: `retract_edge()` also stores feedback
-- `hymem/extraction/prompts/__init__.py`: Add few-shot negative example placeholder
-
-**Impact:** The system self-corrects. If it keeps hallucinating "project uses Docker" when it sees the word "Docker", after a few retractions it stops making that mistake.
-
-### 3b. Multi-Hop Inference
-
-**Current bottleneck:** `_graph_lookup()` in `augment.py:197-227` does 1-hop lookup. If `api depends_on postgresql` and `postgresql uses docker-compose`, asking "does api use docker?" gets nothing.
-
-**Add transitive closure during dreaming, stored as derived edges:**
-
-```sql
--- Derived edges from transitive closure (marked so they can be recomputed)
-ALTER TABLE knowledge_graph ADD COLUMN derived BOOLEAN NOT NULL DEFAULT 0;
-```
-
-After Phase 3 decay, run a simple BFS from each entity to discover 2-hop paths. Add derived edges with `derived=1` and lower confidence (product of source confidences).
-
-For the `depends_on` predicate specifically, also support:
-- `A depends_on B, B depends_on C → A depends_on C` (transitive)
-- `A uses B, B depends_on C → A transitively_depends_on C`
-
-Concrete changes:
-- `hymem/core/schema.sql`: Add `derived` column
-- `hymem/dreaming/phase3.py` or new `phase4.py`: Transitive closure step
-- `hymem/query/augment.py`: Include derived edges in graph lookup
-
-**Impact:** The graph becomes a reasoning engine, not just a lookup table. Hermes can answer "Will switching Postgres versions affect the API?" without explicit documentation.
-
-### 3c. Procedural Memory
-
-**Current bottleneck:** Triples capture declarative knowledge (what is true). They don't capture procedural knowledge (how to do things).
-
-**Add `procedures` table for step-by-step workflows:**
-
-```sql
-CREATE TABLE procedures (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,                -- "Deploy to staging"
-    description TEXT,                  -- LLM summary
-    steps TEXT NOT NULL,               -- JSON array: [{"order":1,"action":"...","tool":"..."}, ...]
-    triggers TEXT,                     -- JSON array: ["deploy", "ship", "release"]
-    entities_involved TEXT,            -- JSON array: ["docker", "kubernetes", "staging"]
-    source_chunk_ids TEXT,             -- JSON array of chunk IDs
-    confidence REAL NOT NULL DEFAULT 1.0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-During Phase 1, the LLM is asked: "Did the user or assistant describe a step-by-step procedure? If yes, extract the steps as an ordered list."
-
-**Impact:** Hermes can answer "How do I deploy to staging?" by retrieving the procedure from memory rather than asking the user to re-explain.
-
-### 3d. Session Summarization
-
-**Current bottleneck:** Honcho's deriver does session summarization. HyMem has no equivalent. Sessions end with `ended_at` set but no summary.
-
-**Add LLM-generated session summaries during dreaming:**
-
-When Phase 1 processes a session's chunks, also generate a one-sentence summary: "User debugged Postgres connection pool issues, resolved by adjusting pool_size and adding health checks."
-
-Store in `sessions.summary` column and use in `get_context()` endpoint to provide the Honcho-expected `summary` field with real content instead of just dump MEMORY.md.
-
-Concrete changes:
-- `hymem/core/schema.sql`: Add `sessions.summary TEXT`
-- `hymem/dreaming/runner.py`: After chunk extraction, generate session summary
-- `hymem/honcho_server.py`: Use `sessions.summary` in context endpoint
-- `hymem/extraction/prompts/__init__.py`: Add session summary prompt
-
-**Impact:** Makes the Honcho context endpoint actually useful. Hermes gets a one-line "what happened last time" before diving into search results.
+### 3d. Session Summarization  ✅
+- `sessions.summary` column in [hymem/core/schema.sql](core/schema.sql).
+- [hymem/dreaming/summary.py](dreaming/summary.py) generates a one-sentence
+  LLM summary per session; the runner persists it.
+- [hymem/honcho/app.py](honcho/app.py) `get_context` prefers
+  `sessions.summary` over the `MEMORY.md` dump when the session has one.
+- Tested by [tests/test_summary.py](../tests/test_summary.py).
 
 ---
 
-## Implementation Priority
+## Future Directions
 
-```
-Phase 1 (this week):
-  ├── 1a: sqlite-vec vector search       ← unblocks everything
-  ├── 1b: Expand predicates (8 new)       ← biggest expressiveness win per line
-  └── 1c: Numeric/temporal facts          ← triples become useful, not just symbolic
+These are the candidate next-round improvements, framed for HyMem-as-embedded-
+module (no CLI / service layer) and aligned with the
+2026-05 hardening initiative (operational ease, pip-install simplicity).
 
-Phase 2 (next week):
-  ├── 2c: Hybrid reranking                ← largest retrieval quality gain
-  ├── 2a: Episodic memory                 ← "what happened" recall
-  └── 2b: Entity hierarchies + types      ← query expansion, better graph traversal
+### A. Procedural feedback loop  *(small)*
+Symmetric to 3a, but for procedures. When Hermes surfaces a procedure via
+`_procedure_search` and the user marks it as wrong / outdated (a new
+`mark_procedure_stale` API), record it and either downgrade `confidence`
+or skip it in future search. Procedures rot faster than declarative facts
+— a "deploy" runbook from six months ago may be actively misleading — so
+a confidence signal matters more here than for triples.
 
-Phase 3 (following weeks):
-  ├── 3a: Feedback-driven extraction      ← self-healing system
-  ├── 3d: Session summarization           ← completeness for Honcho parity
-  ├── 3b: Multi-hop inference             ← graph becomes reasoning engine
-  └── 3c: Procedural memory               ← "how to" recall
-```
+### B. Predicate-aware decay rates  *(small)*
+Phase 3 currently applies one decay schedule to all edges. `prefers` /
+`avoids` should decay slower than `uses` / `runs_on`, because preferences
+are stickier than runtime state. Add a small `predicate -> half_life_days`
+map to `HyMemConfig` and have `phase3.decay` consult it.
 
+### C. Schema migration runner  *(operational)*
+`schema_meta.schema_version` is set to `'1'` but no actual migration
+runner exists — the schema is forward-only via `CREATE TABLE IF NOT
+EXISTS`. As columns evolve (we've quietly added `summary`, `derived`,
+`value_*`, `temporal_scope` etc.), an out-of-date database will silently
+miss them. A small runner in `core/db.py` that compares
+`schema_version` and applies migration scripts under
+`hymem/core/migrations/` would harden upgrade paths — important for the
+pip-install path where users may carry old DBs forward.
+
+### D. Speaker-weighted evidence  *(medium)*
+Right now every chunk contributes equally to edge evidence. Triples
+extracted from user-authored chunks should carry more weight than ones
+from assistant turns (which can be confabulated). Plumb the role of the
+chunk's first message into `kg_evidence` and let phase 3 weight
+`pos_evidence` accordingly. Small schema change, modest extraction
+change, large quality win on noisy logs.
+
+### E. Triple semantic dedup at extraction time  *(medium)*
+We already have `edge_embeddings` keyed on triple text. Before inserting
+a new `(s, p, o)`, look up nearest existing edges by vector and, if one
+is within a tight cosine threshold, attach the new evidence to it
+instead of creating a near-duplicate. Bounds the unbounded growth of
+sibling canonicals like `"uv"` / `"uv_pip"` / `"uv_package_manager"`.
+
+### F. Temporal / first-seen queries  *(small)*
+`knowledge_graph.first_seen` exists but nothing reads it. Expose
+`hy.timeline(entity)` returning the first-seen edge per predicate for an
+entity, so Hermes can answer "when did we start using Postgres?" without
+re-asking. Tiny API surface, no new schema.
+
+### G. Memory export / import  *(operational)*
+A `hy.export(path)` that emits the canonical state as JSONL (sessions,
+chunks, edges, episodes, procedures, profile entries) and an `import`
+counterpart. Useful for backups, project-to-project migration, and giving
+external tools a stable inspection format. Stays in-process; no service
+layer required.
+
+### H. Retrieval explainability for FTS / episode / procedure hits  *(small)*
+`AugmentedContext.graph_facts` carries `why_retrieved`; FTS hits and
+episodes/procedures don't. Add a short reason chip
+(`fts_match("postgres pool")`, `vec_topk(rrf=0.024)`, `procedure_fts`) to
+each, so downstream prompts can quote the reason instead of guessing.
+
+### I. PII / secret redaction at chunk creation  *(security)*
+Chunks are stored verbatim. A small redactor in
+`hymem/dreaming/chunks.py` that detects common shapes (bearer tokens,
+AWS keys, postgres URIs with passwords) and replaces them with markers
+before persistence would keep the on-disk store safer. Drop-in, no
+schema change.
+
+### J. Conflict auto-resolution policy  *(medium)*
+`hy.conflicts()` surfaces contradictions but never resolves them. A
+configurable policy ("prefer newer", "prefer higher-confidence", "LLM
+arbitrator") that walks each conflict and retracts the loser would
+reduce manual operator load. Same machinery as `retract_edge`, just
+wrapped in a chooser.
+
+### K. Multilingual canonicalization audit  *(targeted)*
+Per project memory, Dutch / Latin-script multilingual support is in
+scope. Add a small test that seeds a Dutch chunk ("we gebruiken Postgres
+voor de gebruikersdienst") and asserts canonicalization treats
+`postgres` the same as it would for the English equivalent. Likely
+already correct; just unverified.

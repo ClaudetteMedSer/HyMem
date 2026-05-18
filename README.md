@@ -6,11 +6,11 @@
 
 **HyMem** is a local-first, embedded memory system for AI agents. It gives the **Hermes** agent persistent memory across conversations by extracting a structured SQLite knowledge graph from chat logs during idle "dreaming" cycles, then making that knowledge queryable at conversation time via keyword search, vector search, semantic graph search, and entity lookup. It also auto-maintains two Markdown files (`MEMORY.md` and `USER.md`) that the agent reads before each conversation.
 
-**No cloud, no Postgres, no 500MB Docker images.** One SQLite file, two Markdown files, and a Python library. The LLM is only called during dreaming — query-time retrieval uses only FTS5 + cosine similarity + graph traversal, zero LLM calls.
+**No cloud, no Postgres, no 500MB Docker images.** One SQLite file, two Markdown files, and a Python library. Query-time retrieval defaults to LLM-free — FTS5 + sqlite-vec ANN + graph traversal. An optional hybrid reranker (cross-encoder *or* the configured LLM) can be enabled to break ties when keyword and semantic search disagree, gated by an ambiguity threshold so the LLM hot path stays the exception, not the rule.
 
 **Two deployment modes:** an MCP tools server for direct agent integration, and a **Honcho v3-compatible HTTP server** so Hermes can use the standard `honcho-ai` SDK and treat HyMem as a drop-in replacement for Honcho's managed cloud service.
 
-**~5,700 lines of Python**, zero npm, zero Docker required.
+**~7,600 lines of Python**, zero npm, zero Docker required.
 
 ---
 
@@ -257,7 +257,7 @@ Results are written to `MEMORY.md`'s auto-section, capped at `insights_max_entri
    - If no → leave alone (topic hasn't resurfaced)
 2. Any edge whose Laplace-smoothed confidence `(pos+1)/(pos+neg+2)` drops below the retract threshold (default: 0.15) gets `status = 'retracted'` — kept for audit but excluded from query results.
 
-**Transitive inference** (`inference.py`): After decay, computes transitive closure over `depends_on` edges via BFS. For each entity, discovers 2+-hop dependency paths and inserts derived edges with `derived=1`. Confidence is the product of edge confidences along the path. Edges below the retract threshold are filtered out.
+**Transitive inference** (`inference.py`): After decay, computes transitive closure for derived edges via two rules. (1) `A depends_on B, B depends_on C → A depends_on C` (BFS over the depends_on subgraph). (2) `A uses B, B depends_on C → A depends_on C` (one-hop cross-predicate, folded into `depends_on` so the predicate vocabulary stays stable and no schema migration is required). All derived edges are marked `derived=1` with confidence equal to the product of the source edges' smoothed confidences; previously-derived edges are wiped each cycle so the closure refreshes from scratch. Edges below the retract threshold are filtered out.
 
 After inference, Phase 2 insights are refreshed to reflect the new graph state, and old unreferenced chunks are pruned via `retention.py`.
 
@@ -375,7 +375,7 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 - **Background dreaming on a forked connection**: `_background_dream` runs on `HyMem.fork()` — a fresh SQLite connection that reuses the live instance's LLM/embedding clients — so a dream cycle never collides with concurrent `add_messages` writes.
 - **Batched ingestion**: `add_messages` logs a whole batch under one transaction via `HyMem.log_messages()` rather than one `BEGIN IMMEDIATE` per turn.
 - **Role inference**: Peer IDs matching `user[-_]|human|client|telegram|discord|slack` → user role, `agent|hermes|assistant|ai[-_]|bot|llm` → assistant role.
-- **No LLM in query path**: Search, context, and chat endpoints only call `hy.augment()` — zero LLM calls, zero latency beyond SQLite reads.
+- **LLM-free query path by default**: Search, context, and chat endpoints only call `hy.augment()`. With the default config (`rerank_model="llm"`, ambiguity-gated) the reranker fires only when FTS and vec disagree enough to trigger ambiguity; pick `rerank_model="cross-encoder"` for a local sentence-transformers reranker, or raise `rerank_ambiguity_threshold` to suppress it entirely. SQLite-only is the steady state.
 - **Explainability surfaced as metadata, not prose**: `graph_fact` results carry `metadata.why` with the ranker's reason codes (`fallback:entity_anchored`, `semantic_0.83`, `predicate:uses`, `recency_3d`, …). The `/chat` endpoint returns clean prose alongside a structured `facts[]` array — Hermes-friendly text without losing the trail.
 
 ---
@@ -390,7 +390,7 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 
 **Co-occurrence-aware decay.** Unlike simple TTL-based decay (which would kill all old facts regardless of relevance), HyMem only decays edges whose entities have been re-discussed without reinforcement. This keeps the graph accurate without requiring constant LLM re-extraction.
 
-**Transitive inference.** `depends_on` edges are transitively closed via BFS after each dreaming cycle. If `api depends_on postgres` and `postgres depends_on docker`, a derived edge `api depends_on docker` is added (marked `derived=1`, confidence = product of edge confidences). Derived edges are recomputed from scratch each cycle and excluded from decay.
+**Transitive inference.** After each dreaming cycle, derived edges are computed via two rules: (1) BFS over `depends_on` chains (`A depends_on B, B depends_on C → A depends_on C`), and (2) a one-hop cross-predicate hop (`A uses B, B depends_on C → A depends_on C`). Both emit `depends_on` edges so the predicate vocabulary stays stable — no schema change needed for the cross-predicate case. Derived edges are marked `derived=1`, confidence is the product of source-edge confidences, and the whole derived set is wiped and recomputed each cycle so the closure stays consistent.
 
 **Semantic, explainable graph retrieval.** The knowledge graph isn't just keyword-matched — edges are embedded during dreaming, so `augment()` ranks them against the query. When a predicate routes, scoring is `semantic × confidence × recency × predicate_boost`; otherwise a per-candidate fallback fires (`fallback:entity_anchored`, `fallback:semantic`, or `fallback:recency`) that won't let noisy edge-level KNN drown out a deterministic entity hit. Every returned fact carries `why_retrieved` reason codes derived directly from whichever branch fired, so the agent sees *why* a fact was surfaced without a second LLM call. With no embedding client the ranker degrades gracefully to confidence-and-recency ordering.
 
@@ -460,31 +460,41 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
 | `profile_max_entries` | 16 | Max profile entries in USER.md |
 | `insights_max_entries` | 12 | Max insights in MEMORY.md |
-| `prompt_version` | `"v5"` | Bump to force full reprocessing |
+| `prompt_version` | `"v7"` | Bump to force full reprocessing |
 | `dream_budget` | 50 | Max chunks to process per dreaming cycle |
 | `max_chunks` | 50000 | Soft cap on total stored chunks |
 | `retention_days` | 90 | Chunks newer than this always kept |
-| `rerank_ambiguity_threshold` | 0.6 | Min RRF score drop to skip LLM reranking |
+| `rerank_top_k` | 20 | Candidate pool size handed to the reranker before final top-k trim |
+| `rerank_model` | `"llm"` | `"llm"` (uses the configured LLM client) or `"cross-encoder"` (local sentence-transformers) |
+| `rerank_cross_encoder_model` | `"mixedbread-ai/mxbai-rerank-base-v1"` | HuggingFace model id used when `rerank_model="cross-encoder"` |
+| `rerank_ambiguity_threshold` | 0.6 | Min RRF score drop required before reranking fires; set high to disable |
 
 ---
 
 ## 10. Test Coverage
 
-**148 tests total, 100% passing** across 17 test files:
+**209 tests total, 100% passing** across 23 test files:
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
-- `test_extraction.py` — Triple extraction, marker extraction, polarity handling
+- `test_extraction.py` — Triple extraction, marker extraction, polarity handling, numeric / temporal value parsing
 - `test_canonicalize.py` — Entity normalization, alias resolution, merging, canonical-drift detection and repair, entity-shape filter for object-canonical matches
 - `test_chunks.py` — Salience detection, chunk persistence
 - `test_embeddings.py` — Embedding creation and query, stub determinism, LRU cache (hit/miss accounting, batch split, eviction policy)
 - `test_augment.py` — FTS search, vector search, RRF merge, graph lookup
 - `test_graph_semantic.py` — Edge embedding, hybrid graph ranker (routed + per-candidate fallback branches), `why_retrieved` codes, predicate routing, contradiction detection, token-overlap entity expansion, token-overlap index cache + invalidation
+- `test_rerank.py` — Hybrid reranking: LLM and cross-encoder backends, ambiguity gating, graceful fallback when sentence-transformers is unavailable
+- `test_entity_properties.py` — Entity-type and entity-property extraction + query-time expansion
+- `test_episodes.py` — Episodic memory: persistence, stable ids across re-dreams, semantic episode search via `vec_episodes`
+- `test_procedures.py` — Procedural memory: extraction validation, step-order renormalization, FTS-backed surfacing through `augment()`
+- `test_summary.py` — Session summarization: persistence, idempotency, validation (short / quoted / long), Honcho context preference
+- `test_inference.py` — Transitive inference: depends_on BFS + uses-cross-predicate rule, derivation refresh, retract-threshold filtering
 - `test_markdown_io.py` — Section read/write atomicity
 - `test_integration.py` — End-to-end capture→dream→augment, retract workflow
 - `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
 - `test_mcp_server.py` — MCP tool correctness (all 7 tools)
-- `test_retract.py` — Edge retraction, alias resolution, idempotency
+- `test_retract.py` — Edge retraction, alias resolution, idempotency, feedback-row recording
 - `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording
+- `test_dream_scheduler.py` — Background dream cooldown + concurrency
 - `test_honcho_server.py` — Full Honcho v3 protocol (19 endpoints, all passing)
 - `test_honcho_contract.py` — Real honcho-ai SDK driven against a live server (response-parse contract)
 - `test_concurrency.py` — Dreaming + ingestion + reads coexisting under WAL
@@ -508,7 +518,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (19 endpoints, real-SDK contract tests) | Native |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
 | **SDKs** | Python + MCP + Honcho SDK | Python + TypeScript |
-| **Maturity** | v0.1.0, ~5,700 lines | v3.0.6, 514 commits, 3.4k stars |
+| **Maturity** | v0.1.0, ~7,600 lines | v3.0.6, 514 commits, 3.4k stars |
 | **License** | Not specified | AGPL-3.0 |
 
 **The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, semantic-and-explainable graph ranking, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
@@ -519,7 +529,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 12. Limitations & Known Gaps
 
-- **O(n) vector search fallback**: Cosine similarity in pure Python is slow beyond ~5K chunks (capped at `embedding_max_scan`). sqlite-vec is integrated for ANN but not available on all platforms.
+- **Python cosine fallback**: sqlite-vec is the primary vector search path (vec0 KNN over `vec_chunks` / `vec_edges` / `vec_episodes`), but the extension isn't available on every platform. When it's not loadable, retrieval falls back to a pure-Python cosine scan capped at `embedding_max_scan` chunks (default 5000); on installs where the extension is missing, vector search degrades beyond that cap.
 - **No streaming**: The Honcho server doesn't implement SSE streaming for chat responses.
 - **Single-writer database**: WAL mode lets reads run concurrently with the writer, and dreaming/ingestion run on separate connections, but SQLite still serializes the two writers. Fine for a single-agent setup, not for multi-tenant.
 - **No authentication**: Both MCP and Honcho servers are unauthenticated — they assume localhost-only access.
