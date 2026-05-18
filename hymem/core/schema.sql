@@ -84,6 +84,17 @@ CREATE TABLE IF NOT EXISTS edge_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Content-addressed embedding cache. Deduplicates API/model calls when two
+-- chunks or edges share the same normalized text.
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    text_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    vector_json TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (text_hash, model)
+);
+
 -- Idempotency: each chunk processed at most once per prompt_version.
 CREATE TABLE IF NOT EXISTS processed_chunks (
     chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
@@ -109,6 +120,22 @@ CREATE TABLE IF NOT EXISTS entity_types (
 );
 CREATE INDEX IF NOT EXISTS idx_entity_types_type ON entity_types(type);
 CREATE INDEX IF NOT EXISTS idx_entity_types_entity ON entity_types(entity_canonical);
+
+-- Entity properties: free-form key/value attributes for canonical entities
+-- (e.g. language=python, runtime=node, category=build_tool). Populated
+-- alongside entity_types during phase-1 extraction; one (entity, key) wins,
+-- last write replaces. Source chunk is retained so a property can be traced
+-- back to the LLM extraction that introduced it.
+CREATE TABLE IF NOT EXISTS entity_properties (
+    entity_canonical TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    source_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (entity_canonical, key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_properties_key ON entity_properties(key);
+CREATE INDEX IF NOT EXISTS idx_entity_properties_value ON entity_properties(value);
 
 -- Knowledge graph. Confidence is derived: (pos+1)/(pos+neg+2). Predicates locked.
 CREATE TABLE IF NOT EXISTS knowledge_graph (
@@ -220,6 +247,24 @@ END;
 CREATE TRIGGER IF NOT EXISTS episodes_fts_delete AFTER DELETE ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
 END;
+-- UPSERTs against episodes (re-dreams updating title/summary for the same
+-- message-range id) must keep the FTS shadow table in sync.
+CREATE TRIGGER IF NOT EXISTS episodes_fts_update AFTER UPDATE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+    INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+
+-- Episode-level embeddings. Keyed by stable episode id (see
+-- persist_episodes). The text_hash column points into embedding_cache so a
+-- re-dreamed episode whose title/summary text changed gets re-embedded.
+CREATE TABLE IF NOT EXISTS episode_embeddings (
+    episode_id TEXT PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+    vector_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Procedural memory: step-by-step workflows extracted from conversations.
 CREATE TABLE IF NOT EXISTS procedures (
@@ -266,6 +311,17 @@ CREATE TABLE IF NOT EXISTS extraction_feedback (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_created ON extraction_feedback(created_at);
+
+-- Persistent token-overlap index for entity expansion in augment().
+-- Rebuilt atomically at the end of every dream cycle; updated incrementally
+-- by merge_canonical and retract_edge. Empty table signals a cold start —
+-- build_token_overlap_index will scan canonicals and repopulate it.
+CREATE TABLE IF NOT EXISTS token_overlap_index (
+    token TEXT NOT NULL,
+    canonical TEXT NOT NULL,
+    PRIMARY KEY (token, canonical)
+);
+CREATE INDEX IF NOT EXISTS idx_token_overlap_token ON token_overlap_index(token);
 
 -- Per-cycle dreaming run record. Populated by runner.run_dreaming for every
 -- invocation (success, lock-skip, or error) so operators can observe cadence

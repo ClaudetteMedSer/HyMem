@@ -24,14 +24,14 @@ class Triple:
 
 
 def extract_triples(
-    client: LLMClient, 
-    text: str, 
+    client: LLMClient,
+    text: str,
     negative_examples: str = "",
-) -> tuple[list[Triple], dict[str, str]]:
+) -> tuple[list[Triple], dict[str, str], dict[str, dict[str, str]]]:
     """Run the locked-vocabulary triple prompt and validate the output.
 
-    Returns parsed triples and any entity type hints extracted from the same
-    LLM response.
+    Returns parsed triples, any entity type hints, and any entity property
+    hints (key/value pairs) extracted from the same LLM response.
 
     Anything malformed or off-vocabulary is silently dropped — the LLM is allowed
     to be wrong, but we never propagate garbage into the graph.
@@ -43,7 +43,23 @@ def extract_triples(
         response_format="json",
     )
     raw = client.complete(request)
-    return _parse(raw), extract_entity_types(raw)
+    return _parse(raw), extract_entity_types(raw), extract_entity_properties(raw)
+
+
+_VALID_TYPES = frozenset({
+    "language", "framework", "database", "service", "tool", "library",
+    "file", "environment", "protocol", "container", "package_manager",
+    "api", "platform", "config_file", "testing_framework", "ci_tool",
+    "monitoring_tool", "identity_provider", "message_broker",
+    "person", "team", "project", "codebase", "or_other_tool",
+})
+
+
+# Caps on per-entity property metadata. The LLM is occasionally chatty;
+# truncating here keeps a single bad response from bloating the table.
+_MAX_PROPS_PER_ENTITY = 6
+_MAX_PROP_KEY_LEN = 32
+_MAX_PROP_VALUE_LEN = 64
 
 
 def extract_entity_types(raw: str) -> dict[str, str]:
@@ -63,17 +79,66 @@ def extract_entity_types(raw: str) -> dict[str, str]:
         obj = item.get("object")
         subj_type = item.get("subject_type")
         obj_type = item.get("object_type")
-        valid_types = {
-            "language", "framework", "database", "service", "tool", "library",
-            "file", "environment", "protocol", "container", "package_manager",
-            "api", "platform", "config_file", "testing_framework", "ci_tool",
-            "monitoring_tool", "identity_provider", "message_broker", "or_other_tool"
-        }
-        if isinstance(subject, str) and isinstance(subj_type, str) and subj_type in valid_types:
+        if isinstance(subject, str) and isinstance(subj_type, str) and subj_type in _VALID_TYPES:
             types[subject.strip()] = subj_type
-        if isinstance(obj, str) and isinstance(obj_type, str) and obj_type in valid_types:
+        if isinstance(obj, str) and isinstance(obj_type, str) and obj_type in _VALID_TYPES:
             types[obj.strip()] = obj_type
     return types
+
+
+def extract_entity_properties(raw: str) -> dict[str, dict[str, str]]:
+    """Pull `{entity: {key: value, ...}}` property hints out of the response.
+
+    Recognises two shapes the LLM may emit per triple item:
+      - ``subject_properties``/``object_properties``: an object of key/value
+        strings attached to the subject/object of the triple.
+      - ``properties``: a top-level mapping ``{entity_name: {key: value}}``
+        keyed by the entity's surface form, useful when the same entity
+        appears in multiple triples in the response.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, list):
+        return {}
+
+    props: dict[str, dict[str, str]] = {}
+
+    def _merge(entity: object, payload: object) -> None:
+        if not isinstance(entity, str) or not isinstance(payload, dict):
+            return
+        key_name = entity.strip()
+        if not key_name:
+            return
+        bucket = props.setdefault(key_name, {})
+        for k, v in payload.items():
+            if len(bucket) >= _MAX_PROPS_PER_ENTITY:
+                break
+            if not isinstance(k, str) or not isinstance(v, (str, int, float, bool)):
+                continue
+            k_clean = k.strip().lower()
+            v_clean = str(v).strip()
+            if not k_clean or not v_clean:
+                continue
+            if len(k_clean) > _MAX_PROP_KEY_LEN or len(v_clean) > _MAX_PROP_VALUE_LEN:
+                continue
+            # First write wins for a given (entity, key) pair in the response;
+            # later persistence does INSERT OR REPLACE so re-extractions still
+            # update the row.
+            bucket.setdefault(k_clean, v_clean)
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        _merge(item.get("subject"), item.get("subject_properties"))
+        _merge(item.get("object"), item.get("object_properties"))
+        top_level = item.get("properties")
+        if isinstance(top_level, dict):
+            for entity, payload in top_level.items():
+                _merge(entity, payload)
+
+    return props
 
 
 def _parse(raw: str) -> list[Triple]:

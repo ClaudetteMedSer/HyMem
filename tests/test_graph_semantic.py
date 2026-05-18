@@ -17,7 +17,7 @@ from tests.conftest import make_routed_llm, seed_edge
 
 def test_migration_v6_creates_edge_embeddings(hy):
     conn = hy.conn
-    assert core_db.schema_version(conn) == 6
+    assert core_db.schema_version(conn) == 9
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edge_embeddings'"
     ).fetchone()
@@ -346,6 +346,32 @@ def test_invalidate_query_caches_clears_index(hy):
     assert hy._token_overlap_index is None
 
 
+def test_token_overlap_index_persisted_and_read_by_cold_instance(cfg, stub_llm):
+    """Cold HyMem instance reads the persisted token_overlap_index table instead
+    of scanning knowledge_graph — verifies the cross-instance warm path."""
+    from hymem import HyMem
+
+    # First instance: populate edges, run augment to trigger a cold-start write.
+    h1 = HyMem(cfg, llm=stub_llm)
+    seed_edge(h1.conn, "atta_van_westreenen", "prefers", "dutch")
+    seed_edge(h1.conn, "medflow", "part_of", "atta_projects")
+    h1.augment("anything")
+    # After augment, the table must be populated.
+    rows = h1.conn.execute("SELECT COUNT(*) AS n FROM token_overlap_index").fetchone()
+    assert rows["n"] > 0
+    h1.close()
+
+    # Second instance against the same DB — starts cold (no in-memory cache).
+    h2 = HyMem(cfg, llm=stub_llm)
+    assert h2._token_overlap_index is None
+    # Query for atta_van_westreenen (a subject_canonical, so match_known_entities
+    # finds it). Overlap expansion on the "atta" token should then surface
+    # atta_projects, proving the persisted table was used.
+    ctx = h2.augment("atta_van_westreenen")
+    assert "atta_projects" in ctx.matched_entities
+    h2.close()
+
+
 def test_overlap_skipped_when_token_too_common_end_to_end(hy):
     """With many canonicals sharing a token, token-overlap expansion declines
     to surface them — no `fallback:entity_anchored:overlap` codes appear."""
@@ -447,3 +473,53 @@ def test_recency_weight_math():
     half_life = 30.0
     assert math.isclose(math.exp(-0.0 / half_life), 1.0)
     assert math.isclose(math.exp(-half_life / half_life), math.exp(-1.0))
+
+
+# --- hedge_recommended -----------------------------------------------------
+
+
+def test_hedge_recommended_flagged_for_low_evidence(hy):
+    """A freshly-seeded edge has pos=1, neg=0 (Laplace confidence 0.67) and
+    only 1 total evidence row — both below default thresholds (0.75 / 3)."""
+    seed_edge(hy.conn, "atta", "uses", "fastapi")
+    ctx = hy.augment("tell me about atta")
+    fact = next(f for f in ctx.graph_facts if f.predicate == "uses")
+    assert fact.hedge_recommended is True
+
+
+def test_hedge_recommended_not_flagged_when_well_evidenced(hy):
+    """High confidence (pos >> neg) AND ≥ min_evidence rows: no hedge."""
+    seed_edge(hy.conn, "atta", "uses", "fastapi", pos=10, neg=0)
+    ctx = hy.augment("tell me about atta")
+    fact = next(f for f in ctx.graph_facts if f.predicate == "uses")
+    assert fact.confidence >= 0.75
+    assert (fact.pos_evidence + fact.neg_evidence) >= 3
+    assert fact.hedge_recommended is False
+
+
+def test_hedge_recommended_flagged_when_confidence_below_threshold(hy):
+    """Plenty of evidence but a near-50/50 split — confidence < 0.75 triggers hedge."""
+    seed_edge(hy.conn, "atta", "uses", "fastapi", pos=5, neg=4)
+    ctx = hy.augment("tell me about atta")
+    fact = next(f for f in ctx.graph_facts if f.predicate == "uses")
+    assert (fact.pos_evidence + fact.neg_evidence) >= 3
+    assert fact.confidence < 0.75
+    assert fact.hedge_recommended is True
+
+
+def test_hedge_thresholds_configurable(cfg, stub_llm):
+    """Loosening both thresholds: an otherwise-hedged fact passes the gate."""
+    from dataclasses import replace
+    from hymem import HyMem
+
+    loose = replace(cfg, hedge_confidence_threshold=0.5, hedge_min_evidence=1)
+    hy = HyMem(loose, llm=stub_llm)
+    try:
+        seed_edge(hy.conn, "atta", "uses", "fastapi")  # pos=1, conf=0.67
+        ctx = hy.augment("tell me about atta")
+        fact = next(f for f in ctx.graph_facts if f.predicate == "uses")
+        assert fact.confidence >= 0.5
+        assert (fact.pos_evidence + fact.neg_evidence) >= 1
+        assert fact.hedge_recommended is False
+    finally:
+        hy.close()

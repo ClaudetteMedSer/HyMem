@@ -9,10 +9,10 @@ from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
 from hymem.extraction.embeddings import EmbeddingClient
-from hymem.extraction.llm import LLMClient, LLMRequest
-from hymem.extraction.prompts import RERANK_SYSTEM, RERANK_USER_TEMPLATE
+from hymem.extraction.llm import LLMClient
 from hymem.query.entities import match_known_entities
 from hymem.query.predicate_routing import route_predicates
+from hymem.query.rerank import rerank as run_rerank
 
 log = logging.getLogger("hymem.query.augment")
 
@@ -28,6 +28,11 @@ class GraphFact:
     derived: bool = False
     why_retrieved: list[str] = field(default_factory=list)
     score: float = 0.0
+    hedge_recommended: bool = False
+    """Set by `_graph_lookup` from `cfg.hedge_confidence_threshold` and
+    `cfg.hedge_min_evidence`. Hermes (or any consumer) reads this to decide
+    whether to soften phrasing — HyMem only signals, never rewrites the
+    fact text."""
 
 
 @dataclass
@@ -37,6 +42,9 @@ class EpisodeHit:
     title: str
     summary: str
     score: float
+    score_kind: str = "bm25"
+    """Source of the score: "bm25" (FTS only), "vec" (semantic only), or
+    "rrf" (reciprocal-rank-fused FTS + vec)."""
 
 
 @dataclass
@@ -94,32 +102,59 @@ def augment(
     if cfg.memory_md_path.exists():
         ctx.memory_md = cfg.memory_md_path.read_text(encoding="utf-8")
 
-    fts = _fts_search(conn, user_message, top_k=cfg.fts_top_k)
+    # Pull a wider candidate pool when reranking is likely so the reranker
+    # has room to reorder beyond the top-fts_top_k window; the final result
+    # is still trimmed to fts_top_k after rerank.
+    candidate_k = max(cfg.fts_top_k, cfg.rerank_top_k)
+    fts = _fts_search(conn, user_message, top_k=candidate_k)
     vec: list[FtsHit] = []
     if embedding_client is not None:
         vec = _vector_search(
             conn,
             embedding_client,
             user_message,
-            top_k=cfg.fts_top_k,
+            top_k=candidate_k,
             max_scan=cfg.embedding_max_scan,
         )
-        ctx.fts_hits = _rrf_merge(fts, vec, top_k=cfg.fts_top_k)
+        ctx.fts_hits = _rrf_merge(fts, vec, top_k=candidate_k)
     else:
         ctx.fts_hits = fts
 
-    if llm is not None and should_rerank(fts, vec, ctx.fts_hits, cfg.rerank_ambiguity_threshold):
-        log.debug("rerank.triggered")
-        ctx.fts_hits = _rerank(user_message, list(ctx.fts_hits), llm, top_k=cfg.fts_top_k)
+    rerank_enabled = (
+        cfg.rerank_model == "cross-encoder" or llm is not None
+    )
+    if rerank_enabled and should_rerank(fts, vec, ctx.fts_hits, cfg.rerank_ambiguity_threshold):
+        log.debug("rerank.triggered model=%s", cfg.rerank_model)
+        ctx.fts_hits = run_rerank(
+            user_message,
+            list(ctx.fts_hits[: cfg.rerank_top_k]),
+            top_k=cfg.fts_top_k,
+            model=cfg.rerank_model,
+            llm=llm,
+            cross_encoder_model=cfg.rerank_cross_encoder_model,
+        )
     else:
         log.debug("rerank.skipped")
+        ctx.fts_hits = ctx.fts_hits[: cfg.fts_top_k]
 
-    ctx.episodes = _episode_search(conn, user_message, top_k=cfg.fts_top_k)
+    ctx.episodes = _episode_search(
+        conn, user_message,
+        top_k=cfg.fts_top_k,
+        embedding_client=embedding_client,
+    )
 
     ctx.procedures = _procedure_search(conn, user_message, top_k=cfg.fts_top_k)
 
     matched = match_known_entities(conn, user_message)
     type_expanded, expansion_info = _expand_entities_by_type(conn, matched)
+    # Free-text type/property expansion: the user may ask "what build tools
+    # do we use?" without naming any specific entity. Map type/property
+    # keywords in the message to canonicals tagged with that type or
+    # property; merge into the entity set so Source 1 of the graph lookup
+    # picks them up.
+    query_type_expanded, query_type_info = _expand_entities_from_query(
+        conn, user_message
+    )
     overlap_expanded, overlap_info = _expand_entities_by_token_overlap(
         conn, matched,
         max_per_entity=cfg.graph_token_overlap_max_per_entity,
@@ -127,6 +162,12 @@ def augment(
         token_index=token_overlap_index,
     )
     combined = list(type_expanded)
+    for e in query_type_expanded:
+        if e not in combined:
+            combined.append(e)
+        # Surface the type label that justified the addition through the same
+        # `entity_type:` reason channel as direct-entity type expansion.
+        expansion_info.setdefault(e, query_type_info[e])
     for e in overlap_expanded:
         if e not in combined:
             combined.append(e)
@@ -377,6 +418,7 @@ def _graph_lookup(
                     float(row["days_since"]) if row["days_since"] is not None else 0.0
                 ),
                 "semantic_score": 0.0,
+                "semantic_retrieved": False,
                 "entity_match": False,
                 "entity_types": set(),
                 "overlap_tokens": set(),
@@ -426,6 +468,7 @@ def _graph_lookup(
                 continue
             c = _ensure(row)
             c["semantic_score"] = max(c["semantic_score"], semantic_score)
+            c["semantic_retrieved"] = True
 
     # Source 3 — predicate-routed.
     if routed:
@@ -488,8 +531,8 @@ def _graph_lookup(
                 * predicate_boost
             )
 
-        if semantic_score > 0:
-            why.append(f"semantic_{semantic_score:.2f}")
+        if c["semantic_retrieved"]:
+            why.append(f"semantic_{max(0.0, semantic_score):.2f}")
         if in_routed:
             why.append(f"predicate:{c['p']}")
         for entity_type in sorted(c["entity_types"]):
@@ -499,6 +542,11 @@ def _graph_lookup(
         if c["entity_match"]:
             why.append("entity_match")
 
+        total_evidence = c["pos"] + c["neg"]
+        hedge = (
+            confidence < cfg.hedge_confidence_threshold
+            or total_evidence < cfg.hedge_min_evidence
+        )
         results.append(
             GraphFact(
                 subject=c["s"],
@@ -510,6 +558,7 @@ def _graph_lookup(
                 derived=c["derived"],
                 why_retrieved=why,
                 score=score,
+                hedge_recommended=hedge,
             )
         )
 
@@ -592,43 +641,118 @@ def _python_cosine_edge_search(
             continue
         dot = sum(a * b for a, b in zip(qvec, vec))
         vnorm = math.sqrt(sum(x * x for x in vec)) or 1.0
-        sim = max(0.0, dot / (qnorm * vnorm))
+        sim = dot / (qnorm * vnorm)
         scored.append((sim, r["edge_id"]))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [(edge_id, sim) for sim, edge_id in scored[:top_k]]
 
 
-def _episode_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[EpisodeHit]:
+def _episode_search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    top_k: int = 3,
+    embedding_client: EmbeddingClient | None = None,
+) -> list[EpisodeHit]:
+    """Episode retrieval. Always runs the FTS path; when an embedding client
+    is configured *and* vec_episodes has rows, also runs semantic KNN over
+    title+summary embeddings and RRF-fuses the two ranked lists.
+
+    Falls back to FTS-only (with score_kind="bm25") when there's no embedder,
+    no vec_episodes table, or vec returns nothing — preserving the original
+    behavior for clients that haven't dreamed any episode embeddings yet.
+    """
+    from hymem.core import db as core_db
+
     cleaned = _FTS_SAFE.sub(" ", query).strip()
-    if not cleaned:
-        return []
-    tokens = [t for t in cleaned.split() if len(t) >= 2]
-    if not tokens:
-        return []
-    fts_query = " OR ".join(f'"{t}"' for t in tokens)
+    fts_hits: list[EpisodeHit] = []
+    if cleaned:
+        tokens = [t for t in cleaned.split() if len(t) >= 2]
+        if tokens:
+            fts_query = " OR ".join(f'"{t}"' for t in tokens)
+            try:
+                rows = conn.execute(
+                    """SELECT e.id, e.session_id, e.title, e.summary, bm25(episodes_fts) AS score
+                       FROM episodes_fts
+                       JOIN episodes e ON e.rowid = episodes_fts.rowid
+                       WHERE episodes_fts MATCH ?
+                       ORDER BY score
+                       LIMIT ?""",
+                    (fts_query, top_k * 2),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            for r in rows:
+                fts_hits.append(
+                    EpisodeHit(
+                        episode_id=r["id"],
+                        session_id=r["session_id"],
+                        title=r["title"],
+                        summary=r["summary"][:300],
+                        score=float(r["score"]),
+                        score_kind="bm25",
+                    )
+                )
 
-    try:
-        rows = conn.execute(
-            """SELECT e.id, e.session_id, e.title, e.summary, bm25(episodes_fts) AS score
-               FROM episodes_fts
-               JOIN episodes e ON e.rowid = episodes_fts.rowid
-               WHERE episodes_fts MATCH ?
-               ORDER BY score
-               LIMIT ?""",
-            (fts_query, top_k),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    vec_hits: list[EpisodeHit] = []
+    if (
+        embedding_client is not None
+        and core_db._load_vec_extension(conn)
+        and core_db.has_vec_table(conn, table="vec_episodes")
+    ):
+        qvec = embedding_client.embed([query])[0]
+        try:
+            hit_rows = core_db.vec_search(
+                conn, qvec, top_k * 2, table="vec_episodes"
+            )
+        except Exception:
+            hit_rows = []
+        for rowid, distance in hit_rows:
+            r = conn.execute(
+                "SELECT id, session_id, title, summary FROM episodes WHERE rowid = ?",
+                (rowid,),
+            ).fetchone()
+            if r is None:
+                continue
+            vec_hits.append(
+                EpisodeHit(
+                    episode_id=r["id"],
+                    session_id=r["session_id"],
+                    title=r["title"],
+                    summary=r["summary"][:300],
+                    score=float(1.0 / (1.0 + distance)),
+                    score_kind="vec",
+                )
+            )
 
+    if not vec_hits:
+        return fts_hits[:top_k]
+    if not fts_hits:
+        return vec_hits[:top_k]
+    return _rrf_merge_episodes(fts_hits, vec_hits, top_k=top_k)
+
+
+def _rrf_merge_episodes(
+    fts: list[EpisodeHit],
+    vec: list[EpisodeHit],
+    *,
+    top_k: int,
+    k: int = 60,
+) -> list[EpisodeHit]:
+    """RRF over two ranked episode lists. Mirrors `_rrf_merge` (for chunks)
+    but keyed on episode_id."""
+    by_id: dict[str, EpisodeHit] = {}
+    scores: dict[str, float] = {}
+    for rank, hit in enumerate(fts, start=1):
+        scores[hit.episode_id] = scores.get(hit.episode_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.episode_id, hit)
+    for rank, hit in enumerate(vec, start=1):
+        scores[hit.episode_id] = scores.get(hit.episode_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.episode_id, hit)
+    ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [
-        EpisodeHit(
-            episode_id=r["id"],
-            session_id=r["session_id"],
-            title=r["title"],
-            summary=r["summary"][:300],
-            score=float(r["score"]),
-        )
-        for r in rows
+        replace(by_id[eid], score=score, score_kind="rrf")
+        for eid, score in ordered[:top_k]
     ]
 
 
@@ -672,27 +796,62 @@ def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> l
     return result
 
 
-def build_token_overlap_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
+def build_token_overlap_index(
+    conn: sqlite3.Connection,
+    *,
+    write_conn: sqlite3.Connection | None = None,
+) -> dict[str, list[str]]:
     """Map every underscore-segment token to the active canonicals containing
     it. Caller-cacheable; rebuild after a dream cycle that may have added,
     retracted, or merged edges.
+
+    On a warm database the persistent ``token_overlap_index`` table is read
+    directly (O(index rows) instead of O(active edges)). When the table is
+    empty — cold start, post-migration, or after runner invalidated it —
+    the function falls back to the full canonical scan and, if *write_conn* is
+    provided, persists the result so the next cold start is fast.
 
     Public (no leading underscore) so callers — HyMem instances, background
     workers — can build, stash, and pass it back through `augment()` to avoid
     re-scanning the canonical set on every query. At a few hundred canonicals
     the scan is sub-millisecond; at tens of thousands it begins to matter.
     """
+    persisted = conn.execute(
+        "SELECT token, canonical FROM token_overlap_index"
+    ).fetchall()
+    if persisted:
+        by_token: dict[str, list[str]] = {}
+        for r in persisted:
+            by_token.setdefault(r["token"], []).append(r["canonical"])
+        return by_token
+
     rows = conn.execute(
         "SELECT DISTINCT subject_canonical AS c FROM knowledge_graph WHERE status='active' "
         "UNION "
         "SELECT DISTINCT object_canonical FROM knowledge_graph WHERE status='active'"
     ).fetchall()
-    by_token: dict[str, list[str]] = {}
+    by_token = {}
     for r in rows:
         c = r["c"]
         for tok in c.split("_"):
             if tok:
                 by_token.setdefault(tok, []).append(c)
+
+    if write_conn is not None and by_token:
+        # isolation_level=None means autocommit — wrap explicitly so a partial
+        # write doesn't leave a half-populated table that subsequent cold starts
+        # would trust as complete.
+        write_conn.execute("BEGIN IMMEDIATE")
+        try:
+            write_conn.executemany(
+                "INSERT OR IGNORE INTO token_overlap_index(token, canonical) VALUES (?, ?)",
+                [(tok, c) for tok, canons in by_token.items() for c in canons],
+            )
+            write_conn.execute("COMMIT")
+        except Exception:
+            write_conn.execute("ROLLBACK")
+            raise
+
     return by_token
 
 
@@ -757,6 +916,107 @@ def _expand_entities_by_token_overlap(
     return expansions, overlap_info
 
 
+# Maps category-style query phrases to the entity-type labels emitted by the
+# extraction prompt. Lets "what build tools do we use?" pull every canonical
+# tagged `package_manager` even when no specific package manager is named.
+# Phrases match against a normalised, lowercased copy of the user message.
+_TYPE_QUERY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "package_manager": (
+        "package manager", "package management", "build tool", "build tools",
+        "dependency manager", "dependency management",
+    ),
+    "database": ("database", "databases", "datastore", "data store"),
+    "language": ("programming language", "languages", "language stack"),
+    "framework": ("framework", "frameworks", "web framework"),
+    "service": ("service", "services", "microservice", "microservices"),
+    "container": ("container", "containers", "containerization", "containerisation"),
+    "platform": ("platform", "platforms", "cloud platform"),
+    "testing_framework": ("test framework", "testing framework", "test runner", "test tooling"),
+    "ci_tool": ("ci tool", "ci tools", "ci/cd", "ci pipeline", "continuous integration"),
+    "monitoring_tool": ("monitoring", "observability", "metrics tool"),
+    "config_file": ("config file", "configuration file", "config files"),
+    "identity_provider": ("identity provider", "auth provider", "sso", "single sign-on"),
+    "message_broker": ("message broker", "message queue", "queue system", "pubsub", "pub/sub"),
+    "protocol": ("protocol", "protocols"),
+    "environment": ("environment", "environments", "deployment environment"),
+    "api": ("api", "apis"),
+    "library": ("library", "libraries", "dependency", "dependencies"),
+    "tool": ("tooling", "dev tool", "dev tools"),
+}
+
+# Maps category-style query phrases to entity_properties (key, value) filters.
+# Lets a question about "build tools" also surface entities the LLM tagged
+# with `category=build_tool` even if they have no entity_types row.
+_PROPERTY_QUERY_KEYWORDS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("category", "build_tool"): ("build tool", "build tools"),
+    ("category", "database"): ("database", "databases"),
+    ("category", "testing"): ("test framework", "testing framework", "test runner"),
+    ("category", "deployment"): ("deployment", "deploy tool"),
+    ("category", "observability"): ("monitoring", "observability"),
+}
+
+
+def _expand_entities_from_query(
+    conn: sqlite3.Connection,
+    user_message: str,
+    *,
+    max_per_type: int = 10,
+) -> tuple[list[str], dict[str, str]]:
+    """Pull canonicals whose type or property matches a category-style query.
+
+    Scans the lowercased message for the configured keyword phrases. For each
+    hit, returns up to ``max_per_type`` canonicals tagged with that type (via
+    ``entity_types``) or carrying the matching ``(key, value)`` pair in
+    ``entity_properties``. Returns ``(canonicals, {canonical: type_label})``
+    where the label is the type or ``"key=value"`` rendering of the property.
+    """
+    msg = user_message.lower()
+    matched_types: set[str] = set()
+    for type_label, phrases in _TYPE_QUERY_KEYWORDS.items():
+        if any(p in msg for p in phrases):
+            matched_types.add(type_label)
+
+    matched_props: list[tuple[str, str]] = []
+    for (key, value), phrases in _PROPERTY_QUERY_KEYWORDS.items():
+        if any(p in msg for p in phrases):
+            matched_props.append((key, value))
+
+    if not matched_types and not matched_props:
+        return [], {}
+
+    seen: set[str] = set()
+    out: list[str] = []
+    info: dict[str, str] = {}
+
+    for type_label in sorted(matched_types):
+        rows = conn.execute(
+            "SELECT entity_canonical FROM entity_types WHERE type = ? LIMIT ?",
+            (type_label, max_per_type),
+        ).fetchall()
+        for r in rows:
+            ent = r["entity_canonical"]
+            if ent in seen:
+                continue
+            seen.add(ent)
+            out.append(ent)
+            info[ent] = type_label
+
+    for key, value in matched_props:
+        rows = conn.execute(
+            "SELECT entity_canonical FROM entity_properties WHERE key = ? AND value = ? LIMIT ?",
+            (key, value, max_per_type),
+        ).fetchall()
+        for r in rows:
+            ent = r["entity_canonical"]
+            if ent in seen:
+                continue
+            seen.add(ent)
+            out.append(ent)
+            info[ent] = f"{key}={value}"
+
+    return out, info
+
+
 def _expand_entities_by_type(
     conn: sqlite3.Connection,
     entities: list[str],
@@ -801,51 +1061,3 @@ def _expand_entities_by_type(
     return entities + expanded, expansion_info
 
 
-def _rerank(
-    query: str,
-    candidates: list[FtsHit],
-    llm: LLMClient,
-    top_k: int,
-) -> list[FtsHit]:
-    if not candidates:
-        return candidates
-
-    excerpts_lines = []
-    for i, hit in enumerate(candidates):
-        excerpts_lines.append(f"[{i}] {hit.text[:400]}")
-    excerpts = "\n\n".join(excerpts_lines)
-
-    request = LLMRequest(
-        system=RERANK_SYSTEM,
-        user=RERANK_USER_TEMPLATE.format(query=query, excerpts=excerpts),
-        response_format="json",
-    )
-    raw = llm.complete(request)
-
-    try:
-        ratings = json.loads(raw)
-    except json.JSONDecodeError:
-        return candidates[:top_k]
-
-    if not isinstance(ratings, list):
-        return candidates[:top_k]
-
-    relevance: dict[int, int] = {}
-    for item in ratings:
-        if not isinstance(item, dict):
-            continue
-        idx = item.get("index")
-        score = item.get("relevance")
-        if isinstance(idx, int) and isinstance(score, (int, float)) and 0 <= idx < len(candidates):
-            relevance[idx] = int(score)
-
-    scored = []
-    for i, hit in enumerate(candidates):
-        rrf_score = hit.score if hit.score_kind == "rrf" else 0.0
-        llm_score = relevance.get(i, 3)
-        combined = llm_score * 100 + rrf_score
-        scored.append((combined, hit))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [replace(hit, score=float(score), score_kind="reranked")
-            for score, hit in scored[:top_k]]

@@ -11,7 +11,7 @@ from typing import Iterator
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 6
+EXPECTED_SCHEMA_VERSION = 9
 
 
 def _load_schema() -> str:
@@ -69,6 +69,12 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         _migrate_v5(conn)
     if cur < 6:
         _migrate_v6(conn)
+    if cur < 7:
+        _migrate_v7(conn)
+    if cur < 8:
+        _migrate_v8(conn)
+    if cur < 9:
+        _migrate_v9(conn)
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
@@ -157,7 +163,89 @@ def _migrate_v6(conn: sqlite3.Connection) -> None:
     log.info("migrated schema to v6 (edge embeddings table)")
 
 
-_VEC_TABLES = frozenset({"vec_chunks", "vec_edges"})
+def _migrate_v8(conn: sqlite3.Connection) -> None:
+    """Add episode-level embeddings and a UPDATE-side FTS trigger for episodes.
+
+    Pre-v8 episodes use the per-LLM-call ordinal as their id (``{session}@{n}``)
+    and were INSERT-OR-IGNOREd, so a re-dream silently dropped changes. v8
+    pairs the new stable id format (``{session}@{start}-{end}``) with an
+    UPSERT in persist_episodes, but the existing INSERT/DELETE triggers on
+    ``episodes_fts`` don't cover the new UPDATE path — hence the extra trigger.
+    """
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS episodes_fts_update AFTER UPDATE ON episodes BEGIN
+            INSERT INTO episodes_fts(episodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+            INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS episode_embeddings (
+            episode_id TEXT PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+            vector_json TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            text_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '8')"
+    )
+    log.info("migrated schema to v8 (episode embeddings + FTS update trigger)")
+
+
+def _migrate_v9(conn: sqlite3.Connection) -> None:
+    """Add entity_properties table for key/value attributes per canonical entity."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entity_properties (
+            entity_canonical TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (entity_canonical, key)
+        )
+        """
+    )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entity_properties_key ON entity_properties(key)"
+        )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entity_properties_value ON entity_properties(value)"
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '9')"
+    )
+    log.info("migrated schema to v9 (entity_properties table)")
+
+
+def _migrate_v7(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS token_overlap_index (
+            token TEXT NOT NULL,
+            canonical TEXT NOT NULL,
+            PRIMARY KEY (token, canonical)
+        )""")
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_overlap_token ON token_overlap_index(token)"
+        )
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '7')"
+    )
+    log.info("migrated schema to v7 (token overlap index table)")
+
+
+_VEC_TABLES = frozenset({"vec_chunks", "vec_edges", "vec_episodes"})
 
 
 def _ensure_vec_table_named(conn: sqlite3.Connection, name: str, dim: int) -> None:
@@ -169,11 +257,12 @@ def _ensure_vec_table_named(conn: sqlite3.Connection, name: str, dim: int) -> No
 
 
 def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
-    """Ensure both vec_chunks and vec_edges exist at the given dim.
+    """Ensure vec_chunks, vec_edges, and vec_episodes exist at the given dim.
 
-    The two virtual tables share the single 'vec_dim' schema_meta key, so on a
-    dimension change they are dropped and rebuilt in lockstep, then backfilled
-    from their JSON mirror tables (chunk_embeddings / edge_embeddings).
+    The three virtual tables share the single 'vec_dim' schema_meta key, so on
+    a dimension change they are dropped and rebuilt in lockstep, then
+    backfilled from their JSON mirror tables (chunk_embeddings /
+    edge_embeddings / episode_embeddings).
     """
     if not _load_vec_extension(conn):
         return
@@ -182,10 +271,13 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
             "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
         ).fetchone()
         if existing_dim and int(existing_dim["value"]) == dim:
-            # Dim unchanged — still ensure vec_edges exists and is populated for
-            # DBs that embedded chunks before vec_edges was introduced.
+            # Dim unchanged — still ensure vec_edges / vec_episodes exist and
+            # are populated for DBs that embedded chunks before those tables
+            # were introduced.
             _ensure_vec_table_named(conn, "vec_edges", dim)
             _backfill_vec_edges(conn, dim)
+            _ensure_vec_table_named(conn, "vec_episodes", dim)
+            _backfill_vec_episodes(conn, dim)
             return
         if existing_dim:
             conn.execute("DELETE FROM schema_meta WHERE key = 'vec_dim'")
@@ -193,14 +285,18 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
                 conn.execute("DROP TABLE IF EXISTS vec_chunks")
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("DROP TABLE IF EXISTS vec_edges")
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("DROP TABLE IF EXISTS vec_episodes")
         _ensure_vec_table_named(conn, "vec_chunks", dim)
         _ensure_vec_table_named(conn, "vec_edges", dim)
+        _ensure_vec_table_named(conn, "vec_episodes", dim)
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('vec_dim', ?)",
             (str(dim),),
         )
         _backfill_vec(conn, dim)
         _backfill_vec_edges(conn, dim)
+        _backfill_vec_episodes(conn, dim)
     except sqlite3.OperationalError:
         log.info("vec tables unavailable; using Python cosine search")
 
@@ -270,6 +366,39 @@ def _backfill_vec_edges(conn: sqlite3.Connection, dim: int) -> None:
     log.info("backfilled vec_edges from %d edge rows", len(rows))
 
 
+def _backfill_vec_episodes(conn: sqlite3.Connection, dim: int) -> None:
+    """Populate vec_episodes from episode_embeddings on cold start / dim change."""
+    rows = conn.execute(
+        "SELECT episode_id, vector_json FROM episode_embeddings"
+    ).fetchall()
+    if not rows:
+        return
+    have = conn.execute("SELECT COUNT(*) AS c FROM vec_episodes").fetchone()["c"]
+    if have >= len(rows):
+        return
+    # rowid in vec_episodes mirrors the episodes.rowid so a vec_search hit
+    # joins back via rowid → episodes row in one step.
+    id_rowid = {
+        r["id"]: r["rowid"]
+        for r in conn.execute("SELECT id, rowid FROM episodes").fetchall()
+    }
+    for r in rows:
+        rowid = id_rowid.get(r["episode_id"])
+        if rowid is None:
+            continue
+        try:
+            vec = json.loads(r["vector_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(vec) != dim:
+            vec = list(vec) + [0.0] * (dim - len(vec))
+        conn.execute(
+            "INSERT OR IGNORE INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+            (rowid, _pack_vector(vec)),
+        )
+    log.info("backfilled vec_episodes from %d episode rows", len(rows))
+
+
 def _pack_vector(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
@@ -290,9 +419,8 @@ def vec_search(
             f"""
             SELECT rowid, distance
             FROM {table}
-            WHERE embedding MATCH ?
+            WHERE embedding MATCH ? AND k = ?
             ORDER BY distance
-            LIMIT ?
             """,
             (_pack_vector(query_vector), top_k),
         ).fetchall()
