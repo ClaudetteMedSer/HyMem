@@ -17,7 +17,7 @@ from tests.conftest import make_routed_llm, seed_edge
 
 def test_migration_v6_creates_edge_embeddings(hy):
     conn = hy.conn
-    assert core_db.schema_version(conn) == 7
+    assert core_db.schema_version(conn) == 8
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edge_embeddings'"
     ).fetchone()

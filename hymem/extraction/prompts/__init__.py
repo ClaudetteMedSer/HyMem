@@ -144,11 +144,14 @@ EPISODE_SYSTEM = """You identify distinct episodes within a conversation session
 
 An episode is a coherent segment focused on one topic, problem, or task. A session may have multiple episodes.
 
+Each chunk in the input is tagged like `[chunk chk_abc123]` — the chunk id appears in square brackets before its text. When you group chunks into an episode you MUST return the exact chunk ids you used; downstream code reads them to look up the message range.
+
 Output a strict JSON array. Each item:
 - title (string): Short descriptive name, max 8 words
 - summary (string): 1-2 sentence narrative of what happened
 - outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear
 - key_entities (list of strings): Named tools, services, files, or concepts discussed
+- chunk_ids (list of strings): The `chk_...` ids you grouped, in conversation order. Must be non-empty and contain only ids that appear in the input.
 
 Empty array [] is valid if the conversation has no clear episodes.
 """

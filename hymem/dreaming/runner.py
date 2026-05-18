@@ -23,8 +23,10 @@ from hymem.dreaming.embeddings import (
     assemble_chunk_pending,
     fetch_chunk_embeddings,
     fetch_edge_embeddings,
+    fetch_episode_embeddings,
     persist_chunk_embeddings,
     persist_edge_embeddings,
+    persist_episode_embeddings,
     prepare_chunk_embed_batch,
 )
 from hymem.dreaming.episodes import extract_episodes_for_session, persist_episodes
@@ -49,6 +51,8 @@ class DreamReport:
     chunks_embedded_from_cache: int = 0
     edges_embedded: int = 0
     edges_embedded_from_cache: int = 0
+    episodes_embedded: int = 0
+    episodes_embedded_from_cache: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
 
@@ -374,6 +378,14 @@ def run_dreaming(
                 with core_db.transaction(conn):
                     report.edges_embedded = persist_edge_embeddings(conn, pending_edges)
                 report.edges_embedded_from_cache = pending_edges.cache_hits
+
+            pending_episodes = fetch_episode_embeddings(conn, embedding_client)
+            if pending_episodes is not None:
+                with core_db.transaction(conn):
+                    report.episodes_embedded = persist_episode_embeddings(
+                        conn, pending_episodes
+                    )
+                report.episodes_embedded_from_cache = pending_episodes.cache_hits
         after_retracted = conn.execute(
             "SELECT COUNT(*) AS c FROM knowledge_graph WHERE status = 'retracted'"
         ).fetchone()["c"]

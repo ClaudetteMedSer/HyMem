@@ -33,6 +33,21 @@ class PendingEdgeEmbeddings:
 
 
 @dataclass
+class PendingEpisodeEmbeddings:
+    """One-shot batch for episode embeddings. ``ids`` and ``rowids`` align
+    with ``vectors``/``text_hashes``/``from_cache`` by index."""
+
+    ids: list[str]
+    rowids: list[int]
+    vectors: list[list[float]]
+    text_hashes: list[str]
+    from_cache: list[bool]
+    dim: int
+    model: str
+    cache_hits: int = 0
+
+
+@dataclass
 class ChunkEmbedRequest:
     """Per-batch state captured on the main thread before a background embed.
 
@@ -381,3 +396,126 @@ def persist_edge_embeddings(
                 (edge_id, core_db._pack_vector(vec)),
             )
     return len(pending.new_text_vectors)
+
+
+def _episode_embed_text(title: str, summary: str) -> str:
+    return f"{title}\n{summary}"
+
+
+def fetch_episode_embeddings(
+    conn: sqlite3.Connection, embedder: EmbeddingClient
+) -> PendingEpisodeEmbeddings | None:
+    """Build a batch of episode embeddings for any episode whose stored vector
+    is missing or stale (text_hash mismatch). Cache-hit-aware via embedding_cache.
+
+    Returns None when no episodes need (re-)embedding.
+    """
+    rows = conn.execute(
+        """
+        SELECT e.id, e.rowid AS rowid, e.title, e.summary,
+               ee.text_hash AS stored_hash
+        FROM episodes e
+        LEFT JOIN episode_embeddings ee ON ee.episode_id = e.id
+        """
+    ).fetchall()
+    if not rows:
+        return None
+
+    pending_ids: list[str] = []
+    pending_rowids: list[int] = []
+    pending_hashes: list[str] = []
+    pending_texts: list[str] = []
+    for r in rows:
+        text = _episode_embed_text(r["title"], r["summary"])
+        text_hash = hashlib.sha256(normalize_text(text).encode()).hexdigest()
+        if r["stored_hash"] == text_hash:
+            continue
+        pending_ids.append(r["id"])
+        pending_rowids.append(int(r["rowid"]))
+        pending_hashes.append(text_hash)
+        pending_texts.append(text)
+
+    if not pending_ids:
+        return None
+
+    model = embedder.model
+    cached_by_hash = _fetch_cached_vectors(conn, pending_hashes, model)
+
+    vectors_out: list[list[float] | None] = [None] * len(pending_ids)
+    from_cache = [False] * len(pending_ids)
+    miss_indices: list[int] = []
+    miss_texts: list[str] = []
+    for i, h in enumerate(pending_hashes):
+        cached = cached_by_hash.get(h)
+        if cached is not None:
+            vectors_out[i] = cached
+            from_cache[i] = True
+        else:
+            miss_indices.append(i)
+            miss_texts.append(pending_texts[i])
+
+    if miss_texts:
+        embedded = embedder.embed(miss_texts)
+        if len(embedded) != len(miss_texts):
+            raise RuntimeError(
+                f"embedding client returned {len(embedded)} vectors for "
+                f"{len(miss_texts)} episodes"
+            )
+        for idx, vec in zip(miss_indices, embedded):
+            vectors_out[idx] = vec
+
+    return PendingEpisodeEmbeddings(
+        ids=pending_ids,
+        rowids=pending_rowids,
+        vectors=cast(list[list[float]], vectors_out),
+        text_hashes=pending_hashes,
+        from_cache=from_cache,
+        dim=embedder.dim,
+        model=model,
+        cache_hits=sum(from_cache),
+    )
+
+
+def persist_episode_embeddings(
+    conn: sqlite3.Connection, pending: PendingEpisodeEmbeddings
+) -> int:
+    """UPSERT episode vectors into episode_embeddings + vec_episodes. Cache
+    misses also land in embedding_cache. Caller wraps in core_db.transaction()."""
+    core_db.ensure_vec_table(conn, pending.dim)
+    has_vec = core_db.has_vec_table(conn, table="vec_episodes")
+    for ep_id, rowid, vec, text_hash, is_cached in zip(
+        pending.ids,
+        pending.rowids,
+        pending.vectors,
+        pending.text_hashes,
+        pending.from_cache,
+    ):
+        if not is_cached:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO embedding_cache(text_hash, model, vector_json, dim)
+                VALUES (?, ?, ?, ?)
+                """,
+                (text_hash, pending.model, json.dumps(vec), len(vec)),
+            )
+        conn.execute(
+            """
+            INSERT INTO episode_embeddings(episode_id, vector_json, model, dim, text_hash)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(episode_id) DO UPDATE SET
+                vector_json = excluded.vector_json,
+                model = excluded.model,
+                dim = excluded.dim,
+                text_hash = excluded.text_hash
+            """,
+            (ep_id, json.dumps(vec), pending.model, len(vec), text_hash),
+        )
+        if has_vec:
+            # vec0 doesn't support INSERT OR REPLACE on the rowid PK, so delete
+            # any stale row first.
+            conn.execute("DELETE FROM vec_episodes WHERE rowid = ?", (rowid,))
+            conn.execute(
+                "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+                (rowid, core_db._pack_vector(vec)),
+            )
+    return len(pending.ids)

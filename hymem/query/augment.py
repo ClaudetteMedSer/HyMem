@@ -42,6 +42,9 @@ class EpisodeHit:
     title: str
     summary: str
     score: float
+    score_kind: str = "bm25"
+    """Source of the score: "bm25" (FTS only), "vec" (semantic only), or
+    "rrf" (reciprocal-rank-fused FTS + vec)."""
 
 
 @dataclass
@@ -119,7 +122,11 @@ def augment(
     else:
         log.debug("rerank.skipped")
 
-    ctx.episodes = _episode_search(conn, user_message, top_k=cfg.fts_top_k)
+    ctx.episodes = _episode_search(
+        conn, user_message,
+        top_k=cfg.fts_top_k,
+        embedding_client=embedding_client,
+    )
 
     ctx.procedures = _procedure_search(conn, user_message, top_k=cfg.fts_top_k)
 
@@ -611,37 +618,112 @@ def _python_cosine_edge_search(
     return [(edge_id, sim) for sim, edge_id in scored[:top_k]]
 
 
-def _episode_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[EpisodeHit]:
+def _episode_search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    top_k: int = 3,
+    embedding_client: EmbeddingClient | None = None,
+) -> list[EpisodeHit]:
+    """Episode retrieval. Always runs the FTS path; when an embedding client
+    is configured *and* vec_episodes has rows, also runs semantic KNN over
+    title+summary embeddings and RRF-fuses the two ranked lists.
+
+    Falls back to FTS-only (with score_kind="bm25") when there's no embedder,
+    no vec_episodes table, or vec returns nothing — preserving the original
+    behavior for clients that haven't dreamed any episode embeddings yet.
+    """
+    from hymem.core import db as core_db
+
     cleaned = _FTS_SAFE.sub(" ", query).strip()
-    if not cleaned:
-        return []
-    tokens = [t for t in cleaned.split() if len(t) >= 2]
-    if not tokens:
-        return []
-    fts_query = " OR ".join(f'"{t}"' for t in tokens)
+    fts_hits: list[EpisodeHit] = []
+    if cleaned:
+        tokens = [t for t in cleaned.split() if len(t) >= 2]
+        if tokens:
+            fts_query = " OR ".join(f'"{t}"' for t in tokens)
+            try:
+                rows = conn.execute(
+                    """SELECT e.id, e.session_id, e.title, e.summary, bm25(episodes_fts) AS score
+                       FROM episodes_fts
+                       JOIN episodes e ON e.rowid = episodes_fts.rowid
+                       WHERE episodes_fts MATCH ?
+                       ORDER BY score
+                       LIMIT ?""",
+                    (fts_query, top_k * 2),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            for r in rows:
+                fts_hits.append(
+                    EpisodeHit(
+                        episode_id=r["id"],
+                        session_id=r["session_id"],
+                        title=r["title"],
+                        summary=r["summary"][:300],
+                        score=float(r["score"]),
+                        score_kind="bm25",
+                    )
+                )
 
-    try:
-        rows = conn.execute(
-            """SELECT e.id, e.session_id, e.title, e.summary, bm25(episodes_fts) AS score
-               FROM episodes_fts
-               JOIN episodes e ON e.rowid = episodes_fts.rowid
-               WHERE episodes_fts MATCH ?
-               ORDER BY score
-               LIMIT ?""",
-            (fts_query, top_k),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    vec_hits: list[EpisodeHit] = []
+    if (
+        embedding_client is not None
+        and core_db._load_vec_extension(conn)
+        and core_db.has_vec_table(conn, table="vec_episodes")
+    ):
+        qvec = embedding_client.embed([query])[0]
+        try:
+            hit_rows = core_db.vec_search(
+                conn, qvec, top_k * 2, table="vec_episodes"
+            )
+        except Exception:
+            hit_rows = []
+        for rowid, distance in hit_rows:
+            r = conn.execute(
+                "SELECT id, session_id, title, summary FROM episodes WHERE rowid = ?",
+                (rowid,),
+            ).fetchone()
+            if r is None:
+                continue
+            vec_hits.append(
+                EpisodeHit(
+                    episode_id=r["id"],
+                    session_id=r["session_id"],
+                    title=r["title"],
+                    summary=r["summary"][:300],
+                    score=float(1.0 / (1.0 + distance)),
+                    score_kind="vec",
+                )
+            )
 
+    if not vec_hits:
+        return fts_hits[:top_k]
+    if not fts_hits:
+        return vec_hits[:top_k]
+    return _rrf_merge_episodes(fts_hits, vec_hits, top_k=top_k)
+
+
+def _rrf_merge_episodes(
+    fts: list[EpisodeHit],
+    vec: list[EpisodeHit],
+    *,
+    top_k: int,
+    k: int = 60,
+) -> list[EpisodeHit]:
+    """RRF over two ranked episode lists. Mirrors `_rrf_merge` (for chunks)
+    but keyed on episode_id."""
+    by_id: dict[str, EpisodeHit] = {}
+    scores: dict[str, float] = {}
+    for rank, hit in enumerate(fts, start=1):
+        scores[hit.episode_id] = scores.get(hit.episode_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.episode_id, hit)
+    for rank, hit in enumerate(vec, start=1):
+        scores[hit.episode_id] = scores.get(hit.episode_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.episode_id, hit)
+    ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [
-        EpisodeHit(
-            episode_id=r["id"],
-            session_id=r["session_id"],
-            title=r["title"],
-            summary=r["summary"][:300],
-            score=float(r["score"]),
-        )
-        for r in rows
+        replace(by_id[eid], score=score, score_kind="rrf")
+        for eid, score in ordered[:top_k]
     ]
 
 
