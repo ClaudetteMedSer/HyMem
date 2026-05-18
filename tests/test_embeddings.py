@@ -259,6 +259,112 @@ def test_embedding_cache_skips_repeat_chunk_text_across_dreams(cfg):
         hy.close()
 
 
+def test_chunk_embedding_runs_in_parallel_with_phase1(cfg):
+    """A slow embedder + a non-trivial Phase 1 LLM stream should finish in
+    roughly max(LLM*N, EMBED) wall-time rather than their sum, because chunk
+    embedding is kicked off on a background thread after each persist_chunks
+    and joined after the per-session loop.
+
+    Tunings (LLM dominated by EMBED): with 5 chunks → 10 Phase-1 LLM calls
+    (extract_triples + extract_markers per chunk) + 3 tail calls = 13 LLM
+    calls. Serial: 13*LLM_DELAY + EMBED_DELAY. Parallel: ~EMBED_DELAY.
+    """
+    import time
+    from dataclasses import replace as _dc_replace
+
+    from hymem.extraction.llm import LLMRequest
+
+    LLM_DELAY = 0.01
+    EMBED_DELAY = 0.20
+
+    class SlowEmbed(StubEmbeddingClient):
+        def embed(self, texts):
+            time.sleep(EMBED_DELAY)
+            return super().embed(texts)
+
+    class SlowLLM(StubLLMClient):
+        def complete(self, request: LLMRequest) -> str:
+            time.sleep(LLM_DELAY)
+            return super().complete(request)
+
+    embed = SlowEmbed()
+    tight_cfg = _dc_replace(cfg, dream_budget=5, dream_baseline_budget=0)
+
+    llm = SlowLLM(default="[]")
+    hy = HyMem(tight_cfg, llm=llm, embedding_client=embed)
+    try:
+        hy.open_session("s1")
+        for i in range(5):
+            hy.log_message("s1", "assistant", "anything")
+            hy.log_message(
+                "s1", "user",
+                f"I prefer choice_{i} for the local dev environment because it is fast.",
+            )
+        hy.close_session("s1")
+
+        t0 = time.monotonic()
+        report = hy.dream()
+        elapsed = time.monotonic() - t0
+
+        assert report.chunks_embedded >= 5
+        # We saved roughly EMBED_DELAY by running it parallel to Phase 1.
+        # The serial floor is the sum of Phase 1 LLM + tail LLM + 1 embed.
+        # Require at least 30% of EMBED_DELAY shaved off vs serial.
+        n_llm_calls = 5 * 2 + 3  # 2 calls per chunk + 3 tail (episodes/summary/procedures)
+        serial_floor = n_llm_calls * LLM_DELAY + EMBED_DELAY
+        savings_target = EMBED_DELAY * 0.30
+        assert elapsed < serial_floor - savings_target, (
+            f"expected ≥{savings_target:.3f}s saved by parallelism; "
+            f"elapsed={elapsed:.3f}s serial_floor={serial_floor:.3f}s"
+        )
+    finally:
+        hy.close()
+
+
+def test_background_embed_failure_falls_back_to_post_loop_fetch(cfg):
+    """If the background embed task raises, the dream cycle must continue
+    and the post-loop fetch_chunk_embeddings call must still embed the
+    affected chunks."""
+    from hymem.extraction.embeddings import StubEmbeddingClient as _Stub
+
+    class FlakyEmbed(_Stub):
+        def __init__(self):
+            super().__init__()
+            self.call_count = 0
+
+        def embed(self, texts):
+            self.call_count += 1
+            if self.call_count == 1:
+                raise RuntimeError("simulated background failure")
+            return super().embed(texts)
+
+    embed = FlakyEmbed()
+    llm = StubLLMClient(default="[]")
+    hy = HyMem(cfg, llm=llm, embedding_client=embed)
+    try:
+        hy.open_session("s1")
+        hy.log_message("s1", "assistant", "anything")
+        hy.log_message(
+            "s1", "user",
+            "I prefer fastapi for my web services because it is async and modern.",
+        )
+        hy.close_session("s1")
+
+        # Should NOT raise — background failure is logged, fallback embeds.
+        report = hy.dream()
+        # Background call failed, fallback fetch_chunk_embeddings ran the
+        # second embedder call and persisted the chunk.
+        assert report.chunks_embedded >= 1
+        assert embed.call_count >= 2
+
+        rows = hy.conn.execute(
+            "SELECT COUNT(*) AS c FROM chunk_embeddings"
+        ).fetchone()["c"]
+        assert rows >= 1
+    finally:
+        hy.close()
+
+
 def test_vector_search_respects_embedding_max_scan(cfg):
     embed = StubEmbeddingClient()
     conn = core_db.connect(cfg.db_path)

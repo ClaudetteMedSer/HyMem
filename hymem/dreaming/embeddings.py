@@ -32,6 +32,26 @@ class PendingEdgeEmbeddings:
     cache_hits: int = 0
 
 
+@dataclass
+class ChunkEmbedRequest:
+    """Per-batch state captured on the main thread before a background embed.
+
+    Decouples the SQLite cache lookup (must run on the writer thread) from the
+    embedding API call (offloaded to a background thread). After the embedder
+    returns, ``assemble_chunk_pending`` merges these halves and produces a
+    ``PendingChunkEmbeddings`` ready to persist.
+    """
+
+    ids: list[str]
+    texts: list[str]
+    text_hashes: list[str]
+    cached_by_hash: dict[str, list[float]]
+    miss_indices: list[int]
+    miss_texts: list[str]
+    model: str
+    dim: int
+
+
 def fetch_chunk_embeddings(
     conn: sqlite3.Connection, embedder: EmbeddingClient
 ) -> PendingChunkEmbeddings | None:
@@ -148,6 +168,95 @@ def persist_chunk_embeddings(
             (chunk_rowid, core_db._pack_vector(vec)),
         )
     return len(pending.ids)
+
+
+def prepare_chunk_embed_batch(
+    conn: sqlite3.Connection,
+    chunk_id_text_pairs: list[tuple[str, str]],
+    embedder: EmbeddingClient,
+) -> ChunkEmbedRequest:
+    """Capture all main-thread state for a chunk batch: cache lookup against
+    ``embedding_cache`` and the indices of cache misses that still need an
+    embedder call. The returned request can be passed to ``assemble_chunk_pending``
+    once the embedder has returned vectors for ``miss_texts``."""
+    ids = [cid for cid, _ in chunk_id_text_pairs]
+    texts = [t for _, t in chunk_id_text_pairs]
+    model = embedder.model
+    text_hashes = [
+        hashlib.sha256(normalize_text(t).encode()).hexdigest() for t in texts
+    ]
+    cached_by_hash = _fetch_cached_vectors(conn, text_hashes, model)
+    miss_indices: list[int] = []
+    miss_texts: list[str] = []
+    for i, h in enumerate(text_hashes):
+        if cached_by_hash.get(h) is None:
+            miss_indices.append(i)
+            miss_texts.append(texts[i])
+    return ChunkEmbedRequest(
+        ids=ids,
+        texts=texts,
+        text_hashes=text_hashes,
+        cached_by_hash=cached_by_hash,
+        miss_indices=miss_indices,
+        miss_texts=miss_texts,
+        model=model,
+        dim=embedder.dim,
+    )
+
+
+def assemble_chunk_pending(
+    conn: sqlite3.Connection,
+    request: ChunkEmbedRequest,
+    miss_vectors: list[list[float]],
+    *,
+    exclude_ids: set[str] | None = None,
+) -> PendingChunkEmbeddings | None:
+    """Merge cache hits + freshly embedded vectors into a PendingChunkEmbeddings.
+
+    Queries chunk rowids fresh so a chunk pruned between submit and persist
+    is dropped silently. Returns ``None`` if nothing remains to persist
+    (everything filtered out by ``exclude_ids`` or chunk_id no longer present).
+    """
+    if len(miss_vectors) != len(request.miss_texts):
+        raise RuntimeError(
+            f"embedding client returned {len(miss_vectors)} vectors for "
+            f"{len(request.miss_texts)} chunks"
+        )
+    n = len(request.ids)
+    vectors: list[list[float] | None] = [None] * n
+    from_cache = [False] * n
+    for i in range(n):
+        cached = request.cached_by_hash.get(request.text_hashes[i])
+        if cached is not None:
+            vectors[i] = cached
+            from_cache[i] = True
+    for idx, vec in zip(request.miss_indices, miss_vectors):
+        vectors[idx] = vec
+
+    skip = exclude_ids or set()
+    placeholders = ",".join("?" * len(request.ids))
+    rowid_rows = conn.execute(
+        f"SELECT id, rowid FROM chunks WHERE id IN ({placeholders})",
+        tuple(request.ids),
+    ).fetchall()
+    rowid_map = {r["id"]: r["rowid"] for r in rowid_rows}
+    kept = [
+        i for i, cid in enumerate(request.ids)
+        if cid in rowid_map and cid not in skip and vectors[i] is not None
+    ]
+    if not kept:
+        return None
+
+    return PendingChunkEmbeddings(
+        ids=[request.ids[i] for i in kept],
+        chunk_rowids=[rowid_map[request.ids[i]] for i in kept],
+        vectors=[vectors[i] for i in kept],  # type: ignore[misc]
+        dim=request.dim,
+        model=request.model,
+        text_hashes=[request.text_hashes[i] for i in kept],
+        from_cache=[from_cache[i] for i in kept],
+        cache_hits=sum(from_cache[i] for i in kept),
+    )
 
 
 def fetch_edge_embeddings(

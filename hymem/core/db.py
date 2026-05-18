@@ -311,9 +311,8 @@ def vec_search(
             f"""
             SELECT rowid, distance
             FROM {table}
-            WHERE embedding MATCH ?
+            WHERE embedding MATCH ? AND k = ?
             ORDER BY distance
-            LIMIT ?
             """,
             (_pack_vector(query_vector), top_k),
         ).fetchall()

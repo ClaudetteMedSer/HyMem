@@ -86,6 +86,16 @@ class HyMemConfig:
     """Minimum RRF score drop between #1/#2 results to consider them clear
     (skip reranking). Higher = more reranking."""
 
+    hedge_confidence_threshold: float = 0.75
+    """Below this Laplace-smoothed confidence, a GraphFact is flagged
+    `hedge_recommended` so consumers can soften phrasing
+    ("you may use X" vs "you use X")."""
+
+    hedge_min_evidence: int = 3
+    """A GraphFact with fewer than this many total evidence rows
+    (pos + neg) is flagged `hedge_recommended` regardless of confidence —
+    one early extraction shouldn't read as assertive context indefinitely."""
+
     @property
     def db_path(self) -> Path:
         return self.root / "hymem.sqlite"

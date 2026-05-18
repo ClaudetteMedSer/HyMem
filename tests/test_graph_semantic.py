@@ -473,3 +473,53 @@ def test_recency_weight_math():
     half_life = 30.0
     assert math.isclose(math.exp(-0.0 / half_life), 1.0)
     assert math.isclose(math.exp(-half_life / half_life), math.exp(-1.0))
+
+
+# --- hedge_recommended -----------------------------------------------------
+
+
+def test_hedge_recommended_flagged_for_low_evidence(hy):
+    """A freshly-seeded edge has pos=1, neg=0 (Laplace confidence 0.67) and
+    only 1 total evidence row — both below default thresholds (0.75 / 3)."""
+    seed_edge(hy.conn, "atta", "uses", "fastapi")
+    ctx = hy.augment("tell me about atta")
+    fact = next(f for f in ctx.graph_facts if f.predicate == "uses")
+    assert fact.hedge_recommended is True
+
+
+def test_hedge_recommended_not_flagged_when_well_evidenced(hy):
+    """High confidence (pos >> neg) AND ≥ min_evidence rows: no hedge."""
+    seed_edge(hy.conn, "atta", "uses", "fastapi", pos=10, neg=0)
+    ctx = hy.augment("tell me about atta")
+    fact = next(f for f in ctx.graph_facts if f.predicate == "uses")
+    assert fact.confidence >= 0.75
+    assert (fact.pos_evidence + fact.neg_evidence) >= 3
+    assert fact.hedge_recommended is False
+
+
+def test_hedge_recommended_flagged_when_confidence_below_threshold(hy):
+    """Plenty of evidence but a near-50/50 split — confidence < 0.75 triggers hedge."""
+    seed_edge(hy.conn, "atta", "uses", "fastapi", pos=5, neg=4)
+    ctx = hy.augment("tell me about atta")
+    fact = next(f for f in ctx.graph_facts if f.predicate == "uses")
+    assert (fact.pos_evidence + fact.neg_evidence) >= 3
+    assert fact.confidence < 0.75
+    assert fact.hedge_recommended is True
+
+
+def test_hedge_thresholds_configurable(cfg, stub_llm):
+    """Loosening both thresholds: an otherwise-hedged fact passes the gate."""
+    from dataclasses import replace
+    from hymem import HyMem
+
+    loose = replace(cfg, hedge_confidence_threshold=0.5, hedge_min_evidence=1)
+    hy = HyMem(loose, llm=stub_llm)
+    try:
+        seed_edge(hy.conn, "atta", "uses", "fastapi")  # pos=1, conf=0.67
+        ctx = hy.augment("tell me about atta")
+        fact = next(f for f in ctx.graph_facts if f.predicate == "uses")
+        assert fact.confidence >= 0.5
+        assert (fact.pos_evidence + fact.neg_evidence) >= 1
+        assert fact.hedge_recommended is False
+    finally:
+        hy.close()

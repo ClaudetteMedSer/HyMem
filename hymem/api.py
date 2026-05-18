@@ -63,6 +63,9 @@ class HyMem:
         if self._read_conn is None:
             self.conn  # ensure the write connection is initialized first
             self._read_conn = core_db.connect(self.config.db_path)
+            # Load vec extension before query_only so semantic edge KNN uses
+            # the vec0 fast path instead of falling back to python cosine.
+            core_db._load_vec_extension(self._read_conn)
             self._read_conn.execute("PRAGMA query_only = ON")
         return self._read_conn
 

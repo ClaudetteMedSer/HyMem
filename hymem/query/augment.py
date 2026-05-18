@@ -28,6 +28,11 @@ class GraphFact:
     derived: bool = False
     why_retrieved: list[str] = field(default_factory=list)
     score: float = 0.0
+    hedge_recommended: bool = False
+    """Set by `_graph_lookup` from `cfg.hedge_confidence_threshold` and
+    `cfg.hedge_min_evidence`. Hermes (or any consumer) reads this to decide
+    whether to soften phrasing — HyMem only signals, never rewrites the
+    fact text."""
 
 
 @dataclass
@@ -501,6 +506,11 @@ def _graph_lookup(
         if c["entity_match"]:
             why.append("entity_match")
 
+        total_evidence = c["pos"] + c["neg"]
+        hedge = (
+            confidence < cfg.hedge_confidence_threshold
+            or total_evidence < cfg.hedge_min_evidence
+        )
         results.append(
             GraphFact(
                 subject=c["s"],
@@ -512,6 +522,7 @@ def _graph_lookup(
                 derived=c["derived"],
                 why_retrieved=why,
                 score=score,
+                hedge_recommended=hedge,
             )
         )
 

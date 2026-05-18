@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import sqlite3
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 from hymem.config import HyMemConfig
@@ -12,15 +13,19 @@ from hymem.core import db as core_db
 from hymem.dreaming import phase1, phase2, phase3
 from hymem.dreaming.inference import infer_transitive_edges
 from hymem.dreaming.chunks import (
+    Chunk,
     extract_baseline_chunks,
     extract_high_salience_chunks,
     persist_chunks,
 )
 from hymem.dreaming.embeddings import (
+    ChunkEmbedRequest,
+    assemble_chunk_pending,
     fetch_chunk_embeddings,
     fetch_edge_embeddings,
     persist_chunk_embeddings,
     persist_edge_embeddings,
+    prepare_chunk_embed_batch,
 )
 from hymem.dreaming.episodes import extract_episodes_for_session, persist_episodes
 from hymem.dreaming.procedures import extract_procedures_for_session, persist_procedures
@@ -75,6 +80,13 @@ def run_dreaming(
         )
         return report
 
+    embed_executor: ThreadPoolExecutor | None = None
+    embed_inflight: list[tuple[ChunkEmbedRequest, Future]] = []
+    if embedding_client is not None:
+        embed_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hymem-embed"
+        )
+
     try:
         target_sessions = session_ids or _all_sessions(conn)
         log.info(
@@ -97,6 +109,43 @@ def run_dreaming(
 
         chunks_remaining = cfg.dream_budget
 
+        def _kickoff_chunk_embed(chunks_list: list[Chunk]) -> None:
+            """Cache lookup on the main thread, then submit the embedder call
+            to a single-worker background thread so Phase 1 LLM calls keep
+            running in parallel with the (I/O-bound) embedding API call.
+
+            Skips chunks that already have a row in chunk_embeddings — a
+            re-run dream cycle re-persists the same chunk objects, and
+            vec_chunks (vec0 virtual table) rejects ``INSERT OR REPLACE`` on
+            existing rowids.
+            """
+            if embed_executor is None or embedding_client is None or not chunks_list:
+                return
+            ids = [c.id for c in chunks_list]
+            placeholders = ",".join("?" * len(ids))
+            already_embedded = {
+                r["chunk_id"]
+                for r in conn.execute(
+                    f"SELECT chunk_id FROM chunk_embeddings "
+                    f"WHERE chunk_id IN ({placeholders})",
+                    tuple(ids),
+                ).fetchall()
+            }
+            fresh = [c for c in chunks_list if c.id not in already_embedded]
+            if not fresh:
+                return
+            request = prepare_chunk_embed_batch(
+                conn,
+                [(c.id, c.text) for c in fresh],
+                embedding_client,
+            )
+            client = embedding_client
+            miss_texts = request.miss_texts
+            future: Future = embed_executor.submit(
+                lambda: client.embed(miss_texts) if miss_texts else []
+            )
+            embed_inflight.append((request, future))
+
         for session_id in target_sessions:
             report.sessions_processed += 1
             chunks = extract_high_salience_chunks(
@@ -109,6 +158,7 @@ def run_dreaming(
                     persist_chunks(conn, chunks)
                     for chunk in chunks:
                         index_chunk_mentions(conn, chunk.id, chunk.text)
+                _kickoff_chunk_embed(chunks)
 
             for chunk in chunks:
                 if chunks_remaining <= 0:
@@ -162,6 +212,7 @@ def run_dreaming(
                         persist_chunks(conn, baseline)
                         for chunk in baseline:
                             index_chunk_mentions(conn, chunk.id, chunk.text)
+                    _kickoff_chunk_embed(baseline)
                     for chunk in baseline:
                         if chunks_remaining <= 0:
                             break
@@ -232,11 +283,47 @@ def run_dreaming(
                 break
 
         if embedding_client is not None:
+            # Drain background-embedded batches first, in one transaction. A
+            # per-batch future failure is logged and skipped — the post-loop
+            # fetch_chunk_embeddings call below catches anything missed
+            # (skipped sessions, future raises, miss_texts size mismatch).
+            persisted_ids: set[str] = set()
+            if embed_inflight:
+                with core_db.transaction(conn):
+                    for request, future in embed_inflight:
+                        try:
+                            miss_vectors = future.result()
+                        except Exception:
+                            log.exception(
+                                "embedding.background_failure batch_size=%d",
+                                len(request.ids),
+                            )
+                            continue
+                        try:
+                            pending = assemble_chunk_pending(
+                                conn, request, miss_vectors,
+                                exclude_ids=persisted_ids,
+                            )
+                        except RuntimeError:
+                            log.exception(
+                                "embedding.assemble_failure batch_size=%d",
+                                len(request.ids),
+                            )
+                            continue
+                        if pending is None:
+                            continue
+                        report.chunks_embedded += persist_chunk_embeddings(
+                            conn, pending
+                        )
+                        report.chunks_embedded_from_cache += pending.cache_hits
+                        persisted_ids.update(pending.ids)
+                embed_inflight.clear()
+
             pending_chunks = fetch_chunk_embeddings(conn, embedding_client)
             if pending_chunks is not None:
                 with core_db.transaction(conn):
-                    report.chunks_embedded = persist_chunk_embeddings(conn, pending_chunks)
-                report.chunks_embedded_from_cache = pending_chunks.cache_hits
+                    report.chunks_embedded += persist_chunk_embeddings(conn, pending_chunks)
+                report.chunks_embedded_from_cache += pending_chunks.cache_hits
 
         log.info("phase2.start")
         with core_db.transaction(conn):
@@ -339,6 +426,8 @@ def run_dreaming(
             )
         raise
     finally:
+        if embed_executor is not None:
+            embed_executor.shutdown(wait=True)
         _release_lock(conn, holder)
 
 
