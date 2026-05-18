@@ -377,6 +377,7 @@ def _graph_lookup(
                     float(row["days_since"]) if row["days_since"] is not None else 0.0
                 ),
                 "semantic_score": 0.0,
+                "semantic_retrieved": False,
                 "entity_match": False,
                 "entity_types": set(),
                 "overlap_tokens": set(),
@@ -426,6 +427,7 @@ def _graph_lookup(
                 continue
             c = _ensure(row)
             c["semantic_score"] = max(c["semantic_score"], semantic_score)
+            c["semantic_retrieved"] = True
 
     # Source 3 — predicate-routed.
     if routed:
@@ -488,8 +490,8 @@ def _graph_lookup(
                 * predicate_boost
             )
 
-        if semantic_score > 0:
-            why.append(f"semantic_{semantic_score:.2f}")
+        if c["semantic_retrieved"]:
+            why.append(f"semantic_{max(0.0, semantic_score):.2f}")
         if in_routed:
             why.append(f"predicate:{c['p']}")
         for entity_type in sorted(c["entity_types"]):
@@ -592,7 +594,7 @@ def _python_cosine_edge_search(
             continue
         dot = sum(a * b for a, b in zip(qvec, vec))
         vnorm = math.sqrt(sum(x * x for x in vec)) or 1.0
-        sim = max(0.0, dot / (qnorm * vnorm))
+        sim = dot / (qnorm * vnorm)
         scored.append((sim, r["edge_id"]))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [(edge_id, sim) for sim, edge_id in scored[:top_k]]
