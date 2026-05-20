@@ -2,6 +2,14 @@
 -- live as NNN_*.sql files under hymem/core/migrations/, applied by the runner
 -- in db.py. Keep this file and the migrations in sync: a column added here must
 -- also have a migration so old databases pick it up.
+--
+-- CRITICAL: this file runs via executescript() BEFORE migrations. An existing
+-- table is left untouched by `CREATE TABLE IF NOT EXISTS`, so any *standalone*
+-- statement here that references a migration-added column (a `CREATE INDEX`, a
+-- separate `ALTER`, etc.) will crash on old DBs with "no such column". Such
+-- index/constraint statements must live in the migration file ONLY. The column
+-- may still appear in the `CREATE TABLE` above (harmless no-op on old DBs,
+-- correct on fresh ones).
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
@@ -285,7 +293,13 @@ CREATE TABLE IF NOT EXISTS procedures (
 );
 CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);
 CREATE INDEX IF NOT EXISTS idx_procedures_entities ON procedures(entities_involved);
-CREATE INDEX IF NOT EXISTS idx_procedures_status ON procedures(status);
+-- NOTE: the index on procedures.status lives ONLY in migration
+-- 010_procedure_status.sql, never here. schema.sql runs via executescript()
+-- BEFORE migrations, so on an existing pre-v10 DB the `procedures` table is
+-- already present (CREATE TABLE IF NOT EXISTS is a no-op) and lacks `status`;
+-- a `CREATE INDEX ... ON procedures(status)` here would crash with
+-- "no such column: status". General rule: any index/constraint referencing a
+-- migration-added column belongs in the migration file only.
 
 CREATE VIRTUAL TABLE IF NOT EXISTS procedures_fts USING fts5(
     name, description, steps,

@@ -87,6 +87,48 @@ def test_rerunning_migrations_is_a_noop(tmp_path: Path):
 # --- legacy database upgrade -----------------------------------------------
 
 
+def test_initialize_on_existing_pre_v10_db_does_not_crash(tmp_path: Path):
+    """Regression: initialize() runs schema.sql via executescript() BEFORE
+    migrations. An existing `procedures` table predating the v10 `status`
+    column is left untouched by CREATE TABLE IF NOT EXISTS, so a
+    `CREATE INDEX ... ON procedures(status)` in schema.sql would crash it with
+    "no such column: status". That index must live in migration 010 only.
+
+    Exercises the *real* startup path (initialize), not just _run_migrations —
+    the gap that let the bug ship.
+    """
+    conn = core_db.connect(tmp_path / "pre_v10.sqlite")
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta VALUES ('schema_version', '9');
+        CREATE TABLE procedures (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            steps TEXT NOT NULL DEFAULT '[]',
+            triggers TEXT NOT NULL DEFAULT '[]',
+            entities_involved TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    # Must not raise on the schema.sql pass, then migrate forward.
+    core_db.initialize(conn)
+
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+    assert "status" in _cols(conn, "procedures")
+    idx = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='index' AND name='idx_procedures_status'"
+    ).fetchone()
+    assert idx is not None, "migration 010 must create the status index"
+    conn.close()
+
+
 def test_legacy_v1_db_upgrades_and_gains_columns(tmp_path: Path):
     """A pre-migration (v1) database carrying only the original tables is
     walked forward to the latest version, picking up every additive column,
