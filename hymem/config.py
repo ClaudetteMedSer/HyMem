@@ -15,11 +15,25 @@ def _default_evidence_role_weights() -> dict[str, int]:
 
 
 def _default_predicate_half_life_days() -> dict[str, float]:
-    # Preference/avoidance predicates are sticky — a user's "prefers uv" holds
-    # long after the last mention — so they get a longer half-life than the
-    # global decay_window_days default. Volatile runtime predicates (uses,
-    # runs_on, deploys_to, ...) are absent here and fall back to the default.
-    return {"prefers": 90.0, "avoids": 90.0, "rejects": 90.0}
+    # Tiered eligibility windows for phase-3 decay. Longer = decays slower.
+    #   ~90d  preference/avoidance — a user's "prefers uv" holds long after the
+    #         last mention.
+    #   ~60d  structural / dependency — a dependency or composition rarely
+    #         changes without an explicit conversation, so it shouldn't accrue
+    #         soft-contradiction negatives and get retracted before it's
+    #         reinforced.
+    # Volatile runtime predicates (uses, runs_on, deploys_to, connects_to,
+    # configured_with, ...) are intentionally absent and fall back to the
+    # global decay_window_days.
+    return {
+        "prefers": 90.0,
+        "avoids": 90.0,
+        "rejects": 90.0,
+        "depends_on": 60.0,
+        "requires_version": 60.0,
+        "part_of": 60.0,
+        "implements": 60.0,
+    }
 
 
 @dataclass(frozen=True)
@@ -158,6 +172,14 @@ class HyMemConfig:
     similar to an existing active edge with the *same predicate* attaches its
     evidence to that edge instead of spawning a near-duplicate (e.g. `app uses
     uv` vs `app uses uv_pip`). Kept tight — only collapses genuine siblings."""
+
+    triple_dedup_lexical_ratio: float = 0.85
+    """Lexical-sibling guard for dedup, applied *in addition* to the cosine
+    threshold. A near-duplicate edge must also share its subject or object with
+    the candidate exactly, and the differing entity must be lexically similar —
+    share an underscore token, be a substring, or have a difflib ratio at least
+    this high. Stops false merges of short, embedding-close-but-distinct names
+    (`redis` vs `redash`) that the cosine gate alone would collapse."""
 
     procedure_stale_confidence_factor: float = 0.5
     """Multiplier applied to a procedure's `confidence` when

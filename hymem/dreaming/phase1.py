@@ -5,6 +5,7 @@ import logging
 import math
 import sqlite3
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 from hymem.config import HyMemConfig
 from hymem.dreaming import canonicalize
@@ -151,6 +152,22 @@ def _chunk_first_message_role(conn: sqlite3.Connection, chunk_id: str) -> str | 
     return row["role"] if row else None
 
 
+def _entities_are_siblings(a: str, b: str, ratio: float) -> bool:
+    """Lexical-sibling test for two canonical entity ids: share an underscore
+    token, one is a substring of the other, or their difflib ratio clears
+    `ratio`. Guards dedup against merging short, embedding-close-but-distinct
+    names like `redis` / `redash`."""
+    if a == b:
+        return True
+    a_tokens = {t for t in a.split("_") if len(t) >= 2}
+    b_tokens = {t for t in b.split("_") if len(t) >= 2}
+    if a_tokens & b_tokens:
+        return True
+    if a in b or b in a:
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= ratio
+
+
 def _find_near_duplicate_edge(
     conn: sqlite3.Connection,
     cfg: HyMemConfig,
@@ -159,42 +176,68 @@ def _find_near_duplicate_edge(
     predicate: str,
     obj_canon: str,
 ) -> int | None:
-    """Return the id of an existing active edge whose triple text is at least
-    ``cfg.triple_dedup_cosine_threshold`` cosine-similar to the candidate, or
-    None. Only same-predicate edges are considered — `uses` and `avoids`
-    triples embed close but mean the opposite, so the predicate is a hard gate.
+    """Return the id of an existing active edge that is a near-duplicate of the
+    candidate triple, or None. Three independent gates must all pass, so a
+    merge is conservative:
+
+      1. Predicate — must match exactly (`uses` and `avoids` embed close but
+         mean the opposite).
+      2. Structure — the existing edge must share the candidate's subject *or*
+         object exactly, so only the *other* endpoint varies (a sibling
+         canonical like `uv` / `uv_pip`, not a different fact).
+      3. Lexical + cosine — the varying endpoint must be a lexical sibling
+         (`_entities_are_siblings`) *and* the triple-text cosine must clear
+         `cfg.triple_dedup_cosine_threshold`. The lexical gate stops false
+         merges of short, embedding-close names the cosine gate alone misses.
 
     Reads cached vectors from ``edge_embeddings`` (populated by the post-phase3
     embed pass), so dedup fires against edges from prior cycles, not siblings
-    minted in the same cycle. The candidate is embedded only when there is at
-    least one same-predicate edge to compare against.
+    minted in the same cycle. The candidate is embedded only when at least one
+    structurally + lexically eligible edge exists to compare against.
     """
-    candidate_text = f"{subj_canon} {predicate} {obj_canon}"
     rows = conn.execute(
         """
-        SELECT kg.id AS edge_id,
-               kg.subject_canonical || ' ' || kg.predicate || ' '
-                   || kg.object_canonical AS edge_text,
+        SELECT kg.id AS edge_id, kg.subject_canonical AS s, kg.object_canonical AS o,
                e.vector_json AS vector_json
         FROM knowledge_graph kg
         JOIN edge_embeddings e
           ON e.edge_text = kg.subject_canonical || ' ' || kg.predicate || ' '
                            || kg.object_canonical
         WHERE kg.status = 'active' AND kg.predicate = ?
+          AND (kg.subject_canonical = ? OR kg.object_canonical = ?)
         ORDER BY kg.last_seen DESC
         LIMIT ?
         """,
-        (predicate, cfg.embedding_max_scan),
+        (predicate, subj_canon, obj_canon, cfg.embedding_max_scan),
     ).fetchall()
-    rows = [r for r in rows if r["edge_text"] != candidate_text]
-    if not rows:
+
+    eligible = []
+    for r in rows:
+        same_subj = r["s"] == subj_canon
+        same_obj = r["o"] == obj_canon
+        if same_subj and same_obj:
+            continue  # exact edge (shouldn't reach here — caller dedups new only)
+        # Exactly one endpoint varies; check that the varying one is a sibling.
+        if same_subj:
+            varying_ok = _entities_are_siblings(
+                obj_canon, r["o"], cfg.triple_dedup_lexical_ratio
+            )
+        else:
+            varying_ok = _entities_are_siblings(
+                subj_canon, r["s"], cfg.triple_dedup_lexical_ratio
+            )
+        if varying_ok:
+            eligible.append(r)
+
+    if not eligible:
         return None
 
+    candidate_text = f"{subj_canon} {predicate} {obj_canon}"
     qvec = embedder.embed([candidate_text])[0]
     qnorm = math.sqrt(sum(x * x for x in qvec)) or 1.0
     best_id: int | None = None
     best_sim = -1.0
-    for r in rows:
+    for r in eligible:
         try:
             vec = json.loads(r["vector_json"])
         except (json.JSONDecodeError, TypeError):

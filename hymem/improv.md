@@ -125,9 +125,12 @@ module (no CLI / service layer) and aligned with the
 - Tested by [tests/test_procedures.py](../tests/test_procedures.py).
 
 ### B. Predicate-aware decay rates  ✅
-- `HyMemConfig.predicate_half_life_days` maps sticky predicates
-  (`prefers`/`avoids`/`rejects` → 90d) to a longer eligibility window;
-  others fall back to `decay_window_days`.
+- `HyMemConfig.predicate_half_life_days` is a tiered map: ~90d for
+  preference predicates (`prefers`/`avoids`/`rejects`), ~60d for structural /
+  dependency predicates (`depends_on`/`requires_version`/`part_of`/
+  `implements`) so real dependencies don't decay before reinforcement, and a
+  fallback to `decay_window_days` (30d) for volatile runtime predicates
+  (`uses`/`runs_on`/`deploys_to`/...).
 - `phase3.decay` in [hymem/dreaming/phase3.py](dreaming/phase3.py) groups
   active edges by predicate and applies the per-predicate window to the
   negative-bump eligibility check (the recency probe stays global).
@@ -155,12 +158,17 @@ module (no CLI / service layer) and aligned with the
 
 ### E. Triple semantic dedup at extraction time  ✅
 - `_find_near_duplicate_edge` in [hymem/dreaming/phase1.py](dreaming/phase1.py):
-  before minting a new edge, the candidate triple text is embedded and
-  compared (cosine over cached `edge_embeddings`) against existing
-  *same-predicate* active edges. Within `cfg.triple_dedup_cosine_threshold`
-  (default 0.97) the new evidence is attached to the existing edge instead.
-  The predicate is a hard gate so `uses` / `avoids` never collapse. Gated on
-  `cfg.triple_dedup_enabled` and the presence of an embedding client.
+  before minting a new edge it looks for an existing near-duplicate to attach
+  evidence to. Three independent gates must all pass: (1) **predicate** matches
+  exactly (`uses` / `avoids` never collapse); (2) **structure** — the existing
+  edge shares the candidate's subject *or* object exactly, so only the other
+  endpoint varies (a sibling canonical, not a different fact); (3) **lexical +
+  cosine** — the varying endpoint is a lexical sibling
+  (`cfg.triple_dedup_lexical_ratio`, shared token / substring / difflib ratio)
+  *and* the triple-text cosine clears `cfg.triple_dedup_cosine_threshold`
+  (0.97). The lexical gate stops false merges of short, embedding-close names
+  (`redis` / `redash`). Gated on `cfg.triple_dedup_enabled` + an embedding
+  client.
 - Tested by [tests/test_dedup.py](../tests/test_dedup.py).
 
 ### F. Temporal / first-seen queries  ✅

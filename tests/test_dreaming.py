@@ -250,6 +250,22 @@ def test_phase3_decay_is_predicate_aware(hy):
     assert neg[("user", "uv")] == 0, "sticky 'prefers' edge should be protected"
 
 
+def test_phase3_depends_on_protected_longer_than_uses(hy):
+    """Structural `depends_on` (60d window) survives a re-mention at 40 days
+    while volatile `uses` (default 30d) decays — dependencies shouldn't accrue
+    soft-contradiction negatives before they're reinforced."""
+    conn = hy.conn
+    _seed_aged_edge_with_recent_mention(conn, "app", "depends_on", "redis", days_ago=40)
+    _seed_aged_edge_with_recent_mention(conn, "gateway", "uses", "kafka", days_ago=40)
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    neg = _neg_by_pair(conn)
+    assert neg[("app", "redis")] == 0, "depends_on should be protected at 40d"
+    assert neg[("gateway", "kafka")] >= 1, "uses should decay at 40d"
+
+
 def test_phase3_decay_falls_back_to_default_window(hy):
     """An empty predicate_half_life_days map collapses to the single global
     decay_window_days schedule — `prefers` then decays like any other edge."""

@@ -142,6 +142,42 @@ def test_predicate_gate_blocks_cross_predicate_dedup(cfg):
         hy.close()
 
 
+def test_lexical_guard_blocks_false_merge(cfg):
+    """Even at cosine 1.0, two short distinct names (`redis` / `redash`) must
+    NOT merge — the lexical-sibling guard rejects them."""
+    hy = HyMem(cfg)
+    try:
+        _seed_existing_edge(hy, "app", "uses", "redis", [1.0, 0.0, 0.0, 0.0])
+        chunk = _seed_chunk(hy)
+        embedder = FakeEmbedder({"app uses redash": [1.0, 0.0, 0.0, 0.0]})
+
+        _persist(hy, chunk, Triple("app", "uses", "redash", 1), embedder)
+
+        assert hy.conn.execute(
+            "SELECT COUNT(*) AS c FROM knowledge_graph WHERE object_canonical = 'redash'"
+        ).fetchone()["c"] == 1
+    finally:
+        hy.close()
+
+
+def test_different_subject_not_merged(cfg):
+    """Same predicate+object but a genuinely different subject is a different
+    fact, not a sibling canonical — no merge even at cosine 1.0."""
+    hy = HyMem(cfg)
+    try:
+        _seed_existing_edge(hy, "med_flow", "uses", "fastapi", [1.0, 0.0, 0.0, 0.0])
+        chunk = _seed_chunk(hy)
+        embedder = FakeEmbedder({"fractal uses fastapi": [1.0, 0.0, 0.0, 0.0]})
+
+        _persist(hy, chunk, Triple("fractal", "uses", "fastapi", 1), embedder)
+
+        assert hy.conn.execute(
+            "SELECT COUNT(*) AS c FROM knowledge_graph WHERE subject_canonical = 'fractal'"
+        ).fetchone()["c"] == 1
+    finally:
+        hy.close()
+
+
 def test_dedup_disabled_by_config(cfg):
     import dataclasses
 
