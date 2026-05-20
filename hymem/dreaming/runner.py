@@ -191,6 +191,7 @@ def run_dreaming(
                 with core_db.transaction(conn):
                     phase1.persist_chunk_results(
                         conn, chunk, extraction, prompt_version=cfg.prompt_version,
+                        cfg=cfg, embedding_client=embedding_client,
                     )
                 if extraction.triples or extraction.markers:
                     report.chunks_processed += 1
@@ -239,6 +240,7 @@ def run_dreaming(
                             phase1.persist_chunk_results(
                                 conn, chunk, extraction,
                                 prompt_version=cfg.prompt_version,
+                                cfg=cfg, embedding_client=embedding_client,
                             )
                         if extraction.triples or extraction.markers:
                             report.chunks_processed += 1

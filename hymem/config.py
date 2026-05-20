@@ -4,6 +4,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _default_evidence_role_weights() -> dict[str, int]:
+    # Weight a positive evidence row by the role of its chunk's first message.
+    # The chunker prefixes a user turn with the preceding assistant turn, so an
+    # assistant-prefixed chunk (the common case) keeps weight 1 — unchanged from
+    # the historical +1 — while a chunk the *user* opens (an unprompted, self-
+    # initiated assertion, not an agreement with possibly-confabulated assistant
+    # context) counts double. Roles absent from the map fall back to 1.
+    return {"user": 2}
+
+
+def _default_predicate_half_life_days() -> dict[str, float]:
+    # Preference/avoidance predicates are sticky — a user's "prefers uv" holds
+    # long after the last mention — so they get a longer half-life than the
+    # global decay_window_days default. Volatile runtime predicates (uses,
+    # runs_on, deploys_to, ...) are absent here and fall back to the default.
+    return {"prefers": 90.0, "avoids": 90.0, "rejects": 90.0}
+
+
 @dataclass(frozen=True)
 class HyMemConfig:
     root: Path
@@ -50,6 +68,16 @@ class HyMemConfig:
     decay_window_days: int = 30
     decay_factor: float = 0.9
     retract_threshold: float = 0.15
+
+    predicate_half_life_days: dict[str, float] = field(
+        default_factory=_default_predicate_half_life_days
+    )
+    """Per-predicate eligibility window (in days) for phase-3 decay. An active,
+    unreinforced edge is only considered for a negative-evidence bump once it
+    hasn't been reinforced for this many days. Sticky predicates (prefers /
+    avoids / rejects) use a longer window so they decay slower than volatile
+    runtime predicates. Predicates absent from the map fall back to
+    `decay_window_days`."""
 
     zombie_neg_threshold: int = 2
     """Negative-dominance offset in the auto-retract rule
@@ -110,6 +138,34 @@ class HyMemConfig:
     """A GraphFact with fewer than this many total evidence rows
     (pos + neg) is flagged `hedge_recommended` regardless of confidence —
     one early extraction shouldn't read as assertive context indefinitely."""
+
+    evidence_role_weights: dict[str, int] = field(
+        default_factory=_default_evidence_role_weights
+    )
+    """Per-role positive-evidence weight, keyed on the role of a chunk's first
+    message. Applied when a positive triple bumps `pos_evidence` (phase 1) and
+    when co-mention reinforcement fires (phase 3). Roles absent from the map use
+    weight 1, so the change is a no-op for assistant-prefixed chunks."""
+
+    triple_dedup_enabled: bool = True
+    """When True and an embedding client is available, a brand-new triple is
+    checked against existing same-predicate edges by vector similarity before a
+    new edge is created (see `triple_dedup_cosine_threshold`)."""
+
+    triple_dedup_cosine_threshold: float = 0.97
+    """Cosine-similarity cutoff for `triple_dedup_enabled`. A new
+    `(subject, predicate, object)` whose embedded triple text is at least this
+    similar to an existing active edge with the *same predicate* attaches its
+    evidence to that edge instead of spawning a near-duplicate (e.g. `app uses
+    uv` vs `app uses uv_pip`). Kept tight — only collapses genuine siblings."""
+
+    procedure_stale_confidence_factor: float = 0.5
+    """Multiplier applied to a procedure's `confidence` when
+    `mark_procedure_stale` flags it. The status flip already removes it from
+    `_procedure_search`; the confidence haircut records the negative signal so
+    a later re-extraction starts from a discounted prior rather than 1.0.
+    Procedures rot faster than triples — a stale runbook is actively
+    misleading — so the signal is retained even after the row is hidden."""
 
     @property
     def db_path(self) -> Path:

@@ -9,6 +9,17 @@ from hymem.core.db import backfill_entity_mentions
 log = logging.getLogger("hymem.dreaming.phase3")
 
 
+def _chunk_first_message_role(conn: sqlite3.Connection, chunk_id: str) -> str | None:
+    """Role of the chunk's first message — the author signal for speaker-
+    weighted reinforcement. None if the chunk or message is gone."""
+    row = conn.execute(
+        "SELECT m.role FROM chunks c JOIN messages m ON m.id = c.start_message_id "
+        "WHERE c.id = ?",
+        (chunk_id,),
+    ).fetchone()
+    return row["role"] if row else None
+
+
 def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
     """Co-occurrence-aware decay + negative-dominance retraction.
 
@@ -22,49 +33,67 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
     Stable facts in dormant topics are left alone.
     """
-    cutoff_arg = f"-{int(cfg.decay_window_days)} days"
+    default_window = int(cfg.decay_window_days)
+    # The recency probe ("was this topic discussed lately without reinforcing
+    # the edge?") stays on the global window; only an edge's *eligibility* for
+    # a negative bump is stretched per-predicate, so sticky predicates decay
+    # slower without becoming more sensitive to recent mentions.
+    mention_cutoff = f"-{default_window} days"
 
     # Catch chunks that exist but were never indexed (e.g. pre-upgrade DBs).
     backfill_entity_mentions(conn)
 
-    rows = conn.execute(
-        """
-        SELECT id, subject_canonical, object_canonical
-        FROM knowledge_graph
-        WHERE status = 'active'
-          AND derived = 0
-          AND (last_reinforced IS NULL OR last_reinforced < datetime('now', ?))
-        """,
-        (cutoff_arg,),
-    ).fetchall()
+    active_predicates = [
+        r["predicate"]
+        for r in conn.execute(
+            "SELECT DISTINCT predicate FROM knowledge_graph "
+            "WHERE status = 'active' AND derived = 0"
+        ).fetchall()
+    ]
 
-    for row in rows:
-        edge_id = row["id"]
-        subj = row["subject_canonical"]
-        obj = row["object_canonical"]
+    for predicate in active_predicates:
+        elig_window = int(cfg.predicate_half_life_days.get(predicate, default_window))
+        elig_cutoff = f"-{elig_window} days"
 
-        recent_mention = conn.execute(
+        rows = conn.execute(
             """
-            SELECT 1 FROM entity_mentions em
-            JOIN chunks c ON c.id = em.chunk_id
-            WHERE em.entity_canonical IN (?, ?)
-              AND c.created_at >= datetime('now', ?)
-              AND em.chunk_id NOT IN (
-                  SELECT chunk_id FROM kg_evidence WHERE edge_id = ?
-              )
-            LIMIT 1
+            SELECT id, subject_canonical, object_canonical
+            FROM knowledge_graph
+            WHERE status = 'active'
+              AND derived = 0
+              AND predicate = ?
+              AND (last_reinforced IS NULL OR last_reinforced < datetime('now', ?))
             """,
-            (subj, obj, cutoff_arg, edge_id),
-        ).fetchone()
+            (predicate, elig_cutoff),
+        ).fetchall()
 
-        if not recent_mention:
-            continue
+        for row in rows:
+            edge_id = row["id"]
+            subj = row["subject_canonical"]
+            obj = row["object_canonical"]
 
-        # Topic discussed without reinforcement → treat as soft contradiction.
-        conn.execute(
-            "UPDATE knowledge_graph SET neg_evidence = neg_evidence + 1 WHERE id = ?",
-            (edge_id,),
-        )
+            recent_mention = conn.execute(
+                """
+                SELECT 1 FROM entity_mentions em
+                JOIN chunks c ON c.id = em.chunk_id
+                WHERE em.entity_canonical IN (?, ?)
+                  AND c.created_at >= datetime('now', ?)
+                  AND em.chunk_id NOT IN (
+                      SELECT chunk_id FROM kg_evidence WHERE edge_id = ?
+                  )
+                LIMIT 1
+                """,
+                (subj, obj, mention_cutoff, edge_id),
+            ).fetchone()
+
+            if not recent_mention:
+                continue
+
+            # Topic discussed without reinforcement → treat as soft contradiction.
+            conn.execute(
+                "UPDATE knowledge_graph SET neg_evidence = neg_evidence + 1 WHERE id = ?",
+                (edge_id,),
+            )
 
     # Find every edge that will be retracted this pass — either by smoothed
     # confidence falling below the threshold, or by the negative-dominance
@@ -129,7 +158,7 @@ def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
         comention = conn.execute(
             """
-            SELECT 1
+            SELECT em_s.chunk_id AS chunk_id
             FROM entity_mentions em_s
             JOIN entity_mentions em_o
               ON em_s.chunk_id = em_o.chunk_id
@@ -148,12 +177,18 @@ def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         if not comention:
             continue
 
+        # Speaker-weighted reinforcement: a co-mention in a user-opened chunk
+        # counts more than one prefixed by (possibly confabulated) assistant
+        # context. Defaults to weight 1 for assistant-prefixed chunks.
+        role = _chunk_first_message_role(conn, comention["chunk_id"])
+        weight = cfg.evidence_role_weights.get(role, 1) if role else 1
+
         conn.execute(
             "UPDATE knowledge_graph "
-            "SET pos_evidence = pos_evidence + 1, "
+            "SET pos_evidence = pos_evidence + ?, "
             "    last_reinforced = CURRENT_TIMESTAMP "
             "WHERE id = ?",
-            (edge_id,),
+            (weight, edge_id),
         )
         bumped += 1
 

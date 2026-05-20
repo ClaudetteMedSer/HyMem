@@ -45,6 +45,10 @@ class EpisodeHit:
     score_kind: str = "bm25"
     """Source of the score: "bm25" (FTS only), "vec" (semantic only), or
     "rrf" (reciprocal-rank-fused FTS + vec)."""
+    why_retrieved: list[str] = field(default_factory=list)
+    """Short reason chips (e.g. `episode_fts("postgres pool")`,
+    `episode_rrf(fts+vec, 0.0240)`) mirroring `GraphFact.why_retrieved`, so a
+    consumer can quote why an episode surfaced instead of guessing."""
 
 
 @dataclass
@@ -54,6 +58,9 @@ class FtsHit:
     text: str
     score: float
     score_kind: str = "bm25"
+    why_retrieved: list[str] = field(default_factory=list)
+    """Short reason chips (e.g. `fts_match("postgres pool")`,
+    `vec_topk(sim=0.82)`, `rrf(fts+vec, 0.0240)`, `reranked`)."""
 
 
 @dataclass
@@ -64,6 +71,8 @@ class ProcedureHit:
     description: str
     steps: list[dict]
     score: float
+    why_retrieved: list[str] = field(default_factory=list)
+    """Short reason chips (e.g. `procedure_fts("deploy staging")`)."""
 
 
 @dataclass
@@ -133,6 +142,12 @@ def augment(
             llm=llm,
             cross_encoder_model=cfg.rerank_cross_encoder_model,
         )
+        # rerank() reorders via dataclasses.replace, preserving why_retrieved;
+        # tag the survivors so the chip trail shows the rerank step. New list
+        # per hit to avoid mutating the (shared) pre-rerank chip list.
+        for hit in ctx.fts_hits:
+            if hit.score_kind == "reranked":
+                hit.why_retrieved = [*hit.why_retrieved, "reranked"]
     else:
         log.debug("rerank.skipped")
         ctx.fts_hits = ctx.fts_hits[: cfg.fts_top_k]
@@ -239,12 +254,14 @@ def _fts_search(conn: sqlite3.Connection, query: str, *, top_k: int) -> list[Fts
     except sqlite3.OperationalError:
         return []
 
+    chip = f'fts_match("{" ".join(tokens)}")'
     return [
         FtsHit(
             chunk_id=r["chunk_id"],
             session_id=r["session_id"],
             text=r["text"],
             score=float(r["score"]),
+            why_retrieved=[chip],
         )
         for r in rows
     ]
@@ -284,12 +301,15 @@ def _vec_search(
             (chunk_rowid,),
         ).fetchone()
         if row:
+            sim = 1.0 / (1.0 + distance)
             result.append(
                 FtsHit(
                     chunk_id=row["chunk_id"],
                     session_id=row["session_id"],
                     text=row["text"],
-                    score=float(1.0 / (1.0 + distance)),
+                    score=float(sim),
+                    score_kind="vec",
+                    why_retrieved=[f"vec_topk(sim={sim:.3f})"],
                 )
             )
     return result
@@ -336,6 +356,8 @@ def _python_cosine_search(
             session_id=r["session_id"],
             text=r["text"],
             score=float(sim),
+            score_kind="vec",
+            why_retrieved=[f"vec_topk(sim={sim:.3f})"],
         )
         for sim, r in scored[:top_k]
     ]
@@ -347,6 +369,8 @@ def _rrf_merge(
     # Reciprocal rank fusion: score = sum(1 / (k + rank)) across each list.
     by_id: dict[str, FtsHit] = {}
     scores: dict[str, float] = {}
+    fts_ids = {h.chunk_id for h in fts}
+    vec_ids = {h.chunk_id for h in vec}
     for rank, hit in enumerate(fts, start=1):
         scores[hit.chunk_id] = scores.get(hit.chunk_id, 0.0) + 1.0 / (k + rank)
         by_id.setdefault(hit.chunk_id, hit)
@@ -356,9 +380,26 @@ def _rrf_merge(
 
     ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [
-        replace(by_id[cid], score=score, score_kind="rrf")
+        replace(
+            by_id[cid], score=score, score_kind="rrf",
+            why_retrieved=_rrf_chips(by_id[cid].why_retrieved, cid, fts_ids, vec_ids, score),
+        )
         for cid, score in ordered[:top_k]
     ]
+
+
+def _rrf_chips(
+    base: list[str], item_id: str, fts_ids: set[str], vec_ids: set[str], score: float
+) -> list[str]:
+    """Carry the kept hit's source chip (fts_match / vec_topk) and append a
+    fused `rrf(<sources>, <score>)` chip naming which lists contributed."""
+    if item_id in fts_ids and item_id in vec_ids:
+        sources = "fts+vec"
+    elif item_id in fts_ids:
+        sources = "fts"
+    else:
+        sources = "vec"
+    return [*base, f"rrf({sources}, {score:.4f})"]
 
 
 _EDGE_SELECT = """
@@ -670,6 +711,7 @@ def _episode_search(
         tokens = [t for t in cleaned.split() if len(t) >= 2]
         if tokens:
             fts_query = " OR ".join(f'"{t}"' for t in tokens)
+            episode_chip = f'episode_fts("{" ".join(tokens)}")'
             try:
                 rows = conn.execute(
                     """SELECT e.id, e.session_id, e.title, e.summary, bm25(episodes_fts) AS score
@@ -691,6 +733,7 @@ def _episode_search(
                         summary=r["summary"][:300],
                         score=float(r["score"]),
                         score_kind="bm25",
+                        why_retrieved=[episode_chip],
                     )
                 )
 
@@ -714,14 +757,16 @@ def _episode_search(
             ).fetchone()
             if r is None:
                 continue
+            sim = 1.0 / (1.0 + distance)
             vec_hits.append(
                 EpisodeHit(
                     episode_id=r["id"],
                     session_id=r["session_id"],
                     title=r["title"],
                     summary=r["summary"][:300],
-                    score=float(1.0 / (1.0 + distance)),
+                    score=float(sim),
                     score_kind="vec",
+                    why_retrieved=[f"episode_vec(sim={sim:.3f})"],
                 )
             )
 
@@ -749,11 +794,30 @@ def _rrf_merge_episodes(
     for rank, hit in enumerate(vec, start=1):
         scores[hit.episode_id] = scores.get(hit.episode_id, 0.0) + 1.0 / (k + rank)
         by_id.setdefault(hit.episode_id, hit)
+    fts_ids = {h.episode_id for h in fts}
+    vec_ids = {h.episode_id for h in vec}
     ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [
-        replace(by_id[eid], score=score, score_kind="rrf")
+        replace(
+            by_id[eid], score=score, score_kind="rrf",
+            why_retrieved=_episode_rrf_chips(
+                by_id[eid].why_retrieved, eid, fts_ids, vec_ids, score
+            ),
+        )
         for eid, score in ordered[:top_k]
     ]
+
+
+def _episode_rrf_chips(
+    base: list[str], item_id: str, fts_ids: set[str], vec_ids: set[str], score: float
+) -> list[str]:
+    if item_id in fts_ids and item_id in vec_ids:
+        sources = "fts+vec"
+    elif item_id in fts_ids:
+        sources = "fts"
+    else:
+        sources = "vec"
+    return [*base, f"episode_rrf({sources}, {score:.4f})"]
 
 
 def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[ProcedureHit]:
@@ -772,6 +836,7 @@ def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> l
                FROM procedures_fts
                JOIN procedures p ON p.rowid = procedures_fts.rowid
                WHERE procedures_fts MATCH ?
+                 AND p.status = 'active'
                ORDER BY score
                LIMIT ?""",
             (fts_query, top_k),
@@ -779,6 +844,7 @@ def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> l
     except sqlite3.OperationalError:
         return []
 
+    chip = f'procedure_fts("{" ".join(tokens)}")'
     result: list[ProcedureHit] = []
     for r in rows:
         try:
@@ -792,6 +858,7 @@ def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> l
             description=r["description"] or "",
             steps=steps,
             score=float(r["score"]),
+            why_retrieved=[chip],
         ))
     return result
 

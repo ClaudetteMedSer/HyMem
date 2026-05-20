@@ -113,63 +113,79 @@ These are the candidate next-round improvements, framed for HyMem-as-embedded-
 module (no CLI / service layer) and aligned with the
 2026-05 hardening initiative (operational ease, pip-install simplicity).
 
-### A. Procedural feedback loop  *(small)*
-Symmetric to 3a, but for procedures. When Hermes surfaces a procedure via
-`_procedure_search` and the user marks it as wrong / outdated (a new
-`mark_procedure_stale` API), record it and either downgrade `confidence`
-or skip it in future search. Procedures rot faster than declarative facts
-— a "deploy" runbook from six months ago may be actively misleading — so
-a confidence signal matters more here than for triples.
+### A. Procedural feedback loop  ✅
+- `procedures.status` column (`active`/`stale`) in
+  [hymem/core/schema.sql](core/schema.sql); migration `010` for old DBs.
+- `HyMem.mark_procedure_stale(procedure_id)` in
+  [hymem/api.py](api.py) flips status to `stale` and discounts `confidence`
+  by `cfg.procedure_stale_confidence_factor`. Idempotent, symmetric to
+  `retract_edge`.
+- `_procedure_search` in [hymem/query/augment.py](query/augment.py) filters
+  to `status = 'active'`, so stale procedures stop surfacing.
+- Tested by [tests/test_procedures.py](../tests/test_procedures.py).
 
-### B. Predicate-aware decay rates  *(small)*
-Phase 3 currently applies one decay schedule to all edges. `prefers` /
-`avoids` should decay slower than `uses` / `runs_on`, because preferences
-are stickier than runtime state. Add a small `predicate -> half_life_days`
-map to `HyMemConfig` and have `phase3.decay` consult it.
+### B. Predicate-aware decay rates  ✅
+- `HyMemConfig.predicate_half_life_days` maps sticky predicates
+  (`prefers`/`avoids`/`rejects` → 90d) to a longer eligibility window;
+  others fall back to `decay_window_days`.
+- `phase3.decay` in [hymem/dreaming/phase3.py](dreaming/phase3.py) groups
+  active edges by predicate and applies the per-predicate window to the
+  negative-bump eligibility check (the recency probe stays global).
+- Tested by [tests/test_dreaming.py](../tests/test_dreaming.py).
 
-### C. Schema migration runner  *(operational)*
-`schema_meta.schema_version` is set to `'1'` but no actual migration
-runner exists — the schema is forward-only via `CREATE TABLE IF NOT
-EXISTS`. As columns evolve (we've quietly added `summary`, `derived`,
-`value_*`, `temporal_scope` etc.), an out-of-date database will silently
-miss them. A small runner in `core/db.py` that compares
-`schema_version` and applies migration scripts under
-`hymem/core/migrations/` would harden upgrade paths — important for the
-pip-install path where users may carry old DBs forward.
+### C. Schema migration runner  ✅
+- Forward-only migrations now live as `NNN_*.sql` files under
+  [hymem/core/migrations/](core/migrations/); the runner in
+  [hymem/core/db.py](core/db.py) discovers them, applies any whose version
+  exceeds the DB's `schema_version` (statement-by-statement, tolerating
+  idempotency errors), and bumps the version. `schema.sql` stays the
+  fresh-DB baseline; `pyproject.toml` ships the `.sql` files in the wheel.
+- Tested by [tests/test_migrations.py](../tests/test_migrations.py).
 
-### D. Speaker-weighted evidence  *(medium)*
-Right now every chunk contributes equally to edge evidence. Triples
-extracted from user-authored chunks should carry more weight than ones
-from assistant turns (which can be confabulated). Plumb the role of the
-chunk's first message into `kg_evidence` and let phase 3 weight
-`pos_evidence` accordingly. Small schema change, modest extraction
-change, large quality win on noisy logs.
+### D. Speaker-weighted evidence  ✅
+- `kg_evidence.source_role` column in
+  [hymem/core/schema.sql](core/schema.sql); migration `011`.
+- `phase1.persist_chunk_results` records the role of the chunk's first
+  message and weights the positive `pos_evidence` bump by
+  `cfg.evidence_role_weights` (default `{"user": 2}`); `phase3.reinforce`
+  applies the same weight to co-mention reinforcement. Assistant-prefixed
+  chunks keep weight 1, so the change is a no-op for the common case and
+  boosts unprompted user-opened chunks.
+- Tested by [tests/test_speaker_weighting.py](../tests/test_speaker_weighting.py).
 
-### E. Triple semantic dedup at extraction time  *(medium)*
-We already have `edge_embeddings` keyed on triple text. Before inserting
-a new `(s, p, o)`, look up nearest existing edges by vector and, if one
-is within a tight cosine threshold, attach the new evidence to it
-instead of creating a near-duplicate. Bounds the unbounded growth of
-sibling canonicals like `"uv"` / `"uv_pip"` / `"uv_package_manager"`.
+### E. Triple semantic dedup at extraction time  ✅
+- `_find_near_duplicate_edge` in [hymem/dreaming/phase1.py](dreaming/phase1.py):
+  before minting a new edge, the candidate triple text is embedded and
+  compared (cosine over cached `edge_embeddings`) against existing
+  *same-predicate* active edges. Within `cfg.triple_dedup_cosine_threshold`
+  (default 0.97) the new evidence is attached to the existing edge instead.
+  The predicate is a hard gate so `uses` / `avoids` never collapse. Gated on
+  `cfg.triple_dedup_enabled` and the presence of an embedding client.
+- Tested by [tests/test_dedup.py](../tests/test_dedup.py).
 
-### F. Temporal / first-seen queries  *(small)*
-`knowledge_graph.first_seen` exists but nothing reads it. Expose
-`hy.timeline(entity)` returning the first-seen edge per predicate for an
-entity, so Hermes can answer "when did we start using Postgres?" without
-re-asking. Tiny API surface, no new schema.
+### F. Temporal / first-seen queries  ✅
+- `query.entities.timeline` + `HyMem.timeline(entity)` in
+  [hymem/api.py](api.py) return the first-seen active edge per predicate for
+  an entity (resolved through aliases), oldest first, reading
+  `knowledge_graph.first_seen`. No new schema.
+- Tested by [tests/test_timeline.py](../tests/test_timeline.py).
 
-### G. Memory export / import  *(operational)*
-A `hy.export(path)` that emits the canonical state as JSONL (sessions,
-chunks, edges, episodes, procedures, profile entries) and an `import`
-counterpart. Useful for backups, project-to-project migration, and giving
-external tools a stable inspection format. Stays in-process; no service
-layer required.
+### G. Memory export / import  ✅
+- [hymem/portability.py](portability.py) emits the canonical state as JSON
+  Lines (a `_meta` header then `{"type", "record"}` rows for sessions,
+  chunks, edges, episodes, procedures, profile entries). `HyMem.export(path)`
+  / `HyMem.import_(path)` in [hymem/api.py](api.py) wrap it. Import is
+  additive + idempotent (INSERT-OR-IGNORE, sessions first; autoincrement ids
+  dropped so they dedupe on natural keys) and keeps FTS shadow tables in sync.
+- Tested by [tests/test_portability.py](../tests/test_portability.py).
 
-### H. Retrieval explainability for FTS / episode / procedure hits  *(small)*
-`AugmentedContext.graph_facts` carries `why_retrieved`; FTS hits and
-episodes/procedures don't. Add a short reason chip
-(`fts_match("postgres pool")`, `vec_topk(rrf=0.024)`, `procedure_fts`) to
-each, so downstream prompts can quote the reason instead of guessing.
+### H. Retrieval explainability for FTS / episode / procedure hits  ✅
+- `FtsHit`, `EpisodeHit`, and `ProcedureHit` in
+  [hymem/query/augment.py](query/augment.py) now carry `why_retrieved` reason
+  chips, mirroring `GraphFact`: `fts_match("postgres deploy")`,
+  `vec_topk(sim=0.82)`, `rrf(fts+vec, 0.0240)`, `episode_fts(...)`,
+  `procedure_fts(...)`, and a `reranked` tag when the reranker reorders.
+- Tested by [tests/test_explainability.py](../tests/test_explainability.py).
 
 ### I. PII / secret redaction at chunk creation  *(security)*
 Chunks are stored verbatim. A small redactor in

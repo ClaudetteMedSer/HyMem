@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import sqlite3
 import struct
 from importlib.resources import files
@@ -11,7 +12,7 @@ from typing import Iterator
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 9
+EXPECTED_SCHEMA_VERSION = 11
 
 
 def _load_schema() -> str:
@@ -57,192 +58,91 @@ def initialize(conn: sqlite3.Connection) -> None:
     _run_migrations(conn)
 
 
-def _run_migrations(conn: sqlite3.Connection) -> None:
-    cur = schema_version(conn)
-    if cur < 2:
-        _migrate_v2(conn)
-    if cur < 3:
-        _migrate_v3(conn)
-    if cur < 4:
-        _migrate_v4(conn)
-    if cur < 5:
-        _migrate_v5(conn)
-    if cur < 6:
-        _migrate_v6(conn)
-    if cur < 7:
-        _migrate_v7(conn)
-    if cur < 8:
-        _migrate_v8(conn)
-    if cur < 9:
-        _migrate_v9(conn)
+_MIGRATION_NAME_RE = re.compile(r"^(\d+)")
+# Errors raised when a forward-only migration re-applies against a schema.sql
+# database that already has the object. Tolerated so migrations stay no-ops.
+_IDEMPOTENT_ERROR_MARKERS = ("duplicate column name", "already exists")
 
 
-def _migrate_v2(conn: sqlite3.Connection) -> None:
-    for col, col_type in [
-        ("value_text", "TEXT"),
-        ("value_numeric", "REAL"),
-        ("value_unit", "TEXT"),
-        ("temporal_scope", "TEXT"),
-    ]:
-        try:
-            conn.execute(
-                f"ALTER TABLE kg_evidence ADD COLUMN {col} {col_type}"
-            )
-        except sqlite3.OperationalError:
-            pass
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '2')"
-    )
-    log.info("migrated schema to v2 (numeric/temporal columns)")
+def _discover_migrations() -> list[tuple[int, object]]:
+    """Return (version, traversable) for every NNN_*.sql under migrations/,
+    sorted ascending by the leading integer."""
+    pkg = files("hymem.core.migrations")
+    found: list[tuple[int, object]] = []
+    for entry in pkg.iterdir():
+        name = entry.name
+        if not name.endswith(".sql"):
+            continue
+        match = _MIGRATION_NAME_RE.match(name)
+        if match is None:
+            continue
+        found.append((int(match.group(1)), entry))
+    found.sort(key=lambda item: item[0])
+    return found
 
 
-def _migrate_v3(conn: sqlite3.Connection) -> None:
-    try:
-        conn.execute("ALTER TABLE sessions ADD COLUMN summary TEXT")
-    except sqlite3.OperationalError:
-        pass
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3')"
-    )
-    log.info("migrated schema to v3 (session summary column)")
-
-
-def _migrate_v4(conn: sqlite3.Connection) -> None:
-    try:
-        conn.execute("ALTER TABLE knowledge_graph ADD COLUMN derived BOOLEAN NOT NULL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4')"
-    )
-    log.info("migrated schema to v4 (derived knowledge graph edges)")
-
-
-def _migrate_v5(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS extraction_feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
-            chunk_text_snippet TEXT NOT NULL,
-            extracted_subject TEXT NOT NULL,
-            extracted_predicate TEXT NOT NULL,
-            extracted_object TEXT NOT NULL,
-            feedback_type TEXT NOT NULL DEFAULT 'retracted',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-    try:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_feedback_created ON extraction_feedback(created_at)"
-        )
-    except sqlite3.OperationalError:
-        pass
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '5')"
-    )
-    log.info("migrated schema to v5 (extraction feedback table)")
-
-
-def _migrate_v6(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS edge_embeddings (
-            edge_text TEXT PRIMARY KEY,
-            vector_json TEXT NOT NULL,
-            model TEXT NOT NULL,
-            dim INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-    try:
-        conn.execute(
-            "ALTER TABLE dream_runs ADD COLUMN edges_embedded INTEGER NOT NULL DEFAULT 0"
-        )
-    except sqlite3.OperationalError:
-        pass
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6')"
-    )
-    log.info("migrated schema to v6 (edge embeddings table)")
-
-
-def _migrate_v8(conn: sqlite3.Connection) -> None:
-    """Add episode-level embeddings and a UPDATE-side FTS trigger for episodes.
-
-    Pre-v8 episodes use the per-LLM-call ordinal as their id (``{session}@{n}``)
-    and were INSERT-OR-IGNOREd, so a re-dream silently dropped changes. v8
-    pairs the new stable id format (``{session}@{start}-{end}``) with an
-    UPSERT in persist_episodes, but the existing INSERT/DELETE triggers on
-    ``episodes_fts`` don't cover the new UPDATE path — hence the extra trigger.
+def _split_sql_statements(script: str) -> list[str]:
+    """Split a migration script into individual statements, treating a
+    ``CREATE TRIGGER ... BEGIN ... END;`` block as one statement (its internal
+    semicolons must not split it). Full-line ``--`` comments are dropped.
     """
-    conn.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS episodes_fts_update AFTER UPDATE ON episodes BEGIN
-            INSERT INTO episodes_fts(episodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
-            INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
-        END
-        """
+    body = "\n".join(
+        line for line in script.splitlines() if not line.strip().startswith("--")
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS episode_embeddings (
-            episode_id TEXT PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
-            vector_json TEXT NOT NULL,
-            model TEXT NOT NULL,
-            dim INTEGER NOT NULL,
-            text_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '8')"
-    )
-    log.info("migrated schema to v8 (episode embeddings + FTS update trigger)")
+    parts = re.split(r"(\bBEGIN\b|\bEND\b|;)", body, flags=re.IGNORECASE)
+    statements: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for part in parts:
+        token = part.strip().lower()
+        if token == "begin":
+            depth += 1
+            buf.append(part)
+        elif token == "end":
+            depth = max(0, depth - 1)
+            buf.append(part)
+        elif part == ";" and depth == 0:
+            buf.append(part)
+            stmt = "".join(buf).strip()
+            if stmt:
+                statements.append(stmt)
+            buf = []
+        else:
+            buf.append(part)
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
 
 
-def _migrate_v9(conn: sqlite3.Connection) -> None:
-    """Add entity_properties table for key/value attributes per canonical entity."""
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS entity_properties (
-            entity_canonical TEXT NOT NULL,
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            source_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (entity_canonical, key)
-        )
-        """
-    )
-    with contextlib.suppress(sqlite3.OperationalError):
+def _apply_migration_sql(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a migration script statement-by-statement, tolerating the
+    idempotency errors a forward-only migration raises on an up-to-date DB
+    (duplicate column / object already exists)."""
+    for stmt in _split_sql_statements(script):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            if any(m in str(exc).lower() for m in _IDEMPOTENT_ERROR_MARKERS):
+                continue
+            raise
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Apply every migration file whose version exceeds the DB's
+    schema_version, bumping schema_version after each so an interrupted run
+    resumes cleanly. Migrations are idempotent, so a fresh schema.sql database
+    (which starts at version 1) runs them all as no-ops up to the latest."""
+    cur = schema_version(conn)
+    for version, entry in _discover_migrations():
+        if version <= cur:
+            continue
+        _apply_migration_sql(conn, entry.read_text(encoding="utf-8"))
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_entity_properties_key ON entity_properties(key)"
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+            (str(version),),
         )
-    with contextlib.suppress(sqlite3.OperationalError):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_entity_properties_value ON entity_properties(value)"
-        )
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '9')"
-    )
-    log.info("migrated schema to v9 (entity_properties table)")
-
-
-def _migrate_v7(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS token_overlap_index (
-            token TEXT NOT NULL,
-            canonical TEXT NOT NULL,
-            PRIMARY KEY (token, canonical)
-        )""")
-    try:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_token_overlap_token ON token_overlap_index(token)"
-        )
-    except sqlite3.OperationalError:
-        pass
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '7')"
-    )
-    log.info("migrated schema to v7 (token overlap index table)")
+        log.info("migrated schema to v%d (%s)", version, entry.name)
 
 
 _VEC_TABLES = frozenset({"vec_chunks", "vec_edges", "vec_episodes"})

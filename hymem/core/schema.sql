@@ -1,4 +1,7 @@
--- HyMem schema. All migrations are forward-only; bump schema_version below.
+-- HyMem schema for a fresh database. Forward-only upgrades for existing DBs
+-- live as NNN_*.sql files under hymem/core/migrations/, applied by the runner
+-- in db.py. Keep this file and the migrations in sync: a column added here must
+-- also have a migration so old databases pick it up.
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
@@ -174,6 +177,7 @@ CREATE TABLE IF NOT EXISTS kg_evidence (
     value_numeric REAL,
     value_unit TEXT,
     temporal_scope TEXT,
+    source_role TEXT,
     extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(edge_id, chunk_id, polarity)
 );
@@ -276,10 +280,12 @@ CREATE TABLE IF NOT EXISTS procedures (
     triggers TEXT NOT NULL DEFAULT '[]',
     entities_involved TEXT NOT NULL DEFAULT '[]',
     confidence REAL NOT NULL DEFAULT 1.0,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','stale')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);
 CREATE INDEX IF NOT EXISTS idx_procedures_entities ON procedures(entities_involved);
+CREATE INDEX IF NOT EXISTS idx_procedures_status ON procedures(status);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS procedures_fts USING fts5(
     name, description, steps,

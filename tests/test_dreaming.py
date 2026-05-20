@@ -193,3 +193,74 @@ def test_phase3_retraction_feedback_falls_back_to_negative_evidence(hy):
     assert row["extracted_object"] == "pid_77"
     assert row["feedback_type"] == "retracted"
     assert "pid_77" in row["chunk_text_snippet"]
+
+
+# --- predicate-aware decay (Feature B) -------------------------------------
+
+
+def _seed_aged_edge_with_recent_mention(conn, subject, predicate, obj, days_ago):
+    """Seed an active edge last reinforced `days_ago` days ago plus a fresh
+    chunk that mentions both endpoints (without producing kg_evidence), so the
+    decay recency probe sees a re-mention."""
+    conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('s_pred')")
+    chunk_id = f"c_{subject}_{obj}"
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES (?, 's_pred', 1, 1, 'long_user_turn', "
+        "'still discussing it today')",
+        (chunk_id,),
+    )
+    for ent in (subject, obj):
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_mentions(chunk_id, entity_canonical) "
+            "VALUES (?, ?)",
+            (chunk_id, ent),
+        )
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES (?, ?, ?, 5, 0, datetime('now', ?))",
+        (subject, predicate, obj, f"-{days_ago} days"),
+    )
+
+
+def _neg_by_pair(conn):
+    return {
+        (r["subject_canonical"], r["object_canonical"]): r["neg_evidence"]
+        for r in conn.execute(
+            "SELECT subject_canonical, object_canonical, neg_evidence "
+            "FROM knowledge_graph"
+        ).fetchall()
+    }
+
+
+def test_phase3_decay_is_predicate_aware(hy):
+    """With both edges reinforced 60 days ago and re-mentioned now, the
+    volatile `uses` edge (30-day window) accrues a negative while the sticky
+    `prefers` edge (90-day window) stays protected."""
+    conn = hy.conn
+    _seed_aged_edge_with_recent_mention(conn, "user", "prefers", "uv", days_ago=60)
+    _seed_aged_edge_with_recent_mention(conn, "gateway", "uses", "ruff", days_ago=60)
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    neg = _neg_by_pair(conn)
+    assert neg[("gateway", "ruff")] >= 1, "volatile 'uses' edge should decay"
+    assert neg[("user", "uv")] == 0, "sticky 'prefers' edge should be protected"
+
+
+def test_phase3_decay_falls_back_to_default_window(hy):
+    """An empty predicate_half_life_days map collapses to the single global
+    decay_window_days schedule — `prefers` then decays like any other edge."""
+    import dataclasses
+
+    conn = hy.conn
+    _seed_aged_edge_with_recent_mention(conn, "user", "prefers", "uv", days_ago=60)
+
+    cfg = dataclasses.replace(hy.config, predicate_half_life_days={})
+    from hymem.dreaming.phase3 import decay
+    decay(conn, cfg)
+
+    neg = _neg_by_pair(conn)
+    assert neg[("user", "uv")] >= 1, "with no per-predicate window, prefers decays"
