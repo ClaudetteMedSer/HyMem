@@ -143,7 +143,18 @@ module (no CLI / service layer) and aligned with the
   exceeds the DB's `schema_version` (statement-by-statement, tolerating
   idempotency errors), and bumps the version. `schema.sql` stays the
   fresh-DB baseline; `pyproject.toml` ships the `.sql` files in the wheel.
-- Tested by [tests/test_migrations.py](../tests/test_migrations.py).
+- **Gotcha (learned the hard way):** `initialize()` runs `schema.sql` via
+  `executescript()` *before* migrations. On an existing DB, `CREATE TABLE IF
+  NOT EXISTS` is a no-op, so any **standalone** statement in `schema.sql` that
+  references a migration-added column (a `CREATE INDEX`, a separate `ALTER`,
+  …) crashes with "no such column". Such index/constraint statements must
+  live in the migration file ONLY; the column may still sit in the
+  `CREATE TABLE` (no-op on old DBs). This bit `idx_procedures_status` and is
+  now documented in `schema.sql`.
+- Tested by [tests/test_migrations.py](../tests/test_migrations.py) — including
+  a regression test that drives the real `initialize()` path against a
+  pre-v10 DB (not just `_run_migrations` in isolation, the gap that let the
+  index bug ship).
 
 ### D. Speaker-weighted evidence  ✅
 - `kg_evidence.source_role` column in
@@ -194,6 +205,8 @@ module (no CLI / service layer) and aligned with the
   `vec_topk(sim=0.82)`, `rrf(fts+vec, 0.0240)`, `episode_fts(...)`,
   `procedure_fts(...)`, and a `reranked` tag when the reranker reorders.
 - Tested by [tests/test_explainability.py](../tests/test_explainability.py).
+- **Not yet surfaced downstream:** the chips live on the Python hit objects
+  only — they don't reach the Honcho API response. See item L below.
 
 ### I. PII / secret redaction at chunk creation  *(security)*
 Chunks are stored verbatim. A small redactor in
@@ -215,3 +228,14 @@ scope. Add a small test that seeds a Dutch chunk ("we gebruiken Postgres
 voor de gebruikersdienst") and asserts canonicalization treats
 `postgres` the same as it would for the English equivalent. Likely
 already correct; just unverified.
+
+### L. Surface why_retrieved chips through the Honcho API  *(small)*
+Item H added `why_retrieved` reason chips to `FtsHit` / `EpisodeHit` /
+`ProcedureHit`, but they live on the Python hit objects only — they don't
+reach the Honcho API response, so an external (non-in-process) consumer still
+can't see *why* a hit surfaced. Plumb the chips into the Honcho
+`get_context` / search response shape in `hymem/honcho/` (adapters + models)
+so downstream consumers can quote the reason instead of guessing. Focused
+change: thread the field through the response serialization plus a contract
+test asserting the chips round-trip. Mirrors how `GraphFact.why_retrieved`
+should also be exposed there.
