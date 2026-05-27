@@ -53,11 +53,17 @@ def extract_session_summary(
         response_format="text",
     )
     raw = llm.complete(request)
-    summary = raw.strip().strip('"').strip("'")
+    return clean_summary(raw)
 
+
+def clean_summary(raw: str | None) -> str | None:
+    """Normalize a raw LLM summary string. Returns None when empty or too short
+    to be useful. Shared by the standalone summary call and the session digest."""
+    if not raw:
+        return None
+    summary = raw.strip().strip('"').strip("'")
     if not summary or len(summary) < 10:
         return None
-
     return summary[:500]
 
 

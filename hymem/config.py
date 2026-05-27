@@ -118,6 +118,15 @@ class HyMemConfig:
     non-salience-marked chunks (newest first) per cycle. Guarantees every chunk
     eventually flows through extraction even if it didn't trip the regexes."""
 
+    dream_digest_max_tokens: int = 3072
+    """max_tokens for the batched per-session digest call (episodes + summary +
+    procedures in one JSON object). Larger than the 1024 LLMRequest default
+    because the combined output is roughly three responses' worth."""
+
+    dream_digest_max_chars: int = 12000
+    """Char cap on the session text fed to the digest call (the larger of the
+    pre-batching episode/procedure caps)."""
+
     max_chunks: int = 50000
     """Soft cap on total stored chunks. Excess unreferenced chunks are pruned."""
 

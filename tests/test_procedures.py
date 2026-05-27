@@ -27,12 +27,13 @@ from hymem.extraction.llm import StubLLMClient
 
 
 def _procedure_llm(items: list[dict]) -> StubLLMClient:
-    """Stub that returns ``items`` for the procedure-extraction prompt and an
-    empty array for every other extraction call (triples, markers, episodes,
-    session-summary). Substring keyed on the unique opener of
-    `PROCEDURE_SYSTEM`."""
+    """Stub that returns ``items`` as the procedures section of the batched
+    session-digest response (episodes/summary empty), and an empty array for
+    every other extraction call (triples, markers). Keyed on the unique digest
+    user-prompt closer ``Return the JSON object now``."""
+    digest = {"episodes": [], "summary": "", "procedures": items}
     return StubLLMClient(
-        fixtures={"step-by-step procedures": json.dumps(items)},
+        fixtures={"Return the JSON object now": json.dumps(digest)},
         default="[]",
     )
 

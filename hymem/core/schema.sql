@@ -25,7 +25,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     ended_at TIMESTAMP,
-    summary TEXT
+    summary TEXT,
+    -- prompt_version of the last successful session digest (episodes+summary
+    -- +procedures). The dream runner skips the per-session digest LLM call when
+    -- this matches the current prompt_version and no chunk was re-extracted.
+    -- Migration 012 adds this for existing DBs (ALTER lives there only).
+    digested_prompt_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (

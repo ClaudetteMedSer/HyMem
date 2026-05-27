@@ -24,13 +24,27 @@ from hymem.extraction.llm import StubLLMClient
 
 
 def _episode_llm_response(items: list[dict]) -> StubLLMClient:
-    """Stub that returns the given items for the episode-extraction prompt
-    and an empty array for everything else (so triples/markers/summaries/
-    procedures all no-op)."""
+    """Stub that returns the given items as the episodes section of the batched
+    session-digest response (summary/procedures empty), and an empty array for
+    everything else (so triples/markers no-op). Keyed on the unique digest
+    user-prompt closer ``Return the JSON object now``."""
+    digest = {"episodes": items, "summary": "", "procedures": []}
     return StubLLMClient(
-        fixtures={"identify distinct episodes": json.dumps(items)},
+        fixtures={"Return the JSON object now": json.dumps(digest)},
         default="[]",
     )
+
+
+def _force_redigest(hy: HyMem, sid: str) -> None:
+    """Clear the per-session digest marker so the next ``dream()`` re-runs the
+    batched digest. The runner otherwise skips the digest for a session already
+    digested under the current prompt_version with no newly-extracted chunks;
+    these tests materialize chunks in a first dream, then re-dream to drive the
+    episode-returning stub, which is exactly that skip case."""
+    with hy.conn:
+        hy.conn.execute(
+            "UPDATE sessions SET digested_prompt_version = NULL WHERE id = ?", (sid,)
+        )
 
 
 def _seed_session_with_chunks(hy: HyMem, sid: str, turns: list[tuple[str, str]]) -> None:
@@ -59,17 +73,22 @@ def test_persist_episodes_populates_message_range_and_participants(cfg):
     chunk_ids: list[str] = []
 
     def llm_factory():
-        # Return one episode covering every emitted chunk.
+        # Return one episode covering every emitted chunk, as the episodes
+        # section of the batched session-digest response.
         return StubLLMClient(
-            fixtures={"identify distinct episodes": json.dumps([
-                {
-                    "title": "Postgres pool tuning",
-                    "summary": "Diagnosed pool exhaustion and decided to bump pool_size plus inspect the slow query log.",
-                    "outcome": "resolved",
-                    "key_entities": ["postgres", "pool_size", "slow_query_log"],
-                    "chunk_ids": chunk_ids,  # filled in below
-                }
-            ])}, default="[]",
+            fixtures={"Return the JSON object now": json.dumps({
+                "episodes": [
+                    {
+                        "title": "Postgres pool tuning",
+                        "summary": "Diagnosed pool exhaustion and decided to bump pool_size plus inspect the slow query log.",
+                        "outcome": "resolved",
+                        "key_entities": ["postgres", "pool_size", "slow_query_log"],
+                        "chunk_ids": chunk_ids,  # filled in below
+                    }
+                ],
+                "summary": "",
+                "procedures": [],
+            })}, default="[]",
         )
 
     hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
@@ -86,6 +105,7 @@ def test_persist_episodes_populates_message_range_and_participants(cfg):
         assert rows, "expected at least one chunk to be persisted"
         chunk_ids[:] = [r["id"] for r in rows]
         hy.set_llm(llm_factory())
+        _force_redigest(hy, sid)
         hy.dream()
 
         ep = hy.conn.execute(
@@ -190,6 +210,7 @@ def test_episode_id_is_stable_across_redreams(cfg):
                 "chunk_ids": chunk_ids,
             }
         ]))
+        _force_redigest(hy, sid)
         hy.dream()
         rows1 = hy.conn.execute(
             "SELECT id, title FROM episodes WHERE session_id = ?", (sid,)
@@ -210,6 +231,7 @@ def test_episode_id_is_stable_across_redreams(cfg):
                 "chunk_ids": chunk_ids,
             }
         ]))
+        _force_redigest(hy, sid)
         hy.dream()
         rows2 = hy.conn.execute(
             "SELECT id, title, summary FROM episodes WHERE session_id = ?", (sid,)
@@ -261,6 +283,7 @@ def test_dream_populates_episode_embeddings_and_vec(cfg):
                 "chunk_ids": chunk_ids,
             }
         ]))
+        _force_redigest(hy, sid)
         report = hy.dream()
 
         assert report.episodes_embedded >= 1
@@ -301,6 +324,7 @@ def test_episode_embedding_refreshes_after_upsert(cfg):
             {"title": "Graph store pick", "summary": "Picked dgraph over neo4j.",
              "outcome": "resolved", "key_entities": ["dgraph"], "chunk_ids": chunk_ids},
         ]))
+        _force_redigest(hy, sid)
         hy.dream()
         first_hash = hy.conn.execute(
             "SELECT text_hash FROM episode_embeddings"
@@ -311,6 +335,7 @@ def test_episode_embedding_refreshes_after_upsert(cfg):
             {"title": "Graph store pick", "summary": "Picked dgraph for its sharding story.",
              "outcome": "resolved", "key_entities": ["dgraph", "sharding"], "chunk_ids": chunk_ids},
         ]))
+        _force_redigest(hy, sid)
         report = hy.dream()
         assert report.episodes_embedded >= 1
 
@@ -348,12 +373,16 @@ def test_episode_embedding_idempotent_when_unchanged(cfg):
             "chunk_ids": chunk_ids,
         }]
         hy.set_llm(_episode_llm_response(ep_payload))
+        _force_redigest(hy, sid)
         report1 = hy.dream()
         assert report1.episodes_embedded == 1
 
         # Same content → fetch_episode_embeddings sees matching text_hash
-        # for the only episode → returns None → no embed.
+        # for the only episode → returns None → no embed. We force the digest
+        # to re-run so this exercises embedding idempotency (matching text_hash),
+        # not just the per-session digest skip-guard.
         hy.set_llm(_episode_llm_response(ep_payload))
+        _force_redigest(hy, sid)
         report2 = hy.dream()
         assert report2.episodes_embedded == 0
     finally:
@@ -391,6 +420,7 @@ def test_episode_semantic_search_surfaces_topic_match(cfg):
              "outcome": "resolved", "key_entities": ["statsd", "opentelemetry"],
              "chunk_ids": chunk_ids},
         ]))
+        _force_redigest(hy, sid)
         hy.dream()
 
         # Query exactly matches embed_text (title + "\n" + summary).

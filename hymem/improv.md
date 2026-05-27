@@ -239,3 +239,27 @@ so downstream consumers can quote the reason instead of guessing. Focused
 change: thread the field through the response serialization plus a contract
 test asserting the chips round-trip. Mirrors how `GraphFact.why_retrieved`
 should also be exposed there.
+
+### M. Batched per-session digest + skip-guard  ✅
+- The dream cycle's per-session tail used to make **three** LLM calls
+  (episodes, summary, procedures), each re-reading nearly the same session
+  text. [hymem/dreaming/digest.py](dreaming/digest.py) `extract_session_digest`
+  now produces all three in **one** call returning a single JSON object,
+  driven by `SESSION_DIGEST_SYSTEM` in
+  [hymem/extraction/prompts/__init__.py](extraction/prompts/__init__.py). The
+  per-kind validators were extracted into reusable helpers
+  (`validate_episode_items` / `validate_procedure_items` / `clean_summary`) so
+  the standalone `extract_*_for_session` functions and the batched path share
+  identical logic. Knobs: `dream_digest_max_tokens` (3072),
+  `dream_digest_max_chars` (12000) in [hymem/config.py](config.py).
+- **Skip-guard:** `sessions.digested_prompt_version` (migration `012`) records
+  the prompt_version of the last successful digest. The runner
+  ([hymem/dreaming/runner.py](dreaming/runner.py)) skips the digest call
+  entirely when this matches the current prompt_version *and* no chunk was
+  freshly extracted this run — so steady-state re-dreams of unchanged sessions
+  cost **zero** tail calls. The marker is set only after a successful persist,
+  so a failed call retries next run; a prompt_version bump or new chunks force
+  a re-digest. Operator-curated summaries are preserved (never overwritten).
+- Tested by [tests/test_digest.py](../tests/test_digest.py); the existing
+  episode/summary/procedure dream-level tests were migrated to the digest-shaped
+  stub.

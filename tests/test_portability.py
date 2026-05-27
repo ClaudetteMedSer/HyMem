@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 from hymem import HyMem, HyMemConfig
+from hymem.core import db as core_db
 
 _EXPECTED = {
     "session": 1, "chunk": 1, "episode": 1,
@@ -74,7 +75,7 @@ def test_export_writes_meta_header(tmp_path):
     meta = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
     assert meta["type"] == "_meta"
     assert meta["format"] == "hymem-jsonl"
-    assert meta["schema_version"] == 11
+    assert meta["schema_version"] == core_db.EXPECTED_SCHEMA_VERSION
     hy.close()
 
 

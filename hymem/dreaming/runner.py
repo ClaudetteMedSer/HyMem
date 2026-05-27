@@ -29,8 +29,9 @@ from hymem.dreaming.embeddings import (
     persist_episode_embeddings,
     prepare_chunk_embed_batch,
 )
-from hymem.dreaming.episodes import extract_episodes_for_session, persist_episodes
-from hymem.dreaming.procedures import extract_procedures_for_session, persist_procedures
+from hymem.dreaming.digest import extract_session_digest
+from hymem.dreaming.episodes import persist_episodes
+from hymem.dreaming.procedures import persist_procedures
 from hymem.dreaming.mentions import index_chunk_mentions
 from hymem.dreaming.retention import (
     prune_bookkeeping,
@@ -39,7 +40,7 @@ from hymem.dreaming.retention import (
     prune_messages,
     prune_retracted_edges,
 )
-from hymem.dreaming.summary import extract_session_summary, persist_session_summary
+from hymem.dreaming.summary import persist_session_summary
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 
@@ -158,6 +159,10 @@ def run_dreaming(
 
         for session_id in target_sessions:
             report.sessions_processed += 1
+            # True once any chunk in this session is freshly extracted this run.
+            # Drives the digest skip-guard: an unchanged, already-digested session
+            # makes zero tail LLM calls.
+            had_new_chunk_work = False
             chunks = extract_high_salience_chunks(
                 conn, session_id, min_chars=cfg.salience_min_chars
             )
@@ -194,6 +199,7 @@ def run_dreaming(
                     continue
                 if extraction is None:
                     continue
+                had_new_chunk_work = True
                 with core_db.transaction(conn):
                     phase1.persist_chunk_results(
                         conn, chunk, extraction, prompt_version=cfg.prompt_version,
@@ -242,6 +248,7 @@ def run_dreaming(
                             continue
                         if extraction is None:
                             continue
+                        had_new_chunk_work = True
                         with core_db.transaction(conn):
                             phase1.persist_chunk_results(
                                 conn, chunk, extraction,
@@ -259,35 +266,55 @@ def run_dreaming(
             if not chunks and not baseline:
                 continue
 
-            try:
-                episodes_ext = extract_episodes_for_session(conn, session_id, llm)
-            except Exception:
-                log.exception("episodes.extraction_failure session_id=%s", session_id)
-            else:
-                if episodes_ext is not None and episodes_ext.items:
-                    with core_db.transaction(conn):
-                        count = persist_episodes(conn, session_id, episodes_ext)
-                    log.debug("episodes session_id=%s count=%d", session_id, count)
-
-            try:
-                summary = extract_session_summary(conn, session_id, llm)
-            except Exception:
-                log.exception("summary.failure session_id=%s", session_id)
-            else:
-                if summary:
-                    with core_db.transaction(conn):
-                        persist_session_summary(conn, session_id, summary)
-                    log.debug("summary session_id=%s", session_id)
-
-            try:
-                procedures_ext = extract_procedures_for_session(conn, session_id, llm)
-            except Exception:
-                log.exception("procedures.extraction_failure session_id=%s", session_id)
-            else:
-                if procedures_ext is not None and procedures_ext.items:
-                    with core_db.transaction(conn):
-                        count = persist_procedures(conn, session_id, procedures_ext)
-                    log.debug("procedures session_id=%s count=%d", session_id, count)
+            # Per-session digest: one LLM call producing episodes + summary +
+            # procedures together (replaces three separate calls). Skip it
+            # entirely when this session was already digested under the current
+            # prompt_version and no chunk was re-extracted this run, so
+            # steady-state re-dreams of unchanged sessions cost zero tail calls.
+            digested = conn.execute(
+                "SELECT summary, digested_prompt_version FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            already_digested = (
+                digested is not None
+                and digested["digested_prompt_version"] == cfg.prompt_version
+            )
+            has_summary = digested is not None and bool(digested["summary"])
+            if not (already_digested and not had_new_chunk_work):
+                try:
+                    digest = extract_session_digest(
+                        conn, session_id, llm,
+                        max_tokens=cfg.dream_digest_max_tokens,
+                        max_chars=cfg.dream_digest_max_chars,
+                    )
+                except Exception:
+                    log.exception("digest.extraction_failure session_id=%s", session_id)
+                else:
+                    if digest is not None:
+                        with core_db.transaction(conn):
+                            if digest.episodes.items:
+                                ep_count = persist_episodes(conn, session_id, digest.episodes)
+                                log.debug(
+                                    "episodes session_id=%s count=%d", session_id, ep_count
+                                )
+                            # Don't overwrite an existing (possibly operator-curated)
+                            # summary — matches the old extract_session_summary guard.
+                            if digest.summary and not has_summary:
+                                persist_session_summary(conn, session_id, digest.summary)
+                                log.debug("summary session_id=%s", session_id)
+                            if digest.procedures.items:
+                                pr_count = persist_procedures(
+                                    conn, session_id, digest.procedures
+                                )
+                                log.debug(
+                                    "procedures session_id=%s count=%d", session_id, pr_count
+                                )
+                            # Mark digested only after a successful persist, so a
+                            # failed call leaves the marker unset and retries next run.
+                            conn.execute(
+                                "UPDATE sessions SET digested_prompt_version = ? WHERE id = ?",
+                                (cfg.prompt_version, session_id),
+                            )
 
             if chunks_remaining <= 0:
                 report.budget_exhausted = True
