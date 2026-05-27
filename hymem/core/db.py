@@ -10,6 +10,8 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Iterator
 
+from hymem.core.vectors import decode_vector
+
 log = logging.getLogger("hymem.core.db")
 
 EXPECTED_SCHEMA_VERSION = 11
@@ -214,8 +216,8 @@ def _backfill_vec(conn: sqlite3.Connection, dim: int) -> None:
 
     for r in rows:
         try:
-            vec = json.loads(r["vector_json"])
-        except (json.JSONDecodeError, TypeError):
+            vec = decode_vector(r["vector_json"])
+        except (json.JSONDecodeError, TypeError, ValueError):
             continue
         if len(vec) != dim:
             vec = list(vec) + [0.0] * (dim - len(vec))
@@ -254,8 +256,8 @@ def _backfill_vec_edges(conn: sqlite3.Connection, dim: int) -> None:
         if emb is None:
             continue
         try:
-            vec = json.loads(emb["vector_json"])
-        except (json.JSONDecodeError, TypeError):
+            vec = decode_vector(emb["vector_json"])
+        except (json.JSONDecodeError, TypeError, ValueError):
             continue
         if len(vec) != dim:
             vec = list(vec) + [0.0] * (dim - len(vec))
@@ -287,8 +289,8 @@ def _backfill_vec_episodes(conn: sqlite3.Connection, dim: int) -> None:
         if rowid is None:
             continue
         try:
-            vec = json.loads(r["vector_json"])
-        except (json.JSONDecodeError, TypeError):
+            vec = decode_vector(r["vector_json"])
+        except (json.JSONDecodeError, TypeError, ValueError):
             continue
         if len(vec) != dim:
             vec = list(vec) + [0.0] * (dim - len(vec))

@@ -8,6 +8,7 @@ import sqlite3
 from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
+from hymem.core.vectors import decode_vector
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.entities import match_known_entities
@@ -341,7 +342,7 @@ def _python_cosine_search(
 
     scored: list[tuple[float, sqlite3.Row]] = []
     for r in rows:
-        vec = json.loads(r["vector_json"])
+        vec = decode_vector(r["vector_json"])
         if len(vec) != len(qvec):
             continue
         dot = sum(a * b for a, b in zip(qvec, vec))
@@ -677,7 +678,7 @@ def _python_cosine_edge_search(
 
     scored: list[tuple[float, int]] = []
     for r in rows:
-        vec = json.loads(r["vector_json"])
+        vec = decode_vector(r["vector_json"])
         if len(vec) != len(qvec):
             continue
         dot = sum(a * b for a, b in zip(qvec, vec))

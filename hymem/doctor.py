@@ -9,11 +9,13 @@ Exit code 0 if every check passes (warnings allowed), 1 if any check fails.
 """
 from __future__ import annotations
 
+import sqlite3
 import sys
 
 from hymem.bootstrap import EnvConfig, resolve_env
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
+from hymem.core.vectors import decode_vector, encode_vector
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
 _GLYPH = {OK: "[ OK ]", WARN: "[WARN]", FAIL: "[FAIL]"}
@@ -193,6 +195,43 @@ def _check_canonical_drift(cfg: EnvConfig) -> _Result:
         f"{len(findings)} drifted value(s) ({breakdown}); sample: {sample}. "
         f"Run hymem.dreaming.canonicalize.repair_canonical_drift(conn) to fix.",
     )
+
+
+def repack_embeddings(conn: sqlite3.Connection) -> int:
+    """Re-encode legacy JSON-text vectors to the compact packed form across all
+    embedding tables. Optional, idempotent operator maintenance — new writes are
+    already packed and reads transparently handle both forms, so legacy rows
+    also convert lazily on any rewrite. Returns the number of rows repacked.
+
+    Caller owns the transaction. Rows already packed (vector_json LIKE
+    'b64f32:%') are skipped by the SQL filter, so re-running is cheap.
+    """
+    # (table, key_columns) — key columns uniquely identify a row for UPDATE.
+    targets = [
+        ("chunk_embeddings", ("chunk_id",)),
+        ("edge_embeddings", ("edge_text",)),
+        ("episode_embeddings", ("episode_id",)),
+        ("embedding_cache", ("text_hash", "model")),
+    ]
+    repacked = 0
+    for table, keys in targets:
+        key_cols = ", ".join(keys)
+        rows = conn.execute(
+            f"SELECT {key_cols}, vector_json FROM {table} "
+            f"WHERE vector_json NOT LIKE 'b64f32:%'"
+        ).fetchall()
+        where = " AND ".join(f"{k} = ?" for k in keys)
+        for r in rows:
+            try:
+                packed = encode_vector(decode_vector(r["vector_json"]))
+            except (ValueError, TypeError):
+                continue
+            conn.execute(
+                f"UPDATE {table} SET vector_json = ? WHERE {where}",
+                (packed, *(r[k] for k in keys)),
+            )
+            repacked += 1
+    return repacked
 
 
 def run_doctor() -> int:

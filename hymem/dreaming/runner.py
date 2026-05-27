@@ -32,7 +32,13 @@ from hymem.dreaming.embeddings import (
 from hymem.dreaming.episodes import extract_episodes_for_session, persist_episodes
 from hymem.dreaming.procedures import extract_procedures_for_session, persist_procedures
 from hymem.dreaming.mentions import index_chunk_mentions
-from hymem.dreaming.retention import prune_chunks
+from hymem.dreaming.retention import (
+    prune_bookkeeping,
+    prune_chunks,
+    prune_episodes_and_procedures,
+    prune_messages,
+    prune_retracted_edges,
+)
 from hymem.dreaming.summary import extract_session_summary, persist_session_summary
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
@@ -354,7 +360,11 @@ def run_dreaming(
             derived = infer_transitive_edges(conn, cfg)
             if derived:
                 log.info("inference.derived count=%d", derived)
-            prune_chunks(conn, cfg)
+            pruned = prune_chunks(conn, cfg)
+            pruned += prune_messages(conn, cfg)
+            pruned += prune_retracted_edges(conn, cfg)
+            pruned += prune_episodes_and_procedures(conn, cfg)
+            pruned += prune_bookkeeping(conn, cfg)
             phase2.consolidate_insights(conn, cfg)  # refresh after decay
             conn.execute("DELETE FROM token_overlap_index")
             _canon_rows = conn.execute(
@@ -373,6 +383,13 @@ def run_dreaming(
                     "INSERT OR IGNORE INTO token_overlap_index(token, canonical) VALUES (?, ?)",
                     _index_data,
                 )
+
+        # VACUUM can't run inside a transaction, so it goes after the phase-3
+        # block commits. Only pay the full-rewrite cost when a sweep actually
+        # freed a meaningful number of pages.
+        if cfg.vacuum_after_prune and pruned >= cfg.vacuum_min_pruned:
+            conn.execute("VACUUM")
+            log.info("retention.vacuum pruned=%d", pruned)
 
         if embedding_client is not None:
             pending_edges = fetch_edge_embeddings(conn, embedding_client)

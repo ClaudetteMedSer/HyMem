@@ -122,7 +122,34 @@ class HyMemConfig:
     """Soft cap on total stored chunks. Excess unreferenced chunks are pruned."""
 
     retention_days: int = 90
-    """Chunks newer than this are always kept regardless of graph references."""
+    """Chunks newer than this are always kept regardless of graph references.
+    Also the age window for pruning old episodes and stale procedures."""
+
+    message_retention_days: int = 90
+    """Raw messages of a session are pruned once the session is older than this
+    AND carries a non-null summary. The summary gate means this is a no-op in
+    stub/no-LLM deployments where summaries are never generated, so the only
+    copy of unreconstructable data is never destroyed."""
+
+    tombstone_retention_days: int = 30
+    """Retracted knowledge_graph edges (and their cascaded kg_evidence) are
+    hard-deleted once last_seen is older than this. Active/derived edges are
+    untouched (derived edges are rebuilt each cycle)."""
+
+    dream_runs_keep: int = 500
+    """Max dream_runs rows retained; older rows are pruned (newest kept)."""
+
+    extraction_feedback_keep: int = 200
+    """Max extraction_feedback rows retained (newest kept). Comfortably above
+    the 10 the runner injects as negative examples."""
+
+    vacuum_after_prune: bool = True
+    """Run VACUUM after a dream cycle whose sweeps deleted rows, to return freed
+    pages to the OS (plain DELETE leaves the file size flat)."""
+
+    vacuum_min_pruned: int = 100
+    """Minimum rows pruned in a cycle before VACUUM fires, so trivial sweeps
+    don't pay the full-rewrite cost."""
 
     rerank_ambiguity_threshold: float = 0.6
     """Minimum RRF score drop between #1/#2 results to consider them clear
