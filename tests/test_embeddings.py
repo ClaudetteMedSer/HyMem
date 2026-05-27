@@ -56,6 +56,42 @@ def test_dreaming_populates_chunk_embeddings(hy_with_embed):
     assert all(r["dim"] == 16 for r in rows)
 
 
+def test_persist_chunk_embeddings_reembed_same_rowid(hy_with_embed):
+    """Re-embedding a chunk whose rowid already exists in vec_chunks must not
+    crash. vec0 rejects INSERT OR REPLACE with a UNIQUE-constraint error, so the
+    chunk path delete-then-inserts (matching the episode path)."""
+    from hymem.dreaming.embeddings import (
+        PendingChunkEmbeddings,
+        persist_chunk_embeddings,
+    )
+
+    conn = hy_with_embed.conn
+    conn.execute("INSERT INTO sessions(id) VALUES ('s')")
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES ('c1', 's', 1, 1, 'r', 'txt')"
+    )
+    rowid = conn.execute("SELECT rowid FROM chunks WHERE id = 'c1'").fetchone()["rowid"]
+
+    def pending(vec: list[float]) -> PendingChunkEmbeddings:
+        return PendingChunkEmbeddings(
+            ids=["c1"], chunk_rowids=[rowid], vectors=[vec], dim=len(vec),
+            model="stub", text_hashes=["h"], from_cache=[False],
+        )
+
+    with core_db.transaction(conn):
+        persist_chunk_embeddings(conn, pending([1.0, 0.0, 0.0]))
+    # Second write for the same rowid — used to raise OperationalError.
+    with core_db.transaction(conn):
+        persist_chunk_embeddings(conn, pending([0.0, 1.0, 0.0]))
+
+    if core_db.has_vec_table(conn, table="vec_chunks"):
+        cnt = conn.execute(
+            "SELECT COUNT(*) AS c FROM vec_chunks WHERE rowid = ?", (rowid,)
+        ).fetchone()["c"]
+        assert cnt == 1  # replaced, not duplicated
+
+
 def test_augment_without_embedding_client_uses_fts_only(hy):
     sid = "s1"
     hy.open_session(sid)

@@ -156,6 +156,7 @@ def persist_chunk_embeddings(
     Cache misses are also written to embedding_cache.
     Caller wraps in core_db.transaction()."""
     core_db.ensure_vec_table(conn, pending.dim)
+    has_vec = core_db.has_vec_table(conn, table="vec_chunks")
     for chunk_id, chunk_rowid, vec, text_hash, is_cached in zip(
         pending.ids,
         pending.chunk_rowids,
@@ -178,10 +179,15 @@ def persist_chunk_embeddings(
             """,
             (chunk_id, encode_vector(vec), pending.model, len(vec)),
         )
-        conn.execute(
-            "INSERT OR REPLACE INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
-            (chunk_rowid, core_db._pack_vector(vec)),
-        )
+        if has_vec:
+            # vec0 doesn't support INSERT OR REPLACE on the rowid PK (it raises
+            # UNIQUE constraint failed), so delete any stale row first — same
+            # guard as persist_episode_embeddings.
+            conn.execute("DELETE FROM vec_chunks WHERE rowid = ?", (chunk_rowid,))
+            conn.execute(
+                "INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
+                (chunk_rowid, core_db._pack_vector(vec)),
+            )
     return len(pending.ids)
 
 
