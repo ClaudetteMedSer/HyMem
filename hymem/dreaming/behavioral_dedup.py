@@ -21,11 +21,14 @@ identical, so the cosine between two full-triple-text vectors reflects the
 """
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 from dataclasses import dataclass, field
 
 from hymem.core.vectors import decode_vector
+
+log = logging.getLogger("hymem.dreaming.behavioral_dedup")
 
 # The multi-valued behavioral predicates that proliferate into phrasal variants.
 # (uses / depends_on etc. are excluded: their objects are concrete named things
@@ -153,3 +156,145 @@ def find_behavioral_duplicates(
 
     proposals.sort(key=lambda m: m.collapses, reverse=True)
     return proposals
+
+
+def apply_behavioral_merges(
+    conn: sqlite3.Connection,
+    proposals: list[ProposedMerge],
+) -> dict:
+    """Execute the merges proposed by :func:`find_behavioral_duplicates`.
+
+    For each cluster, folds all member edges into the survivor: evidence is
+    summed, kg_evidence rows are reassigned, member edges are retracted, member
+    object canonicals are aliased to the survivor's, and retraction feedback is
+    recorded so the next dream learns from the correction.
+
+    Caller must wrap this in a ``core_db.transaction()`` — this function does
+    NOT open its own transaction so it can be part of a larger atomic unit.
+    Returns ``{clusters_merged, edges_retracted, survivors_updated}``.
+
+    Idempotent: calling it twice with the same proposals is a no-op on the
+    second call (already-retracted edges are skipped).
+    """
+    clusters_merged = 0
+    edges_retracted = 0
+    survivors_updated = 0
+
+    for proposal in proposals:
+        # Guard: skip if the survivor itself was retracted between report and apply.
+        survivor_active = conn.execute(
+            "SELECT 1 FROM knowledge_graph WHERE id = ? AND status = 'active'",
+            (proposal.survivor_id,),
+        ).fetchone()
+        if not survivor_active:
+            continue
+
+        member_ids = [m.edge_id for m in proposal.members]
+        if not member_ids:
+            continue
+
+        # Fetch evidence from members to sum into survivor.
+        member_evidence = conn.execute(
+            f"""SELECT SUM(pos_evidence) AS pos_sum, SUM(neg_evidence) AS neg_sum
+                FROM knowledge_graph
+                WHERE id IN ({','.join('?' * len(member_ids))})
+                  AND status = 'active'""",
+            member_ids,
+        ).fetchone()
+        pos_sum = member_evidence["pos_sum"] or 0
+        neg_sum = member_evidence["neg_sum"] or 0
+
+        if pos_sum == 0 and neg_sum == 0:
+            continue  # all members already retracted — idempotent
+
+        # Update survivor evidence.
+        conn.execute(
+            """UPDATE knowledge_graph
+               SET pos_evidence = pos_evidence + ?,
+                   neg_evidence = neg_evidence + ?,
+                   last_seen = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (pos_sum, neg_sum, proposal.survivor_id),
+        )
+        survivors_updated += 1
+
+        # Reassign kg_evidence from members to survivor.
+        placeholders = ",".join("?" * len(member_ids))
+        conn.execute(
+            f"""UPDATE OR IGNORE kg_evidence
+                SET edge_id = ?
+                WHERE edge_id IN ({placeholders})""",
+            [proposal.survivor_id] + member_ids,
+        )
+
+        # Record retraction feedback for each member edge.
+        for member in proposal.members:
+            evidence = conn.execute(
+                """SELECT chunk_id FROM kg_evidence
+                   WHERE edge_id = ? AND polarity = 1
+                   ORDER BY extracted_at DESC LIMIT 1""",
+                (proposal.survivor_id,),
+            ).fetchone()
+            if evidence is None:
+                continue
+            chunk = conn.execute(
+                "SELECT text FROM chunks WHERE id = ?", (evidence["chunk_id"],)
+            ).fetchone()
+            if chunk is None:
+                continue
+            conn.execute(
+                """INSERT OR IGNORE INTO extraction_feedback
+                   (chunk_id, chunk_text_snippet, extracted_subject,
+                    extracted_predicate, extracted_object, feedback_type)
+                   VALUES (?, ?, ?, ?, ?, 'retracted')""",
+                (
+                    evidence["chunk_id"],
+                    chunk["text"][:600],
+                    proposal.subject,
+                    proposal.predicate,
+                    member.object,
+                ),
+            )
+
+        # Retract member edges.
+        conn.execute(
+            f"""UPDATE knowledge_graph
+                SET status = 'retracted'
+                WHERE id IN ({placeholders}) AND status = 'active'""",
+            member_ids,
+        )
+
+        # Register object aliases: member object → survivor object.
+        from hymem.dreaming import canonicalize
+
+        for member in proposal.members:
+            if member.object != proposal.survivor_object:
+                canonicalize.register_alias(conn, member.object, proposal.survivor_object)
+
+        # Clean up edge_embeddings for retracted members — the vectors are now
+        # dead weight and would pollute future KNN searches.
+        conn.execute(
+            f"""DELETE FROM edge_embeddings
+                WHERE edge_text IN (
+                    SELECT subject_canonical || ' ' || predicate || ' '
+                           || object_canonical
+                    FROM knowledge_graph
+                    WHERE id IN ({placeholders})
+                )""",
+            member_ids,
+        )
+
+        clusters_merged += 1
+        edges_retracted += len(member_ids)
+        log.info(
+            "behavioral_dedup.applied subject=%s predicate=%s "
+            "survivor=%s members=%d pos=%d neg=%d",
+            proposal.subject, proposal.predicate,
+            proposal.survivor_object, len(member_ids), pos_sum, neg_sum,
+        )
+
+    return {
+        "clusters_merged": clusters_merged,
+        "edges_retracted": edges_retracted,
+        "survivors_updated": survivors_updated,
+    }
