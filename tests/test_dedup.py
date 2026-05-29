@@ -71,11 +71,17 @@ def _seed_chunk(hy: HyMem, chunk_id="c_dedup") -> Chunk:
 
 def _persist(hy: HyMem, chunk: Chunk, triple: Triple, embedder):
     ext = ChunkExtraction(triples=[triple], markers=[])
+    # Mirror the runner: embed dedup candidates OUTSIDE the write transaction,
+    # then pass the precomputed vectors into the (now embed-free) persist call.
+    dedup_vectors = phase1.prepare_dedup_vectors(
+        hy.conn, ext, hy.config, embedder
+    )
     with core_db.transaction(hy.conn):
         phase1.persist_chunk_results(
             hy.conn, chunk, ext,
             prompt_version=hy.config.prompt_version,
             cfg=hy.config, embedding_client=embedder,
+            dedup_vectors=dedup_vectors,
         )
 
 

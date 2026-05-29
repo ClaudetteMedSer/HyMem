@@ -62,6 +62,81 @@ def test_dream_run_skipped_records_lock_skip(hy):
     assert row["ended_at"] is not None
 
 
+def test_refresh_lock_advances_acquired_at_for_owner(hy):
+    # Seed a lock owned by us, backdated well past the TTL so any movement is
+    # unambiguous, then heartbeat it.
+    from hymem.dreaming.runner import _refresh_lock
+
+    hy.conn.execute(
+        "INSERT INTO run_lock(name, acquired_at, holder) "
+        "VALUES ('dreaming', datetime('now', '-1 hour'), 'me')"
+    )
+    before = hy.conn.execute(
+        "SELECT acquired_at FROM run_lock WHERE name = 'dreaming'"
+    ).fetchone()["acquired_at"]
+
+    _refresh_lock(hy.conn, "me")
+
+    after = hy.conn.execute(
+        "SELECT acquired_at FROM run_lock WHERE name = 'dreaming'"
+    ).fetchone()["acquired_at"]
+    # CURRENT_TIMESTAMP is strictly newer than an hour ago.
+    assert after > before
+    # And it is no longer stale relative to the TTL.
+    stale = hy.conn.execute(
+        "SELECT 1 FROM run_lock WHERE name = 'dreaming' "
+        "AND acquired_at < datetime('now', '-120 seconds')"
+    ).fetchone()
+    assert stale is None
+
+
+def test_refresh_lock_does_not_touch_other_holders_lock(hy):
+    # The holder guard must prevent one process from heartbeating (and thus
+    # resurrecting/stealing) a lock another process owns.
+    from hymem.dreaming.runner import _refresh_lock
+
+    hy.conn.execute(
+        "INSERT INTO run_lock(name, acquired_at, holder) "
+        "VALUES ('dreaming', datetime('now', '-1 hour'), 'owner_A')"
+    )
+    before = hy.conn.execute(
+        "SELECT acquired_at FROM run_lock WHERE name = 'dreaming'"
+    ).fetchone()["acquired_at"]
+
+    _refresh_lock(hy.conn, "intruder_B")
+
+    after = hy.conn.execute(
+        "SELECT acquired_at, holder FROM run_lock WHERE name = 'dreaming'"
+    ).fetchone()
+    assert after["acquired_at"] == before  # untouched
+    assert after["holder"] == "owner_A"    # not stolen
+
+
+def test_dream_heartbeats_lock_once_per_session(hy, monkeypatch):
+    # A live dream must refresh the lease each session so a slow run never looks
+    # stale. Spy on _refresh_lock and assert it fires once per processed session.
+    import hymem.dreaming.runner as runner_mod
+
+    _seed_session(hy)  # one session
+    hy.set_llm(make_routed_llm(
+        [{"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1}],
+        [],
+    ))
+
+    calls: list[str] = []
+    real_refresh = runner_mod._refresh_lock
+
+    def _spy(conn, holder):
+        calls.append(holder)
+        return real_refresh(conn, holder)
+
+    monkeypatch.setattr(runner_mod, "_refresh_lock", _spy)
+    report = hy.dream()
+
+    assert report.sessions_processed >= 1
+    assert len(calls) == report.sessions_processed
+
+
 def test_recent_dream_runs_returns_dicts(hy):
     _seed_session(hy)
     hy.dream()
@@ -79,6 +154,97 @@ def test_recent_dream_runs_returns_dicts(hy):
         "skipped_locked", "error",
     }
     assert expected_keys.issubset(rows[0].keys())
+
+
+def test_dream_status_before_any_dream(hy):
+    # Fresh DB: no chunks yet, no dream has run, no lock held.
+    status = hy.dream_status()
+    assert status["pending_chunks"] == 0
+    assert status["total_chunks"] == 0
+    assert status["prompt_version"] == hy.config.prompt_version
+    assert status["in_progress"] is False
+    assert status["last_run"] is None
+
+
+def test_dream_status_counts_and_last_run(hy):
+    _seed_session(hy)
+    triples = [
+        {"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1},
+    ]
+    hy.set_llm(make_routed_llm(triples, []))
+
+    hy.dream()
+
+    after = hy.dream_status()
+    # The dream created chunks and processed them all for the current version.
+    assert after["total_chunks"] > 0
+    assert after["pending_chunks"] == 0
+    assert after["prompt_version"] == hy.config.prompt_version
+    assert after["in_progress"] is False
+    # last_run is populated and reflects the completed cycle.
+    assert after["last_run"] is not None
+    assert after["last_run"]["ended_at"] is not None
+    assert after["last_run"]["error"] is None
+
+    # Seed MORE chunks without dreaming → they have no processed_chunks row for
+    # the current prompt_version, so they count as pending.
+    hy.conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES ('extra-1', 's1', 1, 2, 'test', 'extra chunk')"
+    )
+    hy.conn.commit()
+    bumped = hy.dream_status()
+    assert bumped["total_chunks"] == after["total_chunks"] + 1
+    assert bumped["pending_chunks"] == 1
+
+
+def test_dream_status_pending_drops_after_dream(hy):
+    _seed_session(hy)
+    hy.set_llm(make_routed_llm([], []))
+
+    # A second session whose chunks are created (and processed) by dreaming.
+    sid = "s2"
+    hy.open_session(sid)
+    hy.log_message(sid, "assistant", "We deploy the api to fly_io for staging.")
+    hy.log_message(sid, "user", "Yes, staging runs on fly_io. Keep it that way.")
+    hy.close_session(sid)
+
+    hy.dream()
+    # Every chunk dreaming creates is processed for the current prompt_version.
+    status = hy.dream_status()
+    assert status["total_chunks"] > 0
+    assert status["pending_chunks"] == 0
+
+    # Simulate a prompt_version bump: a HyMem on the same DB but a newer
+    # prompt_version sees the whole backlog as pending again (the surge this
+    # status surface is meant to make transparent).
+    import dataclasses
+
+    from hymem.api import HyMem
+
+    bumped_cfg = dataclasses.replace(
+        hy.config, prompt_version=hy.config.prompt_version + "-next"
+    )
+    hy2 = HyMem(bumped_cfg, llm=hy._llm, embedding_client=hy._embed)
+    try:
+        bumped = hy2.dream_status()
+        assert bumped["prompt_version"] == bumped_cfg.prompt_version
+        assert bumped["pending_chunks"] == bumped["total_chunks"]
+        assert bumped["pending_chunks"] > 0
+    finally:
+        hy2.close()
+
+
+def test_dream_status_in_progress_reflects_lock(hy):
+    _seed_session(hy)
+    assert hy.dream_status()["in_progress"] is False
+
+    hy.conn.execute(
+        "INSERT INTO run_lock(name, acquired_at, holder) "
+        "VALUES ('dreaming', CURRENT_TIMESTAMP, 'other_proc')"
+    )
+    hy.conn.commit()
+    assert hy.dream_status()["in_progress"] is True
 
 
 class _RaisingLLM:

@@ -222,6 +222,56 @@ class HyMem:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def dream_status(self) -> dict:
+        """Operator-visibility snapshot of the dreaming/extraction backlog.
+
+        Pure SQL via `read_conn` — no LLM or embedding calls, no writes — so it
+        works even when no LLM/embedding client is configured. Useful to explain
+        the re-extraction surge that follows a `prompt_version` bump: when the
+        version changes, every chunk is "pending" again and the next dream(s)
+        reprocess the whole backlog, which can take minutes.
+
+        Returns a dict with:
+          - `pending_chunks`: chunks with NO `processed_chunks` row for the
+            CURRENT `config.prompt_version` (i.e. still owed an extraction pass).
+          - `total_chunks`: total chunk count.
+          - `prompt_version`: the current `config.prompt_version`.
+          - `in_progress`: True iff a `run_lock` row named 'dreaming' exists.
+            This is intentionally coarse — a *stale* lock (e.g. from a crashed
+            dream) reads as in_progress until it expires. Lock heartbeat/TTL is
+            handled in the dreaming runner; this method does not reimplement it.
+          - `last_run`: the most recent `dream_runs` row as a dict, or None if
+            no dream has ever run.
+        """
+        conn = self.read_conn
+        pv = self.config.prompt_version
+
+        pending_chunks = conn.execute(
+            "SELECT COUNT(*) FROM chunks "
+            "WHERE id NOT IN ("
+            "    SELECT chunk_id FROM processed_chunks WHERE prompt_version = ?"
+            ")",
+            (pv,),
+        ).fetchone()[0]
+        total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        in_progress = (
+            conn.execute(
+                "SELECT 1 FROM run_lock WHERE name = 'dreaming' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+        last_row = conn.execute(
+            "SELECT * FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        return {
+            "pending_chunks": pending_chunks,
+            "total_chunks": total_chunks,
+            "prompt_version": pv,
+            "in_progress": in_progress,
+            "last_run": dict(last_row) if last_row is not None else None,
+        }
+
     # ---- portability -------------------------------------------------
 
     def export(self, path: str | Path) -> dict[str, int]:

@@ -29,6 +29,22 @@ def test_health_endpoint(client):
     assert r.json() == {"status": "ok", "backend": "hymem"}
 
 
+def test_dream_status_endpoint(client):
+    r = client.get("/dream-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) >= {
+        "pending_chunks",
+        "total_chunks",
+        "prompt_version",
+        "in_progress",
+        "last_run",
+    }
+    assert isinstance(body["pending_chunks"], int)
+    assert isinstance(body["total_chunks"], int)
+    assert isinstance(body["in_progress"], bool)
+
+
 def test_add_messages_logs_and_returns_message_objects(client, hy_with_embed):
     r = client.post(
         "/v3/workspaces/hermes/sessions/sess-1/messages",

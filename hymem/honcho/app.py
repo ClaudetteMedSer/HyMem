@@ -112,6 +112,19 @@ def health() -> dict:
     return {"status": "ok", "backend": "hymem"}
 
 
+@app.get("/dream-status")
+def dream_status() -> dict:
+    """Operator visibility into the re-extraction backlog.
+
+    Not workspace-scoped — dreaming is global to the HyMem instance, like
+    `/health`. Wraps `hy.dream_status()` (pure SQL, no LLM) so an operator can
+    see how many chunks are pending for the current prompt_version, whether a
+    dream is in progress, and the last dream's outcome — making the surge after
+    a prompt_version bump transparent rather than mysterious.
+    """
+    return _get_hy().dream_status()
+
+
 # ── workspace (get-or-create) ────────────────────────────────────────────────
 
 @app.post("/v3/workspaces", status_code=201)

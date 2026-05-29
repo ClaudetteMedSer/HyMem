@@ -64,6 +64,28 @@ class DreamReport:
     budget_exhausted: bool = False
 
 
+def _prepare_dedup_vectors(
+    conn: sqlite3.Connection,
+    extraction: phase1.ChunkExtraction,
+    cfg: HyMemConfig,
+    embedding_client: EmbeddingClient | None,
+) -> dict[str, list[float]]:
+    """Best-effort wrapper around :func:`phase1.prepare_dedup_vectors`.
+
+    Runs the dedup candidate embed *before* the persist transaction is opened,
+    so the network ``embed()`` call never happens under the SQLite write lock.
+    A failure (flaky embedding endpoint, etc.) is logged and degrades to ``{}``
+    — dedup simply doesn't fire for this chunk — mirroring the try/except
+    tolerance the persist path already has around dedup.
+    """
+    try:
+        return phase1.prepare_dedup_vectors(conn, extraction, cfg, embedding_client)
+    except Exception:
+        log.exception("phase1.dedup_prepare_failure chunk triples=%d",
+                      len(extraction.triples))
+        return {}
+
+
 def run_dreaming(
     conn: sqlite3.Connection,
     cfg: HyMemConfig,
@@ -120,6 +142,11 @@ def run_dreaming(
 
         chunks_remaining = cfg.dream_budget
 
+        # Same-wave dedup pool, shared across ALL chunks/sessions of this dream
+        # so a sibling triple in a later chunk collapses onto an edge minted by
+        # an earlier chunk in the same cycle. In-memory only; no DB/network I/O.
+        in_cycle_edges = phase1.new_in_cycle_pool()
+
         def _kickoff_chunk_embed(chunks_list: list[Chunk]) -> None:
             """Cache lookup on the main thread, then submit the embedder call
             to a single-worker background thread so Phase 1 LLM calls keep
@@ -158,6 +185,15 @@ def run_dreaming(
             embed_inflight.append((request, future))
 
         for session_id in target_sessions:
+            # Heartbeat the lease once per session. Sessions are the unit of
+            # slow work (~11s each observed), so refreshing here keeps
+            # acquired_at recent enough that a live dream never crosses the
+            # _LOCK_TTL_SECONDS staleness line — while a crashed holder stops
+            # refreshing and is reclaimed after the TTL. Done OUTSIDE any
+            # core_db.transaction block (autocommit) so the new timestamp is
+            # visible to other connections immediately and is never trapped in
+            # a per-session write transaction.
+            _refresh_lock(conn, holder)
             report.sessions_processed += 1
             # True once any chunk in this session is freshly extracted this run.
             # Drives the digest skip-guard: an unchanged, already-digested session
@@ -200,10 +236,17 @@ def run_dreaming(
                 if extraction is None:
                     continue
                 had_new_chunk_work = True
+                # Embed dedup candidates OUTSIDE the write lock; best-effort so
+                # a flaky embedder degrades to "no dedup", never aborts the dream.
+                dedup_vectors = _prepare_dedup_vectors(
+                    conn, extraction, cfg, embedding_client
+                )
                 with core_db.transaction(conn):
                     phase1.persist_chunk_results(
                         conn, chunk, extraction, prompt_version=cfg.prompt_version,
                         cfg=cfg, embedding_client=embedding_client,
+                        dedup_vectors=dedup_vectors,
+                        in_cycle_edges=in_cycle_edges,
                     )
                 if extraction.triples or extraction.markers:
                     report.chunks_processed += 1
@@ -249,11 +292,18 @@ def run_dreaming(
                         if extraction is None:
                             continue
                         had_new_chunk_work = True
+                        # Embed dedup candidates OUTSIDE the write lock (see
+                        # the salience-tier call site above).
+                        dedup_vectors = _prepare_dedup_vectors(
+                            conn, extraction, cfg, embedding_client
+                        )
                         with core_db.transaction(conn):
                             phase1.persist_chunk_results(
                                 conn, chunk, extraction,
                                 prompt_version=cfg.prompt_version,
                                 cfg=cfg, embedding_client=embedding_client,
+                                dedup_vectors=dedup_vectors,
+                                in_cycle_edges=in_cycle_edges,
                             )
                         if extraction.triples or extraction.markers:
                             report.chunks_processed += 1
@@ -530,6 +580,29 @@ def _release_lock(conn: sqlite3.Connection, holder: str) -> None:
     with contextlib.suppress(sqlite3.Error):
         conn.execute(
             "DELETE FROM run_lock WHERE name = 'dreaming' AND holder = ?",
+            (holder,),
+        )
+
+
+def _refresh_lock(conn: sqlite3.Connection, holder: str) -> None:
+    """Heartbeat the dreaming lease so a live (slow) dream keeps its lock fresh.
+
+    Pushes ``acquired_at`` forward to now so a genuinely slow dream never
+    crosses the ``_LOCK_TTL_SECONDS`` staleness line and gets taken over by a
+    concurrent trigger. A crashed holder simply stops calling this, so its
+    lock still ages past the TTL and is reclaimed.
+
+    Best-effort like :func:`_release_lock` (a refresh failure must never abort
+    the dream) and an autocommit bare execute so the new timestamp is visible
+    to other connections immediately. The ``holder = ?`` guard means this only
+    touches the row if THIS process still owns the lock — if another process
+    legitimately took it over, this refresh is a no-op and cannot resurrect or
+    steal the lock.
+    """
+    with contextlib.suppress(sqlite3.Error):
+        conn.execute(
+            "UPDATE run_lock SET acquired_at = CURRENT_TIMESTAMP"
+            " WHERE name = 'dreaming' AND holder = ?",
             (holder,),
         )
 
