@@ -10,10 +10,11 @@ from difflib import SequenceMatcher
 from hymem.config import HyMemConfig
 from hymem.dreaming import canonicalize
 from hymem.dreaming.chunks import Chunk
+from hymem.extraction.chunk import extract_chunk
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
-from hymem.extraction.markers import Marker, extract_markers
-from hymem.extraction.triples import Triple, extract_triples
+from hymem.extraction.markers import Marker
+from hymem.extraction.triples import Triple
 
 log = logging.getLogger("hymem.dreaming.phase1")
 
@@ -46,15 +47,12 @@ def extract_chunk_results(
     if already:
         return None
 
-    triples, entity_type_hints, entity_property_hints = extract_triples(
-        llm, chunk.text, negative_examples
-    )
-    markers = extract_markers(llm, chunk.text)
+    result = extract_chunk(llm, chunk.text, negative_examples)
     return ChunkExtraction(
-        triples=triples,
-        markers=markers,
-        entity_type_hints=entity_type_hints,
-        entity_property_hints=entity_property_hints,
+        triples=result.triples,
+        markers=result.markers,
+        entity_type_hints=result.entity_type_hints,
+        entity_property_hints=result.entity_property_hints,
     )
 
 

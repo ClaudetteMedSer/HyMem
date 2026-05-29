@@ -37,3 +37,58 @@ def test_augment_without_dreaming_still_returns_empty_context(hy):
     assert ctx.matched_entities == []
     assert ctx.graph_facts == []
     assert ctx.fts_hits == []
+
+
+def test_working_memory_recalls_turn_before_any_dream(hy):
+    # The core gap A1 fixes: a fact stated this session must be recallable via
+    # augment() even though no dream has consolidated it into chunks/graph.
+    sid = "wm1"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "My favorite database is duckdb.")
+
+    ctx = hy.augment("what database do I like?", session_id=sid)
+
+    # No dream ran, so the consolidated tiers stay empty...
+    assert ctx.graph_facts == []
+    # ...but the raw turn is surfaced via the working-memory tier.
+    assert [m.content for m in ctx.recent_turns] == ["My favorite database is duckdb."]
+    assert ctx.recent_turns[0].role == "user"
+    assert ctx.recent_turns[0].session_id == sid
+
+
+def test_working_memory_capped_and_ordered_oldest_to_newest(hy):
+    sid = "wm2"
+    hy.open_session(sid)
+    cap = hy.config.working_memory_turns
+    total = cap + 5
+    for i in range(total):
+        hy.log_message(sid, "user", f"turn {i}")
+
+    ctx = hy.augment("anything", session_id=sid)
+
+    # Capped at working_memory_turns.
+    assert len(ctx.recent_turns) == cap
+    # The most-recent `cap` turns, oldest -> newest.
+    expected = [f"turn {i}" for i in range(total - cap, total)]
+    assert [m.content for m in ctx.recent_turns] == expected
+
+
+def test_working_memory_empty_without_session_id(hy):
+    # Backward compatibility: augment() with no session_id behaves exactly as
+    # before — no working-memory tier.
+    sid = "wm3"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "something the user said")
+
+    ctx = hy.augment("something")
+    assert ctx.recent_turns == []
+
+
+def test_recent_messages_zero_limit_returns_empty(hy):
+    from hymem.session import recent_messages
+
+    sid = "wm4"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "a turn")
+
+    assert recent_messages(hy.read_conn, sid, 0) == []

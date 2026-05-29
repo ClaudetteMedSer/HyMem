@@ -14,6 +14,7 @@ from hymem.extraction.llm import LLMClient
 from hymem.query.entities import match_known_entities
 from hymem.query.predicate_routing import route_predicates
 from hymem.query.rerank import rerank as run_rerank
+from hymem.session import Message, recent_messages
 
 log = logging.getLogger("hymem.query.augment")
 
@@ -86,6 +87,11 @@ class AugmentedContext:
     `fts_hits[i].score` carries different units depending on `score_kind`:
         - "bm25": SQLite FTS5 BM25 score (lower = better, often negative)
         - "rrf":  reciprocal rank fusion score from FTS+vector merge (higher = better)
+
+    `recent_turns` is the working-memory tier: the last N raw turns of the
+    active session, included so the host can surface within-session facts that
+    have not yet been consolidated by dreaming. It is populated only when a
+    `session_id` is passed to `augment()`; otherwise it stays empty.
     """
 
     user_md: str = ""
@@ -95,6 +101,7 @@ class AugmentedContext:
     episodes: list[EpisodeHit] = field(default_factory=list)
     procedures: list[ProcedureHit] = field(default_factory=list)
     matched_entities: list[str] = field(default_factory=list)
+    recent_turns: list[Message] = field(default_factory=list)
 
 
 def augment(
@@ -105,12 +112,19 @@ def augment(
     embedding_client: EmbeddingClient | None = None,
     llm: LLMClient | None = None,
     token_overlap_index: dict[str, list[str]] | None = None,
+    session_id: str | None = None,
 ) -> AugmentedContext:
     ctx = AugmentedContext()
     if cfg.user_md_path.exists():
         ctx.user_md = cfg.user_md_path.read_text(encoding="utf-8")
     if cfg.memory_md_path.exists():
         ctx.memory_md = cfg.memory_md_path.read_text(encoding="utf-8")
+
+    # Working-memory tier: the last N raw turns of the active session, so facts
+    # stated this session are recallable before any dream has consolidated them.
+    # `conn` here is the READ connection; recent_messages is a plain SELECT.
+    if session_id is not None and cfg.working_memory_turns > 0:
+        ctx.recent_turns = recent_messages(conn, session_id, cfg.working_memory_turns)
 
     # Pull a wider candidate pool when reranking is likely so the reranker
     # has room to reorder beyond the top-fts_top_k window; the final result

@@ -145,6 +145,127 @@ MARKER_USER_TEMPLATE = """Excerpt:
 Return the JSON array now."""
 
 
+# --- Combined per-chunk extraction (triples + markers in one call) ----------
+# Single prompt that returns a JSON OBJECT with both "triples" and "markers",
+# halving the per-chunk LLM call count. The rules below are the verbatim triple
+# and marker rules from the separate prompts above so quality does not regress;
+# only the output container changes (object with two array keys, mirroring
+# SESSION_DIGEST_SYSTEM). The distinctive substrings "structured technical
+# relationships" and "EXPLICIT behavioral signals" are preserved for prompt
+# routing in tests.
+
+_CHUNK_EXTRACTION_SYSTEM_TEMPLATE = """You extract structured technical relationships and EXPLICIT behavioral signals from a conversation excerpt in a single pass.
+
+Output a strict JSON OBJECT (not an array). No prose, no markdown, no code fences.
+The object has exactly these two keys:
+
+"triples": a JSON array of relationship items. Each item has exactly: subject (string), predicate (string), object (string), polarity (1 or -1).
+- Optional fields (include only when applicable):
+    value_text (string): numeric value, version string, or quantity mentioned
+    value_numeric (number): parsed numeric value if available
+    value_unit (string): unit for numeric values ("seconds", "MB", "rps")
+    temporal_scope (string): time context ("since 2024", "during migration", "temporarily")
+- Optionally include subject_type and object_type (string) to classify entities:
+    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, or_other_tool
+- Include these types ONLY when you are confident. Skip them otherwise.
+- Optionally include subject_properties and/or object_properties (object of
+  string->string pairs) to capture stable attributes of the entity, e.g.
+  {{"language": "python", "category": "build_tool", "runtime": "node"}}.
+  Keep keys short and lowercase (language, runtime, category, vendor, role).
+  At most 4 properties per entity; skip when not clearly stated.
+- predicate MUST be one of: {predicates}.
+- Predicate meanings:
+    uses: A employs or utilizes B
+    depends_on: A requires B to function
+    prefers: A favors B over alternatives
+    rejects: A explicitly refuses or negates B
+    avoids: A steers clear of B
+    replaces: A supersedes or substitutes B
+    conflicts_with: A is incompatible with B
+    deploys_to: A is deployed or released to B
+    part_of: A is a component or sub-part of B
+    equivalent_to: A is synonymous or interchangeable with B
+    implements: A realizes or fulfills interface/contract/spec B
+    contains: A holds, owns, or includes B as a subcomponent
+    configured_with: A is parameterized or set up using B
+    requires_version: A needs a specific version of B
+    runs_on: A executes or operates on platform/runtime B
+    connects_to: A has a network or data-flow connection to B
+    generates: A produces, outputs, or creates B
+    tested_by: A is tested or verified using B
+{negative_examples}
+- polarity is -1 only when the speaker negates or retracts the relationship
+  ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
+  Mapping for negations: "no longer uses" -> uses with polarity -1.
+  Statements like "we avoid X" use predicate 'avoids' with polarity 1, NOT 'uses' with -1.
+- Skip relationships you are not confident about. An empty array [] is a valid answer.
+- Subject and object should be concrete named things — tools, libraries, services,
+  files, modules, environments, AND people, teams, projects, or codebases by name.
+  Do not invent abstractions like "the system".
+- When a chunk names a person or team alongside a project, codebase, or artifact
+  they own, work on, or belong to, extract the linking edge explicitly. This is
+  high-priority: identity-to-artifact links are the most underrepresented and
+  most useful triples in the graph. Strong examples (extract eagerly when the
+  chunk supports them):
+    "Atta is working on MedFlow"                   -> (atta, part_of, medflow)
+    "I'm building HyMem"                            -> (atta, part_of, hymem)
+    "We use HyMem for the memory layer"             -> (atta, uses, hymem)
+    "The platform team owns the auth service"       -> (platform_team, contains, auth_service)
+    "Sara maintains the ingest pipeline"            -> (sara, part_of, ingest_pipeline)
+  When the speaker is the user themselves ("I'm working on X", "we shipped Y"),
+  resolve the implicit subject to the user's canonical name when known from
+  context; otherwise use a first-person handle and let canonicalization resolve
+  it. Do NOT skip these just because the speaker is implicit.
+  This makes identity-to-artifact relationships queryable as 1-hop graph edges
+  rather than fuzzy text matches across sibling canonicals.
+- Excerpts may be written in languages other than English (e.g. Dutch, German,
+  French, Spanish). Extract relationships regardless; keep subject and object in
+  the original language as they appear in the text.
+
+"markers": a JSON array of EXPLICIT behavioral signals from the user. Each item: {{"kind": "...", "statement": "..."}}.
+- Only include signals that are stated outright. Do NOT infer mood or sentiment.
+- Excerpts may be in languages other than English; identify signals regardless.
+- Allowed kinds:
+    correction: user told the assistant it was wrong about something specific.
+    preference: user explicitly stated they like / want / use approach X.
+    rejection: user explicitly stated they dislike / refuse / will not use X.
+    style: user explicitly asked for a way of communicating (verbosity, format, tone).
+- 'statement' is a single short factual sentence, not a quote.
+
+Always return both keys. An empty array [] is valid for either. Example shape:
+{{"triples": [], "markers": []}}
+"""
+
+
+def build_chunk_extraction_system(negative_examples: str = "") -> str:
+    """Build the combined triples+markers extraction system prompt with optional
+    negative examples. Mirrors ``build_triple_system``."""
+    neg_section = ""
+    if negative_examples:
+        neg_section = (
+            "\nCRITICAL: The following triples were previously extracted INCORRECTLY "
+            "from similar conversation contexts. DO NOT extract these exact "
+            "relationships or close variants:\n"
+            + negative_examples
+            + "\n"
+        )
+    return _CHUNK_EXTRACTION_SYSTEM_TEMPLATE.format(
+        predicates=", ".join(ALLOWED_PREDICATES),
+        negative_examples=neg_section,
+    )
+
+
+CHUNK_EXTRACTION_SYSTEM = build_chunk_extraction_system()
+
+
+CHUNK_EXTRACTION_USER_TEMPLATE = """Excerpt:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object with "triples" and "markers" now."""
+
+
 EPISODE_SYSTEM = """You identify distinct episodes within a conversation session.
 
 An episode is a coherent segment focused on one topic, problem, or task. A session may have multiple episodes.

@@ -47,3 +47,25 @@ def messages_for_session(conn: sqlite3.Connection, session_id: str) -> list[Mess
         (session_id,),
     ).fetchall()
     return [Message(id=r["id"], session_id=r["session_id"], role=r["role"], content=r["content"]) for r in rows]
+
+
+def recent_messages(
+    conn: sqlite3.Connection, session_id: str, limit: int
+) -> list[Message]:
+    """Return the most-recent `limit` messages for the session, in
+    chronological (ascending) order. Returns [] when limit <= 0.
+
+    Selects newest-first (ORDER BY id DESC LIMIT limit) then reverses, so the
+    caller gets the working-memory window oldest -> newest.
+    """
+    if limit <= 0:
+        return []
+    rows = conn.execute(
+        "SELECT id, session_id, role, content FROM messages "
+        "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+        (session_id, limit),
+    ).fetchall()
+    return [
+        Message(id=r["id"], session_id=r["session_id"], role=r["role"], content=r["content"])
+        for r in reversed(rows)
+    ]

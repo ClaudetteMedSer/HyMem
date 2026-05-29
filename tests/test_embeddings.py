@@ -301,16 +301,19 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg):
     embedding is kicked off on a background thread after each persist_chunks
     and joined after the per-session loop.
 
-    Tunings (LLM dominated by EMBED): with 5 chunks → 10 Phase-1 LLM calls
-    (extract_triples + extract_markers per chunk) + 3 tail calls = 13 LLM
-    calls. Serial: 13*LLM_DELAY + EMBED_DELAY. Parallel: ~EMBED_DELAY.
+    Tunings: with 5 chunks → 5 Phase-1 LLM calls (one combined triples+markers
+    call per chunk) + 1 batched digest tail call = 6 LLM calls. LLM_DELAY is
+    sized so the Phase-1 stream (5*LLM_DELAY) is comparable to EMBED_DELAY, so
+    overlapping the two saves close to a full EMBED_DELAY. Serial:
+    6*LLM_DELAY + EMBED_DELAY. Parallel: ~max(5*LLM_DELAY, EMBED_DELAY) + the
+    digest call.
     """
     import time
     from dataclasses import replace as _dc_replace
 
     from hymem.extraction.llm import LLMRequest
 
-    LLM_DELAY = 0.01
+    LLM_DELAY = 0.04
     EMBED_DELAY = 0.20
 
     class SlowEmbed(StubEmbeddingClient):
@@ -346,7 +349,7 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg):
         # We saved roughly EMBED_DELAY by running it parallel to Phase 1.
         # The serial floor is the sum of Phase 1 LLM + tail LLM + 1 embed.
         # Require at least 30% of EMBED_DELAY shaved off vs serial.
-        n_llm_calls = 5 * 2 + 3  # 2 calls per chunk + 3 tail (episodes/summary/procedures)
+        n_llm_calls = 5 * 1 + 1  # 1 combined call per chunk + 1 batched digest tail
         serial_floor = n_llm_calls * LLM_DELAY + EMBED_DELAY
         savings_target = EMBED_DELAY * 0.30
         assert elapsed < serial_floor - savings_target, (

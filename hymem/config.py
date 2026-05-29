@@ -61,6 +61,11 @@ class HyMemConfig:
     """Hard cap on a user message passed to augment(). Longer queries are
     truncated before FTS/embedding so recall latency stays bounded. 0 disables."""
 
+    working_memory_turns: int = 10
+    """Number of most-recent raw turns for the active session that augment()
+    returns as a working-memory tier, so facts stated this session are
+    recallable before any dream runs. 0 disables."""
+
     fts_top_k: int = 5
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
@@ -125,7 +130,7 @@ class HyMemConfig:
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    prompt_version: str = "v7"
+    prompt_version: str = "v8"
 
     dream_budget: int = 50
     """Maximum number of chunks to process per dreaming cycle."""

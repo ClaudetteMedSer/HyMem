@@ -145,7 +145,9 @@ class HyMem:
 
     # ---- query-time --------------------------------------------------
 
-    def augment(self, user_message: str) -> AugmentedContext:
+    def augment(
+        self, user_message: str, *, session_id: str | None = None
+    ) -> AugmentedContext:
         cap = self.config.max_query_chars
         if cap and len(user_message) > cap:
             log.warning(
@@ -162,6 +164,7 @@ class HyMem:
             embedding_client=self._embed,
             llm=self._llm,
             token_overlap_index=self._token_overlap_index,
+            session_id=session_id,
         )
 
     def timeline(self, entity: str) -> list["TimelineEntry"]:

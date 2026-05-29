@@ -66,12 +66,21 @@ def seed_edge(
 
 
 def make_routed_llm(triples: list[dict], markers: list[dict]) -> StubLLMClient:
-    """Stub that routes triple prompts to one payload and marker prompts to another.
+    """Stub for the merged per-chunk extraction call.
 
-    Distinguishes via unique strings in the respective system prompts.
+    Phase 1 now issues a SINGLE call whose prompt returns a JSON object with
+    both "triples" and "markers". The combined prompt contains both distinctive
+    substrings ("structured technical relationships" and "EXPLICIT behavioral
+    signals"), so a single fixture keyed on either routes to the combined object.
+    The separate-key fixtures are retained so any code still issuing the old
+    standalone triple/marker prompts continues to route correctly.
     """
+    combined = json.dumps({"triples": triples, "markers": markers})
     return StubLLMClient(
         fixtures={
+            # Combined chunk-extraction prompt -> object with both keys.
+            "single pass": combined,
+            # Legacy standalone prompts (extract_triples / extract_markers).
             "structured technical relationships": json.dumps(triples),
             "EXPLICIT behavioral signals": json.dumps(markers),
         },

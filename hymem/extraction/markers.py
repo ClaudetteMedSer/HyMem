@@ -30,6 +30,11 @@ def _parse(raw: str) -> list[Marker]:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return []
+    return markers_from_list(data)
+
+
+def markers_from_list(data: list) -> list[Marker]:
+    """Validate an already-decoded markers array into Marker objects."""
     if not isinstance(data, list):
         return []
 

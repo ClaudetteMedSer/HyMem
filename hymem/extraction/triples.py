@@ -62,15 +62,31 @@ _MAX_PROP_KEY_LEN = 32
 _MAX_PROP_VALUE_LEN = 64
 
 
-def extract_entity_types(raw: str) -> dict[str, str]:
-    """Extract entity type hints from the same LLM response."""
+def _as_item_list(raw: str) -> list:
+    """Decode a raw LLM response into a list of items, tolerating garbage.
+
+    Returns [] for invalid JSON or any non-array payload. The combined-extraction
+    path bypasses this and feeds an already-decoded sub-array into the
+    ``*_from_list`` helpers directly.
+    """
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return {}
+        return []
+    if not isinstance(data, list):
+        return []
+    return data
+
+
+def extract_entity_types(raw: str) -> dict[str, str]:
+    """Extract entity type hints from the same LLM response."""
+    return entity_types_from_list(_as_item_list(raw))
+
+
+def entity_types_from_list(data: list) -> dict[str, str]:
+    """Entity type hints from an already-decoded triples array."""
     if not isinstance(data, list):
         return {}
-
     types: dict[str, str] = {}
     for item in data:
         if not isinstance(item, dict):
@@ -96,10 +112,11 @@ def extract_entity_properties(raw: str) -> dict[str, dict[str, str]]:
         keyed by the entity's surface form, useful when the same entity
         appears in multiple triples in the response.
     """
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
+    return entity_properties_from_list(_as_item_list(raw))
+
+
+def entity_properties_from_list(data: list) -> dict[str, dict[str, str]]:
+    """Entity property hints from an already-decoded triples array."""
     if not isinstance(data, list):
         return {}
 
@@ -142,10 +159,11 @@ def extract_entity_properties(raw: str) -> dict[str, dict[str, str]]:
 
 
 def _parse(raw: str) -> list[Triple]:
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
+    return triples_from_list(_as_item_list(raw))
+
+
+def triples_from_list(data: list) -> list[Triple]:
+    """Validate an already-decoded triples array into Triple objects."""
     if not isinstance(data, list):
         return []
 
