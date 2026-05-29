@@ -77,3 +77,4 @@ pip-delete-this-directory.txt
 *.pyc
 *.pyc
 *.pyc
+*.lock
