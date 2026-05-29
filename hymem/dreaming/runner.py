@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import sqlite3
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -185,15 +186,7 @@ def run_dreaming(
             embed_inflight.append((request, future))
 
         for session_id in target_sessions:
-            # Heartbeat the lease once per session. Sessions are the unit of
-            # slow work (~11s each observed), so refreshing here keeps
-            # acquired_at recent enough that a live dream never crosses the
-            # _LOCK_TTL_SECONDS staleness line — while a crashed holder stops
-            # refreshing and is reclaimed after the TTL. Done OUTSIDE any
-            # core_db.transaction block (autocommit) so the new timestamp is
-            # visible to other connections immediately and is never trapped in
-            # a per-session write transaction.
-            _refresh_lock(conn, holder)
+            _heartbeat()
             report.sessions_processed += 1
             # True once any chunk in this session is freshly extracted this run.
             # Drives the digest skip-guard: an unchanged, already-digested session
@@ -214,6 +207,7 @@ def run_dreaming(
             for chunk in chunks:
                 if chunks_remaining <= 0:
                     break
+                _heartbeat()
                 # Skip chunks already processed with the current prompt version
                 # without consuming the budget, so unprocessed chunks at the tail
                 # of the session list don't get starved.
@@ -276,6 +270,7 @@ def run_dreaming(
                     for chunk in baseline:
                         if chunks_remaining <= 0:
                             break
+                        _heartbeat()
                         chunks_remaining -= 1
                         try:
                             extraction = phase1.extract_chunk_results(
@@ -540,6 +535,11 @@ def run_dreaming(
 
 
 _LOCK_TTL_SECONDS = 120
+
+# How often, at most, a live dream refreshes its lease. Kept well under
+# _LOCK_TTL_SECONDS so even a single ultra-heavy session (hundreds of chunks,
+# many minutes) heartbeats several times before the lock could look stale.
+_LOCK_REFRESH_INTERVAL_SECONDS = 30
 
 
 def _acquire_lock(conn: sqlite3.Connection, holder: str) -> bool:

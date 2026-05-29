@@ -112,16 +112,10 @@ def test_refresh_lock_does_not_touch_other_holders_lock(hy):
     assert after["holder"] == "owner_A"    # not stolen
 
 
-def test_dream_heartbeats_lock_once_per_session(hy, monkeypatch):
-    # A live dream must refresh the lease each session so a slow run never looks
-    # stale. Spy on _refresh_lock and assert it fires once per processed session.
+def _spy_refresh_lock(monkeypatch):
+    """Install a spy over runner._refresh_lock; returns the list of holder args
+    it was called with."""
     import hymem.dreaming.runner as runner_mod
-
-    _seed_session(hy)  # one session
-    hy.set_llm(make_routed_llm(
-        [{"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1}],
-        [],
-    ))
 
     calls: list[str] = []
     real_refresh = runner_mod._refresh_lock
@@ -131,10 +125,47 @@ def test_dream_heartbeats_lock_once_per_session(hy, monkeypatch):
         return real_refresh(conn, holder)
 
     monkeypatch.setattr(runner_mod, "_refresh_lock", _spy)
+    return calls
+
+
+def test_dream_heartbeats_lease_at_least_once(hy, monkeypatch):
+    # A live dream must refresh the lease so a slow run never looks stale. The
+    # heartbeat is throttled (default interval), so a fast test dream fires it
+    # at least once — enough to keep acquired_at fresh.
+    _seed_session(hy)
+    hy.set_llm(make_routed_llm(
+        [{"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1}],
+        [],
+    ))
+
+    calls = _spy_refresh_lock(monkeypatch)
     report = hy.dream()
 
     assert report.sessions_processed >= 1
-    assert len(calls) == report.sessions_processed
+    assert len(calls) >= 1
+
+
+def test_dream_heartbeats_within_a_session_when_interval_elapses(hy, monkeypatch):
+    # The edge case the throttle guards: a single heavy session must heartbeat
+    # *during* its chunk processing, not only at session start. With the
+    # interval forced to 0, every per-chunk heartbeat fires — so a session that
+    # processes at least one chunk produces strictly more than one refresh
+    # (session-top + per-chunk), proving the lease can't age out mid-session.
+    import hymem.dreaming.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "_LOCK_REFRESH_INTERVAL_SECONDS", 0)
+    _seed_session(hy)
+    hy.set_llm(make_routed_llm(
+        [{"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1}],
+        [],
+    ))
+
+    calls = _spy_refresh_lock(monkeypatch)
+    report = hy.dream()
+
+    assert report.chunks_processed >= 1
+    # Session-top heartbeat + at least one per-chunk heartbeat.
+    assert len(calls) >= 2
 
 
 def test_recent_dream_runs_returns_dicts(hy):
