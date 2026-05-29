@@ -148,6 +148,22 @@ def run_dreaming(
         # an earlier chunk in the same cycle. In-memory only; no DB/network I/O.
         in_cycle_edges = phase1.new_in_cycle_pool()
 
+        # Lease heartbeat (throttled). Refreshes the lock at most once per
+        # _LOCK_REFRESH_INTERVAL_SECONDS of wall time. Called per session AND
+        # per chunk so a single very heavy session can't let acquired_at age
+        # past the TTL while the dream is still alive — a crashed holder simply
+        # stops calling this and is reclaimed after the TTL. _last_heartbeat
+        # starts at 0.0 so the first call always fires. _refresh_lock runs
+        # OUTSIDE any core_db.transaction (autocommit) so the new timestamp is
+        # immediately visible to other connections.
+        _last_heartbeat = [0.0]
+
+        def _heartbeat() -> None:
+            now = time.monotonic()
+            if now - _last_heartbeat[0] >= _LOCK_REFRESH_INTERVAL_SECONDS:
+                _refresh_lock(conn, holder)
+                _last_heartbeat[0] = now
+
         def _kickoff_chunk_embed(chunks_list: list[Chunk]) -> None:
             """Cache lookup on the main thread, then submit the embedder call
             to a single-worker background thread so Phase 1 LLM calls keep
