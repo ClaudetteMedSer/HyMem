@@ -489,7 +489,7 @@ def run_dreaming(
         _release_lock(conn, holder)
 
 
-_LOCK_TTL_SECONDS = 300
+_LOCK_TTL_SECONDS = 120
 
 
 def _acquire_lock(conn: sqlite3.Connection, holder: str) -> bool:

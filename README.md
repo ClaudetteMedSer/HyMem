@@ -414,7 +414,7 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 
 **Managed Markdown sections.** `USER.md` and `MEMORY.md` use HTML comment delimiters (`<!-- HyMem:auto:section:start -->` / `<!-- HyMem:auto:section:end -->`). Humans can edit everything outside these sections; HyMem only touches its auto-sections. Atomic writes via tempfile + `os.replace()` prevent corruption.
 
-**Advisory lock with stale takeover.** The `run_lock` table prevents concurrent dreaming cycles. If a holder process crashes, the lock is released after 5 minutes of inactivity so the system doesn't deadlock.
+**Advisory lock with stale takeover.** The `run_lock` table prevents concurrent dreaming cycles. If a holder process crashes, the lock is released after 2 minutes of inactivity so the system doesn't deadlock.
 
 ---
 

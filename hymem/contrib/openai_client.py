@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from hymem.extraction.llm import LLMClient, LLMRequest
+from hymem.extraction.retry import with_retry
 
 
 class OpenAICompatibleClient:
@@ -63,5 +64,8 @@ class OpenAICompatibleClient:
         if request.response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
-        resp = self._client.chat.completions.create(**kwargs)
+        resp = with_retry(
+            lambda: self._client.chat.completions.create(**kwargs),
+            label=f"LLM completion ({self.model})",
+        )
         return resp.choices[0].message.content

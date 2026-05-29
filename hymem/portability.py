@@ -3,8 +3,9 @@
 Emits the canonical HyMem state as JSON Lines — one record per line, each
 ``{"type": <kind>, "record": {...}}`` — preceded by a ``_meta`` header. The
 format is stable and human-inspectable, suitable for backups, project-to-
-project migration, and feeding external tooling. Stays in-process; no service
-layer.
+project migration, and feeding external tooling. Embedded-first: this runs
+in-process against the SQLite file, independent of the optional MCP/Honcho
+server adapters.
 
 Import is additive and idempotent: rows are INSERT-OR-IGNOREd in
 dependency order (sessions before their chunks/episodes/procedures), so

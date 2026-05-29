@@ -44,6 +44,23 @@ class HyMemConfig:
     salience_min_chars: int = 30
     """Minimum chunk size before extraction is attempted."""
 
+    # ---- ingest limits & privacy ------------------------------------------
+    redact_secrets: bool = True
+    """When True, message content is scrubbed for high-confidence secrets
+    (API keys, tokens, private keys, credentials in URLs, emails) before it is
+    written to SQLite, so the on-disk store never holds the raw value. Chunks
+    are derived from already-redacted messages, so this one chokepoint covers
+    the whole pipeline. Set False to store verbatim."""
+
+    max_message_chars: int = 100_000
+    """Hard cap on a single logged message. Longer content is truncated (with a
+    marker appended) before storage so a pathological turn can't bloat the DB or
+    stall extraction. 0 disables the cap."""
+
+    max_query_chars: int = 10_000
+    """Hard cap on a user message passed to augment(). Longer queries are
+    truncated before FTS/embedding so recall latency stays bounded. 0 disables."""
+
     fts_top_k: int = 5
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000

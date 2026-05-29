@@ -268,6 +268,38 @@ def _fts_search(conn: sqlite3.Connection, query: str, *, top_k: int) -> list[Fts
     ]
 
 
+def _embeddings_compatible(conn: sqlite3.Connection, embedder: EmbeddingClient) -> bool:
+    """Guard against querying chunk embeddings written by a *different* model or
+    dimension than the active embedder. A dim mismatch is caught per-vector in
+    the python path, but the vec0 fast path has no such check, and a model swap
+    that keeps the same dim would otherwise return silent garbage. When the
+    stored model/dim disagree with the live client, skip vector search (FTS
+    still runs) and log so the operator can re-embed.
+
+    Checks every distinct (model, dim) pair, not just one row: a mixed corpus
+    (some rows from an old model, some from the new) must still be treated as
+    incompatible unless *all* stored vectors match the active client — otherwise
+    a single matching first row would wave through a partially-stale corpus."""
+    rows = conn.execute(
+        "SELECT DISTINCT model, dim FROM chunk_embeddings"
+    ).fetchall()
+    if not rows:
+        return True  # nothing stored yet — nothing to mismatch
+    mismatched = [
+        (r["model"], r["dim"])
+        for r in rows
+        if r["model"] != embedder.model or r["dim"] != embedder.dim
+    ]
+    if mismatched:
+        log.warning(
+            "vector search skipped: stored embeddings include model/dim %s but "
+            "active client is model=%s dim=%s; re-embed to enable semantic recall",
+            mismatched, embedder.model, embedder.dim,
+        )
+        return False
+    return True
+
+
 def _vector_search(
     conn: sqlite3.Connection,
     embedder: EmbeddingClient,
@@ -278,6 +310,8 @@ def _vector_search(
 ) -> list[FtsHit]:
     from hymem.core import db as core_db
 
+    if not _embeddings_compatible(conn, embedder):
+        return []
     if core_db.has_vec_table(conn):
         return _vec_search(conn, embedder, query, top_k=top_k)
     return _python_cosine_search(conn, embedder, query, top_k=top_k, max_scan=max_scan)

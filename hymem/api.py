@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from hymem import portability
+from hymem import redaction
 from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
@@ -106,7 +107,23 @@ class HyMem:
         with core_db.transaction(self.conn):
             session_log.close_session(self.conn, session_id)
 
+    def _prepare_content(self, content: str) -> str:
+        """Apply the ingest-boundary guards (size cap, then secret redaction)
+        before any message text reaches SQLite. Truncation happens first so the
+        redactor never has to scan an unbounded string."""
+        cap = self.config.max_message_chars
+        if cap and len(content) > cap:
+            log.warning(
+                "log_message: content of %d chars exceeds max_message_chars=%d; truncating",
+                len(content), cap,
+            )
+            content = content[:cap] + "\n[TRUNCATED]"
+        if self.config.redact_secrets:
+            content = redaction.redact(content)
+        return content
+
     def log_message(self, session_id: str, role: str, content: str) -> int:
+        content = self._prepare_content(content)
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
             return session_log.append_message(self.conn, session_id, role, content)
@@ -118,16 +135,24 @@ class HyMem:
 
         One BEGIN IMMEDIATE for the whole batch instead of one per message.
         """
+        prepared = [(role, self._prepare_content(content)) for role, content in turns]
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
             return [
                 session_log.append_message(self.conn, session_id, role, content)
-                for role, content in turns
+                for role, content in prepared
             ]
 
     # ---- query-time --------------------------------------------------
 
     def augment(self, user_message: str) -> AugmentedContext:
+        cap = self.config.max_query_chars
+        if cap and len(user_message) > cap:
+            log.warning(
+                "augment: query of %d chars exceeds max_query_chars=%d; truncating",
+                len(user_message), cap,
+            )
+            user_message = user_message[:cap]
         if self._token_overlap_index is None:
             self._token_overlap_index = build_token_overlap_index(
                 self.read_conn, write_conn=self.conn
