@@ -278,6 +278,51 @@ class HyMem:
             ],
         }
 
+    def apply_behavioral_merges(
+        self, *, cosine_threshold: float | None = None
+    ) -> dict:
+        """Run the behavioral dedup dry-run report, then execute the merges.
+
+        A convenience combining :meth:`behavioral_duplicate_report` and
+        :func:`hymem.dreaming.behavioral_dedup.apply_behavioral_merges` into a
+        single atomic call. Runs inside ``core_db.transaction()`` on the primary
+        connection so failures roll back completely. Returns the merged summary
+        dict from ``apply_behavioral_merges`` with the report appended so the
+        caller can see what was done.
+
+        After merging, the in-memory token-overlap index is invalidated (the
+        graph changed) so the next :meth:`augment` rebuilds it.
+        """
+        from hymem.dreaming import behavioral_dedup
+
+        threshold = (
+            cosine_threshold
+            if cosine_threshold is not None
+            else self.config.behavioral_dedup_cosine_threshold
+        )
+        proposals = behavioral_dedup.find_behavioral_duplicates(
+            self.read_conn, cosine_threshold=threshold
+        )
+        if not proposals:
+            return {
+                "clusters_merged": 0,
+                "edges_retracted": 0,
+                "survivors_updated": 0,
+                "proposals_found": 0,
+            }
+
+        from hymem.core import db as core_db
+
+        with core_db.transaction(self.conn):
+            result = behavioral_dedup.apply_behavioral_merges(self.conn, proposals)
+
+        # Invalidate so next augment rebuilds entity lookups from the slimmed graph.
+        self._token_overlap_index = None
+
+        result["cosine_threshold"] = threshold
+        result["proposals_found"] = len(proposals)
+        return result
+
     def dream_status(self) -> dict:
         """Operator-visibility snapshot of the dreaming/extraction backlog.
 
