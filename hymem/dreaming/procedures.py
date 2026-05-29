@@ -62,9 +62,18 @@ def extract_procedures_for_session(
     except json.JSONDecodeError:
         return ProceduresExtraction()
 
-    if not isinstance(data, list):
-        return ProceduresExtraction()
+    return ProceduresExtraction(items=validate_procedure_items(data))
 
+
+def validate_procedure_items(data: object) -> list[dict]:
+    """Validate raw LLM procedure items into clean dicts ready to persist.
+
+    Shared by the standalone procedure call and the batched session digest.
+    Drops items missing a name or valid steps, renumbers steps from 1, and
+    normalizes triggers/entities. Returns [] for any non-list ``data``.
+    """
+    if not isinstance(data, list):
+        return []
     items: list[dict] = []
     for item in data:
         if not isinstance(item, dict):
@@ -119,7 +128,7 @@ def extract_procedures_for_session(
             "entities_involved": entities,
         })
 
-    return ProceduresExtraction(items=items)
+    return items
 
 
 def persist_procedures(

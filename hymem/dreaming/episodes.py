@@ -54,9 +54,18 @@ def extract_episodes_for_session(
     except json.JSONDecodeError:
         return EpisodesExtraction()
 
-    if not isinstance(data, list):
-        return EpisodesExtraction()
+    return EpisodesExtraction(items=validate_episode_items(data, valid_chunk_ids))
 
+
+def validate_episode_items(data: object, valid_chunk_ids: set[str]) -> list[dict]:
+    """Validate raw LLM episode items into clean dicts ready to persist.
+
+    Shared by the standalone episode call and the batched session digest. Drops
+    items missing title/summary and strips hallucinated chunk_ids not present in
+    the input. Returns [] for any non-list ``data``.
+    """
+    if not isinstance(data, list):
+        return []
     items: list[dict] = []
     for item in data:
         if not isinstance(item, dict):
@@ -77,7 +86,7 @@ def extract_episodes_for_session(
         clean["summary"] = summary.strip()
         clean["chunk_ids"] = chunk_ids
         items.append(clean)
-    return EpisodesExtraction(items=items)
+    return items
 
 
 def _resolve_message_range(

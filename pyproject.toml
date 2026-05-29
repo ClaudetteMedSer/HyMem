@@ -23,6 +23,12 @@ hymem-doctor = "hymem.doctor:main"
 [tool.setuptools.packages.find]
 include = ["hymem*"]
 
+[tool.setuptools.package-data]
+# Ship schema.sql and the migration scripts inside the wheel so
+# importlib.resources.files() can read them on a pip-installed copy.
+"hymem.core" = ["schema.sql"]
+"hymem.core.migrations" = ["*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 from dataclasses import dataclass, field
 from typing import cast
 
 from hymem.core import db as core_db
+from hymem.core.vectors import decode_vector, encode_vector
 from hymem.extraction.embeddings import EmbeddingClient, normalize_text
 
 
@@ -146,7 +146,7 @@ def _fetch_cached_vectors(
         f"WHERE model = ? AND text_hash IN ({placeholders})",
         (model, *unique_hashes),
     ).fetchall()
-    return {r["text_hash"]: json.loads(r["vector_json"]) for r in rows}
+    return {r["text_hash"]: decode_vector(r["vector_json"]) for r in rows}
 
 
 def persist_chunk_embeddings(
@@ -156,6 +156,7 @@ def persist_chunk_embeddings(
     Cache misses are also written to embedding_cache.
     Caller wraps in core_db.transaction()."""
     core_db.ensure_vec_table(conn, pending.dim)
+    has_vec = core_db.has_vec_table(conn, table="vec_chunks")
     for chunk_id, chunk_rowid, vec, text_hash, is_cached in zip(
         pending.ids,
         pending.chunk_rowids,
@@ -169,19 +170,24 @@ def persist_chunk_embeddings(
                 INSERT OR IGNORE INTO embedding_cache(text_hash, model, vector_json, dim)
                 VALUES (?, ?, ?, ?)
                 """,
-                (text_hash, pending.model, json.dumps(vec), len(vec)),
+                (text_hash, pending.model, encode_vector(vec), len(vec)),
             )
         conn.execute(
             """
             INSERT OR REPLACE INTO chunk_embeddings(chunk_id, vector_json, model, dim)
             VALUES (?, ?, ?, ?)
             """,
-            (chunk_id, json.dumps(vec), pending.model, len(vec)),
+            (chunk_id, encode_vector(vec), pending.model, len(vec)),
         )
-        conn.execute(
-            "INSERT OR REPLACE INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
-            (chunk_rowid, core_db._pack_vector(vec)),
-        )
+        if has_vec:
+            # vec0 doesn't support INSERT OR REPLACE on the rowid PK (it raises
+            # UNIQUE constraint failed), so delete any stale row first — same
+            # guard as persist_episode_embeddings.
+            conn.execute("DELETE FROM vec_chunks WHERE rowid = ?", (chunk_rowid,))
+            conn.execute(
+                "INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
+                (chunk_rowid, core_db._pack_vector(vec)),
+            )
     return len(pending.ids)
 
 
@@ -366,14 +372,14 @@ def persist_edge_embeddings(
                 INSERT OR IGNORE INTO embedding_cache(text_hash, model, vector_json, dim)
                 VALUES (?, ?, ?, ?)
                 """,
-                (text_hash, pending.model, json.dumps(vec), len(vec)),
+                (text_hash, pending.model, encode_vector(vec), len(vec)),
             )
         conn.execute(
             """
             INSERT OR REPLACE INTO edge_embeddings(edge_text, vector_json, model, dim)
             VALUES (?, ?, ?, ?)
             """,
-            (text, json.dumps(vec), pending.model, len(vec)),
+            (text, encode_vector(vec), pending.model, len(vec)),
         )
 
     core_db.ensure_vec_table(conn, pending.dim)
@@ -390,7 +396,7 @@ def persist_edge_embeddings(
             ).fetchone()
             if emb is None:
                 continue
-            vec = json.loads(emb["vector_json"])
+            vec = decode_vector(emb["vector_json"])
             conn.execute(
                 "INSERT INTO vec_edges(rowid, embedding) VALUES (?, ?)",
                 (edge_id, core_db._pack_vector(vec)),
@@ -496,7 +502,7 @@ def persist_episode_embeddings(
                 INSERT OR IGNORE INTO embedding_cache(text_hash, model, vector_json, dim)
                 VALUES (?, ?, ?, ?)
                 """,
-                (text_hash, pending.model, json.dumps(vec), len(vec)),
+                (text_hash, pending.model, encode_vector(vec), len(vec)),
             )
         conn.execute(
             """
@@ -508,7 +514,7 @@ def persist_episode_embeddings(
                 dim = excluded.dim,
                 text_hash = excluded.text_hash
             """,
-            (ep_id, json.dumps(vec), pending.model, len(vec), text_hash),
+            (ep_id, encode_vector(vec), pending.model, len(vec), text_hash),
         )
         if has_vec:
             # vec0 doesn't support INSERT OR REPLACE on the rowid PK, so delete

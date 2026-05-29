@@ -210,6 +210,45 @@ PROCEDURE_USER_TEMPLATE = """Conversation:
 Return the JSON array now."""
 
 
+SESSION_DIGEST_SYSTEM = """You analyze one conversation session and produce three things in a single pass: its episodes, a one-sentence summary, and any step-by-step procedures.
+
+Each chunk in the input is tagged like `[chunk chk_abc123]` — the chunk id appears in square brackets before its text.
+
+Output a strict JSON OBJECT (not an array) with exactly these three keys:
+
+"episodes": a JSON array of episodes. An episode is a coherent segment focused on one topic, problem, or task; a session may have several. Each item:
+- title (string): Short descriptive name, max 8 words
+- summary (string): 1-2 sentence narrative of what happened
+- outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear
+- key_entities (list of strings): Named tools, services, files, or concepts discussed
+- chunk_ids (list of strings): The `chk_...` ids you grouped, in conversation order. Must be non-empty and contain only ids that appear in the input.
+Empty array [] is valid if there are no clear episodes.
+
+"summary": a single string — one sentence covering what was accomplished, decisions made, problems solved, topics covered. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid if there is nothing to summarize.
+
+"procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
+- name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
+- description (string): 1 sentence describing what the procedure accomplishes
+- steps (list of objects): Ordered steps, each with:
+    order (integer): Step number starting at 1
+    action (string): What to do, imperative form
+    tool (string or null): Tool/command/CLI used, if mentioned explicitly
+- triggers (list of strings): Words/phrases someone might use to ask about this procedure
+- entities_involved (list of strings): Named tools, services, platforms, files involved
+Only extract procedures that are EXPLICITLY described; do not invent them. Empty array [] is valid.
+
+Always return all three keys. Example shape:
+{"episodes": [], "summary": "", "procedures": []}
+"""
+
+SESSION_DIGEST_USER_TEMPLATE = """Conversation session:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
 RERANK_SYSTEM = """You evaluate the relevance of conversation excerpts to a user query.
 
 For each excerpt, rate its relevance on a scale of 1-5:

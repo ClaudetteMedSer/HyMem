@@ -27,12 +27,13 @@ from hymem.extraction.llm import StubLLMClient
 
 
 def _procedure_llm(items: list[dict]) -> StubLLMClient:
-    """Stub that returns ``items`` for the procedure-extraction prompt and an
-    empty array for every other extraction call (triples, markers, episodes,
-    session-summary). Substring keyed on the unique opener of
-    `PROCEDURE_SYSTEM`."""
+    """Stub that returns ``items`` as the procedures section of the batched
+    session-digest response (episodes/summary empty), and an empty array for
+    every other extraction call (triples, markers). Keyed on the unique digest
+    user-prompt closer ``Return the JSON object now``."""
+    digest = {"episodes": [], "summary": "", "procedures": items}
     return StubLLMClient(
-        fixtures={"step-by-step procedures": json.dumps(items)},
+        fixtures={"Return the JSON object now": json.dumps(digest)},
         default="[]",
     )
 
@@ -222,5 +223,98 @@ def test_procedure_surfaces_via_augment_fts(cfg):
         assert top.steps[0]["action"] == "build the docker image"
         assert top.steps[0]["tool"] == "docker"
         assert top.session_id == sid
+    finally:
+        hy.close()
+
+
+# --- procedural feedback loop (mark_procedure_stale) -----------------------
+
+
+def _seed_one_procedure(cfg) -> tuple[HyMem, str]:
+    """Dream a single 'Deploy to staging' procedure into a fresh HyMem and
+    return (hy, procedure_id) for the surfaced hit."""
+    llm = _procedure_llm([
+        {
+            "name": "Deploy to staging",
+            "description": "Push the latest build to the staging Kubernetes cluster.",
+            "steps": [
+                {"order": 1, "action": "build the docker image", "tool": "docker"},
+                {"order": 2, "action": "kubectl apply the staging manifests", "tool": "kubectl"},
+            ],
+            "triggers": ["deploy staging"],
+            "entities_involved": ["docker", "kubernetes", "staging"],
+        },
+    ])
+    hy = HyMem(cfg, llm=llm)
+    _seed_session(hy, "s_stale", [
+        ("assistant", "how do we deploy to staging again?"),
+        ("user", "Build the docker image and kubectl apply the staging manifests."),
+    ])
+    hy.dream()
+    hit = hy.augment("how do I deploy to staging?").procedures[0]
+    return hy, hit.procedure_id
+
+
+def test_mark_procedure_stale_hides_from_search(cfg):
+    """A procedure marked stale stops surfacing in augment()."""
+    hy, pid = _seed_one_procedure(cfg)
+    try:
+        assert hy.mark_procedure_stale(pid) is True
+
+        ctx = hy.augment("how do I deploy to staging?")
+        assert all(p.procedure_id != pid for p in ctx.procedures), (
+            "stale procedure must not surface via _procedure_search"
+        )
+
+        row = hy.conn.execute(
+            "SELECT status FROM procedures WHERE id = ?", (pid,)
+        ).fetchone()
+        assert row["status"] == "stale"
+    finally:
+        hy.close()
+
+
+def test_mark_procedure_stale_downgrades_confidence(cfg):
+    """Marking stale knocks confidence down by the configured factor."""
+    hy, pid = _seed_one_procedure(cfg)
+    try:
+        before = hy.conn.execute(
+            "SELECT confidence FROM procedures WHERE id = ?", (pid,)
+        ).fetchone()["confidence"]
+        assert before == 1.0  # default for a freshly persisted procedure
+
+        hy.mark_procedure_stale(pid)
+
+        after = hy.conn.execute(
+            "SELECT confidence FROM procedures WHERE id = ?", (pid,)
+        ).fetchone()["confidence"]
+        assert after == before * hy.config.procedure_stale_confidence_factor
+    finally:
+        hy.close()
+
+
+def test_mark_procedure_stale_is_idempotent(cfg):
+    """Second call on an already-stale procedure returns False and does not
+    double-discount confidence."""
+    hy, pid = _seed_one_procedure(cfg)
+    try:
+        assert hy.mark_procedure_stale(pid) is True
+        once = hy.conn.execute(
+            "SELECT confidence FROM procedures WHERE id = ?", (pid,)
+        ).fetchone()["confidence"]
+
+        assert hy.mark_procedure_stale(pid) is False
+        twice = hy.conn.execute(
+            "SELECT confidence FROM procedures WHERE id = ?", (pid,)
+        ).fetchone()["confidence"]
+        assert twice == once
+    finally:
+        hy.close()
+
+
+def test_mark_procedure_stale_unknown_id_returns_false(cfg, stub_llm):
+    hy = HyMem(cfg, llm=stub_llm)
+    try:
+        assert hy.mark_procedure_stale("does-not-exist@proc0") is False
     finally:
         hy.close()

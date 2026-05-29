@@ -113,63 +113,100 @@ These are the candidate next-round improvements, framed for HyMem-as-embedded-
 module (no CLI / service layer) and aligned with the
 2026-05 hardening initiative (operational ease, pip-install simplicity).
 
-### A. Procedural feedback loop  *(small)*
-Symmetric to 3a, but for procedures. When Hermes surfaces a procedure via
-`_procedure_search` and the user marks it as wrong / outdated (a new
-`mark_procedure_stale` API), record it and either downgrade `confidence`
-or skip it in future search. Procedures rot faster than declarative facts
-— a "deploy" runbook from six months ago may be actively misleading — so
-a confidence signal matters more here than for triples.
+### A. Procedural feedback loop  ✅
+- `procedures.status` column (`active`/`stale`) in
+  [hymem/core/schema.sql](core/schema.sql); migration `010` for old DBs.
+- `HyMem.mark_procedure_stale(procedure_id)` in
+  [hymem/api.py](api.py) flips status to `stale` and discounts `confidence`
+  by `cfg.procedure_stale_confidence_factor`. Idempotent, symmetric to
+  `retract_edge`.
+- `_procedure_search` in [hymem/query/augment.py](query/augment.py) filters
+  to `status = 'active'`, so stale procedures stop surfacing.
+- Tested by [tests/test_procedures.py](../tests/test_procedures.py).
 
-### B. Predicate-aware decay rates  *(small)*
-Phase 3 currently applies one decay schedule to all edges. `prefers` /
-`avoids` should decay slower than `uses` / `runs_on`, because preferences
-are stickier than runtime state. Add a small `predicate -> half_life_days`
-map to `HyMemConfig` and have `phase3.decay` consult it.
+### B. Predicate-aware decay rates  ✅
+- `HyMemConfig.predicate_half_life_days` is a tiered map: ~90d for
+  preference predicates (`prefers`/`avoids`/`rejects`), ~60d for structural /
+  dependency predicates (`depends_on`/`requires_version`/`part_of`/
+  `implements`) so real dependencies don't decay before reinforcement, and a
+  fallback to `decay_window_days` (30d) for volatile runtime predicates
+  (`uses`/`runs_on`/`deploys_to`/...).
+- `phase3.decay` in [hymem/dreaming/phase3.py](dreaming/phase3.py) groups
+  active edges by predicate and applies the per-predicate window to the
+  negative-bump eligibility check (the recency probe stays global).
+- Tested by [tests/test_dreaming.py](../tests/test_dreaming.py).
 
-### C. Schema migration runner  *(operational)*
-`schema_meta.schema_version` is set to `'1'` but no actual migration
-runner exists — the schema is forward-only via `CREATE TABLE IF NOT
-EXISTS`. As columns evolve (we've quietly added `summary`, `derived`,
-`value_*`, `temporal_scope` etc.), an out-of-date database will silently
-miss them. A small runner in `core/db.py` that compares
-`schema_version` and applies migration scripts under
-`hymem/core/migrations/` would harden upgrade paths — important for the
-pip-install path where users may carry old DBs forward.
+### C. Schema migration runner  ✅
+- Forward-only migrations now live as `NNN_*.sql` files under
+  [hymem/core/migrations/](core/migrations/); the runner in
+  [hymem/core/db.py](core/db.py) discovers them, applies any whose version
+  exceeds the DB's `schema_version` (statement-by-statement, tolerating
+  idempotency errors), and bumps the version. `schema.sql` stays the
+  fresh-DB baseline; `pyproject.toml` ships the `.sql` files in the wheel.
+- **Gotcha (learned the hard way):** `initialize()` runs `schema.sql` via
+  `executescript()` *before* migrations. On an existing DB, `CREATE TABLE IF
+  NOT EXISTS` is a no-op, so any **standalone** statement in `schema.sql` that
+  references a migration-added column (a `CREATE INDEX`, a separate `ALTER`,
+  …) crashes with "no such column". Such index/constraint statements must
+  live in the migration file ONLY; the column may still sit in the
+  `CREATE TABLE` (no-op on old DBs). This bit `idx_procedures_status` and is
+  now documented in `schema.sql`.
+- Tested by [tests/test_migrations.py](../tests/test_migrations.py) — including
+  a regression test that drives the real `initialize()` path against a
+  pre-v10 DB (not just `_run_migrations` in isolation, the gap that let the
+  index bug ship).
 
-### D. Speaker-weighted evidence  *(medium)*
-Right now every chunk contributes equally to edge evidence. Triples
-extracted from user-authored chunks should carry more weight than ones
-from assistant turns (which can be confabulated). Plumb the role of the
-chunk's first message into `kg_evidence` and let phase 3 weight
-`pos_evidence` accordingly. Small schema change, modest extraction
-change, large quality win on noisy logs.
+### D. Speaker-weighted evidence  ✅
+- `kg_evidence.source_role` column in
+  [hymem/core/schema.sql](core/schema.sql); migration `011`.
+- `phase1.persist_chunk_results` records the role of the chunk's first
+  message and weights the positive `pos_evidence` bump by
+  `cfg.evidence_role_weights` (default `{"user": 2}`); `phase3.reinforce`
+  applies the same weight to co-mention reinforcement. Assistant-prefixed
+  chunks keep weight 1, so the change is a no-op for the common case and
+  boosts unprompted user-opened chunks.
+- Tested by [tests/test_speaker_weighting.py](../tests/test_speaker_weighting.py).
 
-### E. Triple semantic dedup at extraction time  *(medium)*
-We already have `edge_embeddings` keyed on triple text. Before inserting
-a new `(s, p, o)`, look up nearest existing edges by vector and, if one
-is within a tight cosine threshold, attach the new evidence to it
-instead of creating a near-duplicate. Bounds the unbounded growth of
-sibling canonicals like `"uv"` / `"uv_pip"` / `"uv_package_manager"`.
+### E. Triple semantic dedup at extraction time  ✅
+- `_find_near_duplicate_edge` in [hymem/dreaming/phase1.py](dreaming/phase1.py):
+  before minting a new edge it looks for an existing near-duplicate to attach
+  evidence to. Three independent gates must all pass: (1) **predicate** matches
+  exactly (`uses` / `avoids` never collapse); (2) **structure** — the existing
+  edge shares the candidate's subject *or* object exactly, so only the other
+  endpoint varies (a sibling canonical, not a different fact); (3) **lexical +
+  cosine** — the varying endpoint is a lexical sibling
+  (`cfg.triple_dedup_lexical_ratio`, shared token / substring / difflib ratio)
+  *and* the triple-text cosine clears `cfg.triple_dedup_cosine_threshold`
+  (0.97). The lexical gate stops false merges of short, embedding-close names
+  (`redis` / `redash`). Gated on `cfg.triple_dedup_enabled` + an embedding
+  client.
+- Tested by [tests/test_dedup.py](../tests/test_dedup.py).
 
-### F. Temporal / first-seen queries  *(small)*
-`knowledge_graph.first_seen` exists but nothing reads it. Expose
-`hy.timeline(entity)` returning the first-seen edge per predicate for an
-entity, so Hermes can answer "when did we start using Postgres?" without
-re-asking. Tiny API surface, no new schema.
+### F. Temporal / first-seen queries  ✅
+- `query.entities.timeline` + `HyMem.timeline(entity)` in
+  [hymem/api.py](api.py) return the first-seen active edge per predicate for
+  an entity (resolved through aliases), oldest first, reading
+  `knowledge_graph.first_seen`. No new schema.
+- Tested by [tests/test_timeline.py](../tests/test_timeline.py).
 
-### G. Memory export / import  *(operational)*
-A `hy.export(path)` that emits the canonical state as JSONL (sessions,
-chunks, edges, episodes, procedures, profile entries) and an `import`
-counterpart. Useful for backups, project-to-project migration, and giving
-external tools a stable inspection format. Stays in-process; no service
-layer required.
+### G. Memory export / import  ✅
+- [hymem/portability.py](portability.py) emits the canonical state as JSON
+  Lines (a `_meta` header then `{"type", "record"}` rows for sessions,
+  chunks, edges, episodes, procedures, profile entries). `HyMem.export(path)`
+  / `HyMem.import_(path)` in [hymem/api.py](api.py) wrap it. Import is
+  additive + idempotent (INSERT-OR-IGNORE, sessions first; autoincrement ids
+  dropped so they dedupe on natural keys) and keeps FTS shadow tables in sync.
+- Tested by [tests/test_portability.py](../tests/test_portability.py).
 
-### H. Retrieval explainability for FTS / episode / procedure hits  *(small)*
-`AugmentedContext.graph_facts` carries `why_retrieved`; FTS hits and
-episodes/procedures don't. Add a short reason chip
-(`fts_match("postgres pool")`, `vec_topk(rrf=0.024)`, `procedure_fts`) to
-each, so downstream prompts can quote the reason instead of guessing.
+### H. Retrieval explainability for FTS / episode / procedure hits  ✅
+- `FtsHit`, `EpisodeHit`, and `ProcedureHit` in
+  [hymem/query/augment.py](query/augment.py) now carry `why_retrieved` reason
+  chips, mirroring `GraphFact`: `fts_match("postgres deploy")`,
+  `vec_topk(sim=0.82)`, `rrf(fts+vec, 0.0240)`, `episode_fts(...)`,
+  `procedure_fts(...)`, and a `reranked` tag when the reranker reorders.
+- Tested by [tests/test_explainability.py](../tests/test_explainability.py).
+- **Not yet surfaced downstream:** the chips live on the Python hit objects
+  only — they don't reach the Honcho API response. See item L below.
 
 ### I. PII / secret redaction at chunk creation  *(security)*
 Chunks are stored verbatim. A small redactor in
@@ -191,3 +228,38 @@ scope. Add a small test that seeds a Dutch chunk ("we gebruiken Postgres
 voor de gebruikersdienst") and asserts canonicalization treats
 `postgres` the same as it would for the English equivalent. Likely
 already correct; just unverified.
+
+### L. Surface why_retrieved chips through the Honcho API  *(small)*
+Item H added `why_retrieved` reason chips to `FtsHit` / `EpisodeHit` /
+`ProcedureHit`, but they live on the Python hit objects only — they don't
+reach the Honcho API response, so an external (non-in-process) consumer still
+can't see *why* a hit surfaced. Plumb the chips into the Honcho
+`get_context` / search response shape in `hymem/honcho/` (adapters + models)
+so downstream consumers can quote the reason instead of guessing. Focused
+change: thread the field through the response serialization plus a contract
+test asserting the chips round-trip. Mirrors how `GraphFact.why_retrieved`
+should also be exposed there.
+
+### M. Batched per-session digest + skip-guard  ✅
+- The dream cycle's per-session tail used to make **three** LLM calls
+  (episodes, summary, procedures), each re-reading nearly the same session
+  text. [hymem/dreaming/digest.py](dreaming/digest.py) `extract_session_digest`
+  now produces all three in **one** call returning a single JSON object,
+  driven by `SESSION_DIGEST_SYSTEM` in
+  [hymem/extraction/prompts/__init__.py](extraction/prompts/__init__.py). The
+  per-kind validators were extracted into reusable helpers
+  (`validate_episode_items` / `validate_procedure_items` / `clean_summary`) so
+  the standalone `extract_*_for_session` functions and the batched path share
+  identical logic. Knobs: `dream_digest_max_tokens` (3072),
+  `dream_digest_max_chars` (12000) in [hymem/config.py](config.py).
+- **Skip-guard:** `sessions.digested_prompt_version` (migration `012`) records
+  the prompt_version of the last successful digest. The runner
+  ([hymem/dreaming/runner.py](dreaming/runner.py)) skips the digest call
+  entirely when this matches the current prompt_version *and* no chunk was
+  freshly extracted this run — so steady-state re-dreams of unchanged sessions
+  cost **zero** tail calls. The marker is set only after a successful persist,
+  so a failed call retries next run; a prompt_version bump or new chunks force
+  a re-digest. Operator-curated summaries are preserved (never overwritten).
+- Tested by [tests/test_digest.py](../tests/test_digest.py); the existing
+  episode/summary/procedure dream-level tests were migrated to the digest-shaped
+  stub.

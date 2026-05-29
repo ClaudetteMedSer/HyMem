@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from pathlib import Path
 from typing import Iterable
 
+from hymem import portability
 from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
@@ -13,6 +15,7 @@ from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
 from hymem.query.conflicts import Conflict, find_conflicts
+from hymem.query.entities import TimelineEntry, timeline as query_timeline
 
 log = logging.getLogger("hymem.api")
 
@@ -136,6 +139,15 @@ class HyMem:
             token_overlap_index=self._token_overlap_index,
         )
 
+    def timeline(self, entity: str) -> list["TimelineEntry"]:
+        """First-seen active edge per predicate for `entity`, oldest first.
+
+        Answers "when did we start using X?" from `knowledge_graph.first_seen`
+        without re-asking the user. `entity` may be a surface form; it's
+        resolved through the alias table. Read-only.
+        """
+        return query_timeline(self.read_conn, entity)
+
     def conflicts(self) -> list[Conflict]:
         """Return detected contradictions in the knowledge graph. Read-only.
 
@@ -181,6 +193,26 @@ class HyMem:
             "SELECT * FROM dream_runs ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---- portability -------------------------------------------------
+
+    def export(self, path: str | Path) -> dict[str, int]:
+        """Write the canonical state (sessions, chunks, edges, episodes,
+        procedures, profile entries) to `path` as JSON Lines. Returns per-kind
+        row counts. Useful for backups, project migration, and external
+        inspection. Read-only.
+        """
+        return portability.export_jsonl(self.conn, path)
+
+    def import_(self, path: str | Path) -> dict[str, int]:
+        """Load a JSON Lines export written by `export()`. Additive and
+        idempotent (INSERT-OR-IGNORE, sessions first); returns per-kind counts
+        of rows inserted. Best run against a fresh database. Invalidates the
+        query-side caches afterwards.
+        """
+        result = portability.import_jsonl(self.conn, path)
+        self._token_overlap_index = None
+        return result
 
     # ---- maintenance -------------------------------------------------
 
@@ -256,4 +288,33 @@ class HyMem:
                         "DELETE FROM token_overlap_index WHERE canonical = ?", (c,)
                     )
         self._token_overlap_index = None
+        return True
+
+    def mark_procedure_stale(self, procedure_id: str) -> bool:
+        """Flag a procedure as wrong / outdated. Idempotent. Returns True if an
+        active procedure was found and updated, False otherwise.
+
+        Symmetric to `retract_edge`, but for procedural memory: when Hermes
+        surfaces a procedure via `augment()` (a `ProcedureHit`) and the user
+        marks it stale, the row is flipped to status='stale' — which removes it
+        from future `_procedure_search` results — and its `confidence` is
+        knocked down by `cfg.procedure_stale_confidence_factor` so the negative
+        signal survives even if the procedure is later re-extracted.
+
+        Only acts on procedures with status='active'; calling again on an
+        already-stale procedure returns False.
+        """
+        with core_db.transaction(self.conn):
+            row = self.conn.execute(
+                "SELECT id FROM procedures WHERE id = ? AND status = 'active'",
+                (procedure_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            self.conn.execute(
+                "UPDATE procedures "
+                "SET status = 'stale', confidence = confidence * ? "
+                "WHERE id = ?",
+                (self.config.procedure_stale_confidence_factor, procedure_id),
+            )
         return True

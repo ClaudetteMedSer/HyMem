@@ -24,11 +24,15 @@ from hymem.extraction.llm import StubLLMClient
 
 
 def _summary_llm(summary: str) -> StubLLMClient:
-    """Stub that returns ``summary`` for the session-summary prompt and an
-    empty array for any other extraction call. Substring keyed on the unique
-    opener of `SESSION_SUMMARY_SYSTEM`."""
+    """Stub that returns ``summary`` as the summary section of the batched
+    session-digest response (episodes/procedures empty), and an empty array for
+    any other extraction call. Keyed on the unique digest user-prompt closer
+    ``Return the JSON object now``."""
+    import json
+
+    digest = {"episodes": [], "summary": summary, "procedures": []}
     return StubLLMClient(
-        fixtures={"one-sentence summary": summary},
+        fixtures={"Return the JSON object now": json.dumps(digest)},
         default="[]",
     )
 

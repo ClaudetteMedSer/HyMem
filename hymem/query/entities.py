@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from dataclasses import dataclass
 
-from hymem.dreaming.canonicalize import normalize
+from hymem.dreaming.canonicalize import normalize, resolve
 
 # First char must be a Unicode letter (so accented Latin words like "préfère"
 # tokenize whole instead of being shredded at the accent); body allows letters,
@@ -68,3 +69,51 @@ def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
         candidates_list + candidates_list + candidates_list,
     ).fetchall()
     return [r[0] for r in rows]
+
+
+@dataclass
+class TimelineEntry:
+    """The earliest active edge involving an entity, per predicate."""
+    predicate: str
+    subject: str
+    object: str
+    first_seen: str
+    status: str
+
+
+def timeline(conn: sqlite3.Connection, entity: str) -> list[TimelineEntry]:
+    """First-seen active edge per predicate for `entity` (as subject or object),
+    oldest first — so Hermes can answer "when did we start using Postgres?"
+    without re-asking. Reads `knowledge_graph.first_seen`; no new schema.
+
+    `entity` is resolved through the alias table, so a surface form
+    ("Postgres") maps to its canonical id ("postgres").
+    """
+    canon = resolve(conn, entity)
+    rows = conn.execute(
+        """
+        SELECT predicate, subject_canonical, object_canonical, first_seen, status
+        FROM (
+            SELECT predicate, subject_canonical, object_canonical, first_seen, status,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY predicate ORDER BY first_seen ASC, id ASC
+                   ) AS rn
+            FROM knowledge_graph
+            WHERE status = 'active'
+              AND (subject_canonical = ? OR object_canonical = ?)
+        )
+        WHERE rn = 1
+        ORDER BY first_seen ASC, predicate ASC
+        """,
+        (canon, canon),
+    ).fetchall()
+    return [
+        TimelineEntry(
+            predicate=r["predicate"],
+            subject=r["subject_canonical"],
+            object=r["object_canonical"],
+            first_seen=r["first_seen"],
+            status=r["status"],
+        )
+        for r in rows
+    ]

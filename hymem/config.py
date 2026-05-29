@@ -4,6 +4,38 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _default_evidence_role_weights() -> dict[str, int]:
+    # Weight a positive evidence row by the role of its chunk's first message.
+    # The chunker prefixes a user turn with the preceding assistant turn, so an
+    # assistant-prefixed chunk (the common case) keeps weight 1 — unchanged from
+    # the historical +1 — while a chunk the *user* opens (an unprompted, self-
+    # initiated assertion, not an agreement with possibly-confabulated assistant
+    # context) counts double. Roles absent from the map fall back to 1.
+    return {"user": 2}
+
+
+def _default_predicate_half_life_days() -> dict[str, float]:
+    # Tiered eligibility windows for phase-3 decay. Longer = decays slower.
+    #   ~90d  preference/avoidance — a user's "prefers uv" holds long after the
+    #         last mention.
+    #   ~60d  structural / dependency — a dependency or composition rarely
+    #         changes without an explicit conversation, so it shouldn't accrue
+    #         soft-contradiction negatives and get retracted before it's
+    #         reinforced.
+    # Volatile runtime predicates (uses, runs_on, deploys_to, connects_to,
+    # configured_with, ...) are intentionally absent and fall back to the
+    # global decay_window_days.
+    return {
+        "prefers": 90.0,
+        "avoids": 90.0,
+        "rejects": 90.0,
+        "depends_on": 60.0,
+        "requires_version": 60.0,
+        "part_of": 60.0,
+        "implements": 60.0,
+    }
+
+
 @dataclass(frozen=True)
 class HyMemConfig:
     root: Path
@@ -51,6 +83,16 @@ class HyMemConfig:
     decay_factor: float = 0.9
     retract_threshold: float = 0.15
 
+    predicate_half_life_days: dict[str, float] = field(
+        default_factory=_default_predicate_half_life_days
+    )
+    """Per-predicate eligibility window (in days) for phase-3 decay. An active,
+    unreinforced edge is only considered for a negative-evidence bump once it
+    hasn't been reinforced for this many days. Sticky predicates (prefers /
+    avoids / rejects) use a longer window so they decay slower than volatile
+    runtime predicates. Predicates absent from the map fall back to
+    `decay_window_days`."""
+
     zombie_neg_threshold: int = 2
     """Negative-dominance offset in the auto-retract rule
     `neg_evidence >= 2 * pos_evidence + zombie_neg_threshold`. At pos=0 this
@@ -76,11 +118,47 @@ class HyMemConfig:
     non-salience-marked chunks (newest first) per cycle. Guarantees every chunk
     eventually flows through extraction even if it didn't trip the regexes."""
 
+    dream_digest_max_tokens: int = 3072
+    """max_tokens for the batched per-session digest call (episodes + summary +
+    procedures in one JSON object). Larger than the 1024 LLMRequest default
+    because the combined output is roughly three responses' worth."""
+
+    dream_digest_max_chars: int = 12000
+    """Char cap on the session text fed to the digest call (the larger of the
+    pre-batching episode/procedure caps)."""
+
     max_chunks: int = 50000
     """Soft cap on total stored chunks. Excess unreferenced chunks are pruned."""
 
     retention_days: int = 90
-    """Chunks newer than this are always kept regardless of graph references."""
+    """Chunks newer than this are always kept regardless of graph references.
+    Also the age window for pruning old episodes and stale procedures."""
+
+    message_retention_days: int = 90
+    """Raw messages of a session are pruned once the session is older than this
+    AND carries a non-null summary. The summary gate means this is a no-op in
+    stub/no-LLM deployments where summaries are never generated, so the only
+    copy of unreconstructable data is never destroyed."""
+
+    tombstone_retention_days: int = 30
+    """Retracted knowledge_graph edges (and their cascaded kg_evidence) are
+    hard-deleted once last_seen is older than this. Active/derived edges are
+    untouched (derived edges are rebuilt each cycle)."""
+
+    dream_runs_keep: int = 500
+    """Max dream_runs rows retained; older rows are pruned (newest kept)."""
+
+    extraction_feedback_keep: int = 200
+    """Max extraction_feedback rows retained (newest kept). Comfortably above
+    the 10 the runner injects as negative examples."""
+
+    vacuum_after_prune: bool = True
+    """Run VACUUM after a dream cycle whose sweeps deleted rows, to return freed
+    pages to the OS (plain DELETE leaves the file size flat)."""
+
+    vacuum_min_pruned: int = 100
+    """Minimum rows pruned in a cycle before VACUUM fires, so trivial sweeps
+    don't pay the full-rewrite cost."""
 
     rerank_ambiguity_threshold: float = 0.6
     """Minimum RRF score drop between #1/#2 results to consider them clear
@@ -110,6 +188,42 @@ class HyMemConfig:
     """A GraphFact with fewer than this many total evidence rows
     (pos + neg) is flagged `hedge_recommended` regardless of confidence —
     one early extraction shouldn't read as assertive context indefinitely."""
+
+    evidence_role_weights: dict[str, int] = field(
+        default_factory=_default_evidence_role_weights
+    )
+    """Per-role positive-evidence weight, keyed on the role of a chunk's first
+    message. Applied when a positive triple bumps `pos_evidence` (phase 1) and
+    when co-mention reinforcement fires (phase 3). Roles absent from the map use
+    weight 1, so the change is a no-op for assistant-prefixed chunks."""
+
+    triple_dedup_enabled: bool = True
+    """When True and an embedding client is available, a brand-new triple is
+    checked against existing same-predicate edges by vector similarity before a
+    new edge is created (see `triple_dedup_cosine_threshold`)."""
+
+    triple_dedup_cosine_threshold: float = 0.97
+    """Cosine-similarity cutoff for `triple_dedup_enabled`. A new
+    `(subject, predicate, object)` whose embedded triple text is at least this
+    similar to an existing active edge with the *same predicate* attaches its
+    evidence to that edge instead of spawning a near-duplicate (e.g. `app uses
+    uv` vs `app uses uv_pip`). Kept tight — only collapses genuine siblings."""
+
+    triple_dedup_lexical_ratio: float = 0.85
+    """Lexical-sibling guard for dedup, applied *in addition* to the cosine
+    threshold. A near-duplicate edge must also share its subject or object with
+    the candidate exactly, and the differing entity must be lexically similar —
+    share an underscore token, be a substring, or have a difflib ratio at least
+    this high. Stops false merges of short, embedding-close-but-distinct names
+    (`redis` vs `redash`) that the cosine gate alone would collapse."""
+
+    procedure_stale_confidence_factor: float = 0.5
+    """Multiplier applied to a procedure's `confidence` when
+    `mark_procedure_stale` flags it. The status flip already removes it from
+    `_procedure_search`; the confidence haircut records the negative signal so
+    a later re-extraction starts from a discounted prior rather than 1.0.
+    Procedures rot faster than triples — a stale runbook is actively
+    misleading — so the signal is retained even after the row is hidden."""
 
     @property
     def db_path(self) -> Path:

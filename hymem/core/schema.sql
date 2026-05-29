@@ -1,4 +1,15 @@
--- HyMem schema. All migrations are forward-only; bump schema_version below.
+-- HyMem schema for a fresh database. Forward-only upgrades for existing DBs
+-- live as NNN_*.sql files under hymem/core/migrations/, applied by the runner
+-- in db.py. Keep this file and the migrations in sync: a column added here must
+-- also have a migration so old databases pick it up.
+--
+-- CRITICAL: this file runs via executescript() BEFORE migrations. An existing
+-- table is left untouched by `CREATE TABLE IF NOT EXISTS`, so any *standalone*
+-- statement here that references a migration-added column (a `CREATE INDEX`, a
+-- separate `ALTER`, etc.) will crash on old DBs with "no such column". Such
+-- index/constraint statements must live in the migration file ONLY. The column
+-- may still appear in the `CREATE TABLE` above (harmless no-op on old DBs,
+-- correct on fresh ones).
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
@@ -14,7 +25,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     ended_at TIMESTAMP,
-    summary TEXT
+    summary TEXT,
+    -- prompt_version of the last successful session digest (episodes+summary
+    -- +procedures). The dream runner skips the per-session digest LLM call when
+    -- this matches the current prompt_version and no chunk was re-extracted.
+    -- Migration 012 adds this for existing DBs (ALTER lives there only).
+    digested_prompt_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -174,6 +190,7 @@ CREATE TABLE IF NOT EXISTS kg_evidence (
     value_numeric REAL,
     value_unit TEXT,
     temporal_scope TEXT,
+    source_role TEXT,
     extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(edge_id, chunk_id, polarity)
 );
@@ -276,10 +293,18 @@ CREATE TABLE IF NOT EXISTS procedures (
     triggers TEXT NOT NULL DEFAULT '[]',
     entities_involved TEXT NOT NULL DEFAULT '[]',
     confidence REAL NOT NULL DEFAULT 1.0,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','stale')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);
 CREATE INDEX IF NOT EXISTS idx_procedures_entities ON procedures(entities_involved);
+-- NOTE: the index on procedures.status lives ONLY in migration
+-- 010_procedure_status.sql, never here. schema.sql runs via executescript()
+-- BEFORE migrations, so on an existing pre-v10 DB the `procedures` table is
+-- already present (CREATE TABLE IF NOT EXISTS is a no-op) and lacks `status`;
+-- a `CREATE INDEX ... ON procedures(status)` here would crash with
+-- "no such column: status". General rule: any index/constraint referencing a
+-- migration-added column belongs in the migration file only.
 
 CREATE VIRTUAL TABLE IF NOT EXISTS procedures_fts USING fts5(
     name, description, steps,

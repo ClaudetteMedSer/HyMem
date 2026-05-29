@@ -1,0 +1,168 @@
+"""Tests for the file-based schema migration runner (db._run_migrations and
+its helpers). Migrations live as ``NNN_*.sql`` under hymem/core/migrations/;
+the runner applies any whose version exceeds the DB's schema_version and is
+idempotent against a fresh schema.sql database.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from hymem.core import db as core_db
+
+
+def _cols(conn, table) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _has_table(conn, name) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+# --- discovery -------------------------------------------------------------
+
+
+def test_discover_migrations_is_contiguous_and_sorted():
+    versions = [v for v, _ in core_db._discover_migrations()]
+    assert versions == sorted(versions)
+    # Migrations start at v2 (v1 is the schema.sql baseline) and reach the
+    # version the code expects.
+    assert versions[0] == 2
+    assert versions[-1] == core_db.EXPECTED_SCHEMA_VERSION
+    assert versions == list(range(2, core_db.EXPECTED_SCHEMA_VERSION + 1))
+
+
+# --- statement splitter ----------------------------------------------------
+
+
+def test_split_keeps_trigger_body_intact():
+    """A CREATE TRIGGER ... BEGIN ...; ...; END; block is one statement, even
+    though its body contains semicolons."""
+    script = """
+    -- a comment line
+    ALTER TABLE t ADD COLUMN c TEXT;
+    CREATE TRIGGER IF NOT EXISTS trg AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('a');
+        INSERT INTO log VALUES ('b');
+    END;
+    """
+    stmts = core_db._split_sql_statements(script)
+    assert len(stmts) == 2
+    assert stmts[0].startswith("ALTER TABLE")
+    assert stmts[1].startswith("CREATE TRIGGER")
+    # Both inner inserts survive inside the single trigger statement.
+    assert stmts[1].count("INSERT INTO log") == 2
+    assert stmts[1].rstrip().endswith("END;")
+
+
+# --- fresh database --------------------------------------------------------
+
+
+def test_fresh_db_lands_at_expected_version(tmp_path: Path):
+    conn = core_db.connect(tmp_path / "fresh.sqlite")
+    core_db.initialize(conn)
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+    # schema.sql already creates these; the no-op migrations didn't clobber them.
+    assert "status" in _cols(conn, "procedures")
+    assert "temporal_scope" in _cols(conn, "kg_evidence")
+    conn.close()
+
+
+def test_rerunning_migrations_is_a_noop(tmp_path: Path):
+    """Applying migrations against an already-current DB raises nothing and
+    leaves the version unchanged."""
+    conn = core_db.connect(tmp_path / "rerun.sqlite")
+    core_db.initialize(conn)
+    v1 = core_db.schema_version(conn)
+    core_db._run_migrations(conn)  # second pass
+    assert core_db.schema_version(conn) == v1
+    conn.close()
+
+
+# --- legacy database upgrade -----------------------------------------------
+
+
+def test_initialize_on_existing_pre_v10_db_does_not_crash(tmp_path: Path):
+    """Regression: initialize() runs schema.sql via executescript() BEFORE
+    migrations. An existing `procedures` table predating the v10 `status`
+    column is left untouched by CREATE TABLE IF NOT EXISTS, so a
+    `CREATE INDEX ... ON procedures(status)` in schema.sql would crash it with
+    "no such column: status". That index must live in migration 010 only.
+
+    Exercises the *real* startup path (initialize), not just _run_migrations —
+    the gap that let the bug ship.
+    """
+    conn = core_db.connect(tmp_path / "pre_v10.sqlite")
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta VALUES ('schema_version', '9');
+        CREATE TABLE procedures (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            steps TEXT NOT NULL DEFAULT '[]',
+            triggers TEXT NOT NULL DEFAULT '[]',
+            entities_involved TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    # Must not raise on the schema.sql pass, then migrate forward.
+    core_db.initialize(conn)
+
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+    assert "status" in _cols(conn, "procedures")
+    idx = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='index' AND name='idx_procedures_status'"
+    ).fetchone()
+    assert idx is not None, "migration 010 must create the status index"
+    conn.close()
+
+
+def test_legacy_v1_db_upgrades_and_gains_columns(tmp_path: Path):
+    """A pre-migration (v1) database carrying only the original tables is
+    walked forward to the latest version, picking up every additive column,
+    table, and the trigger-bearing v8 migration."""
+    conn = core_db.connect(tmp_path / "legacy.sqlite")
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta VALUES ('schema_version', '1');
+        CREATE TABLE sessions(id TEXT PRIMARY KEY);
+        CREATE TABLE chunks(id TEXT PRIMARY KEY);
+        CREATE TABLE kg_evidence(id INTEGER PRIMARY KEY, edge_id INTEGER,
+            chunk_id TEXT, polarity INTEGER);
+        CREATE TABLE knowledge_graph(id INTEGER PRIMARY KEY,
+            subject_canonical TEXT, predicate TEXT, object_canonical TEXT);
+        CREATE TABLE dream_runs(id INTEGER PRIMARY KEY);
+        CREATE TABLE episodes(id TEXT PRIMARY KEY, title TEXT, summary TEXT);
+        CREATE VIRTUAL TABLE episodes_fts USING fts5(title, summary,
+            content=episodes, content_rowid=rowid);
+        CREATE TABLE procedures(id TEXT PRIMARY KEY, confidence REAL DEFAULT 1.0);
+        """
+    )
+
+    core_db._run_migrations(conn)
+
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+    assert "temporal_scope" in _cols(conn, "kg_evidence")  # v2
+    assert "summary" in _cols(conn, "sessions")             # v3
+    assert "derived" in _cols(conn, "knowledge_graph")      # v4
+    assert _has_table(conn, "extraction_feedback")          # v5
+    assert _has_table(conn, "edge_embeddings")              # v6
+    assert _has_table(conn, "token_overlap_index")          # v7
+    assert _has_table(conn, "episode_embeddings")           # v8 (alongside trigger)
+    assert _has_table(conn, "entity_properties")            # v9
+    assert "status" in _cols(conn, "procedures")            # v10
+    assert "source_role" in _cols(conn, "kg_evidence")      # v11
+    conn.close()
