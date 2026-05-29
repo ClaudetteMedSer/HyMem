@@ -222,6 +222,62 @@ class HyMem:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def behavioral_duplicate_report(
+        self, *, cosine_threshold: float | None = None
+    ) -> dict:
+        """Dry-run report of pre-existing behavioral edges (`prefers` / `avoids`
+        / `rejects`) that would collapse if merged on semantic similarity alone.
+
+        Read-only — writes nothing, makes no embedding-API call (it reuses cached
+        `edge_embeddings` vectors). Surfaces the proliferation that predates
+        same-wave collapse so an operator can decide whether a future apply step
+        is worth running. `cosine_threshold` overrides
+        `config.behavioral_dedup_cosine_threshold`; lower it to see more
+        aggressive merges, raise it for only the closest paraphrases.
+
+        Returns ``{cosine_threshold, clusters, edges_collapsed, merges}`` where
+        each merge names the proposed survivor and the members that would fold
+        into it (with each member's cosine to the survivor).
+        """
+        from hymem.dreaming import behavioral_dedup
+
+        threshold = (
+            cosine_threshold
+            if cosine_threshold is not None
+            else self.config.behavioral_dedup_cosine_threshold
+        )
+        proposals = behavioral_dedup.find_behavioral_duplicates(
+            self.read_conn, cosine_threshold=threshold
+        )
+        return {
+            "cosine_threshold": threshold,
+            "clusters": len(proposals),
+            "edges_collapsed": sum(p.collapses for p in proposals),
+            "merges": [
+                {
+                    "subject": p.subject,
+                    "predicate": p.predicate,
+                    "survivor": {
+                        "edge_id": p.survivor_id,
+                        "object": p.survivor_object,
+                        "pos_evidence": p.survivor_pos,
+                        "neg_evidence": p.survivor_neg,
+                    },
+                    "members": [
+                        {
+                            "edge_id": m.edge_id,
+                            "object": m.object,
+                            "pos_evidence": m.pos_evidence,
+                            "neg_evidence": m.neg_evidence,
+                            "cosine_to_survivor": m.cosine_to_survivor,
+                        }
+                        for m in p.members
+                    ],
+                }
+                for p in proposals
+            ],
+        }
+
     def dream_status(self) -> dict:
         """Operator-visibility snapshot of the dreaming/extraction backlog.
 

@@ -239,6 +239,14 @@ class HyMemConfig:
     this high. Stops false merges of short, embedding-close-but-distinct names
     (`redis` vs `redash`) that the cosine gate alone would collapse."""
 
+    behavioral_dedup_cosine_threshold: float = 0.90
+    """Default cosine cutoff for the *retroactive* behavioral-edge dedup report
+    (`HyMem.behavioral_duplicate_report`). Looser than
+    `triple_dedup_cosine_threshold` because behavioral objects are paraphrases
+    (`concise` / `brevity` / `short answers`) rather than tool-name siblings, and
+    the report intentionally drops the lexical gate. Report-only today — no edge
+    is merged automatically; a human reviews proposals before any apply step."""
+
     procedure_stale_confidence_factor: float = 0.5
     """Multiplier applied to a procedure's `confidence` when
     `mark_procedure_stale` flags it. The status flip already removes it from
