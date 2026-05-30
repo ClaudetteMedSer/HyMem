@@ -11,6 +11,7 @@ Endpoint mapping (high level):
   GET  .../sessions/{sid}/context     → MEMORY.md + USER.md + recent turns
   POST .../sessions/{sid}/peers       → register peer → role mapping
   GET  .../peers/{pid}/card           → USER.md behavioral profile
+  POST .../peers/{pid}/search         → hy.augment() as Message objects (peer-scoped)
   POST .../peers/{pid}/chat           → dialectic Q&A via hy.augment()
 
 Configuration is entirely environment-driven — see hymem.bootstrap and
@@ -329,13 +330,22 @@ def list_messages(
     }
 
 
-@app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/search")
-def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> list[dict]:
-    ctx = _get_hy().augment(body.query)
+def _augment_messages(
+    query: str, limit: int, session_id: str, workspace_id: str
+) -> list[dict]:
+    """Run augment() and shape the hits as MessageResponse dicts.
+
+    Shared by the session-scoped and peer-scoped search endpoints — both map
+    HyMem's augment() output (graph facts + FTS hits) onto the SDK's
+    ``list[Message]`` search contract. HyMem retrieval is global (peers are
+    modelled as roles, not authorship partitions), so the two endpoints surface
+    the same content; only the SDK call site differs.
+    """
+    ctx = _get_hy().augment(query)
     results: list[dict] = []
 
     for fact in ctx.graph_facts:
-        if len(results) >= body.limit:
+        if len(results) >= limit:
             break
         content = (
             f"{fact.subject} {fact.predicate} {fact.object} "
@@ -353,7 +363,7 @@ def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> 
         ))
 
     for hit in ctx.fts_hits:
-        if len(results) >= body.limit:
+        if len(results) >= limit:
             break
         results.append(msg(
             f"fts_{hit.chunk_id}",
@@ -362,6 +372,11 @@ def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> 
         ))
 
     return results
+
+
+@app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/search")
+def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> list[dict]:
+    return _augment_messages(body.query, body.limit, session_id, workspace_id)
 
 
 # ── context ──────────────────────────────────────────────────────────────────
@@ -467,6 +482,21 @@ def get_peer_config(workspace_id: str, session_id: str, peer_id: str) -> dict:
 
 
 # ── peers (workspace-scoped) ─────────────────────────────────────────────────
+
+@app.post("/v3/workspaces/{workspace_id}/peers/{peer_id}/search")
+def search_peer_messages(
+    workspace_id: str, peer_id: str, body: SearchRequest
+) -> list[dict]:
+    """Peer-scoped search — the route the Honcho SDK's ``peer.search()`` calls.
+
+    The SDK documents this as "search across all messages in the workspace with
+    this peer as author." HyMem's augment() is global, so this returns the same
+    graph-fact + FTS hits as the session-scoped search. Implementing it is what
+    keeps ``peer.search()`` from 404-ing — the gap that made honcho_search come
+    back empty. Peer-scoped results carry no session id (search spans sessions).
+    """
+    return _augment_messages(body.query, body.limit, "", workspace_id)
+
 
 @app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}/card")
 def get_peer_card(workspace_id: str, peer_id: str) -> dict:
@@ -593,10 +623,15 @@ def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest) -> dict:
             for f in ctx.graph_facts
         ])
 
-    # `facts` is additive metadata for SDK consumers that want the structured
-    # why_retrieved trail without parsing prose. Aligns with `response` (first
-    # query); `facts_by_query` carries the full per-query breakdown.
+    # `content` is the field the honcho-ai SDK's peer.chat() actually reads
+    # (`data.get("content")`); without it the SDK returns None and
+    # honcho_reasoning comes back empty. `response` is kept as an alias for
+    # consumers that read the HyMem-native shape. `facts` is additive metadata
+    # for consumers that want the structured why_retrieved trail without parsing
+    # prose — it aligns with the first query; `facts_by_query` carries the full
+    # per-query breakdown.
     return {
+        "content": responses[0],
         "response": responses[0],
         "queries": queries,
         "facts": facts_per_query[0] if facts_per_query else [],

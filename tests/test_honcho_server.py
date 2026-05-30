@@ -109,6 +109,47 @@ def test_search_returns_graph_facts_after_dream(client, hy_with_embed):
     assert any("docker" in item["content"].lower() for item in body)
 
 
+def test_peer_search_returns_empty_for_unknown_query(client):
+    # peer.search() POSTs to .../peers/{id}/search — the route must exist (it
+    # didn't, which made honcho_search come back empty) and return [] cleanly.
+    r = client.post(
+        "/v3/workspaces/hermes/peers/user-1/search",
+        json={"query": "totally unknown topic xyz"},
+    )
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_peer_search_returns_graph_facts_after_dream(client, hy_with_embed):
+    sid = "s-peersearch"
+    hy_with_embed.open_session(sid)
+    hy_with_embed.log_message(sid, "assistant", "We could try Docker for the local dev environment.")
+    hy_with_embed.log_message(
+        sid, "user",
+        "No, we use uv and system Python for local dev. Don't suggest Docker.",
+    )
+    hy_with_embed.close_session(sid)
+    triples = [
+        {"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1},
+        {"subject": "local_dev", "predicate": "uses", "object": "Docker", "polarity": -1},
+    ]
+    hy_with_embed.set_llm(make_routed_llm(triples, []))
+    hy_with_embed.dream()
+
+    r = client.post(
+        "/v3/workspaces/hermes/peers/agent-main/search",
+        json={"query": "should we use docker for dev?"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert any(item["peer_id"] == "hymem-kg" for item in body)
+    assert any("docker" in item["content"].lower() for item in body)
+    # Peer-scoped search spans sessions — graph-fact pseudo-messages carry no
+    # single session id.
+    kg = [m for m in body if m["peer_id"] == "hymem-kg"]
+    assert kg and all(m["session_id"] == "" for m in kg)
+
+
 def test_context_returns_summary_messages_peers(client, hy_with_embed):
     sid = "s-ctx"
     hy_with_embed.open_session(sid)
@@ -457,6 +498,24 @@ def test_peer_chat_returns_structured_facts_with_why(client, hy_with_embed):
         assert isinstance(fact["why"], list) and fact["why"]
 
 
+def test_peer_chat_exposes_content_field_for_sdk(client, hy_with_embed):
+    # The honcho-ai SDK reads peer.chat() answers from `content`
+    # (data.get("content")); `response` is only a HyMem-native alias. If
+    # `content` is missing or empty the SDK returns None and honcho_reasoning
+    # silently comes back empty — the bug this guards against.
+    _seed_dreamed_graph(hy_with_embed)
+    r = client.post(
+        "/v3/workspaces/hermes/peers/agent-main/chat",
+        json={"query": "what technologies does the backend use"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "content" in body, "SDK reads `content`; it must be present"
+    assert body["content"] == body["response"]
+    assert body["content"], "content must be non-empty when the graph has facts"
+    assert "fast_api" in body["content"].lower()
+
+
 # ── /conflicts endpoint ──────────────────────────────────────────────────────
 
 
@@ -496,3 +555,53 @@ def test_list_conflicts_surfaces_opposing_predicate(client, hy_with_embed):
     body = r.json()
     assert len(body["conflicts"]) == 1
     assert body["conflicts"][0]["kind"] == "opposing_predicate"
+
+
+# ── route-registration contract ──────────────────────────────────────────────
+
+
+def test_every_supported_sdk_route_is_registered():
+    """Each Honcho SDK route HyMem backs must be registered on the app with a
+    matching HTTP method, so a future SDK call can't silently 404 the way
+    peer.search() did (its empty result was the honcho_search bug).
+
+    Paths and verbs are taken from the *pinned SDK's own route table* and verb
+    usage, so this test also breaks if an SDK upgrade renames a path HyMem must
+    serve — turning a would-be production 404 into a local failure.
+    """
+    routes = pytest.importorskip("honcho.http.routes")
+    from starlette.routing import Match
+
+    WS, PID, SID = "ws", "pid", "sid"
+    # (HTTP verb the SDK uses, concrete path the SDK builds). Curated to the
+    # subset HyMem implements — list/clone/summaries/workspace-search are
+    # deliberately out of scope and intentionally absent.
+    supported = [
+        ("POST", routes.workspaces()),
+        ("GET", routes.workspace(WS)),
+        ("POST", routes.peers(WS)),
+        ("GET", routes.peer(WS, PID)),
+        ("POST", routes.peer_chat(WS, PID)),
+        ("POST", routes.peer_search(WS, PID)),
+        ("GET", routes.peer_card(WS, PID)),
+        ("GET", routes.peer_context(WS, PID)),
+        ("POST", routes.peer_representation(WS, PID)),
+        ("POST", routes.sessions(WS)),
+        ("GET", routes.session(WS, SID)),
+        ("POST", routes.session_search(WS, SID)),
+        ("GET", routes.session_context(WS, SID)),
+        ("POST", routes.session_peers(WS, SID)),
+        ("GET", routes.session_peer_config(WS, SID, PID)),
+        ("POST", routes.messages(WS, SID)),
+        ("POST", routes.messages_list(WS, SID)),
+        ("POST", routes.messages_upload(WS, SID)),
+    ]
+
+    def _full_match(method: str, path: str) -> bool:
+        scope = {"type": "http", "method": method, "path": path}
+        return any(
+            route.matches(scope)[0] == Match.FULL for route in hsrv.app.routes
+        )
+
+    missing = [(m, p) for m, p in supported if not _full_match(m, p)]
+    assert not missing, f"SDK routes not registered (path+method): {missing}"
