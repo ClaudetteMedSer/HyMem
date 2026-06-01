@@ -18,6 +18,28 @@ from hymem.session import Message, recent_messages
 
 log = logging.getLogger("hymem.query.augment")
 
+_EPISODE_LOG_PATH = None
+
+
+def _episode_hit_log(episode_id: str, kind: str, query: str) -> None:
+    """Append a one-line JSON hit record to the episode search log."""
+    import datetime as _dt
+    from pathlib import Path as _Path
+    global _EPISODE_LOG_PATH
+    if _EPISODE_LOG_PATH is None:
+        _EPISODE_LOG_PATH = _Path.home() / ".hermes" / "episode_search_log.jsonl"
+    try:
+        record = json.dumps({
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "ep": episode_id,
+            "kind": kind,
+            "q": query,
+        }, default=str)
+        with open(_EPISODE_LOG_PATH, "a") as f:
+            f.write(record + "\n")
+    except Exception:
+        pass  # instrumentation must never crash the caller
+
 
 @dataclass
 class GraphFact:
@@ -818,7 +840,7 @@ def _episode_search(
                     why_retrieved=[f"episode_vec(sim={sim:.3f})"],
                 )
             )
-            log.info(json.dumps({"ep": r["id"], "kind": "vec", "q": query}, default=str))
+            _episode_hit_log(r["id"], "vec", query)
 
     if not vec_hits:
         return fts_hits[:top_k]
@@ -826,7 +848,7 @@ def _episode_search(
         return vec_hits[:top_k]
     merged = _rrf_merge_episodes(fts_hits, vec_hits, top_k=top_k)
     for hit in merged:
-        log.info(json.dumps({"ep": hit.episode_id, "kind": "rrf", "q": query}, default=str))
+        _episode_hit_log(hit.episode_id, "rrf", query)
     return merged
 
 
