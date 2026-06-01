@@ -76,6 +76,14 @@ class HyMemConfig:
     sessions and before any dream consolidates them — the gap chunk-FTS leaves.
     0 disables the path."""
 
+    message_fts_aggregate_cap: int = 200
+    """Max raw-message rows augment() returns when called with `ability="MR"`
+    (aggregation mode for "how many X across all my requests?"). That mode
+    bypasses BM25 top-k and returns *all* matches in chronological order so the
+    host can count them — `AugmentedContext.total_message_matches` carries the
+    true match total, which stays exact even when the returned rows are capped
+    here. 0 disables aggregation."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 

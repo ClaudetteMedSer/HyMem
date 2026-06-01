@@ -278,6 +278,8 @@ AugmentedContext(
     user_md: str,              # USER.md content
     memory_md: str,            # MEMORY.md content
     fts_hits: list[FtsHit],    # Ranked relevant chunks
+    message_hits: list[MessageHit],   # Raw-message keyword hits (see below)
+    total_message_matches: int,       # Coverage signal for ability="MR" (see below)
     graph_facts: list[GraphFact],     # Ranked knowledge graph edges (see below)
     episodes: list[EpisodeHit],       # Matching episodes
     procedures: list[ProcedureHit],   # Matching procedures
@@ -285,6 +287,10 @@ AugmentedContext(
     recent_turns: list[Message],      # Working-memory tier (see below)
 )
 ```
+
+**Raw-message tier (`message_hits`).** Alongside chunk FTS, `augment()` runs a direct FTS5 keyword search over the raw `messages` table (user/assistant turns), indexed live at ingest — so a turn is recallable across sessions and *before* any dream chunks it, the gap chunk-only FTS leaves. Hits are separate from `fts_hits` (different granularity; non-comparable BM25) and each carries `created_at`/`message_id`. Knob: `message_fts_top_k` (default 5, 0 disables).
+
+**Aggregation mode (`ability="MR"`).** For "how many X across all my requests?" questions, the host can pass `hy.augment(q, ability="MR")`. This swaps the top-k-by-relevance message path for an *all-matches, chronological* path capped at `message_fts_aggregate_cap` (default 200), and sets `total_message_matches` to the exact match total. That total is a **coverage signal** (how many messages to scan, cap-aware), not the answer — the host's LLM still counts instances within the returned turns. `ability` is an optional question-type hint the host knows and HyMem does not infer; unknown/None values use the default path (byte-for-byte unchanged).
 
 **Working-memory tier (`recent_turns`).** All the fields above are built from *dreaming artifacts* (chunks, embeddings, graph) — so a fact stated this session is invisible to `augment()` until a dream runs. When called with a `session_id`, `augment()` also returns the last `working_memory_turns` (default 10) raw turns of that session, oldest→newest, so within-session facts are recallable *before* any dream has consolidated them. Omitting `session_id` leaves `recent_turns` empty (unchanged legacy behavior). The turns are already secret-redacted at ingest (see §8), so they are safe to surface.
 
@@ -466,6 +472,8 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `max_query_chars` | 10000 | Truncate an `augment()` query longer than this (0 disables) |
 | `working_memory_turns` | 10 | Recent raw turns `augment(session_id=…)` returns (0 disables) |
 | `fts_top_k` | 5 | FTS results to return |
+| `message_fts_top_k` | 5 | Raw-message keyword hits in `message_hits` (0 disables) |
+| `message_fts_aggregate_cap` | 200 | Max rows for `ability="MR"` aggregation; count stays exact (0 disables) |
 | `graph_top_k_per_entity` | 3 | Entity-anchored graph facts per matched entity |
 | `embedding_max_scan` | 5000 | Max embeddings to scan in Python fallback |
 | `graph_semantic_top_k` | 10 | KNN candidates pulled from `vec_edges` |

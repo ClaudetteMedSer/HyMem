@@ -127,11 +127,33 @@ class AugmentedContext:
     memory_md: str = ""
     fts_hits: list[FtsHit] = field(default_factory=list)
     message_hits: list[MessageHit] = field(default_factory=list)
+    total_message_matches: int = 0
+    """Total raw-message FTS matches for the query when `augment()` ran in
+    aggregation mode (`ability="MR"`); 0 otherwise. This is a *coverage signal*
+    — the number of matching messages, not the answer. The host's LLM still
+    counts instances within `message_hits` (one turn may state several). When
+    `total_message_matches > len(message_hits)` the aggregate cap was hit and
+    coverage is partial."""
     graph_facts: list[GraphFact] = field(default_factory=list)
     episodes: list[EpisodeHit] = field(default_factory=list)
     procedures: list[ProcedureHit] = field(default_factory=list)
     matched_entities: list[str] = field(default_factory=list)
     recent_turns: list[Message] = field(default_factory=list)
+
+
+# Ability hints a host (e.g. a BEAM harness) may pass to shape retrieval to the
+# question type. The label is known to the host, not inferred here. Only "MR"
+# (aggregation) is wired in Phase 1; the rest are reserved for follow-up shaping.
+_ABILITIES = frozenset({"IE", "MR", "TR", "SUM", "IF", "KU"})
+
+
+def _normalize_ability(ability: str | None) -> str | None:
+    """Uppercase + validate an ability hint; unknown/empty values become None so
+    callers degrade to the default (un-shaped) retrieval path."""
+    if not ability:
+        return None
+    normalized = ability.strip().upper()
+    return normalized if normalized in _ABILITIES else None
 
 
 def augment(
@@ -143,7 +165,9 @@ def augment(
     llm: LLMClient | None = None,
     token_overlap_index: dict[str, list[str]] | None = None,
     session_id: str | None = None,
+    ability: str | None = None,
 ) -> AugmentedContext:
+    ability = _normalize_ability(ability)
     ctx = AugmentedContext()
     if cfg.user_md_path.exists():
         ctx.user_md = cfg.user_md_path.read_text(encoding="utf-8")
@@ -200,7 +224,13 @@ def augment(
     # Raw-message keyword tier: direct FTS5 over the session log, reaching turns
     # that were never chunked (low salience, not-yet-dreamed, or other sessions).
     # Kept separate from fts_hits — different granularity, non-comparable BM25.
-    if cfg.message_fts_top_k > 0:
+    # ability="MR" (aggregation) swaps the top-k-by-relevance path for an
+    # all-matches-chronological path + an exact total, so the host can count.
+    if ability == "MR" and cfg.message_fts_aggregate_cap > 0:
+        ctx.message_hits, ctx.total_message_matches = _message_fts_aggregate(
+            conn, user_message, cap=cfg.message_fts_aggregate_cap
+        )
+    elif cfg.message_fts_top_k > 0:
         ctx.message_hits = _message_fts_search(
             conn, user_message, top_k=cfg.message_fts_top_k
         )
@@ -366,6 +396,100 @@ def _message_fts_search(
         )
         for r in rows
     ]
+
+
+# High-frequency function words dropped when building an aggregation FTS query,
+# so a full question ("how many project cards did I add?") matches on content
+# terms only instead of OR-ing in noise like "do"/"have"/"my". English + Dutch
+# (the project's Dutch-prioritized Latin-script scope). Only used by the
+# aggregate path; the normal _message_fts_search keeps its len>=2, no-filter
+# tokenization so ability=None behavior is byte-for-byte unchanged.
+_AGG_STOPWORDS = frozenset({
+    # English
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "have", "has", "had", "my", "your", "our", "their",
+    "its", "in", "on", "at", "to", "for", "of", "with", "from", "by", "as",
+    "about", "what", "how", "when", "where", "which", "who", "whom", "why",
+    "can", "will", "would", "should", "could", "may", "might", "must",
+    "i", "me", "we", "you", "they", "them", "us", "this", "that", "these",
+    "those", "total", "many", "much", "across", "all", "any", "new", "old",
+    "after", "before", "and", "or", "but", "not",
+    # Dutch
+    "de", "het", "een", "ik", "je", "jij", "wij", "ze", "zij", "hij", "u",
+    "heb", "hebt", "heeft", "hebben", "had", "hadden", "ben", "bent", "zijn",
+    "hoeveel", "wat", "hoe", "wanneer", "waar", "welke", "wie", "waarom",
+    "op", "van", "met", "voor", "naar", "aan", "bij", "uit", "over", "om",
+    "tot", "door", "en", "of", "maar", "niet", "alle", "alles", "veel",
+    "totaal", "nieuw", "nieuwe", "na", "mijn", "jouw", "ons", "onze", "hun",
+    "dit", "dat", "deze", "die",
+})
+
+
+def _aggregate_tokens(query: str) -> list[str]:
+    """Build content tokens for an aggregation FTS query: drop stopwords and
+    tokens shorter than 3 chars. Falls back to the normal len>=2 tokenization if
+    that empties the set (a question made entirely of stop/short words), so the
+    query is never empty."""
+    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    if not cleaned:
+        return []
+    parts = cleaned.split()
+    filtered = [t for t in parts if len(t) >= 3 and t.lower() not in _AGG_STOPWORDS]
+    if filtered:
+        return filtered
+    return [t for t in parts if len(t) >= 2]
+
+
+def _message_fts_aggregate(
+    conn: sqlite3.Connection, query: str, *, cap: int
+) -> tuple[list[MessageHit], int]:
+    """Aggregation retrieval over raw messages for MR-style "how many X" queries.
+
+    Unlike `_message_fts_search` (top-k by BM25 *relevance*), this returns *all*
+    matches up to `cap`, ordered **chronologically**, and the exact total match
+    count. The count is the coverage signal the host uses to know it is seeing
+    every match (it may exceed the returned rows when `cap` is hit). Returns
+    ([], 0) on no content tokens or if `messages_fts` is absent."""
+    tokens = _aggregate_tokens(query)
+    if not tokens:
+        return [], 0
+    fts_query = " OR ".join(f'"{t}"' for t in tokens)
+
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) AS c FROM messages_fts WHERE messages_fts MATCH ?",
+            (fts_query,),
+        ).fetchone()["c"]
+        rows = conn.execute(
+            """
+            SELECT m.id, m.session_id, m.role, m.content, m.created_at,
+                   bm25(messages_fts) AS score
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            WHERE messages_fts MATCH ?
+            ORDER BY m.created_at, m.id
+            LIMIT ?
+            """,
+            (fts_query, cap),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return [], 0
+
+    chip = f'message_fts_aggregate("{" ".join(tokens)}")'
+    hits = [
+        MessageHit(
+            message_id=int(r["id"]),
+            session_id=r["session_id"],
+            role=r["role"],
+            text=r["content"],
+            score=float(r["score"]),
+            created_at=r["created_at"] or "",
+            score_kind="aggregate",
+            why_retrieved=[chip],
+        )
+        for r in rows
+    ]
+    return hits, int(total)
 
 
 def _embeddings_compatible(conn: sqlite3.Connection, embedder: EmbeddingClient) -> bool:

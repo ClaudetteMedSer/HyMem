@@ -146,8 +146,21 @@ class HyMem:
     # ---- query-time --------------------------------------------------
 
     def augment(
-        self, user_message: str, *, session_id: str | None = None
+        self,
+        user_message: str,
+        *,
+        session_id: str | None = None,
+        ability: str | None = None,
     ) -> AugmentedContext:
+        """Build retrieval context for `user_message`.
+
+        `ability` is an optional question-type hint (e.g. "MR") the host may pass
+        to shape retrieval — only the host knows the type, HyMem does not infer
+        it. `ability="MR"` switches the raw-message tier into aggregation mode
+        (all matches, chronological, with `total_message_matches`) for
+        "how many X across all my requests?" questions. Unknown/None hints use
+        the default retrieval path.
+        """
         cap = self.config.max_query_chars
         if cap and len(user_message) > cap:
             log.warning(
@@ -165,6 +178,7 @@ class HyMem:
             llm=self._llm,
             token_overlap_index=self._token_overlap_index,
             session_id=session_id,
+            ability=ability,
         )
 
     def timeline(self, entity: str) -> list["TimelineEntry"]:

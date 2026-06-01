@@ -168,3 +168,108 @@ def test_message_hits_drop_after_message_pruned(hy):
 
     hy.conn.execute("DELETE FROM messages WHERE id = ?", (mid,))  # autocommit
     assert hy.augment("pnpm").message_hits == []
+
+
+# --- MR aggregation (ability="MR") ----------------------------------------
+
+
+def test_mr_aggregation_counts_all_matches_beyond_top_k(hy):
+    # The MR lever: message_fts_top_k=5, but aggregation must return ALL matches
+    # with the true total — counting 5 of 9 mentions is the failure we fix.
+    sid = "mr"
+    hy.open_session(sid)
+    assert hy.config.message_fts_top_k == 5
+    for i in range(9):
+        hy.log_message(sid, "user", f"I added project card number {i} to my gallery")
+
+    ctx = hy.augment("how many project cards did I add to my gallery?", ability="MR")
+
+    assert ctx.total_message_matches == 9
+    assert len(ctx.message_hits) == 9
+    # Chronological order (created_at, id) -> ascending message ids.
+    ids = [h.message_id for h in ctx.message_hits]
+    assert ids == sorted(ids)
+    assert ctx.message_hits[0].score_kind == "aggregate"
+    assert ctx.message_hits[0].why_retrieved[0].startswith("message_fts_aggregate(")
+
+
+def test_mr_aggregation_cap_limits_rows_not_count(cfg, stub_llm):
+    from dataclasses import replace
+
+    from hymem import HyMem
+
+    hy = HyMem(replace(cfg, message_fts_aggregate_cap=3), llm=stub_llm)
+    try:
+        sid = "cap"
+        hy.open_session(sid)
+        for i in range(7):
+            hy.log_message(sid, "user", f"deployed service {i} to staging")
+
+        ctx = hy.augment("how many deploys to staging?", ability="MR")
+
+        assert ctx.total_message_matches == 7   # exact total regardless of cap
+        assert len(ctx.message_hits) == 3       # rows capped
+    finally:
+        hy.close()
+
+
+def test_mr_aggregation_stopword_filter_avoids_noise_matches(hy):
+    # A message sharing only stopwords with the question must NOT be counted —
+    # proves the aggregate query drops do/have/many/etc. before matching.
+    sid = "noise"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "I do have many of these things in my list")
+
+    ctx = hy.augment("how many widgets do I have?", ability="MR")
+
+    # "widgets" is the only content token; the message has no "widget".
+    assert ctx.total_message_matches == 0
+
+
+def test_mr_aggregation_falls_back_when_query_all_stopwords(hy):
+    # If filtering empties the token set, fall back to len>=2 tokens so the
+    # query is never empty.
+    sid = "fb"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "many things happened")
+
+    ctx = hy.augment("how many do I have", ability="MR")
+
+    # Fallback keeps how/many/do/have; "many" matches the message.
+    assert ctx.total_message_matches >= 1
+
+
+def test_ability_none_keeps_default_message_path(hy):
+    # Backward compat: no ability -> top-k BM25 path, total stays 0.
+    sid = "none"
+    hy.open_session(sid)
+    for i in range(9):
+        hy.log_message(sid, "user", f"card {i} added to gallery")
+
+    ctx = hy.augment("gallery cards")
+
+    assert ctx.total_message_matches == 0
+    assert len(ctx.message_hits) <= hy.config.message_fts_top_k
+
+
+def test_unknown_ability_falls_back_to_default(hy):
+    sid = "unk"
+    hy.open_session(sid)
+    for i in range(9):
+        hy.log_message(sid, "user", f"item {i} in the gallery")
+
+    ctx = hy.augment("gallery items", ability="BOGUS")
+
+    assert ctx.total_message_matches == 0
+    assert len(ctx.message_hits) <= hy.config.message_fts_top_k
+
+
+def test_mr_ability_is_case_insensitive(hy):
+    sid = "ci"
+    hy.open_session(sid)
+    for i in range(6):
+        hy.log_message(sid, "user", f"deployed build {i}")
+
+    ctx = hy.augment("how many builds deployed?", ability="mr")
+
+    assert ctx.total_message_matches == 6
