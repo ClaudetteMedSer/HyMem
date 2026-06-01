@@ -273,3 +273,46 @@ def test_mr_ability_is_case_insensitive(hy):
     ctx = hy.augment("how many builds deployed?", ability="mr")
 
     assert ctx.total_message_matches == 6
+
+
+def test_mr_aggregation_counts_user_turns_only(hy):
+    # Assistant echoes match the same terms but must not be counted — the
+    # question is about the user's actions, not the assistant's confirmations.
+    sid = "ro"
+    hy.open_session(sid)
+    for i in range(5):
+        hy.log_message(sid, "user", f"add widget {i} to the board")
+        hy.log_message(sid, "assistant", f"added widget {i} to the board")
+
+    ctx = hy.augment("how many widgets did I add to the board?", ability="MR")
+
+    assert ctx.total_message_matches == 5
+    assert len(ctx.message_hits) == 5
+    assert all(h.role == "user" for h in ctx.message_hits)
+
+
+def test_mr_aggregation_dedups_identical_restatements(hy):
+    # Literal restatements collapse to one; the genuinely distinct turn stays.
+    sid = "dd"
+    hy.open_session(sid)
+    for _ in range(3):
+        hy.log_message(sid, "user", "I deployed the API to prod")
+    hy.log_message(sid, "user", "I deployed the API to staging")
+
+    ctx = hy.augment("how many times did I deploy?", ability="MR")
+
+    assert ctx.total_message_matches == 2  # prod (x3 -> 1) + staging
+    assert len(ctx.message_hits) == 2
+
+
+def test_mr_aggregation_keeps_distinct_numbered_events(hy):
+    # The under-count trap: near-identical turns differing only by a number are
+    # distinct events and must NOT be collapsed by dedup.
+    sid = "trap"
+    hy.open_session(sid)
+    for i in range(6):
+        hy.log_message(sid, "user", f"I added card number {i}")
+
+    ctx = hy.augment("how many cards did I add?", ability="MR")
+
+    assert ctx.total_message_matches == 6

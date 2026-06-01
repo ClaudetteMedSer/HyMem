@@ -279,7 +279,7 @@ AugmentedContext(
     memory_md: str,            # MEMORY.md content
     fts_hits: list[FtsHit],    # Ranked relevant chunks
     message_hits: list[MessageHit],   # Raw-message keyword hits (see below)
-    total_message_matches: int,       # Coverage signal for ability="MR" (see below)
+    total_message_matches: int,       # Candidate count for ability="MR" (see below)
     graph_facts: list[GraphFact],     # Ranked knowledge graph edges (see below)
     episodes: list[EpisodeHit],       # Matching episodes
     procedures: list[ProcedureHit],   # Matching procedures
@@ -290,7 +290,7 @@ AugmentedContext(
 
 **Raw-message tier (`message_hits`).** Alongside chunk FTS, `augment()` runs a direct FTS5 keyword search over the raw `messages` table (user/assistant turns), indexed live at ingest — so a turn is recallable across sessions and *before* any dream chunks it, the gap chunk-only FTS leaves. Hits are separate from `fts_hits` (different granularity; non-comparable BM25) and each carries `created_at`/`message_id`. Knob: `message_fts_top_k` (default 5, 0 disables).
 
-**Aggregation mode (`ability="MR"`).** For "how many X across all my requests?" questions, the host can pass `hy.augment(q, ability="MR")`. This swaps the top-k-by-relevance message path for an *all-matches, chronological* path capped at `message_fts_aggregate_cap` (default 200), and sets `total_message_matches` to the exact match total. That total is a **coverage signal** (how many messages to scan, cap-aware), not the answer — the host's LLM still counts instances within the returned turns. `ability` is an optional question-type hint the host knows and HyMem does not infer; unknown/None values use the default path (byte-for-byte unchanged).
+**Counting mode (`ability="MR"`).** For "how many X across all my requests?" questions, the host passes `hy.augment(q, ability="MR")`. LLMs count poorly across a long context, so HyMem does the deterministic part: it restricts to **user** turns (assistant echoes would double-count actions), drops query stopwords (EN + NL), collapses literal restatements (conservative dedup that never merges turns differing by a number or entity — so distinct events aren't under-counted), and returns the **distinct count** in `total_message_matches` plus those turns in `message_hits` as evidence. The count is a *candidate* answer, not gospel — one turn may state several items or none — so the host's LLM verifies it against the turns. `total_message_matches` stays exact even when `message_hits` is capped at `message_fts_aggregate_cap` (default 200). `ability` is an optional question-type hint the host knows and HyMem does not infer; unknown/None values use the default path (byte-for-byte unchanged).
 
 **Working-memory tier (`recent_turns`).** All the fields above are built from *dreaming artifacts* (chunks, embeddings, graph) — so a fact stated this session is invisible to `augment()` until a dream runs. When called with a `session_id`, `augment()` also returns the last `working_memory_turns` (default 10) raw turns of that session, oldest→newest, so within-session facts are recallable *before* any dream has consolidated them. Omitting `session_id` leaves `recent_turns` empty (unchanged legacy behavior). The turns are already secret-redacted at ingest (see §8), so they are safe to surface.
 

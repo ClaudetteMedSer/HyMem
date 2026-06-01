@@ -77,12 +77,12 @@ class HyMemConfig:
     0 disables the path."""
 
     message_fts_aggregate_cap: int = 200
-    """Max raw-message rows augment() returns when called with `ability="MR"`
-    (aggregation mode for "how many X across all my requests?"). That mode
-    bypasses BM25 top-k and returns *all* matches in chronological order so the
-    host can count them — `AugmentedContext.total_message_matches` carries the
-    true match total, which stays exact even when the returned rows are capped
-    here. 0 disables aggregation."""
+    """Max evidence turns augment() returns in `message_hits` when called with
+    `ability="MR"` (the counting path for "how many X across all my requests?").
+    That mode returns distinct, deduped **user** turns chronologically;
+    `AugmentedContext.total_message_matches` carries the candidate count, which
+    stays exact even when the evidence rows are capped here. 0 disables the
+    counting path."""
 
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000

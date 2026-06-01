@@ -128,12 +128,14 @@ class AugmentedContext:
     fts_hits: list[FtsHit] = field(default_factory=list)
     message_hits: list[MessageHit] = field(default_factory=list)
     total_message_matches: int = 0
-    """Total raw-message FTS matches for the query when `augment()` ran in
-    aggregation mode (`ability="MR"`); 0 otherwise. This is a *coverage signal*
-    — the number of matching messages, not the answer. The host's LLM still
-    counts instances within `message_hits` (one turn may state several). When
-    `total_message_matches > len(message_hits)` the aggregate cap was hit and
-    coverage is partial."""
+    """Candidate count for "how many X" questions when `augment()` ran in
+    aggregation mode (`ability="MR"`); 0 otherwise. It is the number of distinct
+    **user** turns matching the query after conservative restatement dedup —
+    assistant echoes are excluded so an action isn't double-counted. It is a
+    *candidate* answer, not gospel: one turn may state several items (or none),
+    so the host's LLM verifies it against `message_hits` (the matching turns,
+    chronological). The count stays exact even when `message_hits` is capped at
+    `message_fts_aggregate_cap` (so `total_message_matches >= len(message_hits)`)."""
     graph_facts: list[GraphFact] = field(default_factory=list)
     episodes: list[EpisodeHit] = field(default_factory=list)
     procedures: list[ProcedureHit] = field(default_factory=list)
@@ -224,8 +226,10 @@ def augment(
     # Raw-message keyword tier: direct FTS5 over the session log, reaching turns
     # that were never chunked (low salience, not-yet-dreamed, or other sessions).
     # Kept separate from fts_hits — different granularity, non-comparable BM25.
-    # ability="MR" (aggregation) swaps the top-k-by-relevance path for an
-    # all-matches-chronological path + an exact total, so the host can count.
+    # ability="MR" swaps the top-k-by-relevance path for a counting path: it
+    # returns a deterministic candidate count (distinct user turns, deduped) plus
+    # the matching turns as evidence, so the host's LLM reads a number instead of
+    # tallying across a wall of hits.
     if ability == "MR" and cfg.message_fts_aggregate_cap > 0:
         ctx.message_hits, ctx.total_message_matches = _message_fts_aggregate(
             conn, user_message, cap=cfg.message_fts_aggregate_cap
@@ -440,41 +444,72 @@ def _aggregate_tokens(query: str) -> list[str]:
     return [t for t in parts if len(t) >= 2]
 
 
+# Upper bound on user turns scanned for an aggregation count, so the count is
+# exact for realistic conversations even when the returned evidence is capped at
+# the (smaller) message_fts_aggregate_cap. Generous vs. any plausible "how many"
+# answer; not a config knob to keep the surface lean.
+_MR_COUNT_SCAN = 5000
+
+
+def _dedup_key(text: str) -> str:
+    """Conservative normalization for restatement dedup: lowercase + collapse
+    whitespace, nothing else. Two turns collapse only if their text is otherwise
+    identical — so turns differing by *any* content token (a number, an entity)
+    stay distinct and the count never folds distinct events together. This is the
+    safe side of the Phase 1.5 trade-off (under-merge, never under-count)."""
+    return " ".join(text.lower().split())
+
+
 def _message_fts_aggregate(
     conn: sqlite3.Connection, query: str, *, cap: int
 ) -> tuple[list[MessageHit], int]:
-    """Aggregation retrieval over raw messages for MR-style "how many X" queries.
+    """Counting retrieval for MR-style "how many X" questions.
 
-    Unlike `_message_fts_search` (top-k by BM25 *relevance*), this returns *all*
-    matches up to `cap`, ordered **chronologically**, and the exact total match
-    count. The count is the coverage signal the host uses to know it is seeing
-    every match (it may exceed the returned rows when `cap` is hit). Returns
-    ([], 0) on no content tokens or if `messages_fts` is absent."""
+    The LLM can't reliably tally across a wall of hits, so this does the
+    deterministic part in SQL/Python and hands back a *candidate count* plus the
+    evidence behind it:
+
+      - restricts to **user** turns (assistant echoes double-count actions),
+      - drops query stopwords so the match is on content terms (`_aggregate_tokens`),
+      - collapses literal restatements via `_dedup_key` (conservative),
+      - returns the distinct count + those turns (chronological), evidence capped
+        at `cap` while the returned count stays exact (scanned up to
+        `_MR_COUNT_SCAN`).
+
+    The count is a *candidate* answer, not gospel — one turn may state several
+    items, or none — so the host's LLM verifies it against the returned turns.
+    Returns ([], 0) on no content tokens or if `messages_fts` is absent."""
     tokens = _aggregate_tokens(query)
     if not tokens:
         return [], 0
     fts_query = " OR ".join(f'"{t}"' for t in tokens)
 
     try:
-        total = conn.execute(
-            "SELECT COUNT(*) AS c FROM messages_fts WHERE messages_fts MATCH ?",
-            (fts_query,),
-        ).fetchone()["c"]
         rows = conn.execute(
             """
             SELECT m.id, m.session_id, m.role, m.content, m.created_at,
                    bm25(messages_fts) AS score
             FROM messages_fts
             JOIN messages m ON m.id = messages_fts.rowid
-            WHERE messages_fts MATCH ?
+            WHERE messages_fts MATCH ? AND m.role = 'user'
             ORDER BY m.created_at, m.id
             LIMIT ?
             """,
-            (fts_query, cap),
+            (fts_query, _MR_COUNT_SCAN),
         ).fetchall()
     except sqlite3.OperationalError:
         return [], 0
 
+    seen: set[str] = set()
+    deduped: list[sqlite3.Row] = []
+    for r in rows:
+        key = _dedup_key(r["content"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    count = len(deduped)
     chip = f'message_fts_aggregate("{" ".join(tokens)}")'
     hits = [
         MessageHit(
@@ -487,9 +522,9 @@ def _message_fts_aggregate(
             score_kind="aggregate",
             why_retrieved=[chip],
         )
-        for r in rows
+        for r in deduped[:cap]
     ]
-    return hits, int(total)
+    return hits, count
 
 
 def _embeddings_compatible(conn: sqlite3.Connection, embedder: EmbeddingClient) -> bool:
