@@ -818,12 +818,16 @@ def _episode_search(
                     why_retrieved=[f"episode_vec(sim={sim:.3f})"],
                 )
             )
+            log.info(json.dumps({"ep": r["id"], "kind": "vec", "q": query}, default=str))
 
     if not vec_hits:
         return fts_hits[:top_k]
     if not fts_hits:
         return vec_hits[:top_k]
-    return _rrf_merge_episodes(fts_hits, vec_hits, top_k=top_k)
+    merged = _rrf_merge_episodes(fts_hits, vec_hits, top_k=top_k)
+    for hit in merged:
+        log.info(json.dumps({"ep": hit.episode_id, "kind": "rrf", "q": query}, default=str))
+    return merged
 
 
 def _rrf_merge_episodes(
@@ -1175,5 +1179,3 @@ def _expand_entities_by_type(
             expanded.append(ent)
 
     return entities + expanded, expansion_info
-
-
