@@ -173,16 +173,16 @@ def test_message_hits_drop_after_message_pruned(hy):
 # --- MR aggregation (ability="MR") ----------------------------------------
 
 
-def test_mr_aggregation_counts_all_matches_beyond_top_k(hy):
+def test_mr_aggregation_counts_all_matches_beyond_top_k(hy_agg):
     # The MR lever: message_fts_top_k=5, but aggregation must return ALL matches
     # with the true total — counting 5 of 9 mentions is the failure we fix.
     sid = "mr"
-    hy.open_session(sid)
-    assert hy.config.message_fts_top_k == 5
+    hy_agg.open_session(sid)
+    assert hy_agg.config.message_fts_top_k == 5
     for i in range(9):
-        hy.log_message(sid, "user", f"I added project card number {i} to my gallery")
+        hy_agg.log_message(sid, "user", f"I added project card number {i} to my gallery")
 
-    ctx = hy.augment("how many project cards did I add to my gallery?", ability="MR")
+    ctx = hy_agg.augment("how many project cards did I add to my gallery?", ability="MR")
 
     assert ctx.total_message_matches == 9
     assert len(ctx.message_hits) == 9
@@ -213,27 +213,27 @@ def test_mr_aggregation_cap_limits_rows_not_count(cfg, stub_llm):
         hy.close()
 
 
-def test_mr_aggregation_stopword_filter_avoids_noise_matches(hy):
+def test_mr_aggregation_stopword_filter_avoids_noise_matches(hy_agg):
     # A message sharing only stopwords with the question must NOT be counted —
     # proves the aggregate query drops do/have/many/etc. before matching.
     sid = "noise"
-    hy.open_session(sid)
-    hy.log_message(sid, "user", "I do have many of these things in my list")
+    hy_agg.open_session(sid)
+    hy_agg.log_message(sid, "user", "I do have many of these things in my list")
 
-    ctx = hy.augment("how many widgets do I have?", ability="MR")
+    ctx = hy_agg.augment("how many widgets do I have?", ability="MR")
 
     # "widgets" is the only content token; the message has no "widget".
     assert ctx.total_message_matches == 0
 
 
-def test_mr_aggregation_falls_back_when_query_all_stopwords(hy):
+def test_mr_aggregation_falls_back_when_query_all_stopwords(hy_agg):
     # If filtering empties the token set, fall back to len>=2 tokens so the
     # query is never empty.
     sid = "fb"
-    hy.open_session(sid)
-    hy.log_message(sid, "user", "many things happened")
+    hy_agg.open_session(sid)
+    hy_agg.log_message(sid, "user", "many things happened")
 
-    ctx = hy.augment("how many do I have", ability="MR")
+    ctx = hy_agg.augment("how many do I have", ability="MR")
 
     # Fallback keeps how/many/do/have; "many" matches the message.
     assert ctx.total_message_matches >= 1
@@ -264,55 +264,94 @@ def test_unknown_ability_falls_back_to_default(hy):
     assert len(ctx.message_hits) <= hy.config.message_fts_top_k
 
 
-def test_mr_ability_is_case_insensitive(hy):
+def test_mr_ability_is_case_insensitive(hy_agg):
     sid = "ci"
-    hy.open_session(sid)
+    hy_agg.open_session(sid)
     for i in range(6):
-        hy.log_message(sid, "user", f"deployed build {i}")
+        hy_agg.log_message(sid, "user", f"deployed build {i}")
 
-    ctx = hy.augment("how many builds deployed?", ability="mr")
+    ctx = hy_agg.augment("how many builds deployed?", ability="mr")
 
     assert ctx.total_message_matches == 6
 
 
-def test_mr_aggregation_counts_user_turns_only(hy):
+def test_mr_aggregation_counts_user_turns_only(hy_agg):
     # Assistant echoes match the same terms but must not be counted — the
     # question is about the user's actions, not the assistant's confirmations.
     sid = "ro"
-    hy.open_session(sid)
+    hy_agg.open_session(sid)
     for i in range(5):
-        hy.log_message(sid, "user", f"add widget {i} to the board")
-        hy.log_message(sid, "assistant", f"added widget {i} to the board")
+        hy_agg.log_message(sid, "user", f"add widget {i} to the board")
+        hy_agg.log_message(sid, "assistant", f"added widget {i} to the board")
 
-    ctx = hy.augment("how many widgets did I add to the board?", ability="MR")
+    ctx = hy_agg.augment("how many widgets did I add to the board?", ability="MR")
 
     assert ctx.total_message_matches == 5
     assert len(ctx.message_hits) == 5
     assert all(h.role == "user" for h in ctx.message_hits)
 
 
-def test_mr_aggregation_dedups_identical_restatements(hy):
+def test_mr_aggregation_dedups_identical_restatements(hy_agg):
     # Literal restatements collapse to one; the genuinely distinct turn stays.
     sid = "dd"
-    hy.open_session(sid)
+    hy_agg.open_session(sid)
     for _ in range(3):
-        hy.log_message(sid, "user", "I deployed the API to prod")
-    hy.log_message(sid, "user", "I deployed the API to staging")
+        hy_agg.log_message(sid, "user", "I deployed the API to prod")
+    hy_agg.log_message(sid, "user", "I deployed the API to staging")
 
-    ctx = hy.augment("how many times did I deploy?", ability="MR")
+    ctx = hy_agg.augment("how many times did I deploy?", ability="MR")
 
     assert ctx.total_message_matches == 2  # prod (x3 -> 1) + staging
     assert len(ctx.message_hits) == 2
 
 
-def test_mr_aggregation_keeps_distinct_numbered_events(hy):
+def test_mr_aggregation_keeps_distinct_numbered_events(hy_agg):
     # The under-count trap: near-identical turns differing only by a number are
     # distinct events and must NOT be collapsed by dedup.
     sid = "trap"
-    hy.open_session(sid)
+    hy_agg.open_session(sid)
     for i in range(6):
-        hy.log_message(sid, "user", f"I added card number {i}")
+        hy_agg.log_message(sid, "user", f"I added card number {i}")
 
-    ctx = hy.augment("how many cards did I add?", ability="MR")
+    ctx = hy_agg.augment("how many cards did I add?", ability="MR")
 
     assert ctx.total_message_matches == 6
+
+
+def test_mr_aggregation_disabled_by_default(hy):
+    # Counting is opt-in: with the default message_fts_aggregate_cap=0,
+    # ability="MR" uses the normal top-k path, not the counting path.
+    sid = "off"
+    hy.open_session(sid)
+    assert hy.config.message_fts_aggregate_cap == 0
+    for i in range(9):
+        hy.log_message(sid, "user", f"card {i} added to gallery")
+
+    ctx = hy.augment("how many cards in the gallery?", ability="MR")
+
+    assert ctx.total_message_matches == 0  # counting path off
+    assert len(ctx.message_hits) <= hy.config.message_fts_top_k  # normal path ran
+
+
+# --- ability="IF" procedure shaping ---------------------------------------
+
+
+def test_if_ability_widens_procedure_budget(hy):
+    # IF pulls a wider procedure set (procedure_top_k_if) than the default
+    # fts_top_k, since procedures are the natural fit for step recall.
+    sid = "ifp"
+    hy.open_session(sid)
+    for i in range(8):
+        hy.conn.execute(
+            "INSERT INTO procedures(id, session_id, name, description, steps) "
+            "VALUES (?, ?, ?, ?, '[]')",
+            (f"p{i}", sid, f"deploy service {i}", "deploy the service to staging"),
+        )
+
+    # Default budget: capped at fts_top_k (5).
+    default = hy.augment("how do I deploy the service?")
+    assert len(default.procedures) == hy.config.fts_top_k
+
+    # ability="IF": widened to procedure_top_k_if (10) -> all 8 surface.
+    iff = hy.augment("what steps to deploy the service?", ability="IF")
+    assert len(iff.procedures) == 8

@@ -32,6 +32,17 @@ def hy(cfg: HyMemConfig, stub_llm: StubLLMClient):
 
 
 @pytest.fixture
+def hy_agg(cfg: HyMemConfig, stub_llm: StubLLMClient):
+    """HyMem with the MR counting path enabled (it is opt-in; the default
+    message_fts_aggregate_cap is 0)."""
+    from dataclasses import replace
+
+    instance = HyMem(replace(cfg, message_fts_aggregate_cap=200), llm=stub_llm)
+    yield instance
+    instance.close()
+
+
+@pytest.fixture
 def hy_with_embed(
     cfg: HyMemConfig, stub_llm: StubLLMClient, embed_stub: StubEmbeddingClient
 ):

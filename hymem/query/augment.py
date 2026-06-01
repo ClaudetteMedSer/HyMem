@@ -245,7 +245,11 @@ def augment(
         embedding_client=embedding_client,
     )
 
-    ctx.procedures = _procedure_search(conn, user_message, top_k=cfg.fts_top_k)
+    # ability="IF" (instruction/step recall) pulls a wider procedure set, since
+    # procedures — ordered step-by-step workflows — are the natural fit for
+    # "what steps did I take to implement X?" The host still decides ordering.
+    proc_top_k = cfg.procedure_top_k_if if ability == "IF" else cfg.fts_top_k
+    ctx.procedures = _procedure_search(conn, user_message, top_k=proc_top_k)
 
     matched = match_known_entities(conn, user_message)
     type_expanded, expansion_info = _expand_entities_by_type(conn, matched)
