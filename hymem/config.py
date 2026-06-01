@@ -76,16 +76,17 @@ class HyMemConfig:
     sessions and before any dream consolidates them — the gap chunk-FTS leaves.
     0 disables the path."""
 
-    message_fts_aggregate_cap: int = 0
-    """Opt-in counting path for `ability="MR"` ("how many X across all my
-    requests?"). **0 (the default) disables it** — `ability="MR"` then uses the
-    normal top-k message path. Set > 0 to enable: augment() returns distinct,
-    deduped **user** turns chronologically in `message_hits` (capped at this
-    value) and the candidate count in `total_message_matches` (exact even when
-    the evidence is capped). Off by default because keyword counting only fits
-    *lexical* "how many" questions; semantic ones ("how many different ways…")
-    need the answering LLM, so it earns its keep only for hosts with lexical
-    aggregation queries."""
+    message_fts_aggregate_cap: int = 50
+    """Counting path for `ability="MR"` ("how many X across all my requests?").
+    Set to 0 to disable — `ability="MR"` then uses the normal top-k message path.
+    When > 0, augment() returns distinct, deduped **user** turns chronologically
+    in `message_hits` (capped at this value) and the candidate count in
+    `total_message_matches` (exact even when the evidence is capped). The cap
+    bounds only the *evidence* turns the host sees, not the count. Defaults to 50:
+    keyword counting fits *lexical* "how many" questions (the common case); the
+    host's LLM still verifies the candidate count against the returned turns, so
+    a purely semantic "how many different ways…" question degrades to LLM tallying
+    rather than returning a wrong number."""
 
     procedure_top_k_if: int = 10
     """Procedure budget when augment() is called with `ability="IF"`

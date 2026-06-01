@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 from hymem import portability
 from hymem import redaction
@@ -16,9 +16,25 @@ from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
 from hymem.query.conflicts import Conflict, find_conflicts
-from hymem.query.entities import TimelineEntry, timeline as query_timeline
+from hymem.query.entities import (
+    GraphCount,
+    TimelineEntry,
+    count_relations as query_count_relations,
+    timeline as query_timeline,
+)
 
 log = logging.getLogger("hymem.api")
+
+
+def _clean_timestamp(value: str | None) -> str | None:
+    """Normalize a caller-supplied event timestamp: trim whitespace and treat
+    an empty string as "not provided" so it falls through to the DB's
+    ingestion-time default rather than writing a blank that would sort before
+    every real date."""
+    if not value:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
 
 
 class HyMem:
@@ -122,25 +138,49 @@ class HyMem:
             content = redaction.redact(content)
         return content
 
-    def log_message(self, session_id: str, role: str, content: str) -> int:
+    def log_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        created_at: str | None = None,
+    ) -> int:
         content = self._prepare_content(content)
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
-            return session_log.append_message(self.conn, session_id, role, content)
+            return session_log.append_message(
+                self.conn, session_id, role, content,
+                created_at=_clean_timestamp(created_at),
+            )
 
     def log_messages(
-        self, session_id: str, turns: Iterable[tuple[str, str]]
+        self,
+        session_id: str,
+        turns: Iterable[tuple[str, str] | tuple[str, str, str | None]],
     ) -> list[int]:
-        """Append a batch of (role, content) turns in a single transaction.
+        """Append a batch of turns in a single transaction.
 
-        One BEGIN IMMEDIATE for the whole batch instead of one per message.
+        Each turn is `(role, content)` or `(role, content, created_at)`, where
+        `created_at` is the caller-supplied *event* time (ISO-8601); omit it (or
+        pass the 2-tuple) to fall back to ingestion time. One BEGIN IMMEDIATE for
+        the whole batch instead of one per message.
         """
-        prepared = [(role, self._prepare_content(content)) for role, content in turns]
+        prepared = [
+            (
+                turn[0],
+                self._prepare_content(turn[1]),
+                _clean_timestamp(turn[2] if len(turn) > 2 else None),
+            )
+            for turn in turns
+        ]
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
             return [
-                session_log.append_message(self.conn, session_id, role, content)
-                for role, content in prepared
+                session_log.append_message(
+                    self.conn, session_id, role, content, created_at=created_at
+                )
+                for role, content, created_at in prepared
             ]
 
     # ---- query-time --------------------------------------------------
@@ -197,6 +237,47 @@ class HyMem:
         predicate, or a subject/object pair joined by opposing predicates.
         """
         return find_conflicts(self.read_conn)
+
+    def count_relations(
+        self,
+        *,
+        count: Literal["subject", "object"] = "subject",
+        predicates: Iterable[str] | None = None,
+        subject: str | None = None,
+        object: str | None = None,
+        object_type: str | None = None,
+        subject_type: str | None = None,
+    ) -> GraphCount:
+        """Exact graph-native count over active `knowledge_graph` edges, for
+        in-domain "how many X …" questions. Read-only.
+
+        Answers questions the aggregate message-FTS path can only *estimate*,
+        because here the entity type vocabulary applies: "how many services
+        depend on redis?" is `count="subject", predicates=["depends_on"],
+        object="redis"`; "how many databases do we use?" is `count="object",
+        predicates=["uses"], object_type="database"`. Only the IN-DOMAIN (tech)
+        type/predicate vocabulary is countable this way — consumer categories
+        ("clothing") aren't typed, so those stay on the message-FTS aggregate
+        path (`augment(ability="MR")`).
+
+        `count` is the load-bearing argument: it states whether DISTINCT subjects
+        or DISTINCT objects are tallied (default `"subject"` — the canonical
+        "how many subjects relate to this object" shape). HyMem never infers the
+        side from the filters. `subject`/`object` surface forms are resolved
+        through the alias table; `subject_type`/`object_type` filter via
+        `entity_types`; `predicates` is optional (omit ⇒ all predicates). The
+        returned `GraphCount` carries the exact `count`, the distinct entities
+        behind it (capped, count stays exact), and the resolved filters used.
+        """
+        return query_count_relations(
+            self.read_conn,
+            count=count,
+            predicates=predicates,
+            subject=subject,
+            object=object,
+            object_type=object_type,
+            subject_type=subject_type,
+        )
 
     # ---- dreaming ----------------------------------------------------
 

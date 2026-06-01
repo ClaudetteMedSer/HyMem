@@ -33,8 +33,8 @@ def hy(cfg: HyMemConfig, stub_llm: StubLLMClient):
 
 @pytest.fixture
 def hy_agg(cfg: HyMemConfig, stub_llm: StubLLMClient):
-    """HyMem with the MR counting path enabled (it is opt-in; the default
-    message_fts_aggregate_cap is 0)."""
+    """HyMem with a wide MR counting cap (200) so aggregation tests see all
+    evidence turns, not just the default cap (50)."""
     from dataclasses import replace
 
     instance = HyMem(replace(cfg, message_fts_aggregate_cap=200), llm=stub_llm)

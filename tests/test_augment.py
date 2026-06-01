@@ -318,19 +318,40 @@ def test_mr_aggregation_keeps_distinct_numbered_events(hy_agg):
     assert ctx.total_message_matches == 6
 
 
-def test_mr_aggregation_disabled_by_default(hy):
-    # Counting is opt-in: with the default message_fts_aggregate_cap=0,
-    # ability="MR" uses the normal top-k path, not the counting path.
-    sid = "off"
+def test_mr_aggregation_enabled_by_default(hy):
+    # Counting is on by default (message_fts_aggregate_cap=50): ability="MR"
+    # takes the counting path and returns an exact candidate count.
+    sid = "on"
     hy.open_session(sid)
-    assert hy.config.message_fts_aggregate_cap == 0
+    assert hy.config.message_fts_aggregate_cap == 50
     for i in range(9):
         hy.log_message(sid, "user", f"card {i} added to gallery")
 
     ctx = hy.augment("how many cards in the gallery?", ability="MR")
 
-    assert ctx.total_message_matches == 0  # counting path off
-    assert len(ctx.message_hits) <= hy.config.message_fts_top_k  # normal path ran
+    assert ctx.total_message_matches == 9  # counting path ran
+
+
+def test_mr_aggregation_opt_out_with_zero_cap(cfg, stub_llm):
+    # Setting the cap to 0 disables counting: ability="MR" falls back to the
+    # normal top-k message path.
+    from dataclasses import replace
+
+    from hymem import HyMem
+
+    hy = HyMem(replace(cfg, message_fts_aggregate_cap=0), llm=stub_llm)
+    try:
+        sid = "off"
+        hy.open_session(sid)
+        for i in range(9):
+            hy.log_message(sid, "user", f"card {i} added to gallery")
+
+        ctx = hy.augment("how many cards in the gallery?", ability="MR")
+
+        assert ctx.total_message_matches == 0  # counting path off
+        assert len(ctx.message_hits) <= hy.config.message_fts_top_k  # normal path ran
+    finally:
+        hy.close()
 
 
 # --- ability="IF" procedure shaping ---------------------------------------
@@ -355,3 +376,88 @@ def test_if_ability_widens_procedure_budget(hy):
     # ability="IF": widened to procedure_top_k_if (10) -> all 8 surface.
     iff = hy.augment("what steps to deploy the service?", ability="IF")
     assert len(iff.procedures) == 8
+
+
+# --- MR over-count provenance: enumeration_turns / enumerates_items ----------
+# These cover the Phase B improvement: a graph-native typed count was ruled out
+# (the entity-type vocabulary is tech-only, so consumer categories like clothing
+# never get typed), so the aggregate path instead FLAGS turns that enumerate
+# several items in one message — the over-count failure mode the count can't
+# resolve on its own.
+
+
+def test_mr_flags_enumeration_turns_as_overcount_signal(hy_agg):
+    # One turn lists three clothing items: the distinct-turn count is 1, but the
+    # true item count is 3. The aggregate path must flag that divergence.
+    sid = "enum"
+    hy_agg.open_session(sid)
+    hy_agg.log_message(sid, "user", "In my closet I have a shirt, jeans and boots")
+
+    ctx = hy_agg.augment("how many items in my closet?", ability="MR")
+
+    assert ctx.total_message_matches == 1          # still one matching turn
+    assert ctx.enumeration_turns == 1              # but it enumerates items
+    assert len(ctx.message_hits) == 1
+    assert ctx.message_hits[0].enumerates_items is True
+
+
+def test_mr_plain_single_item_turns_are_not_flagged(hy_agg):
+    # Plain one-item turns must NOT be flagged: turn-count == item-count holds, so
+    # enumeration_turns stays 0 and the candidate count is the answer.
+    sid = "single"
+    hy_agg.open_session(sid)
+    for it in ("a blue shirt", "a red jacket", "a green hat"):
+        hy_agg.log_message(sid, "user", f"I added {it} to my closet")
+
+    ctx = hy_agg.augment("how many clothing items did I add to my closet?", ability="MR")
+
+    assert ctx.total_message_matches == 3
+    assert ctx.enumeration_turns == 0
+    assert all(h.enumerates_items is False for h in ctx.message_hits)
+
+
+def test_mr_enumeration_count_is_exact_under_cap(cfg, stub_llm):
+    # enumeration_turns is computed over the full deduped set, so it stays exact
+    # even when message_hits is capped below the number of enumerating turns.
+    from dataclasses import replace
+
+    from hymem import HyMem
+
+    hy = HyMem(replace(cfg, message_fts_aggregate_cap=2), llm=stub_llm)
+    try:
+        sid = "capenum"
+        hy.open_session(sid)
+        for i in range(5):
+            hy.log_message(sid, "user", f"On day {i} I packed a shirt, a coat and shoes")
+
+        ctx = hy.augment("how many times did I pack a shirt?", ability="MR")
+
+        assert ctx.total_message_matches == 5   # exact total regardless of cap
+        assert len(ctx.message_hits) == 2       # rows capped
+        assert ctx.enumeration_turns == 5       # exact, over the full set
+    finally:
+        hy.close()
+
+
+def test_mr_enumeration_handles_dutch_conjunction(hy_agg):
+    # Dutch is the prioritized non-English scope: "en" must split an enumeration.
+    sid = "nl"
+    hy_agg.open_session(sid)
+    hy_agg.log_message(sid, "user", "In mijn kast heb ik een shirt, een broek en schoenen")
+
+    ctx = hy_agg.augment("hoeveel dingen heb ik in mijn kast?", ability="MR")
+
+    assert ctx.enumeration_turns == 1
+    assert ctx.message_hits[0].enumerates_items is True
+
+
+def test_ability_none_leaves_enumeration_turns_zero(hy):
+    # Backward compat: the non-MR path never sets enumeration_turns.
+    sid = "noenum"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "I have a shirt, jeans and boots")
+
+    ctx = hy.augment("shirt jeans boots")
+
+    assert ctx.enumeration_turns == 0
+    assert all(h.enumerates_items is False for h in ctx.message_hits)

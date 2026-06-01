@@ -31,13 +31,26 @@ def append_message(
     session_id: str,
     role: str,
     content: str,
+    created_at: str | None = None,
 ) -> int:
+    """Append one turn. `created_at`, when given, is the *event* time supplied by
+    the caller (e.g. the real send time of a chat message, or a transcript's
+    session date) and is stored verbatim — ISO-8601 strings sort correctly under
+    the `ORDER BY created_at` paths that drive chronological/temporal retrieval.
+    When omitted, SQLite's `CURRENT_TIMESTAMP` default records ingestion time."""
     if role not in {"user", "assistant", "system", "tool"}:
         raise ValueError(f"unknown role: {role!r}")
-    cur = conn.execute(
-        "INSERT INTO messages(session_id, role, content) VALUES (?, ?, ?)",
-        (session_id, role, content),
-    )
+    if created_at:
+        cur = conn.execute(
+            "INSERT INTO messages(session_id, role, content, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id, role, content, created_at),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO messages(session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content),
+        )
     return int(cur.lastrowid)
 
 

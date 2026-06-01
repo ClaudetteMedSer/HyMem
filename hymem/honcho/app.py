@@ -262,9 +262,13 @@ def add_messages(
 ) -> list[dict]:
     hy = _get_hy()
     roles = [_resolve_role(workspace_id, m.peer_id) for m in body.messages]
-    # One transaction for the whole batch (see HyMem.log_messages).
+    # One transaction for the whole batch (see HyMem.log_messages). Pass each
+    # message's caller-supplied created_at through so the persisted row carries
+    # the real event time, not bulk-ingestion time — chronological/temporal
+    # retrieval (ORDER BY created_at) depends on it.
     msg_ids = hy.log_messages(
-        session_id, [(role, m.content) for role, m in zip(roles, body.messages)]
+        session_id,
+        [(role, m.content, m.created_at) for role, m in zip(roles, body.messages)],
     )
     responses = [
         msg(msg_id, m.content, m.peer_id, session_id, workspace_id,

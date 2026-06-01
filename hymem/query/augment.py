@@ -11,7 +11,8 @@ from hymem.config import HyMemConfig
 from hymem.core.vectors import decode_vector
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
-from hymem.query.entities import match_known_entities
+from hymem.query.entities import GraphCount, count_relations, match_known_entities
+from hymem.query.intent import detect_ability
 from hymem.query.predicate_routing import route_predicates
 from hymem.query.rerank import rerank as run_rerank
 from hymem.session import Message, recent_messages
@@ -86,6 +87,12 @@ class MessageHit:
     score_kind: str = "bm25"
     why_retrieved: list[str] = field(default_factory=list)
     """Short reason chips, mirroring `FtsHit` (e.g. `message_fts("postgres pool")`)."""
+    enumerates_items: bool = False
+    """True only on aggregate (MR) hits whose turn enumerates *several* items in
+    one message ("a shirt, jeans and boots"). The distinct-turn count treats such
+    a turn as one event, so this flag tells the host LLM that this turn under-
+    counts the true item-count and should be re-read. False for non-aggregate
+    hits and for plain single-item turns."""
 
 
 @dataclass
@@ -98,6 +105,25 @@ class ProcedureHit:
     score: float
     why_retrieved: list[str] = field(default_factory=list)
     """Short reason chips (e.g. `procedure_fts("deploy staging")`)."""
+
+
+@dataclass
+class TemporalEvent:
+    """One dated event for the temporal-reasoning (TR) path, already normalized
+    to a sortable date so the host LLM reads a chronology instead of hunting for
+    dates in retrieval noise.
+
+    `date` is ISO `YYYY-MM-DD` for fully-resolved dates; for a year-less message
+    mention it falls back to the date portion of the source turn's event time
+    (`created_at`) so the event still has a sort key. `source` names where the
+    event came from: "message" (an explicit date written in a turn) or "graph"
+    (a dated knowledge-graph edge — its `temporal_scope`, else its `first_seen`).
+    Only *dated* items appear here; undated graph facts stay in `graph_facts`."""
+
+    date: str
+    text: str
+    source: str
+    why_retrieved: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -136,11 +162,58 @@ class AugmentedContext:
     so the host's LLM verifies it against `message_hits` (the matching turns,
     chronological). The count stays exact even when `message_hits` is capped at
     `message_fts_aggregate_cap` (so `total_message_matches >= len(message_hits)`)."""
-    graph_facts: list[GraphFact] = field(default_factory=list)
+    enumeration_turns: int = 0
+    """Of the matching MR turns, how many enumerate *several* items in one message
+    ("a shirt, jeans and boots"). Populated only under `ability="MR"`; 0 otherwise.
+
+    This is the over-count provenance the aggregate path can offer WITHOUT entity
+    typing (a graph-native typed count was ruled out: the type vocabulary is tech-
+    only, so consumer categories like clothing/food never get typed). When this is
+    0, the one-turn-one-item assumption holds and `total_message_matches` is the
+    answer. When nonzero, that many turns each state multiple items, so the true
+    count is HIGHER than `total_message_matches`; the host LLM should re-read the
+    `message_hits` carrying `enumerates_items=True` and tally items, not turns.
+    Computed over the full deduped match set, so it stays exact under the cap."""
+    graph_count: GraphCount | None = None
+    """EXACT graph-native count for the IN-DOMAIN slice of an `ability="MR"`
+    question, or None. Populated only when the query maps cleanly onto the
+    in-vocab type/predicate/entity machinery (see `hymem.query.count_routing`):
+    "how many services depend on redis?" → distinct typed subjects;
+    "how many databases do we use?" → distinct typed objects. None when the query
+    is out-of-vocab, un-typed, or ambiguous, or when neither edge orientation
+    yields any match (a zero-with-no-evidence result is suppressed rather than
+    surfaced as a misleading "exact 0") — the cases the graph cannot answer.
+
+    Precedence contract for the host: when `graph_count` is present it is the
+    EXACT, dedup-correct answer (a `COUNT(DISTINCT ...)` over active edges) and
+    should be preferred over `total_message_matches`, which is only the lexical
+    *candidate* (it counts raw user turns and can over/under-count). The two
+    coexist on purpose: the keyword candidate always runs as the fallback for
+    out-of-vocab / consumer-domain / un-typed questions where `graph_count` is
+    None, and it also lets the host cross-check the exact number against the
+    matching turns. `graph_count.counted` names which side was tallied so the host
+    can phrase the answer unambiguously."""
     episodes: list[EpisodeHit] = field(default_factory=list)
     procedures: list[ProcedureHit] = field(default_factory=list)
     matched_entities: list[str] = field(default_factory=list)
     recent_turns: list[Message] = field(default_factory=list)
+    temporal_events: list[TemporalEvent] = field(default_factory=list)
+    """Dated events in chronological (date-ascending) order, populated only when
+    `augment()` runs with `ability="TR"`. It merges explicit dates extracted from
+    raw messages (`temporal_mentions`) with dated knowledge-graph edges (their
+    `temporal_scope`, else `first_seen`), so a temporal-reasoning question ("how
+    long between X and Y?", "what happened first?") receives a ready-made
+    timeline. Only dated items appear; undated graph facts stay in `graph_facts`.
+    Empty for every other ability and for DBs without the temporal index."""
+    detected_ability: str | None = None
+    """The ability HyMem *inferred* from the query text when the host supplied no
+    explicit `ability` hint (None when the host supplied one, or when nothing was
+    inferred). Provenance only — it mirrors the `why_retrieved` chips' role of
+    making a routing decision debuggable: it lets a consumer see that, e.g., a
+    plain "how many cards did I add?" was auto-routed to the MR aggregate path
+    without the caller passing `ability="MR"`. An *explicit* host hint always
+    wins and leaves this None, so host-supplied and inferred shaping stay
+    distinguishable."""
 
 
 # Ability hints a host (e.g. a BEAM harness) may pass to shape retrieval to the
@@ -169,8 +242,22 @@ def augment(
     session_id: str | None = None,
     ability: str | None = None,
 ) -> AugmentedContext:
+    # The explicit host hint always wins (the host knows the question type). Only
+    # when it is None/absent/unknown do we infer one from the query text, so the
+    # MR/TR shaping that the BEAM harness gets from a ground-truth label also
+    # fires in real conversations where no label is passed. The inferred code is
+    # re-validated through the same `_ABILITIES` gate so it can never widen the
+    # accepted set. `detected_ability` records the inference for debuggability
+    # (left None when the host supplied the hint, so the two stay distinguishable).
     ability = _normalize_ability(ability)
+    detected: str | None = None
+    if ability is None:
+        detected = _normalize_ability(detect_ability(user_message))
+        ability = detected
+        if detected is not None:
+            log.debug("ability.auto_detected=%s (no host hint)", detected)
     ctx = AugmentedContext()
+    ctx.detected_ability = detected
     if cfg.user_md_path.exists():
         ctx.user_md = cfg.user_md_path.read_text(encoding="utf-8")
     if cfg.memory_md_path.exists():
@@ -231,12 +318,32 @@ def augment(
     # the matching turns as evidence, so the host's LLM reads a number instead of
     # tallying across a wall of hits.
     if ability == "MR" and cfg.message_fts_aggregate_cap > 0:
-        ctx.message_hits, ctx.total_message_matches = _message_fts_aggregate(
+        (
+            ctx.message_hits,
+            ctx.total_message_matches,
+            ctx.enumeration_turns,
+        ) = _message_fts_aggregate(
             conn, user_message, cap=cfg.message_fts_aggregate_cap
         )
+        # Higher-confidence ADDITIVE layer: for the IN-DOMAIN slice of MR
+        # questions the graph gives an EXACT typed count alongside the keyword
+        # candidate above (which always still runs as the fallback). The router
+        # only fires on in-vocab type/predicate/entity, and any failure leaves
+        # graph_count=None — the keyword count is never disturbed.
+        ctx.graph_count = _maybe_graph_count(conn, user_message)
     elif cfg.message_fts_top_k > 0:
         ctx.message_hits = _message_fts_search(
             conn, user_message, top_k=cfg.message_fts_top_k
+        )
+
+    # ability="TR" (temporal reasoning) builds a date-ordered event list so the
+    # host LLM reads a chronology instead of finding dates in noise. It merges
+    # explicit dates extracted from raw messages (temporal_mentions) with dated
+    # knowledge-graph edges, ordered date-ascending. Only populated for TR; the
+    # other tiers above (graph/fts/messages) still run unchanged.
+    if ability == "TR":
+        ctx.temporal_events = _temporal_events(
+            conn, user_message, top_k=cfg.fts_top_k
         )
 
     ctx.episodes = _episode_search(
@@ -464,9 +571,47 @@ def _dedup_key(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+# Coordinating conjunctions that join enumerated items inside one turn, across
+# the project's Latin-script scope (English + Dutch prioritized, plus the common
+# German/French/Spanish forms a multilingual user may switch into). Matched only
+# as whole words (the regex below uses \b) so "android"/"sander" don't trip the
+# "and"-lookalike. Kept as a comment-level note; the split regex is the source
+# of truth so the two never drift.
+#
+# A turn enumerating >= this many items is flagged as an over-count risk: the
+# distinct-turn count treats it as one event, but it states several. Two list
+# segments (one comma/conjunction split) is the smallest unambiguous list.
+_ENUM_MIN_SEGMENTS = 2
+
+
+def _enumerates_items(text: str) -> bool:
+    """Heuristic: does this single turn enumerate *several* items?
+
+    The MR over-count failure mode is one turn listing many things ("I have a
+    shirt, jeans, and boots") — the aggregate count tallies it as one matching
+    turn while the true item count is three. We can't resolve that count without
+    typing (see Phase A), but we can deterministically *flag* the turn so the
+    host LLM knows turn-count and item-count diverge here and re-reads the text.
+
+    Detection is intentionally conservative — a structural list signal, not NLP:
+    we split on commas, semicolons, and standalone coordinating conjunctions
+    (`and`/`en`/`und`/…), and report True only when >= `_ENUM_MIN_SEGMENTS`
+    non-empty segments survive. A plain sentence ("I added a blue shirt") has one
+    segment and is never flagged; "shirt, jeans and boots" yields three. This
+    biases toward *under*-flagging (a missed list just falls back to the existing
+    one-turn-one-item assumption), never toward inventing enumerations."""
+    lowered = text.lower()
+    # Split on list punctuation first, then on standalone conjunction words.
+    rough = re.split(r"[,;]|\band\b|\ben\b|\bund\b|\bet\b|\by\b|\be\b", lowered)
+    segments = [s for s in (seg.strip() for seg in rough) if s]
+    # Re-validate that any conjunction split was a real word boundary: the regex
+    # already enforces \b, but guard the empty/whitespace artifacts above.
+    return len(segments) >= _ENUM_MIN_SEGMENTS
+
+
 def _message_fts_aggregate(
     conn: sqlite3.Connection, query: str, *, cap: int
-) -> tuple[list[MessageHit], int]:
+) -> tuple[list[MessageHit], int, int]:
     """Counting retrieval for MR-style "how many X" questions.
 
     The LLM can't reliably tally across a wall of hits, so this does the
@@ -482,10 +627,22 @@ def _message_fts_aggregate(
 
     The count is a *candidate* answer, not gospel — one turn may state several
     items, or none — so the host's LLM verifies it against the returned turns.
-    Returns ([], 0) on no content tokens or if `messages_fts` is absent."""
+
+    Over-count provenance: because a graph-native typed count is not viable on
+    this schema (the entity-type vocabulary is tech-only, so consumer/personal
+    categories like "clothing" never get typed — see `_enumerates_items` and the
+    module note), we can't *resolve* the "one turn lists three items" case. We
+    instead surface it: the third return value is the number of distinct evidence
+    turns that *enumerate* multiple items, and each such hit carries
+    `enumerates_items=True`. A nonzero value tells the host LLM that turn-count
+    undercounts the true item-count and it should re-read those turns rather than
+    trust the distinct-turn tally. When zero, one-turn-one-item holds and the
+    candidate count is the answer.
+
+    Returns ([], 0, 0) on no content tokens or if `messages_fts` is absent."""
     tokens = _aggregate_tokens(query)
     if not tokens:
-        return [], 0
+        return [], 0, 0
     fts_query = " OR ".join(f'"{t}"' for t in tokens)
 
     try:
@@ -502,7 +659,7 @@ def _message_fts_aggregate(
             (fts_query, _MR_COUNT_SCAN),
         ).fetchall()
     except sqlite3.OperationalError:
-        return [], 0
+        return [], 0, 0
 
     seen: set[str] = set()
     deduped: list[sqlite3.Row] = []
@@ -514,6 +671,10 @@ def _message_fts_aggregate(
         deduped.append(r)
 
     count = len(deduped)
+    # Count over the FULL deduped set (not just the capped evidence) so the
+    # over-count signal stays exact alongside `count`, mirroring how the count
+    # itself survives the cap.
+    enumeration_turns = sum(1 for r in deduped if _enumerates_items(r["content"]))
     chip = f'message_fts_aggregate("{" ".join(tokens)}")'
     hits = [
         MessageHit(
@@ -525,10 +686,271 @@ def _message_fts_aggregate(
             created_at=r["created_at"] or "",
             score_kind="aggregate",
             why_retrieved=[chip],
+            enumerates_items=_enumerates_items(r["content"]),
         )
         for r in deduped[:cap]
     ]
-    return hits, count
+    return hits, count, enumeration_turns
+
+
+def _maybe_graph_count(
+    conn: sqlite3.Connection, query: str
+) -> GraphCount | None:
+    """EXACT graph count for the in-domain slice of an MR query, else None.
+
+    Bridges the MR query to `count_relations` via `count_routing.plan_count`,
+    which only emits a plan when the query maps cleanly onto in-vocab
+    type/predicate/entity (see that module for the side heuristic). The anchor
+    entity is taken from `match_known_entities` — the DIRECT matches only, so a
+    type-expansion canonical can never masquerade as a user-named anchor and
+    pivot the count on an entity the user never mentioned.
+
+    Degrades to None on ANY failure (routing or the count itself) so the keyword
+    aggregate path — which has already run — is never disturbed. `count_relations`
+    already swallows OperationalError; the broad except here guards the routing
+    layer too, keeping augment() robust against a malformed query/graph."""
+    # Imported lazily to avoid a circular import: count_routing imports
+    # detect_query_types from this module.
+    from hymem.query.count_routing import plan_count
+
+    try:
+        matched = match_known_entities(conn, query)
+        plan = plan_count(query, matched)
+        if plan is None:
+            return None
+        result = _resolve_graph_count(conn, plan)
+        # Suppress a zero-with-no-evidence result. An in-vocab mapping that finds
+        # no edges is almost always a wrong-direction or absent-data case; a
+        # surfaced "exact 0" would mislead the host more than the keyword
+        # candidate it would shadow, so fall back to that candidate instead. A
+        # genuine "zero of type X" is rare and the keyword path still answers it.
+        if result.count == 0 and not result.entities:
+            return None
+        return result
+    except Exception:  # noqa: BLE001 — additive layer must never break augment()
+        log.debug("graph_count routing failed; leaving graph_count=None", exc_info=True)
+        return None
+
+
+def _resolve_graph_count(conn: sqlite3.Connection, plan: "CountPlan") -> GraphCount:
+    """Run `count_relations` for a plan, recovering from a wrong-direction guess.
+
+    The router (`plan_count`) has to guess which side carries the counted type for
+    an *anchored* question, and it defaults to typing the **subject** ("how many
+    services depend on redis" → services are subjects). But natural phrasings just
+    as often type the **object** ("how many databases does billing use" → the
+    databases are the objects of `billing uses …`). When the default orientation
+    finds nothing, we retry the mirror orientation (type on the object side,
+    anchor as the subject) and prefer whichever actually has edges.
+
+    Only anchored, subject-typed plans carry this ambiguity. We try the mirror
+    solely when the primary orientation is empty, so a primary that *does* find
+    edges is trusted as-is and no both-orientations-non-empty ambiguity can arise.
+    Unanchored plans (no entity to pivot on) have a single unambiguous orientation
+    and are returned directly."""
+    primary = count_relations(
+        conn,
+        count=plan.count,
+        predicates=plan.predicates,
+        subject=plan.subject,
+        object=plan.object,
+        subject_type=plan.subject_type,
+        object_type=plan.object_type,
+    )
+    # Mirror only applies to the anchored, subject-typed shape the router emits
+    # (count="subject", subject_type=T, object=anchor). If it already found edges,
+    # trust it; otherwise flip the type to the object side and the anchor to the
+    # subject side and see if that orientation is the one the graph holds.
+    anchored_subject_typed = (
+        plan.count == "subject"
+        and plan.subject_type is not None
+        and plan.object is not None
+    )
+    if not anchored_subject_typed or primary.count > 0:
+        return primary
+    mirror = count_relations(
+        conn,
+        count="object",
+        predicates=plan.predicates,
+        subject=plan.object,
+        object_type=plan.subject_type,
+    )
+    return mirror if mirror.count > 0 else primary
+
+
+# Predicates whose edges describe a datable event/adoption ("we started using X
+# on …"), so a dated edge is worth surfacing on the TR timeline. Confidence-
+# bearing relational predicates; excludes structural ones (part_of, contains,
+# equivalent_to) that rarely carry a meaningful event date.
+_TR_EDGE_PREDICATES = frozenset({
+    "uses", "depends_on", "deploys_to", "implements", "replaces",
+    "requires_version", "runs_on", "connects_to", "configured_with",
+})
+
+
+def _temporal_event_date(normalized: str | None, created_at: str) -> str | None:
+    """Pick a sortable date for an event, preferring a fully-resolved date.
+
+    A year-less message mention (`normalized` is None) still has ordering signal
+    via the turn's event time, so we fall back to the date portion of
+    `created_at` (ISO strings sort lexicographically, so the leading 10 chars are
+    the YYYY-MM-DD prefix). Returns None only when nothing datable remains, so
+    the caller can drop it (the TR list must stay date-only)."""
+    if normalized:
+        return normalized
+    if created_at and len(created_at) >= 10 and created_at[4] == "-":
+        return created_at[:10]
+    return None
+
+
+def _temporal_message_events(
+    conn: sqlite3.Connection, query: str, *, top_k: int
+) -> list[TemporalEvent]:
+    """Query-relevant dated message mentions, ordered date-ascending.
+
+    Restricts the FTS-matched messages to those carrying an extracted date
+    (`temporal_mentions`), so the list is purely chronological evidence. Degrades
+    to [] — never raises — when `temporal_mentions` or `messages_fts` is absent
+    (pre-v14 DB), mirroring `_message_fts_search`'s OperationalError tolerance."""
+    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    tokens = [t for t in cleaned.split() if len(t) >= 2]
+
+    # When the query carries content tokens, scope the timeline to messages that
+    # match them; an empty/stopword-only query falls back to the whole index so a
+    # bare "what happened first?" still returns a chronology.
+    try:
+        if tokens:
+            fts_query = " OR ".join(f'"{t}"' for t in tokens)
+            rows = conn.execute(
+                """
+                SELECT tm.normalized_date, tm.raw_text, tm.surrounding_text,
+                       tm.created_at, m.id AS message_id
+                FROM temporal_mentions tm
+                JOIN messages_fts ON messages_fts.rowid = tm.message_id
+                JOIN messages m ON m.id = tm.message_id
+                WHERE messages_fts MATCH ?
+                """,
+                (fts_query,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT normalized_date, raw_text, surrounding_text,
+                       created_at, message_id
+                FROM temporal_mentions
+                """
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    events: list[tuple[str, TemporalEvent]] = []
+    for r in rows:
+        date = _temporal_event_date(r["normalized_date"], r["created_at"] or "")
+        if date is None:
+            continue
+        chip = (
+            "temporal_mention"
+            if r["normalized_date"]
+            else "temporal_mention(event_time)"
+        )
+        events.append((
+            date,
+            TemporalEvent(
+                date=date,
+                text=r["surrounding_text"] or r["raw_text"],
+                source="message",
+                why_retrieved=[chip],
+            ),
+        ))
+    events.sort(key=lambda e: e[0])
+    return [ev for _, ev in events[:top_k]]
+
+
+def _temporal_graph_events(
+    conn: sqlite3.Connection, entities: list[str], *, top_k: int
+) -> list[TemporalEvent]:
+    """Dated knowledge-graph edges for matched entities, ordered date-ascending.
+
+    Revives the long-dead `kg_evidence.temporal_scope`: an edge's most specific
+    recorded scope wins, else the edge's `first_seen` provides an event date.
+    Only datable relational predicates (`_TR_EDGE_PREDICATES`) are considered, so
+    structural edges (part_of, contains) don't clutter the timeline. Returns []
+    when no entity matched. Tolerant of a missing `temporal_scope` column."""
+    if not entities:
+        return []
+
+    pred_placeholders = ",".join("?" * len(_TR_EDGE_PREDICATES))
+    ent_placeholders = ",".join("?" * len(entities))
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT kg.subject_canonical AS s, kg.predicate AS p,
+                   kg.object_canonical AS o, kg.first_seen,
+                   (SELECT ev.temporal_scope FROM kg_evidence ev
+                    WHERE ev.edge_id = kg.id AND ev.temporal_scope IS NOT NULL
+                    ORDER BY ev.extracted_at DESC LIMIT 1) AS scope
+            FROM knowledge_graph kg
+            WHERE kg.status = 'active'
+              AND kg.predicate IN ({pred_placeholders})
+              AND (kg.subject_canonical IN ({ent_placeholders})
+                   OR kg.object_canonical IN ({ent_placeholders}))
+            """,
+            list(_TR_EDGE_PREDICATES) + entities + entities,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    events: list[tuple[str, TemporalEvent]] = []
+    for r in rows:
+        # Prefer an extracted temporal_scope that *looks* like an ISO date so the
+        # merged list stays sortable; otherwise fall back to first_seen. A free-
+        # text scope ("last quarter") is kept as the event text but not as the
+        # sort key, since it can't be ordered against ISO dates.
+        scope = (r["scope"] or "").strip()
+        scope_date = scope[:10] if _looks_iso(scope) else None
+        date = scope_date or _temporal_event_date(None, r["first_seen"] or "")
+        if date is None:
+            continue
+        fact = f"{r['s']} {r['p']} {r['o']}"
+        text = f"{fact} ({scope})" if scope and not scope_date else fact
+        chip = "temporal_scope" if scope_date else "edge_first_seen"
+        events.append((
+            date,
+            TemporalEvent(
+                date=date, text=text, source="graph", why_retrieved=[chip]
+            ),
+        ))
+    events.sort(key=lambda e: e[0])
+    return [ev for _, ev in events[:top_k]]
+
+
+_ISO_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _looks_iso(value: str) -> bool:
+    """True if `value` starts with a YYYY-MM-DD prefix (so its first 10 chars are
+    a usable sort key). Used to decide whether a free-text temporal_scope can be
+    ordered against ISO dates."""
+    return bool(_ISO_DATE_PREFIX.match(value))
+
+
+def _temporal_events(
+    conn: sqlite3.Connection, query: str, *, top_k: int
+) -> list[TemporalEvent]:
+    """Merge dated message mentions and dated graph edges into one chronology.
+
+    The two sources are gathered independently (message mentions by FTS over the
+    query, graph edges by the query's matched entities), concatenated, and sorted
+    date-ascending so the host LLM receives events already in order. Capped at
+    `top_k` after the merge. Returns [] gracefully on a pre-v14 DB (no
+    temporal_mentions table) — the underlying helpers swallow the
+    OperationalError — so the TR path never raises."""
+    msg_events = _temporal_message_events(conn, query, top_k=top_k)
+    entities = match_known_entities(conn, query)
+    graph_events = _temporal_graph_events(conn, entities, top_k=top_k)
+    merged = msg_events + graph_events
+    merged.sort(key=lambda e: e.date)
+    return merged[:top_k]
 
 
 def _embeddings_compatible(conn: sqlite3.Connection, embedder: EmbeddingClient) -> bool:
@@ -1321,6 +1743,24 @@ _PROPERTY_QUERY_KEYWORDS: dict[tuple[str, str], tuple[str, ...]] = {
 }
 
 
+def detect_query_types(user_message: str) -> set[str]:
+    """Return the in-vocab entity-type labels a category-style query names.
+
+    Single source of truth for "which `entity_types` label does this query target"
+    — it scans the lowercased message against the SAME `_TYPE_QUERY_KEYWORDS`
+    phrase map that `_expand_entities_from_query` uses for graph_facts expansion,
+    so the type vocabulary never forks between the retrieval and counting paths.
+    The graph-count router (`hymem.query.count_routing`) consumes this to decide a
+    target subject_type/object_type; `_expand_entities_from_query` reuses it below
+    so the detection logic lives in exactly one place."""
+    msg = user_message.lower()
+    return {
+        type_label
+        for type_label, phrases in _TYPE_QUERY_KEYWORDS.items()
+        if any(p in msg for p in phrases)
+    }
+
+
 def _expand_entities_from_query(
     conn: sqlite3.Connection,
     user_message: str,
@@ -1336,10 +1776,7 @@ def _expand_entities_from_query(
     where the label is the type or ``"key=value"`` rendering of the property.
     """
     msg = user_message.lower()
-    matched_types: set[str] = set()
-    for type_label, phrases in _TYPE_QUERY_KEYWORDS.items():
-        if any(p in msg for p in phrases):
-            matched_types.add(type_label)
+    matched_types: set[str] = detect_query_types(user_message)
 
     matched_props: list[tuple[str, str]] = []
     for (key, value), phrases in _PROPERTY_QUERY_KEYWORDS.items():
