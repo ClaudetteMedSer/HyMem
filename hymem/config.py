@@ -67,6 +67,15 @@ class HyMemConfig:
     recallable before any dream runs. 0 disables."""
 
     fts_top_k: int = 5
+
+    message_fts_top_k: int = 5
+    """Number of raw-message keyword hits augment() returns in `message_hits`,
+    via a direct FTS5 path over the `messages` table (user/assistant turns
+    only). Complements `fts_top_k`, which searches dreamed *chunks*: raw turns
+    are searchable the moment they are logged, so facts are recallable across
+    sessions and before any dream consolidates them — the gap chunk-FTS leaves.
+    0 disables the path."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 

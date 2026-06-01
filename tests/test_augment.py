@@ -92,3 +92,79 @@ def test_recent_messages_zero_limit_returns_empty(hy):
     hy.log_message(sid, "user", "a turn")
 
     assert recent_messages(hy.read_conn, sid, 0) == []
+
+
+# --- raw-message FTS tier (message_hits) ----------------------------------
+
+
+def test_message_hits_recall_raw_turn_across_sessions_before_dream(hy):
+    # The gap this closes: a fact stated in some *other* session, never dreamed,
+    # is still keyword-recallable — unlike the working-memory tier (active
+    # session only) or chunk-FTS (dreamed high-salience spans only).
+    hy.open_session("past")
+    hy.log_message("past", "user", "We migrated the billing service to CockroachDB.")
+    hy.close_session("past")
+
+    # No dream ran, and no session_id is passed (working-memory tier off).
+    ctx = hy.augment("what database does billing use?")
+
+    assert ctx.graph_facts == []   # nothing consolidated
+    assert ctx.recent_turns == []  # no active session
+    hit = next(h for h in ctx.message_hits if "CockroachDB" in h.text)
+    assert hit.session_id == "past"
+    assert hit.role == "user"
+    assert hit.message_id > 0
+    assert hit.created_at  # populated so a consumer can prefer recent statements
+    assert hit.why_retrieved and hit.why_retrieved[0].startswith("message_fts(")
+
+
+def test_message_hits_exclude_tool_and_system_turns(hy):
+    sid = "roles"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "deploy uses terraform")
+    hy.log_message(sid, "assistant", "noted, terraform it is")
+    hy.log_message(sid, "tool", "terraform plan output terraform terraform")
+    hy.log_message(sid, "system", "system note about terraform")
+
+    ctx = hy.augment("terraform")
+
+    roles = {h.role for h in ctx.message_hits}
+    assert roles == {"user", "assistant"}  # tool/system never indexed
+    assert len(ctx.message_hits) == 2
+
+
+def test_message_hits_empty_on_no_match(hy):
+    sid = "nomatch"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "we use redis for caching")
+
+    ctx = hy.augment("quantum chromodynamics unrelated terms")
+    assert ctx.message_hits == []
+
+
+def test_message_hits_disabled_when_top_k_zero(cfg, stub_llm):
+    from dataclasses import replace
+
+    from hymem import HyMem
+
+    hy = HyMem(replace(cfg, message_fts_top_k=0), llm=stub_llm)
+    try:
+        sid = "off"
+        hy.open_session(sid)
+        hy.log_message(sid, "user", "kafka is the message broker")
+        ctx = hy.augment("kafka")
+        assert ctx.message_hits == []
+    finally:
+        hy.close()
+
+
+def test_message_hits_drop_after_message_pruned(hy):
+    # The delete trigger must keep messages_fts in sync so retention doesn't
+    # leave orphaned, unjoinable FTS rows.
+    sid = "prune"
+    hy.open_session(sid)
+    mid = hy.log_message(sid, "user", "we standardized on pnpm for the monorepo")
+    assert any("pnpm" in h.text for h in hy.augment("pnpm").message_hits)
+
+    hy.conn.execute("DELETE FROM messages WHERE id = ?", (mid,))  # autocommit
+    assert hy.augment("pnpm").message_hits == []

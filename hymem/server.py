@@ -129,6 +129,10 @@ def _do_augment(message: str) -> str:
         snippets = [f"[{h.session_id}] {h.text[:300]}" for h in ctx.fts_hits]
         parts.append("**Relevant past context (keyword search):**\n" + "\n".join(snippets))
 
+    if ctx.message_hits:
+        snippets = [f"[{h.session_id}/{h.role}] {h.text[:300]}" for h in ctx.message_hits]
+        parts.append("**Relevant raw turns (keyword search):**\n" + "\n".join(snippets))
+
     return "\n\n".join(parts) if parts else ""
 
 

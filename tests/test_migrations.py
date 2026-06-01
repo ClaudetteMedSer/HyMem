@@ -139,6 +139,8 @@ def test_legacy_v1_db_upgrades_and_gains_columns(tmp_path: Path):
         CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         INSERT INTO schema_meta VALUES ('schema_version', '1');
         CREATE TABLE sessions(id TEXT PRIMARY KEY);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL);
         CREATE TABLE chunks(id TEXT PRIMARY KEY);
         CREATE TABLE kg_evidence(id INTEGER PRIMARY KEY, edge_id INTEGER,
             chunk_id TEXT, polarity INTEGER);
@@ -165,4 +167,42 @@ def test_legacy_v1_db_upgrades_and_gains_columns(tmp_path: Path):
     assert _has_table(conn, "entity_properties")            # v9
     assert "status" in _cols(conn, "procedures")            # v10
     assert "source_role" in _cols(conn, "kg_evidence")      # v11
+    assert _has_table(conn, "messages_fts")                 # v13
+    conn.close()
+
+
+def test_v13_backfills_messages_fts_with_role_filter(tmp_path: Path):
+    """Migration 013 backfills already-logged user/assistant turns into
+    messages_fts and excludes tool/system turns — matching the live trigger's
+    role guard so the index is consistent however a row arrived."""
+    conn = core_db.connect(tmp_path / "v12.sqlite")
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta VALUES ('schema_version', '12');
+        CREATE TABLE sessions(id TEXT PRIMARY KEY);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL);
+        INSERT INTO sessions(id) VALUES ('s');
+        INSERT INTO messages(session_id, role, content) VALUES
+            ('s','user','postgres is the primary datastore'),
+            ('s','assistant','noted: postgres with pgbouncer'),
+            ('s','tool','postgres tool dump postgres postgres');
+        """
+    )
+    assert not _has_table(conn, "messages_fts")
+
+    core_db._run_migrations(conn)  # version 12 -> only migration 013 applies
+
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+    assert _has_table(conn, "messages_fts")
+    roles = [
+        r["role"]
+        for r in conn.execute(
+            "SELECT m.role FROM messages_fts JOIN messages m "
+            "ON m.id = messages_fts.rowid WHERE messages_fts MATCH ? ORDER BY m.id",
+            ('"postgres"',),
+        ).fetchall()
+    ]
+    assert roles == ["user", "assistant"]  # tool turn not backfilled
     conn.close()

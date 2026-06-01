@@ -66,6 +66,29 @@ class FtsHit:
 
 
 @dataclass
+class MessageHit:
+    """A raw session-log turn surfaced by direct FTS5 keyword search over the
+    `messages` table — the path that reaches content not (yet) consolidated into
+    chunks by dreaming, including turns from other sessions.
+
+    Distinct from `FtsHit` (which carries dreamed *chunk* text) on purpose: the
+    two are different granularities and their BM25 scores aren't comparable, so
+    they stay in separate lists and the host weaves them together. `created_at`
+    and `message_id` are exposed so a consumer can prefer the most recent
+    statement when a fact was updated (BM25 alone is recency-blind)."""
+
+    message_id: int
+    session_id: str
+    role: str
+    text: str
+    score: float
+    created_at: str = ""
+    score_kind: str = "bm25"
+    why_retrieved: list[str] = field(default_factory=list)
+    """Short reason chips, mirroring `FtsHit` (e.g. `message_fts("postgres pool")`)."""
+
+
+@dataclass
 class ProcedureHit:
     procedure_id: str
     session_id: str
@@ -92,11 +115,18 @@ class AugmentedContext:
     active session, included so the host can surface within-session facts that
     have not yet been consolidated by dreaming. It is populated only when a
     `session_id` is passed to `augment()`; otherwise it stays empty.
+
+    `message_hits` is the raw-message keyword tier: BM25 hits from a direct FTS5
+    search over the `messages` table (user/assistant turns). Unlike
+    `recent_turns` it is query-relevant and spans *all* sessions, and unlike
+    `fts_hits` it reaches turns that dreaming never chunked. This closes the
+    "search raw messages by keyword" gap that chunk-only FTS leaves.
     """
 
     user_md: str = ""
     memory_md: str = ""
     fts_hits: list[FtsHit] = field(default_factory=list)
+    message_hits: list[MessageHit] = field(default_factory=list)
     graph_facts: list[GraphFact] = field(default_factory=list)
     episodes: list[EpisodeHit] = field(default_factory=list)
     procedures: list[ProcedureHit] = field(default_factory=list)
@@ -166,6 +196,14 @@ def augment(
     else:
         log.debug("rerank.skipped")
         ctx.fts_hits = ctx.fts_hits[: cfg.fts_top_k]
+
+    # Raw-message keyword tier: direct FTS5 over the session log, reaching turns
+    # that were never chunked (low salience, not-yet-dreamed, or other sessions).
+    # Kept separate from fts_hits — different granularity, non-comparable BM25.
+    if cfg.message_fts_top_k > 0:
+        ctx.message_hits = _message_fts_search(
+            conn, user_message, top_k=cfg.message_fts_top_k
+        )
 
     ctx.episodes = _episode_search(
         conn, user_message,
@@ -276,6 +314,54 @@ def _fts_search(conn: sqlite3.Connection, query: str, *, top_k: int) -> list[Fts
             session_id=r["session_id"],
             text=r["text"],
             score=float(r["score"]),
+            why_retrieved=[chip],
+        )
+        for r in rows
+    ]
+
+
+def _message_fts_search(
+    conn: sqlite3.Connection, query: str, *, top_k: int
+) -> list[MessageHit]:
+    """Direct BM25 keyword search over raw `messages` (user/assistant turns).
+
+    Mirrors `_fts_search` but targets `messages_fts` instead of `chunks_fts`, so
+    it reaches turns dreaming never chunked. Returns [] (not an error) if the
+    table is absent — e.g. a DB migrated by older code — so retrieval degrades to
+    chunk-FTS rather than failing."""
+    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    if not cleaned:
+        return []
+    tokens = [t for t in cleaned.split() if len(t) >= 2]
+    if not tokens:
+        return []
+    fts_query = " OR ".join(f'"{t}"' for t in tokens)
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT m.id, m.session_id, m.role, m.content, m.created_at,
+                   bm25(messages_fts) AS score
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            WHERE messages_fts MATCH ?
+            ORDER BY score
+            LIMIT ?
+            """,
+            (fts_query, top_k),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    chip = f'message_fts("{" ".join(tokens)}")'
+    return [
+        MessageHit(
+            message_id=int(r["id"]),
+            session_id=r["session_id"],
+            role=r["role"],
+            text=r["content"],
+            score=float(r["score"]),
+            created_at=r["created_at"] or "",
             why_retrieved=[chip],
         )
         for r in rows
