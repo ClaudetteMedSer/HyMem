@@ -162,9 +162,19 @@ class LLMClient:
 
 # ── Dataset Loader (streaming) ──────────────────────────────────────
 
-def load_longmemeval_data(dataset_path: str, max_questions: int = None) -> list[dict]:
-    """Stream-load LongMemEval questions using ijson, with stratified sampling."""
+def load_longmemeval_data(dataset_path: str, max_questions: int = None, seed: int = 0) -> list[dict]:
+    """Stream-load LongMemEval questions using ijson, with stratified sampling.
+
+    `seed` makes the stratified sample + shuffle deterministic so two runs
+    (e.g. old code vs new code) evaluate the IDENTICAL question set — without
+    it every run draws a fresh sample and per-category deltas are dominated by
+    which questions happened to be drawn, not by the code change. Pass
+    `max_questions=None` (CLI `--sample 0`) to evaluate the full set and remove
+    sampling variance entirely.
+    """
     import ijson, random
+
+    rng = random.Random(seed)
 
     # First pass: collect all questions grouped by type
     by_type = defaultdict(list)
@@ -189,14 +199,14 @@ def load_longmemeval_data(dataset_path: str, max_questions: int = None) -> list[
     questions = []
     for qtype, items in sorted(by_type.items()):
         n = min(per_type + (1 if remaining > 0 else 0), len(items))
-        sampled = random.sample(items, n) if n < len(items) else items
+        sampled = rng.sample(items, n) if n < len(items) else items
         questions.extend(sampled)
         if remaining > 0:
             remaining -= 1
         print(f"    {qtype}: {n}/{len(items)} sampled", flush=True)
 
-    random.shuffle(questions)
-    print(f"  Loaded {len(questions)} questions ({num_types} types, stratified)", flush=True)
+    rng.shuffle(questions)
+    print(f"  Loaded {len(questions)} questions ({num_types} types, stratified, seed={seed})", flush=True)
     return questions
 
 
@@ -636,7 +646,10 @@ def main():
 
     parser = argparse.ArgumentParser(description="HyMem LongMemEval Benchmark")
     parser.add_argument("--scales", default=DEFAULT_SCALE)
-    parser.add_argument("--sample", type=int, default=DEFAULT_SAMPLE)
+    parser.add_argument("--sample", type=int, default=DEFAULT_SAMPLE,
+                        help="questions to evaluate; 0 = full set (no sampling variance)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="RNG seed for stratified sampling; fixed so runs are paired/comparable")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--answer-model", default=ANSWER_MODEL)
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
@@ -676,14 +689,19 @@ def main():
     print(f"\nHyMem LongMemEval Benchmark")
     print(f"  Dataset: {data_file} ({data_file.stat().st_size / 1024 / 1024:.0f} MB)")
     print(f"  Scale: {scale}")
-    print(f"  Max questions: {args.sample}")
+    print(f"  Max questions: {args.sample if args.sample else 'ALL (no sampling)'}")
+    print(f"  Seed: {args.seed}")
     print(f"  Top-K: {args.top_k}")
     print(f"  Answer model: {args.answer_model}")
     print(f"  Judge model: {args.judge_model}")
 
     # Load data
     print("\nLoading dataset...", flush=True)
-    questions = load_longmemeval_data(str(data_file), max_questions=args.sample)
+    questions = load_longmemeval_data(
+        str(data_file),
+        max_questions=args.sample or None,  # --sample 0 -> full set
+        seed=args.seed,
+    )
     total_sessions = sum(len(q.get("haystack_sessions", [])) for q in questions)
     total_msgs = sum(sum(len(s) for s in q.get("haystack_sessions", [])) for q in questions)
     print(f"  Total: {len(questions)} questions, ~{total_sessions} sessions, ~{total_msgs} messages\n")
@@ -766,6 +784,7 @@ def main():
         "config": {
             "scale": scale,
             "sample": args.sample,
+            "seed": args.seed,
             "top_k": args.top_k,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
