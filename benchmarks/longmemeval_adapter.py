@@ -805,9 +805,18 @@ def main():
         "per_question": all_results,
     }
 
+    # Canonical "latest" pointer (stable filename other tools read)...
     results_path = results_dir / "longmemeval-v2-hymem.json"
     with open(results_path, "w") as f:
         json.dump(output, f, indent=2, default=str)
+    # ...plus an immutable, uniquely-named archive copy so a later run never
+    # clobbers a prior result (a seeded run is reproducible, but per-question
+    # detail and one-off numbers are worth keeping). Key by timestamp+seed.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_path = results_dir / f"longmemeval-v2-hymem-{stamp}-seed{args.seed}.json"
+    with open(archive_path, "w") as f:
+        json.dump(output, f, indent=2, default=str)
+    print(f"  Archived: {archive_path.name}", flush=True)
 
     # Update manifest
     manifest_path = results_dir / "manifest.json"

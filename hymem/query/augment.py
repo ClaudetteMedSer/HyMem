@@ -346,7 +346,7 @@ def augment(
     # other tiers above (graph/fts/messages) still run unchanged.
     if ability == "TR":
         ctx.temporal_events = _temporal_events(
-            conn, user_message, top_k=cfg.fts_top_k
+            conn, user_message, ctx.message_hits, ctx.fts_hits, top_k=cfg.fts_top_k
         )
 
     ctx.episodes = _episode_search(
@@ -932,65 +932,109 @@ def _temporal_graph_events(
 _SESSION_EVENT_CAP = 5
 
 
-def _temporal_session_events(
-    conn: sqlite3.Connection, query: str, *, cap: int = _SESSION_EVENT_CAP
+def _truncate(text: str, limit: int = 200) -> str:
+    text = (text or "").strip()
+    return text[: limit - 3] + "..." if len(text) > limit else text
+
+
+def _temporal_hits_events(
+    conn: sqlite3.Connection,
+    message_hits: list["MessageHit"],
+    fts_hits: list["FtsHit"],
+    *,
+    cap: int = _SESSION_EVENT_CAP,
 ) -> list[TemporalEvent]:
-    """Session-date events for FTS-matched turns that carry NO content-date.
+    """Session-date anchors derived from the ALREADY-RETRIEVED evidence — not a
+    fresh keyword pass.
 
-    The turn's `created_at` (the session date threaded in at ingest) is an
-    *anchor* even when the user never restated a date in the text — which is the
-    common LongMemEval shape (the temporal grounding lives in session metadata,
-    not the prose). We surface it as `source="session-date"` so the host LLM
-    knows this is *when-discussed*, not necessarily *when-it-happened* — it must
-    not be treated as event-time for duration math the way a content-date is.
+    The turn's `created_at` (the session date threaded in at ingest) anchors a
+    question even when the user never restated a date in the prose — the common
+    LongMemEval shape (grounding lives in session metadata). Earlier this was a
+    separate FTS pass keyed on the query tokens, which inherited the question's
+    vocabulary: a turn saying "Walk for Hunger" was invisible to a question about
+    a "charity event". Sourcing the anchors from what the retriever ALREADY
+    surfaced fixes that — `fts_hits` are the *semantic* chunk tier (embeddings),
+    so they recall the answer-bearing turn even when keywords miss.
 
-    Guard rails: (1) only turns that have no `temporal_mention` of their own
-    (those are already covered by `_temporal_message_events`, the primary path —
-    no double-counting and content-dates stay authoritative); (2) requires query
-    tokens, so a bare "what happened first?" doesn't dump every turn's date;
-    (3) ranked by relevance (bm25) and capped at `cap`. Degrades to [] — never
-    raises — on a pre-v14 DB (no temporal_mentions table)."""
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
-    tokens = [t for t in cleaned.split() if len(t) >= 2]
-    if not tokens:
-        return []
-
-    fts_query = " OR ".join(f'"{t}"' for t in tokens)
+    Two evidence sources, both emitted as `source="session-date"` (a *when-
+    discussed* anchor, NOT event-time for duration math):
+    (1) `message_hits` — raw turns carrying `created_at` + `message_id` directly;
+    (2) `fts_hits` — dreamed chunks, mapped chunk -> `start_message_id` ->
+        `messages.created_at` for the chunk's session date.
+    Guard rails: a turn/chunk-range that already carries a `temporal_mention`
+    (a content-date) is skipped — those are authoritative and handled by
+    `_temporal_message_events`, so no double-count and no dilution. Capped at
+    `cap`, in retrieval-relevance order (message_hits before chunk hits), then
+    presented date-ascending. Degrades to [] on a pre-v14 DB (no
+    temporal_mentions table)."""
+    # The TR feature is gated on temporal_mentions; absent it, degrade to [] like
+    # the rest of the path (preserves the pre-v14 contract).
     try:
-        rows = conn.execute(
-            """
-            SELECT m.id AS message_id, m.created_at, m.content
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            WHERE messages_fts MATCH ?
-              AND m.id NOT IN (SELECT message_id FROM temporal_mentions)
-            ORDER BY bm25(messages_fts)
-            LIMIT ?
-            """,
-            (fts_query, cap),
-        ).fetchall()
+        dated = {
+            r["message_id"]
+            for r in conn.execute("SELECT message_id FROM temporal_mentions")
+        }
     except sqlite3.OperationalError:
         return []
 
-    events: list[tuple[str, TemporalEvent]] = []
-    for r in rows:
-        date = _temporal_event_date(None, r["created_at"] or "")
+    candidates: list[TemporalEvent] = []
+    seen: set[int] = set()
+
+    # (1) Raw-message hits: provenance is on the hit object itself.
+    for h in message_hits:
+        mid = getattr(h, "message_id", None)
+        if mid is None or mid in dated or mid in seen:
+            continue
+        date = _temporal_event_date(None, getattr(h, "created_at", "") or "")
         if date is None:
             continue
-        text = (r["content"] or "").strip()
-        if len(text) > 200:
-            text = text[:197] + "..."
-        events.append((
-            date,
-            TemporalEvent(
-                date=date,
-                text=text,
-                source="session-date",
-                why_retrieved=["session_date(discussed)"],
-            ),
+        seen.add(mid)
+        candidates.append(TemporalEvent(
+            date=date, text=_truncate(getattr(h, "text", "")),
+            source="session-date", why_retrieved=["message_hit(discussed)"],
         ))
-    events.sort(key=lambda e: e[0])
-    return [ev for _, ev in events]
+
+    # (2) Semantic chunk hits: map chunk -> message range -> session date. Skip a
+    # chunk whose range already carries a content-date (covered by the primary).
+    chunk_ids = [c for c in (getattr(h, "chunk_id", None) for h in fts_hits) if c]
+    if chunk_ids:
+        ph = ",".join("?" * len(chunk_ids))
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT c.id, c.start_message_id, c.text,
+                       (SELECT m.created_at FROM messages m
+                        WHERE m.id = c.start_message_id) AS created_at,
+                       EXISTS(SELECT 1 FROM temporal_mentions tm
+                              WHERE tm.message_id BETWEEN c.start_message_id
+                                                      AND c.end_message_id) AS has_date
+                FROM chunks c
+                WHERE c.id IN ({ph})
+                """,
+                chunk_ids,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        # Preserve the fts_hits relevance order (the SQL IN-clause doesn't).
+        by_id = {r["id"]: r for r in rows}
+        for cid in chunk_ids:
+            r = by_id.get(cid)
+            if r is None or r["has_date"]:
+                continue
+            mid = r["start_message_id"]
+            if mid in seen:
+                continue
+            date = _temporal_event_date(None, r["created_at"] or "")
+            if date is None:
+                continue
+            seen.add(mid)
+            candidates.append(TemporalEvent(
+                date=date, text=_truncate(r["text"]),
+                source="session-date", why_retrieved=["chunk_hit(discussed)"],
+            ))
+
+    # Cap in relevance order (message_hits first), then present date-ascending.
+    return sorted(candidates[:cap], key=lambda e: e.date)
 
 
 _ISO_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -1004,37 +1048,47 @@ def _looks_iso(value: str) -> bool:
 
 
 def _temporal_events(
-    conn: sqlite3.Connection, query: str, *, top_k: int
+    conn: sqlite3.Connection,
+    query: str,
+    message_hits: list["MessageHit"],
+    fts_hits: list["FtsHit"],
+    *,
+    top_k: int,
 ) -> list[TemporalEvent]:
-    """Merge dated message mentions, dated graph edges, and (as a sparse
-    fallback) session-date anchors into one chronology.
+    """Merge dated message mentions, dated graph edges, and session-date anchors
+    into one chronology.
 
-    The primary sources are gathered independently (message mentions by FTS over
-    the query, graph edges by the query's matched entities). When together they
-    yield fewer than two events — too thin to reason over an interval — the
-    session-date fallback fills in the `created_at` of matched dateless turns so
-    metadata-grounded questions still get an anchor (see
-    `_temporal_session_events`). All events are sorted date-ascending and capped
-    at `top_k`. Returns [] gracefully on a pre-v14 DB (no temporal_mentions
-    table) — the underlying helpers swallow the OperationalError — so the TR path
-    never raises."""
+    The primary sources (message mentions by FTS over the query, graph edges by
+    the query's matched entities) are gathered, sorted date-ascending, and capped
+    at `top_k`. Session-date anchors — the `created_at` of *dateless* turns the
+    retriever already surfaced (`message_hits` + semantic `fts_hits`) — are then
+    appended *additively* (beyond `top_k`, capped at `_SESSION_EVENT_CAP`), so
+    metadata-grounded questions get an anchor without the content-date chronology
+    being evicted (see `_temporal_hits_events`). Sourcing them from the retrieved
+    hits rather than a fresh keyword pass means semantic recall reaches the
+    answer-bearing turn even when the question's vocabulary doesn't match it.
+    The union is re-sorted date-ascending. Returns [] gracefully on a pre-v14 DB
+    (no temporal_mentions table) — the underlying helpers swallow the
+    OperationalError — so the TR path never raises."""
     msg_events = _temporal_message_events(conn, query, top_k=top_k)
     entities = match_known_entities(conn, query)
     graph_events = _temporal_graph_events(conn, entities, top_k=top_k)
     primary = msg_events + graph_events
-    # Session dates are a *sparse fallback* anchor, not an always-on source: only
-    # inject them when the content-date + graph chronology has fewer than two
-    # events — too thin to reason over an interval. A rich content-date timeline
-    # is left clean, since discussion-dates (when-mentioned, not when-happened)
-    # would only dilute it. This keeps the precision of the primary path while
-    # still giving metadata-grounded questions (the common LongMemEval shape) an
-    # anchor where today there's nothing.
-    if len(primary) >= 2:
-        primary.sort(key=lambda e: e.date)
-        return primary[:top_k]
-    merged = primary + _temporal_session_events(conn, query)
+    primary.sort(key=lambda e: e.date)
+    primary = primary[:top_k]
+
+    # Session-date anchors are ALWAYS added, not gated on a thin primary. In a
+    # large haystack the content-date timeline is mostly scraped noise (the FTS
+    # always finds *some* dated turns), while the answer-bearing turn is often
+    # dateless-but-session-dated — so the anchor must survive even when content-
+    # dates are plentiful. An earlier `< 2` gate was self-defeating: it never
+    # fired because the haystack always yields ≥2 content-dates. They are added
+    # *additively* (beyond `top_k`) and labelled when-discussed, so they never
+    # EVICT the content-date chronology that the passing questions rely on.
+    session_events = _temporal_hits_events(conn, message_hits, fts_hits)
+    merged = primary + session_events
     merged.sort(key=lambda e: e.date)
-    return merged[:top_k]
+    return merged
 
 
 def _embeddings_compatible(conn: sqlite3.Connection, embedder: EmbeddingClient) -> bool:

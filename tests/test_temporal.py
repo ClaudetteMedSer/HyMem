@@ -180,14 +180,17 @@ def test_tr_session_date_anchors_dateless_turns(hy):
     dates = [e.date for e in ctx.temporal_events]
     assert dates == ["2024-02-10", "2024-08-22"]  # ascending
     assert all(e.source == "session-date" for e in ctx.temporal_events)
-    assert all(e.why_retrieved == ["session_date(discussed)"]
+    # Anchored off the retrieved raw-message hits, not a fresh keyword pass.
+    assert all(e.why_retrieved == ["message_hit(discussed)"]
                for e in ctx.temporal_events)
 
 
-def test_tr_content_dates_suppress_session_fallback(hy):
-    # When the primary chronology already has >= 2 content-date events, the
-    # session-date fallback stays silent — a rich timeline isn't diluted with
-    # discussion-dates.
+def test_tr_session_anchors_coexist_without_evicting_content_dates(hy):
+    # Session anchors are ALWAYS-ON and additive: even with plenty of content-
+    # dates, a matched dateless turn ("api roadmap", no date) still contributes a
+    # session-date anchor — but the content-date events are NOT evicted (a large
+    # haystack scrapes noise content-dates while the answer-bearing turn is often
+    # dateless, so the anchor must survive a rich primary).
     sid = "tr-rich"
     _dream_with_dates(
         hy,
@@ -199,8 +202,14 @@ def test_tr_content_dates_suppress_session_fallback(hy):
         ],
     )
     ctx = hy.augment("when did we work on the api?", ability="TR")
-    assert all(e.source == "message" for e in ctx.temporal_events)
-    assert "session-date" not in {e.source for e in ctx.temporal_events}
+    sources = {e.source for e in ctx.temporal_events}
+    dates = [e.date for e in ctx.temporal_events]
+    # Both content-dates survive...
+    assert "2024-01-10" in dates and "2024-05-01" in dates
+    assert "message" in sources
+    # ...and the dateless "roadmap" turn is now anchored by its session date.
+    assert "session-date" in sources
+    assert dates == sorted(dates)
 
 
 def test_tr_session_fallback_fills_single_content_date(hy):
@@ -265,3 +274,34 @@ def test_tr_degrades_gracefully_without_table(hy):
     hy.conn.execute("DROP TABLE temporal_mentions")
     ctx = hy.augment("what happened first?", ability="TR")
     assert ctx.temporal_events == []
+
+
+def test_tr_chunk_hit_anchors_via_retrieved_chunk(cfg, stub_llm):
+    # Isolate the semantic chunk tier: disable the raw-message tier so anchors
+    # can ONLY come from fts_hits (dreamed chunks). Proves the chunk ->
+    # start_message_id -> messages.created_at mapping that lets a retrieved chunk
+    # contribute a session-date anchor (the recall a keyword pass over the raw
+    # turn would miss).
+    from dataclasses import replace
+    from hymem import HyMem
+
+    hy = HyMem(replace(cfg, message_fts_top_k=0), llm=stub_llm)
+    try:
+        sid = "tr-chunk"
+        hy.open_session(sid)
+        hy.log_message(sid, "user", "I volunteered at the food bank fundraiser.",
+                       created_at="2024-07-04T12:00:00")
+        hy.log_message(sid, "user", "It was a great community fundraiser day out.",
+                       created_at="2024-07-04T12:05:00")
+        hy.close_session(sid)
+        hy.set_llm(make_routed_llm([], []))
+        hy.dream()
+
+        ctx = hy.augment("when was the fundraiser?", ability="TR")
+        assert ctx.message_hits == []  # raw-message tier disabled
+        assert "session-date" in {e.source for e in ctx.temporal_events}
+        chips = [c for e in ctx.temporal_events for c in e.why_retrieved]
+        assert "chunk_hit(discussed)" in chips
+        assert any(e.date == "2024-07-04" for e in ctx.temporal_events)
+    finally:
+        hy.close()
