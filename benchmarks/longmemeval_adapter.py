@@ -407,11 +407,14 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
 
     # TR: inject temporal events as a date-ordered chronology
     if ability == "TR" and temporal_events:
-        parts.append("[TEMPORAL CHRONOLOGY — events in date order:]\n")
+        parts.append("[TEMPORAL CHRONOLOGY — events in date order. A 'discussed' "
+                     "line is the date the turn was logged (when-discussed), not "
+                     "necessarily when the event happened:]\n")
         for ev in temporal_events:
             date = getattr(ev, 'date', '')
-            desc = getattr(ev, 'description', str(ev))
-            parts.append(f"  {date}: {desc}\n")
+            desc = getattr(ev, 'text', str(ev))
+            marker = " (discussed)" if getattr(ev, 'source', '') == "session-date" else ""
+            parts.append(f"  {date}{marker}: {desc}\n")
         parts.append("[END CHRONOLOGY]\n\n")
     total_chars = 0
     for m in memories:

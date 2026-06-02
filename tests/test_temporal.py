@@ -151,11 +151,103 @@ def test_tr_merges_dated_graph_edges(hy):
     assert dates == sorted(dates)
 
 
-def test_tr_empty_when_no_dates(hy):
+def test_tr_empty_when_nothing_matches(hy):
+    # Truly no temporal signal: the seeded turn carries no content-date AND the
+    # query shares no tokens with it, so even the session-date fallback finds
+    # nothing to anchor. The chronology must be empty, not fabricated.
     sid = "tr-none"
     _dream_with_dates(hy, sid, [("user", "we use postgres for everything.")])
-    ctx = hy.augment("what database do we use?", ability="TR")
+    ctx = hy.augment("which programming language is fastest?", ability="TR")
     assert ctx.temporal_events == []
+
+
+# --- session-date fallback (metadata-grounded TR) --------------------------
+
+
+def test_tr_session_date_anchors_dateless_turns(hy):
+    # Two matched turns with NO content-date but distinct session dates
+    # (created_at). The fallback must surface them as source="session-date",
+    # date-ordered, so a metadata-grounded duration question has anchors.
+    sid = "tr-sess"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "I started learning the guitar.",
+                   created_at="2024-02-10T09:00:00")
+    hy.log_message(sid, "user", "I finally played a full song on guitar.",
+                   created_at="2024-08-22T18:00:00")
+    hy.close_session(sid)
+
+    ctx = hy.augment("how long did it take me to learn guitar?", ability="TR")
+    dates = [e.date for e in ctx.temporal_events]
+    assert dates == ["2024-02-10", "2024-08-22"]  # ascending
+    assert all(e.source == "session-date" for e in ctx.temporal_events)
+    assert all(e.why_retrieved == ["session_date(discussed)"]
+               for e in ctx.temporal_events)
+
+
+def test_tr_content_dates_suppress_session_fallback(hy):
+    # When the primary chronology already has >= 2 content-date events, the
+    # session-date fallback stays silent — a rich timeline isn't diluted with
+    # discussion-dates.
+    sid = "tr-rich"
+    _dream_with_dates(
+        hy,
+        sid,
+        [
+            ("user", "We deployed the api on 2024-05-01 to production."),
+            ("user", "We first set up the api on 2024-01-10 in staging."),
+            ("user", "We discussed the api roadmap at length today."),
+        ],
+    )
+    ctx = hy.augment("when did we work on the api?", ability="TR")
+    assert all(e.source == "message" for e in ctx.temporal_events)
+    assert "session-date" not in {e.source for e in ctx.temporal_events}
+
+
+def test_tr_session_fallback_fills_single_content_date(hy):
+    # One content-date isn't enough for an interval; the fallback adds the
+    # session date of the other matched (dateless) turn so both ends exist.
+    sid = "tr-mixed"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "We launched the beta on 2024-03-01.",
+                   created_at="2024-03-01T10:00:00")
+    hy.log_message(sid, "user", "We shipped the beta to all users.",
+                   created_at="2024-09-15T10:00:00")
+    hy.close_session(sid)
+    # Index the content-date in the first turn.
+    hy.set_llm(make_routed_llm([], []))
+    hy.dream()
+
+    ctx = hy.augment("how long was the beta period?", ability="TR")
+    sources = {e.source for e in ctx.temporal_events}
+    assert "message" in sources       # the 2024-03-01 content-date
+    assert "session-date" in sources  # the 2024-09-15 session anchor
+    dates = [e.date for e in ctx.temporal_events]
+    assert dates == sorted(dates)
+
+
+def test_tr_session_fallback_requires_query_tokens(hy):
+    # A stopword-only query must NOT dump every turn's session date.
+    sid = "tr-bare"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "We use redis for caching.",
+                   created_at="2024-04-01T10:00:00")
+    hy.close_session(sid)
+    ctx = hy.augment("a", ability="TR")
+    assert ctx.temporal_events == []
+
+
+def test_tr_session_fallback_is_capped(hy):
+    # More dateless matched turns than the cap: only _SESSION_EVENT_CAP surface.
+    from hymem.query.augment import _SESSION_EVENT_CAP
+    sid = "tr-cap"
+    hy.open_session(sid)
+    for i in range(_SESSION_EVENT_CAP + 4):
+        hy.log_message(sid, "user", f"We reviewed the deployment plan, note {i}.",
+                       created_at=f"2024-01-{i + 1:02d}T10:00:00")
+    hy.close_session(sid)
+    ctx = hy.augment("what was the deployment plan?", ability="TR")
+    assert len(ctx.temporal_events) <= _SESSION_EVENT_CAP
+    assert all(e.source == "session-date" for e in ctx.temporal_events)
 
 
 def test_non_tr_ability_leaves_temporal_events_empty(hy):

@@ -116,8 +116,11 @@ class TemporalEvent:
     `date` is ISO `YYYY-MM-DD` for fully-resolved dates; for a year-less message
     mention it falls back to the date portion of the source turn's event time
     (`created_at`) so the event still has a sort key. `source` names where the
-    event came from: "message" (an explicit date written in a turn) or "graph"
-    (a dated knowledge-graph edge — its `temporal_scope`, else its `first_seen`).
+    event came from: "message" (an explicit date written in a turn), "graph" (a
+    dated knowledge-graph edge — its `temporal_scope`, else its `first_seen`), or
+    "session-date" (the turn's `created_at` for a matched turn that carried no
+    content-date — a *when-discussed* anchor, NOT necessarily when-it-happened,
+    so the host must not use it for duration math the way a content-date is).
     Only *dated* items appear here; undated graph facts stay in `graph_facts`."""
 
     date: str
@@ -924,6 +927,72 @@ def _temporal_graph_events(
     return [ev for _, ev in events[:top_k]]
 
 
+# Secondary TR source (session-date events) is capped tight so a broad FTS match
+# can't flood the chronology and bury the primary content-date / graph evidence.
+_SESSION_EVENT_CAP = 5
+
+
+def _temporal_session_events(
+    conn: sqlite3.Connection, query: str, *, cap: int = _SESSION_EVENT_CAP
+) -> list[TemporalEvent]:
+    """Session-date events for FTS-matched turns that carry NO content-date.
+
+    The turn's `created_at` (the session date threaded in at ingest) is an
+    *anchor* even when the user never restated a date in the text — which is the
+    common LongMemEval shape (the temporal grounding lives in session metadata,
+    not the prose). We surface it as `source="session-date"` so the host LLM
+    knows this is *when-discussed*, not necessarily *when-it-happened* — it must
+    not be treated as event-time for duration math the way a content-date is.
+
+    Guard rails: (1) only turns that have no `temporal_mention` of their own
+    (those are already covered by `_temporal_message_events`, the primary path —
+    no double-counting and content-dates stay authoritative); (2) requires query
+    tokens, so a bare "what happened first?" doesn't dump every turn's date;
+    (3) ranked by relevance (bm25) and capped at `cap`. Degrades to [] — never
+    raises — on a pre-v14 DB (no temporal_mentions table)."""
+    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    tokens = [t for t in cleaned.split() if len(t) >= 2]
+    if not tokens:
+        return []
+
+    fts_query = " OR ".join(f'"{t}"' for t in tokens)
+    try:
+        rows = conn.execute(
+            """
+            SELECT m.id AS message_id, m.created_at, m.content
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            WHERE messages_fts MATCH ?
+              AND m.id NOT IN (SELECT message_id FROM temporal_mentions)
+            ORDER BY bm25(messages_fts)
+            LIMIT ?
+            """,
+            (fts_query, cap),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    events: list[tuple[str, TemporalEvent]] = []
+    for r in rows:
+        date = _temporal_event_date(None, r["created_at"] or "")
+        if date is None:
+            continue
+        text = (r["content"] or "").strip()
+        if len(text) > 200:
+            text = text[:197] + "..."
+        events.append((
+            date,
+            TemporalEvent(
+                date=date,
+                text=text,
+                source="session-date",
+                why_retrieved=["session_date(discussed)"],
+            ),
+        ))
+    events.sort(key=lambda e: e[0])
+    return [ev for _, ev in events]
+
+
 _ISO_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
@@ -937,18 +1006,33 @@ def _looks_iso(value: str) -> bool:
 def _temporal_events(
     conn: sqlite3.Connection, query: str, *, top_k: int
 ) -> list[TemporalEvent]:
-    """Merge dated message mentions and dated graph edges into one chronology.
+    """Merge dated message mentions, dated graph edges, and (as a sparse
+    fallback) session-date anchors into one chronology.
 
-    The two sources are gathered independently (message mentions by FTS over the
-    query, graph edges by the query's matched entities), concatenated, and sorted
-    date-ascending so the host LLM receives events already in order. Capped at
-    `top_k` after the merge. Returns [] gracefully on a pre-v14 DB (no
-    temporal_mentions table) — the underlying helpers swallow the
-    OperationalError — so the TR path never raises."""
+    The primary sources are gathered independently (message mentions by FTS over
+    the query, graph edges by the query's matched entities). When together they
+    yield fewer than two events — too thin to reason over an interval — the
+    session-date fallback fills in the `created_at` of matched dateless turns so
+    metadata-grounded questions still get an anchor (see
+    `_temporal_session_events`). All events are sorted date-ascending and capped
+    at `top_k`. Returns [] gracefully on a pre-v14 DB (no temporal_mentions
+    table) — the underlying helpers swallow the OperationalError — so the TR path
+    never raises."""
     msg_events = _temporal_message_events(conn, query, top_k=top_k)
     entities = match_known_entities(conn, query)
     graph_events = _temporal_graph_events(conn, entities, top_k=top_k)
-    merged = msg_events + graph_events
+    primary = msg_events + graph_events
+    # Session dates are a *sparse fallback* anchor, not an always-on source: only
+    # inject them when the content-date + graph chronology has fewer than two
+    # events — too thin to reason over an interval. A rich content-date timeline
+    # is left clean, since discussion-dates (when-mentioned, not when-happened)
+    # would only dilute it. This keeps the precision of the primary path while
+    # still giving metadata-grounded questions (the common LongMemEval shape) an
+    # anchor where today there's nothing.
+    if len(primary) >= 2:
+        primary.sort(key=lambda e: e.date)
+        return primary[:top_k]
+    merged = primary + _temporal_session_events(conn, query)
     merged.sort(key=lambda e: e.date)
     return merged[:top_k]
 
