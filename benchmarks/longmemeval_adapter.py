@@ -40,6 +40,25 @@ sys.path.insert(0, str(_repo_root))
 
 # ── Config ──────────────────────────────────────────────────────────
 
+def _normalize_date(raw: str | None) -> str | None:
+    """Convert a LongMemEval haystack_date like '2023/05/20 (Sat) 02:21'
+    to ISO-8601 '2023-05-20T02:21:00'. Returns None for empty/None input."""
+    if not raw or not raw.strip():
+        return None
+    # Strip day-of-week parenthetical: '2023/05/20 (Sat) 02:21' -> '2023/05/20 02:21'
+    import re
+    cleaned = re.sub(r'\s*\([^)]*\)', '', raw).strip()
+    # Try common formats
+    for fmt in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M", "%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(cleaned, fmt)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+    # Return cleaned if we can't parse — better than wall-clock
+    return cleaned if cleaned else None
+
+
 DEFAULT_SCALE = "S"
 DEFAULT_SAMPLE = 50  # questions to evaluate (500 total)
 DEFAULT_TOP_K = 15
@@ -221,21 +240,27 @@ class HyMemAdapter:
             self.hy.close()
             self.hy = None
 
-    def ingest_sessions(self, sessions: list[list[dict]], session_ids: list[str]) -> dict:
-        """Ingest all sessions for a question. Each session is a list of messages."""
+    def ingest_sessions(self, sessions: list[list[dict]], session_ids: list[str],
+                         session_dates: list[str] | None = None) -> dict:
+        """Ingest all sessions for a question. Each session is a list of messages.
+        
+        If session_dates is provided (one ISO-8601 date per session), each message
+        gets that session's date as its created_at, giving HyMem real event times
+        instead of wall-clock clustering."""
         total_msgs = 0
         total_chars = 0
-        for sess_id, messages in zip(session_ids, sessions):
+        dates = session_dates or []
+        for idx, (sess_id, messages) in enumerate(zip(session_ids, sessions)):
+            session_date = _normalize_date(dates[idx]) if idx < len(dates) else None
             entries = []
             for m in messages:
                 role = m.get("role", "user")
                 content = m.get("content", "")
                 if content.strip():
-                    entries.append((role, content))
+                    entries.append((role, content, session_date))
                     total_msgs += 1
                     total_chars += len(content)
             if entries:
-                # Use a chunked approach for large sessions
                 chunk_size = 50
                 for i in range(0, len(entries), chunk_size):
                     chunk = entries[i : i + chunk_size]
@@ -259,7 +284,7 @@ class HyMemAdapter:
             result = self.hy.augment(query, ability=ability)
         except Exception as e:
             print(f"    [DEBUG] augment error: {e}", flush=True)
-            return [], 0
+            return [], 0, None, []
 
         # Collect all sources
         graph_facts = []
@@ -336,32 +361,48 @@ class HyMemAdapter:
                 -m.get("confidence", 0),
             ))
 
-        return memories[:top_k], getattr(result, 'total_message_matches', 0)
+        return memories[:top_k], getattr(result, 'total_message_matches', 0), getattr(result, 'graph_count', None), getattr(result, 'temporal_events', [])
 
 
 # ── Answer & Judge ──────────────────────────────────────────────────
 
 def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str = None,
-                    total_matches: int = 0) -> str:
+                    total_matches: int = 0, graph_count=None, temporal_events: list | None = None) -> str:
     """Ask LLM to answer based on retrieved memories.
 
     Uses ability-aware prompts and expanded context for multi-session
     and temporal reasoning questions that need more cross-session data.
-    For MR questions, filters to user-only messages and adds an
-    aggregate count hint from HyMem's counting path.
+    For MR questions, prefers graph_count (exact graph-native count) over
+    total_matches (keyword candidate). For TR questions, injects
+    temporal_events as a date-ordered chronology.
     """
     # MR and TR questions span many sessions — expand context window
     context_limit = MAX_CONTEXT_CHARS * 2 if ability in ("MR", "TR") else MAX_CONTEXT_CHARS
 
-    # MR counting: HyMem pre-counts distinct user turns + dedupes.
-    # total_message_matches is the candidate answer — LLM just verifies it.
-    if ability == "MR" and total_matches > 0:
+    # MR counting: prefer graph_count (EXACT graph-native count) over
+    # total_matches (keyword candidate). When graph_count is present it is
+    # the dedup-correct answer — trust it.
+    parts = []
+    if ability == "MR" and graph_count is not None:
+        count = graph_count.count
+        counted = getattr(graph_count, 'counted', 'items')
+        parts = [f"[HyMem graph-native count: {count} distinct {counted} "
+                  f"(exact COUNT(DISTINCT) over knowledge graph edges). "
+                  f"Use this as the answer. Verify against evidence below.]\n"]
+    elif ability == "MR" and total_matches > 0:
         parts = [f"[HyMem counted {total_matches} distinct user messages "
                   f"matching your question (assistant echoes excluded, "
                   f"restatements deduped). Verify this count against the "
                   f"evidence below and return the final number.]\n"]
-    else:
-        parts = []
+
+    # TR: inject temporal events as a date-ordered chronology
+    if ability == "TR" and temporal_events:
+        parts.append("[TEMPORAL CHRONOLOGY — events in date order:]\n")
+        for ev in temporal_events:
+            date = getattr(ev, 'date', '')
+            desc = getattr(ev, 'description', str(ev))
+            parts.append(f"  {date}: {desc}\n")
+        parts.append("[END CHRONOLOGY]\n\n")
     total_chars = 0
     for m in memories:
         content = m["content"]
@@ -496,6 +537,7 @@ def evaluate_question(
     answer = q_data["answer"]
     sessions = q_data.get("haystack_sessions", [])
     session_ids = q_data.get("haystack_session_ids", [str(i) for i in range(len(sessions))])
+    session_dates = q_data.get("haystack_dates", [])
 
     # Ensure session_ids length matches sessions
     while len(session_ids) < len(sessions):
@@ -505,7 +547,7 @@ def evaluate_question(
     ability = QUESTION_TYPE_TO_ABILITY.get(question_type, None)
 
     # Ingest
-    stats = hy.ingest_sessions(sessions, session_ids)
+    stats = hy.ingest_sessions(sessions, session_ids, session_dates)
     print(f"    Ingested {stats['sessions']} sessions ({stats['messages']} msgs, {stats['chars']} chars)", flush=True)
 
     # Dream
@@ -513,11 +555,12 @@ def evaluate_question(
     hy.dream_and_wait()
 
     # Search
-    memories, total_matches = hy.search(question, ability=ability, top_k=top_k * 3)
-    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches})", flush=True)
+    memories, total_matches, graph_count, temporal_events = hy.search(question, ability=ability, top_k=top_k * 3)
+    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)})", flush=True)
 
     # Answer
-    ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches)
+    ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
+                                 graph_count=graph_count, temporal_events=temporal_events)
 
     # Judge (binary yes/no)
     correct = judge_answer(judge_llm, question_type, question, answer, ai_answer)
@@ -718,7 +761,7 @@ def main():
 
     output = {
         "benchmark": "LongMemEval",
-        "version": "v1-hymem-beam-optimisation",
+        "version": "v2-hymem-tr-mr-wired",
         "date": datetime.now(timezone.utc).isoformat(),
         "config": {
             "scale": scale,
@@ -726,8 +769,8 @@ def main():
             "top_k": args.top_k,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
-            "hy_mem": "beam-optimisation branch",
-            "features": "graph-fact deprioritization, IF procedure shaping, MR counting gated off",
+            "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
+            "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected, str(answer) fix",
             "elapsed_s": elapsed,
             "answer_calls": answer_llm.call_count,
             "judge_calls": judge_llm.call_count,
@@ -740,7 +783,7 @@ def main():
         "per_question": all_results,
     }
 
-    results_path = results_dir / "longmemeval-v1-hymem.json"
+    results_path = results_dir / "longmemeval-v2-hymem.json"
     with open(results_path, "w") as f:
         json.dump(output, f, indent=2, default=str)
 
@@ -750,8 +793,8 @@ def main():
     if manifest_path.exists():
         with open(manifest_path) as f:
             manifest = json.load(f)
-    manifest["LongMemEval"] = {
-        "latest": "longmemeval-v1-hymem.json",
+    manifest["LongMemEval-v2"] = {
+        "latest": "longmemeval-v2-hymem.json",
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "overall_score": round(scores.get("OVERALL", {}).get("accuracy", 0) * 100, 1),
         "scale": scale,
