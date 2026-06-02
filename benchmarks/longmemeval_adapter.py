@@ -377,7 +377,8 @@ class HyMemAdapter:
 # ── Answer & Judge ──────────────────────────────────────────────────
 
 def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str = None,
-                    total_matches: int = 0, graph_count=None, temporal_events: list | None = None) -> str:
+                    total_matches: int = 0, graph_count=None, temporal_events: list | None = None,
+                    question_date: str = "") -> str:
     """Ask LLM to answer based on retrieved memories.
 
     Uses ability-aware prompts and expanded context for multi-session
@@ -385,6 +386,11 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     For MR questions, prefers graph_count (exact graph-native count) over
     total_matches (keyword candidate). For TR questions, injects
     temporal_events as a date-ordered chronology.
+
+    `question_date` is the "now" the question is asked at — the reference point
+    relative-date questions ("how many days ago?", "a month ago") subtract from.
+    Without it the chronology gives event dates but the model has no anchor to
+    compute an interval against, and answers "current date not provided".
     """
     # MR and TR questions span many sessions — expand context window
     context_limit = MAX_CONTEXT_CHARS * 2 if ability in ("MR", "TR") else MAX_CONTEXT_CHARS
@@ -444,9 +450,14 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     else:
         system_prompt = ANSWERING_SYSTEM_PROMPT
 
+    # The reference "now" for relative-date math. Stated explicitly so the model
+    # can subtract event dates from it ("how many days ago", "a month ago")
+    # instead of complaining the current date is unknown.
+    today_line = f"Today's date is {question_date}.\n\n" if question_date else ""
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"},
+        {"role": "user", "content": f"{today_line}CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
     return llm.chat(messages, temperature=0.0, max_tokens=1024)
@@ -552,6 +563,14 @@ def evaluate_question(
     session_ids = q_data.get("haystack_session_ids", [str(i) for i in range(len(sessions))])
     session_dates = q_data.get("haystack_dates", [])
 
+    # Reference "now" for relative-date math. LongMemEval ships `question_date`;
+    # if the cleaned dataset stripped it, fall back to the latest session date
+    # (questions are asked after all sessions, so the most recent haystack date
+    # is the best available proxy for "today").
+    question_date = q_data.get("question_date", "") or (
+        max(session_dates) if session_dates else ""
+    )
+
     # Ensure session_ids length matches sessions
     while len(session_ids) < len(sessions):
         session_ids.append(f"extra_{len(session_ids)}")
@@ -569,11 +588,13 @@ def evaluate_question(
 
     # Search
     memories, total_matches, graph_count, temporal_events = hy.search(question, ability=ability, top_k=top_k * 3)
-    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)})", flush=True)
+    src = "question_date" if q_data.get("question_date") else ("haystack_max" if session_dates else "none")
+    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, now={question_date or '∅'}[{src}])", flush=True)
 
     # Answer
     ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
-                                 graph_count=graph_count, temporal_events=temporal_events)
+                                 graph_count=graph_count, temporal_events=temporal_events,
+                                 question_date=question_date)
 
     # Judge (binary yes/no)
     correct = judge_answer(judge_llm, question_type, question, answer, ai_answer)
@@ -792,7 +813,7 @@ def main():
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
-            "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected, str(answer) fix",
+            "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix",
             "elapsed_s": elapsed,
             "answer_calls": answer_llm.call_count,
             "judge_calls": judge_llm.call_count,
