@@ -81,16 +81,76 @@ def test_mr_tr_overlap_resolves_to_tr(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     [
+        # Recency / "last time" — none of the legacy span/ordering forms caught
+        # these, yet they are core BEAM temporal-reasoning questions.
+        "when did I last go to the dentist?",
+        "when was the last time I saw my brother?",
+        "when's the most recent time I changed my password?",
+        "do you remember the last time I traveled abroad?",
+        # First occurrence / start — distinct from "what happened first".
+        "when did I first try meditation?",
+        "when did I start using postgres?",
+        "when did the project begin?",
+        # Count + "ago" used to fall through to MR; now stays TR.
+        "how many months ago did I start the new job?",
+        "how many weeks ago did we launch?",
+        # Duration-to-now: "how long have I been …" had no anchor before.
+        "how long have I been learning the guitar?",
+        "how long has it been since my last checkup?",
+    ],
+)
+def test_tr_recency_and_duration_to_now_detected(query: str) -> None:
+    assert detect_ability(query) == "TR"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "wanneer was de laatste keer dat ik de tandarts bezocht?",
+        "wanneer ben ik voor het eerst gaan mediteren?",
+        "wanneer ben ik voor het laatst op reis geweest?",
+        "wanneer begon ik met postgres?",
+        "hoeveel maanden geleden ben ik begonnen?",
+        "hoe lang ben ik al aan het leren?",
+    ],
+)
+def test_tr_recency_dutch_detected(query: str) -> None:
+    assert detect_ability(query) == "TR"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
         "what build tools do we use?",
         "tell me about the postgres migration",
         "how are you doing today?",
         "how about we deploy tomorrow",
         "remind me what the deploy steps were",
         "",
+        # Precision guards for the broadened TR patterns: a "first" that is an
+        # ADJECTIVE on a thing, not a recency frame, must NOT become TR.
+        "what's the first thing I should do?",
+        "what was my last order total?",
+        # "how long" as a degree/length question (no temporal continuation).
+        "how long is the rope I bought?",
+        "how long should the README be?",
     ],
 )
 def test_non_matching_queries_return_none(query: str) -> None:
     assert detect_ability(query) is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # A genuine item count whose noun happens to carry "first"/"last" as an
+        # adjective stays MR — the broadened recency patterns must not steal it.
+        "how many first-edition books do I own?",
+        "how many times was the last build retried?",
+    ],
+)
+def test_count_with_first_last_adjective_stays_mr(query: str) -> None:
+    assert detect_ability(query) == "MR"
 
 
 # --- Integration: auto-detection wired into augment() ----------------------

@@ -39,9 +39,9 @@ import re
 
 # --- TR (temporal reasoning) ------------------------------------------------
 #
-# Three independent TR signals, any one of which is sufficient. They are kept
+# Four independent TR signals, any one of which is sufficient. They are kept
 # separate so the duration-counting form (#1) can be checked before MR without
-# also loosening the ordering forms (#2/#3).
+# also loosening the span/ordering/recency forms (#2/#3/#4).
 
 # Temporal units (English + Dutch) used to recognise a *duration* counting
 # question ("how many days between …") as TR rather than MR. "time"/"times" is
@@ -56,26 +56,43 @@ _TEMPORAL_UNIT = (
 
 # Relational anchors that turn a span into a *between-two-events* question.
 # English + Dutch. "since"/"until" included; their Dutch forms "sinds"/"tot".
-_TR_ANCHOR = (
-    r"(?:between|after|before|since|until|"
-    r"tussen|na|voor|voordat|nadat|sinds|tot)"
+# Kept as a bare alternation BODY so it can be reused inside larger patterns
+# without re-typing (the span-end set below extends it with "ago"/"geleden").
+_TR_ANCHOR_BODY = (
+    r"between|after|before|since|until|"
+    r"tussen|na|voor|voordat|nadat|sinds|tot"
 )
+_TR_ANCHOR = r"(?:" + _TR_ANCHOR_BODY + r")"
 
-# 1) Duration counting: "how many days between X and Y", "hoeveel dagen tussen".
-#    A counting opener + a temporal unit + a relational anchor. This is the form
-#    that overlaps MR, so it must be recognised as TR and tested first.
+# A *span end*: either a two-event anchor OR a deictic "ago"/"geleden" that
+# closes a span against now. "how many months ago" is a duration question but
+# carries no anchor, so without "ago" here it used to fall through to MR and get
+# mis-shaped as a count — admitting it keeps that reading temporal.
+_TR_SPAN_END = r"(?:" + _TR_ANCHOR_BODY + r"|ago|geleden)"
+
+# 1) Duration counting: "how many days between X and Y", "how many months ago",
+#    "hoeveel dagen tussen". A counting opener + a temporal unit + a span end.
+#    This is the form that overlaps MR, so it must be recognised as TR and tested
+#    first.
 _TR_DURATION = re.compile(
     r"\b(?:how\s+(?:many|much|long)|hoe(?:\s+(?:veel|lang))?|hoeveel)\b"
     r"[\s\S]*?\b" + _TEMPORAL_UNIT + r"\b"
-    r"[\s\S]*?\b" + _TR_ANCHOR + r"\b",
+    r"[\s\S]*?\b" + _TR_SPAN_END + r"\b",
     re.IGNORECASE,
 )
 
 # 2) Explicit span phrasing without a count: "how long between/after/before",
-#    "how long ago", "hoe lang tussen / na / voor / geleden".
+#    "how long ago", AND the duration-to-now form "how long have I been …" /
+#    "how long has it been". The trailing set is a span end OR a perfect/copular
+#    auxiliary (have/has/had/been + Dutch) that frames an ongoing duration. A
+#    bare degree question ("how long is the rope") carries none of these and
+#    correctly stays unmatched.
 _TR_HOWLONG = re.compile(
     r"\b(?:how\s+long|hoe\s+lang)\b"
-    r"[\s\S]*?\b(?:" + _TR_ANCHOR.strip("()?:") + r"|ago|geleden)\b",
+    r"[\s\S]*?\b(?:" + _TR_SPAN_END.strip("()?:") + r"|"
+    r"have|has|had|been|"
+    r"heb|hebt|heeft|hebben|ben|bent|geweest"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -96,6 +113,28 @@ _TR_ORDER = re.compile(
     r"in\s+welke\s+volgorde|"
     r"welke\s+(?:kwam|gebeurde|was)\s+(?:er\s+)?(?:eerst|eerder|later)"
     r")\b",
+    re.IGNORECASE,
+)
+
+# 4) Recency / first-occurrence: "when did I last …", "when was the last time",
+#    "when did I first try …", "when did I start using …", and Dutch forms. These
+#    pin a single event in time (the most/least recent occurrence) — squarely
+#    temporal, and a large slice of BEAM's TR questions that none of the span /
+#    ordering forms above catch. Kept high-precision: each branch requires an
+#    explicit recency token ("last"/"first"/"start"/"begin"/"voor het laatst"…)
+#    next to a "when did/was" or "the … time" frame, so plain item counts ("how
+#    many first-edition books") and bare facts never match.
+_TR_RECENCY = re.compile(
+    r"\b(?:"
+    r"when\s+(?:was|is|were|'s)\s+the\s+(?:last|first|most\s+recent)\s+time|"
+    r"when\s+did\s+\w+(?:\s+\w+)?\s+(?:last|first|start|begin)\b|"
+    r"the\s+(?:last|first|most\s+recent)\s+time\s+(?:i|we|you|he|she|they)\b|"
+    # Dutch
+    r"wanneer\s+was\s+de\s+(?:laatste|eerste)\s+keer|"
+    r"voor\s+het\s+(?:laatst|eerst)|"
+    r"de\s+(?:laatste|eerste)\s+keer\s+dat|"
+    r"wanneer\s+(?:begon|startte|ben\s+ik\s+begonnen)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -147,6 +186,7 @@ def detect_ability(query: str) -> str | None:
         _TR_DURATION.search(query)
         or _TR_HOWLONG.search(query)
         or _TR_ORDER.search(query)
+        or _TR_RECENCY.search(query)
     ):
         return "TR"
 
