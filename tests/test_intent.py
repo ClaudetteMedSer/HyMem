@@ -121,6 +121,82 @@ def test_tr_recency_dutch_detected(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     [
+        # The adjacency-bug class: a noun sits between the WH-word and the verb,
+        # so the legacy `which\s+(?:happened|was)` never matched these.
+        "which event happened first?",
+        "which event did I attend first?",
+        "who graduated first, second, third?",
+        "which seeds were started first?",
+        "which device did I get first?",
+        "which came first, the outage or the fix?",
+        "which trip did I take earliest?",
+        "which of my projects did I finish most recently?",
+    ],
+)
+def test_tr_ordering_with_intervening_noun_detected(query: str) -> None:
+    assert detect_ability(query) == "TR"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "welke gebeurtenis gebeurde eerst?",
+        "wie studeerde als eerste af?",
+        "welk apparaat kreeg ik het eerst?",
+    ],
+)
+def test_tr_ordering_dutch_with_intervening_noun_detected(query: str) -> None:
+    assert detect_ability(query) == "TR"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # Bare distance/deictic anchors with NO count opener -> temporal.
+        "what did I buy a week ago?",
+        "did I see her two weeks ago?",
+        "what was I working on a month ago?",
+        "what happened four weeks ago?",
+        "what did I do last Saturday?",
+        "where did I go last month?",
+        "wat heb ik vorige week gedaan?",
+        "wat deed ik afgelopen maandag?",
+    ],
+)
+def test_tr_distance_anchors_detected(query: str) -> None:
+    assert detect_ability(query) == "TR"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # Duration-to-now via a count opener + unit + perfect auxiliary (no anchor
+        # or "ago") — used to fall through to MR.
+        "how many weeks have I been exercising?",
+        "how many months have I had this subscription?",
+        "how many years has she been on the team?",
+    ],
+)
+def test_tr_count_duration_to_now_detected(query: str) -> None:
+    assert detect_ability(query) == "TR"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # A timeframe on a genuine COUNT question must stay MR — the count is the
+        # subject, the timeframe is incidental.
+        "how many times did I go to the gym last week?",
+        "how many emails did I send a week ago?",
+    ],
+)
+def test_count_with_timeframe_stays_mr(query: str) -> None:
+    assert detect_ability(query) == "MR"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
         "what build tools do we use?",
         "tell me about the postgres migration",
         "how are you doing today?",
