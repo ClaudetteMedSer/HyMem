@@ -130,6 +130,28 @@ def _gold_in_pool(gold_turns: list[str], pool_texts: list[str]) -> bool:
     return False
 
 
+# ── Ability-router instrumentation ──────────────────────────────────
+# The harness shapes retrieval from the ORACLE question_type label, but real
+# Hermes has no such label — augment() must infer the ability itself via
+# detect_ability(). So any MR/TR gain banked under the oracle label can be
+# illusory in production if the router misses. We record the router's verdict
+# on every run (free) and can optionally DRIVE shaping from it (--auto-ability)
+# to measure the true production score.
+
+def _detect_ability_safe(question: str) -> str | None:
+    """HyMem's production ability inference, or None if unavailable.
+
+    detect_ability emits only "MR"/"TR"/None by design — those are the only
+    wired-in shaping paths; every other oracle ability (IE/KU/PF/ABS) correctly
+    maps to a None inference (no shaping), so a None here on those categories is
+    a correct abstain, not a miss."""
+    try:
+        from hymem.query.intent import detect_ability
+        return detect_ability(question or "")
+    except Exception:
+        return None
+
+
 DEFAULT_SCALE = "S"
 DEFAULT_SAMPLE = 50  # questions to evaluate (500 total)
 DEFAULT_TOP_K = 15
@@ -639,6 +661,7 @@ def evaluate_question(
     hy: HyMemAdapter,
     q_data: dict,
     top_k: int,
+    auto_ability: bool = False,
 ) -> dict:
     """Evaluate a single LongMemEval question."""
     question_id = q_data["question_id"]
@@ -661,8 +684,14 @@ def evaluate_question(
     while len(session_ids) < len(sessions):
         session_ids.append(f"extra_{len(session_ids)}")
 
-    # Map question type to HyMem ability
-    ability = QUESTION_TYPE_TO_ABILITY.get(question_type, None)
+    # Map question type to HyMem ability. We ALWAYS record what the production
+    # router (detect_ability) would infer from the raw question, so the router's
+    # accuracy is measurable on every run. Only when --auto-ability is set do we
+    # actually DRIVE shaping from the inferred label (the true production path);
+    # otherwise the oracle question_type label drives it as before.
+    oracle_ability = QUESTION_TYPE_TO_ABILITY.get(question_type, None)
+    detected_ability = _detect_ability_safe(question)
+    ability = detected_ability if auto_ability else oracle_ability
 
     # Ingest
     stats = hy.ingest_sessions(sessions, session_ids, session_dates)
@@ -692,7 +721,9 @@ def evaluate_question(
 
     ceiling_str = ("∅" if recall_ceiling is None
                    else f"{recall_ceiling}[{recall_tier}]")
-    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str})", flush=True)
+    used_marker = "←used" if auto_ability else ""
+    router_str = f"{oracle_ability or '∅'}/det={detected_ability or '∅'}{used_marker}"
+    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str}, ability={router_str})", flush=True)
 
     # Answer
     ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
@@ -717,6 +748,9 @@ def evaluate_question(
         "recall_tier": recall_tier,
         "gold_mode": gold_mode,
         "gold_turns": len(gold_turns),
+        "oracle_ability": oracle_ability,
+        "detected_ability": detected_ability,
+        "ability_used": ability,
     }
 
 
@@ -811,6 +845,79 @@ def print_recall_diagnostics(diag: dict):
           f"lost the cut (rerank/budget).")
 
 
+def compute_router_diagnostics(results: list[dict]) -> dict:
+    """How well HyMem's production detect_ability matches the oracle label.
+
+    The oracle reduces to a shaping target of MR / TR / NONE (every non-MR/TR
+    oracle ability is a category with no wired shaping, so the correct router
+    verdict there is None — an abstain, not a miss). We build the MR/TR/NONE
+    confusion of detected-vs-target and report per-intent recall/precision plus
+    the abstain accuracy on NONE categories. This is what tells you whether an
+    oracle-label MR/TR gain actually survives in label-free production.
+    """
+    def target(oracle: str | None) -> str:
+        return oracle if oracle in ("MR", "TR") else "NONE"
+
+    def det(d: str | None) -> str:
+        return d if d in ("MR", "TR") else "NONE"
+
+    labels = ("MR", "TR", "NONE")
+    confusion = {t: Counter() for t in labels}  # confusion[target][detected]
+    for r in results:
+        confusion[target(r.get("oracle_ability"))][det(r.get("detected_ability"))] += 1
+
+    per_intent = {}
+    for intent in ("MR", "TR"):
+        tp = confusion[intent][intent]
+        actual = sum(confusion[intent].values())                       # oracle==intent
+        predicted = sum(confusion[t][intent] for t in labels)          # detected==intent
+        per_intent[intent] = {
+            "recall": (tp / actual) if actual else None,               # caught of true
+            "precision": (tp / predicted) if predicted else None,      # right of fired
+            "actual": actual,
+            "predicted": predicted,
+            "tp": tp,
+        }
+    none_total = sum(confusion["NONE"].values())
+    abstain_ok = confusion["NONE"]["NONE"]
+    return {
+        "confusion": {t: dict(confusion[t]) for t in labels},
+        "per_intent": per_intent,
+        "abstain_accuracy": (abstain_ok / none_total) if none_total else None,
+        "false_positives": none_total - abstain_ok,  # normal Qs mis-shaped to MR/TR
+        "none_total": none_total,
+    }
+
+
+def print_router_diagnostics(diag: dict, auto_ability: bool):
+    """Render the detect_ability-vs-oracle confusion. With --auto-ability the
+    inferred label DROVE retrieval; otherwise this is a free shadow measurement
+    of what production would have shaped."""
+    mode = "DROVE shaping (production path)" if auto_ability else "shadow (oracle drove shaping)"
+    print(f"\n  Ability-Router Diagnostics  (detect_ability, {mode})")
+    labels = ("MR", "TR", "NONE")
+    conf = diag["confusion"]
+    print(f"    confusion — rows=oracle target, cols=detected")
+    print(f"    {'':>10}" + "".join(f"{c:>8}" for c in labels))
+    for t in labels:
+        print(f"    {t:>10}" + "".join(f"{conf[t].get(c, 0):>8}" for c in labels))
+    print(f"    {'─'*42}")
+    for intent in ("MR", "TR"):
+        p = diag["per_intent"][intent]
+        rec = "n/a" if p["recall"] is None else f"{p['recall']*100:.0f}%"
+        pre = "n/a" if p["precision"] is None else f"{p['precision']*100:.0f}%"
+        print(f"    {intent}: recall {rec:>4} ({p['tp']}/{p['actual']})   "
+              f"precision {pre:>4} ({p['tp']}/{p['predicted']})")
+    aa = diag["abstain_accuracy"]
+    aa_s = "n/a" if aa is None else f"{aa*100:.0f}%"
+    print(f"    NONE categories: abstain {aa_s} "
+          f"({diag['none_total'] - diag['false_positives']}/{diag['none_total']}), "
+          f"{diag['false_positives']} mis-shaped to MR/TR")
+    print(f"\n    Read: low MR/TR recall → the production router misses these "
+          f"questions, so\n          their oracle-label gain is partly illusory "
+          f"in real Hermes (build detection).")
+
+
 def print_report(scores: dict, metadata: dict):
     """Print LongMemEval results."""
     print(f"\n{'='*80}")
@@ -855,6 +962,11 @@ def main():
     parser.add_argument("--api-key", default="")
     parser.add_argument("--data-dir", default=str(_repo_root.parent / "hymem_beam" / "data"))
     parser.add_argument("--keep-db", action="store_true")
+    parser.add_argument("--auto-ability", action="store_true",
+                        help="Drive retrieval shaping from HyMem's production "
+                             "detect_ability() instead of the oracle question_type "
+                             "label — measures the true label-free production score. "
+                             "(The router confusion is reported either way.)")
     args = parser.parse_args()
 
     # Resolve API key
@@ -925,7 +1037,8 @@ def main():
             hy = HyMemAdapter(db_path, api_key=DEEPSEEK_API_KEY)
             hy.open()
 
-            result = evaluate_question(answer_llm, judge_llm, hy, q_data, args.top_k)
+            result = evaluate_question(answer_llm, judge_llm, hy, q_data, args.top_k,
+                                       auto_ability=args.auto_ability)
             all_results.append(result)
         except Exception as e:
             print(f"    ERROR: {e}", flush=True)
@@ -973,6 +1086,8 @@ def main():
     })
     recall_diag = compute_recall_diagnostics(all_results)
     print_recall_diagnostics(recall_diag)
+    router_diag = compute_router_diagnostics(all_results)
+    print_router_diagnostics(router_diag, args.auto_ability)
 
     # Save
     results_dir = Path("/home/node/.hermes/benchmarks")
@@ -987,10 +1102,11 @@ def main():
             "sample": args.sample,
             "seed": args.seed,
             "top_k": args.top_k,
+            "auto_ability": args.auto_ability,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
-            "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix, recall-ceiling instrumentation (retrieval-vs-ranking miss split)",
+            "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix, recall-ceiling instrumentation (retrieval-vs-ranking miss split), ability-router shadow/auto measurement (detect_ability vs oracle)",
             "elapsed_s": elapsed,
             "answer_calls": answer_llm.call_count,
             "judge_calls": judge_llm.call_count,
@@ -1001,6 +1117,7 @@ def main():
             "count": data["count"],
         } for qtype, data in scores.items()},
         "recall_diagnostics": recall_diag,
+        "router_diagnostics": router_diag,
         "per_question": all_results,
     }
 
