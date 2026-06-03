@@ -59,6 +59,77 @@ def _normalize_date(raw: str | None) -> str | None:
     return cleaned if cleaned else None
 
 
+# ── Recall-ceiling instrumentation ──────────────────────────────────
+# A category's miss has two opposite root causes that need opposite fixes:
+#   - retrieval loss: the gold turn never entered the candidate pool at all
+#     (fix = embeddings / chunking / cross-session fan-out)
+#   - ranking/synthesis loss: the gold turn WAS retrieved but lost the cut or
+#     the model couldn't assemble it (fix = rerank / wider budget / packing)
+# These helpers answer, per question, "did the answer-bearing turn appear
+# ANYWHERE in the pre-truncation retrieval pool?" — splitting the two so a
+# fix targets the right stage instead of being a coin flip.
+
+def _norm_text(s: str) -> str:
+    """Whitespace-collapse + lowercase for robust substring matching."""
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _extract_gold_turns(q_data: dict) -> tuple[list[str], str]:
+    """Return (gold_turn_contents, mode).
+
+    Prefers LongMemEval's turn-level `has_answer: true` flags (mode="turn",
+    the precise signal). Falls back to every turn of the `answer_session_ids`
+    sessions (mode="session", coarser — any turn from an answer session counts).
+    Returns ([], "none") when the dataset carries neither, so the question is
+    excluded from the ceiling rate rather than scored against a fabricated gold.
+    """
+    sessions = q_data.get("haystack_sessions", []) or []
+    session_ids = q_data.get("haystack_session_ids",
+                             [str(i) for i in range(len(sessions))])
+
+    gold: list[str] = []
+    for sess in sessions:
+        for m in sess:
+            if isinstance(m, dict) and m.get("has_answer"):
+                c = m.get("content", "")
+                if c.strip():
+                    gold.append(c)
+    if gold:
+        return gold, "turn"
+
+    ans_ids = set(q_data.get("answer_session_ids", []) or [])
+    if ans_ids:
+        for sid, sess in zip(session_ids, sessions):
+            if sid in ans_ids:
+                for m in sess:
+                    c = m.get("content", "") if isinstance(m, dict) else ""
+                    if c.strip():
+                        gold.append(c)
+        if gold:
+            return gold, "session"
+
+    return [], "none"
+
+
+def _gold_in_pool(gold_turns: list[str], pool_texts: list[str]) -> bool:
+    """True if any gold turn is present in any pooled hit text.
+
+    message_hits expose the raw turn (truncated to 600 chars); fts chunks are a
+    slice of one. So a match is: one string contains the other, or they share a
+    distinctive 40-char prefix (covers the 600-char cap and chunk slicing)."""
+    pool_n = [_norm_text(p) for p in pool_texts if p and p.strip()]
+    for g in gold_turns:
+        gn = _norm_text(g)
+        if not gn:
+            continue
+        for pn in pool_n:
+            if not pn:
+                continue
+            if gn in pn or pn in gn or (len(gn) >= 40 and gn[:40] in pn):
+                return True
+    return False
+
+
 DEFAULT_SCALE = "S"
 DEFAULT_SAMPLE = 50  # questions to evaluate (500 total)
 DEFAULT_TOP_K = 15
@@ -289,12 +360,18 @@ class HyMemAdapter:
         print(f"      Dream completed in {elapsed:.0f}s", flush=True)
 
     def search(self, query: str, ability: str = None, top_k: int = 10):
-        """Search HyMem for the given query. Returns (memories, total_matches)."""
+        """Search HyMem for the given query.
+
+        Returns (memories, total_matches, graph_count, temporal_events, pool)
+        where `pool` is the FULL pre-truncation candidate text by tier
+        ({"message": [...], "fts": [...]}) — used for recall-ceiling analysis,
+        so a category's misses can be split into retrieval loss vs ranking loss.
+        """
         try:
             result = self.hy.augment(query, ability=ability)
         except Exception as e:
             print(f"    [DEBUG] augment error: {e}", flush=True)
-            return [], 0, None, []
+            return [], 0, None, [], {"message": [], "fts": []}
 
         # Collect all sources
         graph_facts = []
@@ -371,7 +448,16 @@ class HyMemAdapter:
                 -m.get("confidence", 0),
             ))
 
-        return memories[:top_k], getattr(result, 'total_message_matches', 0), getattr(result, 'graph_count', None), getattr(result, 'temporal_events', [])
+        # The recall-ceiling pool is the FULL retrieved set per tier, captured
+        # before the memories[:top_k] cut, so we measure whether the gold turn
+        # was retrievable at all — independent of the final ordering/truncation.
+        pool = {
+            "message": [m["content"] for m in message_hits],
+            "fts": [m["content"] for m in fts_hits],
+        }
+        return (memories[:top_k], getattr(result, 'total_message_matches', 0),
+                getattr(result, 'graph_count', None),
+                getattr(result, 'temporal_events', []), pool)
 
 
 # ── Answer & Judge ──────────────────────────────────────────────────
@@ -587,9 +673,26 @@ def evaluate_question(
     hy.dream_and_wait()
 
     # Search
-    memories, total_matches, graph_count, temporal_events = hy.search(question, ability=ability, top_k=top_k * 3)
+    memories, total_matches, graph_count, temporal_events, pool = hy.search(question, ability=ability, top_k=top_k * 3)
     src = "question_date" if q_data.get("question_date") else ("haystack_max" if session_dates else "none")
-    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, now={question_date or '∅'}[{src}])", flush=True)
+
+    # Recall ceiling: was the answer-bearing turn anywhere in the pre-truncation
+    # pool? Splits a miss into retrieval loss (ceiling=False) vs ranking/
+    # synthesis loss (ceiling=True). None when the dataset carries no gold marks.
+    gold_turns, gold_mode = _extract_gold_turns(q_data)
+    if gold_turns:
+        in_msg = _gold_in_pool(gold_turns, pool["message"])
+        in_fts = _gold_in_pool(gold_turns, pool["fts"])
+        recall_ceiling = in_msg or in_fts
+        recall_tier = ("both" if in_msg and in_fts
+                       else "message" if in_msg
+                       else "fts" if in_fts else "none")
+    else:
+        recall_ceiling, recall_tier = None, "unknown"
+
+    ceiling_str = ("∅" if recall_ceiling is None
+                   else f"{recall_ceiling}[{recall_tier}]")
+    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str})", flush=True)
 
     # Answer
     ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
@@ -610,6 +713,10 @@ def evaluate_question(
         "num_sessions": stats["sessions"],
         "num_messages": stats["messages"],
         "num_memories": len(memories),
+        "recall_ceiling": recall_ceiling,
+        "recall_tier": recall_tier,
+        "gold_mode": gold_mode,
+        "gold_turns": len(gold_turns),
     }
 
 
@@ -634,6 +741,74 @@ def compute_scores(results: list[dict]) -> dict:
         "count": len(all_correct),
     }
     return scores
+
+
+def compute_recall_diagnostics(results: list[dict]) -> dict:
+    """Per-category recall-ceiling stats: split misses into retrieval vs ranking.
+
+    For each base type, over questions whose gold turns are known:
+      - ceiling_rate: fraction whose answer turn entered the pre-truncation pool
+      - among the INCORRECT ones, how many were retrieval losses (gold never
+        retrieved) vs ranking/synthesis losses (gold retrieved but answer wrong)
+    The miss split is the actionable signal: retrieval-dominant → embeddings/
+    chunking; ranking-dominant → rerank/budget/packing.
+    """
+    by_type: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        by_type[r["question_type"].replace("_abs", "")].append(r)
+
+    tiers = Counter()
+    modes = Counter()
+    diag: dict[str, dict] = {}
+    for qtype, rows in sorted(by_type.items()):
+        known = [r for r in rows if r.get("recall_ceiling") is not None]
+        hit = [r for r in known if r["recall_ceiling"]]
+        misses = [r for r in rows if not r["correct"]]
+        miss_retrieval = sum(1 for r in misses if r.get("recall_ceiling") is False)
+        miss_ranking = sum(1 for r in misses if r.get("recall_ceiling") is True)
+        miss_unknown = sum(1 for r in misses if r.get("recall_ceiling") is None)
+        for r in known:
+            tiers[r.get("recall_tier", "none")] += 1
+        for r in rows:
+            modes[r.get("gold_mode", "none")] += 1
+        diag[qtype] = {
+            "known": len(known),
+            "unknown": len(rows) - len(known),
+            "ceiling_rate": (len(hit) / len(known)) if known else None,
+            "misses": len(misses),
+            "miss_retrieval": miss_retrieval,
+            "miss_ranking": miss_ranking,
+            "miss_unknown": miss_unknown,
+        }
+    diag["_tiers"] = dict(tiers)
+    diag["_gold_mode"] = dict(modes)
+    return diag
+
+
+def print_recall_diagnostics(diag: dict):
+    """Render the retrieval-vs-ranking split so the next fix targets the right
+    stage instead of guessing."""
+    modes = diag.get("_gold_mode", {})
+    mode_str = ", ".join(f"{k}={v}" for k, v in sorted(modes.items()))
+    print(f"\n  Recall-Ceiling Diagnostics  (gold marks: {mode_str})")
+    print(f"    {'category':<28} {'ceiling':>8}  {'known':>6}   misses → retrieval / ranking / unknown")
+    print(f"    {'─'*82}")
+    for qtype, d in sorted(diag.items()):
+        if qtype.startswith("_"):
+            continue
+        rate = d["ceiling_rate"]
+        rate_s = "  n/a " if rate is None else f"{rate*100:>5.0f}%"
+        print(f"    {qtype:<28} {rate_s:>8}  {d['known']:>6}   "
+              f"{d['misses']:>3}  →  {d['miss_retrieval']:>3}  /  "
+              f"{d['miss_ranking']:>3}  /  {d['miss_unknown']:>3}")
+    tiers = diag.get("_tiers", {})
+    if tiers:
+        tier_str = ", ".join(f"{k}={v}" for k, v in sorted(tiers.items()))
+        print(f"    {'─'*82}")
+        print(f"    recovered-by tier (known questions): {tier_str}")
+    print(f"\n    Read: high retrieval-loss → recall problem (embeddings/chunking/"
+          f"fan-out).\n          high ranking-loss → the turn was retrieved but "
+          f"lost the cut (rerank/budget).")
 
 
 def print_report(scores: dict, metadata: dict):
@@ -796,6 +971,8 @@ def main():
         "top_k": args.top_k,
         "scale": scale,
     })
+    recall_diag = compute_recall_diagnostics(all_results)
+    print_recall_diagnostics(recall_diag)
 
     # Save
     results_dir = Path("/home/node/.hermes/benchmarks")
@@ -813,7 +990,7 @@ def main():
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
-            "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix",
+            "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix, recall-ceiling instrumentation (retrieval-vs-ranking miss split)",
             "elapsed_s": elapsed,
             "answer_calls": answer_llm.call_count,
             "judge_calls": judge_llm.call_count,
@@ -823,6 +1000,7 @@ def main():
             "accuracy": round(data["accuracy"] * 100, 1),
             "count": data["count"],
         } for qtype, data in scores.items()},
+        "recall_diagnostics": recall_diag,
         "per_question": all_results,
     }
 
