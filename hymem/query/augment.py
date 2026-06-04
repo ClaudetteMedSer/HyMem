@@ -316,11 +316,59 @@ def augment(
     # Raw-message keyword tier: direct FTS5 over the session log, reaching turns
     # that were never chunked (low salience, not-yet-dreamed, or other sessions).
     # Kept separate from fts_hits — different granularity, non-comparable BM25.
-    # ability="MR" swaps the top-k-by-relevance path for a counting path: it
-    # returns a deterministic candidate count (distinct user turns, deduped) plus
-    # the matching turns as evidence, so the host's LLM reads a number instead of
-    # tallying across a wall of hits.
-    if ability == "MR" and cfg.message_fts_aggregate_cap > 0:
+    def _relevance_message_hits() -> list[MessageHit]:
+        # This raw-message tier is the dominant recovery source (most gold turns
+        # come back here, not via dreamed chunks), yet it was historically
+        # returned in raw BM25 keyword order — so a turn that is the right answer
+        # but only a weak lexical match sat below the cut. Mirror the chunk tier:
+        # pull a wider candidate pool, then rerank it down to message_fts_top_k so
+        # a semantically-relevant turn in the BM25 tail can be lifted into view.
+        msg_candidate_k = (
+            max(cfg.message_fts_top_k, cfg.rerank_top_k)
+            if (rerank_enabled and cfg.rerank_message_hits)
+            else cfg.message_fts_top_k
+        )
+        msg_hits = _message_fts_search(conn, user_message, top_k=msg_candidate_k)
+        # Only pay the rerank call when it can actually change the surviving set
+        # (pool deeper than the cut). A pool at/below the cut would only reorder
+        # turns the host already sees, not lift a new one in — not worth a call.
+        if (
+            rerank_enabled
+            and cfg.rerank_message_hits
+            and len(msg_hits) > cfg.message_fts_top_k
+        ):
+            log.debug("rerank.message.triggered model=%s", cfg.rerank_model)
+            msg_hits = run_rerank(
+                user_message,
+                list(msg_hits),
+                top_k=cfg.message_fts_top_k,
+                model=cfg.rerank_model,
+                llm=llm,
+                cross_encoder_model=cfg.rerank_cross_encoder_model,
+            )
+            for hit in msg_hits:
+                if hit.score_kind == "reranked":
+                    hit.why_retrieved = [*hit.why_retrieved, "reranked"]
+        else:
+            msg_hits = msg_hits[: cfg.message_fts_top_k]
+        return msg_hits
+
+    # ability="MR" layers a deterministic candidate count (distinct deduped user
+    # turns) onto the tier. The crucial design choice is REPLACE vs ADDITIVE:
+    #  * legacy (mr_aggregate_additive=False): the aggregate OWNS message_hits, so
+    #    a *mis-routed* count question (the router over-fires "how many X" on
+    #    single-session lookups it can't distinguish from text) loses relevance
+    #    retrieval entirely — the dominant real-world cost of MR over-detection.
+    #  * additive (default): relevance retrieval still runs and fills message_hits;
+    #    the COUNT (total_message_matches + the exact in-domain graph_count) is
+    #    layered ON TOP. A false-positive MR detection then costs nothing — the
+    #    question still gets full (reranked) retrieval — while a genuine count
+    #    question keeps its number. This mirrors how TR is already additive, and
+    #    sidesteps the un-fixable text ambiguity ("how many books have I read" is
+    #    a real count in production, a lookup on this benchmark — indistinguishable
+    #    by regex, so precision can't be tightened without cutting real MR recall).
+    mr_aggregate = ability == "MR" and cfg.message_fts_aggregate_cap > 0
+    if mr_aggregate and not cfg.mr_aggregate_additive:
         (
             ctx.message_hits,
             ctx.total_message_matches,
@@ -328,16 +376,24 @@ def augment(
         ) = _message_fts_aggregate(
             conn, user_message, cap=cfg.message_fts_aggregate_cap
         )
-        # Higher-confidence ADDITIVE layer: for the IN-DOMAIN slice of MR
-        # questions the graph gives an EXACT typed count alongside the keyword
-        # candidate above (which always still runs as the fallback). The router
-        # only fires on in-vocab type/predicate/entity, and any failure leaves
-        # graph_count=None — the keyword count is never disturbed.
         ctx.graph_count = _maybe_graph_count(conn, user_message)
-    elif cfg.message_fts_top_k > 0:
-        ctx.message_hits = _message_fts_search(
-            conn, user_message, top_k=cfg.message_fts_top_k
-        )
+    else:
+        if cfg.message_fts_top_k > 0:
+            ctx.message_hits = _relevance_message_hits()
+        if mr_aggregate:
+            # Count layered on top of relevance retrieval (message_hits already
+            # set above). The graph gives an EXACT typed count for the in-domain
+            # slice; any failure leaves graph_count=None and the keyword candidate
+            # count stands. The aggregate's own evidence turns are discarded — the
+            # reranked relevance turns are the better evidence view.
+            (
+                _,
+                ctx.total_message_matches,
+                ctx.enumeration_turns,
+            ) = _message_fts_aggregate(
+                conn, user_message, cap=cfg.message_fts_aggregate_cap
+            )
+            ctx.graph_count = _maybe_graph_count(conn, user_message)
 
     # ability="TR" (temporal reasoning) builds a date-ordered event list so the
     # host LLM reads a chronology instead of finding dates in noise. It merges

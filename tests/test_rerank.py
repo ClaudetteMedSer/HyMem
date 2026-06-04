@@ -87,6 +87,74 @@ def test_rerank_dispatch_cross_encoder_falls_back_to_llm(monkeypatch):
     assert out[0].score_kind == "reranked"
 
 
+def test_message_tier_reranks_wider_pool_then_trims(hy):
+    """The raw-message tier must pull a `rerank_top_k`-wide BM25 pool and rerank
+    it down to `message_fts_top_k` — the fix for ranking-loss misses, since this
+    tier carries most of the gold yet was historically returned in raw BM25 order.
+
+    We deliberately do NOT dream, so `chunks_fts` is empty and the chunk-tier
+    rerank never fires (should_rerank needs both fts+vec). The only rerank call
+    is therefore the message-tier one, and we assert its candidate pool exceeds
+    the returned cut."""
+    hy.open_session("s_msg_pool")
+    # Many raw turns sharing a keyword so the message FTS pool is deep.
+    for i in range(12):
+        hy.log_message("s_msg_pool", "user", f"deploy pipeline note {i}: staging rollout")
+
+    rerank_llm = StubLLMClient(default="[]")
+    hy.set_llm(rerank_llm)
+
+    from dataclasses import replace as dc_replace
+    hy.config = dc_replace(
+        hy.config,
+        message_fts_top_k=3,
+        rerank_top_k=10,
+        rerank_message_hits=True,
+    )
+
+    ctx = hy.augment("deploy pipeline")
+
+    # The cut is honoured.
+    assert len(ctx.message_hits) <= 3
+    # A message-tier rerank ran over a pool wider than the cut.
+    rerank_calls = [
+        c for c in rerank_llm.calls if "evaluate the relevance" in c.system
+    ]
+    assert rerank_calls, "message-tier rerank was never invoked"
+    user = rerank_calls[-1].user
+    marker_count = sum(
+        1 for line in user.splitlines() if line.startswith("[") and "]" in line
+    )
+    assert marker_count > 3
+    assert marker_count <= 10
+
+
+def test_message_tier_rerank_disabled_keeps_raw_bm25(hy):
+    """With `rerank_message_hits=False` the tier returns raw BM25 (no rerank
+    call, no wider pool) — the escape hatch must fully restore prior behaviour."""
+    hy.open_session("s_msg_off")
+    for i in range(12):
+        hy.log_message("s_msg_off", "user", f"deploy pipeline note {i}: staging rollout")
+
+    rerank_llm = StubLLMClient(default="[]")
+    hy.set_llm(rerank_llm)
+
+    from dataclasses import replace as dc_replace
+    hy.config = dc_replace(
+        hy.config,
+        message_fts_top_k=3,
+        rerank_top_k=10,
+        rerank_message_hits=False,
+    )
+
+    hy.augment("deploy pipeline")
+
+    rerank_calls = [
+        c for c in rerank_llm.calls if "evaluate the relevance" in c.system
+    ]
+    assert not rerank_calls, "message-tier rerank fired despite being disabled"
+
+
 def test_augment_uses_rerank_top_k_as_candidate_pool(hy_with_embed):
     """augment() should pull `rerank_top_k` candidates from FTS+vec when
     rerank is enabled, even if `fts_top_k` is smaller. We verify by stubbing

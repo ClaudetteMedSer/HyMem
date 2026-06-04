@@ -198,7 +198,12 @@ def test_mr_aggregation_cap_limits_rows_not_count(cfg, stub_llm):
 
     from hymem import HyMem
 
-    hy = HyMem(replace(cfg, message_fts_aggregate_cap=3), llm=stub_llm)
+    # Replace-mode: the cap bounds the aggregate's own evidence rows shown in
+    # message_hits (the additive default puts relevance turns there instead).
+    hy = HyMem(
+        replace(cfg, message_fts_aggregate_cap=3, mr_aggregate_additive=False),
+        llm=stub_llm,
+    )
     try:
         sid = "cap"
         hy.open_session(sid)
@@ -332,6 +337,44 @@ def test_mr_aggregation_enabled_by_default(hy):
     assert ctx.total_message_matches == 9  # counting path ran
 
 
+def test_mr_additive_layers_count_on_relevance_retrieval(hy):
+    # Additive default (mr_aggregate_additive=True): an MR detection layers the
+    # exact count ON TOP of normal relevance message_hits instead of REPLACING
+    # them with the aggregate's distinct-user evidence. So message_hits stays the
+    # relevance tier (bounded by message_fts_top_k, not the full count, and not
+    # tagged score_kind="aggregate"), while the count is still exact.
+    sid = "additive"
+    hy.open_session(sid)
+    assert hy.config.mr_aggregate_additive is True
+    for i in range(9):
+        hy.log_message(sid, "user", f"I added project card number {i} to my gallery")
+
+    ctx = hy.augment("how many project cards did I add to my gallery?", ability="MR")
+
+    assert ctx.total_message_matches == 9  # count preserved (the MR payload)
+    # Relevance path owns message_hits, NOT the aggregate.
+    assert len(ctx.message_hits) <= hy.config.message_fts_top_k
+    assert all(h.score_kind != "aggregate" for h in ctx.message_hits)
+
+
+def test_mr_false_positive_keeps_relevance_retrieval(hy):
+    # The real-world win of additive mode: a single-session lookup the router
+    # MIS-routes to MR (it can't tell "how many books have I read" from a genuine
+    # cross-session count — they're textually identical) must NOT lose relevance
+    # retrieval. The answer-bearing turn is still surfaced; only a (harmless)
+    # count rides along.
+    sid = "fp"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "I have read 12 books so far this year")
+    for i in range(3):
+        hy.log_message(sid, "user", f"unrelated journaling note {i}")
+
+    ctx = hy.augment("how many books have I read this year?", ability="MR")
+
+    assert any("12 books" in h.text for h in ctx.message_hits)
+    assert all(h.score_kind != "aggregate" for h in ctx.message_hits)
+
+
 def test_mr_aggregation_opt_out_with_zero_cap(cfg, stub_llm):
     # Setting the cap to 0 disables counting: ability="MR" falls back to the
     # normal top-k message path.
@@ -423,7 +466,11 @@ def test_mr_enumeration_count_is_exact_under_cap(cfg, stub_llm):
 
     from hymem import HyMem
 
-    hy = HyMem(replace(cfg, message_fts_aggregate_cap=2), llm=stub_llm)
+    # Replace-mode: message_hits carries the capped aggregate evidence rows.
+    hy = HyMem(
+        replace(cfg, message_fts_aggregate_cap=2, mr_aggregate_additive=False),
+        llm=stub_llm,
+    )
     try:
         sid = "capenum"
         hy.open_session(sid)
