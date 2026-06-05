@@ -387,7 +387,8 @@ class HyMemAdapter:
         elapsed = time.time() - start
         print(f"      Dream completed in {elapsed:.0f}s", flush=True)
 
-    def search(self, query: str, ability: str = None, top_k: int = 10):
+    def search(self, query: str, ability: str = None, top_k: int = 10,
+               message_first: bool = False):
         """Search HyMem for the given query.
 
         Returns (memories, total_matches, graph_count, temporal_events, pool)
@@ -461,7 +462,12 @@ class HyMemAdapter:
         # these abilities — the answer is in the message text.
         TASK_RECALL = {"IF", "MR", "EO", "SUM", "TR"}
 
-        if ability in TASK_RECALL:
+        if ability in TASK_RECALL or message_first:
+            # message_first extends the task-recall ordering (raw turns lead,
+            # dream-derived graph_facts demoted to a confidence-ranked tail) to
+            # the IE/KU/PF lookups too. Tests whether full-dream's SS-user drop is
+            # caused by graph_facts crowding out the answer turn, rather than by
+            # dreaming itself — see the dream-vs-no-dream matrix.
             memories = message_hits + procedure_hits
             rest = episode_hits + fts_hits + graph_facts
             rest.sort(key=lambda m: -m.get("confidence", 0))
@@ -669,6 +675,7 @@ def evaluate_question(
     top_k: int,
     auto_ability: bool = False,
     no_dream: bool = False,
+    message_first: bool = False,
 ) -> dict:
     """Evaluate a single LongMemEval question."""
     question_id = q_data["question_id"]
@@ -717,7 +724,8 @@ def evaluate_question(
         hy.dream_and_wait()
 
     # Search
-    memories, total_matches, graph_count, temporal_events, pool = hy.search(question, ability=ability, top_k=top_k * 3)
+    memories, total_matches, graph_count, temporal_events, pool = hy.search(
+        question, ability=ability, top_k=top_k * 3, message_first=message_first)
     src = "question_date" if q_data.get("question_date") else ("haystack_max" if session_dates else "none")
 
     # Recall ceiling: was the answer-bearing turn anywhere in the pre-truncation
@@ -983,6 +991,7 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
             auto_ability=args.auto_ability, no_dream=args.no_dream,
+            message_first=args.message_first,
         )
     except Exception as e:
         print(f"    ERROR: {e}", flush=True)
@@ -1036,6 +1045,14 @@ def main():
                              "dreamed-chunk/KG/temporal tiers, so it is NOT a "
                              "faithful headline run. Do one full-dream pass for "
                              "the published number.")
+    parser.add_argument("--message-first", action="store_true",
+                        help="Rank raw message_hits ahead of dream-derived "
+                             "graph_facts for IE/KU/PF lookups (graph_facts "
+                             "demoted to a tail supplement), instead of "
+                             "graph-facts-first. Isolates whether full-dream's "
+                             "SS-user regression is a graph_facts-crowding "
+                             "ordering artifact vs dreaming itself. Run with full "
+                             "dream (i.e. WITHOUT --no-dream) to measure.")
     parser.add_argument("--auto-ability", action="store_true",
                         help="Drive retrieval shaping from HyMem's production "
                              "detect_ability() instead of the oracle question_type "
@@ -1181,6 +1198,7 @@ def main():
             "auto_ability": args.auto_ability,
             "workers": args.workers,
             "no_dream": args.no_dream,
+            "message_first": args.message_first,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
