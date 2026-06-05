@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -214,13 +215,17 @@ class LLMClient:
         self.base_url = DEEPSEEK_BASE_URL.rstrip("/")
         self.call_count = 0
         self.total_tokens = 0
+        # Guards the two counters so they aggregate correctly when many worker
+        # threads share this client (--workers > 1).
+        self._lock = threading.Lock()
 
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
         last_error = None
         for attempt in range(3):
             try:
                 content, usage = self._call(messages, temperature, max_tokens)
-                self.total_tokens += usage.get("total_tokens", 0)
+                with self._lock:
+                    self.total_tokens += usage.get("total_tokens", 0)
                 return content
             except Exception as e:
                 last_error = str(e)
@@ -246,7 +251,8 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        self.call_count += 1
+        with self._lock:
+            self.call_count += 1
         return (
             data["choices"][0]["message"].get("content", ""),
             data.get("usage", {}),
@@ -662,6 +668,7 @@ def evaluate_question(
     q_data: dict,
     top_k: int,
     auto_ability: bool = False,
+    no_dream: bool = False,
 ) -> dict:
     """Evaluate a single LongMemEval question."""
     question_id = q_data["question_id"]
@@ -697,9 +704,17 @@ def evaluate_question(
     stats = hy.ingest_sessions(sessions, session_ids, session_dates)
     print(f"    Ingested {stats['sessions']} sessions ({stats['messages']} msgs, {stats['chars']} chars)", flush=True)
 
-    # Dream
-    print(f"    Running dream cycle...", flush=True)
-    hy.dream_and_wait()
+    # Dream — skipped in --no-dream fast mode. The message/rerank/MR paths under
+    # test read messages_fts (populated at ingest, no dream needed); the dreamed
+    # chunk tier uniquely recovers ~2/500 on LME and graph_count is None on every
+    # consumer-domain question, so skipping it barely moves the score while
+    # deleting the dominant cost. NOT a faithful full-system run — for relative
+    # A/B iteration only; do one full-dream pass for the headline number.
+    if no_dream:
+        print(f"    Skipping dream (--no-dream)", flush=True)
+    else:
+        print(f"    Running dream cycle...", flush=True)
+        hy.dream_and_wait()
 
     # Search
     memories, total_matches, graph_count, temporal_events, pool = hy.search(question, ability=ability, top_k=top_k * 3)
@@ -945,6 +960,51 @@ def print_report(scores: dict, metadata: dict):
     print(f"    RAG:       48.5%")
 
 
+# ── Per-question worker ─────────────────────────────────────────────
+
+def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_key):
+    """Full lifecycle for one question: fresh temp DB → open → evaluate → cleanup.
+
+    Self-contained so it can run in a worker thread. Each question gets its own
+    SQLite file + HyMem instance (created and used entirely within this call, so
+    no connection crosses threads); the only shared state is the two LLMClients,
+    whose counters are lock-guarded. Returns the result dict (never raises — an
+    error is captured as an incorrect result so one bad question can't abort a
+    parallel run)."""
+    print(f"[{qi+1}/{total}] Q: {q_data['question_id']} ({q_data['question_type']})", flush=True)
+
+    # Fresh temp DB per question (sessions are question-specific)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-lme-"))
+    db_path = tmp_dir / "hymem.sqlite"
+    hy = None
+    try:
+        hy = HyMemAdapter(db_path, api_key=api_key)
+        hy.open()
+        result = evaluate_question(
+            answer_llm, judge_llm, hy, q_data, args.top_k,
+            auto_ability=args.auto_ability, no_dream=args.no_dream,
+        )
+    except Exception as e:
+        print(f"    ERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        result = {
+            "question_id": q_data.get("question_id", "unknown"),
+            "question_type": q_data.get("question_type", "unknown"),
+            "correct": False,
+            "error": str(e),
+        }
+    finally:
+        if hy:
+            hy.close()
+        if not args.keep_db:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Force GC to prevent file handle leaks
+        gc.collect()
+    return result
+
+
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
@@ -962,6 +1022,20 @@ def main():
     parser.add_argument("--api-key", default="")
     parser.add_argument("--data-dir", default=str(_repo_root.parent / "hymem_beam" / "data"))
     parser.add_argument("--keep-db", action="store_true")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of questions to evaluate concurrently. "
+                             "Questions are independent (own temp DB), so this "
+                             "scales near-linearly on the I/O-bound LLM calls. "
+                             "Results are byte-identical to --workers 1; only "
+                             "throughput changes. Try 8 to start.")
+    parser.add_argument("--no-dream", action="store_true",
+                        help="Skip the per-question dream cycle (the dominant "
+                             "cost). The message/rerank/MR retrieval paths read "
+                             "messages_fts (built at ingest) and don't need it. "
+                             "FAST-MODE FOR RELATIVE A/B ONLY — degrades the "
+                             "dreamed-chunk/KG/temporal tiers, so it is NOT a "
+                             "faithful headline run. Do one full-dream pass for "
+                             "the published number.")
     parser.add_argument("--auto-ability", action="store_true",
                         help="Drive retrieval shaping from HyMem's production "
                              "detect_ability() instead of the oracle question_type "
@@ -1005,6 +1079,10 @@ def main():
     print(f"  Top-K: {args.top_k}")
     print(f"  Answer model: {args.answer_model}")
     print(f"  Judge model: {args.judge_model}")
+    print(f"  Workers: {args.workers}")
+    if args.no_dream:
+        print(f"  ⚠ --no-dream: FAST MODE (relative A/B only, NOT a headline run "
+              f"— dream/KG/temporal tiers degraded)")
 
     # Load data
     print("\nLoading dataset...", flush=True)
@@ -1021,52 +1099,50 @@ def main():
     answer_llm = LLMClient(args.answer_model, DEEPSEEK_API_KEY)
     judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY)
 
-    # Evaluate each question
-    all_results = []
+    # Evaluate each question. Questions are fully independent (own temp DB +
+    # HyMem instance), so --workers > 1 fans them across a thread pool — the work
+    # is ~entirely LLM network I/O, so the GIL is released and threads scale
+    # near-linearly while sharing the LLMClient token counters.
     start_time = time.time()
-    hy = None
+    total = len(questions)
 
-    for qi, q_data in enumerate(questions):
-        print(f"[{qi+1}/{len(questions)}] Q: {q_data['question_id']} ({q_data['question_type']})", flush=True)
+    def _progress(done: int):
+        elapsed = time.time() - start_time
+        acc = sum(1 for r in all_results if r.get("correct")) / max(1, len(all_results))
+        suffix = f" (×{args.workers} workers)" if args.workers > 1 else ""
+        print(f"  ── Progress: {done}/{total} | Acc: {acc*100:.1f}% | "
+              f"Elapsed: {elapsed:.0f}s | Avg: {elapsed/max(1, done):.0f}s/q{suffix}",
+              flush=True)
 
-        # Fresh temp DB per question (sessions are question-specific)
-        tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-lme-"))
-        db_path = tmp_dir / "hymem.sqlite"
+    if args.workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        try:
-            hy = HyMemAdapter(db_path, api_key=DEEPSEEK_API_KEY)
-            hy.open()
-
-            result = evaluate_question(answer_llm, judge_llm, hy, q_data, args.top_k,
-                                       auto_ability=args.auto_ability)
-            all_results.append(result)
-        except Exception as e:
-            print(f"    ERROR: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            all_results.append({
-                "question_id": q_data.get("question_id", "unknown"),
-                "question_type": q_data.get("question_type", "unknown"),
-                "correct": False,
-                "error": str(e),
-            })
-        finally:
-            if hy:
-                hy.close()
-                hy = None
-
-            if not args.keep_db:
-                import shutil
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
-            # Force GC to prevent file handle leaks
-            gc.collect()
-
-        # Progress report every 10 questions
-        if (qi + 1) % 10 == 0:
-            elapsed = time.time() - start_time
-            acc_so_far = sum(1 for r in all_results if r.get("correct")) / len(all_results)
-            print(f"  ── Progress: {qi+1}/{len(questions)} | Acc: {acc_so_far*100:.1f}% | Elapsed: {elapsed:.0f}s | Avg: {elapsed/(qi+1):.0f}s/q", flush=True)
+        # Collect by original index so per_question stays input-ordered (stable
+        # / comparable across runs) even though completion order is arbitrary.
+        results_by_idx: dict[int, dict] = {}
+        all_results: list[dict] = []
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(_evaluate_one_question, qi, total, q_data, args,
+                            answer_llm, judge_llm, DEEPSEEK_API_KEY): qi
+                for qi, q_data in enumerate(questions)
+            }
+            for fut in as_completed(futures):
+                qi = futures[fut]
+                results_by_idx[qi] = fut.result()
+                all_results = list(results_by_idx.values())
+                if len(results_by_idx) % 10 == 0:
+                    _progress(len(results_by_idx))
+        all_results = [results_by_idx[i] for i in range(total)]
+    else:
+        all_results = []
+        for qi, q_data in enumerate(questions):
+            all_results.append(
+                _evaluate_one_question(qi, total, q_data, args,
+                                       answer_llm, judge_llm, DEEPSEEK_API_KEY)
+            )
+            if (qi + 1) % 10 == 0:
+                _progress(qi + 1)
 
     elapsed = time.time() - start_time
     total_calls = answer_llm.call_count + judge_llm.call_count
@@ -1103,6 +1179,8 @@ def main():
             "seed": args.seed,
             "top_k": args.top_k,
             "auto_ability": args.auto_ability,
+            "workers": args.workers,
+            "no_dream": args.no_dream,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
