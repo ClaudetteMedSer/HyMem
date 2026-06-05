@@ -388,7 +388,7 @@ class HyMemAdapter:
         print(f"      Dream completed in {elapsed:.0f}s", flush=True)
 
     def search(self, query: str, ability: str = None, top_k: int = 10,
-               message_first: bool = False):
+               graph_facts_first: bool = False):
         """Search HyMem for the given query.
 
         Returns (memories, total_matches, graph_count, temporal_events, pool)
@@ -462,18 +462,19 @@ class HyMemAdapter:
         # these abilities — the answer is in the message text.
         TASK_RECALL = {"IF", "MR", "EO", "SUM", "TR"}
 
-        if ability in TASK_RECALL or message_first:
-            # message_first extends the task-recall ordering (raw turns lead,
-            # dream-derived graph_facts demoted to a confidence-ranked tail) to
-            # the IE/KU/PF lookups too. Tests whether full-dream's SS-user drop is
-            # caused by graph_facts crowding out the answer turn, rather than by
-            # dreaming itself — see the dream-vs-no-dream matrix.
-            memories = message_hits + procedure_hits
-            rest = episode_hits + fts_hits + graph_facts
-            rest.sort(key=lambda m: -m.get("confidence", 0))
-            memories += rest
-        else:
-            # Knowledge/preference: graph facts first, then message hits
+        # DEFAULT = message-first for EVERY ability: raw answer-bearing turns lead,
+        # dream-derived graph_facts demoted to a confidence-ranked tail. This is the
+        # production-realistic shape — detect_ability returns None for IE/KU/PF/SS-user,
+        # and routing None to graph-facts-first is exactly what caused the −14.3pp
+        # SS-user regression. The full-dream "harm" was 100% this ordering artifact:
+        # --message-first WITH full dream tied no-dream at 65.0% and recovered SS-user
+        # +11.5pp (see project_beam_retrieval memory). No category is proven to prefer
+        # graph-facts-first (the apparent multi-session win was a phantom — MS→MR is
+        # already TASK_RECALL, so it never took the graph-facts-first branch).
+        # --graph-facts-first restores the legacy ordering for the non-task-recall
+        # (IE/KU/PF) lookups, for A/B comparison only.
+        if graph_facts_first and ability not in TASK_RECALL:
+            # Legacy: graph facts first, then message hits (knowledge/preference).
             graph_facts.sort(key=lambda m: -m.get("confidence", 0))
             memories = graph_facts + message_hits + episode_hits + fts_hits + procedure_hits
             memories.sort(key=lambda m: (
@@ -481,6 +482,11 @@ class HyMemAdapter:
                 0 if m["type"] == "message_hit" else 1,
                 -m.get("confidence", 0),
             ))
+        else:
+            memories = message_hits + procedure_hits
+            rest = episode_hits + fts_hits + graph_facts
+            rest.sort(key=lambda m: -m.get("confidence", 0))
+            memories += rest
 
         # The recall-ceiling pool is the FULL retrieved set per tier, captured
         # before the memories[:top_k] cut, so we measure whether the gold turn
@@ -675,7 +681,7 @@ def evaluate_question(
     top_k: int,
     auto_ability: bool = False,
     no_dream: bool = False,
-    message_first: bool = False,
+    graph_facts_first: bool = False,
 ) -> dict:
     """Evaluate a single LongMemEval question."""
     question_id = q_data["question_id"]
@@ -725,7 +731,7 @@ def evaluate_question(
 
     # Search
     memories, total_matches, graph_count, temporal_events, pool = hy.search(
-        question, ability=ability, top_k=top_k * 3, message_first=message_first)
+        question, ability=ability, top_k=top_k * 3, graph_facts_first=graph_facts_first)
     src = "question_date" if q_data.get("question_date") else ("haystack_max" if session_dates else "none")
 
     # Recall ceiling: was the answer-bearing turn anywhere in the pre-truncation
@@ -991,7 +997,7 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
             auto_ability=args.auto_ability, no_dream=args.no_dream,
-            message_first=args.message_first,
+            graph_facts_first=args.graph_facts_first,
         )
     except Exception as e:
         print(f"    ERROR: {e}", flush=True)
@@ -1045,14 +1051,15 @@ def main():
                              "dreamed-chunk/KG/temporal tiers, so it is NOT a "
                              "faithful headline run. Do one full-dream pass for "
                              "the published number.")
-    parser.add_argument("--message-first", action="store_true",
-                        help="Rank raw message_hits ahead of dream-derived "
-                             "graph_facts for IE/KU/PF lookups (graph_facts "
-                             "demoted to a tail supplement), instead of "
-                             "graph-facts-first. Isolates whether full-dream's "
-                             "SS-user regression is a graph_facts-crowding "
-                             "ordering artifact vs dreaming itself. Run with full "
-                             "dream (i.e. WITHOUT --no-dream) to measure.")
+    parser.add_argument("--graph-facts-first", action="store_true",
+                        help="A/B OPT-OUT: restore the legacy graph-facts-first "
+                             "ordering for IE/KU/PF lookups (dream-derived "
+                             "graph_facts ranked above raw message_hits). The "
+                             "DEFAULT is now message-first for every ability — the "
+                             "production-realistic shape, since detect_ability "
+                             "returns None for those lookups and graph-facts-first "
+                             "caused the −14.3pp SS-user regression. Use this flag "
+                             "only to reproduce the old ordering for comparison.")
     parser.add_argument("--auto-ability", action="store_true",
                         help="Drive retrieval shaping from HyMem's production "
                              "detect_ability() instead of the oracle question_type "
@@ -1198,7 +1205,7 @@ def main():
             "auto_ability": args.auto_ability,
             "workers": args.workers,
             "no_dream": args.no_dream,
-            "message_first": args.message_first,
+            "graph_facts_first": args.graph_facts_first,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
