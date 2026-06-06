@@ -321,9 +321,10 @@ def load_longmemeval_oracle(oracle_path: str) -> dict[str, dict]:
 class HyMemAdapter:
     """Direct HyMem Python API adapter with isolated temp DB."""
 
-    def __init__(self, db_path: Path, api_key: str = ""):
+    def __init__(self, db_path: Path, api_key: str = "", embeddings: bool = False):
         self.db_path = db_path
         self.api_key = api_key
+        self.embeddings = embeddings
         self.hy = None
 
     def open(self):
@@ -341,7 +342,19 @@ class HyMemAdapter:
             base_url="https://api.deepseek.com",
             model="deepseek-chat",
         )
-        self.hy = HyMem(cfg, llm=llm)
+        # Optional semantic-recall A/B (lever L1). The client reads HYMEM_EMBEDDING_*
+        # from the environment, so this drives the SAME local embedding server Hermes
+        # uses in production (loopback HYMEM_EMBEDDING_BASE_URL) rather than an API —
+        # no endpoint/model is hardcoded here. Off by default: the headline baseline is
+        # lexical-only, and embeddings on/off is a paired comparison against it.
+        embedding_client = None
+        if self.embeddings:
+            from hymem.contrib.openai_embedding_client import (
+                OpenAICompatibleEmbeddingClient,
+            )
+
+            embedding_client = OpenAICompatibleEmbeddingClient()
+        self.hy = HyMem(cfg, llm=llm, embedding_client=embedding_client)
         return self
 
     def close(self):
@@ -992,7 +1005,7 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
     db_path = tmp_dir / "hymem.sqlite"
     hy = None
     try:
-        hy = HyMemAdapter(db_path, api_key=api_key)
+        hy = HyMemAdapter(db_path, api_key=api_key, embeddings=args.embeddings)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -1065,6 +1078,15 @@ def main():
                              "detect_ability() instead of the oracle question_type "
                              "label — measures the true label-free production score. "
                              "(The router confusion is reported either way.)")
+    parser.add_argument("--embeddings", action="store_true",
+                        help="LEVER L1: enable semantic vector recall by wiring an "
+                             "OpenAICompatibleEmbeddingClient (reads HYMEM_EMBEDDING_* "
+                             "from the env, so it drives the SAME local embedding "
+                             "server Hermes uses — set HYMEM_EMBEDDING_BASE_URL to the "
+                             "loopback endpoint and HYMEM_EMBEDDING_MODEL to the loaded "
+                             "model). DEFAULT is OFF (lexical-only) to match the headline "
+                             "baseline; run with and without, paired on --seed, to "
+                             "measure how much recall the FTS-only path leaves behind.")
     args = parser.parse_args()
 
     # Resolve API key
@@ -1104,6 +1126,12 @@ def main():
     print(f"  Answer model: {args.answer_model}")
     print(f"  Judge model: {args.judge_model}")
     print(f"  Workers: {args.workers}")
+    if args.embeddings:
+        emb_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL", "∅ (UNSET — will fail!)")
+        emb_model = os.environ.get("HYMEM_EMBEDDING_MODEL", "deepseek-embedding")
+        print(f"  Embeddings: ON (semantic recall) — {emb_model} @ {emb_url}")
+    else:
+        print(f"  Embeddings: OFF (lexical/FTS-only — baseline)")
     if args.no_dream:
         print(f"  ⚠ --no-dream: FAST MODE (relative A/B only, NOT a headline run "
               f"— dream/KG/temporal tiers degraded)")
@@ -1206,6 +1234,7 @@ def main():
             "workers": args.workers,
             "no_dream": args.no_dream,
             "graph_facts_first": args.graph_facts_first,
+            "embeddings": args.embeddings,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
