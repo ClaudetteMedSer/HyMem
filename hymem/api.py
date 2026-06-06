@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import logging
+import os
+import shlex
+import subprocess
 import sqlite3
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Iterable, Literal
+from urllib.parse import urlsplit
 
 from hymem import portability
 from hymem import redaction
@@ -35,6 +42,86 @@ def _clean_timestamp(value: str | None) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+
+def _ensure_embedding_server(timeout: float = 45.0) -> bool:
+    """Best-effort: make sure a *local* embedding server is reachable, restarting
+    it if it has died unexpectedly.
+
+    Self-healing at the point of use: the code path that would otherwise crash on
+    a dead embedder (``dream``) is the one that revives it. There is no watchdog
+    process and no polling while idle — the check runs only when an embedder is
+    actually about to be used, so the steady-state cost is one ``/health`` GET.
+
+    Returns ``True`` when the embedding path is safe to proceed, ``False`` only
+    when a local server was down and could not be brought back up.
+
+    Decision table:
+      - ``HYMEM_EMBEDDING_BASE_URL`` unset  → ``True``  (FTS-only / benchmark path)
+      - remote URL (not loopback)           → ``True``  (can't restart a remote host)
+      - local server answers ``/health``    → ``True``  (fast path, no work)
+      - local server down, restart cmd set  → Popen it, poll ``/health`` to timeout
+      - local server down, no restart cmd   → ``False`` (nothing we can do)
+    """
+    base_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL")
+    if not base_url:
+        return True
+
+    host = (urlsplit(base_url).hostname or "").lower()
+    if host not in _LOCAL_HOSTS:
+        # Remote provider: not ours to manage. Skip rather than fail.
+        return True
+
+    health_url = base_url.rstrip("/") + "/health"
+    if _embedding_health_ok(health_url):
+        return True  # already up — nothing to do
+
+    cmd = os.environ.get("HYMEM_EMBEDDING_SERVER_CMD")
+    if not cmd:
+        log.warning(
+            "embedding server at %s is down and HYMEM_EMBEDDING_SERVER_CMD is "
+            "not set — cannot restart it automatically", base_url,
+        )
+        return False
+
+    log.warning("embedding server at %s is down — restarting via %r", base_url, cmd)
+    try:
+        # Detach so the embedding server outlives this restart trigger; inherit
+        # the environment so HYMEM_EMBEDDING_* stay consistent with the client.
+        subprocess.Popen(  # noqa: S603 - cmd is operator-supplied configuration
+            shlex.split(cmd),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        log.warning("failed to launch embedding server (%r): %s", cmd, exc)
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _embedding_health_ok(health_url):
+            log.info("embedding server at %s is back up", base_url)
+            return True
+        time.sleep(1.0)
+
+    log.warning(
+        "embedding server at %s did not become healthy within %.0fs",
+        base_url, timeout,
+    )
+    return False
+
+
+def _embedding_health_ok(health_url: str, timeout: float = 2.0) -> bool:
+    """Return True iff ``GET health_url`` answers with a 2xx status."""
+    try:
+        with urllib.request.urlopen(health_url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 class HyMem:
@@ -287,6 +374,10 @@ class HyMem:
                 "HyMem.dream requires an LLMClient. Pass one to the constructor "
                 "or call set_llm() before dreaming."
             )
+        if self._embed is not None:
+            # Dreaming embeds canonicals/edges; if a local embedding server died
+            # since the last cycle, revive it here before we depend on it.
+            _ensure_embedding_server()
         ids = list(session_ids) if session_ids is not None else None
         report = run_dreaming(
             self.conn,
