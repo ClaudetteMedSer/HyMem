@@ -321,21 +321,34 @@ def load_longmemeval_oracle(oracle_path: str) -> dict[str, dict]:
 class HyMemAdapter:
     """Direct HyMem Python API adapter with isolated temp DB."""
 
-    def __init__(self, db_path: Path, api_key: str = "", embeddings: bool = False):
+    def __init__(self, db_path: Path, api_key: str = "", embeddings: bool = False,
+                 rerank_top_k: int | None = None, rerank_model: str | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
+        self.rerank_top_k = rerank_top_k
+        self.rerank_model = rerank_model
         self.hy = None
 
     def open(self):
         from hymem import HyMem, HyMemConfig
         from hymem.contrib.openai_client import OpenAICompatibleClient
 
+        # L2 ranking levers (None = keep the config default). rerank_top_k widens the
+        # candidate pool the message/chunk reranker sees — a gold turn below this BM25
+        # rank can't be lifted because it's never a candidate. rerank_model swaps the
+        # LLM reranker for a local cross-encoder.
+        overrides = {}
+        if self.rerank_top_k is not None:
+            overrides["rerank_top_k"] = self.rerank_top_k
+        if self.rerank_model is not None:
+            overrides["rerank_model"] = self.rerank_model
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,
             fts_top_k=10,
             graph_top_k=10,
+            **overrides,
         )
         llm = OpenAICompatibleClient(
             api_key=self.api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
@@ -1005,7 +1018,8 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
     db_path = tmp_dir / "hymem.sqlite"
     hy = None
     try:
-        hy = HyMemAdapter(db_path, api_key=api_key, embeddings=args.embeddings)
+        hy = HyMemAdapter(db_path, api_key=api_key, embeddings=args.embeddings,
+                          rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -1078,6 +1092,21 @@ def main():
                              "detect_ability() instead of the oracle question_type "
                              "label — measures the true label-free production score. "
                              "(The router confusion is reported either way.)")
+    parser.add_argument("--rerank-top-k", type=int, default=None,
+                        help="LEVER L2a (ranking): candidate-pool width the message/chunk "
+                             "reranker sees (config default 20). The message tier pulls "
+                             "max(message_fts_top_k=15, rerank_top_k) BM25 candidates and "
+                             "reranks down to 15 — so a gold turn below this BM25 rank "
+                             "NEVER enters the rerank window and no reranker can lift it. "
+                             "Widen (40, 60) to give deeper-BM25 gold a rerank shot; this "
+                             "directly targets the ranking misses (recall is already "
+                             "ruled out). Adds reranker cost per query.")
+    parser.add_argument("--rerank-model", default=None, choices=["llm", "cross-encoder"],
+                        help="LEVER L2b (ranking): reranker backend (config default 'llm', "
+                             "reuses the deepseek host client). 'cross-encoder' uses a local "
+                             "sentence-transformers model (mxbai-rerank-base — English-only, "
+                             "fine for LME; production multilingual needs bge-reranker-v2-m3). "
+                             "A/B against 'llm' AFTER widening --rerank-top-k.")
     parser.add_argument("--embeddings", action="store_true",
                         help="LEVER L1: enable semantic vector recall by wiring an "
                              "OpenAICompatibleEmbeddingClient (reads HYMEM_EMBEDDING_* "
@@ -1132,6 +1161,10 @@ def main():
         print(f"  Embeddings: ON (semantic recall) — {emb_model} @ {emb_url}")
     else:
         print(f"  Embeddings: OFF (lexical/FTS-only — baseline)")
+    if args.rerank_top_k is not None or args.rerank_model is not None:
+        rk = args.rerank_top_k if args.rerank_top_k is not None else "default(20)"
+        rm = args.rerank_model if args.rerank_model is not None else "default(llm)"
+        print(f"  Rerank: top_k={rk}, model={rm}  (L2 ranking lever)")
     if args.no_dream:
         print(f"  ⚠ --no-dream: FAST MODE (relative A/B only, NOT a headline run "
               f"— dream/KG/temporal tiers degraded)")
@@ -1235,6 +1268,8 @@ def main():
             "no_dream": args.no_dream,
             "graph_facts_first": args.graph_facts_first,
             "embeddings": args.embeddings,
+            "rerank_top_k": args.rerank_top_k,
+            "rerank_model": args.rerank_model,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",

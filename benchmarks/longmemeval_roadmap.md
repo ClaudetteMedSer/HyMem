@@ -29,7 +29,7 @@ lives on branch `Beam-optimisation`, uncommitted.
 | `mr_aggregate_additive` | `True` | MR layers a count on top of relevance retrieval (never replaces it) |
 | `message_fts_aggregate_cap` | `50` | exact count regardless of cap |
 | dream | **ON** | vindicated — net-neutral on LME overall, kept for the cross-session KG (product differentiator LME can't see) + the TR edge |
-| embedding_client | **NONE** | ⚠️ semantic vector recall is OFF — see lever #1, the top open item |
+| embedding_client | **NONE** by default; `--embeddings` wires it | semantic vec recall is score-neutral on LME (65.0→65.0, see L1) — wired for production faithfulness, not a score lever; off in the headline run |
 | adapter top_k overrides | `message_fts_top_k=15, fts_top_k=10, graph_top_k=10` | set in `HyMemAdapter.open()` |
 | reference-now | `question_date` prepended | `--now` source logged per run |
 
@@ -186,29 +186,44 @@ The recall-ceiling verdict frames everything: **ranking & cross-session synthesi
 the bottleneck, not recall.** MS is the prize — 27% of the set, lowest score (~46.6%),
 ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
 
-- **L1. Wire a real embedding client — biggest lever + a measurement-validity fix.**
-  The benchmark runs HyMem with NO `embedding_client` (`HyMemAdapter.open()`), so
-  semantic vector recall is OFF and the dreamed-chunk tier is dead (FTS-only recovers
-  2/456 — redundant lexical). `OpenAICompatibleEmbeddingClient` already exists in
-  `hymem/contrib/`. Turning it on activates semantic recall (catches the vocab-mismatch
-  cross-session turns BM25 misses — the "charity event" vs "Walk for Hunger" case) and
-  gives the reranker a real substrate. Directly attacks MS; is simply the correct
-  production config. **Do this first — it changes what every other diagnostic means.**
-  ~5-line adapter change. Then re-run with the recall-ceiling diagnostic to see the new
-  tier attribution before deciding L2 vs L3.
-- **L2. Cross-encoder reranker.** Swap `rerank_model="llm"` → `"cross-encoder"`
-  (`mxbai-rerank-base-v1`, already configured, local/CPU/deterministic/cheaper).
-  Cross-encoders typically out-rank LLM-as-reranker on the "right turn is in the pool,
-  order it" problem — the 190 ranking misses. A/B-able.
+- **L1. Wire a real embedding client — DONE 2026-06-07, score-neutral but diagnostically
+  decisive.** Added `--embeddings` flag (`HyMemAdapter.open()` builds
+  `OpenAICompatibleEmbeddingClient()`, env-driven so it drives the SAME local FastEmbed
+  ONNX server Hermes uses: `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, `:8766`).
+  **Result: overall 65.0 → 65.0 (0.0pp). Embeddings do NOT move the LME score.** Per-cat
+  within noise (KU +3.8, SS-A +1.8, TR −1.5, SS-P −6.6, MS/SS-U flat). Recovered-by tiers:
+  103 both (FTS+vec fusion), 355 raw-message, 5 FTS-only, **no vec-only bucket** → vec
+  recall is *redundant* with FTS on LME; it adds candidates, not unique recall. **The win
+  is the diagnostic, not the score:** with embeddings ON, retrieval loss is near-zero
+  everywhere (MS 6 retrieval vs 65 ranking, SS-U 0 vs 8, TR 13 vs 25) — so the
+  "ranking/synthesis is the bottleneck, not recall" thesis is now PROVEN, not hypothesized.
+  Lever closed. Embeddings stay wired (production-faithful) but are not the score lever.
+  → **redirects all remaining effort to ranking (L2).**
+- **L2. Reranker budget + model — the new top lever (ranking, not recall).**
+  Mechanism (verified [augment.py:335-339](../hymem/query/augment.py#L335-L339),
+  [:456-480](../hymem/query/augment.py#L456-L480)): the *message* tier (dominant, 355
+  hits) reranker is ALREADY firing — it is NOT ambiguity-gated, runs whenever pool > cut.
+  Only the *chunk* tier is gated by `should_rerank`, and that gate now mostly SKIPS because
+  FTS≈vec agree on the top hit — but the chunk tier recovers ~2 turns, so it is noise.
+  Today the message tier pulls `max(message_fts_top_k=15, rerank_top_k=20)=20` BM25
+  candidates and reranks to 15. **If a gold turn sits at BM25 rank 25 it never enters the
+  rerank window — no reranker can save it.** That is the likely shape of the 65 MS ranking
+  misses ("retrieved into the broad pool, lost at the narrow rerank window"). Run in order:
+  - **L2a — widen the candidate budget.** `rerank_top_k` 20 → 40 → 60. Cheapest, directly
+    targets the mechanism. Do FIRST: if gold isn't a candidate, a better model can't help.
+  - **L2b — stronger reranker.** `rerank_model="llm"` → `"cross-encoder"` (mxbai-rerank-base,
+    local/CPU/deterministic/cheaper). Caveat: mxbai-base is English-only — fine for LME,
+    but production multilingual (Dutch scope) needs `bge-reranker-v2-m3`. A/B after L2a.
+  - Both need adapter flags (`--rerank-top-k`, `--rerank-model`), same pattern as `--embeddings`.
 - **L3. Session-diversity packing for MS.** Ensure multi-session gold from 2+ sessions
   all survives `top_k` (one verbose session shouldn't monopolize the budget). Targets
-  MS's structural failure mode that reranking alone won't fix.
+  MS's structural failure mode that reranking alone won't fix. After L2 if MS still lags.
 - **L4. Permissive/abstention-aware default answer prompt (harness, optional, gated).**
   Only if a clean banked benchmark number is wanted — run WITH the `*_abs` slice broken
   out (see D4). Not load-bearing for the HyMem conclusion.
 
-**Sequencing:** L1 → re-measure recall-ceiling → the new miss-split picks L2 (ordering)
-vs L3 (budget). Don't run all three blind. Same data-gated discipline as alley #2.
+**Sequencing:** L1 done (recall ruled out). → L2a budget → re-measure ranking miss-split →
+L2b cross-encoder → L3 only if MS still lags. Don't run blind; same data-gated discipline.
 
 ---
 
