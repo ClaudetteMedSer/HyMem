@@ -93,11 +93,14 @@ def main() -> None:
     # ── per-category miss counts ─────────────────────────────────────
     print(f"  {args.metric} by category (lower is better):")
     print(f"  {'─'*(22+18*len(labels))}")
+    totals = [0] * len(diags)  # per-run sum of this metric across categories
     for cat in cats:
         base_v = diags[0].get(cat, {}).get(args.metric)
         row = f"  {cat:<22}"
         for i, d in enumerate(diags):
             v = d.get(cat, {}).get(args.metric)
+            if v is not None:
+                totals[i] += v
             if v is None:
                 row += f"{'—':>18}"
             elif i == 0 or base_v is None:
@@ -107,6 +110,19 @@ def main() -> None:
                 arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "·")
                 row += f"{f'{v} ({delta:+d}{arrow})':>18}"
         print(row)
+
+    # ── TOTAL row: did widening move the needle at all, across categories? ──
+    print(f"  {'─'*(22+18*len(labels))}")
+    base_tot = totals[0]
+    row = f"  {'TOTAL':<22}"
+    for i, tot in enumerate(totals):
+        if i == 0:
+            row += f"{tot:>18}"
+        else:
+            delta = tot - base_tot
+            arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "·")
+            row += f"{f'{tot} ({delta:+d}{arrow})':>18}"
+    print(row)
 
     print(f"\n  Read: a category whose {args.metric} drops (↓) under a wider rtk is\n"
           f"  where the budget bump landed; flat (·) means the gold wasn't in the\n"

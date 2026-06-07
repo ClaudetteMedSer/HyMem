@@ -14,19 +14,35 @@ It is deliberately LLM-free and embedding-free (router_eval.py pattern):
   - retrieval is a single direct `_message_fts_search` over raw messages (pure BM25).
 So it runs in minutes on the box and decides L2a before any compute is spent.
 
+CAVEAT — this is a LOWER BOUND on combined-pool rank, not the real cut.
+The probe measures rank in the message FTS tier ONLY (the tier L2a widens). The
+real augment pipeline FUSES message hits + chunk hits + graph hits + MR
+aggregation before the top_k cut, so a gold turn at message-BM25 rank 35 may
+surface at combined rank 3 (e.g. dreamed into a high-salience chunk) and already
+be reachable at rerank_top_k=20. Cross-tier recovery only rescues ~2 turns per
+the L1 analysis, so the bias is small in practice — but it makes the probe
+PESSIMISTIC: it may recommend L2a when the gold is already reachable. For a gate
+that is the safe direction (an extra experiment beats a skipped one); just don't
+read the histogram as ground-truth combined rank.
+
 Read the histogram like this:
   rank ≤15           already inside the default cut — not a budget problem
   rank 16–20         in today's pool (20) but trimmed to 15 — a reranker can save it now
   rank 21–40         L2a --rerank-top-k 40 brings it into the pool  ← the L2a target band
   rank 41–60         needs --rerank-top-k 60
   rank 61+           a bigger hammer (pool) — diminishing returns
-  NOT in BM25 top-N  gold is NOT lexically recoverable at any budget → only the
-                     semantic/vector path (or different retrieval) can get it.
-                     This bucket is also the clean answer to "does a wider BM25
+  NOT in BM25 top-N  gold is NOT in the raw MESSAGE-FTS top-N at any budget.
+                     This bucket FLAGS the redundancy question "does a wider BM25
                      pool subsume what embeddings were adding?" — if it is ~0,
-                     BM25@40/60 covers everything vec did and the vector path is
-                     droppable for LME; if it is non-trivial, embeddings recover
-                     turns BM25 never will at any budget.
+                     BM25@40/60 covers everything message-tier vec did and the
+                     vector path is a candidate to drop for LME.
+                     It does NOT ANSWER it. Same cross-tier caveat as above: a
+                     turn missing from message-BM25 top-N may still be recovered
+                     by CHUNK embeddings, so this bucket is conservative on the
+                     "keep embeddings" side. A non-zero count here is NOT proof
+                     embeddings are essential — confirm that with a real
+                     embeddings-on run (the L1 results showed no vec-only bucket),
+                     not with this probe alone.
 
 Usage (run on the Hermes box, from benchmarks/):
   python gold_rank_probe.py --category multi-session --sample 0 --seed 0
@@ -194,8 +210,11 @@ def main() -> None:
 
     print("\n" + "=" * 64)
     print("Read: the '21-40' band is what --rerank-top-k 40 newly reaches; '41-60'\n"
-          "needs 60. A large 'NOT in BM25 top-N' bucket means widening the pool\n"
-          "won't help (and that those turns are exactly what the vector path adds).")
+          "needs 60. A large 'NOT in BM25 top-N' bucket means widening the MESSAGE\n"
+          "pool won't reach those turns — flagging them as the vector path's job\n"
+          "(confirm with a real embeddings-on run; chunk-tier recovery may still\n"
+          "get some). Ranks here are message-FTS only: a LOWER BOUND on the\n"
+          "combined-pool rank, so this gate is pessimistic by design.")
 
 
 if __name__ == "__main__":
