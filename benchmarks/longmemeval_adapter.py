@@ -322,12 +322,14 @@ class HyMemAdapter:
     """Direct HyMem Python API adapter with isolated temp DB."""
 
     def __init__(self, db_path: Path, api_key: str = "", embeddings: bool = False,
-                 rerank_top_k: int | None = None, rerank_model: str | None = None):
+                 rerank_top_k: int | None = None, rerank_model: str | None = None,
+                 rerank_message_hits: bool | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
         self.rerank_top_k = rerank_top_k
         self.rerank_model = rerank_model
+        self.rerank_message_hits = rerank_message_hits
         self.hy = None
 
     def open(self):
@@ -337,12 +339,17 @@ class HyMemAdapter:
         # L2 ranking levers (None = keep the config default). rerank_top_k widens the
         # candidate pool the message/chunk reranker sees — a gold turn below this BM25
         # rank can't be lifted because it's never a candidate. rerank_model swaps the
-        # LLM reranker for a local cross-encoder.
+        # LLM reranker for a local cross-encoder. rerank_message_hits=False restores raw
+        # BM25 order on the dominant message tier (L2c): the gold-rank probe showed 92%
+        # of MS gold already sits at BM25 rank ≤15, so the LLM reranker is demoting gold
+        # it already sees — this toggle measures whether turning it OFF beats it.
         overrides = {}
         if self.rerank_top_k is not None:
             overrides["rerank_top_k"] = self.rerank_top_k
         if self.rerank_model is not None:
             overrides["rerank_model"] = self.rerank_model
+        if self.rerank_message_hits is not None:
+            overrides["rerank_message_hits"] = self.rerank_message_hits
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,
@@ -1019,7 +1026,8 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
     hy = None
     try:
         hy = HyMemAdapter(db_path, api_key=api_key, embeddings=args.embeddings,
-                          rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model)
+                          rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model,
+                          rerank_message_hits=args.rerank_message_hits)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -1106,7 +1114,21 @@ def main():
                              "reuses the deepseek host client). 'cross-encoder' uses a local "
                              "sentence-transformers model (mxbai-rerank-base — English-only, "
                              "fine for LME; production multilingual needs bge-reranker-v2-m3). "
-                             "A/B against 'llm' AFTER widening --rerank-top-k.")
+                             "A/B against the RAW-BM25 baseline (--no-rerank-message-hits), "
+                             "not just against 'llm': the gold-rank probe showed the LLM "
+                             "reranker demotes gold it already sees, so a replacement must "
+                             "beat OFF, not merely beat the incumbent.")
+    parser.add_argument("--rerank-message-hits", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="LEVER L2c (ranking): toggle the dominant MESSAGE-tier reranker "
+                             "(config default ON). --no-rerank-message-hits restores raw BM25 "
+                             "order on the message tier. The gold-rank probe found 92%% of MS "
+                             "gold already at BM25 rank ≤15 yet 65 MS ranking misses remain — "
+                             "i.e. the reranker is dropping gold it already sees. This is the "
+                             "DIAGNOSTIC GATE: run it FIRST. If raw BM25 beats the LLM "
+                             "reranker on MS, the fix is removing the reranker, not replacing "
+                             "it (skip L2b). If it doesn't recover MS, the loss is downstream "
+                             "(packing/budget, → L3), not the reranker. Default None = config.")
     parser.add_argument("--embeddings", action="store_true",
                         help="LEVER L1: enable semantic vector recall by wiring an "
                              "OpenAICompatibleEmbeddingClient (reads HYMEM_EMBEDDING_* "
@@ -1161,10 +1183,17 @@ def main():
         print(f"  Embeddings: ON (semantic recall) — {emb_model} @ {emb_url}")
     else:
         print(f"  Embeddings: OFF (lexical/FTS-only — baseline)")
-    if args.rerank_top_k is not None or args.rerank_model is not None:
+    if (args.rerank_top_k is not None or args.rerank_model is not None
+            or args.rerank_message_hits is not None):
         rk = args.rerank_top_k if args.rerank_top_k is not None else "default(20)"
         rm = args.rerank_model if args.rerank_model is not None else "default(llm)"
-        print(f"  Rerank: top_k={rk}, model={rm}  (L2 ranking lever)")
+        if args.rerank_message_hits is False:
+            mt = "OFF (raw BM25 — L2c diagnostic)"
+        elif args.rerank_message_hits is True:
+            mt = "ON (forced)"
+        else:
+            mt = "default(ON)"
+        print(f"  Rerank: top_k={rk}, model={rm}, message_tier={mt}  (L2 ranking lever)")
     if args.no_dream:
         print(f"  ⚠ --no-dream: FAST MODE (relative A/B only, NOT a headline run "
               f"— dream/KG/temporal tiers degraded)")
@@ -1270,6 +1299,7 @@ def main():
             "embeddings": args.embeddings,
             "rerank_top_k": args.rerank_top_k,
             "rerank_model": args.rerank_model,
+            "rerank_message_hits": args.rerank_message_hits,
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",

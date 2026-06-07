@@ -30,6 +30,9 @@ def _label(cfg: dict) -> str:
     parts = [f"rtk={cfg.get('rerank_top_k') or 20}"]
     if cfg.get("rerank_model"):
         parts.append(cfg["rerank_model"])
+    # L2c: message-tier reranker explicitly OFF (raw BM25) is the key A/B baseline.
+    if cfg.get("rerank_message_hits") is False:
+        parts.append("msgRR=off")
     if cfg.get("embeddings"):
         parts.append("emb")
     if cfg.get("auto_ability"):

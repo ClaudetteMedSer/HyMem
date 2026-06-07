@@ -199,38 +199,51 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
   "ranking/synthesis is the bottleneck, not recall" thesis is now PROVEN, not hypothesized.
   Lever closed. Embeddings stay wired (production-faithful) but are not the score lever.
   → **redirects all remaining effort to ranking (L2).**
-- **L2. Reranker budget + model — the new top lever (ranking, not recall).**
+- **L2. Reranker — the top lever (ranking, not recall). FRONT-RUN PROBE LANDED 2026-06-07.**
   Mechanism (verified [augment.py:335-339](../hymem/query/augment.py#L335-L339),
   [:456-480](../hymem/query/augment.py#L456-L480)): the *message* tier (dominant, 355
-  hits) reranker is ALREADY firing — it is NOT ambiguity-gated, runs whenever pool > cut.
-  Only the *chunk* tier is gated by `should_rerank`, and that gate now mostly SKIPS because
-  FTS≈vec agree on the top hit — but the chunk tier recovers ~2 turns, so it is noise.
-  Today the message tier pulls `max(message_fts_top_k=15, rerank_top_k=20)=20` BM25
-  candidates and reranks to 15. **If a gold turn sits at BM25 rank 25 it never enters the
-  rerank window — no reranker can save it.** That is the likely shape of the 65 MS ranking
-  misses ("retrieved into the broad pool, lost at the narrow rerank window"). Run in order:
-  - **L2a — widen the candidate budget.** `rerank_top_k` 20 → 40 → 60. Cheapest, directly
-    targets the mechanism. Do FIRST: if gold isn't a candidate, a better model can't help.
-  - **L2b — stronger reranker.** `rerank_model="llm"` → `"cross-encoder"` (mxbai-rerank-base,
-    local/CPU/deterministic/cheaper). Caveat: mxbai-base is English-only — fine for LME,
-    but production multilingual (Dutch scope) needs `bge-reranker-v2-m3`. A/B after L2a.
-  - Both need adapter flags (`--rerank-top-k`, `--rerank-model`), same pattern as `--embeddings`.
-  - **FRONT-RUN before spending compute:** `benchmarks/gold_rank_probe.py` (LLM-free,
-    embedding-free; `--category multi-session --sample 0`) dumps the BM25-rank
-    distribution of gold turns per category. It reports cumulative reach at top_k
-    20/40/60 and a "NOT in BM25 top-N" bucket. If MS gold clusters in [21-40], L2a@40
-    will move the needle; if it's at 60+ or unreachable, widening won't help — pick the
-    sweep points (or abandon L2a) from this, don't run blind.
-  - **Reads the sweep:** `benchmarks/compare_recall.py base.json rtk40.json rtk60.json`
-    diffs the persisted `recall_diagnostics` and prints per-category `miss_ranking`
-    with Δ-vs-baseline (↓ = where the budget bump landed). Turns the L2a sweep into one
-    table instead of N eyeballed banners.
-  - **Redundancy-closure (embeddings chapter):** the probe's "NOT in BM25 top-N" bucket
-    is also the clean test of whether a wider BM25 pool subsumes what embeddings added.
-    If that bucket is ~0 for MS, BM25@40/60 covers everything vec recovered → the vector
-    path is droppable for LME (it was already score-neutral, see L1). If it's non-trivial,
-    embeddings recover turns BM25 never will at any budget — keep them. Either way it
-    closes the embeddings chapter with evidence, not assertion.
+  hits) reranker is ALREADY firing — NOT ambiguity-gated, runs whenever pool > cut. Only
+  the *chunk* tier is gated by `should_rerank`, which now mostly SKIPS (FTS≈vec agree) and
+  recovers ~2 turns = noise. The message tier pulls `max(message_fts_top_k=15,
+  rerank_top_k=20)=20` BM25 candidates and reranks to 15.
+  - **PROBE RESULT (`gold_rank_probe.py --category multi-session --sample 0 --seed 0`,
+    n=133 MS):** median gold BM25 rank = **2**. Distribution: **≤15: 122 (92%)**, 16-20: 4
+    (3%), 21-40: 2, 41-60: 1, 61+: 4, **NOT-in-BM25: 0**. The reranker already SEES 126/133
+    gold as candidates at the default budget. This **kills the L2a hypothesis**: widening
+    20→40 newly reaches just 2 turns, →60 one more — noise. The 65 MS ranking misses are
+    NOT "gold below the rerank window"; they are **gold seen-but-demoted** — the LLM
+    reranker is pushing gold OUT of its own top-15. The lever is the reranker's *judgment*,
+    not its *budget*.
+  - **L2a — widen budget (`--rerank-top-k 40/60`). KILLED by the probe.** 3 turns / 133 is
+    not worth the compute. Flag stays for completeness; do not run it for MS.
+  - **L2c — message-tier reranker OFF (`--no-rerank-message-hits`, raw BM25 top-15). THE
+    NEW GATE — RUN FIRST.** Since gold is already at the BM25 top (median rank 2), raw BM25
+    order is a strong baseline the LLM reranker must beat. If raw BM25 ≥ LLM-rerank on MS,
+    **the fix is removing the reranker, not replacing it** (and L2b is moot). If raw BM25
+    does NOT recover MS either, the 65 misses are **downstream of the reranker** —
+    packing / token-budget when message hits compete with chunk+graph for final slots
+    (→ L3), and no reranker change will help. This single run disambiguates reranker-harm
+    vs packing-harm and decides whether L2b is even worth running.
+  - **L2b — cross-encoder (`--rerank-model cross-encoder`, mxbai-rerank-base; needs
+    `pip install sentence-transformers`).** ONLY if L2c shows the reranker is in play
+    (raw BM25 doesn't dominate AND isn't itself the ceiling). A/B it against the **raw-BM25
+    baseline**, not just against the LLM reranker: if the incumbent demotes gold it sees, a
+    replacement must beat OFF, not merely beat the incumbent. English-only — production
+    multilingual (Dutch scope) needs `bge-reranker-v2-m3`.
+  - Adapter flags wired: `--rerank-top-k`, `--rerank-model`, `--rerank-message-hits /
+    --no-rerank-message-hits` (all persisted in result `config` for `compare_recall.py`).
+  - **Reads the sweep:** `compare_recall.py base.json msgRRoff.json [crossenc.json]` diffs
+    `recall_diagnostics`, per-category `miss_ranking` + a TOTAL row, Δ-vs-baseline (↓ = win).
+  - **Probe caveat (documented in its docstring):** BM25 rank is message-FTS only = a LOWER
+    BOUND on combined-pool rank (chunk+graph+MR fuse before the cut), so the gate is
+    pessimistic by design — safe for a "run it" decision.
+  - **Redundancy-closure (embeddings chapter — CLOSED for MS):** NOT-in-BM25 = **0** for MS:
+    BM25 alone reaches 100% of MS gold at some rank → **zero vec-only recovery**, embeddings
+    are fully redundant for MS (matches L1's no-vec-only-bucket). Caveat: the probe is
+    message-FTS only, so a 0 here is conservative on the "keep embeddings" side (chunk
+    embeddings could in principle recover a turn) — but L1's real embeddings-on run already
+    showed no vec-only bucket, so the two agree: vec is droppable for LME on MS. (Other
+    categories not yet probed; TR especially may differ — probe before generalizing.)
 - **L3. Session-diversity packing for MS.** Ensure multi-session gold from 2+ sessions
   all survives `top_k` (one verbose session shouldn't monopolize the budget). Targets
   MS's structural failure mode that reranking alone won't fix. After L2 if MS still lags.
@@ -238,8 +251,10 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
   Only if a clean banked benchmark number is wanted — run WITH the `*_abs` slice broken
   out (see D4). Not load-bearing for the HyMem conclusion.
 
-**Sequencing:** L1 done (recall ruled out). → L2a budget → re-measure ranking miss-split →
-L2b cross-encoder → L3 only if MS still lags. Don't run blind; same data-gated discipline.
+**Sequencing:** L1 done (recall ruled out). L2a KILLED by the gold-rank probe (92% MS gold
+already at BM25 ≤15). → **L2c raw-BM25 gate FIRST** (does turning the message reranker OFF
+beat it on MS?) → branch: if reranker-harm, ship OFF or try L2b cross-encoder vs raw-BM25;
+if neither moves MS, the loss is downstream → **L3 packing**. Don't run blind; data-gated.
 
 ---
 
