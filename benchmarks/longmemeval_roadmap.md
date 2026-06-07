@@ -215,6 +215,22 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
     local/CPU/deterministic/cheaper). Caveat: mxbai-base is English-only — fine for LME,
     but production multilingual (Dutch scope) needs `bge-reranker-v2-m3`. A/B after L2a.
   - Both need adapter flags (`--rerank-top-k`, `--rerank-model`), same pattern as `--embeddings`.
+  - **FRONT-RUN before spending compute:** `benchmarks/gold_rank_probe.py` (LLM-free,
+    embedding-free; `--category multi-session --sample 0`) dumps the BM25-rank
+    distribution of gold turns per category. It reports cumulative reach at top_k
+    20/40/60 and a "NOT in BM25 top-N" bucket. If MS gold clusters in [21-40], L2a@40
+    will move the needle; if it's at 60+ or unreachable, widening won't help — pick the
+    sweep points (or abandon L2a) from this, don't run blind.
+  - **Reads the sweep:** `benchmarks/compare_recall.py base.json rtk40.json rtk60.json`
+    diffs the persisted `recall_diagnostics` and prints per-category `miss_ranking`
+    with Δ-vs-baseline (↓ = where the budget bump landed). Turns the L2a sweep into one
+    table instead of N eyeballed banners.
+  - **Redundancy-closure (embeddings chapter):** the probe's "NOT in BM25 top-N" bucket
+    is also the clean test of whether a wider BM25 pool subsumes what embeddings added.
+    If that bucket is ~0 for MS, BM25@40/60 covers everything vec recovered → the vector
+    path is droppable for LME (it was already score-neutral, see L1). If it's non-trivial,
+    embeddings recover turns BM25 never will at any budget — keep them. Either way it
+    closes the embeddings chapter with evidence, not assertion.
 - **L3. Session-diversity packing for MS.** Ensure multi-session gold from 2+ sessions
   all survives `top_k` (one verbose session shouldn't monopolize the budget). Targets
   MS's structural failure mode that reranking alone won't fix. After L2 if MS still lags.

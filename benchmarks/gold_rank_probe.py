@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Front-run diagnostic for lever L2a (rerank candidate budget).
+
+The L2a hypothesis: the ~190 ranking misses (MS dominant) are gold turns that
+sit BELOW the reranker's candidate window. Today the message tier pulls
+`max(message_fts_top_k=15, rerank_top_k=20)=20` BM25 candidates and reranks to
+15, so a gold turn at BM25 rank 25 can never be lifted — it is never a candidate.
+Widening `rerank_top_k` only helps if the gold actually lives in the reachable
+band. This script measures WHERE the gold sits in the raw BM25 ranking, per
+category, WITHOUT spending a full retrieve+answer+judge run.
+
+It is deliberately LLM-free and embedding-free (router_eval.py pattern):
+  - ingest is pure persistence (messages_fts is built at ingest, no dream, no LLM);
+  - retrieval is a single direct `_message_fts_search` over raw messages (pure BM25).
+So it runs in minutes on the box and decides L2a before any compute is spent.
+
+Read the histogram like this:
+  rank ≤15           already inside the default cut — not a budget problem
+  rank 16–20         in today's pool (20) but trimmed to 15 — a reranker can save it now
+  rank 21–40         L2a --rerank-top-k 40 brings it into the pool  ← the L2a target band
+  rank 41–60         needs --rerank-top-k 60
+  rank 61+           a bigger hammer (pool) — diminishing returns
+  NOT in BM25 top-N  gold is NOT lexically recoverable at any budget → only the
+                     semantic/vector path (or different retrieval) can get it.
+                     This bucket is also the clean answer to "does a wider BM25
+                     pool subsume what embeddings were adding?" — if it is ~0,
+                     BM25@40/60 covers everything vec did and the vector path is
+                     droppable for LME; if it is non-trivial, embeddings recover
+                     turns BM25 never will at any budget.
+
+Usage (run on the Hermes box, from benchmarks/):
+  python gold_rank_probe.py --category multi-session --sample 0 --seed 0
+  python gold_rank_probe.py --category all --sample 0 --seed 0   # every category
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+
+# Sibling import: reuse the adapter's data loader + gold helpers verbatim so the
+# probe and the real run agree on what "gold" and "in pool" mean.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from longmemeval_adapter import (  # noqa: E402
+    HyMemAdapter,
+    _extract_gold_turns,
+    _gold_in_pool,
+    load_longmemeval_data,
+)
+
+# Buckets are (label, lower_inclusive, upper_inclusive); upper None = open-ended.
+# Boundaries chosen to map directly onto the L2a sweep points (20 / 40 / 60).
+_BUCKETS = [
+    ("≤15  (in default cut)", 1, 15),
+    ("16-20 (in pool, trimmed→15)", 16, 20),
+    ("21-40 (L2a top_k=40 reaches)", 21, 40),
+    ("41-60 (L2a top_k=60 reaches)", 41, 60),
+    ("61+   (bigger pool needed)", 61, None),
+]
+
+
+def _bucket_label(rank: int | None) -> str:
+    if rank is None:
+        return "NOT in BM25 top-N (vec-only / unrecoverable)"
+    for label, lo, hi in _BUCKETS:
+        if rank >= lo and (hi is None or rank <= hi):
+            return label
+    return "61+   (bigger pool needed)"
+
+
+def _gold_bm25_rank(hy: HyMemAdapter, question: str, gold_turns: list[str],
+                    pool_depth: int) -> int | None:
+    """Min BM25 rank (1-based) at which any gold turn appears in the raw message
+    FTS ranking, or None if no gold turn is in the top `pool_depth`."""
+    from hymem.query.augment import _message_fts_search
+
+    hits = _message_fts_search(hy.hy.conn, question, top_k=pool_depth)
+    for i, h in enumerate(hits, start=1):
+        # Match one turn at a time so the returned index is the gold's true rank,
+        # not just "some gold is somewhere in the pool".
+        if _gold_in_pool(gold_turns, [h.text]):
+            return i
+    return None
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--category", default="multi-session",
+                    help="question_type to probe (e.g. multi-session, "
+                         "temporal-reasoning), or 'all' for every category.")
+    ap.add_argument("--scales", default="S")
+    ap.add_argument("--sample", type=int, default=0,
+                    help="questions to load; 0 = full set (no sampling variance).")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--pool-depth", type=int, default=200,
+                    help="how deep to scan the BM25 ranking before calling a gold "
+                         "turn unreachable (the 'NOT in top-N' bucket).")
+    ap.add_argument("--data-dir",
+                    default=str(Path(__file__).resolve().parent.parent.parent
+                                / "hymem_beam" / "data"))
+    args = ap.parse_args()
+
+    scale = args.scales.upper()
+    data_file = (Path(args.data_dir) / "longmemeval_s_cleaned.json" if scale == "S"
+                 else Path(args.data_dir) / f"longmemeval_{scale.lower()}_cleaned.json")
+    if not data_file.exists():
+        print(f"ERROR: dataset not found at {data_file}")
+        sys.exit(1)
+
+    questions = load_longmemeval_data(str(data_file),
+                                      max_questions=(args.sample or None),
+                                      seed=args.seed)
+    if args.category != "all":
+        questions = [q for q in questions if q.get("question_type") == args.category]
+    if not questions:
+        print(f"ERROR: no questions for category '{args.category}'")
+        sys.exit(1)
+
+    print(f"\nGold BM25-rank probe  (LLM-free, embedding-free)")
+    print(f"  Category: {args.category}   Questions: {len(questions)}   "
+          f"Pool depth: {args.pool_depth}   Seed: {args.seed}\n", flush=True)
+
+    # Per-category histograms: {category: {bucket_label: count}}.
+    hist: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    no_gold: dict[str, int] = defaultdict(int)
+    ranks_seen: dict[str, list[int]] = defaultdict(list)
+
+    for qi, q in enumerate(questions):
+        cat = q.get("question_type", "?")
+        gold_turns, mode = _extract_gold_turns(q)
+        if not gold_turns:
+            no_gold[cat] += 1
+            continue
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-rankprobe-"))
+        hy = None
+        try:
+            # api_key is never used — no LLM call is made; ingest is pure persistence.
+            hy = HyMemAdapter(tmp_dir / "hymem.sqlite", api_key="probe")
+            hy.open()
+            sessions = q.get("haystack_sessions", [])
+            session_ids = q.get("haystack_session_ids",
+                                [str(i) for i in range(len(sessions))])
+            hy.ingest_sessions(sessions, session_ids, q.get("haystack_dates", []))
+            rank = _gold_bm25_rank(hy, q["question"], gold_turns, args.pool_depth)
+        except Exception as e:  # one bad question must not abort the sweep
+            print(f"  [{qi+1}] {q.get('question_id','?')} ERROR: {e}", flush=True)
+            continue
+        finally:
+            if hy:
+                hy.close()
+
+        hist[cat][_bucket_label(rank)] += 1
+        if rank is not None:
+            ranks_seen[cat].append(rank)
+        if (qi + 1) % 25 == 0:
+            print(f"  …{qi+1}/{len(questions)} probed", flush=True)
+
+    # ── Report ──────────────────────────────────────────────────────
+    print("\n" + "=" * 64)
+    bucket_order = [lbl for lbl, _, _ in _BUCKETS] + [
+        "NOT in BM25 top-N (vec-only / unrecoverable)"]
+    for cat in sorted(hist):
+        rows = hist[cat]
+        n = sum(rows.values())
+        ranks = sorted(ranks_seen[cat])
+        med = ranks[len(ranks) // 2] if ranks else None
+        print(f"\n{cat}   (n={n} with gold"
+              + (f", {no_gold[cat]} excluded: no gold label" if no_gold[cat] else "")
+              + ")")
+        print(f"  median gold BM25 rank: {med if med is not None else '∅'}")
+        # Cumulative reach: how many gold turns a given top_k budget would cover.
+        reachable = {20: 0, 40: 0, 60: 0}
+        for r in ranks:
+            for k in reachable:
+                if r <= k:
+                    reachable[k] += 1
+        for label in bucket_order:
+            c = rows.get(label, 0)
+            if c:
+                bar = "█" * round(40 * c / n) if n else ""
+                print(f"    {label:<46} {c:>4}  {100*c/n:4.0f}%  {bar}")
+        if ranks:
+            print(f"  → reachable by top_k=20: {reachable[20]}/{n} ({100*reachable[20]/n:.0f}%)"
+                  f" | =40: {reachable[40]}/{n} ({100*reachable[40]/n:.0f}%)"
+                  f" | =60: {reachable[60]}/{n} ({100*reachable[60]/n:.0f}%)")
+            gain_40 = reachable[40] - reachable[20]
+            print(f"  → L2a verdict: top_k 20→40 newly reaches {gain_40} gold turn(s) "
+                  f"({100*gain_40/n:.0f}% of this category)")
+
+    print("\n" + "=" * 64)
+    print("Read: the '21-40' band is what --rerank-top-k 40 newly reaches; '41-60'\n"
+          "needs 60. A large 'NOT in BM25 top-N' bucket means widening the pool\n"
+          "won't help (and that those turns are exactly what the vector path adds).")
+
+
+if __name__ == "__main__":
+    main()
