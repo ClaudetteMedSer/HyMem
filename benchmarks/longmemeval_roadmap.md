@@ -224,6 +224,14 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
     packing / token-budget when message hits compete with chunk+graph for final slots
     (→ L3), and no reranker change will help. This single run disambiguates reranker-harm
     vs packing-harm and decides whether L2b is even worth running.
+    - **Attribution footnote when reading the L2c delta:** `--no-rerank-message-hits` turns
+      off ONLY the message tier; the *chunk* tier reranker ([augment.py:296](../hymem/query/augment.py#L296),
+      gated by `should_rerank`, not by this flag) still fires in BOTH the baseline and the
+      L2c column. Its *expected* contribution therefore CANCELS in the paired delta (no
+      bias) — but the LLM reranker is stochastic and the chunk tier swings ~2 turns, so that
+      VARIANCE lands in the delta as noise. **Rule: treat any MS delta within ~±2-3 turns as
+      noise floor, not message-tier signal.** (`should_rerank` mostly skips on LME — FTS≈vec
+      agree on the top hit — so the chunk tier rarely fires, shrinking the floor; but it can.)
   - **L2b — cross-encoder (`--rerank-model cross-encoder`, mxbai-rerank-base; needs
     `pip install sentence-transformers`).** ONLY if L2c shows the reranker is in play
     (raw BM25 doesn't dominate AND isn't itself the ceiling). A/B it against the **raw-BM25
