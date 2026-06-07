@@ -47,6 +47,18 @@ Read the histogram like this:
 Usage (run on the Hermes box, from benchmarks/):
   python gold_rank_probe.py --category multi-session --sample 0 --seed 0
   python gold_rank_probe.py --category all --sample 0 --seed 0   # every category
+
+--coverage mode (L3 gate — multi-gold window coverage, NOT single-best-turn rank):
+  The rank histogram above reports the MIN gold rank (the best turn), which is why MS
+  read so clean (median 2). But MS answers need SEVERAL gold turns across sessions, and
+  the recall diagnostic's "ranking miss" label fires on ANY gold turn in the pool — so it
+  silently bundles coverage-short (gold squeezed out of the 15-slot message window by a
+  verbose session) with fully-covered-but-model-fails (synthesis). --coverage measures how
+  many of a question's N gold turns fit the cut + the window's session concentration, and
+  --join-run splits a run's ranking misses into coverage-short (L3-fixable) vs fully-covered
+  (synthesis, out of scope) — the gate that decides whether L3 packing is worth building:
+  python gold_rank_probe.py --coverage --category multi-session --sample 0 \
+      --join-run ~/.hermes/benchmarks/longmemeval-...-baseline.json
 """
 from __future__ import annotations
 
@@ -157,6 +169,8 @@ def _run_coverage(questions: list[dict], args) -> None:
     """L3 front-run: per-question multi-gold coverage of the `--cut`-slot message
     window, optionally JOINED to a run's ranking-miss labels to split the misses
     into coverage-short (L3-fixable) vs fully-covered (synthesis, out of scope)."""
+    from hymem.query.augment import _message_fts_search
+
     cut = args.cut
     print(f"\nGold COVERAGE probe  (L3 — multi-gold window coverage, LLM-free)")
     print(f"  Category: {args.category}   Questions: {len(questions)}   "

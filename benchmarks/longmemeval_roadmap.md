@@ -216,14 +216,23 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
     not its *budget*.
   - **L2a — widen budget (`--rerank-top-k 40/60`). KILLED by the probe.** 3 turns / 133 is
     not worth the compute. Flag stays for completeness; do not run it for MS.
-  - **L2c — message-tier reranker OFF (`--no-rerank-message-hits`, raw BM25 top-15). THE
-    NEW GATE — RUN FIRST.** Since gold is already at the BM25 top (median rank 2), raw BM25
-    order is a strong baseline the LLM reranker must beat. If raw BM25 ≥ LLM-rerank on MS,
-    **the fix is removing the reranker, not replacing it** (and L2b is moot). If raw BM25
-    does NOT recover MS either, the 65 misses are **downstream of the reranker** —
-    packing / token-budget when message hits compete with chunk+graph for final slots
-    (→ L3), and no reranker change will help. This single run disambiguates reranker-harm
-    vs packing-harm and decides whether L2b is even worth running.
+  - **L2c — message-tier reranker OFF (`--no-rerank-message-hits`, raw BM25 top-15). MEASURED
+    2026-06-07 (no-dream, seed 0, w8) — RERANKER IS NET-POSITIVE; L2 CHAPTER CLOSED.**
+    Result vs baseline (rerank ON): **overall 65.0→64.2 (−0.8), MS 48.1→43.6 (−4.5pp),
+    SS-U flat, TR −0.8. MS ranking misses 60→64 (+4), retrieval misses 9→11 (+2).** Turning
+    the reranker OFF makes MS WORSE → the "reranker demotes gold" hypothesis is **dead**; the
+    reranker LIFTS semantically-relevant turns raw BM25 leaves below the cut. **Keep the
+    message-tier reranker on (shipped default). L2b cross-encoder is moot** (no incumbent
+    harm to fix). **CONFOUND (sharpens the claim):** `--no-rerank-message-hits` also narrows
+    the candidate pool 20→15 ([augment.py:326-330](../hymem/query/augment.py#L326-L330)),
+    so L2c removed BOTH the wider window AND reordering. The **+2 retrieval misses are the
+    fingerprint of the narrowing** — exactly the 4 gold turns the probe found at BM25 rank
+    16-20 (between the 15-cut and the 20-window), which raw-BM25@15 never pulls. So the
+    honest claim is "the message-tier reranker AS CONFIGURED (20-window + LLM reorder) is
+    net-positive for MS," NOT "the LLM's ranking judgment saves MS." A clean reorder-only
+    test (`rerank_top_k=15` ON vs OFF) is NOT worth running — the shipped config is the
+    decision. (Side note: KU −4 ranking misses without the reranker — within noise but a
+    consistent hint the reranker may slightly *harm* KU; category-specific, parked.)
     - **Attribution footnote when reading the L2c delta:** `--no-rerank-message-hits` turns
       off ONLY the message tier; the *chunk* tier reranker ([augment.py:296](../hymem/query/augment.py#L296),
       gated by `should_rerank`, not by this flag) still fires in BOTH the baseline and the
@@ -232,12 +241,12 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
       VARIANCE lands in the delta as noise. **Rule: treat any MS delta within ~±2-3 turns as
       noise floor, not message-tier signal.** (`should_rerank` mostly skips on LME — FTS≈vec
       agree on the top hit — so the chunk tier rarely fires, shrinking the floor; but it can.)
-  - **L2b — cross-encoder (`--rerank-model cross-encoder`, mxbai-rerank-base; needs
-    `pip install sentence-transformers`).** ONLY if L2c shows the reranker is in play
-    (raw BM25 doesn't dominate AND isn't itself the ceiling). A/B it against the **raw-BM25
-    baseline**, not just against the LLM reranker: if the incumbent demotes gold it sees, a
-    replacement must beat OFF, not merely beat the incumbent. English-only — production
-    multilingual (Dutch scope) needs `bge-reranker-v2-m3`.
+  - **L2b — cross-encoder (`--rerank-model cross-encoder`). MOOT after L2c.** L2c showed the
+    LLM reranker is net-POSITIVE (it doesn't demote gold), so there's no incumbent harm for a
+    stronger model to fix; a cross-encoder might still squeeze out the residual but it's not
+    the lever — the residual MS misses are downstream (→ L3). Flag stays wired; revisit only
+    if L3 proves the misses are reranker-judgment-bound (they aren't, per the L3 probe below).
+    (When/if used: English-only mxbai-base — production multilingual/Dutch needs `bge-reranker-v2-m3`.)
   - Adapter flags wired: `--rerank-top-k`, `--rerank-model`, `--rerank-message-hits /
     --no-rerank-message-hits` (all persisted in result `config` for `compare_recall.py`).
   - **Reads the sweep:** `compare_recall.py base.json msgRRoff.json [crossenc.json]` diffs
@@ -252,17 +261,51 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
     embeddings could in principle recover a turn) — but L1's real embeddings-on run already
     showed no vec-only bucket, so the two agree: vec is droppable for LME on MS. (Other
     categories not yet probed; TR especially may differ — probe before generalizing.)
-- **L3. Session-diversity packing for MS.** Ensure multi-session gold from 2+ sessions
-  all survives `top_k` (one verbose session shouldn't monopolize the budget). Targets
-  MS's structural failure mode that reranking alone won't fix. After L2 if MS still lags.
+- **L3. MS coverage at the 15-slot message cut — the next lever (NOT the 45-slot assembly).**
+  **Mechanism CORRECTED 2026-06-07 (the earlier "crowded out of the final context" story was
+  wrong — verified against the code):** the answer context cut is `top_k*3 = 45`
+  ([longmemeval_adapter.py:531](longmemeval_adapter.py#L531)) and the MR/TASK_RECALL assembly
+  places `message_hits` FIRST ([:518-522](longmemeval_adapter.py#L518-L522)) with a total
+  retrieved set ~≤45 — so message hits **always survive the 45-slot cut**; chunk/graph can
+  never crowd them out there (only the low-confidence chunk/graph TAIL is ever trimmed). The
+  real point of loss is the **15-slot `message_fts_top_k` cut inside augment()**: a multi-
+  session answer needs N gold turns across N sessions, and one verbose session can monopolize
+  the 15 message slots, squeezing out sibling-session gold.
+  - **CRITICAL — the "ranking miss" label conflates two failures for MS.** The recall
+    diagnostic sets `recall_ceiling=True` if *ANY* gold turn is in the pool (`_gold_in_pool`
+    is an any-match) — correct for single-session questions (one gold turn = answer), but MS
+    needs SEVERAL. A question needing 3 turns with 1 present + 2 squeezed out still scores
+    ceiling=True → labeled "ranking miss" → but it's a **coverage loss**, not a ranking loss.
+    So the ~64 MS ranking misses are a MIX of **coverage-short** (L3-fixable in HyMem) and
+    **fully-covered-but-model-fails** (synthesis — answer-side, out of scope like SS-pref).
+    Only the coverage-short slice is ours to fix.
+  - **FRONT-RUN GATE before building anything (same discipline that killed L2a):**
+    `gold_rank_probe.py --coverage --category multi-session --sample 0 --seed 0 --join-run
+    <baseline.json>`. LLM-free; per MS question it measures `n_gold`, `n_in_cut` (gold turns
+    inside the 15-slot window), coverage ratio, and the window's **session concentration**
+    (distinct sessions + max-session-share — the monopoly signal). `--join-run` reads the
+    baseline result JSON, isolates the category's ranking misses (correct=False &
+    recall_ceiling=True) and **splits them coverage-short vs fully-covered in a single table
+    row + verdict.** Decision: mostly coverage-short → L3 has teeth (fix below); mostly
+    fully-covered → L3 won't help, the residual is synthesis (bank it, out of scope).
+    - Probe caveat (documented): coverage is raw-BM25 **message-only** (the probe doesn't
+      dream, so no chunks; and no rerank) → a LOWER bound on real coverage, so coverage-short
+      is mildly over-counted (biases toward "L3 has teeth" — the extra-experiment direction).
+  - **The fix, IF coverage-short dominates** (don't build until the gate says so): cheapest
+    is widening `message_fts_top_k` (MS can afford to evict the chunk/graph tail under the
+    45-cut); fancier is session-diversity-aware selection within the window (cap per-session
+    slots so a verbose session can't monopolize). The probe's max-session-share tells you
+    which: high share → diversity-pack; gold simply at rank >15 → just widen the cut.
 - **L4. Permissive/abstention-aware default answer prompt (harness, optional, gated).**
   Only if a clean banked benchmark number is wanted — run WITH the `*_abs` slice broken
   out (see D4). Not load-bearing for the HyMem conclusion.
 
 **Sequencing:** L1 done (recall ruled out). L2a KILLED by the gold-rank probe (92% MS gold
-already at BM25 ≤15). → **L2c raw-BM25 gate FIRST** (does turning the message reranker OFF
-beat it on MS?) → branch: if reranker-harm, ship OFF or try L2b cross-encoder vs raw-BM25;
-if neither moves MS, the loss is downstream → **L3 packing**. Don't run blind; data-gated.
+already at BM25 ≤15). L2c DONE → reranker is net-positive (−4.5pp MS when OFF), keep it, L2b
+moot → **L2 chapter closed.** NOW: **L3 coverage gate** (`--coverage --join-run`) splits the
+MS ranking misses into coverage-short (L3-fixable: widen `message_fts_top_k` / diversity-pack
+the 15-slot window) vs fully-covered (synthesis, out of scope). Build the fix only if
+coverage-short dominates. Don't run blind; same data-gated discipline that killed L2a.
 
 ---
 
