@@ -280,6 +280,35 @@ def _run_coverage(questions: list[dict], args) -> None:
                 if len(short) > len(full) else
                 "is in context and the model still fails → synthesis, answer-side.")
         print(f"  VERDICT: {verdict} {tail}")
+
+        # ── Cut-sweep projection: front-run the message_fts_top_k benchmark sweep ──
+        # gold_ranks is cut-independent, so coverage-short at a WIDER cut is computable
+        # from THIS probe run — no re-ingest, no LLM. This tells you the cut where
+        # coverage-short bottoms out (the recoverable ceiling) BEFORE spending an
+        # answer+judge sweep, and exposes the "gold is at rank 40+ / not in pool"
+        # tail that widening message_fts_top_k can NEVER reach.
+        if args.cut_sweep:
+            sweep = sorted({int(c) for c in args.cut_sweep.split(",")})
+            short_recs = [rec for rec in (r for _, r in matched) if rec["coverage_short"]]
+            base_short = len(short_recs)
+            print(f"  {'─'*58}")
+            print(f"  CUT-SWEEP projection on the {base_short} coverage-short misses")
+            print(f"  (how many stay short as message_fts_top_k widens — raw-BM25 floor):")
+            for c in sweep:
+                still_short = sum(
+                    1 for rec in short_recs
+                    if sum(1 for r in rec["gold_ranks"] if r is not None and r <= c)
+                    < rec["n_gold"])
+                recovered = base_short - still_short
+                print(f"    cut={c:>3}:  still coverage-short {still_short:>3}   "
+                      f"recovered {recovered:>3} ({100*recovered/base_short:.0f}% of short)")
+            # The residual that NO cut reaches: at least one gold turn never appears
+            # in the BM25 pool at all (rank is None) → widening message FTS can't help.
+            unreachable = sum(
+                1 for rec in short_recs
+                if any(r is None for r in rec["gold_ranks"]))
+            print(f"  → floor: {unreachable} short miss(es) have ≥1 gold turn NOT in the "
+                  f"BM25 pool at any depth — widening message_fts_top_k can't reach those.")
     print("\n  Caveat: probe coverage is raw-BM25 message-only (no rerank, no chunks),\n"
           "  a LOWER bound on real coverage → coverage-short is mildly over-counted.\n"
           "  If the split is borderline, confirm with a reranked-coverage run.")
@@ -312,6 +341,12 @@ def main() -> None:
                     help="(--coverage) a benchmark result JSON; splits THIS category's "
                          "ranking misses (correct=False & recall_ceiling=True) into "
                          "coverage-short (L3-fixable) vs fully-covered (synthesis).")
+    ap.add_argument("--cut-sweep", default=None,
+                    help="(--coverage --join-run) comma-list of candidate "
+                         "message_fts_top_k cuts (e.g. '20,25,30'); projects how many "
+                         "coverage-short misses each cut recovers from the SAME probe "
+                         "run (gold_ranks is cut-independent) — front-runs the benchmark "
+                         "sweep and exposes the rank-40+/not-in-pool tail widening can't reach.")
     args = ap.parse_args()
 
     scale = args.scales.upper()
