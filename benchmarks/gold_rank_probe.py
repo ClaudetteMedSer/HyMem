@@ -51,10 +51,11 @@ Usage (run on the Hermes box, from benchmarks/):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 # Sibling import: reuse the adapter's data loader + gold helpers verbatim so the
@@ -102,6 +103,174 @@ def _gold_bm25_rank(hy: HyMemAdapter, question: str, gold_turns: list[str],
     return None
 
 
+def _coverage_record(hits, gold_turns: list[str], cut: int) -> dict:
+    """Multi-gold coverage of the message tier's `cut`-slot window (L3 probe).
+
+    The recall diagnostic calls a question a "ranking miss" if ANY gold turn is
+    in the pool — fine for single-session questions where one gold turn = answer,
+    but MS answers need SEVERAL gold turns across sessions. This measures how many
+    of a question's N gold turns actually fit in the `cut`-slot message window, and
+    how concentrated that window is across sessions (the L3 monopoly signal).
+
+    Per-gold rank is raw BM25 (no rerank, no chunks — the probe doesn't dream), so
+    `n_in_cut` is a LOWER bound on the real reranked coverage → coverage-short is
+    (slightly) over-counted, biasing toward "L3 has teeth" (the extra-experiment
+    direction). Magnitude ≈ the few rank-(cut..rerank_top_k) turns the reranker lifts.
+    """
+    # Rank of each individual gold turn (min position it appears at), independently.
+    gold_ranks: list[int | None] = []
+    gold_hit_sessions: list[str] = []
+    for gt in gold_turns:
+        rank = None
+        sess = None
+        for i, h in enumerate(hits, start=1):
+            if _gold_in_pool([gt], [h.text]):
+                rank, sess = i, h.session_id
+                break
+        gold_ranks.append(rank)
+        if sess is not None:
+            gold_hit_sessions.append(sess)
+
+    n_gold = len(gold_turns)
+    n_in_cut = sum(1 for r in gold_ranks if r is not None and r <= cut)
+
+    # Session concentration of the `cut`-slot window the model actually sees.
+    window = hits[:cut]
+    win_sessions = [h.session_id for h in window]
+    sess_counts = Counter(win_sessions)
+    distinct_sessions = len(sess_counts)
+    max_share = (max(sess_counts.values()) / len(win_sessions)) if win_sessions else 0.0
+
+    return {
+        "n_gold": n_gold,
+        "n_in_cut": n_in_cut,
+        "coverage": (n_in_cut / n_gold) if n_gold else None,
+        "gold_ranks": gold_ranks,
+        "gold_session_span": len(set(gold_hit_sessions)),  # how multi-session the gold is
+        "window_distinct_sessions": distinct_sessions,
+        "window_max_session_share": max_share,
+        "coverage_short": n_in_cut < n_gold,
+    }
+
+
+def _run_coverage(questions: list[dict], args) -> None:
+    """L3 front-run: per-question multi-gold coverage of the `--cut`-slot message
+    window, optionally JOINED to a run's ranking-miss labels to split the misses
+    into coverage-short (L3-fixable) vs fully-covered (synthesis, out of scope)."""
+    cut = args.cut
+    print(f"\nGold COVERAGE probe  (L3 — multi-gold window coverage, LLM-free)")
+    print(f"  Category: {args.category}   Questions: {len(questions)}   "
+          f"cut={cut} (message_fts_top_k)   pool_depth={args.pool_depth}   "
+          f"Seed: {args.seed}\n", flush=True)
+
+    records: dict[str, dict] = {}   # question_id -> coverage record
+    no_gold = 0
+    for qi, q in enumerate(questions):
+        gold_turns, _mode = _extract_gold_turns(q)
+        if not gold_turns:
+            no_gold += 1
+            continue
+        tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-covprobe-"))
+        hy = None
+        try:
+            hy = HyMemAdapter(tmp_dir / "hymem.sqlite", api_key="probe")
+            hy.open()
+            sessions = q.get("haystack_sessions", [])
+            session_ids = q.get("haystack_session_ids",
+                                [str(i) for i in range(len(sessions))])
+            hy.ingest_sessions(sessions, session_ids, q.get("haystack_dates", []))
+            hits = _message_fts_search(hy.hy.conn, q["question"], top_k=args.pool_depth)
+            rec = _coverage_record(hits, gold_turns, cut)
+        except Exception as e:
+            print(f"  [{qi+1}] {q.get('question_id','?')} ERROR: {e}", flush=True)
+            continue
+        finally:
+            if hy:
+                hy.close()
+        records[q.get("question_id", f"idx{qi}")] = rec
+        if (qi + 1) % 25 == 0:
+            print(f"  …{qi+1}/{len(questions)} probed", flush=True)
+
+    n = len(records)
+    if not n:
+        print("No questions with gold turns to report.")
+        return
+
+    def _summarize(recs: list[dict], label: str) -> None:
+        if not recs:
+            print(f"  {label}: (none)")
+            return
+        short = [r for r in recs if r["coverage_short"]]
+        multi = [r for r in recs if r["n_gold"] >= 2]
+        covs = [r["coverage"] for r in recs if r["coverage"] is not None]
+        med_cov = sorted(covs)[len(covs) // 2] if covs else 0.0
+        spans = sorted(r["window_distinct_sessions"] for r in recs)
+        med_span = spans[len(spans) // 2] if spans else 0
+        shares = sorted(r["window_max_session_share"] for r in recs)
+        med_share = shares[len(shares) // 2] if shares else 0.0
+        print(f"  {label}: n={len(recs)}  multi-gold={len(multi)}  "
+              f"coverage-short={len(short)} ({100*len(short)/len(recs):.0f}%)  "
+              f"median coverage={med_cov:.2f}")
+        print(f"    window sessions (median distinct in {cut} slots): {med_span}   "
+              f"median max-session-share: {med_share:.2f}")
+
+    print("=" * 64)
+    print("MARGINAL coverage (all probed questions in category):")
+    _summarize(list(records.values()), "all")
+    _summarize([r for r in records.values() if r["n_gold"] >= 2], "multi-gold only")
+
+    if not args.join_run:
+        print("\nRead: 'coverage-short' = at least one needed gold turn falls outside\n"
+              f"the {cut}-slot message window. High max-session-share + low distinct\n"
+              "sessions = one verbose session monopolizing the window (the L3 signal).\n"
+              "Pass --join-run <baseline.json> to split THIS category's ranking misses\n"
+              "into coverage-short (L3-fixable) vs fully-covered (synthesis, out of scope).")
+        return
+
+    # ── JOIN: split the run's ranking misses into coverage-short vs fully-covered ──
+    with open(args.join_run) as f:
+        run = json.load(f)
+    pq = run.get("per_question", [])
+    in_cat = [r for r in pq
+              if args.category == "all" or r.get("question_type") == args.category]
+    rank_miss = [r for r in in_cat
+                 if not r.get("correct") and r.get("recall_ceiling") is True]
+    retr_miss = [r for r in in_cat
+                 if not r.get("correct") and r.get("recall_ceiling") is False]
+
+    matched = [(r, records[r["question_id"]]) for r in rank_miss
+               if r.get("question_id") in records]
+    unmatched = len(rank_miss) - len(matched)
+    short = [rec for _, rec in matched if rec["coverage_short"]]
+    full = [rec for _, rec in matched if not rec["coverage_short"]]
+
+    print("\n" + "=" * 64)
+    print(f"JOIN — {args.category} misses from {Path(args.join_run).name}")
+    print(f"  ranking misses: {len(rank_miss)}   retrieval misses: {len(retr_miss)}"
+          + (f"   ({unmatched} ranking-miss qids had no probe record)" if unmatched else ""))
+    print(f"  {'─'*58}")
+    tot = len(matched)
+    if tot:
+        sc_short = sorted(r["window_max_session_share"] for r in short)
+        sc_full = sorted(r["window_max_session_share"] for r in full)
+        med = lambda xs: (sorted(xs)[len(xs)//2] if xs else 0.0)
+        print(f"  COVERAGE-SHORT (L3-fixable):   {len(short):>3}  "
+              f"({100*len(short)/tot:.0f}%)   median max-session-share {med(sc_short):.2f}")
+        print(f"  FULLY-COVERED (synthesis):     {len(full):>3}  "
+              f"({100*len(full)/tot:.0f}%)   median max-session-share {med(sc_full):.2f}")
+        print(f"  {'─'*58}")
+        verdict = ("L3 HAS TEETH — most ranking misses are coverage-short; the gold"
+                   if len(short) > len(full) else
+                   "L3 WON'T HELP — most ranking misses are fully covered; the gold")
+        tail = ("doesn't fit the window. Widen message_fts_top_k or diversity-pack."
+                if len(short) > len(full) else
+                "is in context and the model still fails → synthesis, answer-side.")
+        print(f"  VERDICT: {verdict} {tail}")
+    print("\n  Caveat: probe coverage is raw-BM25 message-only (no rerank, no chunks),\n"
+          "  a LOWER bound on real coverage → coverage-short is mildly over-counted.\n"
+          "  If the split is borderline, confirm with a reranked-coverage run.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -118,6 +287,17 @@ def main() -> None:
     ap.add_argument("--data-dir",
                     default=str(Path(__file__).resolve().parent.parent.parent
                                 / "hymem_beam" / "data"))
+    ap.add_argument("--coverage", action="store_true",
+                    help="L3 mode: measure MULTI-GOLD coverage of the message window "
+                         "(how many of a question's N gold turns fit the cut) + session "
+                         "concentration, instead of the single-best-turn rank histogram.")
+    ap.add_argument("--cut", type=int, default=15,
+                    help="message-tier slot count (message_fts_top_k, default 15) — the "
+                         "window multi-gold coverage is measured against in --coverage mode.")
+    ap.add_argument("--join-run", default=None,
+                    help="(--coverage) a benchmark result JSON; splits THIS category's "
+                         "ranking misses (correct=False & recall_ceiling=True) into "
+                         "coverage-short (L3-fixable) vs fully-covered (synthesis).")
     args = ap.parse_args()
 
     scale = args.scales.upper()
@@ -135,6 +315,10 @@ def main() -> None:
     if not questions:
         print(f"ERROR: no questions for category '{args.category}'")
         sys.exit(1)
+
+    if args.coverage:
+        _run_coverage(questions, args)
+        return
 
     print(f"\nGold BM25-rank probe  (LLM-free, embedding-free)")
     print(f"  Category: {args.category}   Questions: {len(questions)}   "
