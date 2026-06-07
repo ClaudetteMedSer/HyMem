@@ -131,6 +131,25 @@ def _gold_in_pool(gold_turns: list[str], pool_texts: list[str]) -> bool:
     return False
 
 
+def _gold_turn_tiers(gold_turns: list[str], pool: dict) -> list[str]:
+    """Per-gold-turn membership in the FUSED pool: which tier (if any) carries each
+    of a question's N gold turns. Unlike recall_ceiling (an any-match bool — "is SOME
+    gold turn in the pool"), this de-conflates multi-gold MS questions: a "none" entry
+    is a gold turn the whole pipeline (message + chunk/fts) failed to retrieve. The
+    L3 floor audit reads off this directly — a "floor" question (gold ∉ raw message
+    FTS, per the probe) is a PHANTOM if every turn here is non-"none" (chunks/embeddings
+    rescued it), or a REAL recall gap if any turn is still "none" with both tiers run."""
+    msg, fts = pool.get("message", []), pool.get("fts", [])
+    tiers: list[str] = []
+    for g in gold_turns:
+        in_m = _gold_in_pool([g], msg)
+        in_f = _gold_in_pool([g], fts)
+        tiers.append("both" if in_m and in_f
+                     else "message" if in_m
+                     else "fts" if in_f else "none")
+    return tiers
+
+
 # ── Ability-router instrumentation ──────────────────────────────────
 # The harness shapes retrieval from the ORACLE question_type label, but real
 # Hermes has no such label — augment() must infer the ability itself via
@@ -778,8 +797,13 @@ def evaluate_question(
         recall_tier = ("both" if in_msg and in_fts
                        else "message" if in_msg
                        else "fts" if in_fts else "none")
+        # Per-gold-turn fused-pool membership — de-conflates the any-match ceiling so
+        # the L3 floor audit can tell phantom (chunks rescue) from real recall gap.
+        gold_turn_tiers = _gold_turn_tiers(gold_turns, pool)
+        gold_turns_in_pool = sum(1 for t in gold_turn_tiers if t != "none")
     else:
         recall_ceiling, recall_tier = None, "unknown"
+        gold_turn_tiers, gold_turns_in_pool = [], None
 
     ceiling_str = ("∅" if recall_ceiling is None
                    else f"{recall_ceiling}[{recall_tier}]")
@@ -810,6 +834,10 @@ def evaluate_question(
         "recall_tier": recall_tier,
         "gold_mode": gold_mode,
         "gold_turns": len(gold_turns),
+        # Floor audit: how many of N gold turns the FUSED pool actually carried, and
+        # the per-turn tier ("none" entries = the unrecovered floor turns).
+        "gold_turns_in_pool": gold_turns_in_pool,
+        "gold_turn_tiers": gold_turn_tiers,
         "oracle_ability": oracle_ability,
         "detected_ability": detected_ability,
         "ability_used": ability,

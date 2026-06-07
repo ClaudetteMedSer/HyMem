@@ -353,6 +353,9 @@ def _run_coverage(questions: list[dict], args) -> None:
         if args.pack_sim:
             short_recs = [rec for rec in (r for _, r in matched) if rec["coverage_short"]]
             base_short = len(short_recs)
+            # Independent of --cut-sweep: a short miss with a None gold rank is floor.
+            floor_n = sum(1 for rec in short_recs
+                          if any(r is None for r in rec["gold_ranks"]))
             print(f"  {'─'*58}")
             print(f"  PACK-SIM on the {base_short} coverage-short misses  "
                   f"(visible cut={cut} held fixed, pool={args.pack_pool}):")
@@ -363,7 +366,36 @@ def _run_coverage(questions: list[dict], args) -> None:
                 print(f"    per-session cap={cap:>2}:  still short {still:>3}   "
                       f"recovered {recovered:>3} ({100*recovered/base_short:.0f}% of short)")
             print(f"  → pack reorders a {cut}-slot window (no answer-side crowding); its "
-                  f"ceiling is the {base_short - unreachable} non-floor misses.")
+                  f"ceiling is the {base_short - floor_n} non-floor misses.")
+
+        # ── Floor audit: reconcile the probe's message-only floor with the run's ──
+        # FUSED-pool per-turn membership (needs an instrumented run carrying
+        # gold_turn_tiers). Splits the message-FTS floor into PHANTOM (chunks/embeddings
+        # rescued the turn → gone) vs REAL recall gap (still "none" with both tiers run →
+        # the next retrieval lever, narrow enough to target directly).
+        has_tiers = any("gold_turn_tiers" in r for r, _ in matched)
+        if has_tiers:
+            probe_floor = [(r, rec) for r, rec in matched
+                           if any(gr is None for gr in rec["gold_ranks"])]
+            phantom, real = [], []
+            for r, _rec in probe_floor:
+                tiers = r.get("gold_turn_tiers") or []
+                (real if any(t == "none" for t in tiers) else phantom).append(r)
+            print(f"  {'─'*58}")
+            print(f"  FLOOR AUDIT — {len(probe_floor)} probe-floor misses vs the run's "
+                  f"fused pool:")
+            print(f"    PHANTOM (chunks/embeddings rescued, all turns pooled): "
+                  f"{len(phantom):>3}")
+            print(f"    REAL recall gap (≥1 gold turn 'none' in fused pool):  "
+                  f"{len(real):>3}")
+            if real:
+                ids = ", ".join(r.get("question_id", "?") for r in real[:8])
+                print(f"    → real-gap qids (target for chunk/embedding recall): {ids}"
+                      + (" …" if len(real) > 8 else ""))
+        elif args.floor_audit:
+            print(f"  {'─'*58}")
+            print("  FLOOR AUDIT requested but the run JSON has no 'gold_turn_tiers' —\n"
+                  "  re-run the baseline with the instrumented adapter first.")
     print("\n  Caveat: probe coverage is raw-BM25 message-only (no rerank, no chunks),\n"
           "  a LOWER bound on real coverage → coverage-short is mildly over-counted.\n"
           "  If the split is borderline, confirm with a reranked-coverage run.")
@@ -411,6 +443,11 @@ def main() -> None:
     ap.add_argument("--pack-pool", type=int, default=60,
                     help="(--pack-sim) candidate-pool depth to diversity-pack the window "
                          "from (default 60). Deeper pool reaches deeper gold turns.")
+    ap.add_argument("--floor-audit", action="store_true",
+                    help="(--coverage --join-run) split the probe's message-FTS floor into "
+                         "PHANTOM (the run's fused pool rescued it via chunks/embeddings) vs "
+                         "REAL recall gap. Auto-fires when the run JSON carries gold_turn_tiers; "
+                         "this flag only warns if the run wasn't instrumented.")
     args = ap.parse_args()
 
     scale = args.scales.upper()

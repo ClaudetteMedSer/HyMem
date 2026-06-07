@@ -296,16 +296,44 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
     45-cut); fancier is session-diversity-aware selection within the window (cap per-session
     slots so a verbose session can't monopolize). The probe's max-session-share tells you
     which: high share → diversity-pack; gold simply at rank >15 → just widen the cut.
+  - **MEASURED 2026-06-07 — L3 IS DEAD in both forms (the gate + two free front-runs killed
+    it before any feature build).** Coverage gate on 60 MS ranking misses: 36 coverage-short
+    (60%), 24 fully-covered/synthesis (40%). But the coverage-short slice does NOT respond to
+    either L3 fix:
+    - **`--cut-sweep 20,25,30` (widen projection, free — `gold_ranks` is cut-independent):**
+      cut=30 recovers only **8 of 36**; **15 are floor** (≥1 gold turn NOT in the message BM25
+      pool at any depth); the other 13 sit at rank 31+. Recovery curve is shallow, floor is large
+      → not a window-size problem.
+    - **`--pack-sim 2,3,4 --pack-pool 60` (diversity-pack simulation, free — reorders a FIXED
+      15-slot window over a deep pool, no answer-side crowding):** recovers **1 of 36** at every
+      cap. The 21 non-floor misses are **intra-session** lexical-rank failures — the gold turn is
+      deep in its OWN session's BM25 ranking, not squeezed out by a sibling session. Diversity-pack
+      can't touch intra-session ranking (scenario C). Same for widening.
+    - **Decomposition of the 60 MS ranking misses:** 15 floor (message-FTS recall gap → chunks/
+      embeddings, the ONLY slice with a live lever) · 20 deep-lexical (intra-session BM25; reranker
+      already mitigates, residual is a lexical ceiling) · 24 synthesis (answer-side, bank it) ·
+      1 widen/pack-recoverable (noise). **L3 (message-window packing/widening) banked as dead.**
+  - **NEXT LEVER — the floor audit (the 15).** The probe floor is message-only (no dream → no
+    chunks), so the real post-chunk floor is unknown. Instrumented the adapter's `per_question`
+    block with **per-gold-turn fused-pool membership** (`gold_turns_in_pool` + `gold_turn_tiers`,
+    `"none"` = unrecovered turn) so a single baseline re-run + `gold_rank_probe.py --coverage
+    --join-run <instrumented.json> --floor-audit` splits the 15 into **PHANTOM** (chunks/embeddings
+    already rescue → floor disappears) vs **REAL** recall gap (chunks miss them too → narrow,
+    targetable chunk/embedding-recall lever on exactly those qids). `recall_ceiling`'s any-match
+    can't answer this; the per-turn record can.
 - **L4. Permissive/abstention-aware default answer prompt (harness, optional, gated).**
   Only if a clean banked benchmark number is wanted — run WITH the `*_abs` slice broken
   out (see D4). Not load-bearing for the HyMem conclusion.
 
 **Sequencing:** L1 done (recall ruled out). L2a KILLED by the gold-rank probe (92% MS gold
 already at BM25 ≤15). L2c DONE → reranker is net-positive (−4.5pp MS when OFF), keep it, L2b
-moot → **L2 chapter closed.** NOW: **L3 coverage gate** (`--coverage --join-run`) splits the
-MS ranking misses into coverage-short (L3-fixable: widen `message_fts_top_k` / diversity-pack
-the 15-slot window) vs fully-covered (synthesis, out of scope). Build the fix only if
-coverage-short dominates. Don't run blind; same data-gated discipline that killed L2a.
+moot → **L2 chapter closed.** L3 DONE → **DEAD in both forms** (cut-sweep recovers ≤8/36,
+pack-sim 1/36; the 21 non-floor MS misses are intra-session lexical-rank, untouchable by
+window packing/widening). NOW: **floor audit** — instrument per-gold-turn fused-pool membership,
+re-run baseline once, `--floor-audit` splits the 15 floor misses into phantom (chunks rescue)
+vs real recall gap (the only remaining retrieval lever, narrowed to ~15 qids). Every step
+data-gated by a free LLM-less probe before any feature build — the discipline that killed L2a,
+L2b, and both halves of L3.
 
 ---
 
