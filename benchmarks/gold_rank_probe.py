@@ -162,7 +162,43 @@ def _coverage_record(hits, gold_turns: list[str], cut: int) -> dict:
         "window_distinct_sessions": distinct_sessions,
         "window_max_session_share": max_share,
         "coverage_short": n_in_cut < n_gold,
+        # Full ranked session sequence (1-based position i → session of hits[i-1]),
+        # so a diversity-pack policy can be simulated as a pure post-process without
+        # re-ingesting. Bounded by pool_depth; trivial memory at MS scale.
+        "ranked_sessions": [h.session_id for h in hits],
     }
+
+
+def _pack_select(ranked_sessions: list[str], cut: int, cap: int, pool: int) -> set[int]:
+    """Simulate diversity-pack selection: pick `cut` of the top-`pool` BM25 hits with
+    at most `cap` turns per session (1-based positions). Pass 1 enforces the cap so
+    under-represented sessions get slots; pass 2 backfills by raw rank if the cap left
+    the window under-full. The VISIBLE window stays `cut` — only its composition changes,
+    so there is no answer-side (45-slot) crowding, unlike widening message_fts_top_k."""
+    candidates = range(1, min(pool, len(ranked_sessions)) + 1)
+    selected: list[int] = []
+    per_session: Counter = Counter()
+    for pos in candidates:                       # pass 1 — capped, diversity-first
+        if len(selected) >= cut:
+            break
+        s = ranked_sessions[pos - 1]
+        if per_session[s] < cap:
+            selected.append(pos)
+            per_session[s] += 1
+    if len(selected) < cut:                       # pass 2 — backfill by rank, cap lifted
+        for pos in candidates:
+            if len(selected) >= cut:
+                break
+            if pos not in selected:
+                selected.append(pos)
+    return set(selected)
+
+
+def _pack_coverage_short(rec: dict, cut: int, cap: int, pool: int) -> bool:
+    """Is the question still coverage-short after a per-session-cap pack of the window?"""
+    sel = _pack_select(rec["ranked_sessions"], cut, cap, pool)
+    n_in = sum(1 for r in rec["gold_ranks"] if r is not None and r in sel)
+    return n_in < rec["n_gold"]
 
 
 def _run_coverage(questions: list[dict], args) -> None:
@@ -309,6 +345,25 @@ def _run_coverage(questions: list[dict], args) -> None:
                 if any(r is None for r in rec["gold_ranks"]))
             print(f"  → floor: {unreachable} short miss(es) have ≥1 gold turn NOT in the "
                   f"BM25 pool at any depth — widening message_fts_top_k can't reach those.")
+
+        # ── Pack-sim: diversity-pack the FIXED-size window over a deep candidate pool ──
+        # Head-to-head vs the widen sweep above, at the SAME visible cut — so any gain
+        # here is free of answer-side crowding. Recovers the deep-in-pool turns whose
+        # session is under-represented; cannot touch the floor (gold not in pool at all).
+        if args.pack_sim:
+            short_recs = [rec for rec in (r for _, r in matched) if rec["coverage_short"]]
+            base_short = len(short_recs)
+            print(f"  {'─'*58}")
+            print(f"  PACK-SIM on the {base_short} coverage-short misses  "
+                  f"(visible cut={cut} held fixed, pool={args.pack_pool}):")
+            for cap in sorted({int(c) for c in args.pack_sim.split(",")}):
+                still = sum(1 for rec in short_recs
+                            if _pack_coverage_short(rec, cut, cap, args.pack_pool))
+                recovered = base_short - still
+                print(f"    per-session cap={cap:>2}:  still short {still:>3}   "
+                      f"recovered {recovered:>3} ({100*recovered/base_short:.0f}% of short)")
+            print(f"  → pack reorders a {cut}-slot window (no answer-side crowding); its "
+                  f"ceiling is the {base_short - unreachable} non-floor misses.")
     print("\n  Caveat: probe coverage is raw-BM25 message-only (no rerank, no chunks),\n"
           "  a LOWER bound on real coverage → coverage-short is mildly over-counted.\n"
           "  If the split is borderline, confirm with a reranked-coverage run.")
@@ -347,6 +402,15 @@ def main() -> None:
                          "coverage-short misses each cut recovers from the SAME probe "
                          "run (gold_ranks is cut-independent) — front-runs the benchmark "
                          "sweep and exposes the rank-40+/not-in-pool tail widening can't reach.")
+    ap.add_argument("--pack-sim", default=None,
+                    help="(--coverage --join-run) comma-list of per-session caps (e.g. "
+                         "'2,3,4'); simulates diversity-pack selection of the FIXED cut-slot "
+                         "window from the top --pack-pool BM25 hits — head-to-head vs "
+                         "--cut-sweep, but with no answer-side crowding (visible window size "
+                         "unchanged). Front-runs the diversity-pack feature.")
+    ap.add_argument("--pack-pool", type=int, default=60,
+                    help="(--pack-sim) candidate-pool depth to diversity-pack the window "
+                         "from (default 60). Deeper pool reaches deeper gold turns.")
     args = ap.parse_args()
 
     scale = args.scales.upper()
