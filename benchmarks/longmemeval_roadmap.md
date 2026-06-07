@@ -313,14 +313,31 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
       embeddings, the ONLY slice with a live lever) · 20 deep-lexical (intra-session BM25; reranker
       already mitigates, residual is a lexical ceiling) · 24 synthesis (answer-side, bank it) ·
       1 widen/pack-recoverable (noise). **L3 (message-window packing/widening) banked as dead.**
-  - **NEXT LEVER — the floor audit (the 15).** The probe floor is message-only (no dream → no
-    chunks), so the real post-chunk floor is unknown. Instrumented the adapter's `per_question`
-    block with **per-gold-turn fused-pool membership** (`gold_turns_in_pool` + `gold_turn_tiers`,
-    `"none"` = unrecovered turn) so a single baseline re-run + `gold_rank_probe.py --coverage
-    --join-run <instrumented.json> --floor-audit` splits the 15 into **PHANTOM** (chunks/embeddings
-    already rescue → floor disappears) vs **REAL** recall gap (chunks miss them too → narrow,
-    targetable chunk/embedding-recall lever on exactly those qids). `recall_ceiling`'s any-match
-    can't answer this; the per-turn record can.
+  - **FLOOR AUDIT — MEASURED 2026-06-07, MS RETRIEVAL STORY CLOSED.** Instrumented the adapter's
+    `per_question` block with **per-gold-turn fused-pool membership** (`gold_turns_in_pool` +
+    `gold_turn_tiers`, `"none"` = unrecovered turn — `recall_ceiling`'s any-match can't answer this).
+    Ran `--floor-audit` on an instrumented baseline, embeddings OFF then ON. **Result: 0 PHANTOM both
+    ways (15/15 REAL off, 14/14 REAL on).** Every floor gold turn evades EVERY tier (message FTS +
+    chunk FTS + vector) — "new retrieval path needed / fundamentally unrecoverable" is now MEASURED.
+    The embeddings-on re-audit was forced by a methodology catch: L1's "no vec-only bucket" was an
+    ANY-MATCH metric, blind to whether the *specific* per-turn floor turns were vec-recoverable (same
+    conflation trap, one level up). Head-to-head OFF→ON: ranking misses 66→58 (−8), coverage-short
+    38→38 (identical), floor 15→14 → **embeddings re-rank (lift deep-but-pooled gold), they don't
+    recall (no new gold in pool)**. **Final MS miss breakdown (emb ON, n=58): 14 REAL floor (~0 banked
+    headroom) · ~24 deep-lexical (reranker+emb already extracted most, residual = lexical ceiling) · 20
+    synthesis (answer-side, bank).** Retrieval headroom on MS ≈ 0 (perfect floor fix ≈ 9 correct ≈
+    1.8pp overall, only IF a buildable path exists AND it carries to real Hermes — least-likely slice
+    to generalize). **VERDICT: MS is ranking/synthesis-bound, not recall-bound. Retrieval ceiling
+    reached.** (Adapter DX fix: `--embeddings` now works with zero env setup — local FastEmbed
+    defaults passed explicitly, `HYMEM_EMBEDDING_*` still overrides.)
+  - **FLOOR INSPECTOR built (`--inspect-floor <instrumented.json>`) — characterize the 14.** Turns
+    "unrecoverable" from a count into a named failure mode per question: reads the run's floor qids
+    (ranking miss + ≥1 `"none"` tier), then ingests/dreams/searches each and dumps the question, the
+    unrecovered gold turn(s) + haystack location + raw msg-FTS rank, the question↔gold salient-token
+    overlap (the VOCAB-GAP signal), and what ranked instead. Heuristic mode tag (VOCAB GAP / WEAK
+    OVERLAP / IMPLICIT) + tally. Run WITH `--embeddings` + full dream to reproduce the audited floor.
+    Decides whether a new path (paraphrase/HyDE/query-expansion vs turn-linking) is worth building —
+    weighed against carry-over (an LME-only fix is out of scope).
 - **L4. Permissive/abstention-aware default answer prompt (harness, optional, gated).**
   Only if a clean banked benchmark number is wanted — run WITH the `*_abs` slice broken
   out (see D4). Not load-bearing for the HyMem conclusion.

@@ -183,6 +183,16 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 ANSWER_MODEL = "deepseek-chat"
 JUDGE_MODEL = "deepseek-chat"
 
+# Local embedding server (lever L1) — the FastEmbed ONNX server Hermes runs in
+# production. These are the OUT-OF-THE-BOX defaults for --embeddings so the flag
+# works with no env setup; every field is still overridable via HYMEM_EMBEDDING_*.
+# DeepSeek has no embeddings API, so the client's own deepseek defaults are a dead
+# end — point at the local server. api_key="local" because the server ignores it.
+LOCAL_EMBED_BASE_URL = "http://localhost:8766/v1"
+LOCAL_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+LOCAL_EMBED_DIM = 384
+LOCAL_EMBED_API_KEY = "local"
+
 ANSWERING_SYSTEM_PROMPT = """You are an AI assistant answering questions based on retrieved memories from past conversations.
 Answer the question concisely using ONLY the provided context. 
 If the context doesn't contain the answer, say "I don't have enough information to answer this question."
@@ -381,18 +391,26 @@ class HyMemAdapter:
             base_url="https://api.deepseek.com",
             model="deepseek-chat",
         )
-        # Optional semantic-recall A/B (lever L1). The client reads HYMEM_EMBEDDING_*
-        # from the environment, so this drives the SAME local embedding server Hermes
-        # uses in production (loopback HYMEM_EMBEDDING_BASE_URL) rather than an API —
-        # no endpoint/model is hardcoded here. Off by default: the headline baseline is
-        # lexical-only, and embeddings on/off is a paired comparison against it.
+        # Optional semantic-recall A/B (lever L1). Drives the SAME local FastEmbed
+        # server Hermes uses in production. Pass the local defaults explicitly so
+        # --embeddings works with ZERO env setup (the client's own defaults point at
+        # DeepSeek, which has no embeddings API — a dead end); HYMEM_EMBEDDING_* still
+        # overrides every field for anyone pointing at a different server. Off by
+        # default: the headline baseline is lexical-only (a paired comparison).
         embedding_client = None
         if self.embeddings:
             from hymem.contrib.openai_embedding_client import (
                 OpenAICompatibleEmbeddingClient,
             )
 
-            embedding_client = OpenAICompatibleEmbeddingClient()
+            env = os.environ.get
+            embedding_client = OpenAICompatibleEmbeddingClient(
+                api_key=(env("HYMEM_EMBEDDING_API_KEY")
+                         or env("HYMEM_LLM_API_KEY") or LOCAL_EMBED_API_KEY),
+                base_url=env("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL,
+                model=env("HYMEM_EMBEDDING_MODEL") or LOCAL_EMBED_MODEL,
+                dim=int(env("HYMEM_EMBEDDING_DIM") or LOCAL_EMBED_DIM),
+            )
         self.hy = HyMem(cfg, llm=llm, embedding_client=embedding_client)
         return self
 
@@ -1083,6 +1101,159 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
     return result
 
 
+# ── Floor inspector (characterize WHY the floor turns evade every tier) ──
+# The floor audit proved 14 MS gold turns reach NO retrieval tier. This turns
+# "unrecoverable" from a count into a named failure mode per question, so we can
+# decide whether a NEW retrieval path is worth building (and would carry to real
+# Hermes) or whether the residual is genuinely synthesis. LLM-free in the analysis;
+# runs the real ingest/dream/search so the tiers shown are the production tiers.
+
+_INSPECT_STOPWORDS = frozenset(
+    "the a an and or but of to in on at for with from by as is are was were be been "
+    "being do does did have has had i you he she it we they my your his her our their "
+    "this that these those what when where who which why how me him us them not no yes "
+    "can could would should will shall may might must about into over under then than "
+    "there here so if out up down off all any some most more very just like get got "
+    "what's i'm i've it's don't didn't isn't there's how's".split()
+)
+
+
+def _salient_tokens(text: str) -> set[str]:
+    """Lowercased content tokens (≥3 chars, non-stopword) for overlap diagnosis."""
+    import re
+    toks = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {t for t in toks if len(t) >= 3 and t not in _INSPECT_STOPWORDS}
+
+
+def _find_gold_location(q_data: dict, gold_text: str) -> str:
+    """Where a gold turn sits in the haystack — sanity that the floor is a retrieval
+    gap, not a gold-extraction artifact. Returns 'session sid, turn k/n' or 'NOT FOUND'."""
+    gnorm = _norm_text(gold_text)
+    sessions = q_data.get("haystack_sessions", []) or []
+    sids = q_data.get("haystack_session_ids", [str(i) for i in range(len(sessions))])
+    for sid, sess in zip(sids, sessions):
+        for k, m in enumerate(sess):
+            if isinstance(m, dict) and _norm_text(m.get("content", "")) == gnorm:
+                return f"session {sid}, turn {k+1}/{len(sess)} (role={m.get('role','?')})"
+    return "NOT FOUND in haystack (gold-extraction artifact?)"
+
+
+def _inspect_floor_questions(questions: list[dict], args, api_key: str) -> None:
+    """For each floor qid (ranking miss with ≥1 gold turn in NO tier), dump the
+    question, the unrecovered gold turn(s), where they sit, their raw message-FTS
+    rank, the question↔gold token overlap, and what the retriever surfaced instead —
+    so the failure mode is legible, not a black box."""
+    from hymem.query.augment import _message_fts_search
+
+    # Select the floor set from the instrumented run JSON (exactly the audited qids).
+    with open(args.inspect_floor) as f:
+        run = json.load(f)
+    pq = run.get("per_question", [])
+    if not any("gold_turn_tiers" in r for r in pq):
+        print(f"\n⚠ {Path(args.inspect_floor).name} has no 'gold_turn_tiers' — re-run the "
+              "baseline with the instrumented adapter (any recent run) before inspecting.")
+        return
+    floor_ids = [r["question_id"] for r in pq
+                 if (args.category == "all" or r.get("question_type") == args.category)
+                 and not r.get("correct") and r.get("recall_ceiling") is True
+                 and any(t == "none" for t in (r.get("gold_turn_tiers") or []))]
+    by_id = {q.get("question_id"): q for q in questions}
+    missing = [qid for qid in floor_ids if qid not in by_id]
+    floor_ids = [qid for qid in floor_ids if qid in by_id]
+    if missing:
+        print(f"\n⚠ {len(missing)} floor qid(s) not in the loaded dataset sample — "
+              f"re-run with --sample 0 to inspect all: {missing[:5]}")
+
+    tier_mode = ("message+chunk+vector" if args.embeddings and not args.no_dream
+                 else "message+chunk (no embeddings)" if not args.no_dream
+                 else "message-only (--no-dream)")
+    print(f"\n{'='*72}\nFLOOR INSPECTOR — {len(floor_ids)} {args.category} floor questions "
+          f"from {Path(args.inspect_floor).name}")
+    print(f"  tiers exercised: {tier_mode}   "
+          f"(run with --embeddings and full dream to reproduce the audited floor)\n{'='*72}")
+
+    mode_tally: Counter = Counter()
+    for n, qid in enumerate(floor_ids, 1):
+        q_data = by_id[qid]
+        question = q_data["question"]
+        q_tokens = _salient_tokens(question)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-inspect-"))
+        hy = None
+        try:
+            hy = HyMemAdapter(tmp_dir / "hymem.sqlite", api_key=api_key,
+                              embeddings=args.embeddings,
+                              rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model,
+                              rerank_message_hits=args.rerank_message_hits)
+            hy.open()
+            sessions = q_data.get("haystack_sessions", [])
+            sids = q_data.get("haystack_session_ids",
+                              [str(i) for i in range(len(sessions))])
+            hy.ingest_sessions(sessions, sids, q_data.get("haystack_dates", []))
+            if not args.no_dream:
+                hy.dream_and_wait()
+            gold_turns, _ = _extract_gold_turns(q_data)
+            # Search with the SAME oracle ability the audited run used (MR for
+            # multi-session), so the live tiers reproduce the audited floor.
+            oracle_ability = QUESTION_TYPE_TO_ABILITY.get(q_data.get("question_type"), None)
+            pool = hy.search(question, ability=oracle_ability, top_k=args.top_k * 3)[4]
+            tiers = _gold_turn_tiers(gold_turns, pool)
+            floor_turns = [g for g, t in zip(gold_turns, tiers) if t == "none"]
+            # Deep raw-message-FTS scan to confirm the floor + show what DID rank.
+            hits = _message_fts_search(hy.hy.conn, question, top_k=60)
+        except Exception as e:
+            print(f"\n[{n}] {qid} ERROR: {e}")
+            continue
+        finally:
+            if hy:
+                hy.close()
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            gc.collect()
+
+        print(f"\n[{n}/{len(floor_ids)}] {qid}  ({q_data.get('question_type')})")
+        print(f"  Q: {question}")
+        print(f"  A: {str(q_data.get('answer',''))[:160]}")
+        print(f"  question salient tokens: {sorted(q_tokens)}")
+        print(f"  ── floor gold turn(s) [{len(floor_turns)} of {len(gold_turns)} gold "
+              f"reach NO tier] ──")
+        for g in floor_turns:
+            gtok = _salient_tokens(g)
+            shared = sorted(q_tokens & gtok)
+            # Raw message-FTS rank of THIS gold turn (None = not even in 60-deep BM25).
+            rank = next((i for i, h in enumerate(hits, 1)
+                         if _gold_in_pool([g], [h.text])), None)
+            loc = _find_gold_location(q_data, g)
+            print(f"    • {g[:240]}")
+            print(f"      at: {loc}")
+            print(f"      raw msg-FTS rank: {rank if rank else 'NOT in top-60'}   "
+                  f"shared salient tokens w/ Q: {len(shared)} {shared}")
+            print(f"      gold-only tokens (what Q never says): "
+                  f"{sorted(gtok - q_tokens)[:12]}")
+            # Heuristic failure-mode tag (advisory — read the text to confirm).
+            if not shared:
+                mode = "VOCAB GAP (zero shared content tokens — paraphrase/synonym)"
+            elif len(shared) <= 2:
+                mode = "WEAK OVERLAP (1-2 shared tokens — buried under verbose siblings)"
+            else:
+                mode = "IMPLICIT (tokens overlap but turn is contextually indirect)"
+            mode_tally[mode.split(" (")[0]] += 1
+            print(f"      FAILURE MODE: {mode}")
+        print(f"  ── what the retriever surfaced instead (top 3 raw msg-FTS) ──")
+        for i, h in enumerate(hits[:3], 1):
+            htok = _salient_tokens(h.text)
+            print(f"    {i}. [{getattr(h,'role','?')}] {h.text[:140]}")
+            print(f"       shares w/ Q: {sorted(q_tokens & htok)[:8]}")
+
+    print(f"\n{'='*72}\nFAILURE-MODE TALLY (advisory): "
+          + "  ".join(f"{k}={v}" for k, v in mode_tally.most_common()))
+    print("  Read: VOCAB GAP dominant → a paraphrase/semantic path (better embeddings,\n"
+          "  query expansion, or HyDE) is the lever — but L1 showed vector adds no recall\n"
+          "  on LME, so confirm the gap is true paraphrase, not just sparse signal.\n"
+          "  IMPLICIT/multi-hop dominant → the answer needs turn-linking (graph/dream\n"
+          "  bridging), not a flat retriever. Weigh CARRY-OVER: an LME-only fix that\n"
+          "  doesn't help real Hermes is out of scope.")
+
+
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
@@ -1158,14 +1329,24 @@ def main():
                              "it (skip L2b). If it doesn't recover MS, the loss is downstream "
                              "(packing/budget, → L3), not the reranker. Default None = config.")
     parser.add_argument("--embeddings", action="store_true",
-                        help="LEVER L1: enable semantic vector recall by wiring an "
-                             "OpenAICompatibleEmbeddingClient (reads HYMEM_EMBEDDING_* "
-                             "from the env, so it drives the SAME local embedding "
-                             "server Hermes uses — set HYMEM_EMBEDDING_BASE_URL to the "
-                             "loopback endpoint and HYMEM_EMBEDDING_MODEL to the loaded "
-                             "model). DEFAULT is OFF (lexical-only) to match the headline "
-                             "baseline; run with and without, paired on --seed, to "
-                             "measure how much recall the FTS-only path leaves behind.")
+                        help="LEVER L1: enable semantic vector recall. Works with NO env "
+                             f"setup — defaults to the local FastEmbed server "
+                             f"({LOCAL_EMBED_MODEL} @ {LOCAL_EMBED_BASE_URL}, dim "
+                             f"{LOCAL_EMBED_DIM}, api_key='local') that Hermes runs in "
+                             "production. Override any field with HYMEM_EMBEDDING_API_KEY/"
+                             "_BASE_URL/_MODEL/_DIM to point at a different server. DEFAULT "
+                             "OFF (lexical-only baseline); run paired on --seed to measure "
+                             "the recall the FTS-only path leaves behind.")
+    parser.add_argument("--inspect-floor", default=None, metavar="RUN.json",
+                        help="DIAGNOSTIC: characterize WHY the floor questions (ranking "
+                             "misses whose gold reaches NO tier) are unrecoverable. Reads an "
+                             "instrumented run JSON (needs gold_turn_tiers), then for each "
+                             "floor qid dumps the question, the unrecovered gold turn(s), "
+                             "their haystack location + raw msg-FTS rank, the question↔gold "
+                             "token overlap, and what ranked instead. Run WITH --embeddings "
+                             "(+full dream) to reproduce the audited floor. Skips the benchmark.")
+    parser.add_argument("--category", default="multi-session",
+                        help="(--inspect-floor) question_type to inspect, or 'all'.")
     args = parser.parse_args()
 
     # Resolve API key
@@ -1206,9 +1387,10 @@ def main():
     print(f"  Judge model: {args.judge_model}")
     print(f"  Workers: {args.workers}")
     if args.embeddings:
-        emb_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL", "∅ (UNSET — will fail!)")
-        emb_model = os.environ.get("HYMEM_EMBEDDING_MODEL", "deepseek-embedding")
-        print(f"  Embeddings: ON (semantic recall) — {emb_model} @ {emb_url}")
+        emb_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
+        emb_model = os.environ.get("HYMEM_EMBEDDING_MODEL") or LOCAL_EMBED_MODEL
+        src = "env" if os.environ.get("HYMEM_EMBEDDING_BASE_URL") else "local default"
+        print(f"  Embeddings: ON (semantic recall) — {emb_model} @ {emb_url} [{src}]")
     else:
         print(f"  Embeddings: OFF (lexical/FTS-only — baseline)")
     if (args.rerank_top_k is not None or args.rerank_model is not None
@@ -1236,6 +1418,11 @@ def main():
     total_sessions = sum(len(q.get("haystack_sessions", [])) for q in questions)
     total_msgs = sum(sum(len(s) for s in q.get("haystack_sessions", [])) for q in questions)
     print(f"  Total: {len(questions)} questions, ~{total_sessions} sessions, ~{total_msgs} messages\n")
+
+    # Floor inspector: a diagnostic, not a benchmark run — dump and exit.
+    if args.inspect_floor:
+        _inspect_floor_questions(questions, args, DEEPSEEK_API_KEY)
+        return
 
     # LLM clients
     answer_llm = LLMClient(args.answer_model, DEEPSEEK_API_KEY)
