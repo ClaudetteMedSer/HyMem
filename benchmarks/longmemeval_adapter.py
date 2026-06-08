@@ -329,11 +329,27 @@ def load_longmemeval_data(dataset_path: str, max_questions: int = None, seed: in
     by_type = defaultdict(list)
     with open(dataset_path, "rb") as f:
         for item in ijson.items(f, "item"):
+            # Official LongMemEval flags ABSTENTION questions via the question_id
+            # suffix `_abs`, NOT question_type — but the judge (get_judge_prompt)
+            # and the answerable-vs-abstention report (compute_abstention_scores)
+            # both key on `_abs` in question_type. Normalize here so an abstention-
+            # bearing dataset measures correctly and the --permissive-default guard
+            # rail actually fires. The `_cleaned` S file dropped abstention entirely
+            # (all-answerable), so this is a no-op there.
             qtype = item["question_type"]
+            if str(item.get("question_id", "")).endswith("_abs") and not qtype.endswith("_abs"):
+                qtype = f"{qtype}_abs"
+                item["question_type"] = qtype
             by_type[qtype].append(item)
 
     total_available = sum(len(v) for v in by_type.values())
     num_types = len(by_type)
+    n_abs = sum(len(v) for k, v in by_type.items() if k.endswith("_abs"))
+    if n_abs:
+        print(f"  Abstention questions present: {n_abs} (guard-rail measurable)", flush=True)
+    else:
+        print(f"  ⚠ No abstention (_abs) questions in this dataset — the "
+              f"answerable-vs-abstention guard rail cannot fire (all-answerable set)", flush=True)
 
     if max_questions is None or max_questions >= total_available:
         # Return all questions

@@ -183,6 +183,24 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   fixed seed (`--auto-ability` to score the production path); accept only if answerable
   (esp. SS-P) lifts WITHOUT sinking the abstention row. Adapter-side prompt change only —
   does NOT alter the load-bearing HyMem conclusion (real Hermes picks its own posture).
+  **MEASURED 2026-06-08 (full 500, seed 0, --auto-ability, strict vs permissive):
+  OVERALL 60.2 → 65.6 (+5.4pp). SS-P 10.0 → 63.3 (+53.3pp, the target) — 16 F→T flips
+  (refusal→correct, all "I don't have enough information"→bridged), 0 T→F. Positive
+  side-effects everywhere: KU +3.9, SS-A +3.6, SS-U +2.8 (92.9→95.7), MS +2.3, TR +0.7.**
+  Clean win on the answerable axis; the abstention guard ("do not invent specific facts")
+  held (0 T→F on SS-P). **GATING CAVEAT — the abstention axis is UNMEASURED: the `_cleaned`
+  S dataset has ZERO `_abs` questions (all 500 answerable), so the answerable-vs-abstention
+  report shows n/a for abstention and CANNOT confirm the permissive default doesn't trade
+  refusals for hallucinations on unanswerable queries.** Since a permissive default's whole
+  risk lives on the abstention axis and production (Hermes) is full of unanswerable queries,
+  this is banked as an LME-ANSWERABLE win, NOT yet cleared to become a Hermes default.
+  **Loader hardened 2026-06-08:** `load_longmemeval_data` now derives the `_abs`
+  question_type from the official LongMemEval `question_id` suffix (official data flags
+  abstention on the id, not the type — judge + report key on the type), and the banner
+  prints whether abstention questions are present so a guard-rail-blind run is obvious.
+  **NEXT to actually clear it: re-run the A/B on an abstention-bearing dataset** (the
+  original/un-cleaned LongMemEval_S, or LongMemEval_M/oracle that retain `_abs`) and require
+  the abstention row to hold, not just answerable to lift.
 - **D5. Disabling dream to "win" on LME.** LME is single-conversation-haystack; the
   cross-session KG dream builds is invisible to it. "No-dream wins" is a statement about
   LME's blind spot, not HyMem — would gut the product differentiator.
