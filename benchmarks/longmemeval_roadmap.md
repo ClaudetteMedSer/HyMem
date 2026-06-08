@@ -168,6 +168,21 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   class (buys real Hermes nothing — PF touches only the benchmark prompt). The only
   honest option is a permissive default prompt, but it endangers the `*_abs` abstention
   slice — run it only with `*_abs` broken out so the trade is visible.
+  **WIRED 2026-06-08 (`--permissive-default`, adapter-only, not yet run):** new
+  `ANSWERING_PERMISSIVE_PROMPT` (preference-style but abstention-guarded — keeps "say I
+  don't have enough information" + "do not invent specific facts") replaces the strict
+  `ANSWERING_SYSTEM_PROMPT` in the **default/unknown-ability `else` branch** of
+  `answer_question` (and the MR no-user-messages fallback) when the flag is set; PF/MR/TR
+  branches untouched. So a label-free SS-P question (router → None → else branch) gets the
+  permissive prompt without reading the oracle label. `compute_abstention_scores` +
+  `print_abstention_scores` break every category into **answerable vs `_abs`** (overall +
+  per-base-category), persisted as `abstention_diagnostics` in the run JSON and printed
+  after the score table — so the SS-P recovery and any abstention regression are both
+  visible in one A/B. Banner shows `Default answer prompt: PERMISSIVE|STRICT`; config
+  records `permissive_default`. **A/B to run:** strict vs `--permissive-default`, same
+  fixed seed (`--auto-ability` to score the production path); accept only if answerable
+  (esp. SS-P) lifts WITHOUT sinking the abstention row. Adapter-side prompt change only —
+  does NOT alter the load-bearing HyMem conclusion (real Hermes picks its own posture).
 - **D5. Disabling dream to "win" on LME.** LME is single-conversation-haystack; the
   cross-session KG dream builds is invisible to it. "No-dream wins" is a statement about
   LME's blind spot, not HyMem — would gut the product differentiator.
@@ -338,6 +353,25 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
     OVERLAP / IMPLICIT) + tally. Run WITH `--embeddings` + full dream to reproduce the audited floor.
     Decides whether a new path (paraphrase/HyDE/query-expansion vs turn-linking) is worth building —
     weighed against carry-over (an LME-only fix is out of scope).
+  - **FLOOR INSPECTOR — MEASURED 2026-06-07, FLOOR BANKED AS UNRECOVERABLE.** Tally over 88 floor gold
+    turns / 35 questions: **VOCAB GAP 60 · WEAK OVERLAP 28 · IMPLICIT 0.** Zero IMPLICIT is the load-
+    bearing number — there is NO hidden multi-hop/turn-linking band the token heuristic was missing, so
+    the KG-bridge path (the one lever that would have both carried to Hermes AND moved the floor) has no
+    target here. But the dumps reframe the 60 "VOCAB GAP" as a **sparse-signal / signal-to-noise problem,
+    not a vocabulary problem**: the gold fact is a single incidental phrase inside a long, topically-
+    unrelated user turn (Q "how many years older is grandma than me" → gold turn is 90% Europe travel
+    advice, "is 32 considered young or old?" buried in it; Q "how many model kits" → "trying enamel washes
+    on my 1/72 B-29" in passing; Q "items of clothing to pick up" → "pick up my dry cleaning for the navy
+    blazer"). The heuristic reads zero token overlap because the turn's DOMINANT content is off-topic — the
+    link is purely contextual (same user, different subject). **No retriever HyMem can build — lexical,
+    semantic, or graph — can distinguish an incidental "32" in a travel message from the rest of the
+    haystack; the bottleneck is SNR *within the gold turn itself*.** The only fix is a reader that spots
+    the needle in a 90%-off-topic turn — answer-side, not retrieval; and not even a HyMem lever. **VERDICT:
+    the 14-floor is fundamentally unrecoverable by retrieval. MS retrieval is fully closed.** (One option
+    explicitly considered and set aside: surface incidental facts at DREAM/extraction time into structured
+    memory — that IS a HyMem-native, carry-over-clean lever in principle, but these are counting/aggregation
+    Qs over incidental side-details with weak Hermes carry-over and high over-extraction risk; not worth it
+    now. Logged as a candidate, not a plan.)
 - **L4. Permissive/abstention-aware default answer prompt (harness, optional, gated).**
   Only if a clean banked benchmark number is wanted — run WITH the `*_abs` slice broken
   out (see D4). Not load-bearing for the HyMem conclusion.
@@ -348,9 +382,13 @@ moot → **L2 chapter closed.** L3 DONE → **DEAD in both forms** (cut-sweep re
 pack-sim 1/36; the 21 non-floor MS misses are intra-session lexical-rank, untouchable by
 window packing/widening). NOW: **floor audit** — instrument per-gold-turn fused-pool membership,
 re-run baseline once, `--floor-audit` splits the 15 floor misses into phantom (chunks rescue)
-vs real recall gap (the only remaining retrieval lever, narrowed to ~15 qids). Every step
-data-gated by a free LLM-less probe before any feature build — the discipline that killed L2a,
-L2b, and both halves of L3.
+vs real recall gap. **DONE 2026-06-07: floor inspected → all sparse-signal, 0 IMPLICIT →
+retrieval is fully closed on MS.** The remaining headroom is ALL answer-side. The next (and only
+clean) answer-side lever is **D4's permissive default prompt with the `*_abs` slice broken out**
+(SS-P crater, ~3.7pp ceiling, prompt change not a HyMem change) — pursue ONLY if a banked LME
+number is wanted; the higher carry-over work is the production levers (router hardening, Dutch
+FTS, TR polish). Every retrieval step was data-gated by a free LLM-less probe before any feature
+build — the discipline that killed L2a, L2b, and both halves of L3, and now closes the floor.
 
 ---
 

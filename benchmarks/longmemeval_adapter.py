@@ -204,6 +204,27 @@ Use this personal information to generate a personalized response to the questio
 You may draw on general knowledge to fill in details, but tailor your answer to respect what you know about the user.
 If the context contains NO relevant personal information about the user, say "I don't have enough information to answer this question." """
 
+# Permissive DEFAULT prompt (lever D4 — the SS-P auto-ability crater fix).
+# The strict ANSWERING_SYSTEM_PROMPT ("ONLY provided context, no outside
+# knowledge") is the right posture for factual lookups but craters preference/
+# recommendation questions: those need the model to bridge the user's stored
+# preference ("uses Premiere Pro") to general knowledge ("here are editing
+# resources"). The oracle path routes SS-P → ANSWERING_PREFERENCE_PROMPT, but the
+# production router (detect_ability) can only emit MR/TR/None, so a label-free
+# SS-P question falls to the default `else` branch and gets the strict prompt →
+# refusal. This permissive default mirrors the preference posture for the
+# unknown-ability case so the fix carries WITHOUT reading the oracle label.
+# KEPT the abstention guard (last two sentences) — it must still say "I don't
+# know" when the context lacks the asked information, so the `*_abs` slice is not
+# silently traded away. Whether it IS traded away is what the broken-out
+# abstention report measures.
+ANSWERING_PERMISSIVE_PROMPT = """You are an AI assistant answering questions based on retrieved memories from past conversations.
+The context contains personal information about the user (preferences, possessions, habits, experiences, history).
+Use this personal information to give a helpful, personalized answer to the question.
+For recommendations, suggestions, or advice you MAY draw on general knowledge — but ground the answer in what the context actually tells you about the user.
+If the context contains NO information relevant to what the question asks, say "I don't have enough information to answer this question."
+Do not invent specific facts about the user (names, dates, numbers, events) that the context does not support."""
+
 ANSWERING_MR_PROMPT = """You are an AI assistant answering questions based on retrieved memories from multiple conversation sessions.
 The question requires counting or aggregating information across sessions.
 Carefully scan ALL the context for every relevant mention. Count distinct items — do not double-count restatements.
@@ -574,7 +595,7 @@ class HyMemAdapter:
 
 def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str = None,
                     total_matches: int = 0, graph_count=None, temporal_events: list | None = None,
-                    question_date: str = "") -> str:
+                    question_date: str = "", permissive_default: bool = False) -> str:
     """Ask LLM to answer based on retrieved memories.
 
     Uses ability-aware prompts and expanded context for multi-session
@@ -629,6 +650,12 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
 
     context = "\n".join(parts) if parts else "No relevant memories found."
 
+    # The default (unknown-ability) prompt. When --permissive-default is set this
+    # is the permissive preference-style prompt (D4 fix) instead of the strict
+    # "only provided context" one — so a label-free SS-P question (router emits
+    # None → this branch) can bridge to general knowledge instead of refusing.
+    default_prompt = ANSWERING_PERMISSIVE_PROMPT if permissive_default else ANSWERING_SYSTEM_PROMPT
+
     # Preference questions need generation + personalization, not fact extraction
     # MR/TR questions need counting + temporal reasoning prompts + more context
     if ability == "PF":
@@ -640,11 +667,11 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         # the answer-bearing information is always in user messages.
         memories = [m for m in memories if m["type"] == "message_hit" and "[user]" in m.get("content", "")]
         if not memories:
-            system_prompt = ANSWERING_SYSTEM_PROMPT  # fallback if no user messages
+            system_prompt = default_prompt  # fallback if no user messages
     elif ability == "TR":
         system_prompt = ANSWERING_TR_PROMPT
     else:
-        system_prompt = ANSWERING_SYSTEM_PROMPT
+        system_prompt = default_prompt
 
     # The reference "now" for relative-date math. Stated explicitly so the model
     # can subtract event dates from it ("how many days ago", "a month ago")
@@ -752,6 +779,7 @@ def evaluate_question(
     auto_ability: bool = False,
     no_dream: bool = False,
     graph_facts_first: bool = False,
+    permissive_default: bool = False,
 ) -> dict:
     """Evaluate a single LongMemEval question."""
     question_id = q_data["question_id"]
@@ -832,7 +860,7 @@ def evaluate_question(
     # Answer
     ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
                                  graph_count=graph_count, temporal_events=temporal_events,
-                                 question_date=question_date)
+                                 question_date=question_date, permissive_default=permissive_default)
 
     # Judge (binary yes/no)
     correct = judge_answer(judge_llm, question_type, question, answer, ai_answer)
@@ -883,6 +911,66 @@ def compute_scores(results: list[dict]) -> dict:
         "count": len(all_correct),
     }
     return scores
+
+
+def compute_abstention_scores(results: list[dict]) -> dict:
+    """Split accuracy into ANSWERABLE vs ABSTENTION questions — the guard rail for
+    the --permissive-default (D4) trade.
+
+    A permissive default prompt buys back SS-P recommendation questions by letting
+    the model bridge to general knowledge; the SAME license can turn a correct "I
+    don't know" into a hallucinated answer on the `_abs` questions (whose gold
+    answer IS abstention). compute_scores strips the `_abs` suffix and folds those
+    into the base category, hiding exactly this regression. Here we keep the split:
+      - ANSWERABLE: question_type without `_abs`
+      - ABSTENTION: question_type ending `_abs`
+    reported overall AND per base category, so a permissive run can be A/B'd
+    against strict with the abstention cost made explicit. If overall goes up while
+    ABSTENTION drops, the gain is partly a hallucination trade, not a clean win.
+    """
+    answerable: list[bool] = []
+    abstention: list[bool] = []
+    by_cat: dict[str, dict[str, list[bool]]] = defaultdict(
+        lambda: {"answerable": [], "abstention": []})
+    for r in results:
+        qtype = r.get("question_type", "")
+        is_abs = qtype.endswith("_abs")
+        base = qtype[:-4] if is_abs else qtype
+        bucket = "abstention" if is_abs else "answerable"
+        (abstention if is_abs else answerable).append(bool(r.get("correct")))
+        by_cat[base][bucket].append(bool(r.get("correct")))
+
+    def _acc(xs: list[bool]) -> dict:
+        return {"accuracy": (sum(xs) / len(xs)) if xs else None, "count": len(xs)}
+
+    return {
+        "answerable": _acc(answerable),
+        "abstention": _acc(abstention),
+        "by_category": {
+            base: {"answerable": _acc(b["answerable"]),
+                   "abstention": _acc(b["abstention"])}
+            for base, b in sorted(by_cat.items())
+        },
+    }
+
+
+def print_abstention_scores(diag: dict):
+    """Render the answerable-vs-abstention split so a permissive-prompt run shows
+    its abstention cost next to its answerable gain."""
+    def _fmt(d: dict) -> str:
+        a = d["accuracy"]
+        return "  n/a " if a is None else f"{a*100:>5.1f}% ({d['count']})"
+
+    print(f"\n  Answerable vs Abstention  (the --permissive-default trade)")
+    print(f"    {'category':<28} {'answerable':>14}  {'abstention':>14}")
+    print(f"    {'─'*60}")
+    for base, b in diag["by_category"].items():
+        print(f"    {base:<28} {_fmt(b['answerable']):>14}  {_fmt(b['abstention']):>14}")
+    print(f"    {'─'*60}")
+    print(f"    {'ALL':<28} {_fmt(diag['answerable']):>14}  {_fmt(diag['abstention']):>14}")
+    print(f"\n    Read: a permissive default should LIFT answerable (esp. "
+          f"single-session-preference)\n          without sinking abstention — if "
+          f"abstention drops, it's trading refusals for hallucinations.")
 
 
 def compute_recall_diagnostics(results: list[dict]) -> dict:
@@ -1079,6 +1167,7 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
             answer_llm, judge_llm, hy, q_data, args.top_k,
             auto_ability=args.auto_ability, no_dream=args.no_dream,
             graph_facts_first=args.graph_facts_first,
+            permissive_default=args.permissive_default,
         )
     except Exception as e:
         print(f"    ERROR: {e}", flush=True)
@@ -1299,6 +1388,18 @@ def main():
                              "detect_ability() instead of the oracle question_type "
                              "label — measures the true label-free production score. "
                              "(The router confusion is reported either way.)")
+    parser.add_argument("--permissive-default", action="store_true",
+                        help="LEVER D4: use a permissive preference-style DEFAULT "
+                             "answer prompt for the unknown-ability case instead of "
+                             "the strict 'only provided context' one. Targets the "
+                             "SS-P auto-ability crater (11.7 to ~73 acc): a label-free "
+                             "preference question (router emits None) currently gets "
+                             "the strict prompt and refuses recommendation questions. "
+                             "Adapter-side prompt change only — not a HyMem change. "
+                             "ALWAYS read the broken-out Answerable-vs-Abstention "
+                             "report after: permissiveness can trade correct '_abs' "
+                             "refusals for hallucinations. A/B against the strict "
+                             "default on a fixed seed.")
     parser.add_argument("--rerank-top-k", type=int, default=None,
                         help="LEVER L2a (ranking): candidate-pool width the message/chunk "
                              "reranker sees (config default 20). The message tier pulls "
@@ -1407,6 +1508,9 @@ def main():
     if args.no_dream:
         print(f"  ⚠ --no-dream: FAST MODE (relative A/B only, NOT a headline run "
               f"— dream/KG/temporal tiers degraded)")
+    print(f"  Default answer prompt: "
+          + ("PERMISSIVE (D4 — preference-style, abstention-guarded)"
+             if args.permissive_default else "STRICT (only provided context)"))
 
     # Load data
     print("\nLoading dataset...", flush=True)
@@ -1489,6 +1593,8 @@ def main():
         "top_k": args.top_k,
         "scale": scale,
     })
+    abstention_diag = compute_abstention_scores(all_results)
+    print_abstention_scores(abstention_diag)
     recall_diag = compute_recall_diagnostics(all_results)
     print_recall_diagnostics(recall_diag)
     router_diag = compute_router_diagnostics(all_results)
@@ -1511,6 +1617,7 @@ def main():
             "workers": args.workers,
             "no_dream": args.no_dream,
             "graph_facts_first": args.graph_facts_first,
+            "permissive_default": args.permissive_default,
             "embeddings": args.embeddings,
             "rerank_top_k": args.rerank_top_k,
             "rerank_model": args.rerank_model,
@@ -1528,6 +1635,7 @@ def main():
             "accuracy": round(data["accuracy"] * 100, 1),
             "count": data["count"],
         } for qtype, data in scores.items()},
+        "abstention_diagnostics": abstention_diag,
         "recall_diagnostics": recall_diag,
         "router_diagnostics": router_diag,
         "per_question": all_results,
