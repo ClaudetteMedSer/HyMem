@@ -140,9 +140,22 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   duration-to-now TR) all hold. **SKIPPED (TR shaping wouldn't help → would be oracle-chasing):**
   recurring time-of-day ("what time do I wake up on Tuesdays"), superlative-over-period ("which
   airline did I fly most in March"), count-before-event ("how many charity events before X" — left
-  to additive-MR). +5 test groups; full suite green. **NEXT (box): re-run `router_eval.py`** — expect
-  TR recall up (~92%→~95%), the 3 spend/take + age rows flip to TR, "in total" rows to MR; confirm
-  TR precision holds and `mr_total` adds no new FPs.
+  to additive-MR). +5 test groups; full suite green. **MEASURED (box, S/500): TR recall 92→95%
+  (+3pp, the 4 targeted spend/take/age rows flipped to TR exactly); MR recall 83→81% (−2pp, 3
+  duration-shaped oracle-MR Qs shifted to TR); TR precision 82→79% (+4 FP across tr_howlong/
+  tr_duration/tr_age); `mr_total` works (2 FP, both on abstention Qs).** **VERDICT: ACCEPT — the
+  TR precision drop is a TAXONOMY ARTIFACT, not production harm, confirming the same pattern as the
+  `mr_count` precision round.** The 4 TR FPs ("how long to assemble the IKEA bookshelf", "how old
+  when grandma gave me the necklace") are linguistically-correct duration/age routings scored as FPs
+  ONLY because the oracle labels them single-session by ANSWER-LOCATION, which production cannot see.
+  TR shaping is ADDITIVE (augment.py: "the other tiers (graph/fts/messages) still run unchanged" — TR
+  only appends `temporal_events`), so a TR FP is near-harmless like an additive-MR FP: a short/empty
+  timeline layered on otherwise-full retrieval; the 3 MR→TR shifts keep full normal retrieval too.
+  **GENERALIZED LESSON (now seen TWICE): router precision against LME systematically UNDERSTATES
+  production quality — the labels encode answer-location the router can't access, and both MR and TR
+  shaping are additive so misroutes don't suppress retrieval. Production-truth = end-to-end accuracy
+  (full LME run), NOT router precision. Do NOT tighten tr_age/tr_duration to chase it — the only
+  suppressor is reading answer-location = gaming.** Router work COMPLETE.
 - **`benchmarks/router_eval.py`.** Zero-LLM sweep of `detect_ability` vs oracle over the
   full dataset (seconds on the box) + per-intent residual-miss listing. Tight tuning loop
   decoupled from the expensive retrieval+judge run.
