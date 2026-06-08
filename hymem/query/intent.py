@@ -36,6 +36,8 @@ has no temporal unit + anchor, so it stays MR.
 from __future__ import annotations
 
 import re
+import unicodedata
+from dataclasses import dataclass
 
 # --- TR (temporal reasoning) ------------------------------------------------
 #
@@ -223,6 +225,92 @@ _MR_COUNT = re.compile(
 )
 
 
+# --- Production hardening ----------------------------------------------------
+#
+# detect_ability sits on the hot path of EVERY label-free augment() call, run on
+# raw host-supplied text — the user's latest turn, which in real Hermes can be a
+# multi-kilobyte paste, malformed, or (on a host bug) not a string at all. Two
+# guards keep that from degrading or crashing the router:
+#
+# (1) Bounded scan. The intent opener ("how many…", "when did…", "how long…",
+#     "which … first") ALWAYS sits at the start of a question. So we classify a
+#     bounded prefix only — which both reflects where the signal lives AND caps
+#     the cost of the lazy `[\s\S]*?` / `[\s\S]{0,60}?` bridges, which on
+#     unbounded input would let a near-miss (an opener+unit with no following
+#     anchor) rescan to end-of-string at every start position. 4096 chars is far
+#     beyond any real opener-to-anchor span (~600 words) yet bounds worst-case
+#     regex work regardless of input size.
+# (2) Type/empty tolerance. A non-str (None, bytes) or blank turn is "no
+#     detectable intent", returned as an abstain rather than raised — the router
+#     must never be the thing that crashes the host on a malformed turn.
+_MAX_SCAN_CHARS = 4096
+
+
+def _prepare(query: object) -> str | None:
+    """Normalise + bound host input for classification; None when there is
+    nothing to classify (non-str or blank). NFC-normalises so composed vs
+    decomposed Latin diacritics (Dutch ë, ï, …) match a single way, then clips to
+    `_MAX_SCAN_CHARS` so the regex cost is bounded no matter how long the turn."""
+    if not isinstance(query, str):
+        return None
+    q = unicodedata.normalize("NFC", query)
+    if not q.strip():
+        return None
+    return q[:_MAX_SCAN_CHARS]
+
+
+@dataclass(frozen=True)
+class AbilitySignal:
+    """The router's decision plus WHY it fired — production observability.
+
+    `ability` is the wired shaping target ("MR"/"TR") or None. `rule` names the
+    branch that produced it so a misroute in real Hermes is diagnosable without
+    re-deriving which of the six patterns matched: the six firing rules
+    ("tr_duration", "tr_howlong", "tr_order", "tr_recency", "mr_count",
+    "tr_distance"), or an abstain reason ("none" = matched nothing, "empty" =
+    blank string, "non_str" = host passed a non-string). It mirrors the
+    `why_retrieved` chips' role: make a routing decision auditable, not opaque."""
+
+    ability: str | None
+    rule: str
+
+
+def detect_ability_signal(query: object) -> AbilitySignal:
+    """Classify `query` AND report which rule decided — the observable core that
+    `detect_ability` wraps. Precedence is unchanged (see module docstring): the
+    STRONG TR signals (duration-count, how-long span, ordering, recency) are
+    tested first and win the "how many" overlap with MR; a plain counting opener
+    is MR; a bare distance/deictic anchor with no count opener is weak TR. Input
+    is hardened via `_prepare` (bounded scan, type/empty tolerance)."""
+    q = _prepare(query)
+    if q is None:
+        return AbilitySignal(None, "empty" if isinstance(query, str) else "non_str")
+
+    # TR first: the STRONG temporal signals win the overlap with MR. Split per
+    # rule (vs one boolean OR) purely so the firing branch is nameable.
+    if _TR_DURATION.search(q):
+        return AbilitySignal("TR", "tr_duration")
+    if _TR_HOWLONG.search(q):
+        return AbilitySignal("TR", "tr_howlong")
+    if _TR_ORDER.search(q):
+        return AbilitySignal("TR", "tr_order")
+    if _TR_RECENCY.search(q):
+        return AbilitySignal("TR", "tr_recency")
+
+    # MR: a plain counting opener with no temporal framing. Checked BEFORE the
+    # weak distance signal so "how many times did I X last week" stays a count —
+    # the timeframe is incidental to a count question, not its subject.
+    if _MR_COUNT.search(q):
+        return AbilitySignal("MR", "mr_count")
+
+    # TR (weak): a bare distance/deictic reference ("a week ago", "last Saturday")
+    # with no count opener — a recall-around-a-time question, so shape it temporal.
+    if _TR_DISTANCE.search(q):
+        return AbilitySignal("TR", "tr_distance")
+
+    return AbilitySignal(None, "none")
+
+
 def detect_ability(query: str) -> str | None:
     """Infer a likely ability hint from raw query text, or None if nothing fits.
 
@@ -239,29 +327,7 @@ def detect_ability(query: str) -> str | None:
     Conservative by design: a borderline phrase that matches nothing here simply
     gets the default path. Returns the bare ability code ("MR"/"TR") — the caller
     re-validates it through the same `_ABILITIES` gate as a host-supplied hint.
+    Thin wrapper over `detect_ability_signal`; use that when you also want the
+    firing rule for logging/observability.
     """
-    if not query:
-        return None
-
-    # TR first: the STRONG temporal signals (duration-count, how-long span,
-    # ordering, recency) win the overlap with MR.
-    if (
-        _TR_DURATION.search(query)
-        or _TR_HOWLONG.search(query)
-        or _TR_ORDER.search(query)
-        or _TR_RECENCY.search(query)
-    ):
-        return "TR"
-
-    # MR: a plain counting opener with no temporal framing. Checked BEFORE the
-    # weak distance signal so "how many times did I X last week" stays a count —
-    # the timeframe is incidental to a count question, not its subject.
-    if _MR_COUNT.search(query):
-        return "MR"
-
-    # TR (weak): a bare distance/deictic reference ("a week ago", "last Saturday")
-    # with no count opener — a recall-around-a-time question, so shape it temporal.
-    if _TR_DISTANCE.search(query):
-        return "TR"
-
-    return None
+    return detect_ability_signal(query).ability

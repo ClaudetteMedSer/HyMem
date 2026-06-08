@@ -12,7 +12,7 @@ from hymem.core.vectors import decode_vector
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.entities import GraphCount, count_relations, match_known_entities
-from hymem.query.intent import detect_ability
+from hymem.query.intent import detect_ability_signal
 from hymem.query.predicate_routing import route_predicates
 from hymem.query.rerank import rerank as run_rerank
 from hymem.session import Message, recent_messages
@@ -217,6 +217,14 @@ class AugmentedContext:
     without the caller passing `ability="MR"`. An *explicit* host hint always
     wins and leaves this None, so host-supplied and inferred shaping stay
     distinguishable."""
+    detected_rule: str | None = None
+    """WHICH router rule produced `detected_ability` (e.g. "tr_recency",
+    "mr_count"), or the abstain reason ("none"/"empty"/"non_str") when nothing was
+    inferred. None when the host supplied an explicit `ability` hint (no inference
+    ran). This is the observability half of the routing decision: `detected_ability`
+    says WHAT was inferred, `detected_rule` says WHY — so a production misroute
+    ("why did this plain question get MR-shaped?") is diagnosable from the result
+    object alone, without re-running the patterns. See `detect_ability_signal`."""
 
 
 # Ability hints a host (e.g. a BEAM harness) may pass to shape retrieval to the
@@ -254,13 +262,18 @@ def augment(
     # (left None when the host supplied the hint, so the two stay distinguishable).
     ability = _normalize_ability(ability)
     detected: str | None = None
+    detected_rule: str | None = None
     if ability is None:
-        detected = _normalize_ability(detect_ability(user_message))
+        signal = detect_ability_signal(user_message)
+        detected_rule = signal.rule
+        detected = _normalize_ability(signal.ability)
         ability = detected
         if detected is not None:
-            log.debug("ability.auto_detected=%s (no host hint)", detected)
+            log.debug("ability.auto_detected=%s rule=%s (no host hint)",
+                      detected, detected_rule)
     ctx = AugmentedContext()
     ctx.detected_ability = detected
+    ctx.detected_rule = detected_rule
     if cfg.user_md_path.exists():
         ctx.user_md = cfg.user_md_path.read_text(encoding="utf-8")
     if cfg.memory_md_path.exists():

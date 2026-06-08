@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import unicodedata
+
 import pytest
 
-from hymem.query.intent import detect_ability
+from hymem.query.intent import (
+    _MAX_SCAN_CHARS,
+    AbilitySignal,
+    detect_ability,
+    detect_ability_signal,
+)
 
 # --- Unit: detect_ability classification -----------------------------------
 
@@ -229,6 +236,76 @@ def test_count_with_first_last_adjective_stays_mr(query: str) -> None:
     assert detect_ability(query) == "MR"
 
 
+# --- Hardening: pathological / malformed production input ------------------
+
+
+@pytest.mark.parametrize("bad", [None, 123, 3.14, b"how many cards?", [], {}, object()])
+def test_non_string_input_abstains_without_raising(bad) -> None:
+    # detect_ability sits on the hot path of every augment() call; a host bug that
+    # passes a non-string must abstain, never raise.
+    assert detect_ability(bad) is None
+    sig = detect_ability_signal(bad)
+    assert sig == AbilitySignal(None, "non_str")
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n", " "])
+def test_blank_input_abstains(blank) -> None:
+    assert detect_ability(blank) is None
+    assert detect_ability_signal(blank).rule == "empty"
+
+
+def test_oversized_input_is_bounded_and_still_classifies_leading_intent() -> None:
+    # The intent opener lives at the START; a megabyte of trailing text must not
+    # change the verdict (signal at the front) nor blow up (bounded scan).
+    q = "how many project cards did I add? " + ("lorem ipsum dolor " * 100_000)
+    assert len(q) > _MAX_SCAN_CHARS
+    assert detect_ability(q) == "MR"
+
+
+def test_oversized_near_miss_does_not_hang() -> None:
+    # An opener+unit with NO following anchor is the backtracking-prone shape for
+    # the lazy [\s\S]*? TR bridges; on unbounded input it would rescan to EOS at
+    # every start. The prefix cap must bound it — assert it returns promptly.
+    import time
+
+    q = "how many days " + ("x " * 500_000)  # unit present, no duration-end anchor
+    start = time.monotonic()
+    result = detect_ability(q)
+    assert time.monotonic() - start < 1.0  # bounded, not O(n^2) over the full paste
+    assert result == "MR"  # "how many" opener with no TR anchor stays a count
+
+
+def test_nfc_normalization_makes_decomposed_diacritics_match() -> None:
+    # Dutch with a DECOMPOSED diacritic (combining mark) must classify identically
+    # to its composed form — _prepare NFC-normalises before matching.
+    composed = "hoeveel café-bezoeken heb ik gelogd?"
+    decomposed = unicodedata.normalize("NFD", composed)
+    assert composed != decomposed  # genuinely different code-point sequences
+    assert detect_ability(decomposed) == detect_ability(composed) == "MR"
+
+
+# --- Observability: detect_ability_signal names the firing rule -------------
+
+
+@pytest.mark.parametrize(
+    "query,ability,rule",
+    [
+        ("how many days between the order and delivery?", "TR", "tr_duration"),
+        ("how long after the migration did the bug appear?", "TR", "tr_howlong"),
+        ("which event happened first?", "TR", "tr_order"),
+        ("when did I last go to the dentist?", "TR", "tr_recency"),
+        ("how many project cards did I add?", "MR", "mr_count"),
+        ("what did I buy a week ago?", "TR", "tr_distance"),
+        ("what build tools do we use?", None, "none"),
+    ],
+)
+def test_signal_reports_firing_rule(query, ability, rule) -> None:
+    sig = detect_ability_signal(query)
+    assert sig == AbilitySignal(ability, rule)
+    # The wrapper must agree with the signal's ability on every branch.
+    assert detect_ability(query) == sig.ability
+
+
 # --- Integration: auto-detection wired into augment() ----------------------
 
 
@@ -243,6 +320,7 @@ def test_counting_question_auto_triggers_aggregate_without_explicit_ability(hy_a
     ctx = hy_agg.augment("how many project cards did I add to my gallery?")
 
     assert ctx.detected_ability == "MR"
+    assert ctx.detected_rule == "mr_count"  # observability: WHY it routed MR
     assert ctx.total_message_matches == 7
 
 
@@ -260,6 +338,7 @@ def test_explicit_ability_overrides_auto_detection(hy_agg):
     )
 
     assert ctx.detected_ability is None  # host hint -> no inference recorded
+    assert ctx.detected_rule is None  # no inference ran, so no rule recorded
     assert ctx.total_message_matches == 4  # MR aggregate ran, not TR
 
 

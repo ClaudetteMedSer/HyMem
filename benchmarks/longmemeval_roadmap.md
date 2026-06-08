@@ -105,6 +105,25 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
 - **`benchmarks/router_eval.py`.** Zero-LLM sweep of `detect_ability` vs oracle over the
   full dataset (seconds on the box) + per-intent residual-miss listing. Tight tuning loop
   decoupled from the expensive retrieval+judge run.
+- **Router hardening 2026-06-08 (production robustness + observability; NOT yet the
+  precision/recall round).** Carry-clean — `detect_ability` IS the production path, so all
+  of this lands in real Hermes. (a) **Robustness:** `_prepare()` now NFC-normalises input
+  (composed vs decomposed Dutch diacritics match one way), tolerates non-str/blank input as
+  an abstain instead of raising (it sits on every augment() hot path — must never crash the
+  host on a malformed turn), and clips the scan to `_MAX_SCAN_CHARS=4096` so the lazy
+  `[\s\S]*?` TR bridges can't rescan a multi-KB paste to EOS at every start position (the
+  intent opener always sits at the question start, so a bounded prefix is both where the
+  signal lives AND a worst-case cost cap). (b) **Observability:** new `AbilitySignal(ability,
+  rule)` + `detect_ability_signal()` name the firing branch (tr_duration/tr_howlong/tr_order/
+  tr_recency/mr_count/tr_distance, or none/empty/non_str); `detect_ability` is now a thin
+  wrapper. `augment()` records `ctx.detected_rule` alongside `detected_ability`, so a
+  production misroute ("why did this get MR-shaped?") is diagnosable from the result object
+  alone. `router_eval.py` prints the firing rule per residual-miss/FP and a by-rule FP tally
+  (names the worst-over-firing pattern). +5 hardening + 1 observability test groups in
+  `test_intent.py` (non-str/blank/oversized/near-miss-no-hang/NFC + per-rule signal); all
+  green on the Mac. **NEXT (box): the precision/recall round** — run `router_eval.py` on an
+  abstention-bearing/real dataset, read the by-rule FP tally + recall misses, tune patterns
+  against ACTUAL misses (not imagined ones), keep precision-over-recall.
 
 ### MR / counting
 - **`message_fts_aggregate_cap` lexical-count path.** user-only filter, EN+NL stopword

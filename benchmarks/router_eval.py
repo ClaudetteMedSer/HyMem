@@ -35,7 +35,7 @@ from longmemeval_adapter import (  # noqa: E402
     print_router_diagnostics,
 )
 
-from hymem.query.intent import detect_ability  # noqa: E402
+from hymem.query.intent import detect_ability_signal  # noqa: E402
 
 
 def _target(oracle: str | None) -> str:
@@ -70,13 +70,14 @@ def main() -> None:
     for q in questions:
         qtype = q["question_type"]
         oracle = QUESTION_TYPE_TO_ABILITY.get(qtype, None)
-        detected = detect_ability(q.get("question", "") or "")
+        signal = detect_ability_signal(q.get("question", "") or "")
         results.append({
             "question_id": q.get("question_id", "?"),
             "question": q.get("question", ""),
             "question_type": qtype,
             "oracle_ability": oracle,
-            "detected_ability": detected,
+            "detected_ability": signal.ability,
+            "detected_rule": signal.rule,  # WHICH pattern decided (observability)
         })
 
     diag = compute_router_diagnostics(results)
@@ -97,15 +98,25 @@ def main() -> None:
               f"'{{detected}}'  ({len(miss)} total):")
         for r in miss[:args.show]:
             got = r["detected_ability"] or "None"
-            print(f"    [{r['question_type']}] det={got:<4} | {r['question'][:96]}")
+            # rule shows WHY a miss was mis-shaped (e.g. an MR question stolen by
+            # tr_distance) — names the exact pattern to fix, not just the verdict.
+            print(f"    [{r['question_type']}] det={got:<4} via {r['detected_rule']:<11} | {r['question'][:84]}")
         if len(miss) > args.show:
             print(f"    … +{len(miss) - args.show} more")
 
     fp = [r for r in results
           if _target(r["oracle_ability"]) == "NONE" and _det(r["detected_ability"]) != "NONE"]
     print(f"\n  False positives — non-MR/TR oracle, router shaped MR/TR  ({len(fp)} total):")
+    # Tally which rule over-fires, so the precision round targets the worst pattern.
+    fp_by_rule: dict[str, int] = {}
+    for r in fp:
+        fp_by_rule[r["detected_rule"]] = fp_by_rule.get(r["detected_rule"], 0) + 1
+    if fp_by_rule:
+        breakdown = ", ".join(f"{rule}={n}" for rule, n in
+                              sorted(fp_by_rule.items(), key=lambda kv: -kv[1]))
+        print(f"    by rule: {breakdown}")
     for r in fp[:args.show]:
-        print(f"    [{r['question_type']}] det={r['detected_ability']:<4} | {r['question'][:96]}")
+        print(f"    [{r['question_type']}] det={r['detected_ability']:<4} via {r['detected_rule']:<11} | {r['question'][:84]}")
     if len(fp) > args.show:
         print(f"    … +{len(fp) - args.show} more")
 
