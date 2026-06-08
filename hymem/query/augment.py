@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
@@ -496,8 +497,28 @@ def should_rerank(
 _FTS_SAFE = re.compile(r"[^A-Za-z0-9_\- ]+")
 
 
+def _fold_diacritics(text: str) -> str:
+    """Strip combining diacritics so a query token matches the FTS index.
+
+    The FTS5 `unicode61` tokenizer folds diacritics when it builds the index
+    ("café" is stored as "cafe"), but `_FTS_SAFE` below is an ASCII-only
+    whitelist — so without this step it would SHRED an accented query token
+    before it ever reaches FTS ("café" → "caf", "coördinatie" → "co rdinatie"),
+    and the Dutch/loanword query would silently match nothing while the index
+    holds the folded form. NFKD splits each precomposed letter into base + mark;
+    dropping the combining marks (`unicodedata.combining`) yields the same ASCII
+    base the index stored, so query and index agree. This covers the full Dutch
+    diacritic set (ë ï ö é ü á è …); precomposed Latin letters with no canonical
+    decomposition (ø ß æ — not used in Dutch) are left for the ASCII strip and
+    are a known out-of-scope residual."""
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(ch)
+    )
+
+
 def _fts_search(conn: sqlite3.Connection, query: str, *, top_k: int) -> list[FtsHit]:
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     if not cleaned:
         return []
     # Build an OR query across tokens so partial matches still surface results.
@@ -546,7 +567,7 @@ def _message_fts_search(
     it reaches turns dreaming never chunked. Returns [] (not an error) if the
     table is absent — e.g. a DB migrated by older code — so retrieval degrades to
     chunk-FTS rather than failing."""
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     if not cleaned:
         return []
     tokens = [t for t in cleaned.split() if len(t) >= 2]
@@ -617,7 +638,7 @@ def _aggregate_tokens(query: str) -> list[str]:
     tokens shorter than 3 chars. Falls back to the normal len>=2 tokenization if
     that empties the set (a question made entirely of stop/short words), so the
     query is never empty."""
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     if not cleaned:
         return []
     parts = cleaned.split()
@@ -884,7 +905,7 @@ def _temporal_message_events(
     (`temporal_mentions`), so the list is purely chronological evidence. Degrades
     to [] — never raises — when `temporal_mentions` or `messages_fts` is absent
     (pre-v14 DB), mirroring `_message_fts_search`'s OperationalError tolerance."""
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     tokens = [t for t in cleaned.split() if len(t) >= 2]
 
     # When the query carries content tokens, scope the timeline to messages that
@@ -1632,7 +1653,7 @@ def _episode_search(
     """
     from hymem.core import db as core_db
 
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     fts_hits: list[EpisodeHit] = []
     if cleaned:
         tokens = [t for t in cleaned.split() if len(t) >= 2]
@@ -1748,7 +1769,7 @@ def _episode_rrf_chips(
 
 
 def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[ProcedureHit]:
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     if not cleaned:
         return []
     tokens = [t for t in cleaned.split() if len(t) >= 2]

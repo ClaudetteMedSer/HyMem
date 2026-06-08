@@ -77,12 +77,25 @@ _TR_PERFECT_AUX = (
     r"heb|hebt|heeft|hebben|ben|bent|geweest"
 )
 
+# Activity-duration verbs (EN + NL): "how long did it TAKE to finish", "how many
+# days did I SPEND on the trip". These close a single-activity span the same way an
+# anchor does — the answer is end-minus-start of ONE activity, a TR timeline — so
+# admitting them as a duration end catches the "spend/take" duration forms that
+# carry no between/after/ago anchor (router-eval TR misses: camping-trip days,
+# book-finishing days). "last"/"lasted" is deliberately EXCLUDED here: it collides
+# with the "last week/month" distance adjective; the gain isn't worth that risk.
+_TR_DUR_VERB = (
+    r"spend|spent|spending|takes?|took|taking|"
+    r"besteed|besteedde|besteden|duurt|duurde|duren|kost|kostte"
+)
+
 # A *duration end*: a two-event anchor, a deictic "ago"/"geleden" that closes a
-# span against now, OR a perfect auxiliary signalling duration-to-now. "how many
-# months ago" / "how many weeks have I been …" are duration questions with no
-# anchor, so without these the count opener falls through to MR and gets
+# span against now, a perfect auxiliary signalling duration-to-now, OR an
+# activity-duration verb (spend/take). "how many months ago" / "how many weeks
+# have I been …" / "how long did it take …" are duration questions with no
+# between-anchor, so without these the count opener falls through to MR and gets
 # mis-shaped — admitting them keeps the temporal reading.
-_TR_DUR_END_BODY = _TR_ANCHOR_BODY + r"|ago|geleden|" + _TR_PERFECT_AUX
+_TR_DUR_END_BODY = _TR_ANCHOR_BODY + r"|ago|geleden|" + _TR_PERFECT_AUX + r"|" + _TR_DUR_VERB
 _TR_DUR_END = r"(?:" + _TR_DUR_END_BODY + r")"
 
 # 1) Duration counting: "how many days between X and Y", "how many months ago",
@@ -203,6 +216,17 @@ _TR_RECENCY = re.compile(
     re.IGNORECASE,
 )
 
+# 6) Age-at-event: "how old was I when I moved to the US", "hoe oud was ik toen
+#    …". The answer is an age computed from a birth date and a dated event — a
+#    two-point temporal calculation, so the TR timeline (birth + event) is the
+#    right shaping. Kept tight: requires "how old + copula" THEN a "when/toen"
+#    clause, so a bare "how old is my laptop" (no event anchor) never matches.
+_TR_AGE = re.compile(
+    r"\bhow\s+old\s+(?:was|were|am|is|are)\b[\s\S]{0,40}?\bwhen\b|"
+    r"\bhoe\s+oud\s+(?:was|ben|is|waren)\b[\s\S]{0,40}?\b(?:toen|wanneer)\b",
+    re.IGNORECASE,
+)
+
 # --- MR (counting) ----------------------------------------------------------
 #
 # Plain item-count openers, English + Dutch. Anchored as whole phrases so they
@@ -254,6 +278,20 @@ _MR_AGGREGATE = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit "sum across events" cue (EN + NL). Paired with a count opener it marks
+# AGGREGATION, not a single duration: "how many hours have I spent playing games
+# IN TOTAL" sums per-session durations (MR), whereas "how many days did I spend on
+# my camping trip" is ONE span (TR). The activity-duration verbs added to
+# `_TR_DUR_END` would otherwise route the former to TR via tr_duration, so this
+# cue is checked FIRST (see `detect_ability_signal`) and forces MR when present.
+# Deliberately narrow — only the unambiguous total phrasings — so it never steals
+# a plain duration ("in total" must be explicit).
+_MR_TOTAL_CUE = re.compile(
+    r"\b(?:in\s+total|altogether|in\s+all|all\s+up|"
+    r"in\s+totaal|bij\s+elkaar|in\s+het\s+totaal)\b",
+    re.IGNORECASE,
+)
+
 
 # --- Production hardening ----------------------------------------------------
 #
@@ -295,11 +333,11 @@ class AbilitySignal:
 
     `ability` is the wired shaping target ("MR"/"TR") or None. `rule` names the
     branch that produced it so a misroute in real Hermes is diagnosable without
-    re-deriving which of the six patterns matched: the six firing rules
-    ("tr_duration", "tr_howlong", "tr_order", "tr_recency", "mr_count",
-    "tr_distance"), or an abstain reason ("none" = matched nothing, "empty" =
-    blank string, "non_str" = host passed a non-string). It mirrors the
-    `why_retrieved` chips' role: make a routing decision auditable, not opaque."""
+    re-deriving which pattern matched: the firing rules ("mr_total",
+    "tr_duration", "tr_howlong", "tr_order", "tr_recency", "tr_age", "mr_count",
+    "mr_aggregate", "tr_distance"), or an abstain reason ("none" = matched
+    nothing, "empty" = blank string, "non_str" = host passed a non-string). It
+    mirrors the `why_retrieved` chips' role: make a routing decision auditable."""
 
     ability: str | None
     rule: str
@@ -316,6 +354,13 @@ def detect_ability_signal(query: object) -> AbilitySignal:
     if q is None:
         return AbilitySignal(None, "empty" if isinstance(query, str) else "non_str")
 
+    # Aggregation guard FIRST: an explicit "in total" sum cue on a counting opener
+    # is summing across events (MR), not one duration — it must win before the
+    # activity-duration verbs in `_TR_DUR_END` route "how many hours have I spent
+    # … in total" to TR. Without the count opener it is left to `_MR_AGGREGATE`.
+    if _MR_TOTAL_CUE.search(q) and _MR_COUNT.search(q):
+        return AbilitySignal("MR", "mr_total")
+
     # TR first: the STRONG temporal signals win the overlap with MR. Split per
     # rule (vs one boolean OR) purely so the firing branch is nameable.
     if _TR_DURATION.search(q):
@@ -326,6 +371,8 @@ def detect_ability_signal(query: object) -> AbilitySignal:
         return AbilitySignal("TR", "tr_order")
     if _TR_RECENCY.search(q):
         return AbilitySignal("TR", "tr_recency")
+    if _TR_AGE.search(q):
+        return AbilitySignal("TR", "tr_age")
 
     # MR: a plain counting opener with no temporal framing. Checked BEFORE the
     # weak distance signal so "how many times did I X last week" stays a count —

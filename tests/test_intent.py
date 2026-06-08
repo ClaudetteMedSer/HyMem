@@ -236,6 +236,69 @@ def test_count_with_first_last_adjective_stays_mr(query: str) -> None:
     assert detect_ability(query) == "MR"
 
 
+# --- TR polish: activity duration, age-at-event, and the "in total" guard ---
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # Single-activity durations: a count opener + temporal unit + a
+        # spend/take verb (no between/after/ago anchor) — router-eval TR misses.
+        "How many days did I spend on my solo camping trip to Yosemite?",
+        "How many days did it take me to finish 'The Nightingale'?",
+        "how many weeks did I spend reading that series?",
+        # "how long did it/I take to …" — the how-long span via an activity verb.
+        "How long did I take to finish 'Evelyn Hugo' and 'The Nightingale'?",
+        "how long did it take to set up the new laptop?",
+        # Dutch activity durations
+        "hoeveel dagen heb ik aan die reis besteed?",
+        "hoe lang duurde het om het boek uit te lezen?",
+    ],
+)
+def test_tr_activity_duration_detected(query: str) -> None:
+    assert detect_ability(query) == "TR"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "How old was I when I moved to the United States?",
+        "how old were you when you started coding?",
+        "hoe oud was ik toen ik verhuisde?",
+    ],
+)
+def test_tr_age_at_event_detected(query: str) -> None:
+    assert detect_ability_signal(query) == AbilitySignal("TR", "tr_age")
+
+
+def test_age_without_event_anchor_is_not_tr() -> None:
+    # "how old is X" with no when/event clause is a plain fact, not a calculation.
+    assert detect_ability("how old is my laptop?") is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # The aggregation counterpart: "in total" sums per-event durations -> MR,
+        # even though a spend/take verb would otherwise route it to TR.
+        "How many hours have I spent playing games in total?",
+        "how many days did I spend travelling in total this year?",
+        "hoeveel uur heb ik in totaal aan gamen besteed?",
+    ],
+)
+def test_in_total_duration_is_mr_not_tr(query: str) -> None:
+    assert detect_ability_signal(query) == AbilitySignal("MR", "mr_total")
+
+
+def test_tr_polish_does_not_regress_existing_overlap() -> None:
+    # The duration-counting overlap and the count-with-timeframe guard must hold
+    # exactly as before, despite the new spend/take duration ends.
+    assert detect_ability("how many days between the order and the delivery?") == "TR"
+    assert detect_ability("how many weeks have I been exercising?") == "TR"  # no "in total"
+    assert detect_ability("how many times did I go to the gym last week?") == "MR"
+    assert detect_ability("how many emails did I send a week ago?") == "MR"
+
+
 # --- MR aggregation (sum/total/avg/percentage WITHOUT a "how many" opener) --
 
 
@@ -268,8 +331,11 @@ def test_mr_aggregation_reports_its_own_rule() -> None:
     assert detect_ability_signal("what is the total amount I spent?") == AbilitySignal(
         "MR", "mr_aggregate"
     )
-    # A count opener still wins the rule name even when "total" is also present.
-    assert detect_ability_signal("how many items in total did I buy?").rule == "mr_count"
+    # A bare count opener (no sum cue) reports mr_count.
+    assert detect_ability_signal("how many cards did I add?").rule == "mr_count"
+    # "how many … in total" is an explicit sum -> mr_total (still MR ability).
+    sig = detect_ability_signal("how many items in total did I buy?")
+    assert sig == AbilitySignal("MR", "mr_total")
 
 
 @pytest.mark.parametrize(

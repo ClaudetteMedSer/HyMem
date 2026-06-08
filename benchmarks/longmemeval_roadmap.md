@@ -77,6 +77,28 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   `AugmentedContext.message_hits`, knob `message_fts_top_k`. **The single biggest
   historical win** (overall 15.2→38.0 on the early BEAM run). Raw turns are searchable
   before any dream consolidates them.
+- **Dutch FTS diacritic fix 2026-06-08 (carry-clean bug fix; query side only, no migration,
+  no dep).** The FTS5 `unicode61` index FOLDS diacritics ("café"→"cafe"), but the query
+  sanitizer `_FTS_SAFE` was an ASCII-only whitelist that SHREDDED accented query tokens before
+  they reached FTS ("café"→"caf" = 0 hits; "coördinatie"→"co" OR "rdinatie" = 0 hits). So every
+  accented Dutch/loanword query silently missed while the index held the folded form — a real
+  retrieval bug, Dutch-prioritized. Fix: new `_fold_diacritics()` (NFKD + drop combining marks)
+  applied at ALL SIX FTS query sites (chunks/messages/aggregate/temporal/episodes/procedures),
+  so query and index agree. Recall is now accent-INSENSITIVE both directions. Covers the full
+  Dutch diacritic set (ë ï ö é ü á è); precomposed non-decomposing Latin letters (ø ß æ — not
+  Dutch) are a known out-of-scope residual. `entities.py` was already accent-safe (Unicode
+  `_TOKEN` + `normalize`), so the bug was isolated to `_FTS_SAFE`. Tests:
+  `test_accented_query_recalls_accented_message`, `test_accent_insensitive_both_directions`;
+  full retrieval suite (208) green. **MEASUREMENT CAVEAT: there is NO Dutch eval set (LME/BEAM
+  are English), so Dutch FTS is validated by correctness + unit tests, not a benchmark delta.**
+  **BIGGER DUTCH LEVER STILL OPEN (needs a decision): stemming (boeken≠boek).** Porter is
+  English-only and stdlib `sqlite3` can't register a custom FTS5 tokenizer (needs apsw/C ext,
+  fights pip-install ease), so Dutch inflection isn't conflated. Options: query-side morphological
+  expansion (driver-agnostic, fragile against the Porter index) vs. replace Porter with a
+  bilingual scheme (migration + English-stemming risk). **DECISION 2026-06-08: DEFERRED until a
+  Dutch eval set exists** — tuning stemming with no benchmark to measure it would be blind work
+  (the same measure-first discipline applied to D4/router). The diacritic fix stands as the
+  complete, high-confidence Dutch FTS deliverable for now.
 - **`created_at` end-to-end (was a live data-loss bug).** `append_message` dropped the
   timestamp → every row got ingestion-time, making all chronological ordering wrong and
   TR structurally unanswerable. Threaded through `log_message(s)`, `app.py`,
@@ -102,6 +124,25 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   noun + adverbial ordinal, determiner-guarded for EN+NL), new `_TR_DISTANCE` ("N units
   ago", "last week"), `_TR_RECENCY` ("when did I last/first…"), `_TR_DURATION` perfect-aux.
   **TR router recall 38% → 92%, precision 86%.** +80-odd cases in `test_intent.py`.
+- **Router TR polish (round 3) 2026-06-08.** Targeted the router-eval TR residual misses where
+  TR SHAPING actually helps (carry-clean, not oracle-chasing). (1) **Activity durations:** added
+  spend/take verbs (`_TR_DUR_VERB`, EN+NL) to `_TR_DUR_END` so a single-activity span with no
+  between/after/ago anchor routes TR — "how many days did I spend on my camping trip", "how many
+  days did it take to finish X" (were `mr_count`), "how long did I take to finish X and Y" (was
+  `none` via `_TR_HOWLONG`). "last/lasted" deliberately excluded (collides with "last week").
+  (2) **`_TR_AGE`:** "how old was I WHEN I moved" → age-at-event = two-point temporal calc (rule
+  `tr_age`); guarded by the "when/toen" clause so "how old is my laptop" stays None. (3) **`_MR_TOTAL_CUE`
+  guard (rule `mr_total`, checked FIRST):** an explicit "in total"/"altogether" sum cue on a count
+  opener is aggregation across events (MR), so "how many hours have I spent … in total" (oracle MR,
+  was mis-firing TR via the new spend verb) correctly stays MR — this resolves the TR/MR duration
+  overlap DEFERRED from the precision round. Predicted on real eval rows: 4 TR misses recovered + 1
+  MR mis-fire corrected; existing overlap guards (between-anchor TR, count-with-timeframe MR,
+  duration-to-now TR) all hold. **SKIPPED (TR shaping wouldn't help → would be oracle-chasing):**
+  recurring time-of-day ("what time do I wake up on Tuesdays"), superlative-over-period ("which
+  airline did I fly most in March"), count-before-event ("how many charity events before X" — left
+  to additive-MR). +5 test groups; full suite green. **NEXT (box): re-run `router_eval.py`** — expect
+  TR recall up (~92%→~95%), the 3 spend/take + age rows flip to TR, "in total" rows to MR; confirm
+  TR precision holds and `mr_total` adds no new FPs.
 - **`benchmarks/router_eval.py`.** Zero-LLM sweep of `detect_ability` vs oracle over the
   full dataset (seconds on the box) + per-intent residual-miss listing. Tight tuning loop
   decoupled from the expensive retrieval+judge run.
@@ -141,9 +182,16 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   (aggregation positives, own-rule reporting, precision guards); all green. **DEFERRED to TR polish:**
   the TR/MR duration-overlap misses ("how many days did I spend on my camping trip" → mr_count steals
   oracle TR) — genuinely ambiguous (inverse "how many hours have I spent...in total" is oracle MR), so
-  it belongs in the TR round, not a half-fix here. **NEXT (box): re-run `router_eval.py`** — expect
-  MR recall up via `mr_aggregate`, `mr_count` FP count unchanged (held by design); read the new
-  `by rule:` tally to confirm `mr_aggregate` recovers recall without a large FP cost.
+  it belongs in the TR round, not a half-fix here. **MEASURED (box, S/500): clean recall-only win.
+  MR recall 74→83% (+9pp, 12 misses recovered: "total amount", "difference in price", "average
+  age/GPA", "percentage discount"); MR precision 55→57% (UP — recall gain outpaced FP cost); TR
+  flat 92%/82%; `mr_count` FPs held at exactly 70; `mr_aggregate` added only 2 FPs (total 89→91).**
+  The lone notable `mr_aggregate` FP is an `_abs` Q ("total cost of my headphones and the iPad") —
+  harmless: it's genuinely aggregation-shaped, and on an abstention Q additive-MR just layers a
+  candidate count that comes back empty (reinforcing, not breaking, abstention). The remaining 20
+  MR misses are NONE-type (no aggregation marker) or the deferred TR/MR duration overlap. **Router
+  hardening COMPLETE** (robustness + observability + precision/recall); residual MR recall lives in
+  the duration overlap, owned by the TR-polish round.
 
 ### MR / counting
 - **`message_fts_aggregate_cap` lexical-count path.** user-only filter, EN+NL stopword

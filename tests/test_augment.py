@@ -142,6 +142,35 @@ def test_message_hits_empty_on_no_match(hy):
     assert ctx.message_hits == []
 
 
+# --- Dutch / accented-Latin FTS (diacritic folding) ------------------------
+
+
+def test_accented_query_recalls_accented_message(hy):
+    # The Dutch bug: the FTS index folds diacritics ("café" stored as "cafe"),
+    # but the ASCII-only query sanitizer used to SHRED an accented query token
+    # ("café" -> "caf") so it matched nothing. `_fold_diacritics` aligns the two.
+    sid = "nl"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "ik was gisteren in een café in Amsterdam")
+
+    # Querying with the accent must now hit (previously returned []).
+    ctx = hy.augment("café")
+    assert any("café" in h.text for h in ctx.message_hits)
+
+
+def test_accent_insensitive_both_directions(hy):
+    # Folding makes recall accent-INSENSITIVE: an unaccented query finds an
+    # accented turn and vice-versa, matching the index's own diacritic folding.
+    sid = "nl2"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "mijn coördinatie tijdens de skireis was prima")
+
+    # accented turn, unaccented query
+    assert any("coördinatie" in h.text for h in hy.augment("coordinatie").message_hits)
+    # accented query still works too
+    assert any("coördinatie" in h.text for h in hy.augment("coördinatie").message_hits)
+
+
 def test_message_hits_disabled_when_top_k_zero(cfg, stub_llm):
     from dataclasses import replace
 
