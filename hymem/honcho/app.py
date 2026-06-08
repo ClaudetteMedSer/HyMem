@@ -262,9 +262,13 @@ def add_messages(
 ) -> list[dict]:
     hy = _get_hy()
     roles = [_resolve_role(workspace_id, m.peer_id) for m in body.messages]
-    # One transaction for the whole batch (see HyMem.log_messages).
+    # One transaction for the whole batch (see HyMem.log_messages). Pass each
+    # message's caller-supplied created_at through so the persisted row carries
+    # the real event time, not bulk-ingestion time — chronological/temporal
+    # retrieval (ORDER BY created_at) depends on it.
     msg_ids = hy.log_messages(
-        session_id, [(role, m.content) for role, m in zip(roles, body.messages)]
+        session_id,
+        [(role, m.content, m.created_at) for role, m in zip(roles, body.messages)],
     )
     responses = [
         msg(msg_id, m.content, m.peer_id, session_id, workspace_id,
@@ -369,6 +373,16 @@ def _augment_messages(
             f"fts_{hit.chunk_id}",
             hit.text[:600], "hymem-fts", hit.session_id, workspace_id,
             {"type": "fts_hit"},
+        ))
+
+    for hit in ctx.message_hits:
+        if len(results) >= limit:
+            break
+        results.append(msg(
+            hit.message_id, hit.text[:600], hit.role,
+            hit.session_id, workspace_id,
+            {"type": "message_hit", "score": hit.score},
+            hit.created_at or None,
         ))
 
     return results
@@ -546,6 +560,14 @@ def get_peer_context(
                 hit.session_id, workspace_id,
                 {"type": "fts_hit", "score": getattr(hit, "score", 0.0)},
             ))
+        for hit in ctx.message_hits:
+            # Raw turns already carry their role — no chunk->message lookup.
+            messages.append(msg(
+                hit.message_id, hit.text[:600], hit.role,
+                hit.session_id, workspace_id,
+                {"type": "message_hit", "score": hit.score},
+                hit.created_at or None,
+            ))
         for fact in ctx.graph_facts:
             content = (
                 f"{fact.subject} {fact.predicate} {fact.object} "
@@ -610,6 +632,9 @@ def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest) -> dict:
         if ctx.fts_hits:
             snippets = [f"- {h.text[:300]}" for h in ctx.fts_hits]
             parts.append("From conversation history:\n" + "\n".join(snippets))
+        if ctx.message_hits:
+            snippets = [f"- {h.text[:300]}" for h in ctx.message_hits]
+            parts.append("From raw turns:\n" + "\n".join(snippets))
         answer = "\n\n".join(parts) if parts else "No relevant information found in memory."
         responses.append(answer)
         facts_per_query.append([

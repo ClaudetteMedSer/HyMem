@@ -42,6 +42,32 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 
+-- FTS over raw message text — a direct keyword path to the session log,
+-- complementing chunks_fts (which only covers high-salience spans materialized
+-- during dreaming). Populated live at ingest via triggers, so a turn is
+-- searchable the moment it is logged: across sessions and before any dream has
+-- consolidated it. Only user/assistant turns are indexed; tool/system turns are
+-- excluded as retrieval noise / index bloat. messages.id is INTEGER PRIMARY KEY
+-- (a rowid alias), so content_rowid='id' joins straight back to the row.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id',
+    tokenize='porter unicode61'
+);
+
+-- Messages are append-only (no UPDATE path in session.py), so insert + delete
+-- triggers keep the index in sync; the WHEN guard mirrors the role filter so
+-- tool/system turns never enter — and a delete of one safely no-ops.
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages
+WHEN new.role IN ('user','assistant') BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages
+WHEN old.role IN ('user','assistant') BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+END;
+
 -- High-salience chunks identified during dreaming phase 1.
 CREATE TABLE IF NOT EXISTS chunks (
     id TEXT PRIMARY KEY,
@@ -63,6 +89,27 @@ CREATE TABLE IF NOT EXISTS entity_mentions (
 );
 CREATE INDEX IF NOT EXISTS idx_entity_mentions_canonical ON entity_mentions(entity_canonical);
 CREATE INDEX IF NOT EXISTS idx_entity_mentions_chunk ON entity_mentions(chunk_id);
+
+-- Explicit dates written in raw message text, extracted during dreaming
+-- (dreaming/temporal.py). The temporal-reasoning (TR) augment path reads this
+-- to return events already sorted by date, so the host LLM never has to find
+-- dates in noise. `normalized_date` is ISO YYYY-MM-DD when a full date (incl.
+-- year) was resolvable, else NULL for a year-less mention whose raw_text and
+-- the turn's `created_at` still carry ordering signal. One row per distinct
+-- (message_id, raw_text) so a re-dreamed chunk does not duplicate mentions.
+-- Migration 014 adds this to existing DBs.
+CREATE TABLE IF NOT EXISTS temporal_mentions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    normalized_date TEXT,
+    raw_text TEXT NOT NULL,
+    surrounding_text TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (message_id, raw_text)
+);
+CREATE INDEX IF NOT EXISTS idx_temporal_mentions_date ON temporal_mentions(normalized_date);
+CREATE INDEX IF NOT EXISTS idx_temporal_mentions_message ON temporal_mentions(message_id);
 
 -- FTS over chunk text. External-content table keeps storage tight.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(

@@ -3,7 +3,7 @@ project_name: "HyMem"
 
 
 # list of languages for which language servers are started; choose from:
-#   al                  angular             ansible             bash                clojure
+Could#   al                  angular             ansible             bash                clojure
 #   cpp                 cpp_ccls            crystal             csharp              csharp_omnisharp
 #   dart                elixir              elm                 erlang              fortran
 #   fsharp              go                  groovy              haskell             haxe

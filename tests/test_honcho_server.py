@@ -74,6 +74,31 @@ def test_add_messages_logs_and_returns_message_objects(client, hy_with_embed):
     ]
 
 
+def test_add_messages_persists_supplied_created_at(client, hy_with_embed):
+    # A caller-supplied created_at must reach the DB row (event time), not be
+    # silently replaced by ingestion time — chronological retrieval depends on it.
+    r = client.post(
+        "/v3/workspaces/hermes/sessions/sess-ts/messages",
+        json={
+            "messages": [
+                {"content": "earlier", "peer_id": "user-1", "created_at": "2024-02-15T09:00:00Z"},
+                {"content": "later", "peer_id": "user-1", "created_at": "2024-03-01T09:00:00Z"},
+                {"content": "no timestamp", "peer_id": "user-1"},
+            ]
+        },
+    )
+    assert r.status_code == 201
+
+    rows = hy_with_embed.conn.execute(
+        "SELECT content, created_at FROM messages WHERE session_id='sess-ts' ORDER BY id"
+    ).fetchall()
+    by_content = {r["content"]: r["created_at"] for r in rows}
+    assert by_content["earlier"] == "2024-02-15T09:00:00Z"
+    assert by_content["later"] == "2024-03-01T09:00:00Z"
+    # Omitted created_at falls back to the DB default, not a blank string.
+    assert by_content["no timestamp"]
+
+
 def test_search_returns_empty_for_unknown_query(client):
     r = client.post(
         "/v3/workspaces/hermes/sessions/s/search",

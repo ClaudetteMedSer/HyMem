@@ -34,6 +34,7 @@ from hymem.dreaming.digest import extract_session_digest
 from hymem.dreaming.episodes import persist_episodes
 from hymem.dreaming.procedures import persist_procedures
 from hymem.dreaming.mentions import index_chunk_mentions
+from hymem.dreaming.temporal import index_chunk_temporal_mentions
 from hymem.dreaming.retention import (
     prune_bookkeeping,
     prune_chunks,
@@ -218,6 +219,7 @@ def run_dreaming(
                     persist_chunks(conn, chunks)
                     for chunk in chunks:
                         index_chunk_mentions(conn, chunk.id, chunk.text)
+                        index_chunk_temporal_mentions(conn, chunk.id)
                 _kickoff_chunk_embed(chunks)
 
             for chunk in chunks:
@@ -282,6 +284,7 @@ def run_dreaming(
                         persist_chunks(conn, baseline)
                         for chunk in baseline:
                             index_chunk_mentions(conn, chunk.id, chunk.text)
+                            index_chunk_temporal_mentions(conn, chunk.id)
                     _kickoff_chunk_embed(baseline)
                     for chunk in baseline:
                         if chunks_remaining <= 0:

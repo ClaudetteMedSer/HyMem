@@ -32,6 +32,23 @@ def hy(cfg: HyMemConfig, stub_llm: StubLLMClient):
 
 
 @pytest.fixture
+def hy_agg(cfg: HyMemConfig, stub_llm: StubLLMClient):
+    """HyMem in MR replace-mode with a wide counting cap (200) so aggregation
+    tests see the aggregate's own evidence turns (distinct deduped user turns
+    with enumerates_items flags) as `message_hits`. `mr_aggregate_additive=False`
+    pins the legacy path these tests assert on; the additive default (relevance
+    retrieval + a layered count) is covered separately."""
+    from dataclasses import replace
+
+    instance = HyMem(
+        replace(cfg, message_fts_aggregate_cap=200, mr_aggregate_additive=False),
+        llm=stub_llm,
+    )
+    yield instance
+    instance.close()
+
+
+@pytest.fixture
 def hy_with_embed(
     cfg: HyMemConfig, stub_llm: StubLLMClient, embed_stub: StubEmbeddingClient
 ):

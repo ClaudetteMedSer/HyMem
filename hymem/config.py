@@ -67,6 +67,48 @@ class HyMemConfig:
     recallable before any dream runs. 0 disables."""
 
     fts_top_k: int = 5
+
+    message_fts_top_k: int = 5
+    """Number of raw-message keyword hits augment() returns in `message_hits`,
+    via a direct FTS5 path over the `messages` table (user/assistant turns
+    only). Complements `fts_top_k`, which searches dreamed *chunks*: raw turns
+    are searchable the moment they are logged, so facts are recallable across
+    sessions and before any dream consolidates them — the gap chunk-FTS leaves.
+    0 disables the path."""
+
+    message_fts_aggregate_cap: int = 50
+    """Counting path for `ability="MR"` ("how many X across all my requests?").
+    Set to 0 to disable — `ability="MR"` then uses the normal top-k message path.
+    When > 0, augment() returns distinct, deduped **user** turns chronologically
+    in `message_hits` (capped at this value) and the candidate count in
+    `total_message_matches` (exact even when the evidence is capped). The cap
+    bounds only the *evidence* turns the host sees, not the count. Defaults to 50:
+    keyword counting fits *lexical* "how many" questions (the common case); the
+    host's LLM still verifies the candidate count against the returned turns, so
+    a purely semantic "how many different ways…" question degrades to LLM tallying
+    rather than returning a wrong number."""
+
+    mr_aggregate_additive: bool = True
+    """When True (default), an `ability="MR"` detection LAYERS the candidate count
+    (`total_message_matches` + exact in-domain `graph_count`) on top of the normal
+    reranked relevance `message_hits`, instead of REPLACING them with the
+    aggregate's chronological distinct-user turns. This neutralises the retrieval
+    cost of MR over-detection: the router can't tell a real cross-session count
+    ("how many times did I deploy") from a single-session lookup phrased as a count
+    ("how many books have I read") — the two are textually identical — so a false
+    positive used to swap a lookup onto the count-only path and lose relevance
+    retrieval. Additive mode means a mis-routed question still gets full retrieval
+    while a genuine count keeps its number. Set False for the legacy replace-mode
+    (aggregate owns `message_hits`). Mirrors the already-additive TR path. The
+    exact count is unchanged either way — only which turns are shown as evidence."""
+
+    procedure_top_k_if: int = 10
+    """Procedure budget when augment() is called with `ability="IF"`
+    (instruction/step recall — "what steps did I take to implement X?").
+    Procedures are the natural fit for IF, so IF-tagged queries pull a wider set
+    of `ProcedureHit`s than the default `fts_top_k`. Other abilities keep
+    `fts_top_k`."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 
@@ -200,6 +242,19 @@ class HyMemConfig:
 
     rerank_cross_encoder_model: str = "mixedbread-ai/mxbai-rerank-base-v1"
     """HuggingFace model id used when ``rerank_model="cross-encoder"``."""
+
+    rerank_message_hits: bool = True
+    """Also rerank the raw-message keyword tier (`message_hits`), not just the
+    chunk tier (`fts_hits`). When True, augment() pulls a `rerank_top_k`-wide
+    BM25 candidate pool from the `messages` table and reranks it down to
+    `message_fts_top_k`, so a semantically-relevant turn sitting in the BM25
+    tail can be lifted into the cut. This tier is the dominant recovery source
+    on BEAM (most gold turns come back here, never via dreamed chunks), yet it
+    was historically returned in raw BM25 order — the bulk of ranking-loss
+    misses. Costs one extra rerank call per query when a reranker is wired and
+    the pool exceeds `message_fts_top_k`. Set False to restore the raw-BM25
+    behaviour (no extra rerank cost). No effect on the MR aggregate path, which
+    counts rather than ranks."""
 
     hedge_confidence_threshold: float = 0.75
     """Below this Laplace-smoothed confidence, a GraphFact is flagged

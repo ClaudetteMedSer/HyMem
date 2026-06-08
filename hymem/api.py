@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import logging
+import os
+import shlex
+import subprocess
 import sqlite3
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
+from urllib.parse import urlsplit
 
 from hymem import portability
 from hymem import redaction
@@ -16,9 +23,105 @@ from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
 from hymem.query.conflicts import Conflict, find_conflicts
-from hymem.query.entities import TimelineEntry, timeline as query_timeline
+from hymem.query.entities import (
+    GraphCount,
+    TimelineEntry,
+    count_relations as query_count_relations,
+    timeline as query_timeline,
+)
 
 log = logging.getLogger("hymem.api")
+
+
+def _clean_timestamp(value: str | None) -> str | None:
+    """Normalize a caller-supplied event timestamp: trim whitespace and treat
+    an empty string as "not provided" so it falls through to the DB's
+    ingestion-time default rather than writing a blank that would sort before
+    every real date."""
+    if not value:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+
+def _ensure_embedding_server(timeout: float = 45.0) -> bool:
+    """Best-effort: make sure a *local* embedding server is reachable, restarting
+    it if it has died unexpectedly.
+
+    Self-healing at the point of use: the code path that would otherwise crash on
+    a dead embedder (``dream``) is the one that revives it. There is no watchdog
+    process and no polling while idle — the check runs only when an embedder is
+    actually about to be used, so the steady-state cost is one ``/health`` GET.
+
+    Returns ``True`` when the embedding path is safe to proceed, ``False`` only
+    when a local server was down and could not be brought back up.
+
+    Decision table:
+      - ``HYMEM_EMBEDDING_BASE_URL`` unset  → ``True``  (FTS-only / benchmark path)
+      - remote URL (not loopback)           → ``True``  (can't restart a remote host)
+      - local server answers ``/health``    → ``True``  (fast path, no work)
+      - local server down, restart cmd set  → Popen it, poll ``/health`` to timeout
+      - local server down, no restart cmd   → ``False`` (nothing we can do)
+    """
+    base_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL")
+    if not base_url:
+        return True
+
+    host = (urlsplit(base_url).hostname or "").lower()
+    if host not in _LOCAL_HOSTS:
+        # Remote provider: not ours to manage. Skip rather than fail.
+        return True
+
+    health_url = base_url.rstrip("/") + "/health"
+    if _embedding_health_ok(health_url):
+        return True  # already up — nothing to do
+
+    cmd = os.environ.get("HYMEM_EMBEDDING_SERVER_CMD")
+    if not cmd:
+        log.warning(
+            "embedding server at %s is down and HYMEM_EMBEDDING_SERVER_CMD is "
+            "not set — cannot restart it automatically", base_url,
+        )
+        return False
+
+    log.warning("embedding server at %s is down — restarting via %r", base_url, cmd)
+    try:
+        # Detach so the embedding server outlives this restart trigger; inherit
+        # the environment so HYMEM_EMBEDDING_* stay consistent with the client.
+        subprocess.Popen(  # noqa: S603 - cmd is operator-supplied configuration
+            shlex.split(cmd),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        log.warning("failed to launch embedding server (%r): %s", cmd, exc)
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _embedding_health_ok(health_url):
+            log.info("embedding server at %s is back up", base_url)
+            return True
+        time.sleep(1.0)
+
+    log.warning(
+        "embedding server at %s did not become healthy within %.0fs",
+        base_url, timeout,
+    )
+    return False
+
+
+def _embedding_health_ok(health_url: str, timeout: float = 2.0) -> bool:
+    """Return True iff ``GET health_url`` answers with a 2xx status."""
+    try:
+        with urllib.request.urlopen(health_url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 class HyMem:
@@ -122,32 +225,69 @@ class HyMem:
             content = redaction.redact(content)
         return content
 
-    def log_message(self, session_id: str, role: str, content: str) -> int:
+    def log_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        created_at: str | None = None,
+    ) -> int:
         content = self._prepare_content(content)
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
-            return session_log.append_message(self.conn, session_id, role, content)
+            return session_log.append_message(
+                self.conn, session_id, role, content,
+                created_at=_clean_timestamp(created_at),
+            )
 
     def log_messages(
-        self, session_id: str, turns: Iterable[tuple[str, str]]
+        self,
+        session_id: str,
+        turns: Iterable[tuple[str, str] | tuple[str, str, str | None]],
     ) -> list[int]:
-        """Append a batch of (role, content) turns in a single transaction.
+        """Append a batch of turns in a single transaction.
 
-        One BEGIN IMMEDIATE for the whole batch instead of one per message.
+        Each turn is `(role, content)` or `(role, content, created_at)`, where
+        `created_at` is the caller-supplied *event* time (ISO-8601); omit it (or
+        pass the 2-tuple) to fall back to ingestion time. One BEGIN IMMEDIATE for
+        the whole batch instead of one per message.
         """
-        prepared = [(role, self._prepare_content(content)) for role, content in turns]
+        prepared = [
+            (
+                turn[0],
+                self._prepare_content(turn[1]),
+                _clean_timestamp(turn[2] if len(turn) > 2 else None),
+            )
+            for turn in turns
+        ]
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
             return [
-                session_log.append_message(self.conn, session_id, role, content)
-                for role, content in prepared
+                session_log.append_message(
+                    self.conn, session_id, role, content, created_at=created_at
+                )
+                for role, content, created_at in prepared
             ]
 
     # ---- query-time --------------------------------------------------
 
     def augment(
-        self, user_message: str, *, session_id: str | None = None
+        self,
+        user_message: str,
+        *,
+        session_id: str | None = None,
+        ability: str | None = None,
     ) -> AugmentedContext:
+        """Build retrieval context for `user_message`.
+
+        `ability` is an optional question-type hint (e.g. "MR") the host may pass
+        to shape retrieval — only the host knows the type, HyMem does not infer
+        it. `ability="MR"` switches the raw-message tier into aggregation mode
+        (all matches, chronological, with `total_message_matches`) for
+        "how many X across all my requests?" questions. Unknown/None hints use
+        the default retrieval path.
+        """
         cap = self.config.max_query_chars
         if cap and len(user_message) > cap:
             log.warning(
@@ -165,6 +305,7 @@ class HyMem:
             llm=self._llm,
             token_overlap_index=self._token_overlap_index,
             session_id=session_id,
+            ability=ability,
         )
 
     def timeline(self, entity: str) -> list["TimelineEntry"]:
@@ -184,6 +325,47 @@ class HyMem:
         """
         return find_conflicts(self.read_conn)
 
+    def count_relations(
+        self,
+        *,
+        count: Literal["subject", "object"] = "subject",
+        predicates: Iterable[str] | None = None,
+        subject: str | None = None,
+        object: str | None = None,
+        object_type: str | None = None,
+        subject_type: str | None = None,
+    ) -> GraphCount:
+        """Exact graph-native count over active `knowledge_graph` edges, for
+        in-domain "how many X …" questions. Read-only.
+
+        Answers questions the aggregate message-FTS path can only *estimate*,
+        because here the entity type vocabulary applies: "how many services
+        depend on redis?" is `count="subject", predicates=["depends_on"],
+        object="redis"`; "how many databases do we use?" is `count="object",
+        predicates=["uses"], object_type="database"`. Only the IN-DOMAIN (tech)
+        type/predicate vocabulary is countable this way — consumer categories
+        ("clothing") aren't typed, so those stay on the message-FTS aggregate
+        path (`augment(ability="MR")`).
+
+        `count` is the load-bearing argument: it states whether DISTINCT subjects
+        or DISTINCT objects are tallied (default `"subject"` — the canonical
+        "how many subjects relate to this object" shape). HyMem never infers the
+        side from the filters. `subject`/`object` surface forms are resolved
+        through the alias table; `subject_type`/`object_type` filter via
+        `entity_types`; `predicates` is optional (omit ⇒ all predicates). The
+        returned `GraphCount` carries the exact `count`, the distinct entities
+        behind it (capped, count stays exact), and the resolved filters used.
+        """
+        return query_count_relations(
+            self.read_conn,
+            count=count,
+            predicates=predicates,
+            subject=subject,
+            object=object,
+            object_type=object_type,
+            subject_type=subject_type,
+        )
+
     # ---- dreaming ----------------------------------------------------
 
     def dream(self, *, session_ids: Iterable[str] | None = None) -> DreamReport:
@@ -192,6 +374,10 @@ class HyMem:
                 "HyMem.dream requires an LLMClient. Pass one to the constructor "
                 "or call set_llm() before dreaming."
             )
+        if self._embed is not None:
+            # Dreaming embeds canonicals/edges; if a local embedding server died
+            # since the last cycle, revive it here before we depend on it.
+            _ensure_embedding_server()
         ids = list(session_ids) if session_ids is not None else None
         report = run_dreaming(
             self.conn,

@@ -92,3 +92,419 @@ def test_recent_messages_zero_limit_returns_empty(hy):
     hy.log_message(sid, "user", "a turn")
 
     assert recent_messages(hy.read_conn, sid, 0) == []
+
+
+# --- raw-message FTS tier (message_hits) ----------------------------------
+
+
+def test_message_hits_recall_raw_turn_across_sessions_before_dream(hy):
+    # The gap this closes: a fact stated in some *other* session, never dreamed,
+    # is still keyword-recallable — unlike the working-memory tier (active
+    # session only) or chunk-FTS (dreamed high-salience spans only).
+    hy.open_session("past")
+    hy.log_message("past", "user", "We migrated the billing service to CockroachDB.")
+    hy.close_session("past")
+
+    # No dream ran, and no session_id is passed (working-memory tier off).
+    ctx = hy.augment("what database does billing use?")
+
+    assert ctx.graph_facts == []   # nothing consolidated
+    assert ctx.recent_turns == []  # no active session
+    hit = next(h for h in ctx.message_hits if "CockroachDB" in h.text)
+    assert hit.session_id == "past"
+    assert hit.role == "user"
+    assert hit.message_id > 0
+    assert hit.created_at  # populated so a consumer can prefer recent statements
+    assert hit.why_retrieved and hit.why_retrieved[0].startswith("message_fts(")
+
+
+def test_message_hits_exclude_tool_and_system_turns(hy):
+    sid = "roles"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "deploy uses terraform")
+    hy.log_message(sid, "assistant", "noted, terraform it is")
+    hy.log_message(sid, "tool", "terraform plan output terraform terraform")
+    hy.log_message(sid, "system", "system note about terraform")
+
+    ctx = hy.augment("terraform")
+
+    roles = {h.role for h in ctx.message_hits}
+    assert roles == {"user", "assistant"}  # tool/system never indexed
+    assert len(ctx.message_hits) == 2
+
+
+def test_message_hits_empty_on_no_match(hy):
+    sid = "nomatch"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "we use redis for caching")
+
+    ctx = hy.augment("quantum chromodynamics unrelated terms")
+    assert ctx.message_hits == []
+
+
+def test_message_hits_disabled_when_top_k_zero(cfg, stub_llm):
+    from dataclasses import replace
+
+    from hymem import HyMem
+
+    hy = HyMem(replace(cfg, message_fts_top_k=0), llm=stub_llm)
+    try:
+        sid = "off"
+        hy.open_session(sid)
+        hy.log_message(sid, "user", "kafka is the message broker")
+        ctx = hy.augment("kafka")
+        assert ctx.message_hits == []
+    finally:
+        hy.close()
+
+
+def test_message_hits_drop_after_message_pruned(hy):
+    # The delete trigger must keep messages_fts in sync so retention doesn't
+    # leave orphaned, unjoinable FTS rows.
+    sid = "prune"
+    hy.open_session(sid)
+    mid = hy.log_message(sid, "user", "we standardized on pnpm for the monorepo")
+    assert any("pnpm" in h.text for h in hy.augment("pnpm").message_hits)
+
+    hy.conn.execute("DELETE FROM messages WHERE id = ?", (mid,))  # autocommit
+    assert hy.augment("pnpm").message_hits == []
+
+
+# --- MR aggregation (ability="MR") ----------------------------------------
+
+
+def test_mr_aggregation_counts_all_matches_beyond_top_k(hy_agg):
+    # The MR lever: message_fts_top_k=5, but aggregation must return ALL matches
+    # with the true total — counting 5 of 9 mentions is the failure we fix.
+    sid = "mr"
+    hy_agg.open_session(sid)
+    assert hy_agg.config.message_fts_top_k == 5
+    for i in range(9):
+        hy_agg.log_message(sid, "user", f"I added project card number {i} to my gallery")
+
+    ctx = hy_agg.augment("how many project cards did I add to my gallery?", ability="MR")
+
+    assert ctx.total_message_matches == 9
+    assert len(ctx.message_hits) == 9
+    # Chronological order (created_at, id) -> ascending message ids.
+    ids = [h.message_id for h in ctx.message_hits]
+    assert ids == sorted(ids)
+    assert ctx.message_hits[0].score_kind == "aggregate"
+    assert ctx.message_hits[0].why_retrieved[0].startswith("message_fts_aggregate(")
+
+
+def test_mr_aggregation_cap_limits_rows_not_count(cfg, stub_llm):
+    from dataclasses import replace
+
+    from hymem import HyMem
+
+    # Replace-mode: the cap bounds the aggregate's own evidence rows shown in
+    # message_hits (the additive default puts relevance turns there instead).
+    hy = HyMem(
+        replace(cfg, message_fts_aggregate_cap=3, mr_aggregate_additive=False),
+        llm=stub_llm,
+    )
+    try:
+        sid = "cap"
+        hy.open_session(sid)
+        for i in range(7):
+            hy.log_message(sid, "user", f"deployed service {i} to staging")
+
+        ctx = hy.augment("how many deploys to staging?", ability="MR")
+
+        assert ctx.total_message_matches == 7   # exact total regardless of cap
+        assert len(ctx.message_hits) == 3       # rows capped
+    finally:
+        hy.close()
+
+
+def test_mr_aggregation_stopword_filter_avoids_noise_matches(hy_agg):
+    # A message sharing only stopwords with the question must NOT be counted —
+    # proves the aggregate query drops do/have/many/etc. before matching.
+    sid = "noise"
+    hy_agg.open_session(sid)
+    hy_agg.log_message(sid, "user", "I do have many of these things in my list")
+
+    ctx = hy_agg.augment("how many widgets do I have?", ability="MR")
+
+    # "widgets" is the only content token; the message has no "widget".
+    assert ctx.total_message_matches == 0
+
+
+def test_mr_aggregation_falls_back_when_query_all_stopwords(hy_agg):
+    # If filtering empties the token set, fall back to len>=2 tokens so the
+    # query is never empty.
+    sid = "fb"
+    hy_agg.open_session(sid)
+    hy_agg.log_message(sid, "user", "many things happened")
+
+    ctx = hy_agg.augment("how many do I have", ability="MR")
+
+    # Fallback keeps how/many/do/have; "many" matches the message.
+    assert ctx.total_message_matches >= 1
+
+
+def test_ability_none_keeps_default_message_path(hy):
+    # Backward compat: no ability -> top-k BM25 path, total stays 0.
+    sid = "none"
+    hy.open_session(sid)
+    for i in range(9):
+        hy.log_message(sid, "user", f"card {i} added to gallery")
+
+    ctx = hy.augment("gallery cards")
+
+    assert ctx.total_message_matches == 0
+    assert len(ctx.message_hits) <= hy.config.message_fts_top_k
+
+
+def test_unknown_ability_falls_back_to_default(hy):
+    sid = "unk"
+    hy.open_session(sid)
+    for i in range(9):
+        hy.log_message(sid, "user", f"item {i} in the gallery")
+
+    ctx = hy.augment("gallery items", ability="BOGUS")
+
+    assert ctx.total_message_matches == 0
+    assert len(ctx.message_hits) <= hy.config.message_fts_top_k
+
+
+def test_mr_ability_is_case_insensitive(hy_agg):
+    sid = "ci"
+    hy_agg.open_session(sid)
+    for i in range(6):
+        hy_agg.log_message(sid, "user", f"deployed build {i}")
+
+    ctx = hy_agg.augment("how many builds deployed?", ability="mr")
+
+    assert ctx.total_message_matches == 6
+
+
+def test_mr_aggregation_counts_user_turns_only(hy_agg):
+    # Assistant echoes match the same terms but must not be counted — the
+    # question is about the user's actions, not the assistant's confirmations.
+    sid = "ro"
+    hy_agg.open_session(sid)
+    for i in range(5):
+        hy_agg.log_message(sid, "user", f"add widget {i} to the board")
+        hy_agg.log_message(sid, "assistant", f"added widget {i} to the board")
+
+    ctx = hy_agg.augment("how many widgets did I add to the board?", ability="MR")
+
+    assert ctx.total_message_matches == 5
+    assert len(ctx.message_hits) == 5
+    assert all(h.role == "user" for h in ctx.message_hits)
+
+
+def test_mr_aggregation_dedups_identical_restatements(hy_agg):
+    # Literal restatements collapse to one; the genuinely distinct turn stays.
+    sid = "dd"
+    hy_agg.open_session(sid)
+    for _ in range(3):
+        hy_agg.log_message(sid, "user", "I deployed the API to prod")
+    hy_agg.log_message(sid, "user", "I deployed the API to staging")
+
+    ctx = hy_agg.augment("how many times did I deploy?", ability="MR")
+
+    assert ctx.total_message_matches == 2  # prod (x3 -> 1) + staging
+    assert len(ctx.message_hits) == 2
+
+
+def test_mr_aggregation_keeps_distinct_numbered_events(hy_agg):
+    # The under-count trap: near-identical turns differing only by a number are
+    # distinct events and must NOT be collapsed by dedup.
+    sid = "trap"
+    hy_agg.open_session(sid)
+    for i in range(6):
+        hy_agg.log_message(sid, "user", f"I added card number {i}")
+
+    ctx = hy_agg.augment("how many cards did I add?", ability="MR")
+
+    assert ctx.total_message_matches == 6
+
+
+def test_mr_aggregation_enabled_by_default(hy):
+    # Counting is on by default (message_fts_aggregate_cap=50): ability="MR"
+    # takes the counting path and returns an exact candidate count.
+    sid = "on"
+    hy.open_session(sid)
+    assert hy.config.message_fts_aggregate_cap == 50
+    for i in range(9):
+        hy.log_message(sid, "user", f"card {i} added to gallery")
+
+    ctx = hy.augment("how many cards in the gallery?", ability="MR")
+
+    assert ctx.total_message_matches == 9  # counting path ran
+
+
+def test_mr_additive_layers_count_on_relevance_retrieval(hy):
+    # Additive default (mr_aggregate_additive=True): an MR detection layers the
+    # exact count ON TOP of normal relevance message_hits instead of REPLACING
+    # them with the aggregate's distinct-user evidence. So message_hits stays the
+    # relevance tier (bounded by message_fts_top_k, not the full count, and not
+    # tagged score_kind="aggregate"), while the count is still exact.
+    sid = "additive"
+    hy.open_session(sid)
+    assert hy.config.mr_aggregate_additive is True
+    for i in range(9):
+        hy.log_message(sid, "user", f"I added project card number {i} to my gallery")
+
+    ctx = hy.augment("how many project cards did I add to my gallery?", ability="MR")
+
+    assert ctx.total_message_matches == 9  # count preserved (the MR payload)
+    # Relevance path owns message_hits, NOT the aggregate.
+    assert len(ctx.message_hits) <= hy.config.message_fts_top_k
+    assert all(h.score_kind != "aggregate" for h in ctx.message_hits)
+
+
+def test_mr_false_positive_keeps_relevance_retrieval(hy):
+    # The real-world win of additive mode: a single-session lookup the router
+    # MIS-routes to MR (it can't tell "how many books have I read" from a genuine
+    # cross-session count — they're textually identical) must NOT lose relevance
+    # retrieval. The answer-bearing turn is still surfaced; only a (harmless)
+    # count rides along.
+    sid = "fp"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "I have read 12 books so far this year")
+    for i in range(3):
+        hy.log_message(sid, "user", f"unrelated journaling note {i}")
+
+    ctx = hy.augment("how many books have I read this year?", ability="MR")
+
+    assert any("12 books" in h.text for h in ctx.message_hits)
+    assert all(h.score_kind != "aggregate" for h in ctx.message_hits)
+
+
+def test_mr_aggregation_opt_out_with_zero_cap(cfg, stub_llm):
+    # Setting the cap to 0 disables counting: ability="MR" falls back to the
+    # normal top-k message path.
+    from dataclasses import replace
+
+    from hymem import HyMem
+
+    hy = HyMem(replace(cfg, message_fts_aggregate_cap=0), llm=stub_llm)
+    try:
+        sid = "off"
+        hy.open_session(sid)
+        for i in range(9):
+            hy.log_message(sid, "user", f"card {i} added to gallery")
+
+        ctx = hy.augment("how many cards in the gallery?", ability="MR")
+
+        assert ctx.total_message_matches == 0  # counting path off
+        assert len(ctx.message_hits) <= hy.config.message_fts_top_k  # normal path ran
+    finally:
+        hy.close()
+
+
+# --- ability="IF" procedure shaping ---------------------------------------
+
+
+def test_if_ability_widens_procedure_budget(hy):
+    # IF pulls a wider procedure set (procedure_top_k_if) than the default
+    # fts_top_k, since procedures are the natural fit for step recall.
+    sid = "ifp"
+    hy.open_session(sid)
+    for i in range(8):
+        hy.conn.execute(
+            "INSERT INTO procedures(id, session_id, name, description, steps) "
+            "VALUES (?, ?, ?, ?, '[]')",
+            (f"p{i}", sid, f"deploy service {i}", "deploy the service to staging"),
+        )
+
+    # Default budget: capped at fts_top_k (5).
+    default = hy.augment("how do I deploy the service?")
+    assert len(default.procedures) == hy.config.fts_top_k
+
+    # ability="IF": widened to procedure_top_k_if (10) -> all 8 surface.
+    iff = hy.augment("what steps to deploy the service?", ability="IF")
+    assert len(iff.procedures) == 8
+
+
+# --- MR over-count provenance: enumeration_turns / enumerates_items ----------
+# These cover the Phase B improvement: a graph-native typed count was ruled out
+# (the entity-type vocabulary is tech-only, so consumer categories like clothing
+# never get typed), so the aggregate path instead FLAGS turns that enumerate
+# several items in one message — the over-count failure mode the count can't
+# resolve on its own.
+
+
+def test_mr_flags_enumeration_turns_as_overcount_signal(hy_agg):
+    # One turn lists three clothing items: the distinct-turn count is 1, but the
+    # true item count is 3. The aggregate path must flag that divergence.
+    sid = "enum"
+    hy_agg.open_session(sid)
+    hy_agg.log_message(sid, "user", "In my closet I have a shirt, jeans and boots")
+
+    ctx = hy_agg.augment("how many items in my closet?", ability="MR")
+
+    assert ctx.total_message_matches == 1          # still one matching turn
+    assert ctx.enumeration_turns == 1              # but it enumerates items
+    assert len(ctx.message_hits) == 1
+    assert ctx.message_hits[0].enumerates_items is True
+
+
+def test_mr_plain_single_item_turns_are_not_flagged(hy_agg):
+    # Plain one-item turns must NOT be flagged: turn-count == item-count holds, so
+    # enumeration_turns stays 0 and the candidate count is the answer.
+    sid = "single"
+    hy_agg.open_session(sid)
+    for it in ("a blue shirt", "a red jacket", "a green hat"):
+        hy_agg.log_message(sid, "user", f"I added {it} to my closet")
+
+    ctx = hy_agg.augment("how many clothing items did I add to my closet?", ability="MR")
+
+    assert ctx.total_message_matches == 3
+    assert ctx.enumeration_turns == 0
+    assert all(h.enumerates_items is False for h in ctx.message_hits)
+
+
+def test_mr_enumeration_count_is_exact_under_cap(cfg, stub_llm):
+    # enumeration_turns is computed over the full deduped set, so it stays exact
+    # even when message_hits is capped below the number of enumerating turns.
+    from dataclasses import replace
+
+    from hymem import HyMem
+
+    # Replace-mode: message_hits carries the capped aggregate evidence rows.
+    hy = HyMem(
+        replace(cfg, message_fts_aggregate_cap=2, mr_aggregate_additive=False),
+        llm=stub_llm,
+    )
+    try:
+        sid = "capenum"
+        hy.open_session(sid)
+        for i in range(5):
+            hy.log_message(sid, "user", f"On day {i} I packed a shirt, a coat and shoes")
+
+        ctx = hy.augment("how many times did I pack a shirt?", ability="MR")
+
+        assert ctx.total_message_matches == 5   # exact total regardless of cap
+        assert len(ctx.message_hits) == 2       # rows capped
+        assert ctx.enumeration_turns == 5       # exact, over the full set
+    finally:
+        hy.close()
+
+
+def test_mr_enumeration_handles_dutch_conjunction(hy_agg):
+    # Dutch is the prioritized non-English scope: "en" must split an enumeration.
+    sid = "nl"
+    hy_agg.open_session(sid)
+    hy_agg.log_message(sid, "user", "In mijn kast heb ik een shirt, een broek en schoenen")
+
+    ctx = hy_agg.augment("hoeveel dingen heb ik in mijn kast?", ability="MR")
+
+    assert ctx.enumeration_turns == 1
+    assert ctx.message_hits[0].enumerates_items is True
+
+
+def test_ability_none_leaves_enumeration_turns_zero(hy):
+    # Backward compat: the non-MR path never sets enumeration_turns.
+    sid = "noenum"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "I have a shirt, jeans and boots")
+
+    ctx = hy.augment("shirt jeans boots")
+
+    assert ctx.enumeration_turns == 0
+    assert all(h.enumerates_items is False for h in ctx.message_hits)

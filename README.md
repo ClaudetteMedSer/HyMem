@@ -278,6 +278,8 @@ AugmentedContext(
     user_md: str,              # USER.md content
     memory_md: str,            # MEMORY.md content
     fts_hits: list[FtsHit],    # Ranked relevant chunks
+    message_hits: list[MessageHit],   # Raw-message keyword hits (see below)
+    total_message_matches: int,       # Candidate count for ability="MR" (see below)
     graph_facts: list[GraphFact],     # Ranked knowledge graph edges (see below)
     episodes: list[EpisodeHit],       # Matching episodes
     procedures: list[ProcedureHit],   # Matching procedures
@@ -285,6 +287,15 @@ AugmentedContext(
     recent_turns: list[Message],      # Working-memory tier (see below)
 )
 ```
+
+**Raw-message tier (`message_hits`).** Alongside chunk FTS, `augment()` runs a direct FTS5 keyword search over the raw `messages` table (user/assistant turns), indexed live at ingest — so a turn is recallable across sessions and *before* any dream chunks it, the gap chunk-only FTS leaves. Hits are separate from `fts_hits` (different granularity; non-comparable BM25) and each carries `created_at`/`message_id`. Knob: `message_fts_top_k` (default 5, 0 disables).
+
+**Ability hints (`augment(..., ability=...)`).** An optional question-type hint the host knows and HyMem does not infer; unknown/None values use the default path (byte-for-byte unchanged). It shapes *what HyMem returns*, never how the host answers:
+
+- **`ability="IF"`** (instruction/step recall — "what steps did I take to implement X?") pulls a wider procedure set (`procedure_top_k_if`, default 10) since procedures are the natural fit.
+- **`ability="MR"`** ("how many X across all my requests?") is an **opt-in counting path** (default off — set `message_fts_aggregate_cap > 0`). LLMs count poorly across a long context, so HyMem does the deterministic part: it restricts to **user** turns (assistant echoes would double-count actions), drops query stopwords (EN + NL), collapses literal restatements (conservative dedup that never merges turns differing by a number or entity — so distinct events aren't under-counted), and returns the **distinct count** in `total_message_matches` plus those turns in `message_hits` as evidence. The count is a *candidate* — one turn may state several items or none — so the host's LLM verifies it against the turns; it stays exact even when evidence is capped. Off by default because keyword counting only fits *lexical* "how many" questions; semantic ones ("how many different ways…") need the answering LLM.
+
+The host assembles these pieces into its prompt and **decides ordering** — for single-conversation *task-recall* questions, `message_hits`/`procedures` should outrank `graph_facts`, whose cross-session tool/preference facts can otherwise crowd the context.
 
 **Working-memory tier (`recent_turns`).** All the fields above are built from *dreaming artifacts* (chunks, embeddings, graph) — so a fact stated this session is invisible to `augment()` until a dream runs. When called with a `session_id`, `augment()` also returns the last `working_memory_turns` (default 10) raw turns of that session, oldest→newest, so within-session facts are recallable *before* any dream has consolidated them. Omitting `session_id` leaves `recent_turns` empty (unchanged legacy behavior). The turns are already secret-redacted at ingest (see §8), so they are safe to surface.
 
@@ -466,6 +477,9 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `max_query_chars` | 10000 | Truncate an `augment()` query longer than this (0 disables) |
 | `working_memory_turns` | 10 | Recent raw turns `augment(session_id=…)` returns (0 disables) |
 | `fts_top_k` | 5 | FTS results to return |
+| `message_fts_top_k` | 5 | Raw-message keyword hits in `message_hits` (0 disables) |
+| `message_fts_aggregate_cap` | 0 | Opt-in `ability="MR"` counting path; evidence cap, count stays exact (0 = off) |
+| `procedure_top_k_if` | 10 | Procedure budget for `ability="IF"` (else `fts_top_k`) |
 | `graph_top_k_per_entity` | 3 | Entity-anchored graph facts per matched entity |
 | `embedding_max_scan` | 5000 | Max embeddings to scan in Python fallback |
 | `graph_semantic_top_k` | 10 | KNN candidates pulled from `vec_edges` |
