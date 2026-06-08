@@ -121,9 +121,29 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   alone. `router_eval.py` prints the firing rule per residual-miss/FP and a by-rule FP tally
   (names the worst-over-firing pattern). +5 hardening + 1 observability test groups in
   `test_intent.py` (non-str/blank/oversized/near-miss-no-hang/NFC + per-rule signal); all
-  green on the Mac. **NEXT (box): the precision/recall round** — run `router_eval.py` on an
-  abstention-bearing/real dataset, read the by-rule FP tally + recall misses, tune patterns
-  against ACTUAL misses (not imagined ones), keep precision-over-recall.
+  green on the Mac.
+- **Router precision/recall round 2026-06-08 (measured on box, S/500).** Eval: MR recall 74%
+  (89/121) precision 55% (89/163); TR recall 92% precision 82%; 89 FPs, **`by rule: mr_count=70`**.
+  **KEY FINDING — the 55% MR precision is a MEASUREMENT ARTIFACT, not a defect; HOLD `mr_count`,
+  do NOT chase precision.** "MR target" = `multi-session` ONLY (per `QUESTION_TYPE_TO_ABILITY`);
+  the 70 `mr_count` FPs are `single-session-user`/`-preference` (→IE/PF→NONE) questions that are
+  textually COUNT questions ("how many playlists do I have", "how much did I spend on a handbag")
+  — oracle calls them NONE-target purely by ANSWER-LOCATION (answer lives in one session), a label
+  production does NOT have. "How many playlists" is the same string whether the answer sits in one
+  session or ten. Tightening `mr_count` to suppress them = overfitting to the session-location
+  oracle label = the exact gaming the carry-over constraint forbids, AND costs real MR recall, AND
+  undoes additive-MR (`mr_aggregate_additive`, default True) which already makes a false MR route
+  near-harmless (count layers on relevance retrieval). The real MR metric is end-to-end accuracy
+  under additive-MR (the full LME run), not router precision. **ACTION TAKEN — recall only:** new
+  `_MR_AGGREGATE` pattern + rule `mr_aggregate` for aggregation phrasing with NO count opener
+  ("total amount I spent" — `_MR_COUNT` needs "amount OF"; "what percentage"; "on average"; EN+NL),
+  same MR aggregate path, separate rule so its recall/FP is measurable independently. +3 test groups
+  (aggregation positives, own-rule reporting, precision guards); all green. **DEFERRED to TR polish:**
+  the TR/MR duration-overlap misses ("how many days did I spend on my camping trip" → mr_count steals
+  oracle TR) — genuinely ambiguous (inverse "how many hours have I spent...in total" is oracle MR), so
+  it belongs in the TR round, not a half-fix here. **NEXT (box): re-run `router_eval.py`** — expect
+  MR recall up via `mr_aggregate`, `mr_count` FP count unchanged (held by design); read the new
+  `by rule:` tally to confirm `mr_aggregate` recovers recall without a large FP cost.
 
 ### MR / counting
 - **`message_fts_aggregate_cap` lexical-count path.** user-only filter, EN+NL stopword

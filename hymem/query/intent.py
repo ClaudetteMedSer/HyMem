@@ -224,6 +224,36 @@ _MR_COUNT = re.compile(
     re.IGNORECASE,
 )
 
+# Aggregation framings that carry NO "how many / how much / hoeveel" opener — a
+# sum / total / average / percentage question over the user's history ("what's
+# the total amount I spent on luxury items", "what percentage of my books are
+# fiction", "on average how late do I go to bed"). These take the SAME MR
+# aggregate path (count + evidence turns; the host LLM computes the sum/avg/pct
+# from the matching turns), but `_MR_COUNT` misses them because it keys on the
+# count opener and requires a literal "amount OF" ("total amount I spent" has no
+# "of"). Kept a SEPARATE pattern + rule ("mr_aggregate") so its recall recovery
+# and false-positive cost are measurable independently of `_MR_COUNT` in
+# router_eval. Precision posture is the same as MR overall: a false MR route is
+# near-harmless under additive-MR (`mr_aggregate_additive`, default True) — the
+# count merely layers on relevance retrieval — so we admit genuinely
+# aggregation-shaped phrasings without demanding they also be count-shaped.
+_MR_AGGREGATE = re.compile(
+    r"\b(?:"
+    r"total\s+(?:number|count|amount|sum|spend|spent|cost)|"  # "total amount I spent", "total spent"
+    r"total\s+(?:i|we|you)\s+(?:spent|spend|paid|earned|saved)|"  # "the total I spent"
+    r"in\s+total|altogether|"
+    r"on\s+average|"
+    r"what(?:'s|\s+is|\s+was)?\s+the\s+average\b|"
+    r"average\s+(?:number|amount|cost|price|spend|spending|time|rating|score)\b|"
+    r"what\s+percent(?:age)?\b|percentage\s+of|proportion\s+of|"
+    # Dutch
+    r"in\s+totaal|totaal\s+(?:aantal|bedrag)|"
+    r"gemiddeld\b|gemiddelde\s+(?:aantal|bedrag|tijd|prijs)|"
+    r"hoeveel\s+procent|welk\s+percentage|percentage\s+van"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 # --- Production hardening ----------------------------------------------------
 #
@@ -302,6 +332,13 @@ def detect_ability_signal(query: object) -> AbilitySignal:
     # the timeframe is incidental to a count question, not its subject.
     if _MR_COUNT.search(q):
         return AbilitySignal("MR", "mr_count")
+
+    # MR (aggregation): a sum/total/average/percentage question with no count
+    # opener ("total amount I spent", "what percentage of …", "on average …").
+    # Same MR aggregate path; checked after the count opener so a question with
+    # both ("how many in total") reports the stronger `mr_count` rule.
+    if _MR_AGGREGATE.search(q):
+        return AbilitySignal("MR", "mr_aggregate")
 
     # TR (weak): a bare distance/deictic reference ("a week ago", "last Saturday")
     # with no count opener — a recall-around-a-time question, so shape it temporal.

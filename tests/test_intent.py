@@ -236,6 +236,59 @@ def test_count_with_first_last_adjective_stays_mr(query: str) -> None:
     assert detect_ability(query) == "MR"
 
 
+# --- MR aggregation (sum/total/avg/percentage WITHOUT a "how many" opener) --
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # The router_eval recall misses: aggregation phrasing with no count opener.
+        "What is the total amount I spent on luxury items in the past few months?",
+        "what's the total I spent on groceries?",
+        "how much do I spend in total each month?",
+        "what percentage of my books are fiction?",
+        "what percent of my deploys failed?",
+        "on average, how late do I go to bed?",
+        "what's the average amount I spend per week?",
+        "what is the average rating I gave my reads?",
+        # Dutch
+        "wat is het totaal bedrag dat ik heb uitgegeven?",
+        "hoeveel procent van mijn boeken is fictie?",
+        "welk percentage van mijn deploys faalde?",
+        "gemiddeld hoe laat ga ik naar bed?",
+    ],
+)
+def test_mr_aggregation_phrasings_detected(query: str) -> None:
+    assert detect_ability(query) == "MR"
+
+
+def test_mr_aggregation_reports_its_own_rule() -> None:
+    # The new aggregation phrasings fire `mr_aggregate`, not `mr_count`, so the
+    # eval can measure their recall/FP independently.
+    assert detect_ability_signal("what is the total amount I spent?") == AbilitySignal(
+        "MR", "mr_aggregate"
+    )
+    # A count opener still wins the rule name even when "total" is also present.
+    assert detect_ability_signal("how many items in total did I buy?").rule == "mr_count"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # Precision guards: "average" as an ordinary adjective, NOT an
+        # aggregation question over history. ("an average day" / "the average
+        # user" don't carry a quantity noun, so the pattern leaves them alone.)
+        "what's an average day like for me?",
+        "tell me about the average user persona",
+    ],
+)
+def test_mr_aggregation_precision_guards(query: str) -> None:
+    # These should NOT be mis-routed to MR by the aggregation pattern. (If a
+    # future tweak trips one, additive-MR keeps it near-harmless — but the intent
+    # is to keep plain descriptive uses out.)
+    assert detect_ability(query) is None
+
+
 # --- Hardening: pathological / malformed production input ------------------
 
 
