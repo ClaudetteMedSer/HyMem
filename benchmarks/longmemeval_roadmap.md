@@ -201,6 +201,20 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   **NEXT to actually clear it: re-run the A/B on an abstention-bearing dataset** (the
   original/un-cleaned LongMemEval_S, or LongMemEval_M/oracle that retain `_abs`) and require
   the abstention row to hold, not just answerable to lift.
+  **GATE CLEARED — MEASURED 2026-06-08 (abstention-bearing set, 500 incl. 30 `_abs`, seed 0,
+  --auto-ability, strict vs permissive):** OVERALL 58.4 → 65.2 (+6.8pp). SS-P 13.3 → 56.7
+  (+43.4pp, 14 F→T / 1 T→F = net +13). Answerable ALL 57.9 → 65.1. **Abstention ALL held
+  flat 66.7 → 66.7 (20/30 both runs).** The aggregate "hold" is a CANCELLATION, not a clean
+  pass: 1 `_abs` regressed (`gpt4_372c3eed_abs`, MS — strict correctly answered "4",
+  permissive invented an Arcadia-High→UCLA-CS narrative) and a different `_abs` improved,
+  netting zero. The guard held **100% on SS-U and TR `_abs` both runs** (single-turn
+  user-fact questions — where a hallucinated fact is most damaging); the one leak was on
+  **multi-session synthesis**, the predictable soft spot (a permissive prompt licenses the
+  cross-session bridging that MS over-extends into confabulation). **Verdict: cleared for
+  the LME headline; cleared-with-documented-caveat as a Hermes default — abstention guard is
+  tight on single-turn facts, leaky on multi-hop synthesis. Do NOT call the guard "perfectly
+  tight"; the MS case forbids it. If shipped as Hermes default, either tighten the guard for
+  the multi-hop case or accept MS abstention as the known monitored residual.**
 - **D5. Disabling dream to "win" on LME.** LME is single-conversation-haystack; the
   cross-session KG dream builds is invisible to it. "No-dream wins" is a statement about
   LME's blind spot, not HyMem — would gut the product differentiator.
