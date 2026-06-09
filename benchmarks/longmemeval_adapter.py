@@ -677,8 +677,24 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
             marker = " (discussed)" if getattr(ev, 'source', '') == "session-date" else ""
             parts.append(f"  {date}{marker}: {desc}\n")
         parts.append("[END CHRONOLOGY]\n\n")
+    # MR counting questions: assistant turns are mostly noise for "how many" —
+    # the answer-bearing info is in user messages. Filter to user-only BEFORE
+    # building context so the model isn't fed assistant echoes. (This filter used
+    # to run AFTER `context` was frozen below = a dead no-op; the MR preamble's
+    # "assistant echoes excluded" claim now actually holds for what the model sees.)
+    # If no user messages survive, keep the full set and fall back to the default
+    # prompt — recorded in mr_user_only and read by the prompt-selection block.
+    context_memories = memories
+    mr_user_only = False
+    if ability == "MR":
+        _user_msgs = [m for m in memories
+                      if m["type"] == "message_hit" and "[user]" in m.get("content", "")]
+        if _user_msgs:
+            context_memories = _user_msgs
+            mr_user_only = True
+
     total_chars = 0
-    for m in memories:
+    for m in context_memories:
         content = m["content"]
         if total_chars + len(content) > context_limit:
             break
@@ -706,13 +722,10 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     if ability == "PF":
         system_prompt = ANSWERING_PREFERENCE_PROMPT
     elif ability == "MR":
-        system_prompt = ANSWERING_MR_PROMPT
-        # Filter to user-only messages for MR counting questions.
-        # Assistant responses are mostly noise for "how many" questions —
-        # the answer-bearing information is always in user messages.
-        memories = [m for m in memories if m["type"] == "message_hit" and "[user]" in m.get("content", "")]
-        if not memories:
-            system_prompt = default_prompt  # fallback if no user messages
+        # The user-only filter ran above (before context build); mr_user_only is
+        # True iff at least one user message survived and now drives the context.
+        # If none did, fall back to the default prompt over the unfiltered context.
+        system_prompt = ANSWERING_MR_PROMPT if mr_user_only else default_prompt
     elif ability == "TR":
         system_prompt = ANSWERING_TR_PROMPT
     else:

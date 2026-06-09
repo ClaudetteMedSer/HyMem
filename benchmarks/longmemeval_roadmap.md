@@ -221,6 +221,25 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   zero-evidence. Fires only on the tech vocabulary → helps real-Hermes in-domain use,
   **None on all LME** (consumer domain) by design.
 
+### Answer-context shaping
+- **KU recency-dating lever 2026-06-09 (prompt-only, SHIPPED, carry-clean).** Two changes in
+  `answer_question`: (1) date-stamp each `message_hit` with its `created_at` in the answer context
+  (`[MEM 2023-11-30] …`); raw turns are the only tier carrying `created_at` (FACT/fts/episode stay
+  undated, graph dating deferred). (2) Append a **value-aware recency clause** to BOTH default
+  prompts (`ANSWERING_SYSTEM_PROMPT` strict + `ANSWERING_PERMISSIVE_PROMPT`): *"use the value from
+  the most recent memory that actually states it; a later memory that only mentions the topic without
+  giving the value does not override it."* **Why it works (probed by `ku_probe.py` before any run):**
+  strict KU misses are "present-but-not-latest" — the new value IS retrieved, but a later turn merely
+  re-mentions the topic without the value (37/37 spoiler turns tangential, 0 stale re-assertions), so
+  naive latest-date-wins is wrong; value-aware recency fixes it. Dating helps the model pick among what
+  it already SEES. **MEASURED (full 500, seed 0, auto-ability, no-dream):** STRICT **overall +5.4pp
+  (58.6→64.0), KU +11.5pp (56.4→67.9)** — both outside the variance band, real; TR +6.0, MS +5.3 also
+  gained (date stamps add recency awareness), SS-U flat 92.9 (clause inert without a multi-date conflict
+  = cleanest no-regression evidence); no regressions. PERMISSIVE (shipping) **overall +2.2pp
+  (65.4→67.6), KU +12.8pp (62.8→75.6)** — the clause STACKS on permissive, abstention held 70%. **Carry
+  to production:** HyMem already exposes `MessageHit.created_at` (docstring names this use case), so
+  Hermes date-stamps its context + carries the clause; no HyMem change — the adapter is the reference impl.
+
 ### Ordering / dream
 - **Message-first default ordering (the carry-over fix).** Inverted the default so
   raw turns lead and graph_facts demote to a confidence-ranked tail for EVERY ability.
@@ -324,6 +343,15 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   TR is strong (92% recall); guarding risks the recall.
 - **D8. Q45-class entity-precision misses** ("model grabs niece vs cousin"). Reader
   precision, not a retrieval/temporal gap. Low ROI at current n.
+- **D9. KU ranking / top_k / budget / rerank as a lever.** `ku_probe.py --ranking` (72 KU items,
+  the recall-ceiling "ranking miss" disambiguated by reconstructing the final answer context offline)
+  found **B=0** — the gold turn reaches the answer context in 70/72, IDENTICALLY under raw BM25 and
+  the LLM reranker. So KU's residual is NOT truncation and NOT reranker-demotion (`rerank_message_hits`
+  gains nothing, no B→C flips). The ~23 remaining KU misses are **synthesis** (gold in context, model
+  still wrong — a few are judge noise per [[project_lme_variance_band]], real core ~17-21) + **2 recall
+  misses**. Don't spend a run on KU ranking/top_k/budget/rerank — exhausted. The dating lever (§2) is
+  the KU win; further KU gains would need conflict-resolution prompt strength or the 2 recall misses,
+  both low-yield.
 
 ---
 
@@ -507,6 +535,26 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
 - **L4. Permissive/abstention-aware default answer prompt (harness, optional, gated).**
   Only if a clean banked benchmark number is wanted — run WITH the `*_abs` slice broken
   out (see D4). Not load-bearing for the HyMem conclusion.
+- **L5. MR dead-filter fix — the active MS lever 2026-06-09 (carry-clean, one-region fix).**
+  **The bug:** `answer_question` builds `context` from the FULL `memories` (incl. assistant turns),
+  freezes it, THEN — too late — reassigns `memories` to a user-only filter that nothing reads
+  ([longmemeval_adapter.py:696](longmemeval_adapter.py#L696) freeze, [:713](longmemeval_adapter.py#L713)
+  dead reassign). So MR-shaped questions see assistant-polluted context despite the MR preamble claiming
+  "assistant echoes excluded" (line 665) — the preamble lies about what the model sees. **Probed before
+  fixing (`ku_probe.py --ms`, n=121, both raw BM25 and reranker ON):** ability distribution **MR=98 (81%),
+  None=13, TR=10** — MR is the overwhelming share of MS, so the blast radius is huge. A/B/C: **A 8-10,
+  B=0, C 111-113** — gold reaches context, residual is in-context. Dead-filter what-if over the 98
+  MR-detected (avg **53% assistant noise** in context): **SAFE 92 (every gold turn is a user message —
+  filter keeps gold, drops noise) · RISK 0 (no gold is an assistant turn that would be dropped) · n/a 6
+  (gold not retrieved anyway = A-bucket).** SAFE dominates, RISK is exactly zero, over half the MR context
+  is wasted assistant echo. **The fix:** apply the user-only filter to the iteration list BEFORE the
+  context-build loop (not after the freeze), keeping the existing "no user messages → fall back to default
+  prompt + unfiltered context" guard. **Carry-clean:** the filter is keyed on the production `detect_ability`
+  → MR route (not the oracle label) and on message role, both of which Hermes has. Reranker side-note: the
+  LLM reranker slightly HELPS MS (A 10→8), unlike KU where it was neutral — consistent with
+  `rerank_message_hits` being net-positive for MR. **STATUS: fix landed in the adapter; A/B run pending
+  (strict + permissive, auto-ability) — accept if MS lifts beyond the [[project_lme_variance_band]] without
+  sinking other categories.**
 
 **Sequencing:** L1 done (recall ruled out). L2a KILLED by the gold-rank probe (92% MS gold
 already at BM25 ≤15). L2c DONE → reranker is net-positive (−4.5pp MS when OFF), keep it, L2b
