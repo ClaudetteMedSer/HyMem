@@ -216,6 +216,12 @@ CREATE TABLE IF NOT EXISTS knowledge_graph (
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_reinforced TIMESTAMP,
+    -- Bi-temporal VALID time (distinct from the transaction-time columns above):
+    -- valid_at = world date the fact became true, invalid_at = world date it was
+    -- superseded (NULL = still valid). Added in migration 015; the validity index
+    -- lives in that migration only (see its header for why it can't sit here).
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','stale','retracted')),
     derived BOOLEAN NOT NULL DEFAULT 0,
     UNIQUE(subject_canonical, predicate, object_canonical)

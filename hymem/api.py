@@ -17,6 +17,7 @@ from hymem import redaction
 from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
+from hymem.dreaming import bitemporal
 from hymem.dreaming import canonicalize as canon
 from hymem.dreaming.runner import DreamReport, run_dreaming
 from hymem.extraction.embeddings import EmbeddingClient
@@ -621,6 +622,10 @@ class HyMem:
                 "WHERE id = ?",
                 (row["id"],),
             )
+            # Close the bi-temporal validity interval (schema v15). An explicit
+            # host retraction has no dated contradicting evidence, so this falls
+            # back to the flip time inside stamp_invalidation.
+            bitemporal.stamp_invalidation(self.conn, [row["id"]])
             # Store feedback for future extraction improvement
             evidence_rows = self.conn.execute(
                 """SELECT chunk_id FROM kg_evidence 

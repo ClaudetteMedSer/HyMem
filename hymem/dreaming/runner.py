@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
-from hymem.dreaming import phase1, phase2, phase3
+from hymem.dreaming import bitemporal, phase1, phase2, phase3
 from hymem.dreaming.inference import infer_transitive_edges
 from hymem.dreaming.chunks import (
     Chunk,
@@ -451,6 +451,13 @@ def run_dreaming(
             derived = infer_transitive_edges(conn, cfg)
             if derived:
                 log.info("inference.derived count=%d", derived)
+            # Open the bi-temporal validity interval on every edge minted this
+            # cycle (direct + derived) from its source-message world date
+            # (schema v15). After decay so retracted edges already carry an
+            # invalid_at; write-once so this is idempotent across cycles.
+            stamped = bitemporal.stamp_validity(conn)
+            if stamped:
+                log.info("bitemporal.valid_at_stamped count=%d", stamped)
             pruned = prune_chunks(conn, cfg)
             pruned += prune_messages(conn, cfg)
             pruned += prune_retracted_edges(conn, cfg)

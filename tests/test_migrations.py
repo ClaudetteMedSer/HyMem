@@ -145,7 +145,9 @@ def test_legacy_v1_db_upgrades_and_gains_columns(tmp_path: Path):
         CREATE TABLE kg_evidence(id INTEGER PRIMARY KEY, edge_id INTEGER,
             chunk_id TEXT, polarity INTEGER);
         CREATE TABLE knowledge_graph(id INTEGER PRIMARY KEY,
-            subject_canonical TEXT, predicate TEXT, object_canonical TEXT);
+            subject_canonical TEXT, predicate TEXT, object_canonical TEXT,
+            first_seen TIMESTAMP, last_seen TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'active');
         CREATE TABLE dream_runs(id INTEGER PRIMARY KEY);
         CREATE TABLE episodes(id TEXT PRIMARY KEY, title TEXT, summary TEXT);
         CREATE VIRTUAL TABLE episodes_fts USING fts5(title, summary,
@@ -169,6 +171,51 @@ def test_legacy_v1_db_upgrades_and_gains_columns(tmp_path: Path):
     assert "source_role" in _cols(conn, "kg_evidence")      # v11
     assert _has_table(conn, "messages_fts")                 # v13
     assert _has_table(conn, "temporal_mentions")            # v14
+    assert "valid_at" in _cols(conn, "knowledge_graph")     # v15
+    assert "invalid_at" in _cols(conn, "knowledge_graph")   # v15
+    idx = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='index' AND name='idx_kg_validity'"
+    ).fetchone()
+    assert idx is not None, "migration 015 must create the validity index"
+    conn.close()
+
+
+def test_v15_backfills_validity_interval(tmp_path: Path):
+    """Migration 015 seeds valid_at from first_seen for existing edges and
+    closes invalid_at from last_seen for already-superseded ones, so pre-v15
+    rows land with a populated (approximate) interval."""
+    conn = core_db.connect(tmp_path / "v14.sqlite")
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta VALUES ('schema_version', '14');
+        CREATE TABLE knowledge_graph(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_canonical TEXT, predicate TEXT, object_canonical TEXT,
+            first_seen TIMESTAMP, last_seen TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'active');
+        INSERT INTO knowledge_graph
+            (subject_canonical, predicate, object_canonical, first_seen, last_seen, status)
+        VALUES
+            ('a','uses','b','2024-01-01','2024-02-01','active'),
+            ('a','uses','c','2023-01-01','2023-06-01','retracted');
+        """
+    )
+
+    core_db._run_migrations(conn)  # v14 -> only migration 015 applies
+
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+    active = conn.execute(
+        "SELECT valid_at, invalid_at FROM knowledge_graph WHERE object_canonical='b'"
+    ).fetchone()
+    superseded = conn.execute(
+        "SELECT valid_at, invalid_at FROM knowledge_graph WHERE object_canonical='c'"
+    ).fetchone()
+    assert active["valid_at"] == "2024-01-01"
+    assert active["invalid_at"] is None          # still valid
+    assert superseded["valid_at"] == "2023-01-01"
+    assert superseded["invalid_at"] == "2023-06-01"  # closed from last_seen
     conn.close()
 
 
@@ -184,6 +231,10 @@ def test_v13_backfills_messages_fts_with_role_filter(tmp_path: Path):
         CREATE TABLE sessions(id TEXT PRIMARY KEY);
         CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL);
+        CREATE TABLE knowledge_graph(id INTEGER PRIMARY KEY,
+            subject_canonical TEXT, predicate TEXT, object_canonical TEXT,
+            first_seen TIMESTAMP, last_seen TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'active');
         INSERT INTO sessions(id) VALUES ('s');
         INSERT INTO messages(session_id, role, content) VALUES
             ('s','user','postgres is the primary datastore'),
@@ -193,7 +244,7 @@ def test_v13_backfills_messages_fts_with_role_filter(tmp_path: Path):
     )
     assert not _has_table(conn, "messages_fts")
 
-    core_db._run_migrations(conn)  # version 12 -> only migration 013 applies
+    core_db._run_migrations(conn)  # from v12: migration 013 backfills messages_fts
 
     assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     assert _has_table(conn, "messages_fts")
@@ -223,6 +274,10 @@ def test_v14_adds_temporal_mentions_table(tmp_path: Path):
         CREATE TABLE sessions(id TEXT PRIMARY KEY);
         CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL);
+        CREATE TABLE knowledge_graph(id INTEGER PRIMARY KEY,
+            subject_canonical TEXT, predicate TEXT, object_canonical TEXT,
+            first_seen TIMESTAMP, last_seen TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'active');
         """
     )
     assert not _has_table(conn, "temporal_mentions")

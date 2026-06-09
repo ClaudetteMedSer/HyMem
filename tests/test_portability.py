@@ -28,7 +28,8 @@ def _seed(hy: HyMem) -> None:
     )
     conn.execute(
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
-        "pos_evidence) VALUES ('app', 'uses', 'postgres', 3)"
+        "pos_evidence, valid_at, invalid_at) "
+        "VALUES ('app', 'uses', 'postgres', 3, '2024-03-15 00:00:00', NULL)"
     )
     conn.execute(
         "INSERT INTO episodes(id, session_id, title, summary) "
@@ -59,6 +60,13 @@ def test_export_import_roundtrip(tmp_path):
         ).fetchone()["summary"] == "did stuff"
         # Edge is queryable through the timeline API.
         assert any(e.object == "postgres" for e in dst.timeline("app"))
+        # Bi-temporal validity interval survived the round-trip (schema v15).
+        edge = dst.conn.execute(
+            "SELECT valid_at, invalid_at FROM knowledge_graph "
+            "WHERE subject_canonical='app' AND object_canonical='postgres'"
+        ).fetchone()
+        assert edge["valid_at"] == "2024-03-15 00:00:00"
+        assert edge["invalid_at"] is None
         # FTS triggers fired on import → chunk and procedure are searchable.
         ctx = dst.augment("postgres deploy staging")
         assert any("postgres" in h.text for h in ctx.fts_hits)
