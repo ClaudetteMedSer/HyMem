@@ -193,10 +193,29 @@ LOCAL_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 LOCAL_EMBED_DIM = 384
 LOCAL_EMBED_API_KEY = "local"
 
-ANSWERING_SYSTEM_PROMPT = """You are an AI assistant answering questions based on retrieved memories from past conversations.
-Answer the question concisely using ONLY the provided context. 
+# Recency-conflict resolution (KU lever). message_hits are stamped with their date
+# in the answer context (see the context builder in answer_question), so when a
+# fact was UPDATED over time the model can prefer the newest *value-bearing*
+# statement. The KU probe (benchmarks/ku_probe.py) showed every strict KU miss is
+# "present-but-not-latest": the new value IS retrieved, but a later turn merely
+# RE-MENTIONS the topic without restating the value (37/37 spoiler turns were
+# tangential, zero stale re-assertions), so naive latest-date-wins would pick the
+# wrong turn. This clause makes recency VALUE-AWARE — a later mention carrying no
+# value does not override an earlier turn that states one. Label-free (reads no
+# question_type), always-on, and inert for single-value categories (never fires
+# without a genuine multi-date conflict). Appended to BOTH default prompts because
+# the headline config runs the permissive default.
+RECENCY_CONFLICT_CLAUSE = (
+    "\nSome memories are stamped with their date, e.g. [MEM 2023-11-30]. When the same fact "
+    "appears with different values at different dates, use the value from the MOST RECENT memory "
+    "that actually states that value — a later memory that only mentions the topic without giving "
+    "the value does NOT override an earlier one that does."
+)
+
+ANSWERING_SYSTEM_PROMPT = ("""You are an AI assistant answering questions based on retrieved memories from past conversations.
+Answer the question concisely using ONLY the provided context.
 If the context doesn't contain the answer, say "I don't have enough information to answer this question."
-Do not make up information. Do not use outside knowledge."""
+Do not make up information. Do not use outside knowledge.""" + RECENCY_CONFLICT_CLAUSE)
 
 ANSWERING_PREFERENCE_PROMPT = """You are an AI assistant answering questions based on retrieved memories from past conversations.
 The context contains personal information about the user (preferences, possessions, habits, experiences).
@@ -218,12 +237,12 @@ If the context contains NO relevant personal information about the user, say "I 
 # know" when the context lacks the asked information, so the `*_abs` slice is not
 # silently traded away. Whether it IS traded away is what the broken-out
 # abstention report measures.
-ANSWERING_PERMISSIVE_PROMPT = """You are an AI assistant answering questions based on retrieved memories from past conversations.
+ANSWERING_PERMISSIVE_PROMPT = ("""You are an AI assistant answering questions based on retrieved memories from past conversations.
 The context contains personal information about the user (preferences, possessions, habits, experiences, history).
 Use this personal information to give a helpful, personalized answer to the question.
 For recommendations, suggestions, or advice you MAY draw on general knowledge — but ground the answer in what the context actually tells you about the user.
 If the context contains NO information relevant to what the question asks, say "I don't have enough information to answer this question."
-Do not invent specific facts about the user (names, dates, numbers, events) that the context does not support."""
+Do not invent specific facts about the user (names, dates, numbers, events) that the context does not support.""" + RECENCY_CONFLICT_CLAUSE)
 
 ANSWERING_MR_PROMPT = """You are an AI assistant answering questions based on retrieved memories from multiple conversation sessions.
 The question requires counting or aggregating information across sessions.
@@ -527,6 +546,9 @@ class HyMemAdapter:
                     "content": f"[{role}] {text}",
                     "type": "message_hit",
                     "confidence": 0.7,
+                    # created_at carried through so the answer context can date-stamp
+                    # each turn — the signal the value-aware recency clause relies on.
+                    "created_at": getattr(hit, "created_at", "") or "",
                 })
 
         fts_hits = []
@@ -660,7 +682,14 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         content = m["content"]
         if total_chars + len(content) > context_limit:
             break
-        tag = "[FACT]" if m["type"] == "graph_fact" else "[MEM]"
+        # Date-stamp raw turns (the only tier carrying created_at) so the recency-
+        # conflict clause can prefer the newest value-bearing statement. FACT/fts/
+        # episode tiers stay undated (graph dating deferred — see KU analysis).
+        if m["type"] == "graph_fact":
+            tag = "[FACT]"
+        else:
+            date10 = (m.get("created_at") or "")[:10]
+            tag = f"[MEM {date10}]" if (m["type"] == "message_hit" and date10) else "[MEM]"
         parts.append(f"{tag} {content}")
         total_chars += len(content) + len(tag) + 2
 
