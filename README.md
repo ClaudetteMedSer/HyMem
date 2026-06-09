@@ -12,6 +12,8 @@
 
 **~9,400 lines of Python**, zero npm, zero Docker required.
 
+**Benchmarked on LongMemEval.** On the 500-question LongMemEval-S suite, HyMem scores **67.6% overall on the production path** — the in-library ability router shaping retrieval with *no* oracle labels, so the number reflects what real Hermes gets, not a benchmark-only ceiling. Full table and methodology in [§11](#11-benchmark-results-longmemeval).
+
 ---
 
 ## Quickstart
@@ -161,6 +163,10 @@ hymem/
 │   ├── augment.py      FTS5 + vector + RRF merge + LLM rerank + hybrid graph
 │   │                   ranker (routed + per-candidate fallback branches,
 │   │                   token-overlap entity expansion)
+│   ├── intent.py       detect_ability() router — infers MR/TR question-type from
+│   │                   the query alone (EN+NL regex, label-free) + AbilitySignal
+│   │                   observability, so ability shaping fires in production with
+│   │                   no oracle label
 │   ├── predicate_routing.py  Keyword → predicate mapping for query expansion
 │   ├── conflicts.py    Contradiction detection over the knowledge graph
 │   └── entities.py     Token-based entity matching against knowledge graph
@@ -228,7 +234,7 @@ Dreaming is the offline process that converts raw chat logs into structured know
 4. **Feedback-driven extraction**: Before processing, the runner loads up to 10 recently retracted triples from `extraction_feedback` and injects them into the prompt as negative examples: "DO NOT extract these relationships." This self-corrects past hallucination patterns.
 5. **Entity canonicalization**: Surface forms (e.g., "Postgres", "PostgreSQL", "postgresql") are normalized via Unicode folding, CamelCase splitting, article/parenthetical stripping, and an alias table.
 6. **Knowledge graph upsert + dedup (lock-free embedding)**: New triples insert edges, repeated triples reinforce evidence counters, negations add negative evidence. Before each chunk's persist transaction opens, dedup candidate vectors are batch-embedded *outside* the write lock (`prepare_dedup_vectors`); the in-transaction path then does pure SQL + in-memory cosine only — no embedding-API call ever runs while the SQLite writer lock is held. A new triple that is a near-duplicate of an existing edge (same predicate, one shared endpoint, lexical-sibling varying endpoint, cosine ≥ threshold) attaches its evidence to that edge instead of minting a sibling. **Same-wave collapse**: because `edge_embeddings` only holds *prior-cycle* vectors, sibling variants minted within the *same* dream are also compared against an in-memory pool of edges created earlier in the cycle (same gates), so a `prompt_version` re-extraction wave can't fan a single preference out into many phrasal-variant edges.
-7. **Idempotency**: Each chunk is processed at most once per `prompt_version`. Bump the version string in config and all chunks reprocess with new prompts (see §12 for the re-extraction-surge note).
+7. **Idempotency**: Each chunk is processed at most once per `prompt_version`. Bump the version string in config and all chunks reprocess with new prompts (see §13 for the re-extraction-surge note).
 
 ### Inter-Phase Steps (`dreaming/runner.py`)
 
@@ -281,19 +287,23 @@ AugmentedContext(
     message_hits: list[MessageHit],   # Raw-message keyword hits (see below)
     total_message_matches: int,       # Candidate count for ability="MR" (see below)
     graph_facts: list[GraphFact],     # Ranked knowledge graph edges (see below)
+    temporal_events: list[TemporalEvent], # Date-ordered chronology for ability="TR"
     episodes: list[EpisodeHit],       # Matching episodes
     procedures: list[ProcedureHit],   # Matching procedures
     matched_entities: list[str],      # Entities found in user message
     recent_turns: list[Message],      # Working-memory tier (see below)
+    detected_ability: str | None,     # MR/TR inferred by detect_ability when the host passes no label
+    detected_rule: str | None,        # which router rule fired (observability — see §3 intent.py)
 )
 ```
 
 **Raw-message tier (`message_hits`).** Alongside chunk FTS, `augment()` runs a direct FTS5 keyword search over the raw `messages` table (user/assistant turns), indexed live at ingest — so a turn is recallable across sessions and *before* any dream chunks it, the gap chunk-only FTS leaves. Hits are separate from `fts_hits` (different granularity; non-comparable BM25) and each carries `created_at`/`message_id`. Knob: `message_fts_top_k` (default 5, 0 disables).
 
-**Ability hints (`augment(..., ability=...)`).** An optional question-type hint the host knows and HyMem does not infer; unknown/None values use the default path (byte-for-byte unchanged). It shapes *what HyMem returns*, never how the host answers:
+**Ability hints (`augment(..., ability=...)`).** An optional question-type hint (`IE`, `MR`, `TR`, `SUM`, `IF`, `KU`) that shapes *what HyMem returns*, never how the host answers. An explicit host hint always wins; when the host passes none, `augment()` runs the label-free `detect_ability` router (`query/intent.py`) and fills `MR`/`TR` from the query text alone — so ability shaping fires in production without an oracle label, and the result records `detected_ability` + `detected_rule` for observability. Unknown/None leaves the default path byte-for-byte unchanged.
 
 - **`ability="IF"`** (instruction/step recall — "what steps did I take to implement X?") pulls a wider procedure set (`procedure_top_k_if`, default 10) since procedures are the natural fit.
-- **`ability="MR"`** ("how many X across all my requests?") is an **opt-in counting path** (default off — set `message_fts_aggregate_cap > 0`). LLMs count poorly across a long context, so HyMem does the deterministic part: it restricts to **user** turns (assistant echoes would double-count actions), drops query stopwords (EN + NL), collapses literal restatements (conservative dedup that never merges turns differing by a number or entity — so distinct events aren't under-counted), and returns the **distinct count** in `total_message_matches` plus those turns in `message_hits` as evidence. The count is a *candidate* — one turn may state several items or none — so the host's LLM verifies it against the turns; it stays exact even when evidence is capped. Off by default because keyword counting only fits *lexical* "how many" questions; semantic ones ("how many different ways…") need the answering LLM.
+- **`ability="MR"`** ("how many X across all my requests?") is an **opt-in counting path** (default off — set `message_fts_aggregate_cap > 0`). LLMs count poorly across a long context, so HyMem does the deterministic part: it restricts to **user** turns (assistant echoes would double-count actions), drops query stopwords (EN + NL), collapses literal restatements (conservative dedup that never merges turns differing by a number or entity — so distinct events aren't under-counted), and returns the **distinct count** in `total_message_matches` plus those turns in `message_hits` as evidence. The count is a *candidate* — one turn may state several items or none — so the host's LLM verifies it against the turns; it stays exact even when evidence is capped. Crucially the count is **additive** — it layers on top of normal relevance retrieval rather than replacing it — so a mis-routed MR question still gets full context and stays answerable. Off by default because keyword counting only fits *lexical* "how many" questions; semantic ones ("how many different ways…") need the answering LLM.
+- **`ability="TR"`** (temporal reasoning — "what did I do *before* X?", "how long ago?") builds a date-ordered chronology in `temporal_events` from dates extracted at dream time plus session-date anchors on retrieved turns, so the answerer has an explicit timeline instead of guessing order from prose.
 
 The host assembles these pieces into its prompt and **decides ordering** — for single-conversation *task-recall* questions, `message_hits`/`procedures` should outrank `graph_facts`, whose cross-session tool/preference facts can otherwise crowd the context.
 
@@ -509,7 +519,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**295 tests total, 100% passing** across 35 test files:
+**427 tests total, 100% passing** across 41 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling, numeric / temporal value parsing
@@ -540,7 +550,51 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ---
 
-## 11. Comparison with Honcho
+## 11. Benchmark Results (LongMemEval)
+
+HyMem is evaluated end-to-end on **LongMemEval-S**, the standard long-term-memory benchmark: 500 questions across six question types, each answered over a multi-session conversation "haystack" of distractor sessions. The harness (`benchmarks/longmemeval_adapter.py`) runs the *real* pipeline per question — ingest the haystack → optionally dream → `hy.augment()` → the host LLM answers from the returned context → an LLM judge scores it.
+
+**Two numbers, always — and the one that counts is production-truth.** A result is only treated as real if it carries to live Hermes; nothing that reads the oracle `question_type` label (which production does not have) is allowed to drive the score. So every run reports both:
+
+- **Oracle** — the question-type label drives retrieval shaping. The category ceiling.
+- **Production-truth (`--auto-ability`)** — the in-library `detect_ability` router (`query/intent.py`, §3) infers the ability from the query alone, label-free, exactly as it does in Hermes. The honest number.
+
+**Production-truth: 67.6% overall** on the full 500-question suite (auto-ability router; permissive, abstention-guarded default answer prompt; recency-dated raw-message context). Dreaming is off for these runs — it is score-neutral on LongMemEval's single-haystack setup and is kept on in production for the cross-session knowledge graph LongMemEval can't see (§8). Answering and judging use the default DeepSeek model.
+
+| Question type | Score |
+|---|---|
+| Single-session-user (SS-U) | 95.7% |
+| Knowledge-update (KU) | 75.6% |
+| Temporal-reasoning (TR) | 72.9% |
+| Single-session-assistant (SS-A) | 66.1% |
+| Single-session-preference (SS-P) | 60.0% |
+| Multi-session (MS) | 45.1% |
+| **Overall** | **67.6%** |
+
+For context, published LongMemEval figures place this local, embedded, SQLite-only system ahead of Honcho (63.8) and the RAG / LIGHT baselines (48.5 / 51.7); the frontier system (Hindsight, 89.4) leads almost entirely on **multi-session** — which is exactly HyMem's lowest row and its open frontier (below).
+
+**What drives the score — every lever carries to production, none reads the oracle label:**
+
+- **Raw-message FTS tier** (`message_hits`, schema v13, §6) — a direct BM25 index over raw turns, recallable across sessions and *before* any dream consolidates them. Historically the single biggest jump.
+- **Label-free ability routing** (`detect_ability`, EN+NL regex, §3) — fills MR/TR shaping in production with no oracle label. MR layers a deterministic, **additive** user-turn count on normal retrieval (a false-positive route stays harmless — retrieval is never suppressed); TR injects a date-ordered chronology.
+- **Recency-dated context** — `message_hits` are stamped with their `created_at`, plus a value-aware recency clause so the answerer prefers the most recent turn that actually *states* a value rather than a later tangential mention. Lifted knowledge-update from 62.8% → 75.6%.
+- **Permissive, abstention-guarded default prompt** — recovers single-session-preference questions the strict prompt refused, while holding the abstention guard tight on single-turn facts.
+
+**The open frontier is multi-session (45.1%).** Extensive LLM-free probing established that MS *retrieval* is effectively closed — the gold turns do reach the answer context; the residual is cross-session **synthesis** (a reader problem, not retrieval) plus a small floor of facts buried as incidental asides inside otherwise off-topic turns. One tempting "fix" (a user-only context filter for MR) was built, measured, and **reverted**: it was neutral on its target and dropped assistant-turn gold on MR-misrouted single-session-assistant questions — a worked example of the project's rule that you never *suppress* retrieval on a routed ability that has false positives, only *add* to it. The full investigation, including dead-ends not to re-chase, lives in `benchmarks/longmemeval_roadmap.md`.
+
+**Reproduce:**
+
+```bash
+# production-truth (the 67.6% headline)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
+    --workers 4 --no-dream --permissive-default
+# oracle ceiling (question-type label drives shaping)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8
+```
+
+---
+
+## 12. Comparison with Honcho
 
 | Dimension | HyMem | Honcho (plastic-labs) |
 |---|---|---|
@@ -566,7 +620,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ---
 
-## 12. Limitations & Known Gaps
+## 13. Limitations & Known Gaps
 
 - **Python cosine fallback**: sqlite-vec is the primary vector search path (vec0 KNN over `vec_chunks` / `vec_edges` / `vec_episodes`), but the extension isn't available on every platform. When it's not loadable, retrieval falls back to a pure-Python cosine scan capped at `embedding_max_scan` chunks (default 5000); on installs where the extension is missing, vector search degrades beyond that cap.
 - **No streaming**: The Honcho server doesn't implement SSE streaming for chat responses.
