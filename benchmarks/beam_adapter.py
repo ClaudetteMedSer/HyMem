@@ -31,7 +31,7 @@ sys.path.insert(0, str(_repo_root))
 
 import requests as http
 
-# ── Config ──────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────
 
 DEFAULT_SCALE = "100K"
 DEFAULT_SAMPLE = 3
@@ -44,10 +44,21 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 ANSWER_MODEL = "deepseek-chat"
 JUDGE_MODEL = "deepseek-chat"
 
-ANSWERING_SYSTEM_PROMPT = """You are an AI assistant answering questions based on retrieved memories.
-Answer the question concisely using ONLY the provided context. 
-If the context doesn't contain the answer, say "I don't have enough information to answer this question."
-Do not make up information. Do not use outside knowledge."""
+# Recency-conflict resolution — imported from the LME adapter's dating fix.
+# When a fact was UPDATED over time, the model can prefer the newest *value-bearing*
+# statement. A later turn that only mentions the topic without restating the value
+# does NOT override an earlier one that does.
+RECENCY_CONFLICT_CLAUSE = (
+    "\nSome memories are stamped with their date, e.g. [MEM 2023-11-30]. When the same fact "
+    "appears with different values at different dates, use the value from the MOST RECENT memory "
+    "that actually states that value — a later memory that only mentions the topic without giving "
+    "the value does NOT override an earlier one that does."
+)
+
+ANSWERING_SYSTEM_PROMPT = ("You are an AI assistant answering questions based on retrieved memories.\n"
+"Answer the question concisely using ONLY the provided context.\n"
+"If the context doesn't contain the answer, say \"I don't have enough information to answer this question.\"\n"
+"Do not make up information. Do not use outside knowledge." + RECENCY_CONFLICT_CLAUSE)
 
 ANSWERING_PREFERENCE_PROMPT = """You are an AI assistant answering questions based on retrieved memories from past conversations.
 The context contains personal information about the user (preferences, possessions, habits, experiences).
@@ -100,7 +111,7 @@ PUBLISHED_SOTA = {
 }
 
 
-# ── LLM Client ──────────────────────────────────────────────────────
+# ── LLM Client ────────────────────────────────────────────────────────────
 
 class LLMClient:
     def __init__(self, model: str, api_key: str):
@@ -137,7 +148,7 @@ class LLMClient:
         return data["choices"][0]["message"].get("content", "")
 
 
-# ── BEAM Dataset Loader ─────────────────────────────────────────────
+# ── BEAM Dataset Loader ───────────────────────────────────────────────
 
 def load_beam_conversations(scales: list[str], max_conv: int = None) -> dict:
     from datasets import load_dataset
@@ -210,7 +221,7 @@ def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
     }
 
 
-# ── HyMem Integration ───────────────────────────────────────────────
+# ── HyMem Integration ───────────────────────────────────────────────────────
 
 class HyMemAdapter:
     """Direct HyMem Python API adapter with isolated temp DB."""
@@ -311,6 +322,9 @@ class HyMemAdapter:
                     "type": "message_hit",
                     "confidence": 0.7,
                     "_score": score,
+                    # created_at carried through so the answer context can date-stamp
+                    # each turn — the signal the value-aware recency clause relies on.
+                    "created_at": getattr(hit, "created_at", "") or "",
                 })
 
         procedure_hits = []
@@ -351,7 +365,7 @@ class HyMemAdapter:
                     "confidence": 0.4,
                 })
 
-        # ── Order by ability ──────────────────────────────────────────
+        # ── Order by ability ──────────────────────────
         # Task-recall abilities (IF/MR/EO/SUM): the question is "what did
         # the user do / what steps / in what order / summarize" — raw
         # message hits and procedures are the most relevant sources.
@@ -428,7 +442,14 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         content = m["content"]
         if total_chars + len(content) > context_limit:
             break
-        tag = "[FACT]" if m["type"] == "graph_fact" else "[MEM]"
+        # Date-stamp raw turns (the only tier carrying created_at) so the recency-
+        # conflict clause can prefer the newest value-bearing statement. FACT/fts/
+        # episode tiers stay undated (graph dating deferred).
+        if m["type"] == "graph_fact":
+            tag = "[FACT]"
+        else:
+            date10 = (m.get("created_at") or "")[:10]
+            tag = f"[MEM {date10}]" if (m["type"] == "message_hit" and date10) else "[MEM]"
         parts.append(f"{tag} {content}")
         total_chars += len(content) + len(tag) + 2
 
@@ -487,7 +508,7 @@ def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_ans
     return {"score": 0.0, "scores": []}
 
 
-# ── Evaluation ──────────────────────────────────────────────────────
+# ── Evaluation ───────────────────────────────────────────────────────
 
 def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter,
                           conv: dict, top_k: int) -> dict:
@@ -498,92 +519,97 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
     # Ingest
     print(f"  Ingesting conv {conv_id} ({len(conv['messages'])} msgs)...", flush=True)
     stats = hy.ingest(session_id, conv["messages"])
+    print(f"    Ingested: {stats['total_msgs']} msgs, {stats['total_chars']} chars", flush=True)
 
     # Dream
-    print(f"    Running dream cycle...", flush=True)
+    print(f"  Dreaming...", flush=True)
     hy.dream_and_wait()
 
-    # Evaluate questions
+    # Evaluate each question
     results = []
     for qi, q in enumerate(conv["questions"]):
-        print(f"    [{qi+1}/{len(conv['questions'])}] {q['ability_short']}: {q['question'][:80]}...", flush=True)
+        ability = q["ability_short"]
+        question = q["question"]
+        print(f"    [{qi+1}/{len(conv['questions'])}] {ability}: {question[:100]}...", flush=True)
 
-        memories, total_matches = hy.search(session_id, q["question"], ability=q["ability_short"], top_k=top_k * 3)
-        ai_answer = answer_question(llm, memories, q["question"], q["ability_short"], total_matches)
-        judgment = judge_answer(judge_llm, q["question"], q["ideal_answer"], q["rubric"], ai_answer)
+        # Search
+        memories, total_matches = hy.search(session_id, question, ability=ability, top_k=top_k)
+        print(f"      {len(memories)} memories", end="")
+        if total_matches > 0:
+            print(f" (total matches: {total_matches})", end="")
+        print()
+
+        # Answer
+        answer = answer_question(llm, memories, question, ability, total_matches)
+
+        # Judge
+        judge_result = judge_answer(judge_llm, question, q["ideal_answer"], q["rubric"], answer)
+        print(f"      Score: {judge_result['score']:.2f}")
 
         results.append({
-            "ability": q["ability_short"],
-            "question": q["question"][:200],
-            "score": judgment["score"],
+            "ability": ability,
+            "question": question,
+            "answer": answer,
+            "score": judge_result["score"],
+            "scores": judge_result["scores"],
         })
-        metrics = f"{len(memories)} memories"
-        if total_matches > 0:
-            metrics += f" (total matches: {total_matches})"
-        print(f"      Score: {judgment['score']:.2f} ({metrics})", flush=True)
 
-    return {"scale": scale, "conversation_id": conv_id, "stats": stats, "results": results}
+    return {
+        "conv_id": conv_id,
+        "scale": scale,
+        "questions": results,
+    }
 
 
 def compute_scores(all_results: list[dict]) -> dict:
-    by_scale_ability = defaultdict(lambda: defaultdict(list))
-    for conv_result in all_results:
-        scale = conv_result["scale"]
-        for r in conv_result["results"]:
-            by_scale_ability[scale][r["ability"]].append(r["score"])
+    per_scale = defaultdict(lambda: defaultdict(list))
+    for conv in all_results:
+        scale = conv["scale"]
+        for q in conv["questions"]:
+            per_scale[scale][q["ability"]].append(q["score"])
+            per_scale[scale]["OVERALL"].append(q["score"])
 
     summary = {}
-    for scale, abilities in by_scale_ability.items():
-        scale_scores = {}
-        all_sc = []
+    for scale, abilities in per_scale.items():
+        summary[scale] = {}
         for ab, scores in abilities.items():
-            avg = sum(scores) / len(scores) if scores else 0.0
-            scale_scores[ab] = {"avg": avg, "count": len(scores)}
-            all_sc.extend(scores)
-        overall = sum(all_sc) / len(all_sc) if all_sc else 0.0
-        scale_scores["OVERALL"] = {"avg": overall, "count": len(all_sc)}
-        summary[scale] = scale_scores
+            summary[scale][ab] = {
+                "avg": sum(scores) / len(scores),
+                "count": len(scores),
+            }
     return summary
 
 
-def print_report(ability_summary: dict, metadata: dict):
-    ABILITIES = ["IE", "MR", "KU", "TR", "ABS", "CR", "EO", "IF", "PF", "SUM"]
+def print_report(summary: dict, config: dict):
+    print()
+    print("=" * 80)
+    print("  HYMEM BEAM END-TO-END RESULTS")
+    print(f"  Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"  LLM: {config['answer_model']} / Judge: {config['judge_model']}")
+    print(f"  Conversations: {config['sample_size']}")
+    print(f"  Top-K: {config['top_k']}")
+    print("=" * 80)
 
-    print(f"\n{'='*80}")
-    print(f"  HYMEM BEAM END-TO-END RESULTS")
-    print(f"  Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"  LLM: {metadata.get('answer_model')} / Judge: {metadata.get('judge_model')}")
-    print(f"  Conversations: {metadata.get('sample_size')}")
-    print(f"  Top-K: {metadata.get('top_k', DEFAULT_TOP_K)}")
-    print(f"{'='*80}")
-
-    print(f"\n  Per-Ability Scores:")
-    header = f"  {'Scale':<8} {'OVERALL':>8}"
-    for ab in ABILITIES:
-        header += f" {ab:>6}"
-    print(header)
-    print(f"  {'-'*len(header)}")
-
-    for scale in sorted(ability_summary.keys()):
-        scores = ability_summary[scale]
-        overall = scores.get("OVERALL", {}).get("avg", 0.0)
-        line = f"  {scale:<8} {overall*100:>7.1f}%"
-        for ab in ABILITIES:
-            s = scores.get(ab, {}).get("avg", 0.0)
-            line += f" {s*100:>5.1f}%"
-        print(line)
+    for scale, abilities in summary.items():
+        print(f"\n  Scale {scale}:")
+        headers = ["IE", "MR", "KU", "TR", "ABS", "CR", "EO", "IF", "PF", "SUM"]
+        print("  " + " ".join(f"{h:>7}" for h in headers) + "  OVERALL")
+        print("  " + "-" * (7 * len(headers) + 9))
+        scores = []
+        for h in headers:
+            s = abilities.get(h, {}).get("avg", None)
+            scores.append(f"{s*100:>6.1f}%" if s is not None else "     —")
+        ov = abilities["OVERALL"]["avg"]
+        print("  " + " ".join(scores) + f"  {ov*100:>6.1f}%")
 
     print(f"\n  SOTA Comparison:")
-    for scale in sorted(ability_summary.keys()):
-        hy_overall = ability_summary[scale].get("OVERALL", {}).get("avg", 0.0)
-        sota = PUBLISHED_SOTA.get(scale, {})
-        print(f"  {scale}:  HyMem {hy_overall*100:.1f}%", end="")
-        for name, score in sota.items():
-            print(f"  |  {name} {score:.1f}%", end="")
-        print()
+    for scale in summary:
+        if scale in PUBLISHED_SOTA:
+            ours = summary[scale]["OVERALL"]["avg"] * 100
+            print(f"  {scale}:  HyMem {ours:.1f}%  |  ", end="")
+            sota_parts = [f"{name} {val}%" for name, val in PUBLISHED_SOTA[scale].items()]
+            print("  |  ".join(sota_parts))
 
-
-# ── Main ────────────────────────────────────────────────────────────
 
 def main():
     global DEEPSEEK_API_KEY
