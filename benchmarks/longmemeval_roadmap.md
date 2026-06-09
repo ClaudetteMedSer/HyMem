@@ -77,6 +77,28 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   `AugmentedContext.message_hits`, knob `message_fts_top_k`. **The single biggest
   historical win** (overall 15.2→38.0 on the early BEAM run). Raw turns are searchable
   before any dream consolidates them.
+- **Dutch FTS diacritic fix 2026-06-08 (carry-clean bug fix; query side only, no migration,
+  no dep).** The FTS5 `unicode61` index FOLDS diacritics ("café"→"cafe"), but the query
+  sanitizer `_FTS_SAFE` was an ASCII-only whitelist that SHREDDED accented query tokens before
+  they reached FTS ("café"→"caf" = 0 hits; "coördinatie"→"co" OR "rdinatie" = 0 hits). So every
+  accented Dutch/loanword query silently missed while the index held the folded form — a real
+  retrieval bug, Dutch-prioritized. Fix: new `_fold_diacritics()` (NFKD + drop combining marks)
+  applied at ALL SIX FTS query sites (chunks/messages/aggregate/temporal/episodes/procedures),
+  so query and index agree. Recall is now accent-INSENSITIVE both directions. Covers the full
+  Dutch diacritic set (ë ï ö é ü á è); precomposed non-decomposing Latin letters (ø ß æ — not
+  Dutch) are a known out-of-scope residual. `entities.py` was already accent-safe (Unicode
+  `_TOKEN` + `normalize`), so the bug was isolated to `_FTS_SAFE`. Tests:
+  `test_accented_query_recalls_accented_message`, `test_accent_insensitive_both_directions`;
+  full retrieval suite (208) green. **MEASUREMENT CAVEAT: there is NO Dutch eval set (LME/BEAM
+  are English), so Dutch FTS is validated by correctness + unit tests, not a benchmark delta.**
+  **BIGGER DUTCH LEVER STILL OPEN (needs a decision): stemming (boeken≠boek).** Porter is
+  English-only and stdlib `sqlite3` can't register a custom FTS5 tokenizer (needs apsw/C ext,
+  fights pip-install ease), so Dutch inflection isn't conflated. Options: query-side morphological
+  expansion (driver-agnostic, fragile against the Porter index) vs. replace Porter with a
+  bilingual scheme (migration + English-stemming risk). **DECISION 2026-06-08: DEFERRED until a
+  Dutch eval set exists** — tuning stemming with no benchmark to measure it would be blind work
+  (the same measure-first discipline applied to D4/router). The diacritic fix stands as the
+  complete, high-confidence Dutch FTS deliverable for now.
 - **`created_at` end-to-end (was a live data-loss bug).** `append_message` dropped the
   timestamp → every row got ingestion-time, making all chronological ordering wrong and
   TR structurally unanswerable. Threaded through `log_message(s)`, `app.py`,
@@ -102,9 +124,87 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   noun + adverbial ordinal, determiner-guarded for EN+NL), new `_TR_DISTANCE` ("N units
   ago", "last week"), `_TR_RECENCY` ("when did I last/first…"), `_TR_DURATION` perfect-aux.
   **TR router recall 38% → 92%, precision 86%.** +80-odd cases in `test_intent.py`.
+- **Router TR polish (round 3) 2026-06-08.** Targeted the router-eval TR residual misses where
+  TR SHAPING actually helps (carry-clean, not oracle-chasing). (1) **Activity durations:** added
+  spend/take verbs (`_TR_DUR_VERB`, EN+NL) to `_TR_DUR_END` so a single-activity span with no
+  between/after/ago anchor routes TR — "how many days did I spend on my camping trip", "how many
+  days did it take to finish X" (were `mr_count`), "how long did I take to finish X and Y" (was
+  `none` via `_TR_HOWLONG`). "last/lasted" deliberately excluded (collides with "last week").
+  (2) **`_TR_AGE`:** "how old was I WHEN I moved" → age-at-event = two-point temporal calc (rule
+  `tr_age`); guarded by the "when/toen" clause so "how old is my laptop" stays None. (3) **`_MR_TOTAL_CUE`
+  guard (rule `mr_total`, checked FIRST):** an explicit "in total"/"altogether" sum cue on a count
+  opener is aggregation across events (MR), so "how many hours have I spent … in total" (oracle MR,
+  was mis-firing TR via the new spend verb) correctly stays MR — this resolves the TR/MR duration
+  overlap DEFERRED from the precision round. Predicted on real eval rows: 4 TR misses recovered + 1
+  MR mis-fire corrected; existing overlap guards (between-anchor TR, count-with-timeframe MR,
+  duration-to-now TR) all hold. **SKIPPED (TR shaping wouldn't help → would be oracle-chasing):**
+  recurring time-of-day ("what time do I wake up on Tuesdays"), superlative-over-period ("which
+  airline did I fly most in March"), count-before-event ("how many charity events before X" — left
+  to additive-MR). +5 test groups; full suite green. **MEASURED (box, S/500): TR recall 92→95%
+  (+3pp, the 4 targeted spend/take/age rows flipped to TR exactly); MR recall 83→81% (−2pp, 3
+  duration-shaped oracle-MR Qs shifted to TR); TR precision 82→79% (+4 FP across tr_howlong/
+  tr_duration/tr_age); `mr_total` works (2 FP, both on abstention Qs).** **VERDICT: ACCEPT — the
+  TR precision drop is a TAXONOMY ARTIFACT, not production harm, confirming the same pattern as the
+  `mr_count` precision round.** The 4 TR FPs ("how long to assemble the IKEA bookshelf", "how old
+  when grandma gave me the necklace") are linguistically-correct duration/age routings scored as FPs
+  ONLY because the oracle labels them single-session by ANSWER-LOCATION, which production cannot see.
+  TR shaping is ADDITIVE (augment.py: "the other tiers (graph/fts/messages) still run unchanged" — TR
+  only appends `temporal_events`), so a TR FP is near-harmless like an additive-MR FP: a short/empty
+  timeline layered on otherwise-full retrieval; the 3 MR→TR shifts keep full normal retrieval too.
+  **GENERALIZED LESSON (now seen TWICE): router precision against LME systematically UNDERSTATES
+  production quality — the labels encode answer-location the router can't access, and both MR and TR
+  shaping are additive so misroutes don't suppress retrieval. Production-truth = end-to-end accuracy
+  (full LME run), NOT router precision. Do NOT tighten tr_age/tr_duration to chase it — the only
+  suppressor is reading answer-location = gaming.** Router work COMPLETE.
 - **`benchmarks/router_eval.py`.** Zero-LLM sweep of `detect_ability` vs oracle over the
   full dataset (seconds on the box) + per-intent residual-miss listing. Tight tuning loop
   decoupled from the expensive retrieval+judge run.
+- **Router hardening 2026-06-08 (production robustness + observability; NOT yet the
+  precision/recall round).** Carry-clean — `detect_ability` IS the production path, so all
+  of this lands in real Hermes. (a) **Robustness:** `_prepare()` now NFC-normalises input
+  (composed vs decomposed Dutch diacritics match one way), tolerates non-str/blank input as
+  an abstain instead of raising (it sits on every augment() hot path — must never crash the
+  host on a malformed turn), and clips the scan to `_MAX_SCAN_CHARS=4096` so the lazy
+  `[\s\S]*?` TR bridges can't rescan a multi-KB paste to EOS at every start position (the
+  intent opener always sits at the question start, so a bounded prefix is both where the
+  signal lives AND a worst-case cost cap). (b) **Observability:** new `AbilitySignal(ability,
+  rule)` + `detect_ability_signal()` name the firing branch (tr_duration/tr_howlong/tr_order/
+  tr_recency/mr_count/tr_distance, or none/empty/non_str); `detect_ability` is now a thin
+  wrapper. `augment()` records `ctx.detected_rule` alongside `detected_ability`, so a
+  production misroute ("why did this get MR-shaped?") is diagnosable from the result object
+  alone. `router_eval.py` prints the firing rule per residual-miss/FP and a by-rule FP tally
+  (names the worst-over-firing pattern). +5 hardening + 1 observability test groups in
+  `test_intent.py` (non-str/blank/oversized/near-miss-no-hang/NFC + per-rule signal); all
+  green on the Mac.
+- **Router precision/recall round 2026-06-08 (measured on box, S/500).** Eval: MR recall 74%
+  (89/121) precision 55% (89/163); TR recall 92% precision 82%; 89 FPs, **`by rule: mr_count=70`**.
+  **KEY FINDING — the 55% MR precision is a MEASUREMENT ARTIFACT, not a defect; HOLD `mr_count`,
+  do NOT chase precision.** "MR target" = `multi-session` ONLY (per `QUESTION_TYPE_TO_ABILITY`);
+  the 70 `mr_count` FPs are `single-session-user`/`-preference` (→IE/PF→NONE) questions that are
+  textually COUNT questions ("how many playlists do I have", "how much did I spend on a handbag")
+  — oracle calls them NONE-target purely by ANSWER-LOCATION (answer lives in one session), a label
+  production does NOT have. "How many playlists" is the same string whether the answer sits in one
+  session or ten. Tightening `mr_count` to suppress them = overfitting to the session-location
+  oracle label = the exact gaming the carry-over constraint forbids, AND costs real MR recall, AND
+  undoes additive-MR (`mr_aggregate_additive`, default True) which already makes a false MR route
+  near-harmless (count layers on relevance retrieval). The real MR metric is end-to-end accuracy
+  under additive-MR (the full LME run), not router precision. **ACTION TAKEN — recall only:** new
+  `_MR_AGGREGATE` pattern + rule `mr_aggregate` for aggregation phrasing with NO count opener
+  ("total amount I spent" — `_MR_COUNT` needs "amount OF"; "what percentage"; "on average"; EN+NL),
+  same MR aggregate path, separate rule so its recall/FP is measurable independently. +3 test groups
+  (aggregation positives, own-rule reporting, precision guards); all green. **DEFERRED to TR polish:**
+  the TR/MR duration-overlap misses ("how many days did I spend on my camping trip" → mr_count steals
+  oracle TR) — genuinely ambiguous (inverse "how many hours have I spent...in total" is oracle MR), so
+  it belongs in the TR round, not a half-fix here. **MEASURED (box, S/500): clean recall-only win.
+  MR recall 74→83% (+9pp, 12 misses recovered: "total amount", "difference in price", "average
+  age/GPA", "percentage discount"); MR precision 55→57% (UP — recall gain outpaced FP cost); TR
+  flat 92%/82%; `mr_count` FPs held at exactly 70; `mr_aggregate` added only 2 FPs (total 89→91).**
+  The lone notable `mr_aggregate` FP is an `_abs` Q ("total cost of my headphones and the iPad") —
+  harmless: it's genuinely aggregation-shaped, and on an abstention Q additive-MR just layers a
+  candidate count that comes back empty (reinforcing, not breaking, abstention). The remaining 20
+  MR misses are NONE-type (no aggregation marker) or the deferred TR/MR duration overlap. **Router
+  hardening COMPLETE** (robustness + observability + precision/recall); residual MR recall lives in
+  the duration overlap, owned by the TR-polish round.
 
 ### MR / counting
 - **`message_fts_aggregate_cap` lexical-count path.** user-only filter, EN+NL stopword
@@ -120,6 +220,25 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   `COUNT(DISTINCT subject|object)` over the KG, mirror-orientation retry, abstains on
   zero-evidence. Fires only on the tech vocabulary → helps real-Hermes in-domain use,
   **None on all LME** (consumer domain) by design.
+
+### Answer-context shaping
+- **KU recency-dating lever 2026-06-09 (prompt-only, SHIPPED, carry-clean).** Two changes in
+  `answer_question`: (1) date-stamp each `message_hit` with its `created_at` in the answer context
+  (`[MEM 2023-11-30] …`); raw turns are the only tier carrying `created_at` (FACT/fts/episode stay
+  undated, graph dating deferred). (2) Append a **value-aware recency clause** to BOTH default
+  prompts (`ANSWERING_SYSTEM_PROMPT` strict + `ANSWERING_PERMISSIVE_PROMPT`): *"use the value from
+  the most recent memory that actually states it; a later memory that only mentions the topic without
+  giving the value does not override it."* **Why it works (probed by `ku_probe.py` before any run):**
+  strict KU misses are "present-but-not-latest" — the new value IS retrieved, but a later turn merely
+  re-mentions the topic without the value (37/37 spoiler turns tangential, 0 stale re-assertions), so
+  naive latest-date-wins is wrong; value-aware recency fixes it. Dating helps the model pick among what
+  it already SEES. **MEASURED (full 500, seed 0, auto-ability, no-dream):** STRICT **overall +5.4pp
+  (58.6→64.0), KU +11.5pp (56.4→67.9)** — both outside the variance band, real; TR +6.0, MS +5.3 also
+  gained (date stamps add recency awareness), SS-U flat 92.9 (clause inert without a multi-date conflict
+  = cleanest no-regression evidence); no regressions. PERMISSIVE (shipping) **overall +2.2pp
+  (65.4→67.6), KU +12.8pp (62.8→75.6)** — the clause STACKS on permissive, abstention held 70%. **Carry
+  to production:** HyMem already exposes `MessageHit.created_at` (docstring names this use case), so
+  Hermes date-stamps its context + carries the clause; no HyMem change — the adapter is the reference impl.
 
 ### Ordering / dream
 - **Message-first default ordering (the carry-over fix).** Inverted the default so
@@ -224,6 +343,15 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   TR is strong (92% recall); guarding risks the recall.
 - **D8. Q45-class entity-precision misses** ("model grabs niece vs cousin"). Reader
   precision, not a retrieval/temporal gap. Low ROI at current n.
+- **D9. KU ranking / top_k / budget / rerank as a lever.** `ku_probe.py --ranking` (72 KU items,
+  the recall-ceiling "ranking miss" disambiguated by reconstructing the final answer context offline)
+  found **B=0** — the gold turn reaches the answer context in 70/72, IDENTICALLY under raw BM25 and
+  the LLM reranker. So KU's residual is NOT truncation and NOT reranker-demotion (`rerank_message_hits`
+  gains nothing, no B→C flips). The ~23 remaining KU misses are **synthesis** (gold in context, model
+  still wrong — a few are judge noise per [[project_lme_variance_band]], real core ~17-21) + **2 recall
+  misses**. Don't spend a run on KU ranking/top_k/budget/rerank — exhausted. The dating lever (§2) is
+  the KU win; further KU gains would need conflict-resolution prompt strength or the 2 recall misses,
+  both low-yield.
 
 ---
 
@@ -407,6 +535,60 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
 - **L4. Permissive/abstention-aware default answer prompt (harness, optional, gated).**
   Only if a clean banked benchmark number is wanted — run WITH the `*_abs` slice broken
   out (see D4). Not load-bearing for the HyMem conclusion.
+- **L5. MR dead-filter fix — the active MS lever 2026-06-09 (carry-clean, one-region fix).**
+  **The bug:** `answer_question` builds `context` from the FULL `memories` (incl. assistant turns),
+  freezes it, THEN — too late — reassigns `memories` to a user-only filter that nothing reads
+  ([longmemeval_adapter.py:696](longmemeval_adapter.py#L696) freeze, [:713](longmemeval_adapter.py#L713)
+  dead reassign). So MR-shaped questions see assistant-polluted context despite the MR preamble claiming
+  "assistant echoes excluded" (line 665) — the preamble lies about what the model sees. **Probed before
+  fixing (`ku_probe.py --ms`, n=121, both raw BM25 and reranker ON):** ability distribution **MR=98 (81%),
+  None=13, TR=10** — MR is the overwhelming share of MS, so the blast radius is huge. A/B/C: **A 8-10,
+  B=0, C 111-113** — gold reaches context, residual is in-context. Dead-filter what-if over the 98
+  MR-detected (avg **53% assistant noise** in context): **SAFE 92 (every gold turn is a user message —
+  filter keeps gold, drops noise) · RISK 0 (no gold is an assistant turn that would be dropped) · n/a 6
+  (gold not retrieved anyway = A-bucket).** SAFE dominates, RISK is exactly zero, over half the MR context
+  is wasted assistant echo. **The fix:** apply the user-only filter to the iteration list BEFORE the
+  context-build loop (not after the freeze), keeping the existing "no user messages → fall back to default
+  prompt + unfiltered context" guard. **Carry-clean:** the filter is keyed on the production `detect_ability`
+  → MR route (not the oracle label) and on message role, both of which Hermes has. Reranker side-note: the
+  LLM reranker slightly HELPS MS (A 10→8), unlike KU where it was neutral — consistent with
+  `rerank_message_hits` being net-positive for MR.
+  - **KILLED — MEASURED 2026-06-09 (full 500, seed 0, auto-ability, strict + permissive, dating-only vs
+    dating+filter). REVERTED.** The filter is **neutral on its MS target** (permissive 45.1→45.1; strict
+    44.4→42.9, within the [[project_lme_variance_band]]) — confirming the 53% assistant noise was NOT
+    hurting the model; it ignored/padded with it. But **overall slips −1.4pp in BOTH postures** and the
+    damage lands on **non-MR-target categories**, uniformly negative, largest on **SS-A (−5.4 strict /
+    −7.2 permissive)**. **Root cause (the probe's blind spot):** under `--auto-ability` the filter fires
+    on the *route* (`detect_ability == MR`), and that route has FALSE POSITIVES — count-shaped questions
+    whose true category is SS-A/KU/SS-P (documented: `mr_count` has ~70 FPs, all single-session). For an
+    FP-routed question the filter **SUBTRACTS** the assistant turns from context, and **SS-A =
+    single-session-ASSISTANT** means the gold answer can live in an assistant turn → stripping assistant
+    turns drops the gold. SS-A negative in BOTH postures with the largest magnitude is the fingerprint.
+    **This breaks the additive-MR safety property** (§2 additive-MR / D3): MR false-positives are only
+    tolerable because a false MR route keeps FULL relevance retrieval and just layers a count on top. A
+    user-only context filter makes MR **subtractive**, reintroducing exactly the harm additive-MR was
+    built to neutralize. **The `ku_probe.py --ms` RISK=0 was CATEGORY-conditioned (measured over true-MS
+    questions, where gold is a user turn by nature), not ROUTE-conditioned — it never sampled the MR-FP
+    population from SS-A/SS-P/KU.** **LESSON (bank it): never SUPPRESS/filter retrieval keyed on a routed
+    ability that has false positives — only ADD on it (the additive-MR invariant). The dead user-only
+    filter is harmless precisely BECAUSE it's dead; "fixing" it is a regression.** The dead no-op stays
+    as-is in the adapter; the dating clause (§2) is the real MS-adjacent lever. Cheap post-hoc confirm
+    (no new run): in the run JSON, isolate `detected_ability==MR` ∧ oracle `single-session-assistant`
+    and check the T→F flips between the two runs.
+  - **CONFIRMED 2026-06-09 (the post-hoc check, no new run).** 7 SS-A questions mis-route to MR; the
+    filter flips ALL 4 that were previously correct (Speyer tourism phone number; French-omelette egg
+    count; HAMT avg framerate; Chiefs-vs-Jaguars score) check->wrong; the 3 already-wrong stay wrong.
+    These are "remind me what you told me about X?" questions — gold lives in a past ASSISTANT turn; the
+    router reads them as count/aggregate-shaped ("how many eggs", "average framerate"), MR strips the
+    assistant turns, gold gone. The full SS-A -5.4/-7.2 regression = these 4 flips. **Key corollary:
+    pre-filter these 4 were MR-routed AND correct — additive-MR already absorbed the mis-route (full
+    retrieval kept, answer found). So there is NOTHING to fix in the router; the route was never the
+    problem.** A router "fix" to stop MR-routing "how many eggs" would (a) read answer-location = gaming
+    (per the §2 router rounds / twice-seen lesson: `mr_count` FPs are single-session count-shaped strings
+    the router CANNOT distinguish from real MR — same surface form), and (b) cost real MR recall — both
+    already-rejected dead-ends. **The only error was making MR subtractive. Resolution: MR shaping stays
+    ADDITIVE-ONLY (count layered on full retrieval); the dead user-only filter stays dead. No filter, no
+    router change — done.**
 
 **Sequencing:** L1 done (recall ruled out). L2a KILLED by the gold-rank probe (92% MS gold
 already at BM25 ≤15). L2c DONE → reranker is net-positive (−4.5pp MS when OFF), keep it, L2b

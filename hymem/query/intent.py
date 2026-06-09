@@ -36,6 +36,8 @@ has no temporal unit + anchor, so it stays MR.
 from __future__ import annotations
 
 import re
+import unicodedata
+from dataclasses import dataclass
 
 # --- TR (temporal reasoning) ------------------------------------------------
 #
@@ -75,12 +77,25 @@ _TR_PERFECT_AUX = (
     r"heb|hebt|heeft|hebben|ben|bent|geweest"
 )
 
+# Activity-duration verbs (EN + NL): "how long did it TAKE to finish", "how many
+# days did I SPEND on the trip". These close a single-activity span the same way an
+# anchor does — the answer is end-minus-start of ONE activity, a TR timeline — so
+# admitting them as a duration end catches the "spend/take" duration forms that
+# carry no between/after/ago anchor (router-eval TR misses: camping-trip days,
+# book-finishing days). "last"/"lasted" is deliberately EXCLUDED here: it collides
+# with the "last week/month" distance adjective; the gain isn't worth that risk.
+_TR_DUR_VERB = (
+    r"spend|spent|spending|takes?|took|taking|"
+    r"besteed|besteedde|besteden|duurt|duurde|duren|kost|kostte"
+)
+
 # A *duration end*: a two-event anchor, a deictic "ago"/"geleden" that closes a
-# span against now, OR a perfect auxiliary signalling duration-to-now. "how many
-# months ago" / "how many weeks have I been …" are duration questions with no
-# anchor, so without these the count opener falls through to MR and gets
+# span against now, a perfect auxiliary signalling duration-to-now, OR an
+# activity-duration verb (spend/take). "how many months ago" / "how many weeks
+# have I been …" / "how long did it take …" are duration questions with no
+# between-anchor, so without these the count opener falls through to MR and gets
 # mis-shaped — admitting them keeps the temporal reading.
-_TR_DUR_END_BODY = _TR_ANCHOR_BODY + r"|ago|geleden|" + _TR_PERFECT_AUX
+_TR_DUR_END_BODY = _TR_ANCHOR_BODY + r"|ago|geleden|" + _TR_PERFECT_AUX + r"|" + _TR_DUR_VERB
 _TR_DUR_END = r"(?:" + _TR_DUR_END_BODY + r")"
 
 # 1) Duration counting: "how many days between X and Y", "how many months ago",
@@ -201,6 +216,17 @@ _TR_RECENCY = re.compile(
     re.IGNORECASE,
 )
 
+# 6) Age-at-event: "how old was I when I moved to the US", "hoe oud was ik toen
+#    …". The answer is an age computed from a birth date and a dated event — a
+#    two-point temporal calculation, so the TR timeline (birth + event) is the
+#    right shaping. Kept tight: requires "how old + copula" THEN a "when/toen"
+#    clause, so a bare "how old is my laptop" (no event anchor) never matches.
+_TR_AGE = re.compile(
+    r"\bhow\s+old\s+(?:was|were|am|is|are)\b[\s\S]{0,40}?\bwhen\b|"
+    r"\bhoe\s+oud\s+(?:was|ben|is|waren)\b[\s\S]{0,40}?\b(?:toen|wanneer)\b",
+    re.IGNORECASE,
+)
+
 # --- MR (counting) ----------------------------------------------------------
 #
 # Plain item-count openers, English + Dutch. Anchored as whole phrases so they
@@ -222,6 +248,152 @@ _MR_COUNT = re.compile(
     re.IGNORECASE,
 )
 
+# Aggregation framings that carry NO "how many / how much / hoeveel" opener — a
+# sum / total / average / percentage question over the user's history ("what's
+# the total amount I spent on luxury items", "what percentage of my books are
+# fiction", "on average how late do I go to bed"). These take the SAME MR
+# aggregate path (count + evidence turns; the host LLM computes the sum/avg/pct
+# from the matching turns), but `_MR_COUNT` misses them because it keys on the
+# count opener and requires a literal "amount OF" ("total amount I spent" has no
+# "of"). Kept a SEPARATE pattern + rule ("mr_aggregate") so its recall recovery
+# and false-positive cost are measurable independently of `_MR_COUNT` in
+# router_eval. Precision posture is the same as MR overall: a false MR route is
+# near-harmless under additive-MR (`mr_aggregate_additive`, default True) — the
+# count merely layers on relevance retrieval — so we admit genuinely
+# aggregation-shaped phrasings without demanding they also be count-shaped.
+_MR_AGGREGATE = re.compile(
+    r"\b(?:"
+    r"total\s+(?:number|count|amount|sum|spend|spent|cost)|"  # "total amount I spent", "total spent"
+    r"total\s+(?:i|we|you)\s+(?:spent|spend|paid|earned|saved)|"  # "the total I spent"
+    r"in\s+total|altogether|"
+    r"on\s+average|"
+    r"what(?:'s|\s+is|\s+was)?\s+the\s+average\b|"
+    r"average\s+(?:number|amount|cost|price|spend|spending|time|rating|score)\b|"
+    r"what\s+percent(?:age)?\b|percentage\s+of|proportion\s+of|"
+    # Dutch
+    r"in\s+totaal|totaal\s+(?:aantal|bedrag)|"
+    r"gemiddeld\b|gemiddelde\s+(?:aantal|bedrag|tijd|prijs)|"
+    r"hoeveel\s+procent|welk\s+percentage|percentage\s+van"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Explicit "sum across events" cue (EN + NL). Paired with a count opener it marks
+# AGGREGATION, not a single duration: "how many hours have I spent playing games
+# IN TOTAL" sums per-session durations (MR), whereas "how many days did I spend on
+# my camping trip" is ONE span (TR). The activity-duration verbs added to
+# `_TR_DUR_END` would otherwise route the former to TR via tr_duration, so this
+# cue is checked FIRST (see `detect_ability_signal`) and forces MR when present.
+# Deliberately narrow — only the unambiguous total phrasings — so it never steals
+# a plain duration ("in total" must be explicit).
+_MR_TOTAL_CUE = re.compile(
+    r"\b(?:in\s+total|altogether|in\s+all|all\s+up|"
+    r"in\s+totaal|bij\s+elkaar|in\s+het\s+totaal)\b",
+    re.IGNORECASE,
+)
+
+
+# --- Production hardening ----------------------------------------------------
+#
+# detect_ability sits on the hot path of EVERY label-free augment() call, run on
+# raw host-supplied text — the user's latest turn, which in real Hermes can be a
+# multi-kilobyte paste, malformed, or (on a host bug) not a string at all. Two
+# guards keep that from degrading or crashing the router:
+#
+# (1) Bounded scan. The intent opener ("how many…", "when did…", "how long…",
+#     "which … first") ALWAYS sits at the start of a question. So we classify a
+#     bounded prefix only — which both reflects where the signal lives AND caps
+#     the cost of the lazy `[\s\S]*?` / `[\s\S]{0,60}?` bridges, which on
+#     unbounded input would let a near-miss (an opener+unit with no following
+#     anchor) rescan to end-of-string at every start position. 4096 chars is far
+#     beyond any real opener-to-anchor span (~600 words) yet bounds worst-case
+#     regex work regardless of input size.
+# (2) Type/empty tolerance. A non-str (None, bytes) or blank turn is "no
+#     detectable intent", returned as an abstain rather than raised — the router
+#     must never be the thing that crashes the host on a malformed turn.
+_MAX_SCAN_CHARS = 4096
+
+
+def _prepare(query: object) -> str | None:
+    """Normalise + bound host input for classification; None when there is
+    nothing to classify (non-str or blank). NFC-normalises so composed vs
+    decomposed Latin diacritics (Dutch ë, ï, …) match a single way, then clips to
+    `_MAX_SCAN_CHARS` so the regex cost is bounded no matter how long the turn."""
+    if not isinstance(query, str):
+        return None
+    q = unicodedata.normalize("NFC", query)
+    if not q.strip():
+        return None
+    return q[:_MAX_SCAN_CHARS]
+
+
+@dataclass(frozen=True)
+class AbilitySignal:
+    """The router's decision plus WHY it fired — production observability.
+
+    `ability` is the wired shaping target ("MR"/"TR") or None. `rule` names the
+    branch that produced it so a misroute in real Hermes is diagnosable without
+    re-deriving which pattern matched: the firing rules ("mr_total",
+    "tr_duration", "tr_howlong", "tr_order", "tr_recency", "tr_age", "mr_count",
+    "mr_aggregate", "tr_distance"), or an abstain reason ("none" = matched
+    nothing, "empty" = blank string, "non_str" = host passed a non-string). It
+    mirrors the `why_retrieved` chips' role: make a routing decision auditable."""
+
+    ability: str | None
+    rule: str
+
+
+def detect_ability_signal(query: object) -> AbilitySignal:
+    """Classify `query` AND report which rule decided — the observable core that
+    `detect_ability` wraps. Precedence is unchanged (see module docstring): the
+    STRONG TR signals (duration-count, how-long span, ordering, recency) are
+    tested first and win the "how many" overlap with MR; a plain counting opener
+    is MR; a bare distance/deictic anchor with no count opener is weak TR. Input
+    is hardened via `_prepare` (bounded scan, type/empty tolerance)."""
+    q = _prepare(query)
+    if q is None:
+        return AbilitySignal(None, "empty" if isinstance(query, str) else "non_str")
+
+    # Aggregation guard FIRST: an explicit "in total" sum cue on a counting opener
+    # is summing across events (MR), not one duration — it must win before the
+    # activity-duration verbs in `_TR_DUR_END` route "how many hours have I spent
+    # … in total" to TR. Without the count opener it is left to `_MR_AGGREGATE`.
+    if _MR_TOTAL_CUE.search(q) and _MR_COUNT.search(q):
+        return AbilitySignal("MR", "mr_total")
+
+    # TR first: the STRONG temporal signals win the overlap with MR. Split per
+    # rule (vs one boolean OR) purely so the firing branch is nameable.
+    if _TR_DURATION.search(q):
+        return AbilitySignal("TR", "tr_duration")
+    if _TR_HOWLONG.search(q):
+        return AbilitySignal("TR", "tr_howlong")
+    if _TR_ORDER.search(q):
+        return AbilitySignal("TR", "tr_order")
+    if _TR_RECENCY.search(q):
+        return AbilitySignal("TR", "tr_recency")
+    if _TR_AGE.search(q):
+        return AbilitySignal("TR", "tr_age")
+
+    # MR: a plain counting opener with no temporal framing. Checked BEFORE the
+    # weak distance signal so "how many times did I X last week" stays a count —
+    # the timeframe is incidental to a count question, not its subject.
+    if _MR_COUNT.search(q):
+        return AbilitySignal("MR", "mr_count")
+
+    # MR (aggregation): a sum/total/average/percentage question with no count
+    # opener ("total amount I spent", "what percentage of …", "on average …").
+    # Same MR aggregate path; checked after the count opener so a question with
+    # both ("how many in total") reports the stronger `mr_count` rule.
+    if _MR_AGGREGATE.search(q):
+        return AbilitySignal("MR", "mr_aggregate")
+
+    # TR (weak): a bare distance/deictic reference ("a week ago", "last Saturday")
+    # with no count opener — a recall-around-a-time question, so shape it temporal.
+    if _TR_DISTANCE.search(q):
+        return AbilitySignal("TR", "tr_distance")
+
+    return AbilitySignal(None, "none")
+
 
 def detect_ability(query: str) -> str | None:
     """Infer a likely ability hint from raw query text, or None if nothing fits.
@@ -239,29 +411,7 @@ def detect_ability(query: str) -> str | None:
     Conservative by design: a borderline phrase that matches nothing here simply
     gets the default path. Returns the bare ability code ("MR"/"TR") — the caller
     re-validates it through the same `_ABILITIES` gate as a host-supplied hint.
+    Thin wrapper over `detect_ability_signal`; use that when you also want the
+    firing rule for logging/observability.
     """
-    if not query:
-        return None
-
-    # TR first: the STRONG temporal signals (duration-count, how-long span,
-    # ordering, recency) win the overlap with MR.
-    if (
-        _TR_DURATION.search(query)
-        or _TR_HOWLONG.search(query)
-        or _TR_ORDER.search(query)
-        or _TR_RECENCY.search(query)
-    ):
-        return "TR"
-
-    # MR: a plain counting opener with no temporal framing. Checked BEFORE the
-    # weak distance signal so "how many times did I X last week" stays a count —
-    # the timeframe is incidental to a count question, not its subject.
-    if _MR_COUNT.search(query):
-        return "MR"
-
-    # TR (weak): a bare distance/deictic reference ("a week ago", "last Saturday")
-    # with no count opener — a recall-around-a-time question, so shape it temporal.
-    if _TR_DISTANCE.search(query):
-        return "TR"
-
-    return None
+    return detect_ability_signal(query).ability

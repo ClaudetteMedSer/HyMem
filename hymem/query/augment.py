@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
@@ -12,7 +13,7 @@ from hymem.core.vectors import decode_vector
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.entities import GraphCount, count_relations, match_known_entities
-from hymem.query.intent import detect_ability
+from hymem.query.intent import detect_ability_signal
 from hymem.query.predicate_routing import route_predicates
 from hymem.query.rerank import rerank as run_rerank
 from hymem.session import Message, recent_messages
@@ -239,6 +240,14 @@ class AugmentedContext:
     without the caller passing `ability="MR"`. An *explicit* host hint always
     wins and leaves this None, so host-supplied and inferred shaping stay
     distinguishable."""
+    detected_rule: str | None = None
+    """WHICH router rule produced `detected_ability` (e.g. "tr_recency",
+    "mr_count"), or the abstain reason ("none"/"empty"/"non_str") when nothing was
+    inferred. None when the host supplied an explicit `ability` hint (no inference
+    ran). This is the observability half of the routing decision: `detected_ability`
+    says WHAT was inferred, `detected_rule` says WHY — so a production misroute
+    ("why did this plain question get MR-shaped?") is diagnosable from the result
+    object alone, without re-running the patterns. See `detect_ability_signal`."""
 
 
 # Ability hints a host (e.g. a BEAM harness) may pass to shape retrieval to the
@@ -276,13 +285,18 @@ def augment(
     # (left None when the host supplied the hint, so the two stay distinguishable).
     ability = _normalize_ability(ability)
     detected: str | None = None
+    detected_rule: str | None = None
     if ability is None:
-        detected = _normalize_ability(detect_ability(user_message))
+        signal = detect_ability_signal(user_message)
+        detected_rule = signal.rule
+        detected = _normalize_ability(signal.ability)
         ability = detected
         if detected is not None:
-            log.debug("ability.auto_detected=%s (no host hint)", detected)
+            log.debug("ability.auto_detected=%s rule=%s (no host hint)",
+                      detected, detected_rule)
     ctx = AugmentedContext()
     ctx.detected_ability = detected
+    ctx.detected_rule = detected_rule
     if cfg.user_md_path.exists():
         ctx.user_md = cfg.user_md_path.read_text(encoding="utf-8")
     if cfg.memory_md_path.exists():
@@ -505,8 +519,28 @@ def should_rerank(
 _FTS_SAFE = re.compile(r"[^A-Za-z0-9_\- ]+")
 
 
+def _fold_diacritics(text: str) -> str:
+    """Strip combining diacritics so a query token matches the FTS index.
+
+    The FTS5 `unicode61` tokenizer folds diacritics when it builds the index
+    ("café" is stored as "cafe"), but `_FTS_SAFE` below is an ASCII-only
+    whitelist — so without this step it would SHRED an accented query token
+    before it ever reaches FTS ("café" → "caf", "coördinatie" → "co rdinatie"),
+    and the Dutch/loanword query would silently match nothing while the index
+    holds the folded form. NFKD splits each precomposed letter into base + mark;
+    dropping the combining marks (`unicodedata.combining`) yields the same ASCII
+    base the index stored, so query and index agree. This covers the full Dutch
+    diacritic set (ë ï ö é ü á è …); precomposed Latin letters with no canonical
+    decomposition (ø ß æ — not used in Dutch) are left for the ASCII strip and
+    are a known out-of-scope residual."""
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(ch)
+    )
+
+
 def _fts_search(conn: sqlite3.Connection, query: str, *, top_k: int) -> list[FtsHit]:
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     if not cleaned:
         return []
     # Build an OR query across tokens so partial matches still surface results.
@@ -555,7 +589,7 @@ def _message_fts_search(
     it reaches turns dreaming never chunked. Returns [] (not an error) if the
     table is absent — e.g. a DB migrated by older code — so retrieval degrades to
     chunk-FTS rather than failing."""
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     if not cleaned:
         return []
     tokens = [t for t in cleaned.split() if len(t) >= 2]
@@ -626,7 +660,7 @@ def _aggregate_tokens(query: str) -> list[str]:
     tokens shorter than 3 chars. Falls back to the normal len>=2 tokenization if
     that empties the set (a question made entirely of stop/short words), so the
     query is never empty."""
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     if not cleaned:
         return []
     parts = cleaned.split()
@@ -893,7 +927,7 @@ def _temporal_message_events(
     (`temporal_mentions`), so the list is purely chronological evidence. Degrades
     to [] — never raises — when `temporal_mentions` or `messages_fts` is absent
     (pre-v14 DB), mirroring `_message_fts_search`'s OperationalError tolerance."""
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     tokens = [t for t in cleaned.split() if len(t) >= 2]
 
     # When the query carries content tokens, scope the timeline to messages that
@@ -1641,7 +1675,7 @@ def _episode_search(
     """
     from hymem.core import db as core_db
 
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     fts_hits: list[EpisodeHit] = []
     if cleaned:
         tokens = [t for t in cleaned.split() if len(t) >= 2]
@@ -1761,7 +1795,7 @@ def _episode_rrf_chips(
 
 
 def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[ProcedureHit]:
-    cleaned = _FTS_SAFE.sub(" ", query).strip()
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     if not cleaned:
         return []
     tokens = [t for t in cleaned.split() if len(t) >= 2]
