@@ -552,9 +552,43 @@ ceiling ~96%, each 10pp ≈ +2.66pp overall, and exactly where Hindsight leads.
   prompt + unfiltered context" guard. **Carry-clean:** the filter is keyed on the production `detect_ability`
   → MR route (not the oracle label) and on message role, both of which Hermes has. Reranker side-note: the
   LLM reranker slightly HELPS MS (A 10→8), unlike KU where it was neutral — consistent with
-  `rerank_message_hits` being net-positive for MR. **STATUS: fix landed in the adapter; A/B run pending
-  (strict + permissive, auto-ability) — accept if MS lifts beyond the [[project_lme_variance_band]] without
-  sinking other categories.**
+  `rerank_message_hits` being net-positive for MR.
+  - **KILLED — MEASURED 2026-06-09 (full 500, seed 0, auto-ability, strict + permissive, dating-only vs
+    dating+filter). REVERTED.** The filter is **neutral on its MS target** (permissive 45.1→45.1; strict
+    44.4→42.9, within the [[project_lme_variance_band]]) — confirming the 53% assistant noise was NOT
+    hurting the model; it ignored/padded with it. But **overall slips −1.4pp in BOTH postures** and the
+    damage lands on **non-MR-target categories**, uniformly negative, largest on **SS-A (−5.4 strict /
+    −7.2 permissive)**. **Root cause (the probe's blind spot):** under `--auto-ability` the filter fires
+    on the *route* (`detect_ability == MR`), and that route has FALSE POSITIVES — count-shaped questions
+    whose true category is SS-A/KU/SS-P (documented: `mr_count` has ~70 FPs, all single-session). For an
+    FP-routed question the filter **SUBTRACTS** the assistant turns from context, and **SS-A =
+    single-session-ASSISTANT** means the gold answer can live in an assistant turn → stripping assistant
+    turns drops the gold. SS-A negative in BOTH postures with the largest magnitude is the fingerprint.
+    **This breaks the additive-MR safety property** (§2 additive-MR / D3): MR false-positives are only
+    tolerable because a false MR route keeps FULL relevance retrieval and just layers a count on top. A
+    user-only context filter makes MR **subtractive**, reintroducing exactly the harm additive-MR was
+    built to neutralize. **The `ku_probe.py --ms` RISK=0 was CATEGORY-conditioned (measured over true-MS
+    questions, where gold is a user turn by nature), not ROUTE-conditioned — it never sampled the MR-FP
+    population from SS-A/SS-P/KU.** **LESSON (bank it): never SUPPRESS/filter retrieval keyed on a routed
+    ability that has false positives — only ADD on it (the additive-MR invariant). The dead user-only
+    filter is harmless precisely BECAUSE it's dead; "fixing" it is a regression.** The dead no-op stays
+    as-is in the adapter; the dating clause (§2) is the real MS-adjacent lever. Cheap post-hoc confirm
+    (no new run): in the run JSON, isolate `detected_ability==MR` ∧ oracle `single-session-assistant`
+    and check the T→F flips between the two runs.
+  - **CONFIRMED 2026-06-09 (the post-hoc check, no new run).** 7 SS-A questions mis-route to MR; the
+    filter flips ALL 4 that were previously correct (Speyer tourism phone number; French-omelette egg
+    count; HAMT avg framerate; Chiefs-vs-Jaguars score) check->wrong; the 3 already-wrong stay wrong.
+    These are "remind me what you told me about X?" questions — gold lives in a past ASSISTANT turn; the
+    router reads them as count/aggregate-shaped ("how many eggs", "average framerate"), MR strips the
+    assistant turns, gold gone. The full SS-A -5.4/-7.2 regression = these 4 flips. **Key corollary:
+    pre-filter these 4 were MR-routed AND correct — additive-MR already absorbed the mis-route (full
+    retrieval kept, answer found). So there is NOTHING to fix in the router; the route was never the
+    problem.** A router "fix" to stop MR-routing "how many eggs" would (a) read answer-location = gaming
+    (per the §2 router rounds / twice-seen lesson: `mr_count` FPs are single-session count-shaped strings
+    the router CANNOT distinguish from real MR — same surface form), and (b) cost real MR recall — both
+    already-rejected dead-ends. **The only error was making MR subtractive. Resolution: MR shaping stays
+    ADDITIVE-ONLY (count layered on full retrieval); the dead user-only filter stays dead. No filter, no
+    router change — done.**
 
 **Sequencing:** L1 done (recall ruled out). L2a KILLED by the gold-rank probe (92% MS gold
 already at BM25 ≤15). L2c DONE → reranker is net-positive (−4.5pp MS when OFF), keep it, L2b
