@@ -169,64 +169,66 @@ def _reconstruct_context_memories(memories: list[dict], context_limit: int) -> l
     return out
 
 
-def diagnose_ranking(adapter: HyMemAdapter, q: dict, run_top_k: int,
-                     context_limit: int) -> dict:
-    question = q["question"]
+def _context_limit_for(ability, base: int) -> int:
+    """answer_question doubles the char budget for MR/TR (they span sessions)."""
+    return base * 2 if ability in ("MR", "TR") else base
+
+
+def _gold_rank(memories: list[dict], gold_turns: list[str]):
+    for i, m in enumerate(memories):
+        if _gold_in_pool(gold_turns, [m["content"]]):
+            return i
+    return None
+
+
+def _classify_gold(memories: list[dict], pool: dict, gold_turns: list[str],
+                   context_limit: int) -> dict:
+    """Bucket the gold turn's fate: A=retrieval miss, B=truncation, C=in-context."""
+    in_pool = (
+        _gold_in_pool(gold_turns, pool["message"]) or _gold_in_pool(gold_turns, pool["fts"])
+    ) if gold_turns else None
+    rank = _gold_rank(memories, gold_turns) if gold_turns else None
+    ctx = _reconstruct_context_memories(memories, context_limit)
+    in_ctx = any(_gold_in_pool(gold_turns, [m["content"]]) for m in ctx) if gold_turns else None
+    if not gold_turns:
+        bucket, why = "n/a", "no gold marks in dataset"
+    elif not in_pool:
+        bucket, why = "A_retrieval", "gold not retrieved into any pool"
+    elif in_ctx:
+        bucket, why = "C_synthesis", f"gold@rank{rank} IS in context ({len(ctx)} mems fit) — model saw it"
+    elif rank is not None:
+        bucket, why = "B_truncation", f"gold@rank{rank} but only {len(ctx)} mems fit the char budget — char-budget cut"
+    else:
+        bucket, why = "B_truncation", "gold in pool but below the 45-candidate top_k cut"
+    return {"in_pool": in_pool, "gold_rank": rank, "gold_in_ctx": in_ctx,
+            "ctx_size": len(ctx), "bucket": bucket, "why": why}
+
+
+def _ingest_and_search(adapter: HyMemAdapter, q: dict, run_top_k: int):
+    """Reproduce the run's ingest + retrieval. ability=detect (auto-ability path);
+    search caps at run_top_k*3 candidates (the adapter passes top_k*3 to search)."""
     sessions = q.get("haystack_sessions", [])
     session_ids = q.get("haystack_session_ids", [str(i) for i in range(len(sessions))])
     session_dates = q.get("haystack_dates", [])
     while len(session_ids) < len(sessions):
         session_ids.append(f"extra_{len(session_ids)}")
     adapter.ingest_sessions(sessions, session_ids, session_dates)
+    ability = _detect_ability_safe(q["question"])
+    memories, _tm, _gc, _tev, pool = adapter.search(
+        q["question"], ability=ability, top_k=run_top_k * 3)
+    return ability, memories, pool
 
-    # Reproduce the run's retrieval EXACTLY: ability=None for KU -> message-first,
-    # search caps at run_top_k*3 candidates (the adapter passes top_k*3 to search).
-    ability = _detect_ability_safe(question)
-    memories, total_matches, _gc, _tev, pool = adapter.search(
-        question, ability=ability, top_k=run_top_k * 3)
 
+def diagnose_ranking(adapter: HyMemAdapter, q: dict, run_top_k: int,
+                     base_context_limit: int) -> dict:
+    ability, memories, pool = _ingest_and_search(adapter, q, run_top_k)
     gold_turns, gold_mode = _extract_gold_turns(q)
-    in_pool = (
-        _gold_in_pool(gold_turns, pool["message"]) or _gold_in_pool(gold_turns, pool["fts"])
-    ) if gold_turns else None
-
-    # Rank of the gold turn in the merged, post-45-cut candidate list the model
-    # would be fed (before the char-budget truncation).
-    gold_rank = None
-    if gold_turns:
-        for i, m in enumerate(memories):
-            if _gold_in_pool(gold_turns, [m["content"]]):
-                gold_rank = i
-                break
-
-    ctx = _reconstruct_context_memories(memories, context_limit)
-    gold_in_ctx = (
-        any(_gold_in_pool(gold_turns, [m["content"]]) for m in ctx)
-    ) if gold_turns else None
-
-    if not gold_turns:
-        bucket, why = "n/a", "no gold marks in dataset"
-    elif not in_pool:
-        bucket, why = "A_retrieval", "gold not retrieved into any pool"
-    elif gold_in_ctx:
-        bucket, why = "C_synthesis", f"gold@rank{gold_rank} IS in context ({len(ctx)} mems fit) — model saw it"
-    elif gold_rank is not None:
-        bucket, why = "B_truncation", f"gold@rank{gold_rank} but only {len(ctx)} mems fit the char budget — char-budget cut"
-    else:
-        bucket, why = "B_truncation", "gold in pool but below the 45-candidate top_k cut"
-
-    return {
-        "q": q,
-        "ability": ability,
-        "n_memories": len(memories),
-        "ctx_size": len(ctx),
-        "gold_rank": gold_rank,
-        "in_pool": in_pool,
-        "gold_in_ctx": gold_in_ctx,
-        "bucket": bucket,
-        "why": why,
-        "gold_mode": gold_mode,
-    }
+    cl = _context_limit_for(ability, base_context_limit)
+    cls = _classify_gold(memories, pool, gold_turns, cl)
+    return {"q": q, "ability": ability, "n_memories": len(memories),
+            "ctx_size": cls["ctx_size"], "gold_rank": cls["gold_rank"],
+            "in_pool": cls["in_pool"], "gold_in_ctx": cls["gold_in_ctx"],
+            "bucket": cls["bucket"], "why": cls["why"], "gold_mode": gold_mode}
 
 
 def print_ranking_report(r: dict) -> None:
@@ -240,6 +242,76 @@ def print_ranking_report(r: dict) -> None:
     print(f"  gold turn : rank={'—' if rank is None else rank}  "
           f"in_pool={r['in_pool']}  in_context={r['gold_in_ctx']}  (mode={r['gold_mode']})")
     print(f"  BUCKET    : {r['bucket']}  — {r['why']}")
+
+
+# ── MS diagnosis ─────────────────────────────────────────────────────────────
+# Multi-session is heterogeneous under --auto-ability: each question detects as MR
+# (counting), TR, or None, and those take different answer paths. On top of the
+# A/B/C localization, MR-detected questions hit a LATENT BUG: answer_question's
+# "filter to user-only turns" runs AFTER the context is already built (it reassigns
+# `memories` at L713, but `context` was frozen at L696), so the filter is dead and
+# the model sees the full UNFILTERED context — assistant turns included, despite
+# the MR preamble claiming "assistant echoes excluded". The what-if below
+# reconstructs context BOTH ways (current=unfiltered vs intended=user-only) to test
+# whether applying the filter before the loop would recover misses or DROP gold.
+
+
+def _user_only(memories: list[dict]) -> list[dict]:
+    """The adapter's intended MR filter (L713) — user message turns only."""
+    return [m for m in memories
+            if m["type"] == "message_hit" and "[user]" in m.get("content", "")]
+
+
+def diagnose_ms(adapter: HyMemAdapter, q: dict, run_top_k: int,
+                base_context_limit: int) -> dict:
+    ability, memories, pool = _ingest_and_search(adapter, q, run_top_k)
+    gold_turns, gold_mode = _extract_gold_turns(q)
+    cl = _context_limit_for(ability, base_context_limit)
+    cls = _classify_gold(memories, pool, gold_turns, cl)
+
+    r = {"q": q, "ability": ability, "gold_mode": gold_mode, "mr_whatif": None}
+    r.update(cls)
+
+    if ability == "MR" and gold_turns:
+        cur_ctx = _reconstruct_context_memories(memories, cl)          # REAL (buggy) behavior
+        cur_in = any(_gold_in_pool(gold_turns, [m["content"]]) for m in cur_ctx)
+        filt = _user_only(memories)                                   # the comment's intent
+        int_ctx = _reconstruct_context_memories(filt, cl)
+        int_in = any(_gold_in_pool(gold_turns, [m["content"]]) for m in int_ctx)
+        gi = _gold_rank(memories, gold_turns)
+        gold_role = "—"
+        if gi is not None:
+            c = memories[gi]["content"]
+            gold_role = ("user" if c.startswith("[user]")
+                         else "assistant" if c.startswith("[assistant]")
+                         else memories[gi]["type"])
+        mh = [m for m in cur_ctx if m["type"] == "message_hit"]
+        asst = [m for m in mh if "[assistant]" in m["content"] and not m["content"].startswith("[user]")]
+        noise = (len(asst) / len(mh)) if mh else 0.0
+        if not cur_in:
+            verdict = "n/a  (gold not in current context — A/B issue, not the filter)"
+        elif int_in:
+            verdict = "SAFE  (gold survives user-only; removing assistant noise is pure upside)"
+        else:
+            verdict = "RISK  (user-only filter DROPS gold — gold is assistant or pushed out)"
+        r["mr_whatif"] = {"gold_role": gold_role, "cur_in": cur_in, "int_in": int_in,
+                          "noise": noise, "n_user_only": len(filt), "verdict": verdict}
+    return r
+
+
+def print_ms_report(r: dict) -> None:
+    q = r["q"]
+    print("=" * 88)
+    print(f"  id      : {q.get('question_id')}")
+    print(f"  question: {q.get('question')}")
+    print(f"  answer  : {q.get('answer')}")
+    print(f"  ability : {r['ability']!r}   bucket: {r['bucket']}  — {r['why']}")
+    w = r["mr_whatif"]
+    if w:
+        print(f"  MR-filter what-if: gold_role={w['gold_role']}  "
+              f"current_ctx={w['cur_in']}  user_only_ctx={w['int_in']}  "
+              f"assistant_noise={w['noise'] * 100:.0f}%  (user-only kept {w['n_user_only']} mems)")
+        print(f"                  -> {w['verdict']}")
 
 
 def print_report(r: dict, top_k: int, show_graph: bool) -> None:
@@ -329,6 +401,67 @@ def run_ranking(ku: list[dict], args) -> None:
     print("  one-flag fix. If C dominates -> the residual is synthesis, not ranking; stop here.")
 
 
+def run_ms(ms: list[dict], args) -> None:
+    from collections import Counter
+    rerank_flag = True if args.rerank else False
+    print(f"MS DIAGNOSIS — {len(ms)} multi-session questions  "
+          f"(reranker={'ON (matches run)' if args.rerank else 'OFF (raw BM25)'}, "
+          f"run_top_k={args.run_top_k}, base char_budget={MAX_CONTEXT_CHARS})\n", flush=True)
+    reports = []
+    for q in ms:
+        tmp = Path(tempfile.mkdtemp(prefix="ms_probe_"))
+        adapter = HyMemAdapter(
+            db_path=tmp / "hymem.db",
+            api_key=args.api_key,
+            embeddings=False,
+            rerank_message_hits=rerank_flag,
+        )
+        try:
+            adapter.open()
+            r = diagnose_ms(adapter, q, args.run_top_k, MAX_CONTEXT_CHARS)
+            reports.append(r)
+            print_ms_report(r)
+        except Exception as e:
+            print(f"  [ERROR on {q.get('question_id')}]: {type(e).__name__}: {e}")
+        finally:
+            try:
+                adapter.close()
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    n = len(reports)
+    if not n:
+        return
+    abil = Counter(r["ability"] or "None" for r in reports)
+    scored = [r for r in reports if r["bucket"] != "n/a"]
+    a = sum(1 for r in scored if r["bucket"] == "A_retrieval")
+    b = sum(1 for r in scored if r["bucket"] == "B_truncation")
+    c = sum(1 for r in scored if r["bucket"] == "C_synthesis")
+    mr = [r for r in reports if r["mr_whatif"]]
+    safe = sum(1 for r in mr if r["mr_whatif"]["verdict"].startswith("SAFE"))
+    risk = sum(1 for r in mr if r["mr_whatif"]["verdict"].startswith("RISK"))
+    na = sum(1 for r in mr if r["mr_whatif"]["verdict"].startswith("n/a"))
+    avg_noise = (sum(r["mr_whatif"]["noise"] for r in mr) / len(mr)) if mr else 0.0
+    print("=" * 88)
+    print("MS SUMMARY")
+    print(f"  questions diagnosed   : {len(scored)}/{n}")
+    print(f"  ability distribution  : " + ", ".join(f"{k}={v}" for k, v in abil.most_common()))
+    print(f"  A retrieval miss      : {a}  (gold never retrieved — RECALL lever)")
+    print(f"  B truncation          : {b}  (gold cut from context — ranking/budget lever)")
+    print(f"  C in-context (synth)  : {c}  (model saw gold, still wrong — synthesis)")
+    print()
+    print(f"  MR-detected dead-filter what-if: {len(mr)} questions, avg assistant-noise {avg_noise * 100:.0f}%")
+    print(f"    SAFE (filter keeps gold, drops noise) : {safe}")
+    print(f"    RISK (filter would drop gold)         : {risk}")
+    print(f"    n/a  (gold not in context anyway)     : {na}")
+    print()
+    print("  READ: if MR-detected is a big share + SAFE dominates + assistant-noise is nonzero")
+    print("  -> applying the dead user-only filter BEFORE building context is upside; worth a run.")
+    print("  If RISK > 0 -> filtering drops gold for those (gold is assistant); a blanket filter")
+    print("  would regress them — filter only assistant ECHOES, or skip. If MS misses are mostly")
+    print("  C on ability=None -> it's default-path synthesis, a different lever than the filter.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Read-only KU retrieval/dating probe")
     repo_root = Path(__file__).resolve().parent.parent
@@ -341,8 +474,11 @@ def main() -> None:
     ap.add_argument("--dream", action="store_true",
                     help="run dream to populate + print conflicting graph edges")
     ap.add_argument("--ranking", action="store_true",
-                    help="RANKING MODE: split each KU item into B (truncation) vs C (synthesis) "
+                    help="RANKING MODE: split each item into B (truncation) vs C (synthesis) "
                          "by reconstructing the final answer context offline")
+    ap.add_argument("--ms", action="store_true",
+                    help="MS MODE: multi-session localization — ability distribution, A/B/C split, "
+                         "and the MR dead-filter what-if (current vs user-only context)")
     ap.add_argument("--rerank", action="store_true",
                     help="ranking mode: match the headline run's LLM message reranker (ON). "
                          "Default is raw BM25 (rerank off) — compare the two to test demotion.")
@@ -359,14 +495,19 @@ def main() -> None:
         print(f"ERROR: dataset not found at {data_file}")
         sys.exit(1)
 
+    target = "multi-session" if args.ms else "knowledge-update"
     print(f"Loading {data_file} ...", flush=True)
     all_q = load_longmemeval_data(str(data_file), max_questions=None, seed=args.seed)
-    ku = [q for q in all_q if q.get("question_type", "").replace("_abs", "") == "knowledge-update"
+    ku = [q for q in all_q if q.get("question_type", "").replace("_abs", "") == target
           and not q.get("question_type", "").endswith("_abs")]
     if not ku:
-        print("No knowledge-update questions found in this dataset.")
+        print(f"No {target} questions found in this dataset.")
         sys.exit(1)
     ku = ku[: args.n]
+
+    if args.ms:
+        run_ms(ku, args)
+        return
 
     if args.ranking:
         run_ranking(ku, args)
