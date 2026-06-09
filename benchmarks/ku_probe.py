@@ -102,6 +102,18 @@ def probe_question(adapter: HyMemAdapter, q: dict, top_k: int) -> dict:
     latest_date = distinct_dates[-1] if distinct_dates else ""
     answer_on_latest = bool(answer_dates) and answer_dates[-1] == latest_date
 
+    # SPOILERS: hits dated strictly AFTER the newest answer-bearing turn — these are
+    # the turns that "beat" the new value on recency and would mislead a naive
+    # latest-date-wins clause. Eyeball each: does it RESTATE a (stale) value for the
+    # same attribute [(a) genuine conflict — unfixable from raw turns], or does it
+    # merely mention the topic with no value [(b) tangential — a value-aware clause
+    # can skip it]? The (a):(b) split is the real ceiling of the dating fix.
+    ans_latest_date = answer_dates[-1] if answer_dates else ""
+    spoilers = [
+        h for h in hits
+        if ans_latest_date and _date10(getattr(h, "created_at", "")) > ans_latest_date
+    ]
+
     return {
         "q": q,
         "ability": ability,
@@ -114,6 +126,8 @@ def probe_question(adapter: HyMemAdapter, q: dict, top_k: int) -> dict:
         "answer_present": answer_present,
         "answer_dates": answer_dates,
         "answer_on_latest": answer_on_latest,
+        "ans_latest_date": ans_latest_date,
+        "spoilers": spoilers,
         "graph_facts": list(getattr(ctx, "graph_facts", None) or []),
     }
 
@@ -140,6 +154,16 @@ def print_report(r: dict, top_k: int, show_graph: bool) -> None:
         text = _norm(getattr(h, "text", ""))[:140]
         mark = " «ANSWER»" if _answer_in(getattr(h, "text", ""), str(q.get("answer", ""))) else ""
         print(f"    [{d or '----------'}] ({role:>9} {score:5.1f}) {text}{mark}")
+    # The decisive eyeball: turns that out-date the new value. Classify each
+    # (a) STALE-VALUE re-assertion (unfixable) vs (b) TANGENTIAL mention (fixable).
+    if r["answer_present"] and not r["answer_on_latest"] and r["spoilers"]:
+        print(f"  --- SPOILERS: turns dated AFTER the new value ({r['ans_latest_date']}) "
+              f"— classify (a) stale-value vs (b) tangential ---")
+        for h in r["spoilers"]:
+            d = _date10(getattr(h, "created_at", ""))
+            role = getattr(h, "role", "?")
+            text = _norm(getattr(h, "text", ""))[:160]
+            print(f"    [{d}] ({role:>9}) {text}")
     if show_graph and r["graph_facts"]:
         print(f"  --- graph_facts (UNDATED tier — conflict check) ---")
         for f in r["graph_facts"][:12]:
@@ -223,6 +247,8 @@ def main() -> None:
     ans_present = sum(1 for r in reports if r["answer_present"])
     ans_latest = sum(1 for r in reports if r["answer_on_latest"])
     multi_date = sum(1 for r in reports if len(r["distinct_dates"]) >= 2)
+    present_not_latest = [r for r in reports if r["answer_present"] and not r["answer_on_latest"]]
+    spoiler_turns = sum(len(r["spoilers"]) for r in present_not_latest)
     print("=" * 88)
     print("SUMMARY")
     print(f"  questions probed                  : {n}")
@@ -233,13 +259,17 @@ def main() -> None:
     print(f"  >=2 distinct dates among hits     : {multi_date}/{n}  "
           f"(is a recency conflict even visible?)")
     print(f"  new value on the LATEST date      : {ans_latest}/{n}  "
-          f"(dating precondition #2 — clean win for the fix)")
+          f"(naive latest-date-wins — pessimistic floor)")
+    print(f"  present-but-NOT-latest (spoiled)  : {len(present_not_latest)}/{n}  "
+          f"across {spoiler_turns} spoiler turns to classify above")
     print()
-    print("  READ: if 'new value present' is HIGH and 'on latest date' is HIGH -> the")
-    print("  dating+clause fix is well-targeted; a full strict run is worth buying.")
-    print("  If 'new value present' is LOW -> the lever is KU RECALL, not answer-shaping;")
-    print("  redirect before spending a run. If present-but-not-latest dominates -> the")
-    print("  conflict isn't recency-separable and the clause won't disambiguate it.")
+    print("  CEILING of a VALUE-AWARE clause = (on-latest + tangential-spoiled)/n.")
+    print("  Read the SPOILER blocks above and count, per spoiled question:")
+    print("    (a) STALE-VALUE re-assertion  -> unfixable from raw turns (recency is genuinely wrong)")
+    print("    (b) TANGENTIAL topic mention  -> a value-aware clause skips it (recoverable)")
+    print("  If (b) dominates -> ceiling is high, a value-aware clause + dating is worth one run.")
+    print("  If (a) shows up often -> raw-turn recency can't separate it; consider the graph")
+    print("  (value-bearing edges, --dream) or stop — KU's big lift is already banked under permissive.")
 
 
 if __name__ == "__main__":
