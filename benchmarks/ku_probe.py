@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from longmemeval_adapter import (  # noqa: E402
+    MAX_CONTEXT_CHARS,
     HyMemAdapter,
     _detect_ability_safe,
     _extract_gold_turns,
@@ -132,6 +133,115 @@ def probe_question(adapter: HyMemAdapter, q: dict, top_k: int) -> dict:
     }
 
 
+# ── Ranking diagnosis ────────────────────────────────────────────────────────
+# "Ranking miss" in the recall-ceiling split = gold was in the pool but the answer
+# was still wrong. That bundles two fates with OPPOSITE fixes:
+#   (B) TRUNCATION — gold turn never survived into the final answer context
+#       (cut by the 45-candidate top_k or, far more often, by the 8000-char budget).
+#       Recoverable by ranking / budget / rerank-off.
+#   (C) SYNTHESIS  — gold turn WAS in the context the model saw, and it still missed.
+#       Ranking can't help; the value-aware clause already applies here.
+# We reconstruct the exact final context OFFLINE (no answer LLM) by mirroring
+# answer_question's char-budget loop, so the B:C split is free to compute. Run with
+# --rerank to match the headline run's pipeline (LLM reranker ON); run without it
+# (raw BM25) to test the "reranker demotes gold it already sees" hypothesis — if a
+# B-bucket question flips to C under raw BM25, rerank_message_hits=False recovers it.
+
+
+def _reconstruct_context_memories(memories: list[dict], context_limit: int) -> list[dict]:
+    """The memories that actually enter the answer context — mirrors the
+    char-budget loop in answer_question (KU has no MR/TR preamble, so the full
+    budget goes to memories). Tag length is counted exactly as the adapter does,
+    including the new [MEM <date>] stamp."""
+    out: list[dict] = []
+    total = 0
+    for m in memories:
+        content = m["content"]
+        if total + len(content) > context_limit:
+            break
+        if m["type"] == "graph_fact":
+            tag = "[FACT]"
+        else:
+            d = (m.get("created_at") or "")[:10]
+            tag = f"[MEM {d}]" if (m["type"] == "message_hit" and d) else "[MEM]"
+        out.append(m)
+        total += len(content) + len(tag) + 2
+    return out
+
+
+def diagnose_ranking(adapter: HyMemAdapter, q: dict, run_top_k: int,
+                     context_limit: int) -> dict:
+    question = q["question"]
+    sessions = q.get("haystack_sessions", [])
+    session_ids = q.get("haystack_session_ids", [str(i) for i in range(len(sessions))])
+    session_dates = q.get("haystack_dates", [])
+    while len(session_ids) < len(sessions):
+        session_ids.append(f"extra_{len(session_ids)}")
+    adapter.ingest_sessions(sessions, session_ids, session_dates)
+
+    # Reproduce the run's retrieval EXACTLY: ability=None for KU -> message-first,
+    # search caps at run_top_k*3 candidates (the adapter passes top_k*3 to search).
+    ability = _detect_ability_safe(question)
+    memories, total_matches, _gc, _tev, pool = adapter.search(
+        question, ability=ability, top_k=run_top_k * 3)
+
+    gold_turns, gold_mode = _extract_gold_turns(q)
+    in_pool = (
+        _gold_in_pool(gold_turns, pool["message"]) or _gold_in_pool(gold_turns, pool["fts"])
+    ) if gold_turns else None
+
+    # Rank of the gold turn in the merged, post-45-cut candidate list the model
+    # would be fed (before the char-budget truncation).
+    gold_rank = None
+    if gold_turns:
+        for i, m in enumerate(memories):
+            if _gold_in_pool(gold_turns, [m["content"]]):
+                gold_rank = i
+                break
+
+    ctx = _reconstruct_context_memories(memories, context_limit)
+    gold_in_ctx = (
+        any(_gold_in_pool(gold_turns, [m["content"]]) for m in ctx)
+    ) if gold_turns else None
+
+    if not gold_turns:
+        bucket, why = "n/a", "no gold marks in dataset"
+    elif not in_pool:
+        bucket, why = "A_retrieval", "gold not retrieved into any pool"
+    elif gold_in_ctx:
+        bucket, why = "C_synthesis", f"gold@rank{gold_rank} IS in context ({len(ctx)} mems fit) — model saw it"
+    elif gold_rank is not None:
+        bucket, why = "B_truncation", f"gold@rank{gold_rank} but only {len(ctx)} mems fit the char budget — char-budget cut"
+    else:
+        bucket, why = "B_truncation", "gold in pool but below the 45-candidate top_k cut"
+
+    return {
+        "q": q,
+        "ability": ability,
+        "n_memories": len(memories),
+        "ctx_size": len(ctx),
+        "gold_rank": gold_rank,
+        "in_pool": in_pool,
+        "gold_in_ctx": gold_in_ctx,
+        "bucket": bucket,
+        "why": why,
+        "gold_mode": gold_mode,
+    }
+
+
+def print_ranking_report(r: dict) -> None:
+    q = r["q"]
+    print("=" * 88)
+    print(f"  id        : {q.get('question_id')}")
+    print(f"  question  : {q.get('question')}")
+    print(f"  answer*   : {q.get('answer')}")
+    print(f"  candidates: {r['n_memories']}   in-context (char-budget): {r['ctx_size']}")
+    rank = r["gold_rank"]
+    print(f"  gold turn : rank={'—' if rank is None else rank}  "
+          f"in_pool={r['in_pool']}  in_context={r['gold_in_ctx']}  (mode={r['gold_mode']})")
+    print(f"  BUCKET    : {r['bucket']}  — {r['why']}")
+
+
 def print_report(r: dict, top_k: int, show_graph: bool) -> None:
     q = r["q"]
     print("=" * 88)
@@ -171,6 +281,54 @@ def print_report(r: dict, top_k: int, show_graph: bool) -> None:
                   f"{getattr(f, 'subject', '')} {getattr(f, 'predicate', '')} {getattr(f, 'object', '')}")
 
 
+def run_ranking(ku: list[dict], args) -> None:
+    rerank_flag = True if args.rerank else False  # raw BM25 by default
+    print(f"RANKING DIAGNOSIS — {len(ku)} KU questions  "
+          f"(message reranker={'ON (matches headline run)' if args.rerank else 'OFF (raw BM25)'}, "
+          f"run_top_k={args.run_top_k}, char_budget={MAX_CONTEXT_CHARS})\n", flush=True)
+    reports = []
+    for q in ku:
+        tmp = Path(tempfile.mkdtemp(prefix="ku_rank_"))
+        adapter = HyMemAdapter(
+            db_path=tmp / "hymem.db",
+            api_key=args.api_key,
+            embeddings=False,
+            rerank_message_hits=rerank_flag,
+        )
+        try:
+            adapter.open()
+            r = diagnose_ranking(adapter, q, args.run_top_k, MAX_CONTEXT_CHARS)
+            reports.append(r)
+            print_ranking_report(r)
+        except Exception as e:
+            print(f"  [ERROR on {q.get('question_id')}]: {type(e).__name__}: {e}")
+        finally:
+            try:
+                adapter.close()
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    n = len(reports)
+    if not n:
+        return
+    scored = [r for r in reports if r["bucket"] != "n/a"]
+    a = sum(1 for r in scored if r["bucket"] == "A_retrieval")
+    b = sum(1 for r in scored if r["bucket"] == "B_truncation")
+    c = sum(1 for r in scored if r["bucket"] == "C_synthesis")
+    print("=" * 88)
+    print("RANKING SUMMARY")
+    print(f"  questions diagnosed         : {len(scored)}/{n}")
+    print(f"  A  retrieval miss           : {a}  (gold never retrieved — needs RECALL, not ranking)")
+    print(f"  B  truncation/ranking miss  : {b}  (gold retrieved but cut from context — "
+          f"RECOVERABLE by ranking/budget/rerank-off)")
+    print(f"  C  in-context (synthesis)   : {c}  (model saw gold, still missed — ranking can't help)")
+    print()
+    print("  READ: B is the addressable bucket. If B is large -> a ranking/budget change is")
+    print("  worth a run. Re-run WITHOUT --rerank vs WITH --rerank: if B-items flip to C under")
+    print("  raw BM25, the LLM reranker is demoting gold and rerank_message_hits=False is a")
+    print("  one-flag fix. If C dominates -> the residual is synthesis, not ranking; stop here.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Read-only KU retrieval/dating probe")
     repo_root = Path(__file__).resolve().parent.parent
@@ -182,6 +340,14 @@ def main() -> None:
                     help="override message_fts_top_k to widen the recall pool (diagnostic)")
     ap.add_argument("--dream", action="store_true",
                     help="run dream to populate + print conflicting graph edges")
+    ap.add_argument("--ranking", action="store_true",
+                    help="RANKING MODE: split each KU item into B (truncation) vs C (synthesis) "
+                         "by reconstructing the final answer context offline")
+    ap.add_argument("--rerank", action="store_true",
+                    help="ranking mode: match the headline run's LLM message reranker (ON). "
+                         "Default is raw BM25 (rerank off) — compare the two to test demotion.")
+    ap.add_argument("--run-top-k", type=int, default=15,
+                    help="the --top-k the headline run used (search sees top_k*3 candidates)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--api-key", default="")
     args = ap.parse_args()
@@ -201,6 +367,11 @@ def main() -> None:
         print("No knowledge-update questions found in this dataset.")
         sys.exit(1)
     ku = ku[: args.n]
+
+    if args.ranking:
+        run_ranking(ku, args)
+        return
+
     print(f"Probing {len(ku)} knowledge-update questions "
           f"(dream={'ON' if args.dream else 'OFF'}, "
           f"message tier=raw BM25, wide={args.wide or 'default'})\n", flush=True)
