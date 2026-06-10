@@ -621,9 +621,72 @@ build — the discipline that killed L2a, L2b, and both halves of L3, and now cl
 
 ## 6. Still pending (larger, durable — not LME-gated)
 
-- Bi-temporal edges (Zep/Graphiti `valid_at`/`invalid_at`).
+- Bi-temporal edges (Zep/Graphiti `valid_at`/`invalid_at`). **Phase 1 (schema v15
+  columns) LANDED; the supersession wiring is P2 below.**
 - RAPTOR-style aggregation nodes in dreaming (staleness via `digested_version`).
+  **Trial running — gated by `raptor_cluster_probe.py` (co-location verdict decides
+  the build).**
 - Relative-date parsing ("twee weken geleden") — needs `dateparser`, deferred against
   the zero-dependency hardening goal.
 - `messages_fts` not carried by export/import.
-- Tokenizer `porter` (English) vs Dutch-first scope.
+- Tokenizer `porter` (English) vs Dutch-first scope. **Unblocked by P5 below.**
+
+### Candidate levers — proposed 2026-06-10, NOT yet probed/built
+
+Same contract as §4: front-run gate before any build; additive-only (the MR-filter
+lesson); nothing reads the oracle label. None re-chase D1–D9. Roughly EV-ordered.
+
+- **P0 (measurement, run first). Reader-parity run.** One full-500 seed-0 run with a
+  stronger answer model through the existing pluggable client — same config, same judge
+  posture. Decides how much of the 19pp gap to Hindsight (89.4) is reader strength vs
+  architecture: even PERFECT MS only reaches ~82 from the 70.0 canonical baseline, so
+  the gap is distributed and the reader is the dominant unmeasured variable (D2/D8/KU
+  residual are all documented deepseek reader weaknesses). Report the reader alongside
+  the number — condition-honesty, not gaming.
+- **P1. Question-conditioned fact distillation at read time (map-reduce reader).** Before
+  the final answer call, map over retrieved hits ("extract any statement relevant to
+  {question}, else NONE"), then answer over the distilled list. Targets THREE banked
+  buckets at once: the 14 sparse-signal floor (each turn read individually → the
+  incidental "32" gets spotted — the floor inspector's "only fix is a reader that spots
+  the needle"), MS synthesis (~20: fuse ~15 one-line facts, not 45 raw slots — RAPTOR's
+  benefit without the clustering bet), and D2's can't-tally (tallying a short extracted
+  list is an easier task). Question-conditioned + transient sidesteps the over-extraction
+  risk that shelved write-time incidental extraction. Cost: N small LLM calls/query —
+  gate on route (MR/TR) or high hit-count. Additive (distilled facts join, never replace,
+  raw hits). Sequence vs RAPTOR: fallback if co-location kills it, complement if not.
+  **Free front-run: dry-run offline on the 20 banked MS synthesis misses.**
+- **P2. Bi-temporal KU supersession (wire the landed v15 columns).** Dream-time
+  contradiction detection: new fact conflicts with stored (same subject/predicate,
+  different value) → stamp old edge `invalid_at`; retrieval demotes/excludes invalidated
+  facts. Converts KU correctness from prompt-side hope (the §2 recency clause — the
+  reader must apply it) into a property of the store — load-bearing for real Hermes,
+  where the reader prompt isn't ours and conversations span months. Measurable target:
+  the ~17–21 KU conflict-resolution residual (D9).
+- **P3. Query rewriting for anaphora (the real-life lever LME is blind to).** Every LME
+  question is self-contained; real Hermes queries aren't ("what did she say about
+  that?"). Resolve pronouns/ellipsis against recent turns BEFORE the retrieval tiers —
+  raw-query FTS gets pronouns, vec gets vagueness, so both tiers miss today. Standard
+  conversational-RAG move, additive, through the existing client Protocol (cheap
+  heuristic pass first, LLM fallback). No LME delta by construction (D5-style blind
+  spot) — production value only, likely worth more there than any remaining LME point.
+- **P4. Typed user-profile tier (bounded incidental-fact extraction).** The SAFE version
+  of the shelved floor-inspector option: extract only schema-constrained first-person
+  assertions at dream time (ages, names, relationships, possessions, preferences,
+  locations) — closed vocabulary keeps precision high, unlike open-ended incidental
+  extraction. Where most of the 14-floor lives, and the memory feature users actually
+  notice ("you remembered my daughter's name"). Honcho-style user representation, native.
+- **P5. Dutch mini eval set (unblocks the deferred stemming decision).** Machine-translate
+  a stratified ~100-Q LME slice (questions + haystacks) → `LME-NL-mini`. Not
+  publication-grade; exists solely so Dutch FTS work (stemming: boeken≠boek, §2
+  diacritics follow-up) stops being blind — measure-first applied to creating the
+  measure. Cheap (a few dollars of MT).
+- **P6. Cross-encoder rerank for production latency (not a score play).** Shipping config
+  spends a full LLM round-trip reranking the message tier on EVERY query. L2c proved
+  reranking is net-positive; nothing proved the LLM must do it. A/B `--rerank-model
+  cross-encoder` (already wired; `bge-reranker-v2-m3` for multilingual per L2b note) —
+  accept if quality holds at ~50ms local. Latency/cost lever for Hermes; LME-neutral
+  expected.
+- **P7. Usage-signal feedback (longer-term).** Track which retrieved memories the answer
+  actually relied on (reader cites hit IDs, or verbatim-overlap detection) → small
+  ranking prior: retrieved-but-ignored decays, cited boosts. Invisible to any benchmark;
+  pays off in long-running deployments.
