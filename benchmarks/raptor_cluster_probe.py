@@ -89,84 +89,17 @@ from longmemeval_adapter import (  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pure clustering core — unit-tested offline on the Mac (test_raptor_cluster_probe).
-# This is the logic Phase-2 dreaming/aggregate.py will reuse, so it is kept free
-# of any DB / LLM / embedding-client dependency and operates on plain dicts.
+# Pure clustering core — canonical home is hymem.dreaming.aggregate (the Phase-2
+# build), re-exported here so probe, unit tests (test_raptor_cluster_probe), and
+# production all run the SAME clusterer and can never silently drift. The DB-side
+# probe helpers below stay local (they're benchmark-only).
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    """Cosine similarity; 0.0 on dim mismatch or zero vectors (matches the
-    behavioral_dedup._cosine contract used elsewhere in the dreaming layer)."""
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5 or 1.0
-    nb = sum(x * x for x in b) ** 0.5 or 1.0
-    return dot / (na * nb)
-
-
-def _jaccard(a: set[str], b: set[str]) -> float:
-    """Jaccard overlap of two entity sets; 0.0 if either is empty."""
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    if not inter:
-        return 0.0
-    return inter / len(a | b)
-
-
-def _linked(e1: dict, e2: dict, emb_threshold: float, ent_threshold: float) -> bool:
-    """Two episodes are in the same cluster iff their embeddings are close OR they
-    share enough key entities. OR (not AND): either signal is sufficient evidence
-    the episodes are about the same thread — embeddings catch paraphrase, entity
-    overlap catches the named-thing continuity embeddings sometimes miss."""
-    if (e1.get("vector") and e2.get("vector")
-            and _cosine(e1["vector"], e2["vector"]) >= emb_threshold):
-        return True
-    if _jaccard(e1.get("entities") or set(), e2.get("entities") or set()) >= ent_threshold:
-        return True
-    return False
-
-
-def cluster_episodes(
-    episodes: list[dict], emb_threshold: float, ent_threshold: float
-) -> dict[str, int]:
-    """Connected-components clustering over the episode link graph (union-find).
-
-    `episodes`: list of {"id": str, "vector": list[float]|None, "entities": set[str]}.
-    Returns {episode_id -> cluster_label}. Two episodes share a label iff there is a
-    path of `_linked` edges between them (transitive closure). This is deliberately
-    the simplest cross-session aggregation a RAPTOR layer could do; if even this
-    co-locates the gold, a smarter clusterer only does better.
-    """
-    parent: dict[str, str] = {e["id"]: e["id"] for e in episodes}
-
-    def find(x: str) -> str:
-        root = x
-        while parent[root] != root:
-            root = parent[root]
-        while parent[x] != root:          # path compression
-            parent[x], x = root, parent[x]
-        return root
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    for i in range(len(episodes)):
-        for j in range(i + 1, len(episodes)):
-            if _linked(episodes[i], episodes[j], emb_threshold, ent_threshold):
-                union(episodes[i]["id"], episodes[j]["id"])
-
-    roots = {e["id"]: find(e["id"]) for e in episodes}
-    label_of: dict[str, int] = {}
-    out: dict[str, int] = {}
-    for eid, root in roots.items():
-        if root not in label_of:
-            label_of[root] = len(label_of)
-        out[eid] = label_of[root]
-    return out
+from hymem.dreaming.aggregate import (  # noqa: E402
+    _cosine,
+    _jaccard,
+    _linked,
+    cluster_episodes,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

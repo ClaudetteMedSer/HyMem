@@ -109,6 +109,46 @@ class HyMemConfig:
     of `ProcedureHit`s than the default `fts_top_k`. Other abilities keep
     `fts_top_k`."""
 
+    aggregation_nodes_enabled: bool = False
+    """Master switch for the Phase-2 RAPTOR cross-session aggregation layer (off
+    by default). When True, dreaming clusters episodes across sessions
+    (connected components over embedding-OR-entity overlap) and fuses each
+    multi-session cluster into one `aggregation_nodes` summary, and augment()
+    surfaces matching nodes in `ctx.aggregation_nodes` as an ADDITIVE tier (it
+    never replaces episode/chunk/message retrieval). It targets the multi-session
+    *synthesis* residual: a question whose answer is spread one-fact-per-session
+    can be read off a single cluster summary instead of re-fusing dozens of raw
+    turns. Off → zero extra LLM cost at dream time and zero behavior change at
+    query time. The front-run co-location probe that gated this build lives in
+    `benchmarks/raptor_cluster_probe.py`."""
+
+    aggregation_emb_threshold: float = 0.55
+    """Cosine threshold above which two episodes link into the same cluster
+    (the embedding arm of the OR). Default from the passing probe grid point
+    (emb≥0.55 OR ent≥0.50), which co-located 87% of mappable gold."""
+
+    aggregation_ent_threshold: float = 0.50
+    """Jaccard(key_entities) threshold above which two episodes link (the entity
+    arm of the OR). Catches the named-thing continuity embeddings miss."""
+
+    aggregation_min_sessions: int = 2
+    """Only fuse clusters spanning at least this many DISTINCT sessions. The
+    whole point is *cross-session* synthesis; a single-session cluster adds
+    nothing the per-session episode/summary doesn't already give, so it is
+    skipped (no LLM call, no node)."""
+
+    aggregation_min_members: int = 2
+    """Minimum episodes in a cluster before it is fused. Singletons are skipped."""
+
+    aggregation_max_members: int = 12
+    """Cap on episodes fed to one aggregation summary call, bounding context and
+    cost. Largest clusters are truncated to their first `max_members` episodes in
+    message order; the node records the full membership regardless."""
+
+    aggregation_top_k: int = 3
+    """Number of aggregation nodes augment() returns in `ctx.aggregation_nodes`
+    when the layer is enabled."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 

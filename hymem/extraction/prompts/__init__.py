@@ -290,6 +290,24 @@ EPISODE_USER_TEMPLATE = """Conversation session:
 Return the JSON array now."""
 
 
+AGGREGATE_SYSTEM = """You fuse several related episodes — drawn from DIFFERENT conversation sessions but about the same ongoing thread, person, project, or topic — into one cross-session summary.
+
+The point is synthesis: a later question may need facts that are scattered one-per-session ("which of my projects use Postgres?", "how did my budget change over the year?"). Pull the through-line together so it can be answered from this one node instead of re-reading every session.
+
+Output a strict JSON object:
+- title (string): Short name for the shared thread, max 8 words
+- summary (string): 2-4 sentences fusing what these episodes collectively establish. Preserve specific named entities, numbers, dates, and changes-over-time; prefer concrete facts over generic narration. Do NOT invent anything not present in the episodes. Do NOT add "The user"/"The assistant" — use passive voice or implicit subject.
+
+Return ONLY the JSON object."""
+
+AGGREGATE_USER_TEMPLATE = """Related episodes from across sessions:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
 SESSION_SUMMARY_SYSTEM = """You write a one-sentence summary of a conversation session.
 
 Focus on: what was accomplished, decisions made, problems solved, topics covered.

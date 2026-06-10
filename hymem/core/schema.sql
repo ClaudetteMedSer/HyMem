@@ -336,6 +336,52 @@ CREATE TABLE IF NOT EXISTS episode_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- RAPTOR cross-session aggregation nodes (schema v16). Each node fuses a
+-- cluster of episodes (connected components over embedding-OR-entity overlap)
+-- that span multiple sessions, so a synthesis question reads a handful of
+-- cluster summaries instead of dozens of raw turns. The whole layer is additive
+-- and off by default at query time (cfg.aggregation_nodes_enabled). Rebuilt from
+-- scratch each dream — membership is a pure function of the current episodes —
+-- so there is no stable-id UPSERT churn; the id is a content hash of members.
+CREATE TABLE IF NOT EXISTS aggregation_nodes (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    member_episode_ids TEXT NOT NULL DEFAULT '[]',
+    session_ids TEXT NOT NULL DEFAULT '[]',
+    n_members INTEGER NOT NULL DEFAULT 0,
+    n_sessions INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS aggregation_nodes_fts USING fts5(
+    title, summary,
+    content='aggregation_nodes', content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_insert AFTER INSERT ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_delete AFTER DELETE ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(aggregation_nodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_update AFTER UPDATE ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(aggregation_nodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+    INSERT INTO aggregation_nodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+
+-- Node-summary embeddings, keyed by node id. Retrieval does a Python-cosine
+-- scan over these (no vec0 table) since the node count is small and the tier is
+-- off by default — keeping the vec0 plumbing limited to chunks/edges/episodes.
+CREATE TABLE IF NOT EXISTS aggregation_node_embeddings (
+    node_id TEXT PRIMARY KEY REFERENCES aggregation_nodes(id) ON DELETE CASCADE,
+    vector_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Procedural memory: step-by-step workflows extracted from conversations.
 CREATE TABLE IF NOT EXISTS procedures (
     id TEXT PRIMARY KEY,

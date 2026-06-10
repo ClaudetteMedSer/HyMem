@@ -624,8 +624,21 @@ build — the discipline that killed L2a, L2b, and both halves of L3, and now cl
 - Bi-temporal edges (Zep/Graphiti `valid_at`/`invalid_at`). **Phase 1 (schema v15
   columns) LANDED; the supersession wiring is P2 below.**
 - RAPTOR-style aggregation nodes in dreaming (staleness via `digested_version`).
-  **Trial running — gated by `raptor_cluster_probe.py` (co-location verdict decides
-  the build).**
+  **GATE PASSED → BUILT (off by default).** `raptor_cluster_probe.py` on the MS
+  ranking misses (grid emb≥0.55 OR ent≥0.50): of 53 misses, 31 had gold turns that
+  became episodes; **27/31 (87%) co-located all gold episodes in ONE cluster**
+  (mean 1.13 gold-clusters vs 16.8 clusters/question) — one node summary bundles the
+  synthesis inputs. The other 22/53 (42%) have NO gold episode at all = a dream
+  **coverage** gap (episode-extraction recall), a separate prior lever, NOT a
+  clustering gap — does not block the build. Built: schema v16 (`aggregation_nodes`,
+  `aggregation_node_embeddings`, migration `016`), `hymem/dreaming/aggregate.py`
+  (canonical clusterer; probe re-exports it), runner step, additive off-by-default
+  retrieval tier (`cfg.aggregation_nodes_enabled` → `ctx.aggregation_nodes`),
+  `tests/test_aggregate.py` (10 offline). **Remaining: G4 = the enabled-vs-disabled
+  LME A/B on the box (must not regress the 70.0 baseline / 51.9 MS floor) before it
+  ships on by default.** Only clusters spanning ≥2 sessions with ≥2 episodes are
+  summarized (singletons/single-session cost no LLM call); nodes are full-rebuilt each
+  dream (content-hash id → unchanged cluster reuses its cached embedding).
 - Relative-date parsing ("twee weken geleden") — needs `dateparser`, deferred against
   the zero-dependency hardening goal.
 - `messages_fts` not carried by export/import.
