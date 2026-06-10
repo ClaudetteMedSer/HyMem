@@ -143,6 +143,7 @@ hymem/
 │   ├── phase2.py       Consolidation: markers→profile, graph→MEMORY.md
 │   ├── phase3.py       Co-occurrence-aware decay + retraction
 │   ├── inference.py    Transitive closure over depends_on edges
+│   ├── bitemporal.py   Valid-time stamping: valid_at/invalid_at on edges
 │   ├── episodes.py     LLM-powered episodic memory extraction
 │   ├── procedures.py   LLM-powered procedural memory extraction
 │   ├── summary.py      LLM-powered session summarization
@@ -194,7 +195,7 @@ hymem/
 - `entity_types` — canonical entity → type classification (language, framework, database, etc.)
 
 **Knowledge graph:**
-- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges
+- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges. **Bi-temporal** (schema v15): alongside the transaction-time columns (`first_seen`/`last_seen` — when HyMem *learned* a fact), each edge carries a valid-time interval `valid_at`/`invalid_at` — when the fact was true *in the world*, sourced from the originating message's date — so supersession is a closed interval (`invalid_at IS NULL` = still valid) rather than a status flip that erases the "what was true as of date X" axis
 - `kg_evidence` — per-source provenance linking edges to chunks, with value/text/temporal metadata
 - `edge_embeddings` — JSON-encoded embedding vectors for knowledge graph edges, keyed on triple text so churning derived edges reuse cached vectors
 - `entity_aliases` — surface form → canonical entity mapping
@@ -266,6 +267,8 @@ Results are written to `MEMORY.md`'s auto-section, capped at `insights_max_entri
    - If yes → add 1 to `neg_evidence` (soft contradiction)
    - If no → leave alone (topic hasn't resurfaced)
 2. Any edge whose Laplace-smoothed confidence `(pos+1)/(pos+neg+2)` drops below the retract threshold (default: 0.15) gets `status = 'retracted'` — kept for audit but excluded from query results.
+
+**Bi-temporal stamping** (`dreaming/bitemporal.py`, schema v15): after decay, `stamp_validity()` opens the valid-time interval on every edge minted this cycle — `valid_at` ← the earliest **positive**-evidence source-message date (falling back to `first_seen`), write-once and idempotent. When an edge is superseded — phase-3 retraction here, or an explicit `retract_edge()` — `stamp_invalidation()` closes it: `invalid_at` ← the newest **negative**-evidence date (the moment the contradicting fact arrived), falling back to the flip time. Behavioral-dedup retraction is *not* stamped: collapsing duplicate edges into a survivor is representational, not a valid-time invalidation.
 
 **Transitive inference** (`inference.py`): After decay, computes transitive closure for derived edges via two rules. (1) `A depends_on B, B depends_on C → A depends_on C` (BFS over the depends_on subgraph). (2) `A uses B, B depends_on C → A depends_on C` (one-hop cross-predicate, folded into `depends_on` so the predicate vocabulary stays stable and no schema migration is required). All derived edges are marked `derived=1` with confidence equal to the product of the source edges' smoothed confidences; previously-derived edges are wiped each cycle so the closure refreshes from scratch. Edges below the retract threshold are filtered out.
 
@@ -519,7 +522,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**427 tests total, 100% passing** across 41 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
+**540 tests total, 100% passing** across 42 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling, numeric / temporal value parsing
@@ -539,6 +542,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
 - `test_mcp_server.py` — MCP tool correctness (all 7 tools)
 - `test_retract.py` — Edge retraction, alias resolution, idempotency, feedback-row recording
+- `test_bitemporal.py` — Valid-time interval: valid_at from positive-evidence world date (write-once), invalid_at on supersession from newest negative-evidence date, as-of resolution, retract_edge interval-close, migration backfill + export round-trip
 - `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording, lock-lease heartbeat (`_refresh_lock` owner advance / holder-guard / once-per-session), `dream_status()` backlog + in-progress reporting
 - `test_dedup_delock.py` — Dedup similarity vectors embedded outside the write lock (`conn.in_transaction` False at every embed), behavior preserved end-to-end
 - `test_dedup_samewave.py` — Same-cycle sibling collapse (same- and cross-chunk), no over-merging of non-siblings, lexical guard still applies, no in-lock embed
