@@ -12,7 +12,7 @@
 
 **~9,400 lines of Python**, zero npm, zero Docker required.
 
-**Benchmarked on LongMemEval.** On the 500-question LongMemEval-S suite, HyMem scores **67.6% overall on the production path** — the in-library ability router shaping retrieval with *no* oracle labels, so the number reflects what real Hermes gets, not a benchmark-only ceiling. Full table and methodology in [§11](#11-benchmark-results-longmemeval).
+**Benchmarked on LongMemEval.** On the 500-question LongMemEval-S suite, HyMem scores **70.0% overall on the production path** — the in-library ability router shaping retrieval with *no* oracle labels, so the number reflects what real Hermes gets, not a benchmark-only ceiling. The headline runs with **dreaming on** (worth +3.6pp; the A/B and per-category lifts are in §11). Full table and methodology in [§11](#11-benchmark-results-longmemeval).
 
 ---
 
@@ -522,7 +522,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**540 tests total, 100% passing** across 42 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
+**554 tests total, 100% passing** across 43 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling, numeric / temporal value parsing
@@ -543,6 +543,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_mcp_server.py` — MCP tool correctness (all 7 tools)
 - `test_retract.py` — Edge retraction, alias resolution, idempotency, feedback-row recording
 - `test_bitemporal.py` — Valid-time interval: valid_at from positive-evidence world date (write-once), invalid_at on supersession from newest negative-evidence date, as-of resolution, retract_edge interval-close, migration backfill + export round-trip
+- `test_raptor_cluster_probe.py` — Pure connected-components clustering core of the Phase-2 RAPTOR front-run gate (`benchmarks/raptor_cluster_probe.py`): cosine/Jaccard primitives, OR-link predicate (embedding *or* entity overlap), transitive closure, embedding-bridge across disjoint entity sets, threshold sensitivity. The DB/dream side runs only on the box; this pins the clusterer the build would reuse
 - `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording, lock-lease heartbeat (`_refresh_lock` owner advance / holder-guard / once-per-session), `dream_status()` backlog + in-progress reporting
 - `test_dedup_delock.py` — Dedup similarity vectors embedded outside the write lock (`conn.in_transaction` False at every embed), behavior preserved end-to-end
 - `test_dedup_samewave.py` — Same-cycle sibling collapse (same- and cross-chunk), no over-merging of non-siblings, lexical guard still applies, no in-lock embed
@@ -563,19 +564,33 @@ HyMem is evaluated end-to-end on **LongMemEval-S**, the standard long-term-memor
 - **Oracle** — the question-type label drives retrieval shaping. The category ceiling.
 - **Production-truth (`--auto-ability`)** — the in-library `detect_ability` router (`query/intent.py`, §3) infers the ability from the query alone, label-free, exactly as it does in Hermes. The honest number.
 
-**Production-truth: 67.6% overall** on the full 500-question suite (auto-ability router; permissive, abstention-guarded default answer prompt; recency-dated raw-message context). Dreaming is off for these runs — it is score-neutral on LongMemEval's single-haystack setup and is kept on in production for the cross-session knowledge graph LongMemEval can't see (§8). Answering and judging use the default DeepSeek model.
+**Production-truth: 70.0% overall** on the full 500-question suite (auto-ability router; permissive, abstention-guarded default answer prompt; recency-dated raw-message context; **full dream**). Answering and judging use the default DeepSeek model. Earlier headline runs were no-dream (LME's single-haystack setup once looked dream-neutral); the definitive A/B below overturns that — dream is worth **+3.6pp overall** and the graph facts it consolidates now carry real weight in retrieval.
 
 | Question type | Score |
 |---|---|
 | Single-session-user (SS-U) | 95.7% |
-| Knowledge-update (KU) | 75.6% |
+| Knowledge-update (KU) | 76.9% |
 | Temporal-reasoning (TR) | 72.9% |
+| Single-session-preference (SS-P) | 66.7% |
 | Single-session-assistant (SS-A) | 66.1% |
-| Single-session-preference (SS-P) | 60.0% |
-| Multi-session (MS) | 45.1% |
-| **Overall** | **67.6%** |
+| Multi-session (MS) | 51.9% |
+| **Overall** | **70.0%** |
 
 For context, published LongMemEval figures place this local, embedded, SQLite-only system ahead of Honcho (63.8) and the RAG / LIGHT baselines (48.5 / 51.7); the frontier system (Hindsight, 89.4) leads almost entirely on **multi-session** — which is exactly HyMem's lowest row and its open frontier (below).
+
+**Dreaming is worth +3.6pp — the definitive A/B (500q, seed 0, auto-ability, permissive-default).** The full-dream table above is the canonical number; the no-dream column below is the same config with the dream cycle skipped:
+
+| Question type | No-dream | Full-dream | Δ |
+|---|---|---|---|
+| Knowledge-update (KU) | 70.5% | 76.9% | +6.4pp |
+| Multi-session (MS) | 42.9% | 51.9% | +9.0pp |
+| Temporal-reasoning (TR) | 74.4% | 72.9% | −1.5pp |
+| Single-session-preference (SS-P) | 56.7% | 66.7% | +10.0pp |
+| Single-session-assistant (SS-A) | 67.9% | 66.1% | −1.8pp |
+| Single-session-user (SS-U) | 94.3% | 95.7% | +1.4pp |
+| **Overall** | **66.4%** | **70.0%** | **+3.6pp** |
+
+The biggest lifts land where cross-session consolidation matters most: **MS +9pp** (dream bridges fractured sessions), **SS-P +10pp** (preferences extracted into graph facts), **KU +6.4pp** (knowledge updates consolidated). The TR and SS-A dips are within LLM-judge variance (~1.5–2pp). The recall ceiling confirms the *mechanism*, not just the score: retrieval misses dropped 42 → 39, and the "both" recovery tier (message + graph facts) jumped **0 → 98** — dream's graph facts are now actively contributing — while MS ranking misses dropped 10 (67 → 57), so the consolidated facts also improve the reranker's candidate quality. Abstention improves in step (70.0% → 76.7% correct refusals): graph consolidation helps the system tell "I truly don't know" from "I just can't find it in messages." The cost is real — **140 min vs 12 min (11.7×), ~1.7M tokens** — which is why dream is a background idle cycle in production, not an inline step.
 
 **What drives the score — every lever carries to production, none reads the oracle label:**
 
@@ -583,13 +598,19 @@ For context, published LongMemEval figures place this local, embedded, SQLite-on
 - **Label-free ability routing** (`detect_ability`, EN+NL regex, §3) — fills MR/TR shaping in production with no oracle label. MR layers a deterministic, **additive** user-turn count on normal retrieval (a false-positive route stays harmless — retrieval is never suppressed); TR injects a date-ordered chronology.
 - **Recency-dated context** — `message_hits` are stamped with their `created_at`, plus a value-aware recency clause so the answerer prefers the most recent turn that actually *states* a value rather than a later tangential mention. Lifted knowledge-update from 62.8% → 75.6%.
 - **Permissive, abstention-guarded default prompt** — recovers single-session-preference questions the strict prompt refused, while holding the abstention guard tight on single-turn facts.
+- **Dreaming (graph consolidation)** — the background dream cycle extracts a cross-session knowledge graph whose facts join the retrieval pool; worth +3.6pp overall and the dominant lever on MS / SS-P / KU (the A/B above).
 
-**The open frontier is multi-session (45.1%).** Extensive LLM-free probing established that MS *retrieval* is effectively closed — the gold turns do reach the answer context; the residual is cross-session **synthesis** (a reader problem, not retrieval) plus a small floor of facts buried as incidental asides inside otherwise off-topic turns. One tempting "fix" (a user-only context filter for MR) was built, measured, and **reverted**: it was neutral on its target and dropped assistant-turn gold on MR-misrouted single-session-assistant questions — a worked example of the project's rule that you never *suppress* retrieval on a routed ability that has false positives, only *add* to it. The full investigation, including dead-ends not to re-chase, lives in `benchmarks/longmemeval_roadmap.md`.
+**The open frontier is multi-session (51.9%).** Extensive LLM-free probing established that MS *retrieval* is effectively closed — the gold turns do reach the answer context; the residual is cross-session **synthesis** (a reader problem, not retrieval) plus a small floor of facts buried as incidental asides inside otherwise off-topic turns. One tempting "fix" (a user-only context filter for MR) was built, measured, and **reverted**: it was neutral on its target and dropped assistant-turn gold on MR-misrouted single-session-assistant questions — a worked example of the project's rule that you never *suppress* retrieval on a routed ability that has false positives, only *add* to it. The full investigation, including dead-ends not to re-chase, lives in `benchmarks/longmemeval_roadmap.md`.
+
+**Next lever under gate — RAPTOR cross-session aggregation (Phase 2).** Since the MS residual is *synthesis* (all gold turns reach context, the reader fails to fuse ~45 raw slots), the candidate fix is upstream: pre-compute hierarchical aggregation nodes so the answer model fuses a handful of cluster summaries instead of dozens of raw turns. This only helps if clustering *co-locates* a question's synthesis inputs into a single node — so, mirroring the front-run discipline that killed the L3 diversity-pack, it is gated by an offline probe (`benchmarks/raptor_cluster_probe.py`) **before** any table or migration is built. The probe dreams each MS miss into episodes, clusters them across sessions by embedding-or-entity overlap, and measures how often the gold-bearing episodes land in one cluster. High co-location → build; gold scatters → bank the writeup like L3. The clusterer is unit-pinned offline (`test_raptor_cluster_probe.py`); the decisive run is on the Hermes box (it needs real dreams) and is pending.
 
 **Reproduce:**
 
 ```bash
-# production-truth (the 67.6% headline)
+# production-truth (the 70.0% headline — full dream, ~140 min at this config)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
+    --workers 4 --permissive-default
+# fast no-dream A/B (the 66.4% column, ~12 min)
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
     --workers 4 --no-dream --permissive-default
 # oracle ceiling (question-type label drives shaping)
