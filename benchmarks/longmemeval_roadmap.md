@@ -673,6 +673,17 @@ build — the discipline that killed L2a, L2b, and both halves of L3, and now cl
   (stable store → zero LLM calls on rebuild; root id salted so digest-style and
   rollup-style fusions never cross-reuse). By construction no LME delta (D5-style
   blind spot) — production value only; evaluate qualitatively on the box.
+  **First prod light (91-session store): tree built clean (13 nodes), but the
+  digest read as a recap of the latest clinical thread, not a profile. Two
+  structural causes fixed (2026-06-11): (a) intermediate rollups were reusing
+  the thread-fusion AGGREGATE prompt, which narrows unrelated topics to the
+  dominant one at every level → new breadth-preserving ROLLUP prompt ("every
+  thread survives"); (b) the leaf cap was a recency slice (`[-cap:]`) → now
+  evenly sampled across the backlog. Fusion salts are now prompt-versioned
+  (`rollup.v1`/`root.v2`), so the next dream regenerates rollups+root with the
+  new prompts while reusing all level-0 fusions. `Digest` gained
+  `n_sessions_total` — a low covered/total ratio means sessions without
+  episodes (dream-coverage gap upstream), not a tree problem.**
 - Relative-date parsing ("twee weken geleden") — needs `dateparser`, deferred against
   the zero-dependency hardening goal.
 - `messages_fts` not carried by export/import.

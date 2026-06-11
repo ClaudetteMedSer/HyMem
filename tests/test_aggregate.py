@@ -41,12 +41,20 @@ _DIGEST_JSON = json.dumps({
 })
 
 
+_ROLLUP_JSON = json.dumps({
+    "title": "Mixed threads",
+    "summary": "Several distinct topics, each preserved.",
+})
+
+
 def _agg_llm() -> StubLLMClient:
-    # Routes on prompt phrases unique to each system prompt: cluster fusion
-    # (AGGREGATE_SYSTEM) vs the root digest (DIGEST_SYSTEM).
+    # Routes on prompt phrases unique to each system prompt: level-0 cluster
+    # fusion (AGGREGATE_SYSTEM), intermediate rollups (ROLLUP_SYSTEM), and the
+    # root digest (DIGEST_SYSTEM).
     return StubLLMClient(
         fixtures={
             "fuse several related episodes": _NODE_JSON,
+            "combined summary that loses no thread": _ROLLUP_JSON,
             "standing digest of everything known": _DIGEST_JSON,
         },
         default="[]",
@@ -321,6 +329,7 @@ def test_digest_root_covers_nodes_and_unclustered_episodes(cfg, conn):
     assert digest.title == "User digest"
     assert "cycles" in digest.summary
     assert digest.n_sessions == 3
+    assert digest.n_sessions_total == 3
 
 
 def test_digest_absent_when_rollup_disabled(cfg, conn):
@@ -380,6 +389,23 @@ def test_digest_converges_on_fully_disjoint_episodes(cfg, conn):
     assert levels and all(lv >= 1 for lv in levels)   # no level-0 clusters formed
 
 
+def test_digest_leaf_cap_samples_across_history_not_recency(cfg, conn):
+    # 4 disjoint episodes, leaf cap 2: a recency slice would digest only
+    # {e3, e4} (the narrow "last fortnight" digest seen on the first prod
+    # build); even sampling must keep the span's endpoints {e1, e4}.
+    acfg = replace(_enabled(cfg, digest=True), aggregation_digest_max_leaves=2)
+    with core_db.transaction(conn):
+        for i in range(1, 5):
+            _seed_episode(conn, f"e{i}", f"s{i}", f"Topic {i}",
+                          f"Notes about topic {i}.", [f"topic{i}"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+
+    root = conn.execute(
+        "SELECT member_episode_ids FROM aggregation_nodes WHERE is_root = 1"
+    ).fetchone()
+    assert set(json.loads(root["member_episode_ids"])) == {"e1", "e4"}
+
+
 def test_digest_rebuild_reuses_fusions(cfg, conn):
     # Unchanged store → unchanged member sets at EVERY level → the rebuild must
     # reuse all stored fusions (level-0, rollups, root) without an LLM call.
@@ -395,12 +421,12 @@ def test_digest_rebuild_reuses_fusions(cfg, conn):
     build_aggregation_nodes(conn, acfg, _agg_llm(), None)
     before = load_digest(conn)
 
+    wrong = json.dumps({"title": "WRONG", "summary": "must not be used"})
     poisoned = StubLLMClient(
         fixtures={
-            "fuse several related episodes": json.dumps(
-                {"title": "WRONG", "summary": "must not be used"}),
-            "standing digest of everything known": json.dumps(
-                {"title": "WRONG", "summary": "must not be used"}),
+            "fuse several related episodes": wrong,
+            "combined summary that loses no thread": wrong,
+            "standing digest of everything known": wrong,
         },
         default="[]",
     )

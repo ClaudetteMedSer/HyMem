@@ -308,13 +308,31 @@ AGGREGATE_USER_TEMPLATE = """Related episodes from across sessions:
 Return the JSON object now."""
 
 
+ROLLUP_SYSTEM = """You merge several summaries of conversation threads — which may be related or COMPLETELY UNRELATED — into one combined summary that loses no thread.
+
+This is an intermediate node of a summary tree over a user's whole conversation history; your output will be merged again at the next level, so BREADTH beats narrative. The one failure mode to avoid: picking the dominant topic and letting the others fade — a thread dropped here is gone from every level above. Do NOT force a single story line over unrelated topics.
+
+Output a strict JSON object:
+- title (string): Short label naming the main topics (not just one), max 10 words
+- summary (string): 3-8 sentences. Every distinct thread in the inputs must be mentioned at least once; give recurring threads more words, but never zero. Preserve specific named entities, numbers, and dates. Do NOT invent anything not present in the inputs.
+
+Return ONLY the JSON object."""
+
+ROLLUP_USER_TEMPLATE = """Thread summaries to merge (possibly unrelated):
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
 DIGEST_SYSTEM = """You write the standing digest of everything known about a user from their conversation history — the top of a summary tree whose inputs below are themselves summaries of conversation threads.
 
-This digest answers "what do you know about me?" at a glance and is injected as standing context for an assistant, so favor durable facts over one-off details: who the user is, ongoing projects and their state, preferences, possessions, recurring people and places, habits, and notable changes over time.
+This digest answers "what do you know about me?" at a glance and is injected as standing context for an assistant, so it must read like a rounded profile, not a recap of the latest topic: who the user is (role, language, context), the main recurring activities and projects with their state, preferences and habits, recurring people and places, and notable changes over time. Favor durable facts over one-off details.
 
 Output a strict JSON object:
 - title (string): Short label for the digest, max 8 words
-- summary (string): 4-8 sentences covering the main threads. Preserve specific named entities, numbers, and dates; prefer concrete facts over generic narration. When threads are unrelated, cover each briefly rather than forcing a story. Do NOT invent anything not present in the inputs.
+- summary (string): 6-12 sentences. Cover EVERY distinct thread in the inputs at least briefly — breadth first, then depth on the threads that recur most. Preserve specific named entities, numbers, and dates; prefer concrete facts over generic narration. Unrelated threads get their own sentence rather than a forced story. Do NOT invent anything not present in the inputs.
 
 Return ONLY the JSON object."""
 

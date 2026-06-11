@@ -51,9 +51,19 @@ from hymem.extraction.prompts import (
     AGGREGATE_USER_TEMPLATE,
     DIGEST_SYSTEM,
     DIGEST_USER_TEMPLATE,
+    ROLLUP_SYSTEM,
+    ROLLUP_USER_TEMPLATE,
 )
 
 log = logging.getLogger("hymem.dreaming.aggregate")
+
+# Fusion-prompt versions, baked into the node-id salt of the level the prompt
+# serves. Reuse is keyed by node id, so bumping a version when its prompt
+# changes materially makes every cached fusion of that kind regenerate on the
+# next dream — without touching the other levels' caches. Level 0 is unsalted
+# (its AGGREGATE prompt predates versioning; bump by introducing a salt).
+_ROLLUP_SALT = "rollup.v1"
+_ROOT_SALT = "root.v2"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +197,21 @@ def _node_id(member_ids: list[str], *, salt: str = "") -> str:
         payload = f"{salt}::{payload}"
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
     return f"agg_{digest}"
+
+
+def _evenly_spaced(seq: list, cap: int) -> list:
+    """At most `cap` elements spread evenly across `seq` (first and last always
+    kept). Used to cap the digest's pass-through leaves: a recency slice
+    (`seq[-cap:]`) would make a first build over a long backlog digest only the
+    newest stretch of history — even spacing keeps the digest spanning the
+    user's whole span at the same LLM cost."""
+    n = len(seq)
+    if cap <= 0 or n <= cap:
+        return list(seq)
+    if cap == 1:
+        return [seq[-1]]
+    idx = sorted({round(i * (n - 1) / (cap - 1)) for i in range(cap)})
+    return [seq[i] for i in idx]
 
 
 def _centroid(vectors: list[list[float] | None]) -> list[float] | None:
@@ -413,12 +438,10 @@ def build_aggregation_nodes(
 
     if cfg.aggregation_digest_enabled:
         # Digest leaves = the level-0 nodes plus every episode no cluster
-        # absorbed (capped to the most recent), so the root covers the WHOLE
-        # store, not just its cross-session threads.
+        # absorbed (capped, sampled evenly across the backlog), so the root
+        # covers the WHOLE store — full time span, not just recent threads.
         leftovers = [e for e in episodes if e["id"] not in clustered_ids]
-        cap = cfg.aggregation_digest_max_leaves
-        if cap > 0:
-            leftovers = leftovers[-cap:]
+        leftovers = _evenly_spaced(leftovers, cfg.aggregation_digest_max_leaves)
         items += [{
             "id": e["id"], "title": e["title"] or "", "summary": e["summary"] or "",
             "vector": e["vector"], "entities": e["entities"],
@@ -494,13 +517,18 @@ def _build_digest_levels(
                 next_items.append(g[0])
                 continue
             member_ids = [m["id"] for m in g]
-            node_id = _node_id(member_ids)
+            node_id = _node_id(member_ids, salt=_ROLLUP_SALT)
             fused = existing.get(node_id)
             if fused is not None:
                 reused += 1
             else:
-                fused = _fuse_items(g, cfg, llm, system=AGGREGATE_SYSTEM,
-                                    template=AGGREGATE_USER_TEMPLATE)
+                # ROLLUP, not AGGREGATE: a rollup group (especially a forced
+                # chunk) can hold UNRELATED threads, and the thread-fusion
+                # prompt would narrow to the dominant one — a thread dropped
+                # here is gone from every level above, which is exactly how a
+                # whole-store digest degrades into a recap of one topic.
+                fused = _fuse_items(g, cfg, llm, system=ROLLUP_SYSTEM,
+                                    template=ROLLUP_USER_TEMPLATE)
                 if fused is None:
                     next_items.extend(g)
                     continue
@@ -525,7 +553,7 @@ def _build_digest_levels(
     if not items:
         return rows, reused
     member_ids = [m["id"] for m in items]
-    root_id = _node_id(member_ids, salt="root")
+    root_id = _node_id(member_ids, salt=_ROOT_SALT)
     fused = existing.get(root_id)
     if fused is not None:
         reused += 1
@@ -546,12 +574,16 @@ def _build_digest_levels(
 @dataclass
 class Digest:
     """The root of the RAPTOR tree — the standing whole-store summary that
-    `HyMem.digest()` exposes for system-prompt-style injection. `n_sessions`
-    says how much history it condenses; `generated_at` is the build time."""
+    `HyMem.digest()` exposes for system-prompt-style injection.
+    `n_sessions`/`n_sessions_total` say how much of the store's history the
+    digest actually condenses — a low ratio means many sessions never produced
+    episodes (a dream-coverage gap upstream of the digest, not a tree problem).
+    `generated_at` is the build time."""
 
     title: str
     summary: str
     n_sessions: int
+    n_sessions_total: int
     generated_at: str
 
 
@@ -569,9 +601,11 @@ def load_digest(conn: sqlite3.Connection) -> Digest | None:
     ).fetchone()
     if row is None:
         return None
+    total = conn.execute("SELECT COUNT(*) AS c FROM sessions").fetchone()["c"]
     return Digest(
         title=row["title"],
         summary=row["summary"],
         n_sessions=row["n_sessions"],
+        n_sessions_total=int(total),
         generated_at=row["created_at"] or "",
     )
