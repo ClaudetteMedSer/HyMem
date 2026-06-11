@@ -436,6 +436,72 @@ def test_digest_rebuild_reuses_fusions(cfg, conn):
     assert after is not None and after.summary == before.summary
 
 
+def test_digest_root_fusion_is_grounded_in_graph_facts(cfg, conn):
+    # The root prompt must carry the VERIFIED FACTS block built from active
+    # non-derived graph edges — the store-grounded anchor that gives the model
+    # true identity signals instead of a vacuum to fill (the Acme incident).
+    from tests.conftest import seed_edge
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"])
+        seed_edge(conn, "atta", "part_of", "medflow", pos=5)
+        seed_edge(conn, "noise", "uses", "leftpad", pos=3, derived=1)  # excluded
+    llm = _agg_llm()
+    build_aggregation_nodes(conn, acfg, llm, None)
+
+    digest_calls = [c for c in llm.calls
+                    if "standing digest of everything known" in c.system]
+    assert len(digest_calls) == 1
+    assert "atta part_of medflow" in digest_calls[0].user
+    assert "leftpad" not in digest_calls[0].user        # derived edges excluded
+    assert load_digest(conn) is not None
+
+
+def test_digest_regenerates_when_graph_facts_change(cfg, conn):
+    # Same tree membership, changed graph → the anchor hash in the root's
+    # cache id must force a fresh fusion (a digest pinned to stale ground
+    # truth is the failure the anchor exists to prevent).
+    from tests.conftest import seed_edge
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"])
+        seed_edge(conn, "atta", "part_of", "medflow", pos=5)
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+
+    with core_db.transaction(conn):
+        seed_edge(conn, "atta", "prefers", "duckdb", pos=4)
+    fresh = StubLLMClient(
+        fixtures={"standing digest of everything known": json.dumps(
+            {"title": "Fresh digest", "summary": "Re-grounded."})},
+        default="[]",
+    )
+    build_aggregation_nodes(conn, acfg, fresh, None)
+    digest = load_digest(conn)
+    assert digest is not None and digest.title == "Fresh digest"
+    # And with the graph unchanged, a further rebuild reuses the new root.
+    build_aggregation_nodes(conn, acfg, StubLLMClient(default="[]"), None)
+    assert load_digest(conn).title == "Fresh digest"
+
+
+def test_digest_anchor_disabled_with_zero_cap(cfg, conn):
+    from tests.conftest import seed_edge
+    acfg = replace(_enabled(cfg, digest=True), aggregation_digest_anchor_facts=0)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"])
+        seed_edge(conn, "atta", "part_of", "medflow", pos=5)
+    llm = _agg_llm()
+    build_aggregation_nodes(conn, acfg, llm, None)
+
+    digest_calls = [c for c in llm.calls
+                    if "standing digest of everything known" in c.system]
+    assert len(digest_calls) == 1
+    assert "atta part_of medflow" not in digest_calls[0].user
+    assert "(none)" in digest_calls[0].user
+
+
 def test_hymem_digest_api_none_by_default(cfg):
     # Default config: aggregation layer off → digest() is None, no error.
     hy = HyMem(cfg, llm=StubLLMClient(default="[]"),

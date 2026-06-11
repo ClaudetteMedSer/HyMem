@@ -688,9 +688,18 @@ build — the discipline that killed L2a, L2b, and both halves of L3, and now cl
   coverage unchanged 65/91). One artifact: an invented identity ("senior
   engineer at Acme Corp") — the digest prompt demanded a profile SHAPE with
   role slots, so the model filled the missing slot; root.v3 makes identity
-  strictly evidence-bound (omit when absent). If v3 still hallucinates,
-  the next anchor is feeding user-canonical graph facts into the digest
-  input — same lever as the host-side profile injection, but store-grounded.**
+  strictly evidence-bound (omit when absent). v3 did NOT kill it — the
+  hallucination had CRYSTALLIZED in a cached rollup node (reuse keeps a
+  poisoned fusion alive across dreams; a root-only prompt fix can't see that
+  its input is invented). Escalation built (2026-06-11, root.v4): (a)
+  store-grounded anchoring — `_anchor_facts` injects top active non-derived
+  knowledge-graph edges as a VERIFIED FACTS ground-truth block into the root
+  fusion (`aggregation_digest_anchor_facts`, default 20, 0 disables); the
+  block's hash joins the root cache id so graph changes regenerate the digest;
+  (b) identity evidence-bound clauses at EVERY fusion level (AGGREGATE, ROLLUP,
+  DIGEST); (c) all salts bumped (cluster.v2 / rollup.v2 / root.v4) so the
+  poisoned cached fusions regenerate next dream. LESSON: a prompt hardened
+  against an artifact must invalidate the cache level that produced it.**
 - Relative-date parsing ("twee weken geleden") — needs `dateparser`, deferred against
   the zero-dependency hardening goal.
 - `messages_fts` not carried by export/import.

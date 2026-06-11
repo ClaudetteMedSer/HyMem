@@ -60,10 +60,14 @@ log = logging.getLogger("hymem.dreaming.aggregate")
 # Fusion-prompt versions, baked into the node-id salt of the level the prompt
 # serves. Reuse is keyed by node id, so bumping a version when its prompt
 # changes materially makes every cached fusion of that kind regenerate on the
-# next dream — without touching the other levels' caches. Level 0 is unsalted
-# (its AGGREGATE prompt predates versioning; bump by introducing a salt).
-_ROLLUP_SALT = "rollup.v1"
-_ROOT_SALT = "root.v3"      # v3: identity strictly evidence-bound (Acme fix)
+# next dream — without touching the other levels' caches. This matters beyond
+# style: a hallucination CRYSTALLIZES in a cached fusion (the "Acme Corp"
+# incident lived in a persisted rollup and survived a root-only fix), so a
+# prompt hardened against an artifact must invalidate the level that produced
+# it, or the artifact outlives the fix.
+_CLUSTER_SALT = "cluster.v2"  # v2: identity evidence-bound (was unsalted)
+_ROLLUP_SALT = "rollup.v2"    # v2: identity evidence-bound
+_ROOT_SALT = "root.v4"        # v4: VERIFIED FACTS anchor block
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,13 +260,14 @@ def select_clusters(
 
 
 def _llm_fuse(
-    text: str, llm: LLMClient, *, system: str, template: str
+    user_prompt: str, llm: LLMClient, *, system: str
 ) -> dict | None:
-    """One LLM call fusing `text` into {title, summary}. Returns None when the
-    call fails or yields nothing usable (so no empty node is persisted)."""
+    """One LLM call fusing the prepared `user_prompt` into {title, summary}.
+    Returns None when the call fails or yields nothing usable (so no empty
+    node is persisted)."""
     request = LLMRequest(
         system=system,
-        user=template.format(text=text),
+        user=user_prompt,
         response_format="json",
     )
     try:
@@ -294,19 +299,39 @@ def _summarize_cluster(
     text = "\n\n---\n\n".join(
         f"[{m['session_id']}] {m['title']}\n{m['summary']}" for m in capped
     )
-    return _llm_fuse(text, llm, system=AGGREGATE_SYSTEM,
-                     template=AGGREGATE_USER_TEMPLATE)
+    return _llm_fuse(AGGREGATE_USER_TEMPLATE.format(text=text), llm,
+                     system=AGGREGATE_SYSTEM)
 
 
-def _fuse_items(
-    items: list[dict], cfg: HyMemConfig, llm: LLMClient,
-    *, system: str, template: str,
-) -> dict | None:
-    """Fuse hierarchy items (level-0 nodes / rollups / pass-through episodes,
-    all carrying title+summary+session_ids) into {title, summary}."""
+def _items_text(items: list[dict], cfg: HyMemConfig) -> str:
+    """Render hierarchy items (level-0 nodes / rollups / pass-through episodes,
+    all carrying title+summary) as one fusion input block."""
     capped = items[: cfg.aggregation_max_members]
-    text = "\n\n---\n\n".join(f"{m['title']}\n{m['summary']}" for m in capped)
-    return _llm_fuse(text, llm, system=system, template=template)
+    return "\n\n---\n\n".join(f"{m['title']}\n{m['summary']}" for m in capped)
+
+
+def _anchor_facts(conn: sqlite3.Connection, cap: int) -> list[str]:
+    """Top ACTIVE, non-derived, non-superseded knowledge-graph edges rendered
+    as one-line facts — the VERIFIED FACTS block grounding the root digest
+    fusion. Graph edges come straight from conversation evidence (unlike the
+    machine-generated summaries the root fuses), so they give the model true
+    identity/preference signals and the authority to drop a summary claim that
+    conflicts — the countermeasure to hallucinations crystallized in cached
+    rollups. Strongest evidence first."""
+    if cap <= 0:
+        return []
+    rows = conn.execute(
+        """
+        SELECT subject_canonical AS s, predicate AS p, object_canonical AS o
+        FROM knowledge_graph
+        WHERE status = 'active' AND derived = 0 AND invalid_at IS NULL
+          AND pos_evidence > neg_evidence
+        ORDER BY pos_evidence - neg_evidence DESC, last_seen DESC, id
+        LIMIT ?
+        """,
+        (cap,),
+    ).fetchall()
+    return [f"{r['s']} {r['p']} {r['o']}" for r in rows]
 
 
 def _persist_node_embeddings(
@@ -414,7 +439,7 @@ def build_aggregation_nodes(
     reused = 0
     for members in clusters:
         member_ids = [m["id"] for m in members]
-        node_id = _node_id(member_ids)
+        node_id = _node_id(member_ids, salt=_CLUSTER_SALT)
         fused = existing.get(node_id)
         if fused is not None:
             reused += 1
@@ -447,7 +472,10 @@ def build_aggregation_nodes(
             "vector": e["vector"], "entities": e["entities"],
             "session_ids": {e["session_id"]},
         } for e in leftovers]
-        digest_rows, digest_reused = _build_digest_levels(items, cfg, llm, existing)
+        digest_rows, digest_reused = _build_digest_levels(
+            items, cfg, llm, existing,
+            anchor_facts=_anchor_facts(conn, cfg.aggregation_digest_anchor_facts),
+        )
         rows += digest_rows
         reused += digest_reused
 
@@ -481,7 +509,8 @@ def build_aggregation_nodes(
 
 
 def _build_digest_levels(
-    items: list[dict], cfg: HyMemConfig, llm: LLMClient, existing: dict[str, dict]
+    items: list[dict], cfg: HyMemConfig, llm: LLMClient,
+    existing: dict[str, dict], *, anchor_facts: list[str],
 ) -> tuple[list[dict], int]:
     """RAPTOR rollup: recursively cluster-and-fuse the frontier `items` (each
     {"id","title","summary","vector","entities","session_ids"}) until at most
@@ -494,7 +523,12 @@ def _build_digest_levels(
     runs of `fan_in` items, which guarantees the loop converges. A failed
     fusion passes its members through unfused (the tree degrades, never
     blocks); if a whole pass makes no progress the loop bails out and the root
-    fuses whatever frontier remains (capped inside `_fuse_items`)."""
+    fuses whatever frontier remains (capped inside `_items_text`).
+
+    The root fusion is GROUNDED: `anchor_facts` (top knowledge-graph edges)
+    render as a VERIFIED FACTS block the digest prompt treats as ground truth
+    over the machine-generated summaries, and the block's hash joins the root's
+    cache id so a changed graph regenerates the digest."""
     rows: list[dict] = []
     reused = 0
     fan_in = max(2, cfg.aggregation_max_members)
@@ -527,8 +561,10 @@ def _build_digest_levels(
                 # prompt would narrow to the dominant one — a thread dropped
                 # here is gone from every level above, which is exactly how a
                 # whole-store digest degrades into a recap of one topic.
-                fused = _fuse_items(g, cfg, llm, system=ROLLUP_SYSTEM,
-                                    template=ROLLUP_USER_TEMPLATE)
+                fused = _llm_fuse(
+                    ROLLUP_USER_TEMPLATE.format(text=_items_text(g, cfg)),
+                    llm, system=ROLLUP_SYSTEM,
+                )
                 if fused is None:
                     next_items.extend(g)
                     continue
@@ -553,13 +589,23 @@ def _build_digest_levels(
     if not items:
         return rows, reused
     member_ids = [m["id"] for m in items]
-    root_id = _node_id(member_ids, salt=_ROOT_SALT)
+    # The VERIFIED FACTS anchor is part of the root's INPUT, so it joins the
+    # cache key: a changed graph (new fact, supersession) regenerates the
+    # digest even when the tree's membership is unchanged — at most one extra
+    # LLM call per dream, and the price of NOT doing it is a digest pinned to
+    # stale ground truth.
+    facts_block = "\n".join(f"- {f}" for f in anchor_facts) if anchor_facts else "(none)"
+    facts_hash = hashlib.sha1(facts_block.encode("utf-8")).hexdigest()[:12]
+    root_id = _node_id(member_ids, salt=f"{_ROOT_SALT}|{facts_hash}")
     fused = existing.get(root_id)
     if fused is not None:
         reused += 1
     else:
-        fused = _fuse_items(items, cfg, llm, system=DIGEST_SYSTEM,
-                            template=DIGEST_USER_TEMPLATE)
+        fused = _llm_fuse(
+            DIGEST_USER_TEMPLATE.format(facts=facts_block,
+                                        text=_items_text(items, cfg)),
+            llm, system=DIGEST_SYSTEM,
+        )
     if fused is None:
         return rows, reused
     session_ids = sorted(set().union(*(m["session_ids"] for m in items)))

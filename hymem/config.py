@@ -167,6 +167,17 @@ class HyMemConfig:
     on a large backlog store (~leaves/11 fusion calls worst case); level-0
     nodes are always included."""
 
+    aggregation_digest_anchor_facts: int = 20
+    """Max ACTIVE, non-derived knowledge-graph edges injected into the root
+    digest fusion as a VERIFIED FACTS ground-truth block (0 disables). The
+    summaries the root fuses are machine-generated and can crystallize
+    hallucinated identity details in the reuse cache (the "Acme Corp" incident);
+    graph edges are extracted directly from conversation evidence, so they give
+    the model true identity/preference signals to use instead of a vacuum to
+    fill, and an explicit license to drop summary claims that conflict. The
+    root node's cache id includes a hash of this block, so the digest
+    regenerates whenever the anchor facts change."""
+
     aggregation_inject_abilities: tuple[str, ...] = ("TR",)
     """Abilities for which the aggregation tier fires at query time (empty tuple
     = every query, the broad mode). The G4 LME A/B (500q, seed 0) showed broad

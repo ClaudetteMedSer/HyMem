@@ -296,7 +296,7 @@ The point is synthesis: a later question may need facts that are scattered one-p
 
 Output a strict JSON object:
 - title (string): Short name for the shared thread, max 8 words
-- summary (string): 2-4 sentences fusing what these episodes collectively establish. Preserve specific named entities, numbers, dates, and changes-over-time; prefer concrete facts over generic narration. Do NOT invent anything not present in the episodes. Do NOT add "The user"/"The assistant" — use passive voice or implicit subject.
+- summary (string): 2-4 sentences fusing what these episodes collectively establish. Preserve specific named entities, numbers, dates, and changes-over-time; prefer concrete facts over generic narration. Do NOT invent anything not present in the episodes. Never state a name, employer, role, or location unless an episode literally states it — omit absent identity details, do not fill them in. Do NOT add "The user"/"The assistant" — use passive voice or implicit subject.
 
 Return ONLY the JSON object."""
 
@@ -314,7 +314,7 @@ This is an intermediate node of a summary tree over a user's whole conversation 
 
 Output a strict JSON object:
 - title (string): Short label naming the main topics (not just one), max 10 words
-- summary (string): 3-8 sentences. Every distinct thread in the inputs must be mentioned at least once; give recurring threads more words, but never zero. Preserve specific named entities, numbers, and dates. Do NOT invent anything not present in the inputs.
+- summary (string): 3-8 sentences. Every distinct thread in the inputs must be mentioned at least once; give recurring threads more words, but never zero. Preserve specific named entities, numbers, and dates. Do NOT invent anything not present in the inputs. Never state a name, employer, role, or location unless an input literally states it — omit absent identity details, do not fill them in.
 
 Return ONLY the JSON object."""
 
@@ -330,7 +330,9 @@ DIGEST_SYSTEM = """You write the standing digest of everything known about a use
 
 This digest answers "what do you know about me?" at a glance and is injected as standing context for an assistant, so it must read like a rounded profile, not a recap of the latest topic: the main recurring activities and projects with their state, preferences and habits, recurring people and places, and notable changes over time. Favor durable facts over one-off details.
 
-Identity is strictly evidence-bound: include the user's name, role, employer, or location ONLY when the inputs literally state them. A profile with no job title is correct; a plausible-sounding invented one ("works at Acme Corp") is the worst possible failure — when an identity detail is absent from the inputs, OMIT it entirely.
+Identity is strictly evidence-bound: include the user's name, role, employer, or location ONLY when the VERIFIED FACTS block or a summary literally states them. A profile with no job title is correct; a plausible-sounding invented one ("works at Acme Corp") is the worst possible failure — when an identity detail is absent from the inputs, OMIT it entirely.
+
+The VERIFIED FACTS block holds statements extracted directly from the user's conversations into a knowledge graph. Treat it as ground truth: when a thread summary conflicts with a verified fact, the fact wins and the summary's claim is dropped. Thread summaries are themselves machine-generated and may contain compression errors — be suspicious of identity or preference claims that appear in only one summary and in no verified fact.
 
 Output a strict JSON object:
 - title (string): Short label for the digest, max 8 words
@@ -338,7 +340,12 @@ Output a strict JSON object:
 
 Return ONLY the JSON object."""
 
-DIGEST_USER_TEMPLATE = """Thread summaries to digest:
+DIGEST_USER_TEMPLATE = """VERIFIED FACTS (knowledge graph — ground truth, trust over the summaries):
+\"\"\"
+{facts}
+\"\"\"
+
+Thread summaries to digest:
 \"\"\"
 {text}
 \"\"\"
