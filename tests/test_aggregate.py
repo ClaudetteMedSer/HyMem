@@ -186,13 +186,52 @@ def test_retrieval_surfaces_nodes_additively(conn, cfg):
                       "Analytics also uses Postgres.", ["postgres", "billing"])
     build_aggregation_nodes(conn, acfg, _agg_llm(), embed)
 
-    ctx = augment(conn, acfg, "postgres billing", embedding_client=embed)
-    assert ctx.aggregation_nodes, "enabled layer should surface a node"
+    ctx = augment(conn, acfg, "postgres billing", embedding_client=embed,
+                  ability="TR")
+    assert ctx.aggregation_nodes, "enabled layer should surface a node for TR"
     node = ctx.aggregation_nodes[0]
     assert node.title == "Postgres across projects"
     assert set(node.session_ids) == {"s1", "s2"}
     # Additive: the per-session episodes are still returned, not displaced.
     assert ctx.episodes, "episode tier must still fire alongside the node tier"
+
+
+def test_retrieval_gated_to_tr_by_default(conn, cfg):
+    # The G4 A/B verdict: broad injection reshuffles ranking against gold
+    # message hits (KU −9.0pp), so by default the tier only fires for TR.
+    acfg = _enabled(cfg)
+    embed = StubEmbeddingClient()
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), embed)
+
+    # Unrouted (ability None) and a non-allowlisted ability both get no nodes...
+    assert augment(conn, acfg, "postgres billing",
+                   embedding_client=embed).aggregation_nodes == []
+    assert augment(conn, acfg, "postgres billing", embedding_client=embed,
+                   ability="KU").aggregation_nodes == []
+    # ...and the host's ability hint is case-insensitive on the gate.
+    assert augment(conn, acfg, "postgres billing", embedding_client=embed,
+                   ability="tr").aggregation_nodes
+
+
+def test_retrieval_broad_mode_with_empty_allowlist(conn, cfg):
+    # Empty allowlist = the broad pre-G4 behavior (every query gets the tier),
+    # kept so the A/B remains reproducible.
+    acfg = replace(_enabled(cfg), aggregation_inject_abilities=())
+    embed = StubEmbeddingClient()
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), embed)
+
+    ctx = augment(conn, acfg, "postgres billing", embedding_client=embed)
+    assert ctx.aggregation_nodes, "broad mode should fire without an ability"
 
 
 def test_retrieval_empty_when_disabled(conn, cfg):

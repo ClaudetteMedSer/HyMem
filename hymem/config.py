@@ -149,6 +149,18 @@ class HyMemConfig:
     """Number of aggregation nodes augment() returns in `ctx.aggregation_nodes`
     when the layer is enabled."""
 
+    aggregation_inject_abilities: tuple[str, ...] = ("TR",)
+    """Abilities for which the aggregation tier fires at query time (empty tuple
+    = every query, the broad mode). The G4 LME A/B (500q, seed 0) showed broad
+    injection is net-harmful: nodes recover NO messages the message/chunk tiers
+    missed — they only reshuffle ranking, crowding gold turns out of the answer
+    pool (KU −9.0pp, SS-P −3.4pp) while helping only temporal reasoning
+    (TR +3.0pp, −4 ranking misses). So by default the tier only fires for
+    TR-routed questions — the one ability with a verified mechanism — and is a
+    no-op elsewhere. Additive-safe under routing errors: a TR false positive
+    merely adds a summary tier (never displaces other tiers), a false negative
+    is identical to the layer being off."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 

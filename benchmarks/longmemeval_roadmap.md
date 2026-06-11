@@ -634,11 +634,24 @@ build — the discipline that killed L2a, L2b, and both halves of L3, and now cl
   `aggregation_node_embeddings`, migration `016`), `hymem/dreaming/aggregate.py`
   (canonical clusterer; probe re-exports it), runner step, additive off-by-default
   retrieval tier (`cfg.aggregation_nodes_enabled` → `ctx.aggregation_nodes`),
-  `tests/test_aggregate.py` (10 offline). **Remaining: G4 = the enabled-vs-disabled
-  LME A/B on the box (must not regress the 70.0 baseline / 51.9 MS floor) before it
-  ships on by default.** Only clusters spanning ≥2 sessions with ≥2 episodes are
-  summarized (singletons/single-session cost no LLM call); nodes are full-rebuilt each
-  dream (content-hash id → unchanged cluster reuses its cached embedding).
+  `tests/test_aggregate.py` (offline). Only clusters spanning ≥2 sessions with ≥2
+  episodes are summarized (singletons/single-session cost no LLM call); nodes are
+  full-rebuilt each dream (content-hash id → unchanged cluster reuses its cached
+  embedding). **G4 RAN (2026-06-11, 500q seed 0): broad injection LOST — 69.0 vs
+  70.0 (−1.0pp).** Recall-ceiling diagnostics: retrieval loss IDENTICAL both runs —
+  nodes recover zero messages, they only reshuffle ranking. KU −9.0pp (+7 ranking
+  misses, nodes crowd gold turns out of the answer pool), SS-P −3.4pp, MS −1.5pp
+  (flat — the 87% co-location signal couldn't outrank BM25+FTS message hits); only
+  TR won (+3.0pp, −4 ranking misses, mechanism verified). **Response (built
+  2026-06-11): narrow injection.** (a) `cfg.aggregation_inject_abilities`, default
+  `("TR",)` — the tier now only fires for TR-routed questions; empty tuple restores
+  broad mode for A/B reproduction. Additive-safe under routing errors (TR FP adds a
+  tier, FN = layer off). (b) The LME adapter now renders nodes as a separate
+  `[CROSS-SESSION SUMMARIES]` block — they no longer compete with raw turns for
+  `memories[:top_k]` slots or context budget, killing the KU crowding mechanism
+  outright. **Remaining: re-run G4 with the TR-gated config (expect: TR captures
+  ~+3pp, all other categories pinned at baseline by construction; must hold the
+  70.0 baseline / 51.9 MS floor).** Layer stays off by default until that passes.
 - Relative-date parsing ("twee weken geleden") — needs `dateparser`, deferred against
   the zero-dependency hardening goal.
 - `messages_fts` not carried by export/import.

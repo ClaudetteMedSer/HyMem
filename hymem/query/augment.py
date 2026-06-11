@@ -449,10 +449,12 @@ def augment(
     )
 
     # Phase-2 RAPTOR additive tier: cross-session cluster summaries. Off by
-    # default; only runs when the layer is enabled, and never displaces the
-    # tiers above — it layers a synthesis view on top for multi-session
-    # questions whose answer is spread one-fact-per-session.
-    if cfg.aggregation_nodes_enabled:
+    # default; only runs when the layer is enabled AND the routed ability is in
+    # `aggregation_inject_abilities` (default TR-only — the G4 A/B showed broad
+    # injection reshuffles ranking against gold message hits everywhere except
+    # temporal reasoning). Never displaces the tiers above — it layers a
+    # synthesis view on top.
+    if cfg.aggregation_nodes_enabled and _aggregation_tier_fires(cfg, ability):
         ctx.aggregation_nodes = _aggregation_search(
             conn, user_message,
             top_k=cfg.aggregation_top_k,
@@ -1801,6 +1803,17 @@ def _episode_rrf_chips(
     else:
         sources = "vec"
     return [*base, f"episode_rrf({sources}, {score:.4f})"]
+
+
+def _aggregation_tier_fires(cfg: HyMemConfig, ability: str | None) -> bool:
+    """Whether the aggregation tier runs for this query's (normalized) ability.
+    An empty `aggregation_inject_abilities` means every query (broad mode, for
+    A/B re-runs); otherwise the ability must be in the allowlist — so with the
+    default `("TR",)` an unrouted question (ability None) gets no nodes."""
+    allowed = cfg.aggregation_inject_abilities
+    if not allowed:
+        return True
+    return ability is not None and ability in {a.upper() for a in allowed}
 
 
 def _aggregation_row_hit(
