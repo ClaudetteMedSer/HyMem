@@ -19,6 +19,7 @@ from hymem.config import HyMemConfig
 from hymem.core import db as core_db
 from hymem.dreaming import bitemporal
 from hymem.dreaming import canonicalize as canon
+from hymem.dreaming.aggregate import Digest, load_digest
 from hymem.dreaming.runner import DreamReport, run_dreaming
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
@@ -308,6 +309,18 @@ class HyMem:
             session_id=session_id,
             ability=ability,
         )
+
+    def digest(self) -> Digest | None:
+        """The standing whole-store summary — the root of the RAPTOR
+        aggregation tree, answering "what do you know about me?" at a glance.
+        Intended as host-facing standing context (e.g. system-prompt
+        injection), NOT as a retrieval tier: it is rebuilt at dream time and
+        never competes with per-query retrieval. Returns None until the
+        aggregation layer (`cfg.aggregation_nodes_enabled` +
+        `cfg.aggregation_digest_enabled`) has dreamed over at least one
+        episode. Read-only.
+        """
+        return load_digest(self.read_conn)
 
     def timeline(self, entity: str) -> list["TimelineEntry"]:
         """First-seen active edge per predicate for `entity`, oldest first.

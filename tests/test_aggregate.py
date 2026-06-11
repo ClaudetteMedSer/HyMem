@@ -19,6 +19,7 @@ from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.core import db as core_db
 from hymem.dreaming.aggregate import (
     build_aggregation_nodes,
+    load_digest,
     _node_id,
     select_clusters,
 )
@@ -34,14 +35,29 @@ _NODE_JSON = json.dumps({
 })
 
 
+_DIGEST_JSON = json.dumps({
+    "title": "User digest",
+    "summary": "Runs billing and analytics on Postgres; also cycles on weekends.",
+})
+
+
 def _agg_llm() -> StubLLMClient:
+    # Routes on prompt phrases unique to each system prompt: cluster fusion
+    # (AGGREGATE_SYSTEM) vs the root digest (DIGEST_SYSTEM).
     return StubLLMClient(
-        fixtures={"fuse several related episodes": _NODE_JSON}, default="[]"
+        fixtures={
+            "fuse several related episodes": _NODE_JSON,
+            "standing digest of everything known": _DIGEST_JSON,
+        },
+        default="[]",
     )
 
 
-def _enabled(cfg: HyMemConfig) -> HyMemConfig:
-    return replace(cfg, aggregation_nodes_enabled=True)
+def _enabled(cfg: HyMemConfig, *, digest: bool = False) -> HyMemConfig:
+    """Aggregation layer on; the v17 digest rollup only when a test opts in, so
+    the level-0 policy tests keep asserting against level-0 rows alone."""
+    return replace(cfg, aggregation_nodes_enabled=True,
+                   aggregation_digest_enabled=digest)
 
 
 def _ep(eid: str, sid: str, entities: list[str], vector=None) -> dict:
@@ -174,6 +190,32 @@ def test_rebuild_replaces_stale_nodes(conn, cfg):
     assert rows[0]["n_members"] == 3
 
 
+def test_rebuild_reuses_fusion_for_unchanged_cluster(conn, cfg):
+    # An unchanged member set must NOT pay a second LLM fusion call: the
+    # content-hash node id keys the stored title/summary for reuse. Second
+    # build runs with an LLM whose fixture would CHANGE the summary — the
+    # stored fusion surviving proves no call was made for the stable cluster.
+    acfg = _enabled(cfg)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "t2", "s", ["postgres", "billing"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    first = conn.execute("SELECT id, title, summary FROM aggregation_nodes").fetchone()
+
+    poisoned = StubLLMClient(
+        fixtures={"fuse several related episodes": json.dumps(
+            {"title": "WRONG", "summary": "this fusion must never be used"})},
+        default="[]",
+    )
+    built = build_aggregation_nodes(conn, acfg, poisoned, None)
+
+    row = conn.execute("SELECT id, title, summary FROM aggregation_nodes").fetchone()
+    assert built == 1
+    assert row["id"] == first["id"]
+    assert row["title"] == first["title"] == "Postgres across projects"
+    assert row["summary"] == first["summary"]
+
+
 # ── additive retrieval tier ──────────────────────────────────────────────────
 
 def test_retrieval_surfaces_nodes_additively(conn, cfg):
@@ -246,3 +288,133 @@ def test_retrieval_empty_when_disabled(conn, cfg):
     # ...but query with it disabled (the default cfg): the tier must not run.
     ctx = augment(conn, cfg, "postgres billing", embedding_client=embed)
     assert ctx.aggregation_nodes == []
+
+
+# ── v17 hierarchy / root digest ──────────────────────────────────────────────
+
+def test_digest_root_covers_nodes_and_unclustered_episodes(cfg, conn):
+    # e1+e2 cluster (level-0 node); e3 is a disjoint singleton no cluster
+    # absorbs — the digest must still cover it, so the root's members are the
+    # node AND the pass-through episode (whole-store coverage, not just threads).
+    assert cfg.aggregation_digest_enabled, "digest must be on by default"
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e3", "s3", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"])
+    built = build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    assert built == 2                            # level-0 node + root
+
+    root = conn.execute(
+        "SELECT * FROM aggregation_nodes WHERE is_root = 1").fetchone()
+    assert root is not None and root["level"] >= 1
+    node_id = conn.execute(
+        "SELECT id FROM aggregation_nodes WHERE level = 0").fetchone()["id"]
+    assert set(json.loads(root["member_episode_ids"])) == {node_id, "e3"}
+    assert json.loads(root["session_ids"]) == ["s1", "s2", "s3"]
+
+    digest = load_digest(conn)
+    assert digest is not None
+    assert digest.title == "User digest"
+    assert "cycles" in digest.summary
+    assert digest.n_sessions == 3
+
+
+def test_digest_absent_when_rollup_disabled(cfg, conn):
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+    build_aggregation_nodes(conn, _enabled(cfg, digest=False), _agg_llm(), None)
+    assert load_digest(conn) is None
+    # Level-0 layer is untouched by the digest switch.
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM aggregation_nodes WHERE level = 0"
+    ).fetchone()["c"] == 1
+
+
+def test_digest_root_excluded_from_retrieval_tier(cfg, conn):
+    # The root says "cycles on weekends" — a query for exactly that must NOT
+    # surface it in ctx.aggregation_nodes: levels >= 1 are standing context for
+    # HyMem.digest(), never retrieval competitors (the G4 crowding lesson).
+    acfg = replace(_enabled(cfg, digest=True),
+                   aggregation_inject_abilities=())   # broad mode: tier always on
+    embed = StubEmbeddingClient()
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e3", "s3", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), embed)
+    assert load_digest(conn) is not None
+
+    ctx = augment(conn, acfg, "cycles on weekends digest", embedding_client=embed)
+    root_id = conn.execute(
+        "SELECT id FROM aggregation_nodes WHERE is_root = 1").fetchone()["id"]
+    assert root_id not in {h.node_id for h in ctx.aggregation_nodes}
+
+
+def test_digest_converges_on_fully_disjoint_episodes(cfg, conn):
+    # No two episodes link (disjoint entities, no vectors) and the fan-in is
+    # forced tiny, so natural clustering makes NO progress at every level: the
+    # consecutive-chunk fallback must still reduce the frontier and reach a
+    # root. 5 leaves @ fan_in 2 → 2 rollup levels before the root fusion.
+    acfg = replace(_enabled(cfg, digest=True), aggregation_max_members=2)
+    with core_db.transaction(conn):
+        for i in range(1, 6):
+            _seed_episode(conn, f"e{i}", f"s{i}", f"Topic {i}",
+                          f"Notes about topic {i}.", [f"topic{i}"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+
+    digest = load_digest(conn)
+    assert digest is not None
+    assert digest.n_sessions == 5
+    levels = [r["level"] for r in conn.execute(
+        "SELECT level FROM aggregation_nodes WHERE is_root = 0").fetchall()]
+    assert levels and all(lv >= 1 for lv in levels)   # no level-0 clusters formed
+
+
+def test_digest_rebuild_reuses_fusions(cfg, conn):
+    # Unchanged store → unchanged member sets at EVERY level → the rebuild must
+    # reuse all stored fusions (level-0, rollups, root) without an LLM call.
+    # The second build's LLM would poison any node it actually fused.
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e3", "s3", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    before = load_digest(conn)
+
+    poisoned = StubLLMClient(
+        fixtures={
+            "fuse several related episodes": json.dumps(
+                {"title": "WRONG", "summary": "must not be used"}),
+            "standing digest of everything known": json.dumps(
+                {"title": "WRONG", "summary": "must not be used"}),
+        },
+        default="[]",
+    )
+    build_aggregation_nodes(conn, acfg, poisoned, None)
+    assert poisoned.calls == []                  # every fusion reused
+    after = load_digest(conn)
+    assert after is not None and after.summary == before.summary
+
+
+def test_hymem_digest_api_none_by_default(cfg):
+    # Default config: aggregation layer off → digest() is None, no error.
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"),
+               embedding_client=StubEmbeddingClient())
+    try:
+        assert hy.digest() is None
+    finally:
+        hy.close()

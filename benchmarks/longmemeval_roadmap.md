@@ -649,9 +649,30 @@ build — the discipline that killed L2a, L2b, and both halves of L3, and now cl
   tier, FN = layer off). (b) The LME adapter now renders nodes as a separate
   `[CROSS-SESSION SUMMARIES]` block — they no longer compete with raw turns for
   `memories[:top_k]` slots or context budget, killing the KU crowding mechanism
-  outright. **Remaining: re-run G4 with the TR-gated config (expect: TR captures
-  ~+3pp, all other categories pinned at baseline by construction; must hold the
-  70.0 baseline / 51.9 MS floor).** Layer stays off by default until that passes.
+  outright. **TR-gated re-run (2026-06-11, paired seed): WASH — TR dead flat
+  (75.2% both ways, 20 ranking misses both ways); the original +3.0pp/−4-miss TR
+  signal did NOT reproduce — it was run variance interacting with the crowding
+  mechanism, not a real lever. Overall −0.8pp (in-band); non-TR deltas are 1–2
+  misses each, confirmed as noise (no agg-node leakage past the gate). VERDICT:
+  RAPTOR clustering has NO measurable LME payoff — closed as an LME lever. The
+  layer stays off by default; the build (clusterer, schema v16, TR gate,
+  non-crowding adapter block) is kept as production infrastructure pending a
+  real-experience consumption model (cold-start/global/vague queries — the D5/P3
+  class LME is blind to by construction). MS synthesis residual → P1.**
+  **Consumption model v1 BUILT (2026-06-11): RAPTOR hierarchy + root digest**
+  (schema v17 `level`/`is_root`, `cfg.aggregation_digest_enabled` default True
+  under the layer switch). Dream rolls the level-0 nodes PLUS every unclustered
+  episode (capped `aggregation_digest_max_leaves`, whole-store coverage) up
+  recursively — natural clustering per level, consecutive-chunk fallback when
+  nothing links so convergence is guaranteed — into one root digest node;
+  `HyMem.digest()` returns it for host system-prompt injection ("what do you
+  know about me?", the cold-start/global question no retrieval tier can answer).
+  Levels ≥1 NEVER enter the query tier (level=0 filter in `_aggregation_search`)
+  — standing context, not a retrieval competitor, so the G4 crowding mechanism
+  is structurally impossible. Fusions are reuse-cached by member-set hash
+  (stable store → zero LLM calls on rebuild; root id salted so digest-style and
+  rollup-style fusions never cross-reuse). By construction no LME delta (D5-style
+  blind spot) — production value only; evaluate qualitatively on the box.
 - Relative-date parsing ("twee weken geleden") — needs `dateparser`, deferred against
   the zero-dependency hardening goal.
 - `messages_fts` not carried by export/import.

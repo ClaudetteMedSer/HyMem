@@ -1853,7 +1853,9 @@ def _aggregation_search(
     embedder is present) a Python-cosine scan over `aggregation_node_embeddings`
     — the node count is small and the tier is off by default, so no vec0 table is
     maintained. The two ranked lists are RRF-fused, mirroring `_episode_search`.
-    Returns [] cleanly when no node table/rows exist (un-dreamed clients)."""
+    Returns [] cleanly when no node table/rows exist (un-dreamed clients).
+    Only level-0 nodes are candidates: the v17 rollup/digest levels are
+    host-facing standing context (`HyMem.digest()`), not retrieval competitors."""
     cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     fts_hits: list[AggregationNodeHit] = []
     if cleaned:
@@ -1867,7 +1869,7 @@ def _aggregation_search(
                               n.session_ids, bm25(aggregation_nodes_fts) AS score
                        FROM aggregation_nodes_fts
                        JOIN aggregation_nodes n ON n.rowid = aggregation_nodes_fts.rowid
-                       WHERE aggregation_nodes_fts MATCH ?
+                       WHERE aggregation_nodes_fts MATCH ? AND n.level = 0
                        ORDER BY score
                        LIMIT ?""",
                     (fts_query, top_k * 2),
@@ -1888,6 +1890,7 @@ def _aggregation_search(
                        n.session_ids, ne.vector_json
                 FROM aggregation_node_embeddings ne
                 JOIN aggregation_nodes n ON n.id = ne.node_id
+                WHERE n.level = 0
                 ORDER BY n.created_at DESC
                 LIMIT ?
                 """,

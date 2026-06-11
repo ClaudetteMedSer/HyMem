@@ -149,6 +149,24 @@ class HyMemConfig:
     """Number of aggregation nodes augment() returns in `ctx.aggregation_nodes`
     when the layer is enabled."""
 
+    aggregation_digest_enabled: bool = True
+    """Sub-switch (active only when `aggregation_nodes_enabled` is True): after
+    the level-0 cluster nodes are built, recursively roll the tree up — cluster
+    the level-0 nodes plus the episodes no cluster absorbed, fuse each group
+    into a level-N node, repeat — until one ROOT digest node remains: the
+    standing "what do you know about me?" summary `HyMem.digest()` returns.
+    This is the consumption model the G4 A/Bs argued FOR: the digest is host-
+    facing standing context (e.g. system-prompt injection), not a retrieval
+    competitor — levels >= 1 never enter the query-time tier, so it cannot
+    crowd message hits. Fusion calls are reuse-cached by member-set hash, so a
+    dream over a stable store rebuilds the tree without new LLM calls."""
+
+    aggregation_digest_max_leaves: int = 256
+    """Cap on pass-through episodes (those outside every kept cluster) admitted
+    into the digest tree, keeping the most recent. Bounds first-build LLM cost
+    on a large backlog store (~leaves/11 fusion calls worst case); level-0
+    nodes are always included."""
+
     aggregation_inject_abilities: tuple[str, ...] = ("TR",)
     """Abilities for which the aggregation tier fires at query time (empty tuple
     = every query, the broad mode). The G4 LME A/B (500q, seed 0) showed broad

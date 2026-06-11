@@ -21,8 +21,17 @@ sessions with ≥ `aggregation_min_members` episodes are summarized — singleto
 and single-session clusters add nothing over the per-session episode, so they
 cost no LLM call. Nodes are rebuilt from scratch each dream (membership is a
 pure function of the current episodes), so there is no stale-id UPSERT churn;
-summary embeddings are cache-keyed by text so an unchanged node re-uses its
-vector.
+summary embeddings are cache-keyed by text and fusions by member-set hash, so
+an unchanged node re-uses both its vector and its LLM summary.
+
+On top of the flat level-0 layer sits the RAPTOR rollup (schema v17,
+`cfg.aggregation_digest_enabled`): the level-0 nodes plus the episodes no
+cluster absorbed are recursively clustered-and-fused into level-N nodes until
+one ROOT digest remains — the standing "what do you know about me?" summary
+`HyMem.digest()` returns for host system-prompt injection. The G4 LME A/Bs
+showed retrieval-side injection of these summaries is at best a wash (raw
+message FTS already wins wherever the query has keywords), so the tree's value
+is host-facing standing context: levels ≥ 1 never enter the query-time tier.
 """
 from __future__ import annotations
 
@@ -30,13 +39,19 @@ import hashlib
 import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
 from hymem.core.vectors import decode_vector, encode_vector
 from hymem.extraction.embeddings import EmbeddingClient, normalize_text
 from hymem.extraction.llm import LLMClient, LLMRequest
-from hymem.extraction.prompts import AGGREGATE_SYSTEM, AGGREGATE_USER_TEMPLATE
+from hymem.extraction.prompts import (
+    AGGREGATE_SYSTEM,
+    AGGREGATE_USER_TEMPLATE,
+    DIGEST_SYSTEM,
+    DIGEST_USER_TEMPLATE,
+)
 
 log = logging.getLogger("hymem.dreaming.aggregate")
 
@@ -161,11 +176,31 @@ def load_clusterable_episodes(conn: sqlite3.Connection) -> list[dict]:
     return episodes
 
 
-def _node_id(member_ids: list[str]) -> str:
-    """Stable id for a node = content hash of its sorted member episode ids, so an
-    unchanged cluster keeps its id (and cached embedding) across dream cycles."""
-    digest = hashlib.sha1("|".join(sorted(member_ids)).encode("utf-8")).hexdigest()[:16]
+def _node_id(member_ids: list[str], *, salt: str = "") -> str:
+    """Stable id for a node = content hash of its sorted member ids, so an
+    unchanged cluster keeps its id (and cached embedding + fusion) across dream
+    cycles. `salt` separates id spaces for nodes that could share a member set
+    but carry a different KIND of fusion (the root digest uses a different
+    prompt than an intermediate rollup, so they must never reuse each other)."""
+    payload = "|".join(sorted(member_ids))
+    if salt:
+        payload = f"{salt}::{payload}"
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
     return f"agg_{digest}"
+
+
+def _centroid(vectors: list[list[float] | None]) -> list[float] | None:
+    """Mean of the non-None member vectors (None if there are none) — gives a
+    rollup item a clusterable vector without an embedding call; the persisted
+    node embedding is computed separately from the fused text."""
+    present = [v for v in vectors if v]
+    if not present:
+        return None
+    dim = len(present[0])
+    if any(len(v) != dim for v in present):
+        return None
+    n = len(present)
+    return [sum(v[i] for v in present) / n for i in range(dim)]
 
 
 def select_clusters(
@@ -195,24 +230,20 @@ def select_clusters(
     return kept
 
 
-def _summarize_cluster(
-    members: list[dict], cfg: HyMemConfig, llm: LLMClient
+def _llm_fuse(
+    text: str, llm: LLMClient, *, system: str, template: str
 ) -> dict | None:
-    """One LLM call fusing a cluster's episodes into {title, summary}. Returns
-    None if the cluster yields nothing usable (so no empty node is persisted)."""
-    capped = members[: cfg.aggregation_max_members]
-    text = "\n\n---\n\n".join(
-        f"[{m['session_id']}] {m['title']}\n{m['summary']}" for m in capped
-    )
+    """One LLM call fusing `text` into {title, summary}. Returns None when the
+    call fails or yields nothing usable (so no empty node is persisted)."""
     request = LLMRequest(
-        system=AGGREGATE_SYSTEM,
-        user=AGGREGATE_USER_TEMPLATE.format(text=text),
+        system=system,
+        user=template.format(text=text),
         response_format="json",
     )
     try:
         raw = llm.complete(request)
     except Exception:
-        log.exception("aggregate.llm_failure members=%d", len(members))
+        log.exception("aggregate.llm_failure")
         return None
     try:
         data = json.loads(raw)
@@ -228,6 +259,29 @@ def _summarize_cluster(
     if not title or not summary:
         return None
     return {"title": title, "summary": summary}
+
+
+def _summarize_cluster(
+    members: list[dict], cfg: HyMemConfig, llm: LLMClient
+) -> dict | None:
+    """Fuse a level-0 cluster's episodes into {title, summary}."""
+    capped = members[: cfg.aggregation_max_members]
+    text = "\n\n---\n\n".join(
+        f"[{m['session_id']}] {m['title']}\n{m['summary']}" for m in capped
+    )
+    return _llm_fuse(text, llm, system=AGGREGATE_SYSTEM,
+                     template=AGGREGATE_USER_TEMPLATE)
+
+
+def _fuse_items(
+    items: list[dict], cfg: HyMemConfig, llm: LLMClient,
+    *, system: str, template: str,
+) -> dict | None:
+    """Fuse hierarchy items (level-0 nodes / rollups / pass-through episodes,
+    all carrying title+summary+session_ids) into {title, summary}."""
+    capped = items[: cfg.aggregation_max_members]
+    text = "\n\n---\n\n".join(f"{m['title']}\n{m['summary']}" for m in capped)
+    return _llm_fuse(text, llm, system=system, template=template)
 
 
 def _persist_node_embeddings(
@@ -306,11 +360,12 @@ def build_aggregation_nodes(
     """Rebuild the cross-session aggregation layer from the current episodes.
 
     No-op when the layer is disabled. Otherwise: cluster → keep cross-session
-    multi-member clusters → fuse each with one LLM call → full-replace
+    multi-member clusters → fuse each NEW cluster with one LLM call (an
+    unchanged member set reuses the stored fusion, no call) → full-replace
     `aggregation_nodes` → (re-)embed node summaries. Returns the node count.
     Full rebuild (DELETE then INSERT) because membership is a pure function of
     the present episodes; the content-hash id means an unchanged cluster keeps
-    its embedding via the cache. Caller need not hold a transaction.
+    both its fusion and its embedding. Caller need not hold a transaction.
     """
     if not cfg.aggregation_nodes_enabled:
         return 0
@@ -318,38 +373,205 @@ def build_aggregation_nodes(
     episodes = load_clusterable_episodes(conn)
     clusters = select_clusters(episodes, cfg)
 
-    built: list[tuple[str, dict, list[dict]]] = []
+    # The content-hash node id makes the previous fusion reusable: an unchanged
+    # member set keeps its title/summary without a new LLM call, so a dream over
+    # a mostly-stable store rebuilds the whole tree only paying for memberships
+    # that actually changed. (The embedding was already cache-keyed; this
+    # extends the same discipline to the much more expensive fusion call.)
+    existing: dict[str, dict] = {
+        row["id"]: {"title": row["title"], "summary": row["summary"]}
+        for row in conn.execute("SELECT id, title, summary FROM aggregation_nodes")
+    }
+
+    rows: list[dict] = []
+    items: list[dict] = []          # hierarchy frontier: level-0 nodes first
+    clustered_ids: set[str] = set()
+    reused = 0
     for members in clusters:
-        fused = _summarize_cluster(members, cfg, llm)
-        if fused is None:
-            continue
         member_ids = [m["id"] for m in members]
-        built.append((_node_id(member_ids), fused, members))
+        node_id = _node_id(member_ids)
+        fused = existing.get(node_id)
+        if fused is not None:
+            reused += 1
+        else:
+            fused = _summarize_cluster(members, cfg, llm)
+            if fused is None:
+                continue
+        session_ids = sorted({m["session_id"] for m in members})
+        rows.append({
+            "id": node_id, "title": fused["title"], "summary": fused["summary"],
+            "member_ids": member_ids, "session_ids": session_ids,
+            "level": 0, "is_root": 0,
+        })
+        clustered_ids.update(member_ids)
+        items.append({
+            "id": node_id, "title": fused["title"], "summary": fused["summary"],
+            "vector": _centroid([m["vector"] for m in members]),
+            "entities": set().union(*(m["entities"] for m in members)),
+            "session_ids": set(session_ids),
+        })
+
+    if cfg.aggregation_digest_enabled:
+        # Digest leaves = the level-0 nodes plus every episode no cluster
+        # absorbed (capped to the most recent), so the root covers the WHOLE
+        # store, not just its cross-session threads.
+        leftovers = [e for e in episodes if e["id"] not in clustered_ids]
+        cap = cfg.aggregation_digest_max_leaves
+        if cap > 0:
+            leftovers = leftovers[-cap:]
+        items += [{
+            "id": e["id"], "title": e["title"] or "", "summary": e["summary"] or "",
+            "vector": e["vector"], "entities": e["entities"],
+            "session_ids": {e["session_id"]},
+        } for e in leftovers]
+        digest_rows, digest_reused = _build_digest_levels(items, cfg, llm, existing)
+        rows += digest_rows
+        reused += digest_reused
 
     with core_db.transaction(conn):
         # Full replace: rows the new clustering no longer produces must not linger.
         # ON DELETE CASCADE clears aggregation_node_embeddings for dropped nodes.
         conn.execute("DELETE FROM aggregation_nodes")
-        for node_id, fused, members in built:
-            member_ids = [m["id"] for m in members]
-            session_ids = sorted({m["session_id"] for m in members})
+        for r in rows:
             conn.execute(
                 """
                 INSERT INTO aggregation_nodes(
                     id, title, summary, member_episode_ids, session_ids,
-                    n_members, n_sessions
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    n_members, n_sessions, level, is_root
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    node_id, fused["title"], fused["summary"],
-                    json.dumps(member_ids), json.dumps(session_ids),
-                    len(member_ids), len(session_ids),
+                    r["id"], r["title"], r["summary"],
+                    json.dumps(r["member_ids"]), json.dumps(r["session_ids"]),
+                    len(r["member_ids"]), len(r["session_ids"]),
+                    r["level"], r["is_root"],
                 ),
             )
 
-    if embedding_client is not None and built:
+    if embedding_client is not None and rows:
         with core_db.transaction(conn):
             _persist_node_embeddings(conn, embedding_client)
 
-    log.info("aggregate.built nodes=%d (from %d episodes)", len(built), len(episodes))
-    return len(built)
+    log.info("aggregate.built nodes=%d reused=%d (from %d episodes)",
+             len(rows), reused, len(episodes))
+    return len(rows)
+
+
+def _build_digest_levels(
+    items: list[dict], cfg: HyMemConfig, llm: LLMClient, existing: dict[str, dict]
+) -> tuple[list[dict], int]:
+    """RAPTOR rollup: recursively cluster-and-fuse the frontier `items` (each
+    {"id","title","summary","vector","entities","session_ids"}) until at most
+    `aggregation_max_members` remain, then fuse those into the single ROOT
+    digest node. Returns (node rows for every level >= 1, reused-fusion count).
+
+    Each pass clusters with the SAME `_linked` rule as level 0 (centroid
+    vectors, union entity sets); when nothing links — disjoint topics, exactly
+    the case a digest must still cover — it falls back to fusing consecutive
+    runs of `fan_in` items, which guarantees the loop converges. A failed
+    fusion passes its members through unfused (the tree degrades, never
+    blocks); if a whole pass makes no progress the loop bails out and the root
+    fuses whatever frontier remains (capped inside `_fuse_items`)."""
+    rows: list[dict] = []
+    reused = 0
+    fan_in = max(2, cfg.aggregation_max_members)
+    level = 1
+    while len(items) > fan_in:
+        labels = cluster_episodes(
+            items, cfg.aggregation_emb_threshold, cfg.aggregation_ent_threshold
+        )
+        grouped: dict[int, list[dict]] = {}
+        for it in items:
+            grouped.setdefault(labels[it["id"]], []).append(it)
+        groups = sorted(grouped.values(),
+                        key=lambda g: (-len(g), sorted(m["id"] for m in g)[0]))
+        if all(len(g) < 2 for g in groups):
+            groups = [items[i:i + fan_in] for i in range(0, len(items), fan_in)]
+
+        next_items: list[dict] = []
+        for g in groups:
+            if len(g) < 2:
+                next_items.append(g[0])
+                continue
+            member_ids = [m["id"] for m in g]
+            node_id = _node_id(member_ids)
+            fused = existing.get(node_id)
+            if fused is not None:
+                reused += 1
+            else:
+                fused = _fuse_items(g, cfg, llm, system=AGGREGATE_SYSTEM,
+                                    template=AGGREGATE_USER_TEMPLATE)
+                if fused is None:
+                    next_items.extend(g)
+                    continue
+            session_ids: set[str] = set().union(*(m["session_ids"] for m in g))
+            rows.append({
+                "id": node_id, "title": fused["title"], "summary": fused["summary"],
+                "member_ids": member_ids, "session_ids": sorted(session_ids),
+                "level": level, "is_root": 0,
+            })
+            next_items.append({
+                "id": node_id, "title": fused["title"], "summary": fused["summary"],
+                "vector": _centroid([m["vector"] for m in g]),
+                "entities": set().union(*(m["entities"] for m in g)),
+                "session_ids": session_ids,
+            })
+        if len(next_items) >= len(items):    # no progress (fusions all failed)
+            items = next_items
+            break
+        items = next_items
+        level += 1
+
+    if not items:
+        return rows, reused
+    member_ids = [m["id"] for m in items]
+    root_id = _node_id(member_ids, salt="root")
+    fused = existing.get(root_id)
+    if fused is not None:
+        reused += 1
+    else:
+        fused = _fuse_items(items, cfg, llm, system=DIGEST_SYSTEM,
+                            template=DIGEST_USER_TEMPLATE)
+    if fused is None:
+        return rows, reused
+    session_ids = sorted(set().union(*(m["session_ids"] for m in items)))
+    rows.append({
+        "id": root_id, "title": fused["title"], "summary": fused["summary"],
+        "member_ids": member_ids, "session_ids": session_ids,
+        "level": level, "is_root": 1,
+    })
+    return rows, reused
+
+
+@dataclass
+class Digest:
+    """The root of the RAPTOR tree — the standing whole-store summary that
+    `HyMem.digest()` exposes for system-prompt-style injection. `n_sessions`
+    says how much history it condenses; `generated_at` is the build time."""
+
+    title: str
+    summary: str
+    n_sessions: int
+    generated_at: str
+
+
+def load_digest(conn: sqlite3.Connection) -> Digest | None:
+    """Return the current root digest, or None when the aggregation layer is
+    disabled, has not dreamed yet, or the store has no episodes. Read-only."""
+    row = conn.execute(
+        """
+        SELECT title, summary, n_sessions, created_at
+        FROM aggregation_nodes
+        WHERE is_root = 1
+        ORDER BY created_at DESC, id
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    return Digest(
+        title=row["title"],
+        summary=row["summary"],
+        n_sessions=row["n_sessions"],
+        generated_at=row["created_at"] or "",
+    )

@@ -336,13 +336,18 @@ CREATE TABLE IF NOT EXISTS episode_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- RAPTOR cross-session aggregation nodes (schema v16). Each node fuses a
--- cluster of episodes (connected components over embedding-OR-entity overlap)
--- that span multiple sessions, so a synthesis question reads a handful of
--- cluster summaries instead of dozens of raw turns. The whole layer is additive
--- and off by default at query time (cfg.aggregation_nodes_enabled). Rebuilt from
--- scratch each dream — membership is a pure function of the current episodes —
--- so there is no stable-id UPSERT churn; the id is a content hash of members.
+-- RAPTOR cross-session aggregation nodes (schema v16; hierarchy in v17). A
+-- level-0 node fuses a cluster of episodes (connected components over
+-- embedding-OR-entity overlap) that span multiple sessions, so a synthesis
+-- question reads a handful of cluster summaries instead of dozens of raw turns.
+-- Levels >= 1 (v17) are RAPTOR rollups whose member_episode_ids hold CHILD ids
+-- (lower-level node ids and/or pass-through episode ids), recursing until one
+-- is_root digest node — the standing "what do you know about me" summary
+-- exposed via HyMem.digest(). Only level 0 enters query-time retrieval. The
+-- whole layer is additive and off by default (cfg.aggregation_nodes_enabled).
+-- Rebuilt from scratch each dream — membership is a pure function of the
+-- current episodes — so there is no stable-id UPSERT churn; the id is a content
+-- hash of members, which also keys reuse of an unchanged node's LLM fusion.
 CREATE TABLE IF NOT EXISTS aggregation_nodes (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -351,7 +356,9 @@ CREATE TABLE IF NOT EXISTS aggregation_nodes (
     session_ids TEXT NOT NULL DEFAULT '[]',
     n_members INTEGER NOT NULL DEFAULT 0,
     n_sessions INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    level INTEGER NOT NULL DEFAULT 0,
+    is_root INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS aggregation_nodes_fts USING fts5(

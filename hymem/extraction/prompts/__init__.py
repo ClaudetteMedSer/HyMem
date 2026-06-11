@@ -308,6 +308,24 @@ AGGREGATE_USER_TEMPLATE = """Related episodes from across sessions:
 Return the JSON object now."""
 
 
+DIGEST_SYSTEM = """You write the standing digest of everything known about a user from their conversation history — the top of a summary tree whose inputs below are themselves summaries of conversation threads.
+
+This digest answers "what do you know about me?" at a glance and is injected as standing context for an assistant, so favor durable facts over one-off details: who the user is, ongoing projects and their state, preferences, possessions, recurring people and places, habits, and notable changes over time.
+
+Output a strict JSON object:
+- title (string): Short label for the digest, max 8 words
+- summary (string): 4-8 sentences covering the main threads. Preserve specific named entities, numbers, and dates; prefer concrete facts over generic narration. When threads are unrelated, cover each briefly rather than forcing a story. Do NOT invent anything not present in the inputs.
+
+Return ONLY the JSON object."""
+
+DIGEST_USER_TEMPLATE = """Thread summaries to digest:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
 SESSION_SUMMARY_SYSTEM = """You write a one-sentence summary of a conversation session.
 
 Focus on: what was accomplished, decisions made, problems solved, topics covered.
