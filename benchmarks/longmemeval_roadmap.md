@@ -699,7 +699,10 @@ build — the discipline that killed L2a, L2b, and both halves of L3, and now cl
   (b) identity evidence-bound clauses at EVERY fusion level (AGGREGATE, ROLLUP,
   DIGEST); (c) all salts bumped (cluster.v2 / rollup.v2 / root.v4) so the
   poisoned cached fusions regenerate next dream. LESSON: a prompt hardened
-  against an artifact must invalidate the cache level that produced it.**
+  against an artifact must invalidate the cache level that produced it.
+  The full carry-over plan for this thread (v4 verification, P4 profile tier,
+  episode-coverage fix, enablement path, Hermes wiring) lives in
+  `benchmarks/raptor_digest_plan.md`.**
 - Relative-date parsing ("twee weken geleden") — needs `dateparser`, deferred against
   the zero-dependency hardening goal.
 - `messages_fts` not carried by export/import.
