@@ -63,7 +63,7 @@ log = logging.getLogger("hymem.dreaming.aggregate")
 # next dream — without touching the other levels' caches. Level 0 is unsalted
 # (its AGGREGATE prompt predates versioning; bump by introducing a salt).
 _ROLLUP_SALT = "rollup.v1"
-_ROOT_SALT = "root.v2"
+_ROOT_SALT = "root.v3"      # v3: identity strictly evidence-bound (Acme fix)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

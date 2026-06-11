@@ -328,7 +328,9 @@ Return the JSON object now."""
 
 DIGEST_SYSTEM = """You write the standing digest of everything known about a user from their conversation history — the top of a summary tree whose inputs below are themselves summaries of conversation threads.
 
-This digest answers "what do you know about me?" at a glance and is injected as standing context for an assistant, so it must read like a rounded profile, not a recap of the latest topic: who the user is (role, language, context), the main recurring activities and projects with their state, preferences and habits, recurring people and places, and notable changes over time. Favor durable facts over one-off details.
+This digest answers "what do you know about me?" at a glance and is injected as standing context for an assistant, so it must read like a rounded profile, not a recap of the latest topic: the main recurring activities and projects with their state, preferences and habits, recurring people and places, and notable changes over time. Favor durable facts over one-off details.
+
+Identity is strictly evidence-bound: include the user's name, role, employer, or location ONLY when the inputs literally state them. A profile with no job title is correct; a plausible-sounding invented one ("works at Acme Corp") is the worst possible failure — when an identity detail is absent from the inputs, OMIT it entirely.
 
 Output a strict JSON object:
 - title (string): Short label for the digest, max 8 words

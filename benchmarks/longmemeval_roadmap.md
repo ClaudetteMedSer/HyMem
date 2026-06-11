@@ -683,7 +683,14 @@ build — the discipline that killed L2a, L2b, and both halves of L3, and now cl
   (`rollup.v1`/`root.v2`), so the next dream regenerates rollups+root with the
   new prompts while reusing all level-0 fusions. `Digest` gained
   `n_sessions_total` — a low covered/total ratio means sessions without
-  episodes (dream-coverage gap upstream), not a tree problem.**
+  episodes (dream-coverage gap upstream), not a tree problem. Side-by-side on
+  prod CONFIRMED the breadth fix (7+ threads vs the single clinical vignette;
+  coverage unchanged 65/91). One artifact: an invented identity ("senior
+  engineer at Acme Corp") — the digest prompt demanded a profile SHAPE with
+  role slots, so the model filled the missing slot; root.v3 makes identity
+  strictly evidence-bound (omit when absent). If v3 still hallucinates,
+  the next anchor is feeding user-canonical graph facts into the digest
+  input — same lever as the host-side profile injection, but store-grounded.**
 - Relative-date parsing ("twee weken geleden") — needs `dateparser`, deferred against
   the zero-dependency hardening goal.
 - `messages_fts` not carried by export/import.
