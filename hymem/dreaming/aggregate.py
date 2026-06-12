@@ -66,7 +66,9 @@ log = logging.getLogger("hymem.dreaming.aggregate")
 # incident lived in a persisted rollup and survived a root-only fix), so a
 # prompt hardened against an artifact must invalidate the level that produced
 # it, or the artifact outlives the fix.
-_CLUSTER_SALT = "cluster.v2"  # v2: identity evidence-bound (was unsalted)
+_CLUSTER_SALT = "cluster.v3"  # v3: recency-window split at max_cluster_size
+                              #     (membership semantics changed — Stage 3a
+                              #     chaining guard); v2: identity evidence-bound
 _ROLLUP_SALT = "rollup.v2"    # v2: identity evidence-bound
 _ROOT_SALT = "root.v4"        # v4: VERIFIED FACTS anchor block
 
@@ -112,7 +114,8 @@ def _linked(e1: dict, e2: dict, emb_threshold: float, ent_threshold: float) -> b
 
 
 def cluster_episodes(
-    episodes: list[dict], emb_threshold: float, ent_threshold: float
+    episodes: list[dict], emb_threshold: float, ent_threshold: float,
+    *, max_cluster_size: int | None = None,
 ) -> dict[str, int]:
     """Connected-components clustering over the episode link graph (union-find).
 
@@ -121,7 +124,27 @@ def cluster_episodes(
     path of `_linked` edges between them (transitive closure). This is deliberately
     the simplest cross-session aggregation a RAPTOR layer could do; if even this
     co-locates the gold, a smarter clusterer only does better.
+
+    `max_cluster_size` is the Stage-3a chaining guard (raptor_digest_plan.md):
+    OR-links chain transitively, and on the prod store (probe, 2026-06-12) that
+    snowballed into ONE component of 348 episodes spanning 61 sessions — a
+    fusion of that is mush. When set, any component larger than the cap is
+    split deterministically into consecutive recency-ordered windows of at most
+    `max_cluster_size` members; when None (the default, and what the probes
+    pass) behavior is identical to the uncapped clusterer, so
+    benchmarks/cluster_size_probe.py keeps measuring RAW chaining.
+
+    Recency signal: members are ordered by `start_message_id` ascending when
+    present (messages.id is a store-wide AUTOINCREMENT, so it is a true
+    cross-session ingestion-order clock — the loader already carries it),
+    falling back to input position (rollup items and bare test dicts carry no
+    message ids; input position is the loader's stable order). Full windows are
+    aligned to the most-RECENT end, so the one possibly-undersized window holds
+    the OLDEST episodes — if downstream min-size filtering drops it, what is
+    lost is the least recent slice, never the newest.
     """
+    if max_cluster_size is not None and max_cluster_size < 1:
+        raise ValueError(f"max_cluster_size must be >= 1, got {max_cluster_size}")
     parent: dict[str, str] = {e["id"]: e["id"] for e in episodes}
 
     def find(x: str) -> str:
@@ -149,7 +172,41 @@ def cluster_episodes(
         if root not in label_of:
             label_of[root] = len(label_of)
         out[eid] = label_of[root]
-    return out
+    if max_cluster_size is None:
+        return out
+
+    # Chaining guard: split every over-cap component into recency windows.
+    pos = {e["id"]: i for i, e in enumerate(episodes)}
+
+    def _recency_key(e: dict) -> tuple:
+        sm = e.get("start_message_id")
+        # Episodes carrying a message id sort by it (global ingestion order);
+        # items without one (rollup nodes, plain dicts) keep input order and
+        # sort after dated ones. Input position breaks all ties → deterministic.
+        return (0, sm, pos[e["id"]]) if isinstance(sm, int) else (1, 0, pos[e["id"]])
+
+    components: dict[int, list[dict]] = {}
+    for e in episodes:
+        components.setdefault(out[e["id"]], []).append(e)
+
+    capped: dict[str, int] = {}
+    next_label = 0
+    for label in sorted(components):       # original first-seen label order
+        members = components[label]
+        if len(members) <= max_cluster_size:
+            for m in members:
+                capped[m["id"]] = next_label
+            next_label += 1
+            continue
+        ordered = sorted(members, key=_recency_key)   # oldest → newest
+        head = len(ordered) % max_cluster_size        # undersized window = oldest
+        bounds = ([0] if head else []) + list(
+            range(head, len(ordered), max_cluster_size))
+        for start in bounds:
+            for m in ordered[start:start + max_cluster_size]:
+                capped[m["id"]] = next_label
+            next_label += 1
+    return capped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,6 +242,11 @@ def load_clusterable_episodes(conn: sqlite3.Connection) -> list[dict]:
             "session_id": r["session_id"],
             "title": r["title"],
             "summary": r["summary"],
+            # Recency signal for the max_cluster_size window split: messages.id
+            # is a store-wide AUTOINCREMENT, so this orders episodes by
+            # ingestion time across sessions (session_id alone is lexicographic
+            # and NOT chronological for non-date-prefixed session names).
+            "start_message_id": r["start_message_id"],
             "entities": {_norm_entity(x) for x in raw_entities if x},
             "vector": vec,
         })
@@ -238,11 +300,18 @@ def select_clusters(
 ) -> list[list[dict]]:
     """Cluster all episodes, then keep only the clusters worth a summary: at least
     `aggregation_min_members` episodes spanning at least `aggregation_min_sessions`
-    distinct sessions. Returns each kept cluster's episodes in load order."""
+    distinct sessions. Returns each kept cluster's episodes in load order.
+
+    Clustering runs with the `aggregation_max_cluster_size` chaining guard
+    (0 in config = uncapped → None here): an over-cap component arrives as
+    recency windows, and each window flows through the SAME min-members /
+    min-sessions policy below — an undersized trailing window is dropped here
+    exactly like any other too-small cluster."""
     if not episodes:
         return []
     labels = cluster_episodes(
-        episodes, cfg.aggregation_emb_threshold, cfg.aggregation_ent_threshold
+        episodes, cfg.aggregation_emb_threshold, cfg.aggregation_ent_threshold,
+        max_cluster_size=cfg.aggregation_max_cluster_size or None,
     )
     grouped: dict[int, list[dict]] = {}
     for ep in episodes:
@@ -549,8 +618,12 @@ def _build_digest_levels(
     fan_in = max(2, cfg.aggregation_max_members)
     level = 1
     while len(items) > fan_in:
+        # Same chaining guard as level 0: a transitive mega-component among the
+        # rollup frontier would otherwise fuse from a `aggregation_max_members`
+        # truncation of itself, silently dropping every thread past the cut.
         labels = cluster_episodes(
-            items, cfg.aggregation_emb_threshold, cfg.aggregation_ent_threshold
+            items, cfg.aggregation_emb_threshold, cfg.aggregation_ent_threshold,
+            max_cluster_size=cfg.aggregation_max_cluster_size or None,
         )
         grouped: dict[int, list[dict]] = {}
         for it in items:

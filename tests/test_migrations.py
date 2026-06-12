@@ -190,6 +190,9 @@ def test_v15_backfills_validity_interval(tmp_path: Path):
         """
         CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         INSERT INTO schema_meta VALUES ('schema_version', '14');
+        CREATE TABLE sessions(id TEXT PRIMARY KEY);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL);
         CREATE TABLE knowledge_graph(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_canonical TEXT, predicate TEXT, object_canonical TEXT,

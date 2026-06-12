@@ -17,6 +17,7 @@ from hymem.dreaming.inference import infer_transitive_edges
 from hymem.dreaming.chunks import (
     Chunk,
     extract_baseline_chunks,
+    extract_fallback_chunk,
     extract_high_salience_chunks,
     persist_chunks,
 )
@@ -44,7 +45,11 @@ from hymem.dreaming.retention import (
     prune_retracted_edges,
 )
 from hymem.dreaming.summary import persist_session_summary
-from hymem.dreaming.user_profile import extract_user_profile, persist_user_profile
+from hymem.dreaming.user_profile import (
+    PROFILE_PROMPT_VERSION,
+    extract_user_profile,
+    persist_user_profile,
+)
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 
@@ -328,11 +333,29 @@ def run_dreaming(
                             report.triples_extracted += len(extraction.triples)
                             report.markers_extracted += len(extraction.markers)
 
-            # Sessions with no content in either tier skip the per-session tail
-            # blocks — matches the pre-baseline behavior and avoids wasted LLM
-            # calls on empty sessions.
+            # Sessions with no content in either tier used to skip the
+            # per-session tail outright — which left short sessions (all user
+            # turns under min_chars, no triggers) never digested,
+            # digested_prompt_version NULL forever. Mint ONE fallback chunk
+            # spanning the whole session so the digest has something to read;
+            # truly empty sessions (no user/assistant content) still skip.
             if not chunks and not baseline:
-                continue
+                fallback = extract_fallback_chunk(
+                    conn, session_id, max_chars=cfg.dream_digest_max_chars
+                )
+                if fallback is None:
+                    continue
+                report.chunks_seen += 1
+                with core_db.transaction(conn):
+                    persist_chunks(conn, [fallback])
+                    index_chunk_mentions(conn, fallback.id, fallback.text)
+                    index_chunk_temporal_mentions(conn, fallback.id)
+                _kickoff_chunk_embed([fallback])
+                # Deliberately NO phase-1 triple extraction and NO
+                # had_new_chunk_work: the goal is digest/episode coverage, not
+                # graph growth from diagnostic noise — and leaving the flag
+                # unset keeps the digest skip-guard below zero-call on later
+                # re-dreams of this (unchanged) session.
 
             # Per-session digest: one LLM call producing episodes + summary +
             # procedures together (replaces three separate calls). Skip it
@@ -340,7 +363,8 @@ def run_dreaming(
             # prompt_version and no chunk was re-extracted this run, so
             # steady-state re-dreams of unchanged sessions cost zero tail calls.
             digested = conn.execute(
-                "SELECT summary, digested_prompt_version FROM sessions WHERE id = ?",
+                "SELECT summary, digested_prompt_version, profile_prompt_version "
+                "FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             already_digested = (
@@ -386,13 +410,21 @@ def run_dreaming(
 
             # P4 typed user-profile extraction: one LLM call over the session's
             # USER turns only (closed slot vocabulary, schema v18), piggybacking
-            # on the per-session digest batching above and sharing its
-            # skip-guard, so a steady-state re-dream of unchanged sessions still
-            # makes zero tail calls. Persisting is supersession-aware and
-            # re-assert-idempotent, so re-running over the same turns is safe.
-            # The LLM call runs OUTSIDE the write transaction, like the digest.
+            # on the per-session digest batching above but with its OWN
+            # skip-guard (sessions.profile_prompt_version, schema v19): the
+            # digest guard keys on cfg.prompt_version, so sharing it would mean
+            # a PROFILE_PROMPT_VERSION bump alone never re-extracts an
+            # already-digested session. Steady-state re-dreams of unchanged
+            # sessions still make zero tail calls. Persisting is
+            # supersession-aware and re-assert-idempotent, so re-running over
+            # the same turns is safe. The LLM call runs OUTSIDE the write
+            # transaction, like the digest.
+            profile_current = (
+                digested is not None
+                and digested["profile_prompt_version"] == PROFILE_PROMPT_VERSION
+            )
             if cfg.profile_extraction_enabled and not (
-                already_digested and not had_new_chunk_work
+                profile_current and not had_new_chunk_work
             ):
                 try:
                     profile = extract_user_profile(
@@ -405,11 +437,21 @@ def run_dreaming(
                         "profile.extraction_failure session_id=%s", session_id
                     )
                 else:
-                    if profile is not None and profile.items:
+                    if profile is not None:
+                        # A valid extraction with ZERO items is a legitimate
+                        # "nothing here": persist whatever validated (maybe
+                        # nothing) and stamp the prompt version in the SAME
+                        # transaction, so only an LLM failure (the except
+                        # above) leaves the stamp unset and retries next run.
                         with core_db.transaction(conn):
                             persisted = persist_user_profile(
                                 conn, profile,
                                 redact_values=cfg.redact_secrets,
+                            )
+                            conn.execute(
+                                "UPDATE sessions SET profile_prompt_version = ? "
+                                "WHERE id = ?",
+                                (PROFILE_PROMPT_VERSION, session_id),
                             )
                         report.profile_items_extracted += persisted
                         if persisted:

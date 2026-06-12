@@ -30,7 +30,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- +procedures). The dream runner skips the per-session digest LLM call when
     -- this matches the current prompt_version and no chunk was re-extracted.
     -- Migration 012 adds this for existing DBs (ALTER lives there only).
-    digested_prompt_version TEXT
+    digested_prompt_version TEXT,
+    -- PROFILE_PROMPT_VERSION of the last successful user-profile extraction
+    -- (same skip mechanics as digested_prompt_version, but decoupled so a
+    -- profile-prompt bump alone re-extracts). Migration 019 adds this for
+    -- existing DBs (ALTER lives there only).
+    profile_prompt_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (

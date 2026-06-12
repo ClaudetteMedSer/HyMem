@@ -19,8 +19,12 @@ from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.core import db as core_db
 from hymem.dreaming.aggregate import (
     build_aggregation_nodes,
+    cluster_episodes,
     load_digest,
+    _CLUSTER_SALT,
     _node_id,
+    _ROLLUP_SALT,
+    _ROOT_SALT,
     select_clusters,
 )
 from hymem.extraction.llm import StubLLMClient
@@ -128,6 +132,120 @@ def test_node_id_stable_for_membership_and_order_independent():
     b = _node_id(["e1", "e2"])
     assert a == b                                  # order-independent
     assert a != _node_id(["e1", "e2", "e3"])       # membership change → new id
+
+
+# ── Stage-3a chaining guard: max_cluster_size recency-window split ───────────
+# The prod store grew ONE 348-episode component spanning 61 sessions through
+# transitive OR-link chaining (cluster_size_probe, 2026-06-12); the guard
+# splits over-cap components into recency windows. Membership semantics changed
+# → cluster salt bumped to v3 (rollup/root salts unchanged: their cache ids key
+# on member sets, which change naturally).
+
+def _entity_chain(n: int, start_message_ids: list[int] | None = None) -> list[dict]:
+    """n episodes where ONLY consecutive pairs entity-link at jaccard exactly
+    0.50 (= the production ent threshold): {t0}, {t0,t1}, {t1}, {t1,t2}, ...
+    Non-adjacent pairs overlap at most 1/3, so one big component can exist only
+    through union-find transitivity — the failure mode the guard splits."""
+    eps = []
+    for k in range(n):
+        j = k // 2
+        ents = [f"t{j}"] if k % 2 == 0 else [f"t{j}", f"t{j + 1}"]
+        ep = _ep(f"e{k}", f"s{k}", ents)
+        if start_message_ids is not None:
+            ep["start_message_id"] = start_message_ids[k]
+        eps.append(ep)
+    return eps
+
+
+def test_salts_pinned():
+    # Membership semantics changed (recency-window split) → cluster salt MUST
+    # be v3, or cached pre-guard mega-cluster fusions survive the fix (the
+    # "Acme Corp" lesson). Rollup/root deliberately NOT bumped.
+    assert _CLUSTER_SALT == "cluster.v3"
+    assert _ROLLUP_SALT == "rollup.v2"
+    assert _ROOT_SALT == "root.v4"
+
+
+def test_over_cap_component_splits_into_windows_deterministically():
+    eps = _entity_chain(7)                      # ONE component of 7, uncapped
+    uncapped = cluster_episodes(eps, 0.55, 0.50)
+    assert len(set(uncapped.values())) == 1
+
+    capped = cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3)
+    windows: dict[int, set[str]] = {}
+    for eid, label in capped.items():
+        windows.setdefault(label, set()).add(eid)
+    assert all(len(w) <= 3 for w in windows.values())
+    # 7 = 1 + 3 + 3: full windows align to the newest end, the undersized
+    # window holds the OLDEST episodes (input order = recency fallback).
+    assert sorted(len(w) for w in windows.values()) == [1, 3, 3]
+    # Deterministic: a second run is identical, label for label.
+    assert cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3) == capped
+
+
+def test_max_cluster_size_none_is_the_uncapped_clusterer():
+    eps = _entity_chain(7)
+    assert (cluster_episodes(eps, 0.55, 0.50, max_cluster_size=None)
+            == cluster_episodes(eps, 0.55, 0.50))
+
+
+def test_windows_are_recency_ordered_by_start_message_id():
+    # Input order is SHUFFLED relative to recency: start_message_id (a global
+    # AUTOINCREMENT messages.id in prod, carried by load_clusterable_episodes)
+    # is the ordering signal, not list position. Recency order by message id:
+    # e0(10) e1(20) e2(30) e3(40) e4(50) e5(60) e6(70).
+    eps = _entity_chain(7, start_message_ids=[10, 20, 30, 40, 50, 60, 70])
+    eps = [eps[i] for i in (4, 0, 6, 2, 5, 1, 3)]   # shuffle input order
+
+    capped = cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3)
+    windows: dict[int, set[str]] = {}
+    for eid, label in capped.items():
+        windows.setdefault(label, set()).add(eid)
+    # Consecutive recency slices, full windows at the newest end:
+    assert sorted(windows.values(), key=len) == sorted(
+        [{"e0"}, {"e1", "e2", "e3"}, {"e4", "e5", "e6"}], key=len)
+
+
+def test_component_exactly_at_cap_is_not_split():
+    eps = _entity_chain(7)
+    capped = cluster_episodes(eps, 0.55, 0.50, max_cluster_size=7)
+    assert capped == cluster_episodes(eps, 0.55, 0.50)   # one component, intact
+
+
+def test_build_respects_aggregation_max_cluster_size(conn, cfg):
+    # Integration: a 7-episode transitive chain across 7 sessions, cap 3 → no
+    # persisted level-0 node may exceed 3 members. Windows of 3 span 3 sessions
+    # (pass min_members/min_sessions); the undersized window of 1 is dropped by
+    # the SAME downstream policy as any singleton.
+    for k in range(7):
+        j = k // 2
+        ents = [f"t{j}"] if k % 2 == 0 else [f"t{j}", f"t{j + 1}"]
+        _seed_episode(conn, f"e{k}", f"s{k}", f"ep {k}", f"about {ents}",
+                      ents, start=10 * (k + 1), end=10 * (k + 1) + 1)
+    cfg = replace(_enabled(cfg), aggregation_max_cluster_size=3)
+    n = build_aggregation_nodes(conn, cfg, _agg_llm())
+    rows = conn.execute(
+        "SELECT n_members, member_episode_ids FROM aggregation_nodes "
+        "WHERE level = 0").fetchall()
+    assert n == len(rows) == 2                       # two full windows kept
+    assert all(r["n_members"] <= 3 for r in rows)
+    members = {frozenset(json.loads(r["member_episode_ids"])) for r in rows}
+    assert members == {frozenset({"e1", "e2", "e3"}),
+                       frozenset({"e4", "e5", "e6"})}
+
+
+def test_build_uncapped_when_config_cap_is_zero(conn, cfg):
+    # House style: 0 = uncapped (translated to None at the call site).
+    for k in range(7):
+        j = k // 2
+        ents = [f"t{j}"] if k % 2 == 0 else [f"t{j}", f"t{j + 1}"]
+        _seed_episode(conn, f"e{k}", f"s{k}", f"ep {k}", f"about {ents}",
+                      ents, start=10 * (k + 1), end=10 * (k + 1) + 1)
+    cfg = replace(_enabled(cfg), aggregation_max_cluster_size=0)
+    assert build_aggregation_nodes(conn, cfg, _agg_llm()) == 1
+    row = conn.execute(
+        "SELECT n_members FROM aggregation_nodes WHERE level = 0").fetchone()
+    assert row["n_members"] == 7                     # the raw mega-component
 
 
 # ── DB build + persistence ───────────────────────────────────────────────────

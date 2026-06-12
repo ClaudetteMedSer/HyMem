@@ -66,8 +66,8 @@ store — trivial). Checklist:
        ORDER BY pos_evidence - neg_evidence DESC LIMIT 20;`
       Expectation: tech edges present, personal identity (bedrijfsarts, name) likely
       ABSENT — that absence is the Stage 1 motivation, record it.
-- [ ] Coverage attribution: `SELECT COUNT(DISTINCT session_id) FROM episodes;` vs total
-      sessions. If ≈65, the digest is faithful and the 26-session gap is Stage 2's.
+- [x] Coverage attribution: 66/92 sessions covered (71.7%) — confirmed via the Stage 2
+      probe on 2026-06-12; the 26-session gap is Stage 2's (see its RESULT below).
 - [ ] Second dream, no changes → `reused=N` (all fusions), digest byte-identical.
 
 **Gate:** if v4 still shows invented identity after cache eviction + anchor, do NOT
@@ -94,6 +94,43 @@ paste the rendered prompts into the box LLM, hand-score slot precision; ≥0.9 �
 re-dream and check `hy.digest()` for Acme's clean omission (the anchor now has a
 true identity edge to prefer); <0.9 → set `profile_extraction_enabled=False` and
 revise `profile.v1`/validation before any prod dream.
+
+**GATE RESULT (box run 2026-06-12): precision ~8% (≈8/98) — gate NOT passed.**
+31 sessions, 98 rows extracted. Correct: ~7–9 (name, language, location,
+relationship(titus skrabanja)=supervisor). Failures, by mode:
+1. `health_condition` bleed — role descriptions ("works as bedrijfsarts with
+   verzuimbegeleiding") and PATIENT facts ("chronische vermoeidheid",
+   "patient finally booked psychologist") landed as user health.
+2. `employer` misresolution — GitHub org (ClaudetteMedSer) taken as employer;
+   the real employer (O3) missed.
+3. `possession` over-extraction — 20+ rows enumerating individual GitHub repos;
+   redundant `recurring_activity` rows. ~85 of 98 rows are noise.
+4. Over-conservative on real facts — `role=bedrijfsarts` and `employer=O3` are
+   explicit in prior_memory text but were not extracted (`role=developer` came
+   out instead — incomplete).
+**Root cause:** the prompt can't distinguish "facts ABOUT the user" from "facts
+IN the user's context" — prior_memory_file dumps carry tech context (repos,
+agent config) and clinical reflections (patients), and v1 extracts from both.
+**Despite the gate failure, the ANCHOR MECHANISM is verified:** regenerated
+digest titled "Atta Van Westreenen — Developer Profile", ZERO mention of Acme
+Corp — real identity facts outcompeted the hallucinated one. "Suspect → omit"
+confirmed end-to-end; what failed is extraction precision, not consumption.
+
+**Response (built 2026-06-12, this branch): profile.v2.** Per the gate contract:
+- `profile_extraction_enabled` default flipped to **False** — no prod dream
+  extracts until the v2 prompt re-passes the ≥0.9 gate.
+- `profile.v2` prompt rewrite targeting the four failure modes above (the
+  aboutness test: user-vs-context; clinician-patient exclusion; employer ≠
+  GitHub org; possession = durable real-world items only; pasted memory text
+  that explicitly describes the user IS extractable — channel ≠ aboutness).
+- Migration 019 (schema v19): purge the failed v1 rows (`DELETE FROM
+  user_profile` — regenerable, v18 never released) + per-session
+  `sessions.profile_prompt_version` stamp, decoupling the profile skip-guard
+  from the digest guard so a prompt-version bump re-extracts on already-digested
+  sessions (v1 sharing the digest guard would have made v2 unreachable without
+  a full re-dream under a bumped digest prompt).
+**Re-gate procedure (box):** same as before — `profile_prompt_dump.py`,
+hand-score ≥0.9, only then set `profile_extraction_enabled=True` and dream.
 
 **Problem:** the anchor can only inject what the graph knows, and the 18-predicate
 vocabulary is tech-domain. "User is a bedrijfsarts in Amsterdam named Atta" never becomes
@@ -152,8 +189,29 @@ yielded zero?). Three different causes → three different fixes:
 
 **Gate:** build nothing until the probe says which bucket dominates.
 
-**Est:** probe is small; the fix depends on the bucket (mechanical → small; prompt recall
-→ medium, needs offline before/after on the same sessions).
+**PROBE RESULT (box run 2026-06-12): never_dreamed dominates — mechanical fix.**
+Coverage 71.7% (66/92). Of 26 uncovered: 23 never_dreamed (88.5%), 3
+dreamed_zero_short (11.5%), 0 dreamed_zero_long. The 23 are test/WebSocket/
+diagnostic sessions with 0–4 messages. No prompt work needed.
+
+**Root cause (located in code):** both chunk tiers only mint chunks from USER
+turns that clear `salience_min_chars` or a trigger regex
+(`hymem/dreaming/chunks.py`); a session whose user turns are all short produces
+zero chunks in both tiers, and the runner's `if not chunks and not baseline:
+continue` skips the entire per-session tail — digest never runs,
+`digested_prompt_version` stays NULL forever.
+
+**Fix (built 2026-06-12, this branch): short-session fallback chunk.** When a
+session reaches the tail with zero chunks in both tiers but has ≥1 user/assistant
+message, mint ONE fallback chunk spanning the whole session
+(`salience_reason='short_session_fallback'`, char-capped), persist + embed it
+like any other chunk, and let the normal digest tail run (episodes get a valid
+evidence chunk id; `digested_prompt_version` gets stamped; skip-guard then makes
+re-dreams free). Phase-1 triple extraction is NOT run on fallback chunks — the
+goal is digest/episode coverage, not graph growth from diagnostic noise.
+Truly empty sessions (zero user/assistant messages) still skip. Expected effect
+on the box: next dream digests the 23 sessions (23 one-off LLM calls); honest
+residue moves to dreamed_zero_short where the digest legitimately found nothing.
 
 ---
 
@@ -174,6 +232,29 @@ distribution on the prod store (pure-Python, no LLM — reuse
 guard entirely. If mega-clusters exist: cap component size (split by recency window at
 cap, or require BOTH emb AND ent agreement to grow a component past the cap). Salt-bump
 `cluster.v3` if fusion inputs change.
+
+**PROBE RESULT (box run 2026-06-12): mega-cluster confirmed — build the guard.**
+348 episodes in ONE component at cap 15, spanning 61 sessions
+(2026-05-07-hymem-setup through Branch-Update-Verification-Reviewed) — a single
+giant component via transitive chaining through the embedding arm.
+
+**Guard (built 2026-06-12, this branch): recency-window split at cap.**
+`cluster_episodes` gains `max_cluster_size` (config
+`aggregation_max_cluster_size`, default 15; 0 = uncapped, translated to None
+at the call sites): components larger than the cap are split deterministically
+into recency-ordered windows of ≤ cap (the plan's sanctioned option — the
+BOTH-arms alternative is union-find order-dependent). Recency signal is
+`start_message_id` (store-wide AUTOINCREMENT = true cross-session ingestion
+clock; session_id is lexicographic, NOT chronological on the prod store); full
+windows align to the most-recent end so the one possibly-undersized window
+holds the OLDEST episodes — downstream min-members/min-sessions filtering then
+drops the least recent slice, never the newest. Applied at BOTH call sites
+(level-0 `select_clusters` and the rollup loop — a frontier mega-component
+would otherwise fuse from a truncation of itself). Salt bumped
+`cluster.v2 → cluster.v3` (membership semantics changed); `rollup.v2`/`root.v4`
+unchanged — their cache ids already key on member sets, which change
+naturally. The probe keeps measuring RAW chaining (calls the clusterer
+uncapped) so it stays the diagnostic for the guard.
 
 **3b. O(n²) scaling.** `cluster_episodes` is all-pairs Python cosine, rebuilt per dream
 — fine at 10² episodes, death at 10⁴. Fix: candidate blocking — entity inverted index
@@ -217,6 +298,30 @@ digest say X" with provenance — pairs well with Hermes UI later.
   (`cfg.augment_include_digest`, default False) to keep `augment()` lean.
 
 ---
+
+## Next box run (after the 2026-06-12 build wave: profile.v2 + fallback chunk + chaining guard)
+
+1. Pull the branch; the next dream auto-migrates to schema v19 (purges the
+   failed profile.v1 rows; profile extraction is default-OFF so no profile
+   calls happen).
+2. That same dream digests the 23 never-dreamed sessions (~23 one-off LLM
+   calls via the fallback chunk) and regenerates cluster fusions under
+   `cluster.v3` windows (≤15 members). Then:
+   - re-run `benchmarks/episode_coverage_probe.py` → never_dreamed should be ~0;
+   - re-run `benchmarks/cluster_size_probe.py` → still reports RAW chaining
+     (expected: the 348-mega-component persists in the RAW view; the guard
+     windows it at build time — check `aggregation_nodes` member counts ≤ 15);
+   - eyeball `hy.digest()` — breadth should hold or improve with the 23 newly
+     covered sessions.
+3. Re-gate profile.v2: `python benchmarks/profile_prompt_dump.py <store>
+   --sessions 20`, hand-score precision. ≥0.9 → set
+   `profile_extraction_enabled=True`, re-dream (per-session
+   `profile_prompt_version` stamps are NULL, so every session re-extracts
+   without re-digesting), confirm digest identity facts. <0.9 → iterate the
+   prompt (bump to profile.v3), leave the flag off.
+4. Still outstanding from Stage 0: second no-change dream → `reused=N`,
+   digest byte-identical (note: the FIRST post-pull dream regenerates cluster
+   fusions because of the v3 salt — run the reuse check on the dream after).
 
 ## Suggested order for tomorrow
 

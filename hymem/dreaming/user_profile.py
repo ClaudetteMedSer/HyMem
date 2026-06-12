@@ -52,7 +52,9 @@ log = logging.getLogger("hymem.dreaming.user_profile")
 # Pinned prompt version, following the salt convention in aggregate.py
 # (cluster.v2 / root.v4): bump when USER_PROFILE_SYSTEM / the user template
 # change materially so operators can attribute extraction shifts to the prompt.
-PROFILE_PROMPT_VERSION = "profile.v1"
+# profile.v2: aboutness test + per-slot tightening (health_condition, employer,
+# possession) after profile.v1 failed the on-box precision gate at ~8%.
+PROFILE_PROMPT_VERSION = "profile.v2"
 
 # The CLOSED slot vocabulary, in the priority order consumers render
 # (identity first). Must stay in lockstep with the CHECK constraint in

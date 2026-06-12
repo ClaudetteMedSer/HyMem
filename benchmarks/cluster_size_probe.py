@@ -9,13 +9,17 @@ real store that can snowball into one mega-cluster whose fusion is mush. Before
 this probe measures the cluster-size distribution on the PROD store:
 
   max cluster size < --cap (default 15, the plan's mega-cluster line)
-      → chaining is bounded in practice → the guard is unnecessary, skip the
-        3a build entirely.
+      → chaining is bounded in practice → the guard is moot at this cap.
   max cluster size >= --cap
-      → mega-cluster(s) exist → build the chaining guard before the flip: cap
-        component size (split by recency window at the cap) or require BOTH
-        emb AND ent agreement to grow a component past the cap, and salt-bump
-        `cluster.v3` because the fusion inputs change.
+      → mega-cluster(s) exist → the chaining guard handles them at build time.
+
+The guard is BUILT (2026-06-12, after this probe found a 348-episode component
+spanning 61 sessions on the prod store): `cluster_episodes` splits over-cap
+components into recency-ordered windows, governed by the config knob
+`aggregation_max_cluster_size` (default 15; 0 = uncapped), salt `cluster.v3`.
+This probe deliberately keeps calling the clusterer UNCAPPED so it measures RAW
+transitive chaining — i.e. what the guard would split — not the post-guard
+distribution.
 
 Offline, LLM-less, and READ-ONLY: the store is opened via sqlite URI mode=ro,
 so the probe can point at the live prod file without any risk of writing to it.
@@ -25,9 +29,10 @@ does not dream.
 
 Like benchmarks/raptor_cluster_probe.py, the loader and the clusterer are
 RE-EXPORTED VERBATIM from hymem.dreaming.aggregate (the canonical home), so the
-distribution measured here is exactly the one `build_aggregation_nodes` would
-cluster — probe and prod can never silently drift. The default thresholds are
-the production `HyMemConfig` defaults for the same reason.
+components measured here are exactly the RAW components production forms before
+its `max_cluster_size` window split (the probe calls the clusterer without the
+cap on purpose) — probe and prod can never silently drift. The default
+thresholds are the production `HyMemConfig` defaults for the same reason.
 
 Usage (on the box, against the prod store):
   python cluster_size_probe.py ~/.hermes/hymem.sqlite
@@ -59,7 +64,8 @@ DEFAULT_EMB_THRESHOLD: float = HyMemConfig.__dataclass_fields__[
 DEFAULT_ENT_THRESHOLD: float = HyMemConfig.__dataclass_fields__[
     "aggregation_ent_threshold"].default
 
-# The plan's mega-cluster line: "If max cluster ≪ 15 episodes, skip the guard."
+# The plan's mega-cluster line, and now the default of the BUILT guard's knob
+# (HyMemConfig.aggregation_max_cluster_size).
 DEFAULT_CAP: int = 15
 
 # Histogram buckets: (lo, hi inclusive, label); hi=None means unbounded.
@@ -71,9 +77,10 @@ _BUCKETS: tuple[tuple[int, int | None, str], ...] = (
     (15, None, "15+"),
 )
 
-VERDICT_SKIP = "guard unnecessary, skip 3a build"
-VERDICT_GUARD = ("mega-cluster present → build chaining guard (cap component "
-                 "size / require BOTH emb AND ent past cap), salt-bump cluster.v3")
+VERDICT_SKIP = "no mega-cluster at this cap; chaining guard has nothing to split"
+VERDICT_GUARD = ("mega-cluster present → the BUILT chaining guard splits it at "
+                 "build time into recency windows of aggregation_max_cluster_size "
+                 "(salt cluster.v3); this probe shows the RAW uncapped chaining")
 
 
 def open_store_readonly(path: Path) -> sqlite3.Connection:

@@ -179,6 +179,57 @@ def extract_baseline_chunks(
     return result
 
 
+def extract_fallback_chunk(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    max_chars: int,
+) -> Chunk | None:
+    """Mint ONE chunk spanning the whole session, for sessions both tiers missed.
+
+    Closes the never-dreamed bug: the salience and baseline tiers only mint
+    chunks from USER turns that clear ``min_chars`` or a trigger regex, so a
+    session whose user turns are all short (test/WebSocket/diagnostic sessions)
+    produces zero chunks in both tiers and the runner skips the per-session
+    tail — the digest never runs and ``sessions.digested_prompt_version`` stays
+    NULL forever. This fallback gives the digest one real chunk to read (and
+    episodes a valid evidence id). Phase-1 triple extraction is deliberately
+    never run on fallback chunks — the goal is digest/episode coverage, not
+    graph growth from diagnostic noise.
+
+    The chunk spans the first→last user/assistant message with non-empty
+    content; its text is the ``role: content`` lines of all such turns,
+    truncated to ``max_chars``. Returns None when no user/assistant message
+    with non-empty content exists (truly empty sessions still skip the tail).
+    """
+    rows = [
+        row
+        for row in conn.execute(
+            "SELECT id, role, content FROM messages "
+            "WHERE session_id = ? AND role IN ('user', 'assistant') "
+            "ORDER BY id",
+            (session_id,),
+        )
+        if row["content"]
+    ]
+    if not rows:
+        return None
+
+    start_id = rows[0]["id"]
+    end_id = rows[-1]["id"]
+    pieces = [f"{row['role']}: {row['content']}" for row in rows]
+    text = "\n".join(pieces)[:max_chars]
+
+    return Chunk(
+        id=_chunk_id(session_id, start_id, end_id),
+        session_id=session_id,
+        start_message_id=start_id,
+        end_message_id=end_id,
+        salience_reason="short_session_fallback",
+        text=text,
+    )
+
+
 def persist_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
     for c in chunks:
         conn.execute(

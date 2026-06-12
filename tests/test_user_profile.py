@@ -10,7 +10,13 @@ relationship-per-person supersede; other multi-valued slots accumulate;
 re-assertion never duplicates), anchor priority order + combined cap,
 the additive augment tier (no slot competition with existing tiers),
 redaction of sensitive values in every consumer, the empty-before-dream
-contract, and the v18 migration on both fresh and existing-v17 stores.
+contract, the off-by-default gate (profile.v1 failed the on-box precision
+gate, so profile_extraction_enabled defaults False until profile.v2
+re-passes), the decoupled per-session profile_prompt_version skip-guard
+(schema v19), and the v18/v19 migrations on fresh and existing stores.
+
+NOTE: extraction-path tests opt in with profile_extraction_enabled=True —
+the shipped default is False.
 """
 from __future__ import annotations
 
@@ -39,6 +45,23 @@ from tests.conftest import seed_edge
 # Routing substring unique to USER_PROFILE_SYSTEM (the digest/triple stubs key
 # on their own closers, so the fixtures never collide).
 _NEEDLE = "typed user-profile facts"
+
+
+def _on(cfg):
+    """Config with profile extraction opted in (the shipped default is False
+    until the profile.v2 prompt re-passes the on-box precision gate)."""
+    return replace(cfg, profile_extraction_enabled=True)
+
+
+def _profile_calls(stub_llm) -> list:
+    return [c for c in stub_llm.calls if _NEEDLE in c.system]
+
+
+def _stamp(conn, sid) -> str | None:
+    row = conn.execute(
+        "SELECT profile_prompt_version FROM sessions WHERE id = ?", (sid,)
+    ).fetchone()
+    return row["profile_prompt_version"] if row else None
 
 
 def _item(slot, value, mid, *, key=None, conf=0.9) -> dict:
@@ -88,7 +111,7 @@ def conn(cfg):
 
 
 def test_dream_extracts_profile_from_user_turns_only(cfg, stub_llm):
-    hy = HyMem(cfg, llm=stub_llm)
+    hy = HyMem(_on(cfg), llm=stub_llm)
     try:
         sid = "s_profile"
         m_user = hy.log_message(
@@ -122,15 +145,17 @@ def test_dream_extracts_profile_from_user_turns_only(cfg, stub_llm):
         assert "bedrijfsarts bij MedFlow" in prompt
         assert "rewarding work" not in prompt, "assistant turns must not be in the prompt"
         # Prompt version string exists and follows the salt convention.
-        assert PROFILE_PROMPT_VERSION == "profile.v1"
+        assert PROFILE_PROMPT_VERSION == "profile.v2"
     finally:
         hy.close()
 
 
 def test_redream_unchanged_session_skips_profile_call(cfg, stub_llm):
-    """The profile call shares the digest skip-guard: an unchanged,
-    already-digested session makes zero tail calls on a re-dream."""
-    hy = HyMem(cfg, llm=stub_llm)
+    """The profile call has its own stamp-based skip-guard
+    (sessions.profile_prompt_version): an unchanged session already stamped
+    with the current PROFILE_PROMPT_VERSION makes zero profile calls on a
+    re-dream."""
+    hy = HyMem(_on(cfg), llm=stub_llm)
     try:
         sid = "s_skip"
         mid = hy.log_message(
@@ -138,26 +163,91 @@ def test_redream_unchanged_session_skips_profile_call(cfg, stub_llm):
         )
         stub_llm.fixtures[_NEEDLE] = json.dumps([_item("location", "Amsterdam", mid)])
         hy.dream()
-        first = len([c for c in stub_llm.calls if _NEEDLE in c.system])
-        assert first == 1
+        assert len(_profile_calls(stub_llm)) == 1
+        assert _stamp(hy.conn, sid) == PROFILE_PROMPT_VERSION
         hy.dream()  # nothing changed
-        assert len([c for c in stub_llm.calls if _NEEDLE in c.system]) == first
+        assert len(_profile_calls(stub_llm)) == 1
         # And the re-asserted row was not duplicated either way.
         assert len(_rows(hy.conn)) == 1
     finally:
         hy.close()
 
 
-def test_profile_extraction_disabled_makes_no_call(cfg, stub_llm):
-    hy = HyMem(replace(cfg, profile_extraction_enabled=False), llm=stub_llm)
+def test_profile_extraction_disabled_by_default_makes_no_call(cfg, stub_llm):
+    """profile_extraction_enabled defaults to FALSE (profile.v1 failed the
+    on-box precision gate at ~8%): a dream under a default config must make
+    zero profile LLM calls, persist nothing, and leave the stamp unset."""
+    assert cfg.profile_extraction_enabled is False
+    hy = HyMem(cfg, llm=stub_llm)  # defaults, no opt-in
     try:
+        sid = "s_off"
         mid = hy.log_message(
-            "s_off", "user", "I work as a bedrijfsarts at MedFlow nowadays.",
+            sid, "user", "I work as a bedrijfsarts at MedFlow nowadays.",
         )
         stub_llm.fixtures[_NEEDLE] = json.dumps([_item("role", "bedrijfsarts", mid)])
         hy.dream()
-        assert [c for c in stub_llm.calls if _NEEDLE in c.system] == []
+        assert _profile_calls(stub_llm) == []
         assert _rows(hy.conn) == []
+        assert _stamp(hy.conn, sid) is None
+    finally:
+        hy.close()
+
+
+def test_profile_stamp_set_after_successful_extraction(cfg, stub_llm):
+    """A successful extraction stamps sessions.profile_prompt_version —
+    including a valid extraction with ZERO items (a legitimate 'nothing
+    here'), which must also suppress the call on the next dream."""
+    hy = HyMem(_on(cfg), llm=stub_llm)
+    try:
+        sid = "s_stamp"
+        hy.log_message(
+            sid, "user", "Nothing personal here, just postgres tuning notes.",
+        )
+        stub_llm.fixtures[_NEEDLE] = "[]"  # valid extraction, zero items
+        hy.dream()
+        assert len(_profile_calls(stub_llm)) == 1
+        assert _rows(hy.conn) == []
+        assert _stamp(hy.conn, sid) == PROFILE_PROMPT_VERSION
+        hy.dream()  # stamped + no new chunk work → no second call
+        assert len(_profile_calls(stub_llm)) == 1
+    finally:
+        hy.close()
+
+
+def test_old_profile_stamp_re_extracts_despite_current_digest(cfg, stub_llm):
+    """THE DECOUPLING TEST: the profile guard keys on PROFILE_PROMPT_VERSION,
+    not on the digest's prompt_version. With digested_prompt_version current
+    but an old profile stamp (as after a profile-prompt bump), a re-dream
+    must run profile extraction again."""
+    hy = HyMem(_on(cfg), llm=stub_llm)
+    try:
+        sid = "s_bump"
+        mid = hy.log_message(
+            sid, "user", "Ik werk tegenwoordig als bedrijfsarts.",
+        )
+        stub_llm.fixtures[_NEEDLE] = json.dumps([_item("role", "bedrijfsarts", mid)])
+        hy.dream()
+        assert len(_profile_calls(stub_llm)) == 1
+
+        # Simulate a session last extracted under the failed v1 prompt.
+        hy.conn.execute(
+            "UPDATE sessions SET profile_prompt_version = 'profile.v1' "
+            "WHERE id = ?",
+            (sid,),
+        )
+        # Precondition: the DIGEST guard alone would skip this session.
+        digested = hy.conn.execute(
+            "SELECT digested_prompt_version FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        assert digested["digested_prompt_version"] == hy.config.prompt_version
+
+        hy.dream()
+        assert len(_profile_calls(stub_llm)) == 2, (
+            "an outdated profile stamp must re-run extraction even though "
+            "the session digest is current"
+        )
+        assert _stamp(hy.conn, sid) == PROFILE_PROMPT_VERSION  # re-stamped
+        assert len(_rows(hy.conn)) == 1  # re-assertion did not duplicate
     finally:
         hy.close()
 
@@ -212,7 +302,7 @@ def test_db_check_constraint_rejects_unknown_slot(conn):
 
 
 def test_unknown_slot_from_llm_never_persists(cfg, stub_llm):
-    hy = HyMem(cfg, llm=stub_llm)
+    hy = HyMem(_on(cfg), llm=stub_llm)
     try:
         mid = hy.log_message(
             "s_bad", "user", "My favorite color is blue and I am a teacher.",
@@ -361,7 +451,7 @@ def test_profile_change_regenerates_digest(cfg, conn):
 
 
 def test_augment_user_profile_tier_is_additive(cfg, stub_llm):
-    hy = HyMem(cfg, llm=stub_llm)
+    hy = HyMem(_on(cfg), llm=stub_llm)
     try:
         sid = "s_aug"
         mid = hy.log_message(
@@ -394,7 +484,8 @@ def test_augment_user_profile_tier_is_additive(cfg, stub_llm):
 
 
 def test_augment_tier_respects_flag_and_cap(cfg, stub_llm):
-    hy = HyMem(replace(cfg, profile_context_cap=1), llm=stub_llm)
+    hy = HyMem(replace(cfg, profile_extraction_enabled=True, profile_context_cap=1),
+               llm=stub_llm)
     try:
         mid = hy.log_message("s_cap", "user", "Ik ben Atta en ik werk als arts.")
         _persist(hy.conn, [
@@ -440,7 +531,7 @@ def test_profile_returns_active_typed_entries(cfg, stub_llm):
 
 
 def test_health_condition_value_is_redacted_in_all_consumers(cfg, stub_llm):
-    hy = HyMem(cfg, llm=stub_llm)
+    hy = HyMem(_on(cfg), llm=stub_llm)
     try:
         mid = hy.log_message("s_red", "user", "I track my asthma in an app.")
         _persist(hy.conn, [_item(
@@ -491,7 +582,7 @@ def test_render_profile_fact_shapes():
     assert render_profile_fact(keyed) == "user relationship(anna) sister"
 
 
-# ── migration v18 ────────────────────────────────────────────────────────────
+# ── migrations v18 / v19 ─────────────────────────────────────────────────────
 
 
 def _has_table(conn, name) -> bool:
@@ -503,14 +594,17 @@ def _has_table(conn, name) -> bool:
     )
 
 
-def test_fresh_store_lands_at_v18_with_user_profile(tmp_path: Path):
+def test_fresh_store_lands_at_v19_with_user_profile(tmp_path: Path):
     conn = core_db.connect(tmp_path / "fresh.sqlite")
     core_db.initialize(conn)
-    assert core_db.schema_version(conn) == 18 == core_db.EXPECTED_SCHEMA_VERSION
+    assert core_db.schema_version(conn) == 19 == core_db.EXPECTED_SCHEMA_VERSION
     assert _has_table(conn, "user_profile")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(user_profile)")}
     assert {"slot", "slot_key", "value", "evidence_message_id", "confidence",
             "valid_at", "invalid_at", "created_at"} <= cols
+    # v19: the per-session profile stamp exists on a fresh store too.
+    session_cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    assert "profile_prompt_version" in session_cols
     conn.close()
 
 
@@ -550,4 +644,56 @@ def test_migration_018_applies_on_existing_v17_store(tmp_path: Path):
     )
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("INSERT INTO user_profile(slot, value) VALUES ('made_up', 'x')")
+    conn.close()
+
+
+def test_migration_019_purges_v1_rows_and_adds_session_stamp(tmp_path: Path):
+    """A v18 store carrying profile.v1 rows is walked to v19: the failed-gate
+    rows are PURGED (regenerable by re-dreaming; v18 never shipped), the
+    sessions.profile_prompt_version column appears, and unrelated data
+    survives."""
+    conn = core_db.connect(tmp_path / "v18.sqlite")
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta VALUES ('schema_version', '18');
+        CREATE TABLE sessions(id TEXT PRIMARY KEY, summary TEXT,
+            digested_prompt_version TEXT);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE user_profile (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slot TEXT NOT NULL,
+            slot_key TEXT,
+            value TEXT NOT NULL,
+            evidence_message_id INTEGER,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            valid_at TIMESTAMP,
+            invalid_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO sessions(id) VALUES ('s');
+        INSERT INTO messages(session_id, role, content)
+            VALUES ('s', 'user', 'Repos: ClaudetteMedSer/HyMem');
+        INSERT INTO user_profile(slot, value, evidence_message_id) VALUES
+            ('employer', 'ClaudetteMedSer', 1),
+            ('possession', 'HyMem repository', 1);
+        """
+    )
+
+    core_db._run_migrations(conn)  # from v18: only migration 019 applies
+
+    assert core_db.schema_version(conn) == 19 == core_db.EXPECTED_SCHEMA_VERSION
+    # The ~8%-precision profile.v1 rows are gone…
+    assert conn.execute("SELECT COUNT(*) AS c FROM user_profile").fetchone()["c"] == 0
+    # …the per-session stamp column exists (and starts NULL)…
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    assert "profile_prompt_version" in cols
+    row = conn.execute(
+        "SELECT profile_prompt_version FROM sessions WHERE id = 's'"
+    ).fetchone()
+    assert row["profile_prompt_version"] is None
+    # …and unrelated data is untouched.
+    assert conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"] == 1
     conn.close()

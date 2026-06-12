@@ -131,6 +131,19 @@ class HyMemConfig:
     """Jaccard(key_entities) threshold above which two episodes link (the entity
     arm of the OR). Catches the named-thing continuity embeddings miss."""
 
+    aggregation_max_cluster_size: int = 15
+    """Hard cap on connected-component size before fusion — the Stage-3a
+    chaining guard (0 = uncapped). The OR-link rule chains transitively
+    (A~B, B~C puts A with C even when they share nothing), and on the prod
+    store the probe (benchmarks/cluster_size_probe.py, 2026-06-12) found ONE
+    component of 348 episodes spanning 61 sessions — fusing that yields a mush
+    summary. Components larger than the cap are split deterministically into
+    recency-ordered windows of at most this many episodes (full windows aligned
+    to the newest end; an undersized oldest window is dropped by the normal
+    min-members/min-sessions policy). 0 translates to None (uncapped) at the
+    `cluster_episodes` call sites — matching the `aggregation_digest_anchor_facts`
+    "0 disables" house style."""
+
     aggregation_min_sessions: int = 2
     """Only fuse clusters spanning at least this many DISTINCT sessions. The
     whole point is *cross-session* synthesis; a single-session cluster adds
@@ -190,21 +203,26 @@ class HyMemConfig:
     merely adds a summary tier (never displaces other tiers), a false negative
     is identical to the layer being off."""
 
-    profile_extraction_enabled: bool = True
+    profile_extraction_enabled: bool = False
     """Master switch for the typed user-profile tier (schema v18, Stage 1 /
-    P4). When True, dreaming runs one extra LLM call per dreamed session over
-    the session's USER turns only, extracting facts into the CLOSED slot
-    vocabulary (role, name, employer, location, language, relationship(person),
-    possession, age_birthday, health_condition, recurring_activity — enforced
-    by validation AND a table CHECK, so the LLM can never invent a slot). Rows
-    are bi-temporal (valid_at/invalid_at, the v15 knowledge-graph semantics):
-    single-valued slots supersede on conflict, relationship supersedes per
-    person, the rest accumulate. Consumed ADDITIVELY by three readers — the
-    root digest's VERIFIED FACTS anchor (profile rows above graph edges),
-    augment()'s `ctx.user_profile` tier (never displaces other tiers), and
-    `HyMem.profile()`. The call shares the per-session digest skip-guard, so
-    re-dreaming unchanged sessions still costs zero tail calls. False → no
-    extraction call and an always-empty augment tier."""
+    P4). DEFAULT OFF: the profile.v1 prompt FAILED the on-box hand-scored
+    precision gate (~8% — see benchmarks/raptor_digest_plan.md Stage 1), so
+    extraction stays gated off until the profile.v2 prompt re-passes the ≥0.9
+    precision gate on the box. When True, dreaming runs one extra LLM call per
+    dreamed session over the session's USER turns only, extracting facts into
+    the CLOSED slot vocabulary (role, name, employer, location, language,
+    relationship(person), possession, age_birthday, health_condition,
+    recurring_activity — enforced by validation AND a table CHECK, so the LLM
+    can never invent a slot). Rows are bi-temporal (valid_at/invalid_at, the
+    v15 knowledge-graph semantics): single-valued slots supersede on conflict,
+    relationship supersedes per person, the rest accumulate. Consumed
+    ADDITIVELY by three readers — the root digest's VERIFIED FACTS anchor
+    (profile rows above graph edges), augment()'s `ctx.user_profile` tier
+    (never displaces other tiers), and `HyMem.profile()`. The call has its own
+    per-session skip-guard (sessions.profile_prompt_version, schema v19), so
+    re-dreaming unchanged sessions still costs zero tail calls while a
+    PROFILE_PROMPT_VERSION bump alone re-extracts. False → no extraction call
+    and an always-empty augment tier."""
 
     profile_max_items_per_session: int = 16
     """Cap on validated profile items accepted from one per-session extraction
