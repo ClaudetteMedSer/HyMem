@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
 from hymem.core.vectors import decode_vector
+from hymem.dreaming.user_profile import ProfileEntry, load_profile
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.entities import GraphCount, count_relations, match_known_entities
@@ -224,6 +225,16 @@ class AugmentedContext:
     procedures: list[ProcedureHit] = field(default_factory=list)
     matched_entities: list[str] = field(default_factory=list)
     recent_turns: list[Message] = field(default_factory=list)
+    user_profile: list[ProfileEntry] = field(default_factory=list)
+    """ACTIVE typed user-profile rows (schema v18) — the small, always-relevant
+    identity tier (name, role, employer, location, relationship(person), ...)
+    extracted from USER turns under a closed slot vocabulary. ADDITIVE like the
+    aggregation tier: it is loaded by a standalone SELECT and never consumes a
+    slot from message/chunk/episode/graph retrieval, so a populated profile
+    cannot crowd gold turns out of any other tier. Empty until a dream has
+    extracted profile facts, when `cfg.profile_extraction_enabled` is False, or
+    on a pre-v18 store. Capped at `cfg.profile_context_cap`, identity slots
+    first; values are already redaction-scrubbed at persist time."""
     temporal_events: list[TemporalEvent] = field(default_factory=list)
     """Dated events in chronological (date-ascending) order, populated only when
     `augment()` runs with `ability="TR"`. It merges explicit dates extracted from
@@ -308,6 +319,13 @@ def augment(
     # `conn` here is the READ connection; recent_messages is a plain SELECT.
     if session_id is not None and cfg.working_memory_turns > 0:
         ctx.recent_turns = recent_messages(conn, session_id, cfg.working_memory_turns)
+
+    # P4 typed user-profile tier: always-relevant identity facts, loaded by its
+    # own SELECT so it is purely ADDITIVE — no other tier's top-k budget is
+    # touched (mirrors how the TR/aggregation tiers layer on). load_profile
+    # degrades to [] on a pre-v18 store.
+    if cfg.profile_extraction_enabled:
+        ctx.user_profile = load_profile(conn, cap=cfg.profile_context_cap)
 
     # Pull a wider candidate pool when reranking is likely so the reranker
     # has room to reorder beyond the top-fts_top_k window; the final result

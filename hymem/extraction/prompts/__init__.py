@@ -433,6 +433,52 @@ SESSION_DIGEST_USER_TEMPLATE = """Conversation session:
 Return the JSON object now."""
 
 
+# --- Typed user-profile extraction (Stage 1 / P4, schema v18) ---------------
+# Runs over USER turns only, once per dreamed session, alongside the batched
+# session digest. The slot vocabulary is CLOSED and re-enforced downstream
+# twice (validate_profile_items + the user_profile table CHECK), so a slot the
+# LLM invents can never persist. Pinned by PROFILE_PROMPT_VERSION in
+# hymem/dreaming/user_profile.py — bump it when this wording changes
+# materially. The user-template closer is deliberately unique ("Return the
+# profile JSON array now.") so test stubs keyed on the digest/triple closers
+# never route here; "typed user-profile facts" is the routing substring.
+
+USER_PROFILE_SYSTEM = """You extract typed user-profile facts from the USER's own turns in one conversation session.
+
+Each user turn is tagged like `[msg 42]` — the message id appears in square brackets before its text. Only the user's turns are in the input; extract only what the USER states about THEMSELVES (or their own relationships, possessions, health, and activities).
+
+Output a strict JSON array. Each item has exactly:
+- slot (string): MUST be one of:
+    role: the user's job or professional role ("bedrijfsarts", "backend engineer")
+    name: the user's own name
+    employer: the organization the user works for
+    location: where the user lives or is based
+    language: a language the user speaks or writes
+    relationship: another person in the user's life — requires slot_key
+    possession: a notable thing the user owns ("a 2019 camper van")
+    age_birthday: the user's age or birthday
+    health_condition: a health condition, allergy, or treatment the user mentions about themselves
+    recurring_activity: a habit or recurring activity ("runs every sunday")
+- slot_key (string): ONLY for relationship — the other person's name ("anna"). Omit for every other slot.
+- value (string): the fact itself, short and concrete ("bedrijfsarts", "Amsterdam", "sister").
+- evidence_message_id (integer): the exact `[msg N]` id of the user turn stating the fact. MUST be an id present in the input.
+- confidence (number between 0.0 and 1.0): how explicitly the user stated the fact (1.0 = stated outright; lower when hedged or implied).
+
+Rules:
+- The slot list above is CLOSED. Never output any other slot name; skip facts that fit no slot.
+- Only durable facts the user states about themselves. Skip questions, hypotheticals, one-off events, and facts about other people (except via relationship).
+- Turns may be in languages other than English (e.g. Dutch); extract regardless and keep the value in the original language.
+- Skip facts you are not confident about. An empty array [] is a valid answer.
+"""
+
+USER_PROFILE_USER_TEMPLATE = """User turns from one session:
+\"\"\"
+{text}
+\"\"\"
+
+Return the profile JSON array now."""
+
+
 RERANK_SYSTEM = """You evaluate the relevance of conversation excerpts to a user query.
 
 For each excerpt, rate its relevance on a scale of 1-5:

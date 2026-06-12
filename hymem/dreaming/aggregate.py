@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
 from hymem.core.vectors import decode_vector, encode_vector
+from hymem.dreaming.user_profile import load_profile, render_profile_fact
 from hymem.extraction.embeddings import EmbeddingClient, normalize_text
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import (
@@ -311,15 +312,29 @@ def _items_text(items: list[dict], cfg: HyMemConfig) -> str:
 
 
 def _anchor_facts(conn: sqlite3.Connection, cap: int) -> list[str]:
-    """Top ACTIVE, non-derived, non-superseded knowledge-graph edges rendered
-    as one-line facts — the VERIFIED FACTS block grounding the root digest
-    fusion. Graph edges come straight from conversation evidence (unlike the
+    """ACTIVE typed user-profile rows (schema v18) followed by top ACTIVE,
+    non-derived, non-superseded knowledge-graph edges, rendered as one-line
+    facts — the VERIFIED FACTS block grounding the root digest fusion.
+
+    Profile rows lead the block: they hold exactly the durable identity facts
+    (name, role, employer, location, ...) the tech-domain graph vocabulary can
+    never mint — the Stage-0 finding that motivated P4 — so they outrank graph
+    edges, and `cap` bounds the COMBINED list (graph edges fill the remainder).
+    Both sources come straight from conversation evidence (unlike the
     machine-generated summaries the root fuses), so they give the model true
     identity/preference signals and the authority to drop a summary claim that
     conflicts — the countermeasure to hallucinations crystallized in cached
-    rollups. Strongest evidence first."""
+    rollups. Edges strongest-evidence first. Because profile rows join the
+    returned list, they flow into the facts-block hash in the root's cache id,
+    so a profile change regenerates the digest just like a graph change."""
     if cap <= 0:
         return []
+    profile = [
+        render_profile_fact(entry) for entry in load_profile(conn, cap=cap)
+    ]
+    remaining = cap - len(profile)
+    if remaining <= 0:
+        return profile
     rows = conn.execute(
         """
         SELECT subject_canonical AS s, predicate AS p, object_canonical AS o
@@ -329,9 +344,9 @@ def _anchor_facts(conn: sqlite3.Connection, cap: int) -> list[str]:
         ORDER BY pos_evidence - neg_evidence DESC, last_seen DESC, id
         LIMIT ?
         """,
-        (cap,),
+        (remaining,),
     ).fetchall()
-    return [f"{r['s']} {r['p']} {r['o']}" for r in rows]
+    return profile + [f"{r['s']} {r['p']} {r['o']}" for r in rows]
 
 
 def _persist_node_embeddings(

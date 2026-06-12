@@ -389,6 +389,36 @@ CREATE TABLE IF NOT EXISTS aggregation_node_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Typed user-profile slots (schema v18, Stage 1 / P4). Durable personal facts
+-- the tech-domain knowledge-graph vocabulary can never hold (role, name,
+-- employer, location, ...), extracted from USER turns only during dreaming
+-- under the CLOSED slot vocabulary the CHECK enforces — the LLM cannot invent
+-- a slot. slot_key parameterizes a slot ('relationship' is keyed by the other
+-- person); NULL for unkeyed slots. Bi-temporal like knowledge_graph (v15
+-- semantics): valid_at = world date the fact became true (evidence message
+-- created_at), invalid_at = world date a conflicting value on the same
+-- (slot, slot_key) superseded it (NULL = still valid). Consumed additively by
+-- the digest's VERIFIED FACTS anchor, augment()'s ctx.user_profile tier, and
+-- HyMem.profile(). The index is safe here (unlike migration-added columns)
+-- because the table is created whole in this same script.
+CREATE TABLE IF NOT EXISTS user_profile (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot TEXT NOT NULL CHECK (slot IN (
+        'role','name','employer','location','language','relationship',
+        'possession','age_birthday','health_condition','recurring_activity'
+    )),
+    slot_key TEXT,
+    value TEXT NOT NULL,
+    evidence_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    confidence REAL NOT NULL DEFAULT 1.0
+        CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_user_profile_active
+    ON user_profile(slot, slot_key, invalid_at);
+
 -- Procedural memory: step-by-step workflows extracted from conversations.
 CREATE TABLE IF NOT EXISTS procedures (
     id TEXT PRIMARY KEY,

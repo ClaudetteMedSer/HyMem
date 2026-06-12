@@ -190,6 +190,35 @@ class HyMemConfig:
     merely adds a summary tier (never displaces other tiers), a false negative
     is identical to the layer being off."""
 
+    profile_extraction_enabled: bool = True
+    """Master switch for the typed user-profile tier (schema v18, Stage 1 /
+    P4). When True, dreaming runs one extra LLM call per dreamed session over
+    the session's USER turns only, extracting facts into the CLOSED slot
+    vocabulary (role, name, employer, location, language, relationship(person),
+    possession, age_birthday, health_condition, recurring_activity — enforced
+    by validation AND a table CHECK, so the LLM can never invent a slot). Rows
+    are bi-temporal (valid_at/invalid_at, the v15 knowledge-graph semantics):
+    single-valued slots supersede on conflict, relationship supersedes per
+    person, the rest accumulate. Consumed ADDITIVELY by three readers — the
+    root digest's VERIFIED FACTS anchor (profile rows above graph edges),
+    augment()'s `ctx.user_profile` tier (never displaces other tiers), and
+    `HyMem.profile()`. The call shares the per-session digest skip-guard, so
+    re-dreaming unchanged sessions still costs zero tail calls. False → no
+    extraction call and an always-empty augment tier."""
+
+    profile_max_items_per_session: int = 16
+    """Cap on validated profile items accepted from one per-session extraction
+    call. A runaway response (the LLM tagging every sentence as a fact) is
+    truncated here before any row is written; 16 comfortably covers a genuine
+    identity-dense session."""
+
+    profile_context_cap: int = 24
+    """Max ACTIVE profile rows augment() returns in `ctx.user_profile`. The
+    tier is meant to stay small and always-relevant; multi-valued slots
+    (possession, recurring_activity, ...) accumulate over a long history, so
+    the cap keeps the tier from bloating host prompts. Identity slots sort
+    first, so they always survive the cut. `HyMem.profile()` is uncapped."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 

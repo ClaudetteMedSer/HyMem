@@ -21,6 +21,7 @@ from hymem.dreaming import bitemporal
 from hymem.dreaming import canonicalize as canon
 from hymem.dreaming.aggregate import Digest, load_digest
 from hymem.dreaming.runner import DreamReport, run_dreaming
+from hymem.dreaming.user_profile import ProfileEntry, load_profile
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
@@ -321,6 +322,19 @@ class HyMem:
         episode. Read-only.
         """
         return load_digest(self.read_conn)
+
+    def profile(self) -> list[ProfileEntry]:
+        """ACTIVE typed user-profile rows (schema v18) — the durable personal
+        facts (name, role, employer, location, language, relationship(person),
+        possession, age_birthday, health_condition, recurring_activity)
+        extracted from USER turns during dreaming under a closed slot
+        vocabulary. Identity slots first; superseded rows (invalid_at set) are
+        excluded, so this is the CURRENT profile. Values were
+        redaction-scrubbed at persist time. Empty before the first dream (or
+        with `profile_extraction_enabled=False`, nothing is ever extracted).
+        Read-only.
+        """
+        return load_profile(self.read_conn)
 
     def timeline(self, entity: str) -> list["TimelineEntry"]:
         """First-seen active edge per predicate for `entity`, oldest first.

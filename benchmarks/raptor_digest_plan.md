@@ -39,13 +39,28 @@ score, nothing reads oracle labels.*
 
 ## Stage 0 — Verify root.v4 on the box (run FIRST tomorrow, ~15 min)
 
+**RESULT (box run 2026-06-12): v4 verified, gate passed in spirit — proceed to Stage 1.**
+- Acme demoted from stated-as-fact (root.v3) to "noted but not verified" (root.v4) — the
+  evidence-bound clause works at all levels. NOT omitted: the graph has no contradictory
+  identity edge for it to lose to. "Suspect" ≠ "omit" → clean omission needs a true
+  identity edge (e.g. `(atta_van_westreenen, works_as, bedrijfsarts)`) so "senior
+  engineer" contradicts. That is exactly the Stage 1 / P4 motivation — recorded.
+- Anchor grounding confirmed: digest now names real graph entities
+  (claudette_med_ser, agent37_containers, composio_git_hub) vs v3's generic names.
+- Breadth retained and improved: 10+ threads (v3 had 7), more specific detail.
+- Gate reading: the model is NOT inventing at episode level — it correctly applies
+  "identity claim with no verified fact → suspect". No further prompt-tuning.
+- Still outstanding (non-blocking): coverage-attribution query and the second-dream
+  `reused=N` / byte-identical check.
+
 The salt bumps mean the next dream regenerates every fusion (~13 calls on the 91-session
 store — trivial). Checklist:
 
-- [ ] Re-dream with the layer enabled; confirm `aggregate.built nodes=N reused=0` in the
+- [x] Re-dream with the layer enabled; confirm `aggregate.built nodes=N reused=0` in the
       log (full regeneration — proves the poisoned rollup is evicted).
-- [ ] `hy.digest()`: "Acme Corp" / invented identity GONE; breadth retained (7+ threads).
-- [ ] Inspect what the anchor actually injected:
+- [x] `hy.digest()`: "Acme Corp" / invented identity GONE; breadth retained (7+ threads).
+      *(Partial: demoted to "noted but not verified", not gone — see RESULT above.)*
+- [x] Inspect what the anchor actually injected:
       `SELECT subject_canonical, predicate, object_canonical FROM knowledge_graph
        WHERE status='active' AND derived=0 AND invalid_at IS NULL
        ORDER BY pos_evidence - neg_evidence DESC LIMIT 20;`
@@ -62,6 +77,23 @@ the tree); jump to Stage 1/2 diagnostics instead.
 ---
 
 ## Stage 1 — P4: typed user-profile tier (feeds the anchor true identity)
+
+**STATUS (2026-06-12): BUILT, on-box gate pending.** Schema v18 (`user_profile`,
+closed-vocab CHECK), `profile.v1` extraction over USER turns (piggybacks the
+per-session digest skip-guard — zero tail calls on unchanged re-dreams), bi-temporal
+supersession (single-valued slots + relationship-per-person supersede; rest
+accumulate; re-assertion reinforces, never duplicates), redaction at the persist
+chokepoint. All three consumers wired: `_anchor_facts()` (profile rows above graph
+edges, combined cap, feeds the root cache hash so profile changes regenerate the
+digest), additive `ctx.user_profile` in `augment()`, `HyMem.profile()`. Config:
+`profile_extraction_enabled` (True) / `profile_max_items_per_session` (16) /
+`profile_context_cap` (24). 23 tests green; full suite 584 passed.
+**The front-run precision gate still applies, now as a POST-build enable gate on the
+box:** run `python benchmarks/profile_prompt_dump.py <prod store> --sessions 20`,
+paste the rendered prompts into the box LLM, hand-score slot precision; ≥0.9 →
+re-dream and check `hy.digest()` for Acme's clean omission (the anchor now has a
+true identity edge to prefer); <0.9 → set `profile_extraction_enabled=False` and
+revise `profile.v1`/validation before any prod dream.
 
 **Problem:** the anchor can only inject what the graph knows, and the 18-predicate
 vocabulary is tech-domain. "User is a bedrijfsarts in Amsterdam named Atta" never becomes
@@ -102,6 +134,11 @@ aggregation clusters can ever cover them. Same root cause as the banked LME find
 (42% of MS misses had no gold episode). Fixing it widens the digest AND is the one
 RAPTOR-adjacent lever that would also move the benchmark.
 
+**Probe READY (2026-06-12):** `benchmarks/episode_coverage_probe.py` — read-only
+(sqlite mode=ro), buckets every zero-episode session into never_dreamed /
+dreamed_zero_short / dreamed_zero_long and prints the verdict guide. Run on the box:
+`python benchmarks/episode_coverage_probe.py <prod store> --json coverage_audit.json`.
+
 **Probe first (free, LLM-less, ~30 min):** on the prod store, characterize the 26
 sessions: length distribution (are they short/single-exchange?), content type (tool
 noise? pure Q&A?), `sessions.digested_version` (were they dreamed at all, or dreamed and
@@ -124,7 +161,13 @@ yielded zero?). Three different causes → three different fixes:
 
 The layer is still `aggregation_nodes_enabled = False` in prod. Before flipping:
 
-**3a. Chaining guard (quality).** Connected-components over OR-links chains
+**3a. Chaining guard (quality).** *Probe READY (2026-06-12):*
+`benchmarks/cluster_size_probe.py` — read-only, reuses the production
+clusterer/loader verbatim and the production thresholds (0.55/0.50), histogram +
+largest-cluster membership + verdict at `--cap 15`. Run on the box:
+`python benchmarks/cluster_size_probe.py <prod store> --json cluster_sizes.json`.
+
+Connected-components over OR-links chains
 transitively → one mega-cluster yields mush summaries. *Probe first:* cluster-size
 distribution on the prod store (pure-Python, no LLM — reuse
 `benchmarks/raptor_cluster_probe.py` loaders). If max cluster ≪ 15 episodes, skip the

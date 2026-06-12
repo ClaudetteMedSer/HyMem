@@ -44,6 +44,7 @@ from hymem.dreaming.retention import (
     prune_retracted_edges,
 )
 from hymem.dreaming.summary import persist_session_summary
+from hymem.dreaming.user_profile import extract_user_profile, persist_user_profile
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 
@@ -64,6 +65,7 @@ class DreamReport:
     episodes_embedded: int = 0
     episodes_embedded_from_cache: int = 0
     aggregation_nodes_built: int = 0
+    profile_items_extracted: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
 
@@ -380,6 +382,40 @@ def run_dreaming(
                             conn.execute(
                                 "UPDATE sessions SET digested_prompt_version = ? WHERE id = ?",
                                 (cfg.prompt_version, session_id),
+                            )
+
+            # P4 typed user-profile extraction: one LLM call over the session's
+            # USER turns only (closed slot vocabulary, schema v18), piggybacking
+            # on the per-session digest batching above and sharing its
+            # skip-guard, so a steady-state re-dream of unchanged sessions still
+            # makes zero tail calls. Persisting is supersession-aware and
+            # re-assert-idempotent, so re-running over the same turns is safe.
+            # The LLM call runs OUTSIDE the write transaction, like the digest.
+            if cfg.profile_extraction_enabled and not (
+                already_digested and not had_new_chunk_work
+            ):
+                try:
+                    profile = extract_user_profile(
+                        conn, session_id, llm,
+                        max_chars=cfg.dream_digest_max_chars,
+                        max_items=cfg.profile_max_items_per_session,
+                    )
+                except Exception:
+                    log.exception(
+                        "profile.extraction_failure session_id=%s", session_id
+                    )
+                else:
+                    if profile is not None and profile.items:
+                        with core_db.transaction(conn):
+                            persisted = persist_user_profile(
+                                conn, profile,
+                                redact_values=cfg.redact_secrets,
+                            )
+                        report.profile_items_extracted += persisted
+                        if persisted:
+                            log.debug(
+                                "profile session_id=%s rows=%d",
+                                session_id, persisted,
                             )
 
             if chunks_remaining <= 0:
