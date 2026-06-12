@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -75,10 +75,48 @@ Do not make up information."""
 
 ANSWERING_TR_PROMPT = """You are an AI assistant answering questions based on retrieved memories from past conversations.
 The question requires reasoning about when events happened — dates, timelines, or event ordering.
+Memories tagged [MEM YYYY-MM-DD] are listed in chronological order, earliest first.
 Carefully scan ALL the context for relevant dates, times, and event mentions.
 Calculate the answer from the evidence provided. For dated events, compute durations precisely.
 If you cannot determine the answer from the context, say "I don't have enough information."
 Do not make up dates or events."""
+
+# CR rubrics grade on SURFACING the contradiction, the opposite of the default
+# prompt's recency clause (which coaches silently preferring the newest value —
+# right for KU, wrong here). CR therefore gets its own prompt, additively; the
+# default prompt and its clause are unchanged for KU/IE/ABS.
+ANSWERING_CR_PROMPT = """You are an AI assistant answering questions based on retrieved memories.
+The user's statements in the context may CONTRADICT each other. Scan the context for conflicting values or claims about the question topic. When you find a conflict, do NOT silently pick one side: state both versions explicitly (with their [MEM] dates when available), point out that they contradict each other, and then say which one you consider current and why — usually the most recent value-bearing statement.
+If there is no contradiction, answer normally using ONLY the context.
+If the context contains nothing relevant, say "I don't have enough information to answer this question."
+Do not make up information."""
+
+ANSWERING_EO_PROMPT = """You are an AI assistant answering questions about the order in which events happened.
+Memories tagged [MEM YYYY-MM-DD] are listed in chronological order, earliest first; use those dates and that ordering as evidence. Watch for events RECOUNTED later than they happened — order events by when they occurred, not by when they were mentioned.
+Identify every event the question asks about, then answer with the ordering — as a numbered list when a sequence is requested.
+Base the ordering ONLY on the provided context. If some relevant event is missing from the context, say so, but still order the events that ARE present rather than refusing to answer."""
+
+ANSWERING_IF_PROMPT = """You are an AI assistant answering questions based on retrieved memories.
+The user has previously given standing instructions about HOW answers must be presented (for example: use code blocks with syntax highlighting, include version numbers, include numeric codes, follow a specific structure). Scan the context for any such instructions and FOLLOW them exactly in your answer.
+Reproduce technical specifics — commands, codes, versions, names — verbatim from the context. Completeness and required formatting matter more than brevity.
+If the context doesn't contain the answer, say "I don't have enough information to answer this question."
+Do not make up information."""
+
+ANSWERING_SUM_PROMPT = """You are an AI assistant summarizing past conversations from retrieved memories.
+Write a comprehensive, specific summary of everything in the context that is relevant to the question: cover every distinct topic, decision, and outcome, and include concrete details — names, numbers, dates, versions — rather than generalities.
+Summarize whatever relevant material is present even if it looks incomplete; only say "I don't have enough information to answer this question" if the context contains nothing relevant at all.
+Do not add information that is not in the context."""
+
+# Abilities not listed here fall through to ANSWERING_SYSTEM_PROMPT.
+ANSWERING_PROMPTS = {
+    "PF": ANSWERING_PREFERENCE_PROMPT,
+    "MR": ANSWERING_MR_PROMPT,
+    "TR": ANSWERING_TR_PROMPT,
+    "CR": ANSWERING_CR_PROMPT,
+    "EO": ANSWERING_EO_PROMPT,
+    "IF": ANSWERING_IF_PROMPT,
+    "SUM": ANSWERING_SUM_PROMPT,
+}
 
 JUDGE_SYSTEM_PROMPT = """You are an impartial judge evaluating AI responses against rubrics.
 
@@ -179,16 +217,39 @@ def load_beam_conversations(scales: list[str], max_conv: int = None) -> dict:
     return data
 
 
+def _parse_time_anchor(raw: str | None) -> str | None:
+    """BEAM stamps each session block's opening message with a time anchor
+    like 'March-15-2024' — the in-world date of that session. Returns an
+    ISO date, or None when absent/unparseable (→ ingestion-time fallback)."""
+    if not raw:
+        return None
+    for fmt in ("%B-%d-%Y", "%b-%d-%Y", "%B %d, %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw.strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
     all_messages = []
     chat = sample.get("chat", [])
     for block in chat:
         if isinstance(block, list):
+            # One anchor per session block (carried by its first message);
+            # it dates every turn of that session.
+            block_date = None
+            for msg in block:
+                if isinstance(msg, dict) and msg.get("time_anchor"):
+                    block_date = _parse_time_anchor(msg["time_anchor"])
+                    if block_date:
+                        break
             for msg in block:
                 if isinstance(msg, dict):
                     all_messages.append({
                         "role": msg.get("role", "unknown"),
                         "content": msg.get("content", ""),
+                        "date": block_date,
                     })
 
     pq_raw = sample.get("probing_questions", "{}")
@@ -255,14 +316,23 @@ class HyMemAdapter:
 
     def ingest(self, session_id: str, messages: list[dict]):
         """Ingest messages directly into HyMem."""
-        # Log all messages in one batch
+        # Log all messages in one batch, dated with the BEAM session time
+        # anchor as the event time — this is what [MEM YYYY-MM-DD] tags and
+        # the EO/TR chronological ordering run on. The anchor is date-only,
+        # so a per-turn second offset keeps within-session turn order; turns
+        # without an anchor fall back to ingestion time.
         log_entries = []
-        for m in messages:
+        for i, m in enumerate(messages):
             role = m.get("role", "user")
             content = m.get("content", "")
             if not content.strip():
                 continue
-            log_entries.append((role, content))
+            date = m.get("date")
+            created_at = None
+            if date:
+                base = datetime.fromisoformat(f"{date}T12:00:00")
+                created_at = (base + timedelta(seconds=i)).isoformat()
+            log_entries.append((role, content, created_at))
 
         if log_entries:
             self.hy.log_messages(session_id, log_entries)
@@ -431,8 +501,21 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
                       f"restatements deduped). Verify this count against the "
                       f"evidence below and return the final number.]\n")
 
-    # MR and TR: need more context — cross-session data is fractured
-    context_limit = MAX_CONTEXT_CHARS * 2 if ability in ("MR", "TR") else MAX_CONTEXT_CHARS
+    # MR/TR: cross-session data is fractured; EO: full timeline must fit;
+    # SUM: coverage-graded — all four get the doubled context budget.
+    context_limit = MAX_CONTEXT_CHARS * 2 if ability in ("MR", "TR", "EO", "SUM") else MAX_CONTEXT_CHARS
+
+    # EO/TR: dated turns read as a timeline — chronological, earliest first.
+    # search() already picked the survivors by relevance; display order is the
+    # only ordering signal the answer model gets, and it cannot sort shuffled
+    # snippets itself (every EO question failed that way). Undated tiers
+    # (facts/episodes/fts) keep their relevance order after the timeline.
+    if ability in ("EO", "TR"):
+        dated = sorted(
+            (m for m in memories if m.get("created_at")),
+            key=lambda m: m["created_at"],
+        )
+        memories = dated + [m for m in memories if not m.get("created_at")]
 
     for m in memories:
         content = m["content"]
@@ -452,14 +535,7 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     context = "\n".join(parts) if parts else "No relevant memories found."
 
     # Ability-aware answering prompts
-    if ability == "PF":
-        system_prompt = ANSWERING_PREFERENCE_PROMPT
-    elif ability == "MR":
-        system_prompt = ANSWERING_MR_PROMPT
-    elif ability == "TR":
-        system_prompt = ANSWERING_TR_PROMPT
-    else:
-        system_prompt = ANSWERING_SYSTEM_PROMPT
+    system_prompt = ANSWERING_PROMPTS.get(ability, ANSWERING_SYSTEM_PROMPT)
 
     messages = [
         {"role": "system", "content": system_prompt},
