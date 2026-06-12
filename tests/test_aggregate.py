@@ -17,9 +17,12 @@ import pytest
 
 from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.core import db as core_db
+from hymem.core.vectors import encode_vector
 from hymem.dreaming.aggregate import (
     build_aggregation_nodes,
     cluster_episodes,
+    generate_candidate_pairs,
+    load_clusterable_episodes,
     load_digest,
     _CLUSTER_SALT,
     _node_id,
@@ -246,6 +249,171 @@ def test_build_uncapped_when_config_cap_is_zero(conn, cfg):
     row = conn.execute(
         "SELECT n_members FROM aggregation_nodes WHERE level = 0").fetchone()
     assert row["n_members"] == 7                     # the raw mega-component
+
+
+# ── Stage-3b candidate blocking: O(n²) all-pairs → entity index + vec KNN ────
+# Prod timing (2026-06-12): 395 episodes → 77,815 pair tests → 4.04s per dream,
+# past the 2s gate. Blocking only generates the candidate pair list; the pure
+# clusterer's contract (and the probe's exact all-pairs default) is preserved.
+
+def _seed_embedded_episode(conn, embed, eid, sid, summary, entities,
+                           start=1, end=2):
+    """Episode + episode_embeddings row (vector = stub embed of `summary`, so
+    identical summaries cosine-link at 1.0). Callers run
+    `core_db.ensure_vec_table(conn, embed.dim)` AFTER seeding — its cold-start
+    backfill mirrors episode_embeddings into vec_episodes by rowid, the same
+    path a real store takes."""
+    _seed_episode(conn, eid, sid, eid, summary, entities, start, end)
+    vec = embed.embed([summary])[0]
+    conn.execute(
+        "INSERT INTO episode_embeddings(episode_id, vector_json, model, dim, text_hash) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (eid, encode_vector(vec), embed.model, embed.dim, f"hash:{eid}"),
+    )
+
+
+def test_candidate_pairs_none_default_is_exact_all_pairs():
+    # (a) The probe contract: default None — and an explicit full pair set —
+    # both reproduce today's all-pairs labels exactly.
+    eps = _entity_chain(7)
+    base = cluster_episodes(eps, 0.55, 0.50)
+    assert cluster_episodes(eps, 0.55, 0.50, candidate_pairs=None) == base
+    all_pairs = {
+        tuple(sorted((a["id"], b["id"])))
+        for i, a in enumerate(eps) for b in eps[i + 1:]
+    }
+    assert cluster_episodes(eps, 0.55, 0.50, candidate_pairs=all_pairs) == base
+    # And the cap path composes with candidate_pairs unchanged.
+    assert (cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3,
+                             candidate_pairs=all_pairs)
+            == cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3))
+
+
+def test_generate_candidate_pairs_entity_index_exact_plus_knn(conn, cfg):
+    # (b) Entity arm: exactly the pairs sharing >= 1 entity. Cosine arm: only
+    # the KNN pairs of the (two) episodes that carry vectors. e5/e6 share NO
+    # entity but have identical summaries → only the vec arm can pair them.
+    embed = StubEmbeddingClient()
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "t1", "billing", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "t2", "analytics", ["postgres"])
+        _seed_episode(conn, "e3", "s3", "t3", "stream", ["kafka"])
+        _seed_episode(conn, "e4", "s4", "t4", "stream2", ["kafka", "flink"])
+        _seed_embedded_episode(conn, embed, "e5", "s5", "same words", ["solo5"])
+        _seed_embedded_episode(conn, embed, "e6", "s6", "same words", ["solo6"])
+    core_db.ensure_vec_table(conn, embed.dim)
+
+    eps = load_clusterable_episodes(conn)
+    pairs = generate_candidate_pairs(conn, eps, emb_top_k=24)
+    assert pairs == {("e1", "e2"), ("e3", "e4"), ("e5", "e6")}
+
+
+def test_blocking_exact_when_k_covers_store(conn, cfg):
+    # (c) k >= n-1 → blocked labels == exact labels on a real store with both
+    # link kinds present (cosine via identical stub vectors, entity via jaccard).
+    embed = StubEmbeddingClient()
+    with core_db.transaction(conn):
+        _seed_embedded_episode(conn, embed, "e1", "s1", "postgres rollout notes",
+                               ["postgres"])
+        _seed_embedded_episode(conn, embed, "e2", "s2", "postgres rollout notes",
+                               ["billing"])                       # cosine link to e1
+        _seed_embedded_episode(conn, embed, "e3", "s3", "kafka pipeline",
+                               ["kafka", "stream"])
+        _seed_embedded_episode(conn, embed, "e4", "s4", "totally different text",
+                               ["kafka", "stream"])               # entity link to e3
+        _seed_embedded_episode(conn, embed, "e5", "s5", "weekend cycling",
+                               ["cycling"])                       # singleton
+    core_db.ensure_vec_table(conn, embed.dim)
+
+    eps = load_clusterable_episodes(conn)
+    exact = cluster_episodes(eps, 0.55, 0.50)
+    pairs = generate_candidate_pairs(conn, eps, emb_top_k=24)
+    assert pairs is not None
+    assert cluster_episodes(eps, 0.55, 0.50, candidate_pairs=pairs) == exact
+
+
+def test_generate_candidate_pairs_none_without_vec_table(conn, cfg):
+    # (d) sqlite_vec is optional: no vec_episodes table → None → the caller
+    # falls back to exact all-pairs, embedded small stores unchanged.
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres"])
+        _seed_episode(conn, "e2", "s2", "t2", "s", ["postgres"])
+    conn.execute("DROP TABLE IF EXISTS vec_episodes")   # simulate vec-less store
+    assert not core_db.has_vec_table(conn, table="vec_episodes")
+    eps = load_clusterable_episodes(conn)
+    assert generate_candidate_pairs(conn, eps, emb_top_k=24) is None
+
+
+def test_generate_candidate_pairs_none_when_top_k_zero(conn, cfg):
+    # (e) aggregation_blocking_top_k=0 disables blocking even with the vec
+    # table present.
+    embed = StubEmbeddingClient()
+    with core_db.transaction(conn):
+        _seed_embedded_episode(conn, embed, "e1", "s1", "postgres", ["postgres"])
+        _seed_embedded_episode(conn, embed, "e2", "s2", "postgres", ["postgres"])
+    core_db.ensure_vec_table(conn, embed.dim)
+    assert core_db.has_vec_table(conn, table="vec_episodes")
+    eps = load_clusterable_episodes(conn)
+    assert generate_candidate_pairs(conn, eps, emb_top_k=0) is None
+    assert generate_candidate_pairs(conn, eps, emb_top_k=24) is not None
+
+
+def test_blocking_reduces_candidate_pair_count(conn, cfg):
+    # (f) ~60 episodes, sparse entities (20 entities × 3 episodes) and clustered
+    # vectors (6 identical-summary groups of 10): the candidate set must be
+    # strictly smaller than all n(n-1)/2 pairs, while still covering every
+    # entity-sharing pair exactly (the lossless arm).
+    embed = StubEmbeddingClient()
+    n = 60
+    with core_db.transaction(conn):
+        for i in range(n):
+            _seed_embedded_episode(
+                conn, embed, f"e{i:02d}", f"s{i:02d}",
+                f"thread {i % 6} progress notes", [f"t{i % 20}"],
+                start=i + 1, end=i + 2,
+            )
+    core_db.ensure_vec_table(conn, embed.dim)
+
+    eps = load_clusterable_episodes(conn)
+    pairs = generate_candidate_pairs(conn, eps, emb_top_k=5)
+    assert pairs is not None
+    assert len(pairs) < n * (n - 1) // 2
+    entity_pairs = {
+        tuple(sorted((a["id"], b["id"])))
+        for i, a in enumerate(eps) for b in eps[i + 1:]
+        if a["entities"] & b["entities"]
+    }
+    assert entity_pairs <= pairs
+
+
+def test_build_same_nodes_with_blocking_on_and_off(conn, cfg):
+    # (g) Integration through select_clusters/build: with k covering the store,
+    # blocking on and off persist identical level-0 nodes.
+    from dataclasses import replace as _replace
+    embed = StubEmbeddingClient()
+    with core_db.transaction(conn):
+        _seed_embedded_episode(conn, embed, "e1", "s1", "billing on postgres",
+                               ["postgres", "billing"])
+        _seed_embedded_episode(conn, embed, "e2", "s2", "analytics on postgres",
+                               ["postgres", "billing"])
+        _seed_embedded_episode(conn, embed, "e3", "s3", "weekend cycling",
+                               ["cycling"])
+    core_db.ensure_vec_table(conn, embed.dim)
+
+    def _nodes():
+        return {
+            (r["id"], r["member_episode_ids"]) for r in conn.execute(
+                "SELECT id, member_episode_ids FROM aggregation_nodes"
+            ).fetchall()
+        }
+
+    blocking_on = _replace(_enabled(cfg), aggregation_blocking_top_k=24)
+    blocking_off = _replace(_enabled(cfg), aggregation_blocking_top_k=0)
+    build_aggregation_nodes(conn, blocking_on, _agg_llm())
+    nodes_on = _nodes()
+    build_aggregation_nodes(conn, blocking_off, _agg_llm())   # full rebuild
+    assert nodes_on == _nodes()
+    assert nodes_on, "the postgres cluster must produce a node either way"
 
 
 # ── DB build + persistence ───────────────────────────────────────────────────

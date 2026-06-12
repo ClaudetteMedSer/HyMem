@@ -144,6 +144,18 @@ class HyMemConfig:
     `cluster_episodes` call sites — matching the `aggregation_digest_anchor_facts`
     "0 disables" house style."""
 
+    aggregation_blocking_top_k: int = 24
+    """Candidate-blocking KNN width for the cosine arm of episode clustering
+    (Stage 3b). All-pairs Python cosine is O(n²) per dream — on the prod box
+    (2026-06-12) 395 episodes meant 77,815 pair tests at 4.04s, past the 2s
+    budget. With blocking, the entity arm tests exactly the pairs sharing >= 1
+    key entity (lossless: Jaccard >= 0.5 needs a shared entity) and the cosine
+    arm tests each episode against its top-k `vec_episodes` neighbors only.
+    0 disables blocking entirely (exact all-pairs — what
+    benchmarks/cluster_size_probe.py measures); with k >= n-1 blocking is
+    exact, so small stores lose nothing. Stores without sqlite_vec fall back
+    to exact all-pairs automatically."""
+
     aggregation_min_sessions: int = 2
     """Only fuse clusters spanning at least this many DISTINCT sessions. The
     whole point is *cross-session* synthesis; a single-session cluster adds

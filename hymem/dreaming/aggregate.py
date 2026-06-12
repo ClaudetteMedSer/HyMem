@@ -116,6 +116,7 @@ def _linked(e1: dict, e2: dict, emb_threshold: float, ent_threshold: float) -> b
 def cluster_episodes(
     episodes: list[dict], emb_threshold: float, ent_threshold: float,
     *, max_cluster_size: int | None = None,
+    candidate_pairs: set[tuple[str, str]] | None = None,
 ) -> dict[str, int]:
     """Connected-components clustering over the episode link graph (union-find).
 
@@ -124,6 +125,25 @@ def cluster_episodes(
     path of `_linked` edges between them (transitive closure). This is deliberately
     the simplest cross-session aggregation a RAPTOR layer could do; if even this
     co-locates the gold, a smarter clusterer only does better.
+
+    `candidate_pairs` is the Stage-3b candidate-blocking hook
+    (raptor_digest_plan.md; prod timing 2026-06-12: 395 episodes → 77,815
+    all-pairs `_linked` tests → 4.04s per dream, past the 2s gate). When None
+    (the default, and what benchmarks/cluster_size_probe.py measures), every
+    pair is tested — byte-identical to the historical all-pairs behavior. When
+    provided, ONLY those pairs are `_linked`-tested; each pair is a tuple of
+    two episode ids normalized ascending (`(a, b) with a < b` — i.e.
+    `tuple(sorted(...))`), and pairs naming ids outside `episodes` are ignored.
+    The caller (`generate_candidate_pairs`) builds the set from an entity
+    inverted index (EXACT for the Jaccard arm: ent_threshold >= any positive
+    value requires >= 1 shared entity, so no entity link is ever lost) plus
+    embedding KNN top-k over `vec_episodes` (APPROXIMATE for the cosine arm: a
+    missed link means both endpoints already had >= k closer neighbors).
+    Components are order-independent, so labels stay deterministic regardless
+    of set iteration order. Deliberately NO node-id salt bump for blocking:
+    salts version PROMPT-level staleness, while node cache ids already key on
+    member-set hashes — a membership changed by blocking regenerates its
+    fusion naturally, an unchanged one keeps its still-valid cache.
 
     `max_cluster_size` is the Stage-3a chaining guard (raptor_digest_plan.md):
     OR-links chain transitively, and on the prod store (probe, 2026-06-12) that
@@ -160,10 +180,18 @@ def cluster_episodes(
         if ra != rb:
             parent[ra] = rb
 
-    for i in range(len(episodes)):
-        for j in range(i + 1, len(episodes)):
-            if _linked(episodes[i], episodes[j], emb_threshold, ent_threshold):
-                union(episodes[i]["id"], episodes[j]["id"])
+    if candidate_pairs is None:
+        for i in range(len(episodes)):
+            for j in range(i + 1, len(episodes)):
+                if _linked(episodes[i], episodes[j], emb_threshold, ent_threshold):
+                    union(episodes[i]["id"], episodes[j]["id"])
+    else:
+        by_id = {e["id"]: e for e in episodes}
+        for a, b in candidate_pairs:
+            if a == b or a not in by_id or b not in by_id:
+                continue
+            if _linked(by_id[a], by_id[b], emb_threshold, ent_threshold):
+                union(a, b)
 
     roots = {e["id"]: find(e["id"]) for e in episodes}
     label_of: dict[str, int] = {}
@@ -222,7 +250,7 @@ def load_clusterable_episodes(conn: sqlite3.Connection) -> list[dict]:
     a stable member list / id falls out of clustering. Mirrors the probe loader."""
     rows = conn.execute(
         """
-        SELECT e.id, e.session_id, e.title, e.summary,
+        SELECT e.rowid AS rowid, e.id, e.session_id, e.title, e.summary,
                e.start_message_id, e.end_message_id, e.key_entities,
                em.vector_json
         FROM episodes e
@@ -239,6 +267,10 @@ def load_clusterable_episodes(conn: sqlite3.Connection) -> list[dict]:
         vec = decode_vector(r["vector_json"]) if r["vector_json"] else None
         episodes.append({
             "id": r["id"],
+            # episodes.rowid mirrors vec_episodes.rowid (see _backfill_vec_episodes /
+            # persist_episode_embeddings), so blocking can translate KNN hits back
+            # to episode ids without a per-hit SELECT.
+            "rowid": r["rowid"],
             "session_id": r["session_id"],
             "title": r["title"],
             "summary": r["summary"],
@@ -251,6 +283,78 @@ def load_clusterable_episodes(conn: sqlite3.Connection) -> list[dict]:
             "vector": vec,
         })
     return episodes
+
+
+def generate_candidate_pairs(
+    conn: sqlite3.Connection, episodes: list[dict], *, emb_top_k: int,
+) -> set[tuple[str, str]] | None:
+    """Stage-3b candidate blocking: the pair set `cluster_episodes` should test
+    instead of all O(n²) pairs (prod, 2026-06-12: 395 episodes → 77,815 pairs →
+    4.04s per dream, past the 2s gate).
+
+    Returns None whenever blocking cannot run exactly as designed, and the
+    caller MUST then fall back to exact all-pairs (pass candidate_pairs=None):
+      - `emb_top_k <= 0` (config: aggregation_blocking_top_k=0 disables blocking);
+      - no `vec_episodes` table / sqlite_vec extension unavailable — sqlite_vec
+        is an optional dependency, and embedded small stores without it must
+        keep today's exact behavior unchanged.
+
+    Otherwise returns ascending-normalized id pairs from two arms:
+      - Entity arm (EXACT): inverted index entity → episode ids over the
+        already-normalized `e["entities"]` sets; every co-occurring pair under
+        any entity is a candidate. Jaccard >= 0.5 requires >= 1 shared entity,
+        so this arm loses nothing.
+      - Cosine arm (approximate): per-episode KNN top `emb_top_k` neighbors via
+        `core_db.vec_search` over `vec_episodes` (whose rowids mirror
+        episodes.rowid). Queried as k+1 so the episode's own row never consumes
+        a neighbor slot — hence with emb_top_k >= n-1 the arm is exact and
+        small stores lose nothing. Hits whose rowid is not in `episodes`
+        (retention may have pruned the row since vec ingest) and self-pairs are
+        skipped. Episodes without a vector contribute no cosine candidates —
+        exactly `_linked`'s behavior, whose cosine arm never fires for them;
+        the entity arm still covers them.
+    """
+    if emb_top_k <= 0:
+        return None
+    # Mirrors the augment.py vec path guard: the virtual table can be listed in
+    # sqlite_master while the extension fails to load on THIS connection — then
+    # every vec_search returns [], which would silently amputate the cosine arm
+    # rather than approximate it. Treat that as "cannot run as designed".
+    if not core_db._load_vec_extension(conn):
+        return None
+    if not core_db.has_vec_table(conn, table="vec_episodes"):
+        return None
+
+    pairs: set[tuple[str, str]] = set()
+
+    # Entity arm (exact): invert entity → episode ids, pair all co-occurrences.
+    inverted: dict[str, list[str]] = {}
+    for e in episodes:
+        for ent in e.get("entities") or ():
+            inverted.setdefault(ent, []).append(e["id"])
+    for ids in inverted.values():
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                if a != b:
+                    pairs.add((a, b) if a < b else (b, a))
+
+    # Cosine arm (approximate): KNN per vectored episode, translated rowid → id.
+    id_of_rowid = {
+        e["rowid"]: e["id"] for e in episodes if e.get("rowid") is not None
+    }
+    for e in episodes:
+        vec = e.get("vector")
+        if not vec:
+            continue
+        hits = core_db.vec_search(conn, vec, emb_top_k + 1, table="vec_episodes")
+        for rowid, _distance in hits:
+            other = id_of_rowid.get(rowid)
+            if other is None or other == e["id"]:
+                continue
+            a, b = e["id"], other
+            pairs.add((a, b) if a < b else (b, a))
+    return pairs
 
 
 def _node_id(member_ids: list[str], *, salt: str = "") -> str:
@@ -296,7 +400,8 @@ def _centroid(vectors: list[list[float] | None]) -> list[float] | None:
 
 
 def select_clusters(
-    episodes: list[dict], cfg: HyMemConfig
+    episodes: list[dict], cfg: HyMemConfig,
+    conn: sqlite3.Connection | None = None,
 ) -> list[list[dict]]:
     """Cluster all episodes, then keep only the clusters worth a summary: at least
     `aggregation_min_members` episodes spanning at least `aggregation_min_sessions`
@@ -306,12 +411,23 @@ def select_clusters(
     (0 in config = uncapped → None here): an over-cap component arrives as
     recency windows, and each window flows through the SAME min-members /
     min-sessions policy below — an undersized trailing window is dropped here
-    exactly like any other too-small cluster."""
+    exactly like any other too-small cluster.
+
+    `conn` enables Stage-3b candidate blocking (the KNN cosine arm needs the
+    store's `vec_episodes` table); None — pure offline callers — means exact
+    all-pairs clustering, as does any condition under which
+    `generate_candidate_pairs` declines to block."""
     if not episodes:
         return []
+    pairs = (
+        generate_candidate_pairs(
+            conn, episodes, emb_top_k=cfg.aggregation_blocking_top_k)
+        if conn is not None else None
+    )
     labels = cluster_episodes(
         episodes, cfg.aggregation_emb_threshold, cfg.aggregation_ent_threshold,
         max_cluster_size=cfg.aggregation_max_cluster_size or None,
+        candidate_pairs=pairs,
     )
     grouped: dict[int, list[dict]] = {}
     for ep in episodes:
@@ -505,7 +621,7 @@ def build_aggregation_nodes(
         return 0
 
     episodes = load_clusterable_episodes(conn)
-    clusters = select_clusters(episodes, cfg)
+    clusters = select_clusters(episodes, cfg, conn)
 
     # The content-hash node id makes the previous fusion reusable: an unchanged
     # member set keeps its title/summary without a new LLM call, so a dream over
@@ -621,6 +737,8 @@ def _build_digest_levels(
         # Same chaining guard as level 0: a transitive mega-component among the
         # rollup frontier would otherwise fuse from a `aggregation_max_members`
         # truncation of itself, silently dropping every thread past the cut.
+        # Deliberately EXACT all-pairs (no candidate blocking): the frontier is
+        # a few dozen items at most, and rollup items aren't in vec_episodes.
         labels = cluster_episodes(
             items, cfg.aggregation_emb_threshold, cfg.aggregation_ent_threshold,
             max_cluster_size=cfg.aggregation_max_cluster_size or None,

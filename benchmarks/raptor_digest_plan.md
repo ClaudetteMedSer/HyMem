@@ -286,6 +286,36 @@ top-k neighbors via the existing vec path for the cosine arm. Keep the pure clus
 contract (probe re-exports it) — blocking only generates the candidate pair list.
 *Gate:* time the current build on the prod store first; if < 2s, defer this stage.
 
+**TIMING RESULT (box run 2026-06-12): 395 episodes, 77,815 pairs, 4.04s > 2s —
+gate fired, do NOT defer.** Build the blocking as designed. Notes pinned before
+the build:
+- The entity arm is EXACT under blocking: Jaccard ≥ 0.5 requires ≥1 shared
+  entity, so the inverted index loses nothing.
+- The cosine arm is approximate (top-k KNN via `vec_episodes`): with
+  k ≥ n−1 it is exact, so small stores lose nothing; at scale a missed link
+  means both endpoints already had ≥k closer neighbors — and the cap-15
+  windowing makes marginal membership drift immaterial anyway.
+- NO salt bump: blocking changes membership, not the fusion prompt; cache ids
+  already key on member-set hashes, so changed clusters regenerate naturally
+  and unchanged clusters keep their valid cached fusions. (The 3a bump was for
+  the cap semantics; the salt rule is about prompt-level staleness.)
+- No `vec_episodes` table (sqlite_vec absent) → fall back to exact all-pairs,
+  today's behavior; embedded small stores are unaffected.
+
+**BUILT + VERIFIED (2026-06-12, this branch).** `cluster_episodes` gains
+`candidate_pairs` (None = exact all-pairs — the probe contract);
+`generate_candidate_pairs(conn, episodes, emb_top_k)` builds the set (entity
+inverted index + KNN k+1 over `vec_episodes`, rowid-mapped; returns None →
+exact fallback when top_k≤0, the vec extension won't load, or the table is
+absent). Config: `aggregation_blocking_top_k = 24` (0 disables). Wired through
+`select_clusters(…, conn=None)`; the rollup loop stays exact (frontier items
+are few and not in vec_episodes). Salts untouched per the no-bump rationale.
+Verified independently on a synthetic 400-episode store (40-center vectors,
+sparse entities): candidates = 10.0% of all-pairs, 1.675s → 0.258s (6.5×),
+components byte-identical, k≥n−1 exactness holds. Extrapolated box time:
+~4.04s → well under 1s. **Stage 3b CLOSED pending a box re-time
+(`dream` log or the timing snippet) to confirm <2s on the real store.**
+
 **3c. Flip criteria.** Enable on the Hermes server when: v4 digest verified (Stage 0),
 3a probe clean or guard built, dream-time cost measured and acceptable (log
 `nodes=/reused=` over a week — steady-state should be near-full reuse). The QUERY tier
