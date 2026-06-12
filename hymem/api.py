@@ -320,6 +320,14 @@ class HyMem:
         aggregation layer (`cfg.aggregation_nodes_enabled` +
         `cfg.aggregation_digest_enabled`) has dreamed over at least one
         episode. Read-only.
+
+        Embedded-host pattern: inject `digest().as_context_block()` into the
+        system prompt and re-fetch after each `dream()` — the digest only
+        changes at dream time, so there is nothing to poll between dreams.
+        The block's footer carries session coverage and `generated_at`, making
+        staleness visible to the model and the user. Hosts that prefer a
+        single call per turn can set `cfg.augment_include_digest` to receive
+        the same object as `ctx.digest` from `augment()` instead.
         """
         return load_digest(self.read_conn)
 

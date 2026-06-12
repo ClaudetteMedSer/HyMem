@@ -1,11 +1,12 @@
 """MCP server for HyMem.
 
-Exposes seven tools to the Hermes Agent platform:
+Exposes eight tools to the Hermes Agent platform:
   hymem_capture  — log a full conversation at once + optionally dream (preferred)
   hymem_log      — log one conversational turn (fallback for turn-by-turn use)
   hymem_dream    — run a dreaming cycle (extract, consolidate, decay)
   hymem_augment  — retrieve graph facts + FTS context for a user message
   hymem_profile  — return USER.md (behavioral profile) + MEMORY.md (project insights)
+  hymem_digest   — return the standing whole-store memory digest (RAPTOR root)
   hymem_alias    — register a surface-form alias for an entity
   hymem_retract  — retract a wrongly extracted knowledge graph edge
 
@@ -149,6 +150,17 @@ def _do_profile() -> str:
     return "\n\n".join(parts) if parts else "No profile or insights available yet."
 
 
+def _do_digest() -> str:
+    digest = _get_hy().digest()
+    if digest is None:
+        return (
+            "No digest available yet — it is built at dream time once the "
+            "aggregation layer (aggregation_nodes_enabled + "
+            "aggregation_digest_enabled) has dreamed over at least one episode."
+        )
+    return digest.as_context_block()
+
+
 def _do_alias(surface: str, canonical: str) -> str:
     _get_hy().register_alias(surface, canonical)
     return f"alias registered: {surface!r} → {canonical!r}"
@@ -228,6 +240,21 @@ def hymem_profile() -> str:
     return _do_profile()
 
 
+def hymem_digest() -> str:
+    """Return the standing whole-store memory digest.
+
+    The digest is the root of HyMem's cross-session aggregation tree: one
+    summary answering "what do you know about me?" across the entire store,
+    rebuilt at dream time (never per query). Inject it as standing context at
+    session start — it complements hymem_profile (behavioral profile) with a
+    narrative of what the user has actually been working on. The footer states
+    how many sessions it covers and when it was generated, so staleness is
+    visible; re-fetch after hymem_dream to pick up a refreshed digest.
+    Returns an explanatory message if no digest has been built yet.
+    """
+    return _do_digest()
+
+
 def hymem_alias(surface: str, canonical: str) -> str:
     """Register that two names refer to the same entity.
 
@@ -255,6 +282,7 @@ def main() -> None:
     mcp_instance.tool()(hymem_dream)
     mcp_instance.tool()(hymem_augment)
     mcp_instance.tool()(hymem_profile)
+    mcp_instance.tool()(hymem_digest)
     mcp_instance.tool()(hymem_alias)
     mcp_instance.tool()(hymem_retract)
     mcp_instance.run()

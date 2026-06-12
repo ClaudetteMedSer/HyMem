@@ -320,9 +320,14 @@ def generate_candidate_pairs(
     # sqlite_master while the extension fails to load on THIS connection — then
     # every vec_search returns [], which would silently amputate the cosine arm
     # rather than approximate it. Treat that as "cannot run as designed".
+    # The declines are logged because the fallback is invisible from results
+    # (identical components, just slower) — a bare core_db.connect() without
+    # vec initialization once made a hand-timed box run measure the exact path.
     if not core_db._load_vec_extension(conn):
+        log.debug("blocking.decline reason=vec_extension_unavailable (exact all-pairs)")
         return None
     if not core_db.has_vec_table(conn, table="vec_episodes"):
+        log.debug("blocking.decline reason=no_vec_episodes_table (exact all-pairs)")
         return None
 
     pairs: set[tuple[str, str]] = set()
@@ -837,6 +842,20 @@ class Digest:
     n_sessions: int
     n_sessions_total: int
     generated_at: str
+
+    def as_context_block(self) -> str:
+        """The canonical system-prompt rendering: title, summary, and one
+        provenance footer. Every delivery surface (embedded host injection,
+        the MCP `hymem_digest` tool, the Honcho peer representation) uses this
+        so the staleness display is decided in exactly one place: the footer
+        names the coverage ratio and the build time, because a digest is a
+        dream-time artifact — the reader must be able to see "this reflects
+        the store as of <generated_at>", not mistake it for live state."""
+        footer = f"(Memory digest covering {self.n_sessions} of {self.n_sessions_total} sessions"
+        if self.generated_at:
+            footer += f"; generated {self.generated_at}"
+        footer += ".)"
+        return f"## {self.title}\n\n{self.summary}\n\n{footer}"
 
 
 def load_digest(conn: sqlite3.Connection) -> Digest | None:

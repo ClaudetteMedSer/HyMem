@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
 from hymem.core.vectors import decode_vector
+from hymem.dreaming.aggregate import Digest, load_digest
 from hymem.dreaming.user_profile import ProfileEntry, load_profile
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
@@ -235,6 +236,15 @@ class AugmentedContext:
     extracted profile facts, when `cfg.profile_extraction_enabled` is False, or
     on a pre-v18 store. Capped at `cfg.profile_context_cap`, identity slots
     first; values are already redaction-scrubbed at persist time."""
+    digest: Digest | None = None
+    """The standing whole-store root digest (see `HyMem.digest()`), populated
+    only when `cfg.augment_include_digest` is True — the Stage-5 convenience
+    for single-call hosts that cannot make a separate `digest()` call. None by
+    default: the digest is standing, dream-time context, so most hosts should
+    fetch it once per dream rather than on every augment. Like the profile and
+    aggregation tiers it is purely additive — loaded by its own SELECT, never
+    a retrieval competitor, cannot crowd any other tier. Render it with
+    `digest.as_context_block()` for the canonical staleness-stamped form."""
     temporal_events: list[TemporalEvent] = field(default_factory=list)
     """Dated events in chronological (date-ascending) order, populated only when
     `augment()` runs with `ability="TR"`. It merges explicit dates extracted from
@@ -326,6 +336,12 @@ def augment(
     # degrades to [] on a pre-v18 store.
     if cfg.profile_extraction_enabled:
         ctx.user_profile = load_profile(conn, cap=cfg.profile_context_cap)
+
+    # Stage-5 single-call convenience: ship the standing root digest alongside
+    # the per-query tiers. Off by default — the digest only changes at dream
+    # time, so most hosts fetch it once via HyMem.digest() instead of here.
+    if cfg.augment_include_digest:
+        ctx.digest = load_digest(conn)
 
     # Pull a wider candidate pool when reranking is likely so the reranker
     # has room to reorder beyond the top-fts_top_k window; the final result

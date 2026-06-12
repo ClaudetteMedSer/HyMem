@@ -215,6 +215,17 @@ class HyMemConfig:
     merely adds a summary tier (never displaces other tiers), a false negative
     is identical to the layer being off."""
 
+    augment_include_digest: bool = False
+    """When True, `augment()` also loads the standing root digest into
+    `ctx.digest` so a single-call host gets the whole-store summary without a
+    second `HyMem.digest()` round-trip. Default False to keep `augment()` lean:
+    the digest is *standing* context — it does not change per query, so a host
+    that assembles its own system prompt should fetch it once per dream via
+    `HyMem.digest()` (or the `hymem_digest` MCP tool) instead of paying the
+    load on every turn. Purely additive either way: the digest is never a
+    retrieval tier and consumes no other tier's budget (the Stage-5 delivery
+    decision in benchmarks/raptor_digest_plan.md)."""
+
     profile_extraction_enabled: bool = True
     """Master switch for the typed user-profile tier (schema v18, Stage 1 /
     P4). Default ON since profile.v2 PASSED the on-box hand-scored precision

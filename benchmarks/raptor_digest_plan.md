@@ -312,9 +312,17 @@ absent). Config: `aggregation_blocking_top_k = 24` (0 disables). Wired through
 are few and not in vec_episodes). Salts untouched per the no-bump rationale.
 Verified independently on a synthetic 400-episode store (40-center vectors,
 sparse entities): candidates = 10.0% of all-pairs, 1.675s → 0.258s (6.5×),
-components byte-identical, k≥n−1 exactness holds. Extrapolated box time:
-~4.04s → well under 1s. **Stage 3b CLOSED pending a box re-time
-(`dream` log or the timing snippet) to confirm <2s on the real store.**
+components byte-identical, k≥n−1 exactness holds.
+
+**BOX RE-TIME (2026-06-12): 4.04s → 1.27s (3.2×), pairs 79,401 → 19,561
+(24.6%), components IDENTICAL — under the 2s gate. Stage 3b CLOSED.**
+The 3.2× vs the synthetic 6.5× is denser real-world entity overlap (the exact
+entity arm keeps 25% of pairs vs 10% synthetic); the KNN cosine arm is the
+part that scales, so headroom grows with store size. Operational note from the
+re-time: a bare `core_db.connect()` does NOT load the vec extension on its own
+— the blocking guard then correctly degrades to exact all-pairs (by design,
+but worth knowing when timing/probing by hand: initialize the store the way
+HyMem does, or you measure the fallback path).
 
 **3c. Flip criteria.** Enable on the Hermes server when: v4 digest verified (Stage 0),
 3a probe clean or guard built, dream-time cost measured and acceptable (log
@@ -344,6 +352,8 @@ digest say X" with provenance — pairs well with Hermes UI later.
 
 ## Stage 5 — Digest delivery into Hermes (product wiring)
 
+**BUILT (2026-06-12, this branch). All four surfaces wired; 652 tests green.**
+
 - Embedded host: inject `digest().summary` into the system prompt; refresh after each
   dream. Decide staleness display (`generated_at` is exposed).
 - `server.py` (MCP): add a `digest` tool (8th tool) returning the dataclass fields.
@@ -352,6 +362,30 @@ digest say X" with provenance — pairs well with Hermes UI later.
 - Open design question for tomorrow: should `augment()` ALSO return the digest (e.g.
   `ctx.digest`) so single-call hosts get it? Leaning yes-but-optional
   (`cfg.augment_include_digest`, default False) to keep `augment()` lean.
+
+**What was built, and the decisions taken:**
+- **Staleness display DECIDED via one canonical render:** `Digest.as_context_block()`
+  — `## title` + summary + a single provenance footer
+  `(Memory digest covering N of M sessions; generated <generated_at>.)`.
+  Every delivery surface uses this method, so the staleness decision lives in
+  exactly one place. Embedded-host pattern documented on `HyMem.digest()`:
+  inject the block, re-fetch after each `dream()` (the digest only changes at
+  dream time — nothing to poll between dreams).
+- **MCP:** `hymem_digest` (8th tool) returns `as_context_block()`, or an
+  explanatory "not built yet" message instead of an error when no root exists.
+- **Honcho:** new `_peer_representation()` helper = digest block ABOVE USER.md,
+  consumed by BOTH user-representation surfaces (`GET .../peers/{pid}/card` and
+  `peer_representation` in `GET .../peers/{pid}/context`). Degrades to plain
+  USER.md when no digest exists (today's behavior, pinned by test).
+- **Open question RESOLVED as leaned: yes-but-optional.**
+  `cfg.augment_include_digest` (default False) → `ctx.digest: Digest | None` on
+  `AugmentedContext`. Additive like the profile/aggregation tiers (own SELECT,
+  never a retrieval competitor); default-off keeps `augment()` lean since the
+  digest is standing dream-time context, not per-query context.
+- NOT touched: salts (no fusion-prompt change — delivery only), retrieval tiers,
+  and the Stage-3c flip (`aggregation_nodes_enabled` stays False in prod until
+  the week-scale cost watch passes; these surfaces all degrade gracefully to
+  "no digest" until then).
 
 ---
 

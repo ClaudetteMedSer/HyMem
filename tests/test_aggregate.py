@@ -21,6 +21,7 @@ from hymem.core.vectors import encode_vector
 from hymem.dreaming.aggregate import (
     build_aggregation_nodes,
     cluster_episodes,
+    Digest,
     generate_candidate_pairs,
     load_clusterable_episodes,
     load_digest,
@@ -796,3 +797,65 @@ def test_hymem_digest_api_none_by_default(cfg):
         assert hy.digest() is None
     finally:
         hy.close()
+
+
+# ── Stage 5: delivery surfaces ───────────────────────────────────────────────
+
+def test_digest_as_context_block_carries_summary_and_staleness():
+    # The one canonical render every delivery surface uses: title header,
+    # summary body, and a footer that makes coverage + build time visible.
+    d = Digest(title="User digest", summary="Runs billing on Postgres.",
+               n_sessions=3, n_sessions_total=4,
+               generated_at="2026-06-12 09:00:00")
+    block = d.as_context_block()
+    assert block.startswith("## User digest")
+    assert "Runs billing on Postgres." in block
+    assert "covering 3 of 4 sessions" in block
+    assert "generated 2026-06-12 09:00:00" in block
+
+
+def test_digest_as_context_block_without_generated_at():
+    # A root row with a NULL created_at loads as generated_at="" — the footer
+    # then states coverage only rather than printing an empty timestamp.
+    d = Digest(title="t", summary="s", n_sessions=1, n_sessions_total=1,
+               generated_at="")
+    block = d.as_context_block()
+    assert "covering 1 of 1 sessions" in block
+    assert "generated" not in block
+
+
+def test_augment_digest_none_by_default(cfg, conn):
+    # augment() stays lean: even with a built root digest, ctx.digest is None
+    # unless the host opts in via cfg.augment_include_digest.
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    assert load_digest(conn) is not None
+
+    ctx = augment(conn, acfg, "postgres billing")
+    assert ctx.digest is None
+
+
+def test_augment_digest_included_when_opted_in(cfg, conn):
+    acfg = replace(_enabled(cfg, digest=True), augment_include_digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+
+    ctx = augment(conn, acfg, "postgres billing")
+    assert ctx.digest is not None
+    assert ctx.digest.title == "User digest"
+    assert ctx.digest.n_sessions_total == 2
+
+
+def test_augment_digest_opt_in_none_when_no_root(cfg, conn):
+    acfg = replace(cfg, augment_include_digest=True)
+    ctx = augment(conn, acfg, "anything at all")
+    assert ctx.digest is None

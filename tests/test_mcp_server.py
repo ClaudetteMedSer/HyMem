@@ -124,6 +124,36 @@ def test_hymem_profile_handles_only_user_md(hy):
     assert "PROJECT INSIGHTS" not in result
 
 
+def _seed_root_digest(hy, *, title="User digest", summary="Works on HyMem."):
+    """Insert a root aggregation node directly — load_digest() only reads the
+    table, so the tool tests don't need to run a full aggregation build."""
+    hy.conn.execute(
+        "INSERT INTO aggregation_nodes "
+        "(id, title, summary, member_episode_ids, session_ids, "
+        " n_members, n_sessions, level, is_root) "
+        "VALUES ('root-test', ?, ?, '[]', '[]', 2, 2, 1, 1)",
+        (title, summary),
+    )
+    hy.conn.commit()
+
+
+def test_hymem_digest_explains_when_absent(hy):
+    srv.set_hy(hy)
+    result = srv._do_digest()
+    assert "No digest available yet" in result
+
+
+def test_hymem_digest_returns_context_block(hy):
+    srv.set_hy(hy)
+    _seed_root_digest(hy)
+    result = srv._do_digest()
+    assert result.startswith("## User digest")
+    assert "Works on HyMem." in result
+    # The staleness footer: coverage ratio + generated_at are always present.
+    assert "Memory digest covering 2 of" in result
+    assert "generated" in result
+
+
 def test_hymem_alias_registers_mapping(hy):
     srv.set_hy(hy)
     result = srv._do_alias("MedFlow", "med_flow")

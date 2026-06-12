@@ -10,7 +10,7 @@ Endpoint mapping (high level):
   POST .../sessions/{sid}/search      → hy.augment() as Message objects
   GET  .../sessions/{sid}/context     → MEMORY.md + USER.md + recent turns
   POST .../sessions/{sid}/peers       → register peer → role mapping
-  GET  .../peers/{pid}/card           → USER.md behavioral profile
+  GET  .../peers/{pid}/card           → standing digest + USER.md behavioral profile
   POST .../peers/{pid}/search         → hy.augment() as Message objects (peer-scoped)
   POST .../peers/{pid}/chat           → dialectic Q&A via hy.augment()
 
@@ -512,14 +512,31 @@ def search_peer_messages(
     return _augment_messages(body.query, body.limit, "", workspace_id)
 
 
+def _peer_representation() -> str:
+    """The user-representation text the peer card/context endpoints return:
+    the standing root digest (when the aggregation layer has built one) above
+    USER.md. The digest is HyMem's analogue of Honcho's dialectic user model —
+    a whole-store "what do you know about me?" narrative — so it belongs on
+    exactly the endpoints the SDK reads a user representation from. Rendered
+    via Digest.as_context_block(), whose footer carries coverage + generated_at
+    so the consumer can see how stale the dream-time artifact is. Degrades to
+    plain USER.md (today's behavior) when no digest exists."""
+    hy = _get_hy()
+    cfg = hy.config
+    parts: list[str] = []
+    digest = hy.digest()
+    if digest is not None:
+        parts.append(digest.as_context_block())
+    if cfg.user_md_path.exists():
+        user_md = cfg.user_md_path.read_text(encoding="utf-8")
+        if user_md.strip():
+            parts.append(user_md)
+    return "\n\n".join(parts)
+
+
 @app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}/card")
 def get_peer_card(workspace_id: str, peer_id: str) -> dict:
-    cfg = _get_hy().config
-    content = (
-        cfg.user_md_path.read_text(encoding="utf-8")
-        if cfg.user_md_path.exists() else ""
-    )
-    return adapters.peer_card_response(peer_id, workspace_id, content)
+    return adapters.peer_card_response(peer_id, workspace_id, _peer_representation())
 
 
 @app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}/context")
@@ -539,9 +556,7 @@ def get_peer_context(
     hy = _get_hy()
     cfg = hy.config
 
-    peer_representation = ""
-    if cfg.user_md_path.exists():
-        peer_representation = cfg.user_md_path.read_text(encoding="utf-8")
+    peer_representation = _peer_representation()
 
     messages = []
     if search_query:

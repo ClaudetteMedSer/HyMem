@@ -224,6 +224,59 @@ def test_peer_card_returns_user_md_content(client, hy_with_embed):
     assert "prefers uv" in body["content"]
 
 
+def _seed_root_digest(hy):
+    """A root aggregation node, inserted directly: the representation surfaces
+    only read it via load_digest(), no aggregation build needed."""
+    hy.conn.execute(
+        "INSERT INTO aggregation_nodes "
+        "(id, title, summary, member_episode_ids, session_ids, "
+        " n_members, n_sessions, level, is_root) "
+        "VALUES ('root-test', 'User digest', 'Works on HyMem and Hermes.', "
+        " '[]', '[]', 3, 3, 1, 1)"
+    )
+    hy.conn.commit()
+
+
+def test_peer_card_prepends_digest_when_built(client, hy_with_embed):
+    # Stage 5: the digest is the Honcho-analogue of the dialectic user model,
+    # so the card carries it ABOVE the USER.md behavioral profile.
+    hy_with_embed.config.user_md_path.write_text(
+        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
+    )
+    _seed_root_digest(hy_with_embed)
+    r = client.get("/v3/workspaces/hermes/peers/user-1/card")
+    assert r.status_code == 200
+    content = r.json()["content"]
+    assert "Works on HyMem and Hermes." in content
+    assert "Memory digest covering 3 of" in content  # staleness footer
+    assert "prefers uv" in content
+    assert content.index("Works on HyMem and Hermes.") < content.index("prefers uv")
+
+
+def test_peer_context_representation_includes_digest(client, hy_with_embed):
+    hy_with_embed.config.user_md_path.write_text(
+        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
+    )
+    _seed_root_digest(hy_with_embed)
+    r = client.get("/v3/workspaces/hermes/peers/user-1/context")
+    assert r.status_code == 200
+    rep = r.json()["peer_representation"]
+    assert "Works on HyMem and Hermes." in rep
+    assert "prefers uv" in rep
+
+
+def test_peer_representation_plain_user_md_without_digest(client, hy_with_embed):
+    # No digest built → today's behavior: USER.md verbatim, no digest block.
+    hy_with_embed.config.user_md_path.write_text(
+        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
+    )
+    r = client.get("/v3/workspaces/hermes/peers/user-1/context")
+    assert r.status_code == 200
+    rep = r.json()["peer_representation"]
+    assert "prefers uv" in rep
+    assert "Memory digest" not in rep
+
+
 def test_peer_chat_returns_response_for_query(client, hy_with_embed):
     r = client.post(
         "/v3/workspaces/hermes/peers/user-1/chat",

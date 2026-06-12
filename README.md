@@ -361,7 +361,7 @@ It's pure SQL over the existing schema — no LLM call — and ignores retracted
 
 ### MCP Server (`hymem-server` → `server.py`)
 
-Exposes 7 tools via the Model Context Protocol:
+Exposes 8 tools via the Model Context Protocol:
 
 | Tool | Purpose |
 |---|---|
@@ -370,6 +370,7 @@ Exposes 7 tools via the Model Context Protocol:
 | `hymem_dream` | Run a dreaming cycle manually |
 | `hymem_augment` | Retrieve graph facts + FTS context for a message |
 | `hymem_profile` | Return USER.md + MEMORY.md |
+| `hymem_digest` | Standing whole-store digest (RAPTOR root) with coverage + generated-at footer |
 | `hymem_alias` | Register surface-form→canonical mapping |
 | `hymem_retract` | Retract a wrongly extracted edge |
 
@@ -394,8 +395,8 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 | `GET .../sessions/{sid}/context` | MEMORY.md + USER.md + recent turns + summary | Session summary from dreaming |
 | `POST .../sessions/{sid}/peers` | Register peers + role mappings | |
 | `GET .../sessions/{sid}/peers/{pid}/config` | Per-session peer config | |
-| `GET .../peers/{pid}/card` | USER.md behavioral profile | |
-| `GET .../peers/{pid}/context` | Peer-scoped context with optional search | |
+| `GET .../peers/{pid}/card` | Standing digest + USER.md behavioral profile | Digest block (when built) precedes USER.md |
+| `GET .../peers/{pid}/context` | Peer-scoped context with optional search | `peer_representation` = digest + USER.md |
 | `POST .../peers/{pid}/representation` | Update peer representation | |
 | `POST .../peers/{pid}/chat` | Dialectic Q&A via `hy.augment()` | Returns prose + structured `facts[]` with `why` |
 | `GET /v3/workspaces/{wid}/conflicts` | `hy.conflicts()` over the graph | Pure SQL, no LLM call |
