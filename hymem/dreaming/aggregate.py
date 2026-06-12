@@ -842,6 +842,10 @@ class Digest:
     n_sessions: int
     n_sessions_total: int
     generated_at: str
+    node_id: str = ""
+    """The root aggregation node's id — the entry point for the Stage-4b
+    drill-down: pass it to `HyMem.expand_node()` to see which child nodes and
+    episodes the digest was fused from ("why does my digest say X?")."""
 
     def as_context_block(self) -> str:
         """The canonical system-prompt rendering: title, summary, and one
@@ -863,7 +867,7 @@ def load_digest(conn: sqlite3.Connection) -> Digest | None:
     disabled, has not dreamed yet, or the store has no episodes. Read-only."""
     row = conn.execute(
         """
-        SELECT title, summary, n_sessions, created_at
+        SELECT id, title, summary, n_sessions, created_at
         FROM aggregation_nodes
         WHERE is_root = 1
         ORDER BY created_at DESC, id
@@ -879,4 +883,127 @@ def load_digest(conn: sqlite3.Connection) -> Digest | None:
         n_sessions=row["n_sessions"],
         n_sessions_total=int(total),
         generated_at=row["created_at"] or "",
+        node_id=row["id"],
+    )
+
+
+@dataclass
+class NodeChild:
+    """A child aggregation node inside a `NodeExpansion` — one level-(N−1)
+    fusion the expanded node rolled up. Expand it in turn to keep descending."""
+
+    id: str
+    title: str
+    summary: str
+    level: int
+    n_members: int
+    n_sessions: int
+
+
+@dataclass
+class NodeMemberEpisode:
+    """A leaf inside a `NodeExpansion`: the per-session episode whose summary
+    fed the node's fusion. `start_message_id`/`end_message_id` bound the raw
+    turns it condenses, so a host can jump from any digest claim all the way
+    down to the original conversation."""
+
+    id: str
+    session_id: str
+    title: str
+    summary: str
+    start_message_id: int
+    end_message_id: int
+
+
+@dataclass
+class NodeExpansion:
+    """One step of the RAPTOR tree-traversal read (`HyMem.expand_node()`):
+    the node itself plus its members, resolved one level down. Members of a
+    level >= 1 node are a mix of child nodes and pass-through episodes (leaves
+    no cluster absorbed); level-0 members are episodes only. Member order is
+    the persisted fusion-input order. `missing_member_ids` keeps the read
+    honest instead of silently shrinking: ids that resolved to neither a node
+    nor an episode (should not happen — nodes are rebuilt atomically each
+    dream — so anything here indicates store surgery)."""
+
+    id: str
+    title: str
+    summary: str
+    level: int
+    is_root: bool
+    child_nodes: list[NodeChild]
+    episodes: list[NodeMemberEpisode]
+    missing_member_ids: list[str]
+
+
+def expand_node(conn: sqlite3.Connection, node_id: str) -> NodeExpansion | None:
+    """Resolve an aggregation node's members one level down — the Stage-4b
+    drill-down behind "why does my digest say X?". Start from
+    `Digest.node_id` (the root) or an `AggregationNodeHit.node_id` from the
+    query tier, and recurse through `child_nodes` until everything is
+    episodes. Returns None for an unknown id. Read-only; per-member point
+    lookups (members are capped at fusion time, so the fan-out is small)."""
+    row = conn.execute(
+        """
+        SELECT id, title, summary, level, is_root, member_episode_ids
+        FROM aggregation_nodes
+        WHERE id = ?
+        """,
+        (node_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    child_nodes: list[NodeChild] = []
+    episodes: list[NodeMemberEpisode] = []
+    missing: list[str] = []
+    for member_id in json.loads(row["member_episode_ids"]):
+        node_row = conn.execute(
+            """
+            SELECT id, title, summary, level, n_members, n_sessions
+            FROM aggregation_nodes
+            WHERE id = ?
+            """,
+            (member_id,),
+        ).fetchone()
+        if node_row is not None:
+            child_nodes.append(NodeChild(
+                id=node_row["id"],
+                title=node_row["title"],
+                summary=node_row["summary"],
+                level=node_row["level"],
+                n_members=node_row["n_members"],
+                n_sessions=node_row["n_sessions"],
+            ))
+            continue
+        ep_row = conn.execute(
+            """
+            SELECT id, session_id, title, summary,
+                   start_message_id, end_message_id
+            FROM episodes
+            WHERE id = ?
+            """,
+            (member_id,),
+        ).fetchone()
+        if ep_row is not None:
+            episodes.append(NodeMemberEpisode(
+                id=ep_row["id"],
+                session_id=ep_row["session_id"],
+                title=ep_row["title"],
+                summary=ep_row["summary"],
+                start_message_id=ep_row["start_message_id"],
+                end_message_id=ep_row["end_message_id"],
+            ))
+            continue
+        missing.append(member_id)
+
+    return NodeExpansion(
+        id=row["id"],
+        title=row["title"],
+        summary=row["summary"],
+        level=row["level"],
+        is_root=bool(row["is_root"]),
+        child_nodes=child_nodes,
+        episodes=episodes,
+        missing_member_ids=missing,
     )

@@ -348,6 +348,25 @@ levels, child nodes) — the RAPTOR tree-traversal read. `member_episode_ids` al
 persisted; this is a thin read-only accessor + tests. Lets a host show "why does my
 digest say X" with provenance — pairs well with Hermes UI later.
 
+**4b BUILT (2026-06-12, this branch — pulled forward of the 3c flip since it
+touches nothing query-time; 657 tests green).**
+- `expand_node(conn, node_id)` in `aggregate.py` → `NodeExpansion`: the node's
+  own fields plus its members resolved ONE level down — `child_nodes`
+  (`NodeChild`) and `episodes` (`NodeMemberEpisode`, carrying session_id +
+  start/end message ids so a host can walk a digest claim down to the raw
+  turns). Member order = persisted fusion-input order. `missing_member_ids`
+  keeps the read honest instead of silently shrinking (only reachable via
+  store surgery; pinned by test).
+- Entry point: `Digest` gained `node_id` (the root's id; additive,
+  default ""), so the traversal starts from `digest().node_id` — or from an
+  `AggregationNodeHit.node_id` out of the query tier.
+- `HyMem.expand_node()` reads via `read_conn`; returns None for unknown/stale
+  ids (node ids are rebuilt each dream). No LLM, no schema change, no salt
+  (read-only delivery). Exported: `NodeExpansion`/`NodeChild`/
+  `NodeMemberEpisode` from the package root.
+- NOT built into MCP/Honcho surfaces — per the plan this is the embedded/UI
+  read; wire a tool/endpoint only when a concrete Hermes UI consumer exists.
+
 ---
 
 ## Stage 5 — Digest delivery into Hermes (product wiring)

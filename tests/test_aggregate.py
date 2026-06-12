@@ -22,6 +22,7 @@ from hymem.dreaming.aggregate import (
     build_aggregation_nodes,
     cluster_episodes,
     Digest,
+    expand_node,
     generate_candidate_pairs,
     load_clusterable_episodes,
     load_digest,
@@ -859,3 +860,82 @@ def test_augment_digest_opt_in_none_when_no_root(cfg, conn):
     acfg = replace(cfg, augment_include_digest=True)
     ctx = augment(conn, acfg, "anything at all")
     assert ctx.digest is None
+
+
+# ── Stage 4b: drill-down API ─────────────────────────────────────────────────
+
+def _build_digest_tree(cfg, conn):
+    """e1+e2 cluster into a level-0 node; e3 is a pass-through leaf — so the
+    root's members are one child NODE and one EPISODE, the mixed shape the
+    drill-down must resolve."""
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e3", "s3", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"], start=5, end=9)
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+
+
+def test_expand_root_resolves_child_node_and_passthrough_episode(cfg, conn):
+    _build_digest_tree(cfg, conn)
+    digest = load_digest(conn)
+    assert digest is not None and digest.node_id  # the traversal entry point
+
+    exp = expand_node(conn, digest.node_id)
+    assert exp is not None
+    assert exp.is_root and exp.level >= 1
+    assert exp.title == "User digest"
+    assert exp.missing_member_ids == []
+
+    assert len(exp.child_nodes) == 1
+    child = exp.child_nodes[0]
+    assert child.level == 0
+    assert child.title == "Postgres across projects"
+    assert child.n_members == 2 and child.n_sessions == 2
+
+    assert [e.id for e in exp.episodes] == ["e3"]
+    leaf = exp.episodes[0]
+    assert leaf.session_id == "s3"
+    assert (leaf.start_message_id, leaf.end_message_id) == (5, 9)
+
+
+def test_expand_level0_node_returns_member_episodes_only(cfg, conn):
+    _build_digest_tree(cfg, conn)
+    root = expand_node(conn, load_digest(conn).node_id)
+
+    exp = expand_node(conn, root.child_nodes[0].id)
+    assert exp is not None
+    assert exp.level == 0 and not exp.is_root
+    assert exp.child_nodes == []
+    assert {e.id for e in exp.episodes} == {"e1", "e2"}
+    assert {e.session_id for e in exp.episodes} == {"s1", "s2"}
+
+
+def test_expand_unknown_node_returns_none(cfg, conn):
+    _build_digest_tree(cfg, conn)
+    assert expand_node(conn, "no-such-node") is None
+
+
+def test_expand_reports_dangling_members(cfg, conn):
+    # Honest-read contract: a member id that resolves to neither table is
+    # reported, not silently dropped (only reachable via store surgery).
+    _build_digest_tree(cfg, conn)
+    digest = load_digest(conn)
+    with core_db.transaction(conn):
+        conn.execute("DELETE FROM episodes WHERE id = 'e3'")
+
+    exp = expand_node(conn, digest.node_id)
+    assert exp.missing_member_ids == ["e3"]
+    assert len(exp.child_nodes) == 1 and exp.episodes == []
+
+
+def test_hymem_expand_node_api(cfg):
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"),
+               embedding_client=StubEmbeddingClient())
+    try:
+        assert hy.expand_node("anything") is None  # empty store, no error
+    finally:
+        hy.close()

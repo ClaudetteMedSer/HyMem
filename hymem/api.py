@@ -19,7 +19,12 @@ from hymem.config import HyMemConfig
 from hymem.core import db as core_db
 from hymem.dreaming import bitemporal
 from hymem.dreaming import canonicalize as canon
-from hymem.dreaming.aggregate import Digest, load_digest
+from hymem.dreaming.aggregate import (
+    Digest,
+    NodeExpansion,
+    expand_node as aggregate_expand_node,
+    load_digest,
+)
 from hymem.dreaming.runner import DreamReport, run_dreaming
 from hymem.dreaming.user_profile import ProfileEntry, load_profile
 from hymem.extraction.embeddings import EmbeddingClient
@@ -330,6 +335,20 @@ class HyMem:
         the same object as `ctx.digest` from `augment()` instead.
         """
         return load_digest(self.read_conn)
+
+    def expand_node(self, node_id: str) -> NodeExpansion | None:
+        """Drill one level down into the RAPTOR aggregation tree — the
+        provenance read behind "why does my digest say X?". Resolves the
+        node's persisted members into child nodes and member episodes (each
+        episode carrying its session id and raw-message span), so a host can
+        walk from the standing digest (`digest().node_id`) or a query-tier
+        node (`AggregationNodeHit.node_id`) all the way down to the original
+        turns. Returns None for an unknown id (e.g. a stale id from before
+        the last dream — nodes are rebuilt from scratch each cycle, so ids
+        are only stable while the underlying episode membership is).
+        Read-only; never an LLM call.
+        """
+        return aggregate_expand_node(self.read_conn, node_id)
 
     def profile(self) -> list[ProfileEntry]:
         """ACTIVE typed user-profile rows (schema v18) — the durable personal
