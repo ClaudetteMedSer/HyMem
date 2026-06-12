@@ -494,9 +494,10 @@ For each excerpt, rate its relevance on a scale of 1-5:
 2 - Marginally relevant, shares keywords but different topic
 1 - Not relevant
 
-Output a strict JSON array. Each item: {"index": 0, "relevance": 4}
+Output strict JSON: an object with one "ratings" key holding an array.
+Each array item: {"index": 0, "relevance": 4}
 The index field corresponds to the [0], [1], [2] markers in the input.
-Empty array [] is valid if nothing is relevant.
+{"ratings": []} is valid if nothing is relevant.
 """
 
 RERANK_USER_TEMPLATE = """Query: "{query}"
@@ -504,4 +505,4 @@ RERANK_USER_TEMPLATE = """Query: "{query}"
 Excerpts:
 {excerpts}
 
-Return the JSON array now."""
+Return the JSON object now."""

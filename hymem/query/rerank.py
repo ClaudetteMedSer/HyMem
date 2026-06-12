@@ -53,9 +53,11 @@ def llm_rerank(
     fused ordering instead of an arbitrary one.
 
     Returns up to ``top_k`` candidates with ``score`` set to the combined
-    rating and ``score_kind`` set to ``"reranked"``. On any parse failure
-    the input is truncated to ``top_k`` and returned unchanged — the
-    pipeline never fails closed on a flaky LLM.
+    rating and ``score_kind`` set to ``"reranked"``. On any backend or parse
+    failure the input is truncated to ``top_k`` and returned unchanged — the
+    pipeline never fails closed on a flaky LLM. This sits on augment()'s hot
+    path, so the Reranker contract (never raise) is load-bearing: an exception
+    here would abort the whole augment call, not just the rerank.
     """
     if not candidates:
         return candidates
@@ -68,12 +70,21 @@ def llm_rerank(
         user=RERANK_USER_TEMPLATE.format(query=query, excerpts=excerpts),
         response_format="json",
     )
-    raw = llm.complete(request)
+    try:
+        raw = llm.complete(request)
+    except Exception:
+        log.exception("llm_rerank backend failed; returning candidates unreranked")
+        return candidates[:top_k]
 
     try:
         ratings = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         return candidates[:top_k]
+    # JSON-mode backends (response_format "json_object") are required to emit
+    # an object, so the prompt asks for {"ratings": [...]}; models without
+    # strict JSON mode may still return the bare array. Accept both.
+    if isinstance(ratings, dict):
+        ratings = ratings.get("ratings")
     if not isinstance(ratings, list):
         return candidates[:top_k]
 

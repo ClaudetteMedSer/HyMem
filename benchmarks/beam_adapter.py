@@ -315,13 +315,11 @@ class HyMemAdapter:
         for hit in (getattr(result, "message_hits", None) or []):
             text = getattr(hit, "text", "")[:600]
             role = getattr(hit, "role", "unknown")
-            score = getattr(hit, "score", 0.0)
             if text.strip():
                 message_hits.append({
                     "content": f"[{role}] {text}",
                     "type": "message_hit",
                     "confidence": 0.7,
-                    "_score": score,
                     # created_at carried through so the answer context can date-stamp
                     # each turn — the signal the value-aware recency clause relies on.
                     "created_at": getattr(hit, "created_at", "") or "",
@@ -381,16 +379,18 @@ class HyMemAdapter:
         # interleave by confidence so message_hits aren't pushed out of
         # the context window entirely.
         if ability in TASK_RECALL:
-            # MR aggregation path (opt-in, cap>0): counting mode still works
+            # MR aggregation path (opt-in, cap>0): counting mode still works.
+            # message_hits arrive best-first from augment() in both backends
+            # (raw BM25 ascending, reranked combined-score descending) — do not
+            # re-sort on the raw score here, the two directions are opposite.
             if ability == "MR" and total_matches > 0:
-                message_hits.sort(key=lambda h: h["_score"])  # lower BM25 = better
                 memories = [{
                     "content": f"[HyMem counted {total_matches} distinct user messages matching this question]",
                     "type": "system",
                     "confidence": 1.0,
                 }]
                 memories += message_hits + procedure_hits + episode_hits + fts_hits + graph_facts
-                return [m for m in memories if m.pop("_score", None) or True][:min(top_k * 6, 120)], total_matches
+                return memories[:min(top_k * 6, 120)], total_matches
 
             # Task-recall: messages > procedures > then interleave rest by confidence
             memories = message_hits + procedure_hits
@@ -413,10 +413,6 @@ class HyMemAdapter:
             ))
 
         memories = memories[:top_k]
-
-        # Strip internal _score field before returning
-        for m in memories:
-            m.pop("_score", None)
 
         return memories, total_matches
 
@@ -460,12 +456,6 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         system_prompt = ANSWERING_PREFERENCE_PROMPT
     elif ability == "MR":
         system_prompt = ANSWERING_MR_PROMPT
-        # Filter to user-only messages for MR counting questions.
-        # Assistant responses are mostly noise for "how many" questions —
-        # the answer-bearing information is always in user messages.
-        memories = [m for m in memories if m["type"] == "message_hit" and "[user]" in m.get("content", "")]
-        if not memories:
-            system_prompt = ANSWERING_SYSTEM_PROMPT  # fallback if no user messages
     elif ability == "TR":
         system_prompt = ANSWERING_TR_PROMPT
     else:
@@ -532,8 +522,12 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
         question = q["question"]
         print(f"    [{qi+1}/{len(conv['questions'])}] {ability}: {question[:100]}...", flush=True)
 
-        # Search
-        memories, total_matches = hy.search(session_id, question, ability=ability, top_k=top_k)
+        # Search. The ×3 widens the answer context to three times the per-run
+        # --top-k (30 memories at the default 10) — the v16 baseline width.
+        # dea8d94's rewrite of this loop silently dropped the multiplier; the
+        # 10-memory runs that followed scored ~11pp below the 30-memory ones
+        # (KU fell from 70-83% to 0-17%), so this width is load-bearing.
+        memories, total_matches = hy.search(session_id, question, ability=ability, top_k=top_k * 3)
         print(f"      {len(memories)} memories", end="")
         if total_matches > 0:
             print(f" (total matches: {total_matches})", end="")
@@ -550,6 +544,8 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
             "ability": ability,
             "question": question,
             "answer": answer,
+            "ideal_answer": q["ideal_answer"],
+            "rubric": q["rubric"],
             "score": judge_result["score"],
             "scores": judge_result["scores"],
         })
@@ -698,8 +694,10 @@ def main():
         "top_k": top_k,
     })
 
-    # Save
-    results_path = _repo_root.parent / "hymem_beam" / "results.json"
+    # Save — one file per run, so cross-run comparisons keep their metadata
+    # (sample size, top_k, models) instead of each run clobbering the last.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    results_path = _repo_root.parent / "hymem_beam" / f"results_{stamp}.json"
     results_path.parent.mkdir(exist_ok=True)
     output = {
         "metadata": {
@@ -709,12 +707,21 @@ def main():
             "scales": scales,
             "sample": max_conv,
             "top_k": top_k,
+            # Effective answer-context width (top_k × 3). Saved explicitly:
+            # the June 2026 score step came down to this number changing
+            # without any record of it in run output.
+            "context_memories": top_k * 3,
             "elapsed_s": elapsed,
             "answer_calls": answer_llm.call_count,
             "judge_calls": judge_llm.call_count,
         },
         "summary": {scale: {ab: data["avg"] for ab, data in abilities.items()}
                      for scale, abilities in summary.items()},
+        # Full per-question records (answer, ideal, rubric, judge scores) so
+        # runs can be re-judged and diffed post-hoc. An empty "scores" list on
+        # a question with a non-empty rubric means the judge reply failed to
+        # parse and the 0.0 is an artifact, not a graded zero.
+        "conversations": all_results,
     }
     with open(results_path, "w") as f:
         json.dump(output, f, indent=2, default=str)

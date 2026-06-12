@@ -45,6 +45,38 @@ def test_llm_rerank_returns_passthrough_on_garbage():
     assert [h.text for h in out] == ["a", "b"]
 
 
+def test_llm_rerank_accepts_object_wrapped_ratings():
+    """Strict-JSON-mode backends (response_format json_object) must emit an
+    object, not a bare array — the prompt asks for {"ratings": [...]} and the
+    parser must unwrap it."""
+    candidates = [
+        _Hit(text="completely irrelevant blue elephant trivia"),
+        _Hit(text="how to deploy api to staging via docker"),
+    ]
+    llm = StubLLMClient(default=json.dumps({"ratings": [
+        {"index": 0, "relevance": 1},
+        {"index": 1, "relevance": 5},
+    ]}))
+    out = llm_rerank("how do I deploy?", candidates, llm, top_k=2)
+    assert "deploy" in out[0].text
+    assert out[0].score_kind == "reranked"
+
+
+def test_llm_rerank_returns_passthrough_when_backend_raises():
+    """The Reranker contract (never raise) sits on augment()'s hot path: a
+    network/rate-limit error from the LLM must degrade to the un-reranked
+    list, not abort the whole augment call."""
+
+    class _ExplodingLLM:
+        def complete(self, request):
+            raise ConnectionError("simulated 429")
+
+    candidates = [_Hit(text="a"), _Hit(text="b"), _Hit(text="c")]
+    out = llm_rerank("q", candidates, _ExplodingLLM(), top_k=2)
+    assert [h.text for h in out] == ["a", "b"]
+    assert out[0].score_kind == "rrf"
+
+
 def test_rerank_dispatch_with_llm_model():
     candidates = [_Hit(text="x"), _Hit(text="y")]
     llm = StubLLMClient(default=json.dumps([{"index": 1, "relevance": 5}]))
