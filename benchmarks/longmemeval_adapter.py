@@ -408,13 +408,16 @@ class HyMemAdapter:
 
     def __init__(self, db_path: Path, api_key: str = "", embeddings: bool = False,
                  rerank_top_k: int | None = None, rerank_model: str | None = None,
-                 rerank_message_hits: bool | None = None):
+                 rerank_message_hits: bool | None = None,
+                 aggregation_nodes: bool = False, aggregation_broad: bool = False):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
         self.rerank_top_k = rerank_top_k
         self.rerank_model = rerank_model
         self.rerank_message_hits = rerank_message_hits
+        self.aggregation_nodes = aggregation_nodes
+        self.aggregation_broad = aggregation_broad
         self.hy = None
 
     def open(self):
@@ -435,6 +438,14 @@ class HyMemAdapter:
             overrides["rerank_model"] = self.rerank_model
         if self.rerank_message_hits is not None:
             overrides["rerank_message_hits"] = self.rerank_message_hits
+        # RAPTOR A/B levers. --aggregation-nodes enables the layer (dream builds
+        # nodes, the TR-gated tier fires per cfg.aggregation_inject_abilities);
+        # --aggregation-broad additionally clears the ability allowlist, which
+        # reproduces the broad-injection G4 run that lost 69.0 vs 70.0.
+        if self.aggregation_nodes:
+            overrides["aggregation_nodes_enabled"] = True
+        if self.aggregation_broad:
+            overrides["aggregation_inject_abilities"] = ()
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,
@@ -517,16 +528,21 @@ class HyMemAdapter:
                graph_facts_first: bool = False):
         """Search HyMem for the given query.
 
-        Returns (memories, total_matches, graph_count, temporal_events, pool)
-        where `pool` is the FULL pre-truncation candidate text by tier
-        ({"message": [...], "fts": [...]}) — used for recall-ceiling analysis,
-        so a category's misses can be split into retrieval loss vs ranking loss.
+        Returns (memories, total_matches, graph_count, temporal_events,
+        aggregation_nodes, pool) where `pool` is the FULL pre-truncation
+        candidate text by tier ({"message": [...], "fts": [...]}) — used for
+        recall-ceiling analysis, so a category's misses can be split into
+        retrieval loss vs ranking loss. `aggregation_nodes` (RAPTOR tier,
+        TR-gated by default) is returned SEPARATELY from `memories` on purpose:
+        the G4 A/B showed that letting nodes compete for memories[:top_k] slots
+        crowds gold message hits out of the answer pool (KU −9.0pp). They render
+        as their own bracketed context block instead.
         """
         try:
             result = self.hy.augment(query, ability=ability)
         except Exception as e:
             print(f"    [DEBUG] augment error: {e}", flush=True)
-            return [], 0, None, [], {"message": [], "fts": []}
+            return [], 0, None, [], [], {"message": [], "fts": []}
 
         # Collect all sources
         graph_facts = []
@@ -572,6 +588,17 @@ class HyMemAdapter:
                     "type": "procedure",
                     "confidence": 0.75,
                 })
+
+        # RAPTOR aggregation nodes (empty unless the layer is enabled AND the
+        # ability passed the inject gate — TR-only by default). Kept OUT of the
+        # `memories` pool: they go to answer_question as a separate block.
+        aggregation_nodes = []
+        for node in (getattr(result, "aggregation_nodes", None) or []):
+            title = getattr(node, "title", "")
+            summary = getattr(node, "summary", "")[:600]
+            content = f"{title}: {summary}" if title else summary
+            if content.strip():
+                aggregation_nodes.append(content)
 
         episode_hits = []
         for ep in (getattr(result, "episodes", None) or []):
@@ -626,13 +653,14 @@ class HyMemAdapter:
         }
         return (memories[:top_k], getattr(result, 'total_message_matches', 0),
                 getattr(result, 'graph_count', None),
-                getattr(result, 'temporal_events', []), pool)
+                getattr(result, 'temporal_events', []), aggregation_nodes, pool)
 
 
 # ── Answer & Judge ──────────────────────────────────────────────────
 
 def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str = None,
                     total_matches: int = 0, graph_count=None, temporal_events: list | None = None,
+                    aggregation_nodes: list | None = None,
                     question_date: str = "", permissive_default: bool = False) -> str:
     """Ask LLM to answer based on retrieved memories.
 
@@ -640,7 +668,9 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     and temporal reasoning questions that need more cross-session data.
     For MR questions, prefers graph_count (exact graph-native count) over
     total_matches (keyword candidate). For TR questions, injects
-    temporal_events as a date-ordered chronology.
+    temporal_events as a date-ordered chronology. `aggregation_nodes` (RAPTOR
+    cross-session summaries, TR-gated upstream) render as a separate block so
+    they never compete with raw turns for top_k slots or context budget.
 
     `question_date` is the "now" the question is asked at — the reference point
     relative-date questions ("how many days ago?", "a month ago") subtract from.
@@ -677,6 +707,19 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
             marker = " (discussed)" if getattr(ev, 'source', '') == "session-date" else ""
             parts.append(f"  {date}{marker}: {desc}\n")
         parts.append("[END CHRONOLOGY]\n\n")
+
+    # RAPTOR aggregation nodes render as their own block, NOT as memories: they
+    # never consume a memories[:top_k] slot or context-budget chars ahead of raw
+    # turns — the crowding that cost KU −9.0pp in the broad-injection A/B.
+    # Empty unless the layer is enabled and the ability passed the inject gate
+    # (TR-only by default).
+    if aggregation_nodes:
+        parts.append("[CROSS-SESSION SUMMARIES — each fuses related episodes "
+                     "from multiple sessions; verify details against the "
+                     "memories below:]\n")
+        for node in aggregation_nodes:
+            parts.append(f"  {node}\n")
+        parts.append("[END SUMMARIES]\n\n")
     total_chars = 0
     for m in memories:
         content = m["content"]
@@ -873,7 +916,7 @@ def evaluate_question(
         hy.dream_and_wait()
 
     # Search
-    memories, total_matches, graph_count, temporal_events, pool = hy.search(
+    memories, total_matches, graph_count, temporal_events, aggregation_nodes, pool = hy.search(
         question, ability=ability, top_k=top_k * 3, graph_facts_first=graph_facts_first)
     src = "question_date" if q_data.get("question_date") else ("haystack_max" if session_dates else "none")
 
@@ -900,11 +943,12 @@ def evaluate_question(
                    else f"{recall_ceiling}[{recall_tier}]")
     used_marker = "←used" if auto_ability else ""
     router_str = f"{oracle_ability or '∅'}/det={detected_ability or '∅'}{used_marker}"
-    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str}, ability={router_str})", flush=True)
+    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, agg_nodes={len(aggregation_nodes)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str}, ability={router_str})", flush=True)
 
     # Answer
     ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
                                  graph_count=graph_count, temporal_events=temporal_events,
+                                 aggregation_nodes=aggregation_nodes,
                                  question_date=question_date, permissive_default=permissive_default)
 
     # Judge (binary yes/no)
@@ -1206,7 +1250,9 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
     try:
         hy = HyMemAdapter(db_path, api_key=api_key, embeddings=args.embeddings,
                           rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model,
-                          rerank_message_hits=args.rerank_message_hits)
+                          rerank_message_hits=args.rerank_message_hits,
+                          aggregation_nodes=args.aggregation_nodes,
+                          aggregation_broad=args.aggregation_broad)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -1329,7 +1375,7 @@ def _inspect_floor_questions(questions: list[dict], args, api_key: str) -> None:
             # Search with the SAME oracle ability the audited run used (MR for
             # multi-session), so the live tiers reproduce the audited floor.
             oracle_ability = QUESTION_TYPE_TO_ABILITY.get(q_data.get("question_type"), None)
-            pool = hy.search(question, ability=oracle_ability, top_k=args.top_k * 3)[4]
+            pool = hy.search(question, ability=oracle_ability, top_k=args.top_k * 3)[5]
             tiers = _gold_turn_tiers(gold_turns, pool)
             floor_turns = [g for g, t in zip(gold_turns, tiers) if t == "none"]
             # Deep raw-message-FTS scan to confirm the floor + show what DID rank.
@@ -1483,6 +1529,22 @@ def main():
                              "_BASE_URL/_MODEL/_DIM to point at a different server. DEFAULT "
                              "OFF (lexical-only baseline); run paired on --seed to measure "
                              "the recall the FTS-only path leaves behind.")
+    parser.add_argument("--aggregation-nodes", action="store_true",
+                        help="RAPTOR G4 lever: enable the Phase-2 cross-session aggregation "
+                             "layer (dream builds cluster-summary nodes; the retrieval tier "
+                             "fires only for abilities in cfg.aggregation_inject_abilities — "
+                             "TR-only by default — and renders as a separate "
+                             "[CROSS-SESSION SUMMARIES] block that never competes with raw "
+                             "turns for top_k slots). DEFAULT OFF. Requires a dream pass "
+                             "(do not combine with --no-dream) and --embeddings for the "
+                             "node vector arm; with --auto-ability the gate uses the "
+                             "router's TR detection, mirroring production.")
+    parser.add_argument("--aggregation-broad", action="store_true",
+                        help="(with --aggregation-nodes) clear the ability allowlist so the "
+                             "aggregation tier fires on EVERY question — reproduces the "
+                             "broad-injection G4 A/B that lost 69.0 vs 70.0 (KU −9.0pp from "
+                             "nodes crowding gold turns out of the answer pool). For "
+                             "comparison runs only.")
     parser.add_argument("--inspect-floor", default=None, metavar="RUN.json",
                         help="DIAGNOSTIC: characterize WHY the floor questions (ranking "
                              "misses whose gold reaches NO tier) are unrecoverable. Reads an "

@@ -5,6 +5,7 @@ import sqlite3
 
 from hymem.config import HyMemConfig
 from hymem.core.db import backfill_entity_mentions
+from hymem.dreaming import bitemporal
 
 log = logging.getLogger("hymem.dreaming.phase3")
 
@@ -127,6 +128,9 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
             f"UPDATE knowledge_graph SET status = 'retracted' WHERE id IN ({placeholders})",
             ids,
         )
+        # Close the validity interval: these facts were superseded by the
+        # contradicting evidence that drove the decay (schema v15 valid time).
+        bitemporal.stamp_invalidation(conn, ids)
 
 
 def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:

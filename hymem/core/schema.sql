@@ -216,6 +216,12 @@ CREATE TABLE IF NOT EXISTS knowledge_graph (
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_reinforced TIMESTAMP,
+    -- Bi-temporal VALID time (distinct from the transaction-time columns above):
+    -- valid_at = world date the fact became true, invalid_at = world date it was
+    -- superseded (NULL = still valid). Added in migration 015; the validity index
+    -- lives in that migration only (see its header for why it can't sit here).
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','stale','retracted')),
     derived BOOLEAN NOT NULL DEFAULT 0,
     UNIQUE(subject_canonical, predicate, object_canonical)
@@ -323,6 +329,59 @@ END;
 -- re-dreamed episode whose title/summary text changed gets re-embedded.
 CREATE TABLE IF NOT EXISTS episode_embeddings (
     episode_id TEXT PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+    vector_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- RAPTOR cross-session aggregation nodes (schema v16; hierarchy in v17). A
+-- level-0 node fuses a cluster of episodes (connected components over
+-- embedding-OR-entity overlap) that span multiple sessions, so a synthesis
+-- question reads a handful of cluster summaries instead of dozens of raw turns.
+-- Levels >= 1 (v17) are RAPTOR rollups whose member_episode_ids hold CHILD ids
+-- (lower-level node ids and/or pass-through episode ids), recursing until one
+-- is_root digest node — the standing "what do you know about me" summary
+-- exposed via HyMem.digest(). Only level 0 enters query-time retrieval. The
+-- whole layer is additive and off by default (cfg.aggregation_nodes_enabled).
+-- Rebuilt from scratch each dream — membership is a pure function of the
+-- current episodes — so there is no stable-id UPSERT churn; the id is a content
+-- hash of members, which also keys reuse of an unchanged node's LLM fusion.
+CREATE TABLE IF NOT EXISTS aggregation_nodes (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    member_episode_ids TEXT NOT NULL DEFAULT '[]',
+    session_ids TEXT NOT NULL DEFAULT '[]',
+    n_members INTEGER NOT NULL DEFAULT 0,
+    n_sessions INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    level INTEGER NOT NULL DEFAULT 0,
+    is_root INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS aggregation_nodes_fts USING fts5(
+    title, summary,
+    content='aggregation_nodes', content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_insert AFTER INSERT ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_delete AFTER DELETE ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(aggregation_nodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_update AFTER UPDATE ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(aggregation_nodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+    INSERT INTO aggregation_nodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+
+-- Node-summary embeddings, keyed by node id. Retrieval does a Python-cosine
+-- scan over these (no vec0 table) since the node count is small and the tier is
+-- off by default — keeping the vec0 plumbing limited to chunks/edges/episodes.
+CREATE TABLE IF NOT EXISTS aggregation_node_embeddings (
+    node_id TEXT PRIMARY KEY REFERENCES aggregation_nodes(id) ON DELETE CASCADE,
     vector_json TEXT NOT NULL,
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,

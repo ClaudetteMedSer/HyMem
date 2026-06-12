@@ -78,6 +78,25 @@ class EpisodeHit:
 
 
 @dataclass
+class AggregationNodeHit:
+    """A Phase-2 RAPTOR cross-session aggregation node — one fused summary over a
+    cluster of episodes that spanned several sessions. Surfaced as an ADDITIVE
+    tier (only when `cfg.aggregation_nodes_enabled`) so a multi-session synthesis
+    question can read the through-line from one summary instead of re-fusing
+    dozens of raw turns. `member_episode_ids`/`session_ids` let the host trace
+    the node back to its sources."""
+
+    node_id: str
+    title: str
+    summary: str
+    member_episode_ids: list[str]
+    session_ids: list[str]
+    score: float
+    score_kind: str = "bm25"
+    why_retrieved: list[str] = field(default_factory=list)
+
+
+@dataclass
 class FtsHit:
     chunk_id: str
     session_id: str
@@ -220,6 +239,10 @@ class AugmentedContext:
     matching turns. `graph_count.counted` names which side was tallied so the host
     can phrase the answer unambiguously."""
     episodes: list[EpisodeHit] = field(default_factory=list)
+    aggregation_nodes: list[AggregationNodeHit] = field(default_factory=list)
+    """Phase-2 RAPTOR cross-session cluster summaries (see `AggregationNodeHit`).
+    Empty unless `cfg.aggregation_nodes_enabled` is set AND the dream has built
+    nodes — an additive tier that never displaces episode/chunk/message hits."""
     procedures: list[ProcedureHit] = field(default_factory=list)
     matched_entities: list[str] = field(default_factory=list)
     recent_turns: list[Message] = field(default_factory=list)
@@ -446,6 +469,20 @@ def augment(
         top_k=cfg.fts_top_k,
         embedding_client=embedding_client,
     )
+
+    # Phase-2 RAPTOR additive tier: cross-session cluster summaries. Off by
+    # default; only runs when the layer is enabled AND the routed ability is in
+    # `aggregation_inject_abilities` (default TR-only — the G4 A/B showed broad
+    # injection reshuffles ranking against gold message hits everywhere except
+    # temporal reasoning). Never displaces the tiers above — it layers a
+    # synthesis view on top.
+    if cfg.aggregation_nodes_enabled and _aggregation_tier_fires(cfg, ability):
+        ctx.aggregation_nodes = _aggregation_search(
+            conn, user_message,
+            top_k=cfg.aggregation_top_k,
+            embedding_client=embedding_client,
+            max_scan=cfg.embedding_max_scan,
+        )
 
     # ability="IF" (instruction/step recall) pulls a wider procedure set, since
     # procedures — ordered step-by-step workflows — are the natural fit for
@@ -1792,6 +1829,164 @@ def _episode_rrf_chips(
     else:
         sources = "vec"
     return [*base, f"episode_rrf({sources}, {score:.4f})"]
+
+
+def _aggregation_tier_fires(cfg: HyMemConfig, ability: str | None) -> bool:
+    """Whether the aggregation tier runs for this query's (normalized) ability.
+    An empty `aggregation_inject_abilities` means every query (broad mode, for
+    A/B re-runs); otherwise the ability must be in the allowlist — so with the
+    default `("TR",)` an unrouted question (ability None) gets no nodes."""
+    allowed = cfg.aggregation_inject_abilities
+    if not allowed:
+        return True
+    return ability is not None and ability in {a.upper() for a in allowed}
+
+
+def _aggregation_row_hit(
+    row: sqlite3.Row, *, score: float, score_kind: str, chip: str
+) -> AggregationNodeHit:
+    """Build an `AggregationNodeHit` from an aggregation_nodes row, decoding the
+    JSON member/session id lists defensively (a malformed list degrades to [])."""
+    try:
+        member_ids = json.loads(row["member_episode_ids"] or "[]")
+    except (ValueError, TypeError):
+        member_ids = []
+    try:
+        session_ids = json.loads(row["session_ids"] or "[]")
+    except (ValueError, TypeError):
+        session_ids = []
+    return AggregationNodeHit(
+        node_id=row["id"],
+        title=row["title"],
+        summary=row["summary"][:600],
+        member_episode_ids=member_ids,
+        session_ids=session_ids,
+        score=float(score),
+        score_kind=score_kind,
+        why_retrieved=[chip],
+    )
+
+
+def _aggregation_search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    top_k: int = 3,
+    embedding_client: EmbeddingClient | None = None,
+    max_scan: int = 5000,
+) -> list[AggregationNodeHit]:
+    """Phase-2 RAPTOR node retrieval. FTS over node title+summary, plus (when an
+    embedder is present) a Python-cosine scan over `aggregation_node_embeddings`
+    — the node count is small and the tier is off by default, so no vec0 table is
+    maintained. The two ranked lists are RRF-fused, mirroring `_episode_search`.
+    Returns [] cleanly when no node table/rows exist (un-dreamed clients).
+    Only level-0 nodes are candidates: the v17 rollup/digest levels are
+    host-facing standing context (`HyMem.digest()`), not retrieval competitors."""
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    fts_hits: list[AggregationNodeHit] = []
+    if cleaned:
+        tokens = [t for t in cleaned.split() if len(t) >= 2]
+        if tokens:
+            fts_query = " OR ".join(f'"{t}"' for t in tokens)
+            chip = f'agg_fts("{" ".join(tokens)}")'
+            try:
+                rows = conn.execute(
+                    """SELECT n.id, n.title, n.summary, n.member_episode_ids,
+                              n.session_ids, bm25(aggregation_nodes_fts) AS score
+                       FROM aggregation_nodes_fts
+                       JOIN aggregation_nodes n ON n.rowid = aggregation_nodes_fts.rowid
+                       WHERE aggregation_nodes_fts MATCH ? AND n.level = 0
+                       ORDER BY score
+                       LIMIT ?""",
+                    (fts_query, top_k * 2),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            fts_hits = [
+                _aggregation_row_hit(r, score=r["score"], score_kind="bm25", chip=chip)
+                for r in rows
+            ]
+
+    vec_hits: list[AggregationNodeHit] = []
+    if embedding_client is not None:
+        try:
+            rows = conn.execute(
+                """
+                SELECT n.id, n.title, n.summary, n.member_episode_ids,
+                       n.session_ids, ne.vector_json
+                FROM aggregation_node_embeddings ne
+                JOIN aggregation_nodes n ON n.id = ne.node_id
+                WHERE n.level = 0
+                ORDER BY n.created_at DESC
+                LIMIT ?
+                """,
+                (max_scan,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        if rows:
+            qvec = embedding_client.embed([query])[0]
+            qnorm = math.sqrt(sum(x * x for x in qvec)) or 1.0
+            scored: list[tuple[float, sqlite3.Row]] = []
+            for r in rows:
+                vec = decode_vector(r["vector_json"])
+                if len(vec) != len(qvec):
+                    continue
+                dot = sum(a * b for a, b in zip(qvec, vec))
+                vnorm = math.sqrt(sum(x * x for x in vec)) or 1.0
+                scored.append((dot / (qnorm * vnorm), r))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            vec_hits = [
+                _aggregation_row_hit(
+                    r, score=sim, score_kind="vec", chip=f"agg_vec(sim={sim:.3f})"
+                )
+                for sim, r in scored[:top_k * 2]
+            ]
+
+    if not vec_hits:
+        return fts_hits[:top_k]
+    if not fts_hits:
+        return vec_hits[:top_k]
+    return _rrf_merge_aggregation(fts_hits, vec_hits, top_k=top_k)
+
+
+def _rrf_merge_aggregation(
+    fts: list[AggregationNodeHit],
+    vec: list[AggregationNodeHit],
+    *,
+    top_k: int,
+    k: int = 60,
+) -> list[AggregationNodeHit]:
+    """RRF over two ranked aggregation-node lists. Mirrors `_rrf_merge_episodes`,
+    keyed on node_id."""
+    by_id: dict[str, AggregationNodeHit] = {}
+    scores: dict[str, float] = {}
+    for rank, hit in enumerate(fts, start=1):
+        scores[hit.node_id] = scores.get(hit.node_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.node_id, hit)
+    for rank, hit in enumerate(vec, start=1):
+        scores[hit.node_id] = scores.get(hit.node_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.node_id, hit)
+    fts_ids = {h.node_id for h in fts}
+    vec_ids = {h.node_id for h in vec}
+    ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    out: list[AggregationNodeHit] = []
+    for nid, score in ordered[:top_k]:
+        if nid in fts_ids and nid in vec_ids:
+            sources = "fts+vec"
+        elif nid in fts_ids:
+            sources = "fts"
+        else:
+            sources = "vec"
+        out.append(
+            replace(
+                by_id[nid], score=score, score_kind="rrf",
+                why_retrieved=[
+                    *by_id[nid].why_retrieved, f"agg_rrf({sources}, {score:.4f})"
+                ],
+            )
+        )
+    return out
 
 
 def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[ProcedureHit]:

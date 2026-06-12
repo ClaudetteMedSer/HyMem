@@ -12,7 +12,7 @@
 
 **~9,400 lines of Python**, zero npm, zero Docker required.
 
-**Benchmarked on LongMemEval.** On the 500-question LongMemEval-S suite, HyMem scores **67.6% overall on the production path** — the in-library ability router shaping retrieval with *no* oracle labels, so the number reflects what real Hermes gets, not a benchmark-only ceiling. Full table and methodology in [§11](#11-benchmark-results-longmemeval).
+**Benchmarked on LongMemEval.** On the 500-question LongMemEval-S suite, HyMem scores **70.0% overall on the production path** — the in-library ability router shaping retrieval with *no* oracle labels, so the number reflects what real Hermes gets, not a benchmark-only ceiling. The headline runs with **dreaming on** (worth +3.6pp; the A/B and per-category lifts are in §11). Full table and methodology in [§11](#11-benchmark-results-longmemeval).
 
 ---
 
@@ -143,6 +143,7 @@ hymem/
 │   ├── phase2.py       Consolidation: markers→profile, graph→MEMORY.md
 │   ├── phase3.py       Co-occurrence-aware decay + retraction
 │   ├── inference.py    Transitive closure over depends_on edges
+│   ├── bitemporal.py   Valid-time stamping: valid_at/invalid_at on edges
 │   ├── episodes.py     LLM-powered episodic memory extraction
 │   ├── procedures.py   LLM-powered procedural memory extraction
 │   ├── summary.py      LLM-powered session summarization
@@ -194,7 +195,7 @@ hymem/
 - `entity_types` — canonical entity → type classification (language, framework, database, etc.)
 
 **Knowledge graph:**
-- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges
+- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges. **Bi-temporal** (schema v15): alongside the transaction-time columns (`first_seen`/`last_seen` — when HyMem *learned* a fact), each edge carries a valid-time interval `valid_at`/`invalid_at` — when the fact was true *in the world*, sourced from the originating message's date — so supersession is a closed interval (`invalid_at IS NULL` = still valid) rather than a status flip that erases the "what was true as of date X" axis
 - `kg_evidence` — per-source provenance linking edges to chunks, with value/text/temporal metadata
 - `edge_embeddings` — JSON-encoded embedding vectors for knowledge graph edges, keyed on triple text so churning derived edges reuse cached vectors
 - `entity_aliases` — surface form → canonical entity mapping
@@ -266,6 +267,8 @@ Results are written to `MEMORY.md`'s auto-section, capped at `insights_max_entri
    - If yes → add 1 to `neg_evidence` (soft contradiction)
    - If no → leave alone (topic hasn't resurfaced)
 2. Any edge whose Laplace-smoothed confidence `(pos+1)/(pos+neg+2)` drops below the retract threshold (default: 0.15) gets `status = 'retracted'` — kept for audit but excluded from query results.
+
+**Bi-temporal stamping** (`dreaming/bitemporal.py`, schema v15): after decay, `stamp_validity()` opens the valid-time interval on every edge minted this cycle — `valid_at` ← the earliest **positive**-evidence source-message date (falling back to `first_seen`), write-once and idempotent. When an edge is superseded — phase-3 retraction here, or an explicit `retract_edge()` — `stamp_invalidation()` closes it: `invalid_at` ← the newest **negative**-evidence date (the moment the contradicting fact arrived), falling back to the flip time. Behavioral-dedup retraction is *not* stamped: collapsing duplicate edges into a survivor is representational, not a valid-time invalidation.
 
 **Transitive inference** (`inference.py`): After decay, computes transitive closure for derived edges via two rules. (1) `A depends_on B, B depends_on C → A depends_on C` (BFS over the depends_on subgraph). (2) `A uses B, B depends_on C → A depends_on C` (one-hop cross-predicate, folded into `depends_on` so the predicate vocabulary stays stable and no schema migration is required). All derived edges are marked `derived=1` with confidence equal to the product of the source edges' smoothed confidences; previously-derived edges are wiped each cycle so the closure refreshes from scratch. Edges below the retract threshold are filtered out.
 
@@ -519,7 +522,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**427 tests total, 100% passing** across 41 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
+**564 tests total, 100% passing** across 44 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling, numeric / temporal value parsing
@@ -539,6 +542,9 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
 - `test_mcp_server.py` — MCP tool correctness (all 7 tools)
 - `test_retract.py` — Edge retraction, alias resolution, idempotency, feedback-row recording
+- `test_bitemporal.py` — Valid-time interval: valid_at from positive-evidence world date (write-once), invalid_at on supersession from newest negative-evidence date, as-of resolution, retract_edge interval-close, migration backfill + export round-trip
+- `test_raptor_cluster_probe.py` — Pure connected-components clustering core of the Phase-2 RAPTOR front-run gate (`benchmarks/raptor_cluster_probe.py`): cosine/Jaccard primitives, OR-link predicate (embedding *or* entity overlap), transitive closure, embedding-bridge across disjoint entity sets, threshold sensitivity. The DB/dream side runs only on the box; this pins the clusterer the build reuses (re-exported from `hymem.dreaming.aggregate`, so probe/tests/production share one clusterer)
+- `test_aggregate.py` — Phase-2 RAPTOR aggregation layer (`hymem/dreaming/aggregate.py` + the additive retrieval tier): cluster-selection policy (only cross-session, multi-member clusters become nodes; singletons/single-session dropped), content-hash node id (order-independent, membership-sensitive), the persisted node + summary-embedding shape, full-rebuild semantics (no stale node lingers), the off-by-default build/query guards, and that retrieval surfaces nodes *additively* without displacing the episode tier
 - `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording, lock-lease heartbeat (`_refresh_lock` owner advance / holder-guard / once-per-session), `dream_status()` backlog + in-progress reporting
 - `test_dedup_delock.py` — Dedup similarity vectors embedded outside the write lock (`conn.in_transaction` False at every embed), behavior preserved end-to-end
 - `test_dedup_samewave.py` — Same-cycle sibling collapse (same- and cross-chunk), no over-merging of non-siblings, lexical guard still applies, no in-lock embed
@@ -559,19 +565,33 @@ HyMem is evaluated end-to-end on **LongMemEval-S**, the standard long-term-memor
 - **Oracle** — the question-type label drives retrieval shaping. The category ceiling.
 - **Production-truth (`--auto-ability`)** — the in-library `detect_ability` router (`query/intent.py`, §3) infers the ability from the query alone, label-free, exactly as it does in Hermes. The honest number.
 
-**Production-truth: 67.6% overall** on the full 500-question suite (auto-ability router; permissive, abstention-guarded default answer prompt; recency-dated raw-message context). Dreaming is off for these runs — it is score-neutral on LongMemEval's single-haystack setup and is kept on in production for the cross-session knowledge graph LongMemEval can't see (§8). Answering and judging use the default DeepSeek model.
+**Production-truth: 70.0% overall** on the full 500-question suite (auto-ability router; permissive, abstention-guarded default answer prompt; recency-dated raw-message context; **full dream**). Answering and judging use the default DeepSeek model. Earlier headline runs were no-dream (LME's single-haystack setup once looked dream-neutral); the definitive A/B below overturns that — dream is worth **+3.6pp overall** and the graph facts it consolidates now carry real weight in retrieval.
 
 | Question type | Score |
 |---|---|
 | Single-session-user (SS-U) | 95.7% |
-| Knowledge-update (KU) | 75.6% |
+| Knowledge-update (KU) | 76.9% |
 | Temporal-reasoning (TR) | 72.9% |
+| Single-session-preference (SS-P) | 66.7% |
 | Single-session-assistant (SS-A) | 66.1% |
-| Single-session-preference (SS-P) | 60.0% |
-| Multi-session (MS) | 45.1% |
-| **Overall** | **67.6%** |
+| Multi-session (MS) | 51.9% |
+| **Overall** | **70.0%** |
 
 For context, published LongMemEval figures place this local, embedded, SQLite-only system ahead of Honcho (63.8) and the RAG / LIGHT baselines (48.5 / 51.7); the frontier system (Hindsight, 89.4) leads almost entirely on **multi-session** — which is exactly HyMem's lowest row and its open frontier (below).
+
+**Dreaming is worth +3.6pp — the definitive A/B (500q, seed 0, auto-ability, permissive-default).** The full-dream table above is the canonical number; the no-dream column below is the same config with the dream cycle skipped:
+
+| Question type | No-dream | Full-dream | Δ |
+|---|---|---|---|
+| Knowledge-update (KU) | 70.5% | 76.9% | +6.4pp |
+| Multi-session (MS) | 42.9% | 51.9% | +9.0pp |
+| Temporal-reasoning (TR) | 74.4% | 72.9% | −1.5pp |
+| Single-session-preference (SS-P) | 56.7% | 66.7% | +10.0pp |
+| Single-session-assistant (SS-A) | 67.9% | 66.1% | −1.8pp |
+| Single-session-user (SS-U) | 94.3% | 95.7% | +1.4pp |
+| **Overall** | **66.4%** | **70.0%** | **+3.6pp** |
+
+The biggest lifts land where cross-session consolidation matters most: **MS +9pp** (dream bridges fractured sessions), **SS-P +10pp** (preferences extracted into graph facts), **KU +6.4pp** (knowledge updates consolidated). The TR and SS-A dips are within LLM-judge variance (~1.5–2pp). The recall ceiling confirms the *mechanism*, not just the score: retrieval misses dropped 42 → 39, and the "both" recovery tier (message + graph facts) jumped **0 → 98** — dream's graph facts are now actively contributing — while MS ranking misses dropped 10 (67 → 57), so the consolidated facts also improve the reranker's candidate quality. Abstention improves in step (70.0% → 76.7% correct refusals): graph consolidation helps the system tell "I truly don't know" from "I just can't find it in messages." The cost is real — **140 min vs 12 min (11.7×), ~1.7M tokens** — which is why dream is a background idle cycle in production, not an inline step.
 
 **What drives the score — every lever carries to production, none reads the oracle label:**
 
@@ -579,13 +599,21 @@ For context, published LongMemEval figures place this local, embedded, SQLite-on
 - **Label-free ability routing** (`detect_ability`, EN+NL regex, §3) — fills MR/TR shaping in production with no oracle label. MR layers a deterministic, **additive** user-turn count on normal retrieval (a false-positive route stays harmless — retrieval is never suppressed); TR injects a date-ordered chronology.
 - **Recency-dated context** — `message_hits` are stamped with their `created_at`, plus a value-aware recency clause so the answerer prefers the most recent turn that actually *states* a value rather than a later tangential mention. Lifted knowledge-update from 62.8% → 75.6%.
 - **Permissive, abstention-guarded default prompt** — recovers single-session-preference questions the strict prompt refused, while holding the abstention guard tight on single-turn facts.
+- **Dreaming (graph consolidation)** — the background dream cycle extracts a cross-session knowledge graph whose facts join the retrieval pool; worth +3.6pp overall and the dominant lever on MS / SS-P / KU (the A/B above).
 
-**The open frontier is multi-session (45.1%).** Extensive LLM-free probing established that MS *retrieval* is effectively closed — the gold turns do reach the answer context; the residual is cross-session **synthesis** (a reader problem, not retrieval) plus a small floor of facts buried as incidental asides inside otherwise off-topic turns. One tempting "fix" (a user-only context filter for MR) was built, measured, and **reverted**: it was neutral on its target and dropped assistant-turn gold on MR-misrouted single-session-assistant questions — a worked example of the project's rule that you never *suppress* retrieval on a routed ability that has false positives, only *add* to it. The full investigation, including dead-ends not to re-chase, lives in `benchmarks/longmemeval_roadmap.md`.
+**The open frontier is multi-session (51.9%).** Extensive LLM-free probing established that MS *retrieval* is effectively closed — the gold turns do reach the answer context; the residual is cross-session **synthesis** (a reader problem, not retrieval) plus a small floor of facts buried as incidental asides inside otherwise off-topic turns. One tempting "fix" (a user-only context filter for MR) was built, measured, and **reverted**: it was neutral on its target and dropped assistant-turn gold on MR-misrouted single-session-assistant questions — a worked example of the project's rule that you never *suppress* retrieval on a routed ability that has false positives, only *add* to it. The full investigation, including dead-ends not to re-chase, lives in `benchmarks/longmemeval_roadmap.md`.
+
+**RAPTOR cross-session aggregation (Phase 2), gate PASSED → built.** Since the MS residual is *synthesis* (all gold turns reach context, the reader fails to fuse ~45 raw slots), the fix is upstream: pre-compute hierarchical aggregation nodes so the answer model fuses a handful of cluster summaries instead of dozens of raw turns. This only helps if clustering *co-locates* a question's synthesis inputs into a single node — so, mirroring the front-run discipline that killed the L3 diversity-pack, it was gated by an offline probe (`benchmarks/raptor_cluster_probe.py`) **before** any table or migration was built. The probe dreams each MS miss into episodes, clusters them across sessions by embedding-or-entity overlap, and measures how often the gold-bearing episodes land in one cluster. **Result (grid emb≥0.55 OR ent≥0.50, 53 MS ranking misses): of the 31 questions whose gold turns became episodes, 27 (87%) had all their gold episodes land in a single cluster (mean 1.13 gold-clusters/question against 16.8 clusters/question)** — one aggregation-node summary captures everything the reader must fuse. The remaining 22/53 (42%) have *no* gold episode at all: a dream **coverage** gap (episode-extraction recall), not a clustering gap, and a separate lever that doesn't block this build. High co-location → build, so the layer has LANDED: schema v16 (`aggregation_nodes` + `aggregation_node_embeddings`, migration `016`), `dreaming/aggregate.py` (cluster → fuse each cross-session multi-session cluster with one LLM call → full-rebuild the nodes, cache-keyed summary embeddings), a dream-runner step, and an **additive, off-by-default** retrieval tier (`cfg.aggregation_nodes_enabled`) that surfaces cluster summaries in `ctx.aggregation_nodes` without displacing the episode/chunk/message tiers. Off by default → zero dream-time cost and zero query-time behavior change until a host opts in. It is unit-covered offline (`test_aggregate.py`, plus the clusterer pinned in `test_raptor_cluster_probe.py`); the decisive co-location run was on the Hermes box (it needs real dreams).
+
+**G4 verdict (2026-06-11): closed as an LME lever → pivoted to a standing digest.** The on/off LME A/B lost (69.0 vs 70.0): the nodes recovered no messages the message/chunk tiers missed — they only reshuffled ranking, crowding knowledge-update gold out of the answer pool — and a TR-gated re-run was a wash (temporal-reasoning dead flat; the earlier +3pp was run variance). Retrieval-side injection structurally can't win where raw-message FTS already closes recall, so the layer's consumption model is now **host-facing standing context**: schema v17 adds RAPTOR hierarchy levels — dreaming recursively rolls the level-0 cluster nodes plus all unclustered episodes (capped, most-recent-first) up into one **root digest node**, with a consecutive-chunk fallback that guarantees convergence even when nothing clusters — and `HyMem.digest()` returns that root for system-prompt injection: the "what do you know about me?" answer no keyword retrieval can produce. Levels ≥ 1 never enter the query-time tier (level-0 filter in `_aggregation_search`), so the digest cannot crowd retrieval by construction, and every fusion is reuse-cached by member-set hash, so re-dreaming a stable store costs zero LLM calls. The query-time tier itself stays additive and ability-gated (`cfg.aggregation_inject_abilities`, default TR-only) for hosts that opt in.
 
 **Reproduce:**
 
 ```bash
-# production-truth (the 67.6% headline)
+# production-truth (the 70.0% headline — full dream, ~140 min at this config)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
+    --workers 4 --permissive-default
+# fast no-dream A/B (the 66.4% column, ~12 min)
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
     --workers 4 --no-dream --permissive-default
 # oracle ceiling (question-type label drives shaping)

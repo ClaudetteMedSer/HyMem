@@ -11,7 +11,8 @@ from dataclasses import dataclass
 
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
-from hymem.dreaming import phase1, phase2, phase3
+from hymem.dreaming import bitemporal, phase1, phase2, phase3
+from hymem.dreaming.aggregate import build_aggregation_nodes
 from hymem.dreaming.inference import infer_transitive_edges
 from hymem.dreaming.chunks import (
     Chunk,
@@ -62,6 +63,7 @@ class DreamReport:
     edges_embedded_from_cache: int = 0
     episodes_embedded: int = 0
     episodes_embedded_from_cache: int = 0
+    aggregation_nodes_built: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
 
@@ -451,6 +453,13 @@ def run_dreaming(
             derived = infer_transitive_edges(conn, cfg)
             if derived:
                 log.info("inference.derived count=%d", derived)
+            # Open the bi-temporal validity interval on every edge minted this
+            # cycle (direct + derived) from its source-message world date
+            # (schema v15). After decay so retracted edges already carry an
+            # invalid_at; write-once so this is idempotent across cycles.
+            stamped = bitemporal.stamp_validity(conn)
+            if stamped:
+                log.info("bitemporal.valid_at_stamped count=%d", stamped)
             pruned = prune_chunks(conn, cfg)
             pruned += prune_messages(conn, cfg)
             pruned += prune_retracted_edges(conn, cfg)
@@ -496,6 +505,19 @@ def run_dreaming(
                         conn, pending_episodes
                     )
                 report.episodes_embedded_from_cache = pending_episodes.cache_hits
+
+        # Phase-2 RAPTOR aggregation. Runs last (needs the fresh episode
+        # embeddings the clusterer reads) and is a no-op unless the layer is
+        # enabled. Manages its own transactions; off by default so it costs
+        # nothing for clients that haven't opted in.
+        if cfg.aggregation_nodes_enabled:
+            try:
+                report.aggregation_nodes_built = build_aggregation_nodes(
+                    conn, cfg, llm, embedding_client
+                )
+            except Exception:
+                log.exception("aggregate.build_failure")
+
         after_retracted = conn.execute(
             "SELECT COUNT(*) AS c FROM knowledge_graph WHERE status = 'retracted'"
         ).fetchone()["c"]

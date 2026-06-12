@@ -109,6 +109,87 @@ class HyMemConfig:
     of `ProcedureHit`s than the default `fts_top_k`. Other abilities keep
     `fts_top_k`."""
 
+    aggregation_nodes_enabled: bool = False
+    """Master switch for the Phase-2 RAPTOR cross-session aggregation layer (off
+    by default). When True, dreaming clusters episodes across sessions
+    (connected components over embedding-OR-entity overlap) and fuses each
+    multi-session cluster into one `aggregation_nodes` summary, and augment()
+    surfaces matching nodes in `ctx.aggregation_nodes` as an ADDITIVE tier (it
+    never replaces episode/chunk/message retrieval). It targets the multi-session
+    *synthesis* residual: a question whose answer is spread one-fact-per-session
+    can be read off a single cluster summary instead of re-fusing dozens of raw
+    turns. Off → zero extra LLM cost at dream time and zero behavior change at
+    query time. The front-run co-location probe that gated this build lives in
+    `benchmarks/raptor_cluster_probe.py`."""
+
+    aggregation_emb_threshold: float = 0.55
+    """Cosine threshold above which two episodes link into the same cluster
+    (the embedding arm of the OR). Default from the passing probe grid point
+    (emb≥0.55 OR ent≥0.50), which co-located 87% of mappable gold."""
+
+    aggregation_ent_threshold: float = 0.50
+    """Jaccard(key_entities) threshold above which two episodes link (the entity
+    arm of the OR). Catches the named-thing continuity embeddings miss."""
+
+    aggregation_min_sessions: int = 2
+    """Only fuse clusters spanning at least this many DISTINCT sessions. The
+    whole point is *cross-session* synthesis; a single-session cluster adds
+    nothing the per-session episode/summary doesn't already give, so it is
+    skipped (no LLM call, no node)."""
+
+    aggregation_min_members: int = 2
+    """Minimum episodes in a cluster before it is fused. Singletons are skipped."""
+
+    aggregation_max_members: int = 12
+    """Cap on episodes fed to one aggregation summary call, bounding context and
+    cost. Largest clusters are truncated to their first `max_members` episodes in
+    message order; the node records the full membership regardless."""
+
+    aggregation_top_k: int = 3
+    """Number of aggregation nodes augment() returns in `ctx.aggregation_nodes`
+    when the layer is enabled."""
+
+    aggregation_digest_enabled: bool = True
+    """Sub-switch (active only when `aggregation_nodes_enabled` is True): after
+    the level-0 cluster nodes are built, recursively roll the tree up — cluster
+    the level-0 nodes plus the episodes no cluster absorbed, fuse each group
+    into a level-N node, repeat — until one ROOT digest node remains: the
+    standing "what do you know about me?" summary `HyMem.digest()` returns.
+    This is the consumption model the G4 A/Bs argued FOR: the digest is host-
+    facing standing context (e.g. system-prompt injection), not a retrieval
+    competitor — levels >= 1 never enter the query-time tier, so it cannot
+    crowd message hits. Fusion calls are reuse-cached by member-set hash, so a
+    dream over a stable store rebuilds the tree without new LLM calls."""
+
+    aggregation_digest_max_leaves: int = 256
+    """Cap on pass-through episodes (those outside every kept cluster) admitted
+    into the digest tree, keeping the most recent. Bounds first-build LLM cost
+    on a large backlog store (~leaves/11 fusion calls worst case); level-0
+    nodes are always included."""
+
+    aggregation_digest_anchor_facts: int = 20
+    """Max ACTIVE, non-derived knowledge-graph edges injected into the root
+    digest fusion as a VERIFIED FACTS ground-truth block (0 disables). The
+    summaries the root fuses are machine-generated and can crystallize
+    hallucinated identity details in the reuse cache (the "Acme Corp" incident);
+    graph edges are extracted directly from conversation evidence, so they give
+    the model true identity/preference signals to use instead of a vacuum to
+    fill, and an explicit license to drop summary claims that conflict. The
+    root node's cache id includes a hash of this block, so the digest
+    regenerates whenever the anchor facts change."""
+
+    aggregation_inject_abilities: tuple[str, ...] = ("TR",)
+    """Abilities for which the aggregation tier fires at query time (empty tuple
+    = every query, the broad mode). The G4 LME A/B (500q, seed 0) showed broad
+    injection is net-harmful: nodes recover NO messages the message/chunk tiers
+    missed — they only reshuffle ranking, crowding gold turns out of the answer
+    pool (KU −9.0pp, SS-P −3.4pp) while helping only temporal reasoning
+    (TR +3.0pp, −4 ranking misses). So by default the tier only fires for
+    TR-routed questions — the one ability with a verified mechanism — and is a
+    no-op elsewhere. Additive-safe under routing errors: a TR false positive
+    merely adds a summary tier (never displaces other tiers), a false negative
+    is identical to the layer being off."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 

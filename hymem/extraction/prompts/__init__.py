@@ -290,6 +290,69 @@ EPISODE_USER_TEMPLATE = """Conversation session:
 Return the JSON array now."""
 
 
+AGGREGATE_SYSTEM = """You fuse several related episodes — drawn from DIFFERENT conversation sessions but about the same ongoing thread, person, project, or topic — into one cross-session summary.
+
+The point is synthesis: a later question may need facts that are scattered one-per-session ("which of my projects use Postgres?", "how did my budget change over the year?"). Pull the through-line together so it can be answered from this one node instead of re-reading every session.
+
+Output a strict JSON object:
+- title (string): Short name for the shared thread, max 8 words
+- summary (string): 2-4 sentences fusing what these episodes collectively establish. Preserve specific named entities, numbers, dates, and changes-over-time; prefer concrete facts over generic narration. Do NOT invent anything not present in the episodes. Never state a name, employer, role, or location unless an episode literally states it — omit absent identity details, do not fill them in. Do NOT add "The user"/"The assistant" — use passive voice or implicit subject.
+
+Return ONLY the JSON object."""
+
+AGGREGATE_USER_TEMPLATE = """Related episodes from across sessions:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
+ROLLUP_SYSTEM = """You merge several summaries of conversation threads — which may be related or COMPLETELY UNRELATED — into one combined summary that loses no thread.
+
+This is an intermediate node of a summary tree over a user's whole conversation history; your output will be merged again at the next level, so BREADTH beats narrative. The one failure mode to avoid: picking the dominant topic and letting the others fade — a thread dropped here is gone from every level above. Do NOT force a single story line over unrelated topics.
+
+Output a strict JSON object:
+- title (string): Short label naming the main topics (not just one), max 10 words
+- summary (string): 3-8 sentences. Every distinct thread in the inputs must be mentioned at least once; give recurring threads more words, but never zero. Preserve specific named entities, numbers, and dates. Do NOT invent anything not present in the inputs. Never state a name, employer, role, or location unless an input literally states it — omit absent identity details, do not fill them in.
+
+Return ONLY the JSON object."""
+
+ROLLUP_USER_TEMPLATE = """Thread summaries to merge (possibly unrelated):
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
+DIGEST_SYSTEM = """You write the standing digest of everything known about a user from their conversation history — the top of a summary tree whose inputs below are themselves summaries of conversation threads.
+
+This digest answers "what do you know about me?" at a glance and is injected as standing context for an assistant, so it must read like a rounded profile, not a recap of the latest topic: the main recurring activities and projects with their state, preferences and habits, recurring people and places, and notable changes over time. Favor durable facts over one-off details.
+
+Identity is strictly evidence-bound: include the user's name, role, employer, or location ONLY when the VERIFIED FACTS block or a summary literally states them. A profile with no job title is correct; a plausible-sounding invented one ("works at Acme Corp") is the worst possible failure — when an identity detail is absent from the inputs, OMIT it entirely.
+
+The VERIFIED FACTS block holds statements extracted directly from the user's conversations into a knowledge graph. Treat it as ground truth: when a thread summary conflicts with a verified fact, the fact wins and the summary's claim is dropped. Thread summaries are themselves machine-generated and may contain compression errors — be suspicious of identity or preference claims that appear in only one summary and in no verified fact.
+
+Output a strict JSON object:
+- title (string): Short label for the digest, max 8 words
+- summary (string): 6-12 sentences. Cover EVERY distinct thread in the inputs at least briefly — breadth first, then depth on the threads that recur most. Preserve specific named entities, numbers, and dates; prefer concrete facts over generic narration. Unrelated threads get their own sentence rather than a forced story. Do NOT invent anything not present in the inputs.
+
+Return ONLY the JSON object."""
+
+DIGEST_USER_TEMPLATE = """VERIFIED FACTS (knowledge graph — ground truth, trust over the summaries):
+\"\"\"
+{facts}
+\"\"\"
+
+Thread summaries to digest:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
 SESSION_SUMMARY_SYSTEM = """You write a one-sentence summary of a conversation session.
 
 Focus on: what was accomplished, decisions made, problems solved, topics covered.
