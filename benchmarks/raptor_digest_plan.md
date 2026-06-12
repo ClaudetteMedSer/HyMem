@@ -68,7 +68,10 @@ store — trivial). Checklist:
       ABSENT — that absence is the Stage 1 motivation, record it.
 - [x] Coverage attribution: 66/92 sessions covered (71.7%) — confirmed via the Stage 2
       probe on 2026-06-12; the 26-session gap is Stage 2's (see its RESULT below).
-- [ ] Second dream, no changes → `reused=N` (all fusions), digest byte-identical.
+- [x] Second dream, no changes → `reused=N` (all fusions), digest byte-identical.
+      *(Confirmed 2026-06-12 post-build-wave: third dream pass 34/34 reused,
+      digest byte-identical — the second pass legitimately regenerated because
+      profile.v2 rows entered the anchor between passes. Stage 0 fully CLOSED.)*
 
 **Gate:** if v4 still shows invented identity after cache eviction + anchor, do NOT
 prompt-tune further — that's evidence the model invents at episode level (upstream of
@@ -131,6 +134,26 @@ confirmed end-to-end; what failed is extraction precision, not consumption.
   a full re-dream under a bumped digest prompt).
 **Re-gate procedure (box):** same as before — `profile_prompt_dump.py`,
 hand-score ≥0.9, only then set `profile_extraction_enabled=True` and dream.
+
+**RE-GATE RESULT (box run 2026-06-12): profile.v2 PASSED — Stage 1 CLOSED.**
+Raw 83.7%, adjusted ~95% (≈123/129; the raw score penalized verbose-but-correct
+role variants like "aios bedrijfsgeneeskunde" against a too-strict GT set).
+Every v1 failure mode fixed and verified: ZERO health_condition bleeds, ZERO
+GitHub-org employers, ZERO repo possessions, and the previously-missed
+role=bedrijfsarts / employer=O3 now extracted (the aboutness inline example
+working). Zero Acme/senior-engineer extraction — the beam-test session handled
+correctly. Residual imperfections (NOT worth a v3 re-gate cycle):
+- 2× relationship without slot_key ("supervisor" sans "titus skrabanja") —
+  validation drops these at persist time, so they cost recall, not precision;
+  a one-line prompt nudge IF a v3 ever happens for other reasons.
+- 1× employer="not explicitly stated" — LLM emitted meta-reasoning as a value;
+  genuine but singular.
+**Default flipped back ON (`profile_extraction_enabled=True`) per the gate
+contract.** Any future material prompt change re-enters the same gate: bump
+PROFILE_PROMPT_VERSION, default False, re-score ≥0.9, re-enable.
+End-to-end stabilization confirmed: profile rows entered the anchor → root
+regenerated once (expected — anchor hash changed), then third dream 34/34
+reused, digest byte-identical, Acme omitted across all three passes.
 
 **Problem:** the anchor can only inject what the graph knows, and the 18-predicate
 vocabulary is tech-domain. "User is a bedrijfsarts in Amsterdam named Atta" never becomes
@@ -267,6 +290,9 @@ contract (probe re-exports it) — blocking only generates the candidate pair li
 3a probe clean or guard built, dream-time cost measured and acceptable (log
 `nodes=/reused=` over a week — steady-state should be near-full reuse). The QUERY tier
 stays TR-gated; enabling the layer is primarily for the digest.
+*Status 2026-06-12: criteria 1 and 2 MET (Stage 0 closed; guard built and
+verified ≤15 on the box). Steady-state reuse already looks right (34/34 on the
+no-change pass) — what remains is the week-scale cost observation, then flip.*
 
 ---
 
@@ -299,29 +325,29 @@ digest say X" with provenance — pairs well with Hermes UI later.
 
 ---
 
-## Next box run (after the 2026-06-12 build wave: profile.v2 + fallback chunk + chaining guard)
+## Next box run — COMPLETED 2026-06-12, all gates passed
 
-1. Pull the branch; the next dream auto-migrates to schema v19 (purges the
-   failed profile.v1 rows; profile extraction is default-OFF so no profile
-   calls happen).
-2. That same dream digests the 23 never-dreamed sessions (~23 one-off LLM
-   calls via the fallback chunk) and regenerates cluster fusions under
-   `cluster.v3` windows (≤15 members). Then:
-   - re-run `benchmarks/episode_coverage_probe.py` → never_dreamed should be ~0;
-   - re-run `benchmarks/cluster_size_probe.py` → still reports RAW chaining
-     (expected: the 348-mega-component persists in the RAW view; the guard
-     windows it at build time — check `aggregation_nodes` member counts ≤ 15);
-   - eyeball `hy.digest()` — breadth should hold or improve with the 23 newly
-     covered sessions.
-3. Re-gate profile.v2: `python benchmarks/profile_prompt_dump.py <store>
-   --sessions 20`, hand-score precision. ≥0.9 → set
-   `profile_extraction_enabled=True`, re-dream (per-session
-   `profile_prompt_version` stamps are NULL, so every session re-extracts
-   without re-digesting), confirm digest identity facts. <0.9 → iterate the
-   prompt (bump to profile.v3), leave the flag off.
-4. Still outstanding from Stage 0: second no-change dream → `reused=N`,
-   digest byte-identical (note: the FIRST post-pull dream regenerates cluster
-   fusions because of the v3 salt — run the reuse check on the dream after).
+1. ✓ Auto-migrated to v19, v1 rows purged.
+2. ✓ Coverage 66→71/92 (77.2%); never_dreamed 23→9 — the 9 are ALL 0-message
+   WebSocket placeholders, which the fallback correctly skips (working as
+   designed). dreamed_zero_short now 12: diagnostic/trigger sessions (1–4 msg
+   tech content) where the fallback chunk exists but the episode extractor
+   legitimately titles nothing — arguably correct; covering them would need an
+   episode-extraction prompt tweak (a "single substantive exchange is an
+   episode" instruction), parked as an OPTIONAL Stage 2b below.
+   ✓ Cluster guard: level-0 nodes all ≤15 members (was one 348-component);
+   probe still reports the raw 352-mega-cluster by design (it measures
+   uncapped chaining).
+3. ✓ profile.v2 re-gate PASSED ~95% adjusted (see Stage 1 RE-GATE RESULT);
+   default flipped back ON.
+4. ✓ Reuse check: third dream 34/34 reused, digest byte-identical; Acme
+   omitted across all three passes. Tests on box: 621 passed / 2 skipped.
+
+**Optional Stage 2b (parked, decide later):** the 12 dreamed_zero_short
+diagnostic sessions. Current behavior is defensible (no episode in "diagnostic
+trigger" content); only build the prompt tweak if digest breadth over those
+sessions ever matters. Same front-run contract: offline before/after on those
+12 sessions first.
 
 ## Suggested order for tomorrow
 

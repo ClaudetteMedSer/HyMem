@@ -203,12 +203,15 @@ class HyMemConfig:
     merely adds a summary tier (never displaces other tiers), a false negative
     is identical to the layer being off."""
 
-    profile_extraction_enabled: bool = False
+    profile_extraction_enabled: bool = True
     """Master switch for the typed user-profile tier (schema v18, Stage 1 /
-    P4). DEFAULT OFF: the profile.v1 prompt FAILED the on-box hand-scored
-    precision gate (~8% — see benchmarks/raptor_digest_plan.md Stage 1), so
-    extraction stays gated off until the profile.v2 prompt re-passes the ≥0.9
-    precision gate on the box. When True, dreaming runs one extra LLM call per
+    P4). Default ON since profile.v2 PASSED the on-box hand-scored precision
+    gate (~95% adjusted, zero v1 bleed-throughs, 2026-06-12 — see
+    benchmarks/raptor_digest_plan.md Stage 1; profile.v1 had FAILED it at ~8%,
+    which kept this False until the v2 re-gate). Any material prompt change
+    re-enters the same gate: bump PROFILE_PROMPT_VERSION, flip this False,
+    re-score ≥0.9 on the box, then re-enable. When True, dreaming runs one
+    extra LLM call per
     dreamed session over the session's USER turns only, extracting facts into
     the CLOSED slot vocabulary (role, name, employer, location, language,
     relationship(person), possession, age_birthday, health_condition,

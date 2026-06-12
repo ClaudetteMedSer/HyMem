@@ -173,12 +173,18 @@ def test_redream_unchanged_session_skips_profile_call(cfg, stub_llm):
         hy.close()
 
 
-def test_profile_extraction_disabled_by_default_makes_no_call(cfg, stub_llm):
-    """profile_extraction_enabled defaults to FALSE (profile.v1 failed the
-    on-box precision gate at ~8%): a dream under a default config must make
+def test_profile_extraction_enabled_by_default(cfg):
+    """profile_extraction_enabled defaults to TRUE: profile.v2 passed the
+    on-box precision gate (~95% adjusted, 2026-06-12) after profile.v1 had
+    failed it at ~8% and kept the default False in between."""
+    assert cfg.profile_extraction_enabled is True
+
+
+def test_profile_extraction_disabled_flag_makes_no_call(cfg, stub_llm):
+    """With profile_extraction_enabled explicitly False, a dream must make
     zero profile LLM calls, persist nothing, and leave the stamp unset."""
-    assert cfg.profile_extraction_enabled is False
-    hy = HyMem(cfg, llm=stub_llm)  # defaults, no opt-in
+    cfg = replace(cfg, profile_extraction_enabled=False)
+    hy = HyMem(cfg, llm=stub_llm)
     try:
         sid = "s_off"
         mid = hy.log_message(
