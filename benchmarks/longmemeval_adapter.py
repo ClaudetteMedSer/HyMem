@@ -409,7 +409,8 @@ class HyMemAdapter:
     def __init__(self, db_path: Path, api_key: str = "", embeddings: bool = False,
                  rerank_top_k: int | None = None, rerank_model: str | None = None,
                  rerank_message_hits: bool | None = None,
-                 aggregation_nodes: bool = False, aggregation_broad: bool = False):
+                 aggregation_nodes: bool = False, aggregation_broad: bool = False,
+                 value_supersession: bool = False):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -418,6 +419,7 @@ class HyMemAdapter:
         self.rerank_message_hits = rerank_message_hits
         self.aggregation_nodes = aggregation_nodes
         self.aggregation_broad = aggregation_broad
+        self.value_supersession = value_supersession
         self.hy = None
 
     def open(self):
@@ -446,6 +448,10 @@ class HyMemAdapter:
             overrides["aggregation_nodes_enabled"] = True
         if self.aggregation_broad:
             overrides["aggregation_inject_abilities"] = ()
+        # Bi-temporal KU lever: dream-cycle single-assertion value supersession.
+        # Off by default; the headline baseline is the paired comparison.
+        if self.value_supersession:
+            overrides["value_supersession_enabled"] = True
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,
@@ -1252,7 +1258,8 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
                           rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model,
                           rerank_message_hits=args.rerank_message_hits,
                           aggregation_nodes=args.aggregation_nodes,
-                          aggregation_broad=args.aggregation_broad)
+                          aggregation_broad=args.aggregation_broad,
+                          value_supersession=args.value_supersession)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -1545,6 +1552,15 @@ def main():
                              "broad-injection G4 A/B that lost 69.0 vs 70.0 (KU −9.0pp from "
                              "nodes crowding gold turns out of the answer pool). For "
                              "comparison runs only.")
+    parser.add_argument("--value-supersession", action="store_true",
+                        help="Bi-temporal KU lever (cfg.value_supersession_enabled): the "
+                             "dream cycle retracts the OLDER of two competing typed-value "
+                             "edges (numeric/percentage/count) sharing subject+predicate, "
+                             "closing its invalid_at at the newer value's valid_at — so an "
+                             "updated fact supersedes the stale one instead of both staying "
+                             "active. DEFAULT OFF. Requires a dream pass (do NOT combine "
+                             "with --no-dream). Confirm it fired via the dream-log line "
+                             "'bitemporal.value_superseded count=' before reading results.")
     parser.add_argument("--inspect-floor", default=None, metavar="RUN.json",
                         help="DIAGNOSTIC: characterize WHY the floor questions (ranking "
                              "misses whose gold reaches NO tier) are unrecoverable. Reads an "

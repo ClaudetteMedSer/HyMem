@@ -311,8 +311,16 @@ reorder. See *Open levers*.
         `invalid_at` at the winner's `valid_at`. Gated by
         `cfg.value_supersession_enabled`. Typed-value scoping keeps multi-valued
         facts safe. Test flips green with the flag on; full suite green.
-      - **Next:** LME A/B (KU-strict, ≥2-3 seeds, overall-regression guard) to size
-        it; then decide the date/version representation and the default flip.
+      - **A/B is now runnable:** `longmemeval_adapter.py` has a `--value-supersession`
+        flag (wires `value_supersession_enabled`). Protocol: full-dream, `--sample 500`
+        (KU needs its ~70 items), 3 paired repeats, change only this one bit vs the
+        canonical 70.0 baseline. Read OVERALL (G4 guard, hold ~70 ±1.5pp) +
+        knowledge-update strict (target, needs >±5pp to clear noise) + collateral
+        watch on multi-session / single-session-preference / knowledge-update_abs.
+        **Pre-check before interpreting:** confirm dream log `bitemporal.value_superseded
+        count>0` — if 0, real extraction isn't populating `value_numeric` and a null
+        result means discriminator-too-narrow, not lever-fails.
+      - **Then:** decide the date/version representation and the default flip.
 - [ ] *(superseded)* turn-recency reorder and the block-tag sub-check — both moot;
       mention-order is the wrong axis (see the reverted blend above).
 - [ ] **Per-block sessions:** split each conversation's ~3 time-anchored blocks
