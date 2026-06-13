@@ -600,10 +600,10 @@ def _has_table(conn, name) -> bool:
     )
 
 
-def test_fresh_store_lands_at_v19_with_user_profile(tmp_path: Path):
+def test_fresh_store_lands_at_v20_with_user_profile(tmp_path: Path):
     conn = core_db.connect(tmp_path / "fresh.sqlite")
     core_db.initialize(conn)
-    assert core_db.schema_version(conn) == 19 == core_db.EXPECTED_SCHEMA_VERSION
+    assert core_db.schema_version(conn) == 20 == core_db.EXPECTED_SCHEMA_VERSION
     assert _has_table(conn, "user_profile")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(user_profile)")}
     assert {"slot", "slot_key", "value", "evidence_message_id", "confidence",
@@ -626,6 +626,7 @@ def test_migration_018_applies_on_existing_v17_store(tmp_path: Path):
         CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE dream_runs(id INTEGER PRIMARY KEY AUTOINCREMENT);
         INSERT INTO sessions(id) VALUES ('s');
         INSERT INTO messages(session_id, role, content)
             VALUES ('s', 'user', 'I am a bedrijfsarts.');
@@ -633,7 +634,7 @@ def test_migration_018_applies_on_existing_v17_store(tmp_path: Path):
     )
     assert not _has_table(conn, "user_profile")
 
-    core_db._run_migrations(conn)  # from v17: only migration 018 applies
+    core_db._run_migrations(conn)  # from v17: migrations 018-020 apply
 
     assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     assert _has_table(conn, "user_profile")
@@ -679,6 +680,7 @@ def test_migration_019_purges_v1_rows_and_adds_session_stamp(tmp_path: Path):
             invalid_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE dream_runs(id INTEGER PRIMARY KEY AUTOINCREMENT);
         INSERT INTO sessions(id) VALUES ('s');
         INSERT INTO messages(session_id, role, content)
             VALUES ('s', 'user', 'Repos: ClaudetteMedSer/HyMem');
@@ -688,9 +690,9 @@ def test_migration_019_purges_v1_rows_and_adds_session_stamp(tmp_path: Path):
         """
     )
 
-    core_db._run_migrations(conn)  # from v18: only migration 019 applies
+    core_db._run_migrations(conn)  # from v18: migrations 019-020 apply
 
-    assert core_db.schema_version(conn) == 19 == core_db.EXPECTED_SCHEMA_VERSION
+    assert core_db.schema_version(conn) == 20 == core_db.EXPECTED_SCHEMA_VERSION
     # The ~8%-precision profile.v1 rows are gone…
     assert conn.execute("SELECT COUNT(*) AS c FROM user_profile").fetchone()["c"] == 0
     # …the per-session stamp column exists (and starts NULL)…

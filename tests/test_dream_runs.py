@@ -44,6 +44,43 @@ def test_dream_persists_run_report(hy):
     assert row["markers_extracted"] == report.markers_extracted
 
 
+def test_dream_persists_aggregation_counters(hy, monkeypatch):
+    # The RAPTOR flip criteria watch the built/reused split per cycle
+    # (benchmarks/raptor_digest_plan.md Stage 3c). build_aggregation_nodes
+    # computes it; the runner must land it in dream_runs (the log.info() it also
+    # emits is dropped on a server without basicConfig). Stub the builder so the
+    # assertion is on the wiring, not the clustering machinery.
+    import dataclasses
+
+    from hymem.api import HyMem
+    from hymem.dreaming import runner as runner_mod
+    from hymem.dreaming.aggregate import AggregationResult
+
+    monkeypatch.setattr(
+        runner_mod, "build_aggregation_nodes",
+        lambda *a, **kw: AggregationResult(nodes=3, reused=2),
+    )
+
+    enabled = HyMem(
+        dataclasses.replace(hy.config, aggregation_nodes_enabled=True),
+        llm=hy._llm, embedding_client=hy._embed,
+    )
+    try:
+        _seed_session(enabled)
+        report = enabled.dream()
+        assert report.aggregation_nodes_built == 3
+        assert report.aggregation_nodes_reused == 2
+
+        row = enabled.conn.execute(
+            "SELECT aggregation_nodes_built, aggregation_nodes_reused "
+            "FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row["aggregation_nodes_built"] == 3
+        assert row["aggregation_nodes_reused"] == 2
+    finally:
+        enabled.close()
+
+
 def test_dream_run_skipped_records_lock_skip(hy):
     _seed_session(hy)
     hy.conn.execute(
@@ -182,6 +219,7 @@ def test_recent_dream_runs_returns_dicts(hy):
         "id", "started_at", "ended_at",
         "sessions_processed", "chunks_seen", "chunks_processed",
         "chunks_embedded", "triples_extracted", "markers_extracted",
+        "aggregation_nodes_built", "aggregation_nodes_reused",
         "skipped_locked", "error",
     }
     assert expected_keys.issubset(rows[0].keys())

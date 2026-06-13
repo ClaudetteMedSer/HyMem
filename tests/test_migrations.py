@@ -193,6 +193,7 @@ def test_v15_backfills_validity_interval(tmp_path: Path):
         CREATE TABLE sessions(id TEXT PRIMARY KEY);
         CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL);
+        CREATE TABLE dream_runs(id INTEGER PRIMARY KEY);
         CREATE TABLE knowledge_graph(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_canonical TEXT, predicate TEXT, object_canonical TEXT,
@@ -234,6 +235,7 @@ def test_v13_backfills_messages_fts_with_role_filter(tmp_path: Path):
         CREATE TABLE sessions(id TEXT PRIMARY KEY);
         CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL);
+        CREATE TABLE dream_runs(id INTEGER PRIMARY KEY);
         CREATE TABLE knowledge_graph(id INTEGER PRIMARY KEY,
             subject_canonical TEXT, predicate TEXT, object_canonical TEXT,
             first_seen TIMESTAMP, last_seen TIMESTAMP,
@@ -277,6 +279,7 @@ def test_v14_adds_temporal_mentions_table(tmp_path: Path):
         CREATE TABLE sessions(id TEXT PRIMARY KEY);
         CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL);
+        CREATE TABLE dream_runs(id INTEGER PRIMARY KEY);
         CREATE TABLE knowledge_graph(id INTEGER PRIMARY KEY,
             subject_canonical TEXT, predicate TEXT, object_canonical TEXT,
             first_seen TIMESTAMP, last_seen TIMESTAMP,

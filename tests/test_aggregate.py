@@ -228,7 +228,7 @@ def test_build_respects_aggregation_max_cluster_size(conn, cfg):
         _seed_episode(conn, f"e{k}", f"s{k}", f"ep {k}", f"about {ents}",
                       ents, start=10 * (k + 1), end=10 * (k + 1) + 1)
     cfg = replace(_enabled(cfg), aggregation_max_cluster_size=3)
-    n = build_aggregation_nodes(conn, cfg, _agg_llm())
+    n = build_aggregation_nodes(conn, cfg, _agg_llm()).nodes
     rows = conn.execute(
         "SELECT n_members, member_episode_ids FROM aggregation_nodes "
         "WHERE level = 0").fetchall()
@@ -247,7 +247,7 @@ def test_build_uncapped_when_config_cap_is_zero(conn, cfg):
         _seed_episode(conn, f"e{k}", f"s{k}", f"ep {k}", f"about {ents}",
                       ents, start=10 * (k + 1), end=10 * (k + 1) + 1)
     cfg = replace(_enabled(cfg), aggregation_max_cluster_size=0)
-    assert build_aggregation_nodes(conn, cfg, _agg_llm()) == 1
+    assert build_aggregation_nodes(conn, cfg, _agg_llm()).nodes == 1
     row = conn.execute(
         "SELECT n_members FROM aggregation_nodes WHERE level = 0").fetchone()
     assert row["n_members"] == 7                     # the raw mega-component
@@ -428,7 +428,7 @@ def test_build_creates_node_for_cross_session_cluster(conn, cfg):
         _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
                       "Analytics warehouse also runs Postgres.", ["postgres", "billing"])
 
-    built = build_aggregation_nodes(conn, _enabled(cfg), _agg_llm(), embed)
+    built = build_aggregation_nodes(conn, _enabled(cfg), _agg_llm(), embed).nodes
     assert built == 1
 
     row = conn.execute(
@@ -453,7 +453,7 @@ def test_build_is_noop_when_disabled(conn, cfg):
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres", "billing"])
         _seed_episode(conn, "e2", "s2", "t2", "s", ["postgres", "billing"])
-    built = build_aggregation_nodes(conn, cfg, _agg_llm(), None)  # cfg disabled by default
+    built = build_aggregation_nodes(conn, cfg, _agg_llm(), None).nodes  # cfg disabled by default
     assert built == 0
     assert conn.execute("SELECT COUNT(*) AS c FROM aggregation_nodes").fetchone()["c"] == 0
 
@@ -462,7 +462,7 @@ def test_build_skips_single_session(conn, cfg):
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres", "billing"])
         _seed_episode(conn, "e2", "s1", "t2", "s", ["postgres", "billing"])
-    built = build_aggregation_nodes(conn, _enabled(cfg), _agg_llm(), None)
+    built = build_aggregation_nodes(conn, _enabled(cfg), _agg_llm(), None).nodes
     assert built == 0
     assert conn.execute("SELECT COUNT(*) AS c FROM aggregation_nodes").fetchone()["c"] == 0
 
@@ -503,7 +503,7 @@ def test_rebuild_reuses_fusion_for_unchanged_cluster(conn, cfg):
             {"title": "WRONG", "summary": "this fusion must never be used"})},
         default="[]",
     )
-    built = build_aggregation_nodes(conn, acfg, poisoned, None)
+    built = build_aggregation_nodes(conn, acfg, poisoned, None).nodes
 
     row = conn.execute("SELECT id, title, summary FROM aggregation_nodes").fetchone()
     assert built == 1
@@ -601,7 +601,7 @@ def test_digest_root_covers_nodes_and_unclustered_episodes(cfg, conn):
                       "Analytics also uses Postgres.", ["postgres", "billing"])
         _seed_episode(conn, "e3", "s3", "Weekend cycling",
                       "Started cycling on weekends.", ["cycling"])
-    built = build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    built = build_aggregation_nodes(conn, acfg, _agg_llm(), None).nodes
     assert built == 2                            # level-0 node + root
 
     root = conn.execute(

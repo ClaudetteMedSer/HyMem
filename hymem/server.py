@@ -36,6 +36,8 @@ is affected.
 from __future__ import annotations
 
 import json
+import logging
+import os
 
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
 # Re-exported here under the historical names used by tests and tool helpers.
@@ -276,6 +278,15 @@ def hymem_retract(subject: str, predicate: str, object: str) -> str:
 
 
 def main() -> None:
+    # Configure logging at the application entry point (never on import — that
+    # would clobber a host's handlers). Without this, the dream runner's
+    # log.info() lines — including "aggregate.built nodes=/reused=" and the
+    # aggregate.build_failure exception — are silently dropped, leaving the
+    # server with no operational visibility. Level is env-tunable.
+    logging.basicConfig(
+        level=os.environ.get("HYMEM_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     mcp_instance = _get_mcp()
     mcp_instance.tool()(hymem_capture)
     mcp_instance.tool()(hymem_log)

@@ -503,6 +503,8 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     edges_embedded INTEGER NOT NULL DEFAULT 0,
     triples_extracted INTEGER NOT NULL DEFAULT 0,
     markers_extracted INTEGER NOT NULL DEFAULT 0,
+    aggregation_nodes_built INTEGER NOT NULL DEFAULT 0,
+    aggregation_nodes_reused INTEGER NOT NULL DEFAULT 0,
     skipped_locked INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );

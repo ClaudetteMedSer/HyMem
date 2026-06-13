@@ -40,6 +40,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
@@ -57,6 +58,16 @@ from hymem.extraction.prompts import (
 )
 
 log = logging.getLogger("hymem.dreaming.aggregate")
+
+
+class AggregationResult(NamedTuple):
+    """Outcome of a node (re)build: total nodes written, and how many fusions
+    were served from cache (a content-hash id that already existed) instead of
+    being recomputed. ``reused`` is the dream-cost signal the RAPTOR flip
+    criteria watches — near-full reuse on an unchanged store means steady
+    state. See benchmarks/raptor_digest_plan.md Stage 3c."""
+    nodes: int
+    reused: int
 
 # Fusion-prompt versions, baked into the node-id salt of the level the prompt
 # serves. Reuse is keyed by node id, so bumping a version when its prompt
@@ -611,19 +622,20 @@ def build_aggregation_nodes(
     cfg: HyMemConfig,
     llm: LLMClient,
     embedding_client: EmbeddingClient | None = None,
-) -> int:
+) -> AggregationResult:
     """Rebuild the cross-session aggregation layer from the current episodes.
 
     No-op when the layer is disabled. Otherwise: cluster → keep cross-session
     multi-member clusters → fuse each NEW cluster with one LLM call (an
     unchanged member set reuses the stored fusion, no call) → full-replace
-    `aggregation_nodes` → (re-)embed node summaries. Returns the node count.
+    `aggregation_nodes` → (re-)embed node summaries. Returns the node count and
+    the reused-fusion count (see :class:`AggregationResult`).
     Full rebuild (DELETE then INSERT) because membership is a pure function of
     the present episodes; the content-hash id means an unchanged cluster keeps
     both its fusion and its embedding. Caller need not hold a transaction.
     """
     if not cfg.aggregation_nodes_enabled:
-        return 0
+        return AggregationResult(0, 0)
 
     episodes = load_clusterable_episodes(conn)
     clusters = select_clusters(episodes, cfg, conn)
@@ -710,7 +722,7 @@ def build_aggregation_nodes(
 
     log.info("aggregate.built nodes=%d reused=%d (from %d episodes)",
              len(rows), reused, len(episodes))
-    return len(rows)
+    return AggregationResult(len(rows), reused)
 
 
 def _build_digest_levels(

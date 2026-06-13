@@ -71,6 +71,7 @@ class DreamReport:
     episodes_embedded: int = 0
     episodes_embedded_from_cache: int = 0
     aggregation_nodes_built: int = 0
+    aggregation_nodes_reused: int = 0
     profile_items_extracted: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
@@ -598,9 +599,9 @@ def run_dreaming(
         # nothing for clients that haven't opted in.
         if cfg.aggregation_nodes_enabled:
             try:
-                report.aggregation_nodes_built = build_aggregation_nodes(
-                    conn, cfg, llm, embedding_client
-                )
+                agg = build_aggregation_nodes(conn, cfg, llm, embedding_client)
+                report.aggregation_nodes_built = agg.nodes
+                report.aggregation_nodes_reused = agg.reused
             except Exception:
                 log.exception("aggregate.build_failure")
 
@@ -620,6 +621,8 @@ def run_dreaming(
                 edges_embedded = ?,
                 triples_extracted = ?,
                 markers_extracted = ?,
+                aggregation_nodes_built = ?,
+                aggregation_nodes_reused = ?,
                 skipped_locked = 0
             WHERE id = ?
             """,
@@ -631,6 +634,8 @@ def run_dreaming(
                 report.edges_embedded,
                 report.triples_extracted,
                 report.markers_extracted,
+                report.aggregation_nodes_built,
+                report.aggregation_nodes_reused,
                 run_id,
             ),
         )
