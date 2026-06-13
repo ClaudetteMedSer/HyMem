@@ -332,6 +332,23 @@ stays TR-gated; enabling the layer is primarily for the digest.
 verified ≤15 on the box). Steady-state reuse already looks right (34/34 on the
 no-change pass) — what remains is the week-scale cost observation, then flip.*
 
+**INSTRUMENTATION LANDED (2026-06-13, this branch).** The `nodes=/reused=`
+signal this criterion watches was only reaching a `log.info()` at
+`aggregate.py:711`, and the MCP server runs without `logging.basicConfig`, so
+production dropped it silently — we had the flat-34 circumstantial evidence but
+not the exact reused count. Fixed at the source instead of the log:
+`build_aggregation_nodes` now returns `AggregationResult(nodes, reused)`, and
+the runner persists BOTH into `dream_runs` per cycle (`aggregation_nodes_built`,
+`aggregation_nodes_reused` — schema v20, migration 020). `built` was likewise
+computed-then-dropped before this; both gaps closed. So the week-scale dataset
+now accrues durably as a queryable column rather than a scraped log line —
+captured forward from deploy (the June 11-12 runs stay unrecoverable: full-
+replace keeps no prior-membership baseline to diff, so no post-hoc DB
+reconstruction was possible). Secondary: added `logging.basicConfig` (env-tuned
+via `HYMEM_LOG_LEVEL`, default INFO) to the `hymem-server` entry point, which
+also closes the parallel blind spot where the `aggregate.build_failure`
+exception was being dropped. 663 tests green.
+
 ---
 
 ## Stage 4 — Query-time consumption v2 (only after Stage 3)
