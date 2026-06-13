@@ -311,16 +311,30 @@ reorder. See *Open levers*.
         `invalid_at` at the winner's `valid_at`. Gated by
         `cfg.value_supersession_enabled`. Typed-value scoping keeps multi-valued
         facts safe. Test flips green with the flag on; full suite green.
-      - **A/B is now runnable:** `longmemeval_adapter.py` has a `--value-supersession`
-        flag (wires `value_supersession_enabled`). Protocol: full-dream, `--sample 500`
-        (KU needs its ~70 items), 3 paired repeats, change only this one bit vs the
-        canonical 70.0 baseline. Read OVERALL (G4 guard, hold ~70 ±1.5pp) +
-        knowledge-update strict (target, needs >±5pp to clear noise) + collateral
+      - **v1 box result (2026-06-13): DID NOT FIRE.** Full LME-S 500q treatment =
+        70.6% (KU 87.2%) but `bitemporal.value_superseded count=0` across all 500
+        dream cycles (vs thousands of `valid_at_stamped` — stamping runs fine, the
+        supersede query returns empty). Root cause confirmed by sampling 10 of 500
+        per-question DBs: 207 kg_evidence rows, **1** with `value_numeric` populated
+        (a lone `$120` on a `prefers` edge, no competing pair). DeepSeek captures the
+        number in `object_canonical` but doesn't tag `value_numeric` → v1's
+        `HAVING has_numeric=1` matched nothing. Discriminator-too-narrow, NOT
+        lever-fails, exactly as pre-checked.
+      - **v2 (uncommitted, flag still OFF):** discriminator now PARSES
+        `object_canonical` (`_classify_object` → `("num",unit)`/`("date",None)`/`None`;
+        free text never competes). Adds DATE objects (april_1→april_5) and UNTAGGED
+        numerics (count 5→7) — the LME-KU value classes. `value_numeric` kept as a
+        fast-path only. Per-supersession INFO log `bitemporal.supersede subj=.. pred=..
+        old=.. new=..` = free collateral audit. Suite 668 green.
+      - **A/B protocol (v2):** `longmemeval_adapter.py --value-supersession`,
+        full-dream, `--sample 500`, 3 paired repeats vs canonical 70.0. **Cheapest
+        gate first:** `grep "bitemporal.supersede"` in the treatment dream log —
+        `count>0` AND a clean audit (all updates, no `prefers`/multi-valued rows)
+        before spending on scored interpretation. Then OVERALL (G4 guard, hold ~70
+        ±1.5pp) + knowledge-update strict (target, >±5pp to clear noise) + collateral
         watch on multi-session / single-session-preference / knowledge-update_abs.
-        **Pre-check before interpreting:** confirm dream log `bitemporal.value_superseded
-        count>0` — if 0, real extraction isn't populating `value_numeric` and a null
-        result means discriminator-too-narrow, not lever-fails.
-      - **Then:** decide the date/version representation and the default flip.
+      - **Then:** if a clean numeric multi-value shows in the audit, add a
+        single-valued-predicate gate; decide date/version representation; default flip.
 - [ ] *(superseded)* turn-recency reorder and the block-tag sub-check — both moot;
       mention-order is the wrong axis (see the reverted blend above).
 - [ ] **Per-block sessions:** split each conversation's ~3 time-anchored blocks

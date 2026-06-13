@@ -29,6 +29,7 @@ from dataclasses import replace
 import pytest
 
 from hymem import HyMem
+from hymem.dreaming.value_supersession import _classify_object
 from hymem.extraction.llm import StubLLMClient
 
 # Stable subject/predicate; only the object (the dated value) changes between the
@@ -292,5 +293,130 @@ def test_value_supersession_flag_flips_behavior(cfg, flag_on):
         ctx = hy.augment("What is the test coverage?")
         objs = {f.object for f in ctx.graph_facts if f.subject == NUM_SUBJECT}
         assert NUM_OLD not in objs, f"stale value still retrievable: {sorted(objs)}"
+    finally:
+        hy.close()
+
+
+# ── Step 1 (v2): parse-based discriminator ───────────────────────────────────
+# The real extractor leaves `value_numeric` NULL but captures the value in the
+# object string (a box run measured 1 of 207 evidence rows tagged). v2 classifies
+# the object_canonical itself, so a DATE update and an UNTAGGED numeric update
+# both supersede — the classes that dominate the LME knowledge-update floor.
+
+
+def test_classify_object():
+    """The discriminator: numbers and dates are typed; free text is not."""
+    assert _classify_object("165") == ("num", None)
+    assert _classify_object("65_percent") == ("num", "percent")
+    assert _classify_object("78%") == ("num", "%")
+    assert _classify_object("$120") == ("num", "$")
+    assert _classify_object("-3.5_kg") == ("num", "kg")
+    assert _classify_object("april_5_2024") == ("date", None)
+    assert _classify_object("2024-04-05") == ("date", None)
+    # Free-text objects must never be treated as a single-valued quantity, so a
+    # multi-valued relation (preferences, tools) is never collapsed.
+    assert _classify_object("adidas_black_sneakers") is None
+    assert _classify_object("postgres") is None
+    assert _classify_object("") is None
+    assert _classify_object(None) is None
+
+
+def _date_update_llm() -> StubLLMClient:
+    """A deadline date update — POSITIVE evidence only, NO value_numeric. This is
+    the case v1 could not reach (the date lives only in the object string)."""
+    first = _chunk_extraction_response(
+        [{"subject": SUBJECT, "predicate": PREDICATE, "object": OLD_OBJECT, "polarity": 1}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": SUBJECT, "predicate": PREDICATE, "object": NEW_OBJECT, "polarity": 1}]
+    )
+    return StubLLMClient(fixtures={"April 1": first, "April 5": second}, default="[]")
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_value_supersession_parses_date_objects(cfg, flag_on):
+    """A date update (april_1 -> april_5) carries no value_numeric, yet v2
+    supersedes the older date when the flag is on and leaves both active off."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_deadline_parse"
+        hy.open_session(sid)
+        hy.log_message(
+            sid, "user",
+            "My project deadline is April 1, 2024. Please remember that date.",
+            created_at="2024-03-01 09:00:00",
+        )
+        hy.log_message(
+            sid, "user",
+            "Update: the project deadline changed to April 5, 2024.",
+            created_at="2024-03-20 09:00:00",
+        )
+        hy.close_session(sid)
+
+        hy.set_llm(_date_update_llm())
+        hy.dream()
+
+        conn = hy.conn
+        active = {
+            r["object_canonical"]
+            for r in conn.execute(
+                "SELECT object_canonical FROM knowledge_graph "
+                "WHERE subject_canonical = ? AND predicate = ? AND status = 'active'",
+                (SUBJECT, PREDICATE),
+            ).fetchall()
+        }
+        if not flag_on:
+            assert active == {OLD_OBJECT, NEW_OBJECT}
+        else:
+            assert active == {NEW_OBJECT}, f"date supersession failed: {active}"
+    finally:
+        hy.close()
+
+
+def _untagged_numeric_llm() -> StubLLMClient:
+    """A count update (5 -> 7 team members) with NO value_numeric metadata — the
+    number lives only in the canonical object string, as the real extractor emits."""
+    first = _chunk_extraction_response(
+        [{"subject": "team_size", "predicate": "configured_with", "object": "5", "polarity": 1}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": "team_size", "predicate": "configured_with", "object": "7", "polarity": 1}]
+    )
+    return StubLLMClient(fixtures={"five engineers": first, "seven engineers": second}, default="[]")
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_value_supersession_parses_untagged_numeric(cfg, flag_on):
+    """A bare count update with no value_numeric still supersedes under v2."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_team"
+        hy.open_session(sid)
+        hy.log_message(
+            sid, "user", "We have five engineers on the team right now.",
+            created_at="2024-03-01 09:00:00",
+        )
+        hy.log_message(
+            sid, "user", "Update: we now have seven engineers after two hires.",
+            created_at="2024-03-20 09:00:00",
+        )
+        hy.close_session(sid)
+
+        hy.set_llm(_untagged_numeric_llm())
+        hy.dream()
+
+        conn = hy.conn
+        active = {
+            r["object_canonical"]
+            for r in conn.execute(
+                "SELECT object_canonical FROM knowledge_graph "
+                "WHERE subject_canonical = 'team_size' AND predicate = 'configured_with' "
+                "AND status = 'active'",
+            ).fetchall()
+        }
+        if not flag_on:
+            assert active == {"5", "7"}
+        else:
+            assert active == {"7"}, f"untagged-numeric supersession failed: {active}"
     finally:
         hy.close()
