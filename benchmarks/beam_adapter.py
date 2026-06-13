@@ -494,35 +494,22 @@ class HyMemAdapter:
             # Procedures come last here — they're mostly noise for
             # knowledge questions and only relevant for IF.
             graph_facts.sort(key=lambda m: -m.get("confidence", 0))
-
-            # KU/PF recency blend. Facts get UPDATED over time — the gold answer is
-            # the newest value-bearing turn (T128 "78%" supersedes T114 "65%"), yet
-            # message_hits arrive in augment() RELEVANCE order with date playing no
-            # part. An updated value that is less lexically central than its stale
-            # sibling ranks lower and falls below the top_k cap, so the recency
-            # clause never sees it. Blend recency into the relevance order with a
-            # Borda-style rank fusion: relevance stays primary (weight 0.65), recency
-            # pulls a recent turn up enough to survive the cap (0.35), both candidates
-            # reach the answerer and the clause decides. A *pure* recency sort is
-            # wrong — it nukes topical relevance and regresses retrospective mentions
-            # ("originally 1,800, cut to 1,350") where the stale value is the LATER-
-            # mentioned turn. Scoped to KU/PF; IE/ABS/CR keep pure relevance order.
-            if ability in ("KU", "PF") and len(message_hits) > 1:
-                rel_rank = {id(m): i for i, m in enumerate(message_hits)}
-                rec_rank = {id(m): i for i, m in enumerate(sorted(
-                    message_hits, key=lambda m: m.get("created_at") or "", reverse=True))}
-                message_hits.sort(
-                    key=lambda m: 0.65 * rel_rank[id(m)] + 0.35 * rec_rank[id(m)])
-
             memories = graph_facts + message_hits + episode_hits + fts_hits + procedure_hits + recent
-            # Sort: graph_facts stay first, message_hits next, rest by confidence.
-            # message_hits all carry confidence 0.7, so this stable sort ties on the
-            # third key and preserves the (recency-blended, for KU/PF) order above.
+            # Sort: graph_facts stay first, message_hits next, rest by confidence
             memories.sort(key=lambda m: (
                 m["type"] != "graph_fact",
                 0 if m["type"] == "message_hit" else 1,
                 -m.get("confidence", 0),
             ))
+            # NOTE: a turn-level recency blend was tried here and REVERTED — it was
+            # net −3 (fixed 1 KU zero, broke 4 working cases). The gold turn ASSERTS
+            # the update ("updated to April 5") and is usually OLDER than a later turn
+            # that merely REFERENCES the stale value ("per the April 1 deadline"), so
+            # mention-recency systematically pulls the wrong turn up and slices the
+            # assertion. The answerer's recency clause already resolves updates
+            # correctly WHEN both values reach it — the real failure is fact-VALIDITY
+            # recency (valid_at), not mention order. That's the schema-v15 bi-temporal
+            # path (core), not an adapter reorder. See beam_investigation_notes.md.
 
         memories = memories[:top_k]
 

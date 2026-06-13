@@ -255,18 +255,24 @@ clause never gets both) or both survive but the clause isn't honored. The box's
 *location* (search() ordering) and *axis* (recency over the flat default) are
 right; the lever is relevance-vs-recency, not confidence-vs-recency.
 
-**Trap the table exposes — pure recency would regress conv 10.** Gold `1,350`
-(T64, early) vs stale `1,800` (T242, late): the stale value is mentioned *later* —
-a **retrospective mention** ("originally 1,800, cut to 1,350"). "Prefer the latest
-turn/`created_at`" picks 1,800 = wrong. Recency-of-*mention* ≠ recency-of-
-*validity* — the bi-temporal `valid_at` problem (schema v15 has the field; the
-adapter doesn't populate it). 7/8 are clean forward-recency; conv 10 (and conv 8's
-first row) are the residual recency can't fix.
+**A turn-recency reorder was then tried, run, and falsified.** I predicted "7/8
+clean forward-recency, conv 10 the residual." The box run showed the **opposite**:
+a Borda recency-blend on `message_hits` went net **−3** (fixed only conv 8, broke
+conv 1/3/4/6 that had been working). The retrospective pattern isn't a rare
+residual — it's the **dominant** mode. The gold turn *asserts* the update ("updated
+to April 5"); it is usually **older** than a later turn that merely *references*
+the stale value ("per the April 1 deadline"). Mention-recency pulls the reference
+up and slices the assertion, so the answerer sees only the stale value. Conv 8 was
+the lone case where mention-order happened to coincide with validity.
 
-**Deciding sub-check** for the inversions: are gold & stale in *different*
-`time_anchor` blocks (→ event-date recency resolves them, since block date not turn
-index drives `created_at`) or the *same* block / a retrospective (→ needs
-valid-time)? One look at the two `[MEM date]` tags.
+**Conclusion: turn-level recency is the wrong axis.** The recency that matters is
+fact-*validity* recency — when the fact became true, not when it was last
+mentioned. The answerer's recency clause already resolves updates correctly **when
+both values reach it** (that's why conv 1/3/4/6 worked before the blend); the blend
+broke that by rearranging which turns reach the answerer. The real lever is the
+schema-v15 bi-temporal `valid_at`/`invalid_at` path (extract update semantics, set
+validity, prefer latest-valid at retrieval) — core, LME-validated, *not* an adapter
+reorder. See *Open levers*.
 
 ---
 
@@ -276,19 +282,27 @@ valid-time)? One look at the two `[MEM date]` tags.
       It's a ranking/recall lever, not a ceiling.
 - [x] **KU `[FACT]`-vs-`[MEM]` tag classification** — **DONE: 8/8 `[MEM]`,** all
       old-vs-updated, model returns the stale value. Graph tier not in play.
-- [x] **KU/PF recency-blended message_hit ordering (adapter, additive)** —
-      **LANDED** (`search()` else-branch, [beam_adapter.py](beam_adapter.py)).
-      Borda rank-fusion `0.65·relevance + 0.35·recency` over `message_hits`, KU/PF
-      only; IE/ABS/CR keep pure relevance. Smoke-tested: gold (newest, low-
-      relevance) survives a cap that sliced it pre-fix; IE untouched; stable final
-      sort preserves the blend; conv-10 retrospective doesn't regress (both
-      candidates survive, clause decides). Awaiting box BEAM run (sample≥10).
-- [ ] **Block-tag sub-check on conv 10 / conv 8** inversions: different
-      `time_anchor` block (recency works) vs same-block/retrospective (needs
-      valid-time). Decides whether recency alone clears the floor or leaves a
-      bi-temporal residual.
-- [ ] **Populate `valid_at`/`invalid_at` (schema v15) from BEAM** for the
-      retrospective-mention residual — recency-of-mention ≠ validity. Core, later.
+- [x] **KU/PF recency-blended message_hit ordering (adapter)** — **TRIED &
+      REVERTED.** Box run: net **−3** (fixed 1 KU zero — conv 8, the only case where
+      turn-recency aligned with validity; **broke 4 previously-working cases**:
+      conv 1 165→150, conv 3 Apr5→Apr1, conv 4 15→10 problems, conv 6 7→5 women).
+      Mechanism of the regression: the gold turn *asserts* the update ("updated to
+      April 5") and is usually **older** than a later turn that merely *references*
+      the stale value ("per the April 1 deadline"); mention-recency pulls the
+      reference up and slices the assertion. The answerer's recency clause already
+      resolves updates correctly **when both values reach it** — the blend broke
+      that by rearranging which turns reach the answerer. **Turn-level recency is
+      the wrong axis.** Reverted; tombstone comment left in `search()`.
+- [ ] **Populate `valid_at`/`invalid_at` (schema v15) from BEAM** — the box run
+      proved this is the **dominant** KU failure mode, not a residual. The fix is
+      fact-validity recency: extract update semantics during dreaming ("updated to
+      X" / "changed to X" asserts new validity; "per the X" / "originally X" is a
+      reference, not a re-assertion), set `valid_at`/`invalid_at`, and at retrieval
+      prefer the fact with the latest `valid_at` (suppress invalidated values).
+      Core bi-temporal path, **LME-validated** — not an adapter reorder, not
+      BEAM-hand-fit. This is now the primary KU lever.
+- [ ] *(superseded)* turn-recency reorder and the block-tag sub-check — both moot;
+      mention-order is the wrong axis (see the reverted blend above).
 - [ ] **Per-block sessions:** split each conversation's ~3 time-anchored blocks
       into distinct HyMem sessions. Helps **EO** (clean per-session timelines) and
       restores the aggregation tier — but only helps KU/PF *if* the adapter starts
