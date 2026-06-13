@@ -462,6 +462,26 @@ class HyMemAdapter:
                 memories += message_hits + procedure_hits + episode_hits + fts_hits + graph_facts
                 return memories[:min(top_k * 6, 120)], total_matches
 
+            # Coverage abilities (EO/SUM): the question is "order / summarize
+            # EVERYTHING that happened", not "find the turns most similar to the
+            # question". Relevance-ranked raw turns systematically surface the
+            # planning/meta turns (which lexically match ordering/summary
+            # language) over the specific events the rubric grades on — the model
+            # then orders/summarizes the wrong events (observed: every EO answer
+            # listed planning items, not implementation milestones). Episode
+            # summaries are session-level "what happened" coverage at high
+            # density-per-char, so lead with them; otherwise message_hits fill
+            # every top_k slot and episodes are sliced off entirely. The raw-turn
+            # timeline follows as the dating/ordering evidence.
+            if ability in ("EO", "SUM"):
+                overview = episode_hits[:8]
+                rest = fts_hits + graph_facts + recent
+                rest.sort(key=lambda m: -m.get("confidence", 0))
+                memories = overview + message_hits + procedure_hits + rest
+                # Reserve the overview on top of the normal message budget so
+                # the slice can't eat it.
+                return memories[:len(overview) + top_k], total_matches
+
             # Task-recall: messages > procedures > then interleave rest by confidence
             memories = message_hits + procedure_hits
             rest = episode_hits + fts_hits + graph_facts + recent
@@ -508,9 +528,20 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     # EO/TR: dated turns read as a timeline — chronological, earliest first.
     # search() already picked the survivors by relevance; display order is the
     # only ordering signal the answer model gets, and it cannot sort shuffled
-    # snippets itself (every EO question failed that way). Undated tiers
-    # (facts/episodes/fts) keep their relevance order after the timeline.
-    if ability in ("EO", "TR"):
+    # snippets itself (every EO question failed that way).
+    if ability == "EO":
+        # Episodes (the coverage overview search() loaded for EO) lead, so the
+        # char budget can't truncate them; then the dated raw-turn timeline;
+        # then any other undated tiers.
+        episodes = [m for m in memories if m["type"] == "episode"]
+        dated = sorted(
+            (m for m in memories if m["type"] != "episode" and m.get("created_at")),
+            key=lambda m: m["created_at"],
+        )
+        other = [m for m in memories
+                 if m["type"] != "episode" and not m.get("created_at")]
+        memories = episodes + dated + other
+    elif ability == "TR":
         dated = sorted(
             (m for m in memories if m.get("created_at")),
             key=lambda m: m["created_at"],
