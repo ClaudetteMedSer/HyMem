@@ -335,6 +335,37 @@ reorder. See *Open levers*.
         watch on multi-session / single-session-preference / knowledge-update_abs.
       - **Then:** if a clean numeric multi-value shows in the audit, add a
         single-valued-predicate gate; decide date/version representation; default flip.
+      - **v2 box result (2026-06-14): correct, but LME-S can't exercise it.** Count
+        still 0, for a STRUCTURAL reason: across 100 DBs the parser found 37 groups —
+        ~31 same-object reinforcement, 2 competing-but-SAME-`valid_at`, **0 cross-session
+        updates**. LME-S embeds value changes intra-session (one `valid_at`), so the
+        tie-breaker correctly skips. Critically, the one near-fire — `sahara_yoga_studio
+        contains 5_class_package / 10_class_package` (two studios, identical pattern) —
+        is a MULTI-VALUED `contains` (a studio offers both tiers), i.e. a would-be FALSE
+        POSITIVE saved only by the shared `valid_at`. ⇒ do NOT lower the tie-breaker
+        (the box's own suggestion) — same `valid_at` = no temporal basis = must not
+        supersede. The scored A/B was SKIPPED (confirmed no-op; paying to verify
+        70.0==70.0 is the waste to avoid).
+      - **Mechanism VALIDATED separately (green):** `test_value_supersession_across_sessions`
+        — two SEPARATE sessions, distinct world dates (Jan 20 → Mar 35); flag ON retracts
+        the older, `invalid_at`=newer `valid_at`, stale gone from retrieval; flag OFF
+        no-op. Proves classify→group→compare end-to-end for a dataset (BEAM) that DOES
+        drift cross-session. Suite 670 green. **v2 lands DORMANT (flag OFF), no LME claim.**
+- [ ] **[MEM]-consumption lever (the real KU lever; BEAM not LME-S).** KU zeros were
+      8/8 [MEM] (raw turns), but the graph never re-ranks/annotates [MEM] with its
+      validity knowledge; [MEM] dates are MENTION-time (why the Borda blend failed).
+      Asset: post-supersession graph = validity oracle (active=current@valid_at,
+      retracted=stale@invalid_at) + provenance kg_evidence→chunks→messages links
+      edges↔turns. Principle: **additive annotation, never reorder** (Borda broke 4
+      working cases by pulling turns up). Layers: **L1** date the [FACT] tier with
+      `valid_at` (closes the "graph dating deferred" TODO, beam_adapter.py:566 — the
+      winner already shows alone post-supersession, dating lets it out-authority a
+      stale dated [MEM]); **L2** annotate a [MEM] whose source edge is retracted
+      (`[MEM .. — superseded by ..]`, needs msg-id on each hit); **L3 (opt)** validity
+      boost keyed on `valid_at` not mention-time, gated + measured alone. **Coverage
+      gate first (cheap probe):** for the KU zeros, did the gold value mint a graph
+      edge at all? If mostly NO, the bottleneck is EXTRACTION coverage, not ranking,
+      and the lever's ceiling is low until that's fixed. Cheapest path: probe + ship L1.
 - [ ] *(superseded)* turn-recency reorder and the block-tag sub-check — both moot;
       mention-order is the wrong axis (see the reverted blend above).
 - [ ] **Per-block sessions:** split each conversation's ~3 time-anchored blocks

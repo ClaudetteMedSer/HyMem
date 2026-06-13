@@ -31,6 +31,7 @@ Usage (on the Hermes box, from benchmarks/):
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 import tempfile
@@ -68,6 +69,45 @@ def _answer_in(text: str, answer: str) -> bool:
 def _date10(created_at: str) -> str:
     """Leading YYYY-MM-DD of an ISO created_at, or '' if absent/short."""
     return created_at[:10] if created_at and len(created_at) >= 10 else ""
+
+
+def _gold_value_tokens(answer: str) -> list[str]:
+    """Discriminating tokens of the gold value: any token carrying a digit (a
+    number/size/version) or an alpha word >3 chars (a brand/name). Short
+    stopwords are dropped so the edge match isn't swamped."""
+    out = []
+    for t in re.split(r"[^a-z0-9]+", (answer or "").lower()):
+        if t and (any(c.isdigit() for c in t) or len(t) > 3):
+            out.append(t)
+    return out
+
+
+def _gold_edges(conn, answer: str) -> list[tuple]:
+    """COVERAGE PROBE: does the gold value exist as a knowledge_graph EDGE at
+    all — minted by extraction, regardless of whether retrieval surfaced it?
+
+    This is the extraction-vs-ranking fork for the [MEM]-consumption lever. The
+    `graph_facts` tier shows only RETRIEVED edges (top-k, relevance-filtered); a
+    direct table scan tells us instead whether the value ever entered the graph.
+    A numeric gold token matches a whole object/subject token exactly (so "35"
+    doesn't hit "350"); an alpha token >3 chars matches as a substring (a value
+    embedded in a longer canonical). Returns (row, matched_tokens) per edge."""
+    toks = _gold_value_tokens(answer)
+    if not toks:
+        return []
+    rows = conn.execute(
+        "SELECT subject_canonical AS s, predicate AS p, object_canonical AS o, "
+        "       status AS st, valid_at AS v, invalid_at AS iv "
+        "FROM knowledge_graph"
+    ).fetchall()
+    out = []
+    for row in rows:
+        hay = f"{row['s']} {row['o']}".lower()
+        hay_toks = set(re.split(r"[^a-z0-9]+", hay))
+        matched = [t for t in toks if t in hay_toks or (len(t) > 3 and t in hay)]
+        if matched:
+            out.append((row, matched))
+    return out
 
 
 def probe_question(adapter: HyMemAdapter, q: dict, top_k: int) -> dict:
@@ -351,6 +391,14 @@ def print_report(r: dict, top_k: int, show_graph: bool) -> None:
         for f in r["graph_facts"][:12]:
             print(f"    [FACT conf={getattr(f, 'confidence', 0):.2f}] "
                   f"{getattr(f, 'subject', '')} {getattr(f, 'predicate', '')} {getattr(f, 'object', '')}")
+    if show_graph:
+        ge = r.get("gold_edges") or []
+        print(f"  GOLD VALUE as graph edge   : {'YES' if ge else 'NO'}  "
+              f"({len(ge)} matching edge(s); table scan, not retrieval) "
+              f"[coverage: was the value extracted at all?]")
+        for row, matched in ge[:8]:
+            print(f"    [{row['st']:>9} v={(row['v'] or '')[:10] or '----------'}] "
+                  f"{row['s']} {row['p']} {row['o']}  «match {','.join(matched)}»")
 
 
 def run_ranking(ku: list[dict], args) -> None:
@@ -540,6 +588,9 @@ def main() -> None:
                 adapter.dream_and_wait()
                 ctx = adapter.hy.augment(q["question"], ability=r["ability"])
                 r["graph_facts"] = list(getattr(ctx, "graph_facts", None) or [])
+                # COVERAGE GATE: did the gold value mint an edge at all (vs only
+                # living in raw turns)? Direct table scan, not retrieval-filtered.
+                r["gold_edges"] = _gold_edges(adapter.hy.conn, str(q.get("answer", "")))
             reports.append(r)
             print_report(r, args.top_k, args.dream)
         except Exception as e:
@@ -574,6 +625,15 @@ def main() -> None:
           f"(naive latest-date-wins — pessimistic floor)")
     print(f"  present-but-NOT-latest (spoiled)  : {len(present_not_latest)}/{n}  "
           f"across {spoiler_turns} spoiler turns to classify above")
+    if args.dream:
+        edge_present = sum(1 for r in reports if r.get("gold_edges"))
+        print()
+        print(f"  >>> COVERAGE GATE — gold value present as graph edge : {edge_present}/{n}")
+        print(f"      (direct knowledge_graph scan; the [MEM]-consumption lever's prerequisite)")
+        print(f"      LOW  -> bottleneck is EXTRACTION coverage, not [MEM] ranking; L1-L3 have a")
+        print(f"              low ceiling until extraction captures the value. Redirect upstream.")
+        print(f"      HIGH -> value IS in the graph; L1 ([FACT] dating) + L2 (stale-[MEM] annot.)")
+        print(f"              can consume it. CROSS-REF the per-question YES/NO against the KU zeros.")
     print()
     print("  CEILING of a VALUE-AWARE clause = (on-latest + tangential-spoiled)/n.")
     print("  Read the SPOILER blocks above and count, per spoiled question:")

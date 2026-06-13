@@ -420,3 +420,85 @@ def test_value_supersession_parses_untagged_numeric(cfg, flag_on):
             assert active == {"7"}, f"untagged-numeric supersession failed: {active}"
     finally:
         hy.close()
+
+
+# ── Step 1 (v2): cross-SESSION mechanism validation ──────────────────────────
+# The box found LME-S embeds value updates WITHIN one session (both values share a
+# single valid_at), so the `valid_at` tie-breaker correctly skips them and the
+# lever is a no-op on that dataset. This test supplies the shape LME-S lacks and
+# the lever actually targets: the SAME attribute asserted in two SEPARATE sessions
+# with DISTINCT world dates. It proves the full path — per-session valid_at
+# stamping -> grouping -> the older session's value superseded by the newer — end
+# to end, so we know the mechanism is sound for a dataset (e.g. BEAM) that does
+# exercise cross-session drift, independently of the null LME-S signal.
+XS_SUBJECT = "headcount"
+XS_PRED = "configured_with"
+XS_OLD = "20"
+XS_NEW = "35"
+
+
+def _xsession_llm() -> StubLLMClient:
+    first = _chunk_extraction_response(
+        [{"subject": XS_SUBJECT, "predicate": XS_PRED, "object": XS_OLD, "polarity": 1}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": XS_SUBJECT, "predicate": XS_PRED, "object": XS_NEW, "polarity": 1}]
+    )
+    return StubLLMClient(
+        fixtures={"twenty people": first, "thirty-five people": second}, default="[]"
+    )
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_value_supersession_across_sessions(cfg, flag_on):
+    """Two SEPARATE sessions, distinct world dates: the January value (20) is
+    superseded by the March value (35) when the flag is on. This is the
+    cross-session drift the lever is for and that LME-S does not contain."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        # Session 1 — January.
+        hy.open_session("s_jan")
+        hy.log_message(
+            "s_jan", "user", "Right now we employ twenty people across the company.",
+            created_at="2024-01-10 09:00:00",
+        )
+        hy.close_session("s_jan")
+        # Session 2 — March, a later world date in its own session.
+        hy.open_session("s_mar")
+        hy.log_message(
+            "s_mar", "user", "After the spring hiring round we employ thirty-five people now.",
+            created_at="2024-03-15 09:00:00",
+        )
+        hy.close_session("s_mar")
+
+        hy.set_llm(_xsession_llm())
+        hy.dream()
+
+        conn = hy.conn
+        rows = {
+            r["object_canonical"]: r
+            for r in conn.execute(
+                "SELECT object_canonical, status, valid_at, invalid_at "
+                "FROM knowledge_graph WHERE subject_canonical = ? AND predicate = ?",
+                (XS_SUBJECT, XS_PRED),
+            ).fetchall()
+        }
+        assert {XS_OLD, XS_NEW} <= set(rows), f"both edges should mint: {set(rows)}"
+        # Sanity: the two sessions produced DISTINCT valid_at (the LME-S gap).
+        assert rows[XS_OLD]["valid_at"] != rows[XS_NEW]["valid_at"], (
+            "cross-session edges must carry different world dates for this test"
+        )
+        assert rows[XS_OLD]["valid_at"] < rows[XS_NEW]["valid_at"]
+
+        if not flag_on:
+            assert rows[XS_OLD]["status"] == "active" and rows[XS_NEW]["status"] == "active"
+        else:
+            assert rows[XS_NEW]["status"] == "active"
+            assert rows[XS_OLD]["status"] == "retracted", "older session value not superseded"
+            # Interval closed at the newer session's world date.
+            assert rows[XS_OLD]["invalid_at"] == rows[XS_NEW]["valid_at"]
+            ctx = hy.augment("How many people does the company employ?")
+            objs = {f.object for f in ctx.graph_facts if f.subject == XS_SUBJECT}
+            assert XS_OLD not in objs, f"stale cross-session value still retrievable: {sorted(objs)}"
+    finally:
+        hy.close()
