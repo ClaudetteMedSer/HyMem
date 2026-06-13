@@ -293,14 +293,26 @@ reorder. See *Open levers*.
       resolves updates correctly **when both values reach it** — the blend broke
       that by rearranging which turns reach the answerer. **Turn-level recency is
       the wrong axis.** Reverted; tombstone comment left in `search()`.
-- [ ] **Populate `valid_at`/`invalid_at` (schema v15) from BEAM** — the box run
-      proved this is the **dominant** KU failure mode, not a residual. The fix is
-      fact-validity recency: extract update semantics during dreaming ("updated to
-      X" / "changed to X" asserts new validity; "per the X" / "originally X" is a
-      reference, not a re-assertion), set `valid_at`/`invalid_at`, and at retrieval
-      prefer the fact with the latest `valid_at` (suppress invalidated values).
-      Core bi-temporal path, **LME-validated** — not an adapter reorder, not
-      BEAM-hand-fit. This is now the primary KU lever.
+- [~] **Fact-validity recency via schema-v15 `valid_at`/`invalid_at`** — the
+      dominant KU failure mode (not a residual). LME-driven, core, not BEAM-hand-fit.
+      Progress (all local + deterministic; LME A/B pending on the box):
+      - **Step 0 (done):** repro test `tests/test_ku_update_supersession_repro.py`
+        pins the gap — a single update emits only positive evidence, so the old
+        edge stays active. Settled the routing: the real extraction prompt is
+        tech-stack-framed and unreliable on value updates; even when it emits a
+        `replaces`/`-1`, nothing acts on it (read-only at query time; one negative
+        can't trip phase3). The detector + correctness discriminator already exist
+        in `query/conflicts.py` (`_competing_objects`, functional predicates) but
+        are read-only.
+      - **Step 1 (landed, flag default OFF):** `hymem/dreaming/value_supersession.py`
+        — a dream-cycle consumer that retracts the older-`valid_at` edge among
+        competing **typed-value** objects (numeric/%/count via
+        `kg_evidence.value_numeric`, `value_unit` as compatibility key), closing
+        `invalid_at` at the winner's `valid_at`. Gated by
+        `cfg.value_supersession_enabled`. Typed-value scoping keeps multi-valued
+        facts safe. Test flips green with the flag on; full suite green.
+      - **Next:** LME A/B (KU-strict, ≥2-3 seeds, overall-regression guard) to size
+        it; then decide the date/version representation and the default flip.
 - [ ] *(superseded)* turn-recency reorder and the block-tag sub-check — both moot;
       mention-order is the wrong axis (see the reverted blend above).
 - [ ] **Per-block sessions:** split each conversation's ~3 time-anchored blocks

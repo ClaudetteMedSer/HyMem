@@ -45,6 +45,7 @@ from hymem.dreaming.retention import (
     prune_retracted_edges,
 )
 from hymem.dreaming.summary import persist_session_summary
+from hymem.dreaming.value_supersession import supersede_competing_values
 from hymem.dreaming.user_profile import (
     PROFILE_PROMPT_VERSION,
     extract_user_profile,
@@ -538,6 +539,13 @@ def run_dreaming(
             stamped = bitemporal.stamp_validity(conn)
             if stamped:
                 log.info("bitemporal.valid_at_stamped count=%d", stamped)
+            # Single-assertion supersession: once valid_at is stamped, close the
+            # interval on older typed-value edges that a newer value replaced
+            # (opt-in; needs valid_at, runs before retracted-edge pruning).
+            if cfg.value_supersession_enabled:
+                superseded = supersede_competing_values(conn, cfg)
+                if superseded:
+                    log.info("bitemporal.value_superseded count=%d", superseded)
             pruned = prune_chunks(conn, cfg)
             pruned += prune_messages(conn, cfg)
             pruned += prune_retracted_edges(conn, cfg)

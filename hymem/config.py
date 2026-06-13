@@ -319,6 +319,19 @@ class HyMemConfig:
     under many negatives). Keep small; raising shields more edges from
     retraction."""
 
+    value_supersession_enabled: bool = False
+    """Opt-in (schema v15 bi-temporal). When True, the dream cycle closes the
+    validity interval of an OLDER value-edge the moment a NEWER one supersedes it:
+    among active, non-derived edges sharing subject + predicate but differing on a
+    *typed-value* object (a numeric quantity / percentage / count, identified via
+    `kg_evidence.value_numeric`, with `value_unit` as the compatibility key), the
+    edge with the earlier `valid_at` is retracted and its `invalid_at` set to the
+    newer edge's `valid_at`. This is single-assertion supersession — one
+    authoritative update suffices — distinct from the evidence-accumulation
+    retract rule above which needs repeated negatives. Typed-value scoping means
+    multi-valued facts (a project using many tools) are never collapsed. Default
+    off until the LME guard clears. See `hymem/dreaming/value_supersession.py`."""
+
     reinforce_window_days: int = 30
     """Window for soft positive reinforcement from co-mention. Symmetric to
     decay_window_days."""
