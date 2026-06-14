@@ -95,18 +95,32 @@ def _gold_edges(conn, answer: str) -> list[tuple]:
     that matches exactly. This rejects token-coincidence false positives — gold
     "Ford F-150" {ford,150} hitting "ford_mustang_shelby" (only "ford", no
     numeric) — that a bare substring/any-token match produced. Returns
-    (row, matched_tokens) per qualifying edge."""
+    (row, matched_tokens) per qualifying edge.
+
+    The haystack folds in the kg_evidence value fields (surface_object,
+    value_text, value_numeric, value_unit) per edge, JOINed in: a knowledge-update
+    VALUE frequently lands in the evidence row rather than object_canonical, and an
+    object-only scan is blind to it. NOTE the residual word/digit gap — gold "four"
+    won't token-match value_numeric "4.0"; the dump (--dream NO rows) is the ground
+    truth when the matcher can't bridge that."""
     toks = _gold_value_tokens(answer)
     if not toks:
         return []
     rows = conn.execute(
-        "SELECT subject_canonical AS s, predicate AS p, object_canonical AS o, "
-        "       status AS st, valid_at AS v, invalid_at AS iv "
-        "FROM knowledge_graph"
+        "SELECT kg.subject_canonical AS s, kg.predicate AS p, kg.object_canonical AS o, "
+        "       kg.status AS st, kg.valid_at AS v, kg.invalid_at AS iv, "
+        "       GROUP_CONCAT(COALESCE(e.surface_object,''), ' ') AS so, "
+        "       GROUP_CONCAT(COALESCE(e.value_text,''), ' ')    AS vt, "
+        "       GROUP_CONCAT(COALESCE(e.value_numeric,''), ' ') AS vn, "
+        "       GROUP_CONCAT(COALESCE(e.value_unit,''), ' ')    AS vu "
+        "FROM knowledge_graph kg "
+        "LEFT JOIN kg_evidence e ON e.edge_id = kg.id "
+        "GROUP BY kg.id"
     ).fetchall()
     out = []
     for row in rows:
-        hay_toks = set(re.split(r"[^a-z0-9]+", f"{row['s']} {row['o']}".lower()))
+        hay = f"{row['s']} {row['o']} {row['so'] or ''} {row['vt'] or ''} {row['vn'] or ''} {row['vu'] or ''}"
+        hay_toks = set(re.split(r"[^a-z0-9]+", hay.lower()))
         matched = [t for t in toks if t in hay_toks]
         if not matched:
             continue
@@ -115,6 +129,30 @@ def _gold_edges(conn, answer: str) -> list[tuple]:
         if strong:
             out.append((row, matched))
     return out
+
+
+def _all_edges_with_values(conn) -> list:
+    """GROUND TRUTH for a NO row: every edge in this question's graph with its
+    kg_evidence value fields, so a human/LLM can eyeball where the gold value
+    actually is. Three fates the fuzzy matcher can't distinguish but the eye can:
+      (1) value sits in object_canonical/surface/value_* under different PHRASING
+          (gold "four" vs "4_korean_restaurants") -> matcher gap, value IS present
+          -> the [MEM]-consumption lever's prerequisite is met after all;
+      (2) value is genuinely ABSENT from every field -> extraction still missed it
+          -> L1-L3 have a low ceiling, redirect upstream (box's claim is wrong);
+      (3) value in a free-text object the predicate didn't structure.
+    Per-question DBs are small (one question's sessions), so we dump all edges."""
+    return conn.execute(
+        "SELECT kg.subject_canonical AS s, kg.predicate AS p, kg.object_canonical AS o, "
+        "       kg.status AS st, kg.valid_at AS v, "
+        "       GROUP_CONCAT(COALESCE(e.surface_object,''), '|') AS so, "
+        "       GROUP_CONCAT(COALESCE(e.value_text,''), '|')     AS vt, "
+        "       GROUP_CONCAT(COALESCE(e.value_numeric,''), '|')  AS vn, "
+        "       GROUP_CONCAT(COALESCE(e.value_unit,''), '|')     AS vu "
+        "FROM knowledge_graph kg "
+        "LEFT JOIN kg_evidence e ON e.edge_id = kg.id "
+        "GROUP BY kg.id ORDER BY kg.subject_canonical, kg.predicate"
+    ).fetchall()
 
 
 def probe_question(adapter: HyMemAdapter, q: dict, top_k: int) -> dict:
@@ -406,6 +444,19 @@ def print_report(r: dict, top_k: int, show_graph: bool) -> None:
         for row, matched in ge[:8]:
             print(f"    [{row['st']:>9} v={(row['v'] or '')[:10] or '----------'}] "
                   f"{row['s']} {row['p']} {row['o']}  «match {','.join(matched)}»")
+        if not ge:
+            ae = r.get("all_edges") or []
+            print(f"  --- GROUND-TRUTH edge dump ({len(ae)} edge(s); is the gold value "
+                  f"present-but-unmatched, or absent?) ---")
+            if not ae:
+                print(f"    (no edges minted at all for this question)")
+            for row in ae[:30]:
+                vals = "  ".join(
+                    f"{lbl}={row[k]}" for lbl, k in
+                    (("so", "so"), ("vt", "vt"), ("vn", "vn"), ("vu", "vu"))
+                    if (row[k] or "").strip("| "))
+                print(f"    [{row['st']:>9}] {row['s']} {row['p']} {row['o']}"
+                      + (f"   {{{vals}}}" if vals else ""))
 
 
 def run_ranking(ku: list[dict], args) -> None:
@@ -598,6 +649,11 @@ def main() -> None:
                 # COVERAGE GATE: did the gold value mint an edge at all (vs only
                 # living in raw turns)? Direct table scan, not retrieval-filtered.
                 r["gold_edges"] = _gold_edges(adapter.hy.conn, str(q.get("answer", "")))
+                # On a NO, dump the whole graph+evidence so we can SEE whether the
+                # value is present-but-unmatched (matcher gap) or genuinely absent
+                # (extraction miss) — the fork that decides if L1/L2 is worth it.
+                if not r["gold_edges"]:
+                    r["all_edges"] = _all_edges_with_values(adapter.hy.conn)
             reports.append(r)
             print_report(r, args.top_k, args.dream)
         except Exception as e:
