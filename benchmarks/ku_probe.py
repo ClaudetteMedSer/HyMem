@@ -89,9 +89,13 @@ def _gold_edges(conn, answer: str) -> list[tuple]:
     This is the extraction-vs-ranking fork for the [MEM]-consumption lever. The
     `graph_facts` tier shows only RETRIEVED edges (top-k, relevance-filtered); a
     direct table scan tells us instead whether the value ever entered the graph.
-    A numeric gold token matches a whole object/subject token exactly (so "35"
-    doesn't hit "350"); an alpha token >3 chars matches as a substring (a value
-    embedded in a longer canonical). Returns (row, matched_tokens) per edge."""
+    Matching is WHOLE-TOKEN (no substring), and a hit only counts as coverage
+    when it PINS the value rather than sharing a common word: a numeric/size
+    token matches, OR >=2 gold tokens match, OR the gold value is a single token
+    that matches exactly. This rejects token-coincidence false positives — gold
+    "Ford F-150" {ford,150} hitting "ford_mustang_shelby" (only "ford", no
+    numeric) — that a bare substring/any-token match produced. Returns
+    (row, matched_tokens) per qualifying edge."""
     toks = _gold_value_tokens(answer)
     if not toks:
         return []
@@ -102,10 +106,13 @@ def _gold_edges(conn, answer: str) -> list[tuple]:
     ).fetchall()
     out = []
     for row in rows:
-        hay = f"{row['s']} {row['o']}".lower()
-        hay_toks = set(re.split(r"[^a-z0-9]+", hay))
-        matched = [t for t in toks if t in hay_toks or (len(t) > 3 and t in hay)]
-        if matched:
+        hay_toks = set(re.split(r"[^a-z0-9]+", f"{row['s']} {row['o']}".lower()))
+        matched = [t for t in toks if t in hay_toks]
+        if not matched:
+            continue
+        numeric_hit = any(any(c.isdigit() for c in t) for t in matched)
+        strong = numeric_hit or len(matched) >= 2 or (len(toks) == 1 and len(matched) == 1)
+        if strong:
             out.append((row, matched))
     return out
 

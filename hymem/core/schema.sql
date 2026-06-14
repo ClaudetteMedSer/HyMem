@@ -213,7 +213,8 @@ CREATE TABLE IF NOT EXISTS knowledge_graph (
         'uses','depends_on','prefers','rejects','avoids',
         'replaces','conflicts_with','deploys_to','part_of','equivalent_to',
         'implements','contains','configured_with','requires_version',
-        'runs_on','connects_to','generates','tested_by'
+        'runs_on','connects_to','generates','tested_by',
+        'owns','located_in','participates_in','has_attribute'
     )),
     object_canonical TEXT NOT NULL,
     pos_evidence INTEGER NOT NULL DEFAULT 0,

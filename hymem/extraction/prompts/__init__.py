@@ -22,9 +22,16 @@ ALLOWED_PREDICATES = (
     "connects_to",
     "generates",
     "tested_by",
+    # Personal-life value facts (added v9): the KU-coverage gap was that these
+    # classes — possessions, residence, activities/habits, personal metrics —
+    # had no expressible predicate, so the value never reached the graph.
+    "owns",
+    "located_in",
+    "participates_in",
+    "has_attribute",
 )
 
-_TRIPLE_SYSTEM_TEMPLATE = """You extract structured technical relationships from conversation excerpts.
+_TRIPLE_SYSTEM_TEMPLATE = """You extract structured technical relationships and personal-life facts from conversation excerpts.
 
 Rules:
 - Output a strict JSON array. No prose, no markdown, no code fences.
@@ -35,7 +42,7 @@ Rules:
     value_unit (string): unit for numeric values ("seconds", "MB", "rps")
     temporal_scope (string): time context ("since 2024", "during migration", "temporarily")
 - Optionally include subject_type and object_type (string) to classify entities:
-    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, or_other_tool
+    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, place, organization, product, vehicle, activity, event, document, or_other_entity
 - Include these types ONLY when you are confident. Skip them otherwise.
 - Optionally include subject_properties and/or object_properties (object of
   string->string pairs) to capture stable attributes of the entity, e.g.
@@ -62,6 +69,10 @@ Rules:
     connects_to: A has a network or data-flow connection to B
     generates: A produces, outputs, or creates B
     tested_by: A is tested or verified using B
+    owns: A owns or possesses B (a vehicle, home, device, or other belonging)
+    located_in: A lives in, is located in, or is based in place B
+    participates_in: A does, plays, practices, attends, or is enrolled in activity/event B (put frequency or schedule in temporal_scope)
+    has_attribute: A has the personal attribute or measurement B (age, height, weight, salary, a rate); state the value as the object (e.g. 60_bpm) and also in value_numeric/value_unit when numeric
 {negative_examples}
 - polarity is -1 only when the speaker negates or retracts the relationship
   ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
@@ -69,7 +80,9 @@ Rules:
   Statements like "we avoid X" use predicate 'avoids' with polarity 1, NOT 'uses' with -1.
 - Skip relationships you are not confident about. An empty array [] is a valid answer.
 - Subject and object should be concrete named things — tools, libraries, services,
-  files, modules, environments, AND people, teams, projects, or codebases by name.
+  files, modules, environments, people, teams, projects, or codebases by name, AND
+  the user's personal-life things: possessions, places they live, activities they
+  do, events they attend, and personal attributes.
   Do not invent abstractions like "the system".
 - When a chunk names a person or team alongside a project, codebase, or artifact
   they own, work on, or belong to, extract the linking edge explicitly. This is
@@ -87,6 +100,16 @@ Rules:
   it. Do NOT skip these just because the speaker is implicit.
   This makes identity-to-artifact relationships queryable as 1-hop graph edges
   rather than fuzzy text matches across sibling canonicals.
+- Personal-life facts about the user are EQUALLY high-priority — possessions,
+  where they live, activities and habits, and personal attributes. Extract them
+  with the same eagerness as technical facts, resolving an implicit first-person
+  subject ("I", "we", "my") to the user's canonical name when known:
+    "I drive a Ford F-150"             -> (user, owns, ford_f_150)
+    "We just moved to Austin"           -> (user, located_in, austin)
+    "I play tennis every Tuesday"       -> (user, participates_in, tennis)   [temporal_scope: "every Tuesday"]
+    "My resting heart rate is 60 bpm"   -> (user, has_attribute, 60_bpm)     [value_numeric: 60, value_unit: "bpm"]
+  Updates to these (a new car, a move, a changed metric) are exactly the
+  knowledge-update facts the graph must capture — never skip them as "not technical".
 - Excerpts may be written in languages other than English (e.g. Dutch, German,
   French, Spanish). Extract relationships regardless; keep subject and object in
   the original language as they appear in the text.
@@ -154,7 +177,7 @@ Return the JSON array now."""
 # relationships" and "EXPLICIT behavioral signals" are preserved for prompt
 # routing in tests.
 
-_CHUNK_EXTRACTION_SYSTEM_TEMPLATE = """You extract structured technical relationships and EXPLICIT behavioral signals from a conversation excerpt in a single pass.
+_CHUNK_EXTRACTION_SYSTEM_TEMPLATE = """You extract structured technical relationships, personal-life facts, and EXPLICIT behavioral signals from a conversation excerpt in a single pass.
 
 Output a strict JSON OBJECT (not an array). No prose, no markdown, no code fences.
 The object has exactly these two keys:
@@ -166,7 +189,7 @@ The object has exactly these two keys:
     value_unit (string): unit for numeric values ("seconds", "MB", "rps")
     temporal_scope (string): time context ("since 2024", "during migration", "temporarily")
 - Optionally include subject_type and object_type (string) to classify entities:
-    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, or_other_tool
+    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, place, organization, product, vehicle, activity, event, document, or_other_entity
 - Include these types ONLY when you are confident. Skip them otherwise.
 - Optionally include subject_properties and/or object_properties (object of
   string->string pairs) to capture stable attributes of the entity, e.g.
@@ -193,6 +216,10 @@ The object has exactly these two keys:
     connects_to: A has a network or data-flow connection to B
     generates: A produces, outputs, or creates B
     tested_by: A is tested or verified using B
+    owns: A owns or possesses B (a vehicle, home, device, or other belonging)
+    located_in: A lives in, is located in, or is based in place B
+    participates_in: A does, plays, practices, attends, or is enrolled in activity/event B (put frequency or schedule in temporal_scope)
+    has_attribute: A has the personal attribute or measurement B (age, height, weight, salary, a rate); state the value as the object (e.g. 60_bpm) and also in value_numeric/value_unit when numeric
 {negative_examples}
 - polarity is -1 only when the speaker negates or retracts the relationship
   ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
@@ -200,7 +227,9 @@ The object has exactly these two keys:
   Statements like "we avoid X" use predicate 'avoids' with polarity 1, NOT 'uses' with -1.
 - Skip relationships you are not confident about. An empty array [] is a valid answer.
 - Subject and object should be concrete named things — tools, libraries, services,
-  files, modules, environments, AND people, teams, projects, or codebases by name.
+  files, modules, environments, people, teams, projects, or codebases by name, AND
+  the user's personal-life things: possessions, places they live, activities they
+  do, events they attend, and personal attributes.
   Do not invent abstractions like "the system".
 - When a chunk names a person or team alongside a project, codebase, or artifact
   they own, work on, or belong to, extract the linking edge explicitly. This is
@@ -218,6 +247,16 @@ The object has exactly these two keys:
   it. Do NOT skip these just because the speaker is implicit.
   This makes identity-to-artifact relationships queryable as 1-hop graph edges
   rather than fuzzy text matches across sibling canonicals.
+- Personal-life facts about the user are EQUALLY high-priority — possessions,
+  where they live, activities and habits, and personal attributes. Extract them
+  with the same eagerness as technical facts, resolving an implicit first-person
+  subject ("I", "we", "my") to the user's canonical name when known:
+    "I drive a Ford F-150"             -> (user, owns, ford_f_150)
+    "We just moved to Austin"           -> (user, located_in, austin)
+    "I play tennis every Tuesday"       -> (user, participates_in, tennis)   [temporal_scope: "every Tuesday"]
+    "My resting heart rate is 60 bpm"   -> (user, has_attribute, 60_bpm)     [value_numeric: 60, value_unit: "bpm"]
+  Updates to these (a new car, a move, a changed metric) are exactly the
+  knowledge-update facts the graph must capture — never skip them as "not technical".
 - Excerpts may be written in languages other than English (e.g. Dutch, German,
   French, Spanish). Extract relationships regardless; keep subject and object in
   the original language as they appear in the text.

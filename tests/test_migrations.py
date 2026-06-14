@@ -223,6 +223,74 @@ def test_v15_backfills_validity_interval(tmp_path: Path):
     conn.close()
 
 
+def test_v21_rebuilds_predicate_check_preserving_data_and_fk(tmp_path: Path):
+    """Migration 021 rebuilds knowledge_graph to widen the predicate CHECK
+    (adding the v9 personal-life predicates). The rebuild must preserve every
+    edge with its id (so kg_evidence.edge_id stays valid), keep enforcing the
+    vocabulary (just wider), and restore FK enforcement after the table swap."""
+    import sqlite3
+
+    import pytest
+
+    conn = core_db.connect(tmp_path / "v20.sqlite")
+    # A pre-021 store: the OLD (narrow) predicate CHECK, a populated edge with
+    # evidence counts and a validity stamp, and a kg_evidence child FK row.
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta VALUES ('schema_version', '20');
+        CREATE TABLE knowledge_graph(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_canonical TEXT NOT NULL,
+            predicate TEXT NOT NULL CHECK (predicate IN ('uses','prefers','configured_with')),
+            object_canonical TEXT NOT NULL,
+            pos_evidence INTEGER NOT NULL DEFAULT 0,
+            neg_evidence INTEGER NOT NULL DEFAULT 0,
+            first_seen TIMESTAMP, last_seen TIMESTAMP, last_reinforced TIMESTAMP,
+            valid_at TIMESTAMP, invalid_at TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'active', derived BOOLEAN NOT NULL DEFAULT 0,
+            UNIQUE(subject_canonical, predicate, object_canonical));
+        CREATE TABLE kg_evidence(id INTEGER PRIMARY KEY,
+            edge_id INTEGER NOT NULL REFERENCES knowledge_graph(id) ON DELETE CASCADE,
+            chunk_id TEXT, polarity INTEGER);
+        INSERT INTO knowledge_graph
+            (id, subject_canonical, predicate, object_canonical, pos_evidence, valid_at, status)
+            VALUES (42, 'project', 'configured_with', '78_percent', 3, '2024-03-20', 'active');
+        INSERT INTO kg_evidence(id, edge_id, chunk_id, polarity) VALUES (7, 42, 'c1', 1);
+        """
+    )
+
+    core_db._run_migrations(conn)
+
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+    # Edge preserved with its id and payload; the FK child still resolves to it.
+    edge = conn.execute(
+        "SELECT id, predicate, object_canonical, pos_evidence, valid_at "
+        "FROM knowledge_graph WHERE id = 42"
+    ).fetchone()
+    assert (edge["predicate"], edge["object_canonical"], edge["pos_evidence"], edge["valid_at"]) == (
+        "configured_with", "78_percent", 3, "2024-03-20"
+    )
+    assert conn.execute("SELECT edge_id FROM kg_evidence WHERE id = 7").fetchone()["edge_id"] == 42
+    # The widened vocabulary admits a personal-life predicate…
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
+        "VALUES ('user', 'owns', 'ford_f_150')"
+    )
+    # …but is still a closed CHECK, not removed.
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
+            "VALUES ('x', 'made_up', 'y')"
+        )
+    # FK enforcement restored after the swap (PRAGMA foreign_keys flipped back on).
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO kg_evidence(id, edge_id, chunk_id, polarity) VALUES (9, 99999, 'c2', 1)"
+        )
+    conn.close()
+
+
 def test_v13_backfills_messages_fts_with_role_filter(tmp_path: Path):
     """Migration 013 backfills already-logged user/assistant turns into
     messages_fts and excludes tool/system turns — matching the live trigger's

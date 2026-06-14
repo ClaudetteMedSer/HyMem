@@ -366,6 +366,38 @@ reorder. See *Open levers*.
       gate first (cheap probe):** for the KU zeros, did the gold value mint a graph
       edge at all? If mostly NO, the bottleneck is EXTRACTION coverage, not ranking,
       and the lever's ceiling is low until that's fixed. Cheapest path: probe + ship L1.
+      - **COVERAGE PROBE RESULT (2026-06-14): bottleneck IS extraction, lever DEFERRED.**
+        `ku_probe.py --dream` (new `_gold_edges` table scan, S-scale): **10/72 KU gold
+        values minted as edges (14%)**; **KU zeros = 10/10 NO** (after matcher
+        hardening; box's raw run showed 2 false YES from substring coincidence —
+        `ford`→`ford_mustang_shelby`, `tennis`→`nike_..._tennis_shoes` — now fixed:
+        whole-token + numeric/≥2-token/single-exact "pin" rule). All 10 YES are
+        `active` (when extraction fires it gets the CURRENT value right; 0 stale-only).
+        ⇒ the gold value lives ONLY in raw turns, never the graph — confirms the 8/8
+        [MEM] finding. [MEM]-consumption L1–L3 has a LOW CEILING; do NOT build it yet.
+        value_supersession stays dormant. The missed values are PERSONAL attributes /
+        possessions / preferences (Ford F-150 truck, tennis schedule) — consistent
+        with the settled "extraction prompt is tech-stack-framed" finding. **Real KU
+        lever is now UPSTREAM: extraction coverage of personal-life value facts.**
+      - **v9 EXTRACTION EXTENSION LANDED (2026-06-14, uncommitted).** Chose "full
+        extend" (predicates + de-tech the prompt). Added 4 predicates to
+        ALLOWED_PREDICATES + both prompt templates: `owns`, `located_in`,
+        `participates_in`, `has_attribute` (personal-fact examples + broadened
+        entity-types/"concrete named things"; routing substring "structured technical
+        relationships" PRESERVED — de-tech is additive: "...and personal-life facts").
+        `prompt_version` v8→v9. Routing keywords added (owns/lives in/plays/age...);
+        dropped "have" (too generic). The locked predicate CHECK forced a
+        knowledge_graph table-rebuild migration **021** (EXPECTED_SCHEMA_VERSION 20→21;
+        CHECK expanded, NOT dropped; rebuild preserves edge ids + kg_evidence FK +
+        indexes, verified by `test_v21_rebuilds_predicate_check_preserving_data_and_fk`).
+        Tests: `test_personal_predicates.py`. Suite 676 green.
+      - **NEXT (box): re-run the coverage probe to measure the lift.**
+        `python ku_probe.py --dream --n 78` — does `>>> COVERAGE GATE` move off 10/72
+        (14%)? Cross-ref the KU zeros: do their gold values now mint edges? If coverage
+        rises → the [MEM]-consumption lever (L1 [FACT] dating + L2 stale-[MEM] annot.)
+        becomes worth building. If still flat → the prompt change isn't enough on
+        DeepSeek; reconsider. Watch BEAM/LME OVERALL for extraction-noise regression
+        from the broadened scope (G4 guard).
 - [ ] *(superseded)* turn-recency reorder and the block-tag sub-check — both moot;
       mention-order is the wrong axis (see the reverted blend above).
 - [ ] **Per-block sessions:** split each conversation's ~3 time-anchored blocks
