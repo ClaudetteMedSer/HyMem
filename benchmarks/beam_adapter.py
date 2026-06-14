@@ -278,6 +278,7 @@ def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
                     all_questions.append({
                         "ability": ability,
                         "ability_short": ABILITY_MAP.get(ability, ability[:3].upper()),
+                        "question_id": q.get("question_id") or q.get("id") or "",
                         "question": q.get("question", ""),
                         "ideal_answer": q.get("ideal_response", q.get("ideal_answer", "")),
                         "rubric": q.get("rubric", []),
@@ -525,7 +526,42 @@ class HyMemAdapter:
         return memories, total_matches
 
 
-def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str, total_matches: int = 0) -> str:
+# Opt-in transcript logging for localizing a category's floor (retrieval vs
+# answer-side). Set BEAM_CONTEXT_LOG=/path/to/file.txt to append, per question,
+# the EXACT assembled context the model saw (presented order, [MEM date]/[FACT]
+# tags intact) + the prediction. Zero cost when the env var is unset; wrapped so
+# a logging error can never break a benchmark run. Optionally narrow with
+# BEAM_CONTEXT_LOG_ABILITIES=CR,EO to only dump those abilities.
+def _log_context(question_id: str, ability: str, system_prompt: str,
+                 question: str, context: str, prediction: str) -> None:
+    path = os.environ.get("BEAM_CONTEXT_LOG")
+    if not path:
+        return
+    only = os.environ.get("BEAM_CONTEXT_LOG_ABILITIES", "")
+    if only and ability not in {a.strip() for a in only.split(",") if a.strip()}:
+        return
+    try:
+        sys_line = (system_prompt or "").strip().splitlines()[0] if system_prompt else ""
+        block = (
+            "\n================ CONTEXT LOG ================\n"
+            f"QID: {question_id or '(none)'}\n"
+            f"ABILITY: {ability}\n"
+            f"SYSTEM_PROMPT[0]: {sys_line}\n"
+            f"QUESTION: {question}\n"
+            f"---- CONTEXT ({len(context)} chars, presented order) ----\n"
+            f"{context}\n"
+            "---- PREDICTION ----\n"
+            f"{prediction}\n"
+            "============================================\n"
+        )
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(block)
+    except Exception as e:
+        print(f"      [context-log skipped: {type(e).__name__}: {e}]", flush=True)
+
+
+def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str,
+                    total_matches: int = 0, question_id: str = "") -> str:
     """Ask LLM to answer based on retrieved memories."""
     # Build context from memories
     parts = []
@@ -591,7 +627,9 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         {"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
-    return llm.chat(messages, temperature=0.0, max_tokens=1024)
+    prediction = llm.chat(messages, temperature=0.0, max_tokens=1024)
+    _log_context(question_id, ability, system_prompt, question, context, prediction)
+    return prediction
 
 
 def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_answer: str) -> dict:
@@ -659,7 +697,8 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
         print()
 
         # Answer
-        answer = answer_question(llm, memories, question, ability, total_matches)
+        answer = answer_question(llm, memories, question, ability, total_matches,
+                                 question_id=q.get("question_id", ""))
 
         # Judge
         judge_result = judge_answer(judge_llm, question, q["ideal_answer"], q["rubric"], answer)
