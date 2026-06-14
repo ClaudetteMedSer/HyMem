@@ -107,20 +107,14 @@ Write a comprehensive, specific summary of everything in the context that is rel
 Summarize whatever relevant material is present even if it looks incomplete; only say "I don't have enough information to answer this question" if the context contains nothing relevant at all.
 Do not add information that is not in the context."""
 
-# KNOWLEDGE_UPDATE gets its own prompt (additively — the shared default and its
-# RECENCY_CONFLICT_CLAUSE stay unchanged for IE/ABS, which fall through). The
-# ku_probe spoiler split showed the headroom: of the present-but-not-latest
-# questions, ~23/28 are recoverable because the later turn that out-dates the
-# answer either only mentions the topic (no value) or carries a value of a
-# DIFFERENT kind than the question asks for — only ~5 carry a genuine competing
-# same-kind value (unfixable from raw turns). The default clause says "value",
-# which under-covers place/yes-no/venue golds; this one generalises to "whatever
-# the question asks for" and spells out the procedure.
-ANSWERING_KU_PROMPT = """You are an AI assistant answering questions based on retrieved memories from past conversations.
-A fact the question asks about may have CHANGED over time, so the context can hold several different answers stamped at different dates, e.g. [MEM 2023-11-30], listed earliest first.
-First decide exactly what the question asks for — a number, amount, duration, frequency, date, place, name, or yes/no. Then find the memories that DIRECTLY state that for the thing asked about, and answer with the one from the MOST RECENT date.
-A later memory that only mentions the topic, or states something of a DIFFERENT kind than was asked, does NOT override an earlier memory that actually gives the answer — ignore it when judging recency.
-Answer concisely using ONLY the provided context. If no memory states the answer, say "I don't have enough information to answer this question." Do not make up information or use outside knowledge."""
+# NB (2026-06-14): a dedicated procedural KU prompt was A/B'd and REGRESSED KU hard
+# (45%→20%, IE/ABS/OVERALL flat — additive design held, the regression was all KU).
+# DeepSeek executes the simple shared RECENCY_CONFLICT_CLAUSE ("use the latest value")
+# BETTER than an explicit "decide what's asked → find direct statements → check
+# recency → ignore different-kind mentions" procedure: the extra reasoning steps make
+# it abstain/mispick. So KU intentionally falls through to ANSWERING_SYSTEM_PROMPT —
+# do NOT re-add a procedural KU prompt. The spoiler-split headroom is real but it's
+# retrieval/selection-side, not promptable on this model.
 
 # Abilities not listed here fall through to ANSWERING_SYSTEM_PROMPT.
 ANSWERING_PROMPTS = {
@@ -131,7 +125,6 @@ ANSWERING_PROMPTS = {
     "EO": ANSWERING_EO_PROMPT,
     "IF": ANSWERING_IF_PROMPT,
     "SUM": ANSWERING_SUM_PROMPT,
-    "KU": ANSWERING_KU_PROMPT,
 }
 
 JUDGE_SYSTEM_PROMPT = """You are an impartial judge evaluating AI responses against rubrics.
