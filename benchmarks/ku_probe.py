@@ -82,6 +82,60 @@ def _gold_value_tokens(answer: str) -> list[str]:
     return out
 
 
+# ── Spoiler (a)/(b) auto-classifier ──────────────────────────────────────────
+# A "spoiler" is a turn dated AFTER the newest answer-bearing turn — it out-dates
+# the new value and can mislead a naive latest-date-wins clause. Two fates with
+# OPPOSITE fixes: (a) STALE-VALUE re-assertion (a later turn restates an OLD value
+# for the same attribute — unfixable from raw turns, recency is genuinely wrong)
+# vs (b) TANGENTIAL mention (the turn touches the topic but carries no value — a
+# value-aware clause skips it, recoverable). Because spoilers by construction never
+# contain the gold value (a turn that did would BE answer-bearing and move the
+# anchor), any value of the SAME SHAPE as the gold sitting in a spoiler is a
+# COMPETING (stale) value ⇒ (a). No same-shape value ⇒ (b).
+_MONEY = re.compile(r"[$€£]\s?\d|\bdollars?\b|\busd\b", re.I)
+_DURATION = re.compile(r"\b\d{1,2}:\d{2}\b|\b\d+\s*(?:hours?|hrs?|minutes?|mins?|seconds?|secs?)\b", re.I)
+_NUMWORD = re.compile(r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|once|twice)\b", re.I)
+_NUM = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+_MONTH = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", re.I)
+
+
+def _value_shape(text: str) -> str | None:
+    """Coarse shape of a value in `text`: money|time|date|num|None. Ordered
+    most-specific-first so '$400' reads as money, '25:50' as time, not num."""
+    text = text or ""
+    if _MONEY.search(text):
+        return "money"
+    if _DURATION.search(text):
+        return "time"
+    if _MONTH.search(text):
+        return "date"
+    if _NUMWORD.search(text) or _NUM.search(text):
+        return "num"
+    return None
+
+
+def _classify_spoiler(spoiler_text: str, answer: str) -> str:
+    """'a' (stale-value), 'b' (tangential), or '?' (gold has no value shape —
+    a location/boolean/venue — so a shape match can't decide it; eyeball)."""
+    gshape = _value_shape(answer)
+    if gshape is None:
+        return "?"
+    return "a" if _value_shape(spoiler_text) == gshape else "b"
+
+
+def _spoiler_verdict(spoilers, answer: str) -> tuple[str, list[str]]:
+    """Roll a question's spoiler turns into one verdict: 'a' if ANY spoiler
+    carries a competing same-shape value (the recency clause CAN'T win), 'b' if
+    all are tangential (a value-aware clause recovers it), '?' if shapeless gold.
+    Returns (verdict, per_spoiler_tags)."""
+    tags = [_classify_spoiler(_norm(getattr(h, "text", "")), answer) for h in spoilers]
+    if not tags:
+        return "b", tags
+    if "?" in tags and not any(t == "a" for t in tags):
+        return "?", tags
+    return ("a" if "a" in tags else "b"), tags
+
+
 def _gold_edges(conn, answer: str) -> list[tuple]:
     """COVERAGE PROBE: does the gold value exist as a knowledge_graph EDGE at
     all — minted by extraction, regardless of whether retrieval surfaced it?
@@ -424,13 +478,18 @@ def print_report(r: dict, top_k: int, show_graph: bool) -> None:
     # The decisive eyeball: turns that out-date the new value. Classify each
     # (a) STALE-VALUE re-assertion (unfixable) vs (b) TANGENTIAL mention (fixable).
     if r["answer_present"] and not r["answer_on_latest"] and r["spoilers"]:
+        answer = str(r["q"].get("answer", ""))
+        verdict, tags = _spoiler_verdict(r["spoilers"], answer)
+        label = {"a": "(a) STALE-VALUE — unfixable from raw turns",
+                 "b": "(b) TANGENTIAL — value-aware clause recovers",
+                 "?": "(?) shapeless gold — EYEBALL"}[verdict]
         print(f"  --- SPOILERS: turns dated AFTER the new value ({r['ans_latest_date']}) "
-              f"— classify (a) stale-value vs (b) tangential ---")
-        for h in r["spoilers"]:
+              f"— auto-verdict {label} ---")
+        for h, tag in zip(r["spoilers"], tags):
             d = _date10(getattr(h, "created_at", ""))
             role = getattr(h, "role", "?")
             text = _norm(getattr(h, "text", ""))[:160]
-            print(f"    [{d}] ({role:>9}) {text}")
+            print(f"    [{tag}] [{d}] ({role:>9}) {text}")
     if show_graph and r["graph_facts"]:
         print(f"  --- graph_facts (UNDATED tier — conflict check) ---")
         for f in r["graph_facts"][:12]:
@@ -697,14 +756,33 @@ def main() -> None:
         print(f"              low ceiling until extraction captures the value. Redirect upstream.")
         print(f"      HIGH -> value IS in the graph; L1 ([FACT] dating) + L2 (stale-[MEM] annot.)")
         print(f"              can consume it. CROSS-REF the per-question YES/NO against the KU zeros.")
+    # ── Spoiler (a)/(b) auto-tally: the KU headroom question ─────────────────
+    # Each present-but-not-latest question gets one verdict (any same-shape
+    # competing value among its spoilers = (a) stale; all tangential = (b)).
+    # Shapeless-gold questions land in (?) for manual eyeball.
+    verdicts = {"a": [], "b": [], "?": []}
+    for r in present_not_latest:
+        v, _ = _spoiler_verdict(r["spoilers"], str(r["q"].get("answer", "")))
+        verdicts[v].append(r["q"].get("question_id", "?"))
+    a, b, u = len(verdicts["a"]), len(verdicts["b"]), len(verdicts["?"])
+    pnl = len(present_not_latest)
     print()
-    print("  CEILING of a VALUE-AWARE clause = (on-latest + tangential-spoiled)/n.")
-    print("  Read the SPOILER blocks above and count, per spoiled question:")
-    print("    (a) STALE-VALUE re-assertion  -> unfixable from raw turns (recency is genuinely wrong)")
-    print("    (b) TANGENTIAL topic mention  -> a value-aware clause skips it (recoverable)")
-    print("  If (b) dominates -> ceiling is high, a value-aware clause + dating is worth one run.")
-    print("  If (a) shows up often -> raw-turn recency can't separate it; consider the graph")
-    print("  (value-bearing edges, --dream) or stop — KU's big lift is already banked under permissive.")
+    print(f"  >>> SPOILER SPLIT (of the {pnl} present-but-not-latest) — auto-classified:")
+    print(f"        (a) STALE-VALUE  : {a:>3}  unfixable from raw turns (recency genuinely wrong)")
+    print(f"        (b) TANGENTIAL   : {b:>3}  a value-aware clause recovers these")
+    print(f"        (?) shapeless    : {u:>3}  location/boolean/venue gold — EYEBALL these")
+    # Optimistic recoverable ceiling treats (?) as recoverable; pessimistic as not.
+    ceil_lo = (ans_latest + b)
+    ceil_hi = (ans_latest + b + u)
+    print(f"      VALUE-AWARE CLAUSE CEILING ≈ (on-latest {ans_latest} + recoverable) / {n}")
+    print(f"        = {ceil_lo}/{n} ({100*ceil_lo//n}%) pessimistic  ..  "
+          f"{ceil_hi}/{n} ({100*ceil_hi//n}%) optimistic (counts (?) as recoverable)")
+    print(f"      READ: if (b) dominates → recency-clause headroom, worth one tuning run.")
+    print(f"            if (a) dominates → raw-turn recency can't separate it → KU is")
+    print(f"            synthesis-bound (the LME KU verdict); stop spending on KU retrieval.")
+    print(f"      Spot-check the (?) and a few (a) SPOILER blocks above to trust the split.")
+    if verdicts["?"]:
+        print(f"      (?) question_ids: {', '.join(verdicts['?'][:20])}")
 
 
 if __name__ == "__main__":
