@@ -161,10 +161,10 @@ PUBLISHED_SOTA = {
 # ── LLM Client ────────────────────────────────────────────────────────────
 
 class LLMClient:
-    def __init__(self, model: str, api_key: str):
+    def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL):
         self.model = model
         self.api_key = api_key
-        self.base_url = DEEPSEEK_BASE_URL.rstrip("/")
+        self.base_url = base_url.rstrip("/")
         self.call_count = 0
 
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
@@ -193,6 +193,45 @@ class LLMClient:
         data = resp.json()
         self.call_count += 1
         return data["choices"][0]["message"].get("content", "")
+
+
+# ── Answer-model provider registry ────────────────────────────────────────
+# The BEAM ANSWERER is swappable to isolate the answer-side ceiling (KU/CR/EO
+# all fail on context that is already present, 2026-06) from extraction/assembly.
+# ONLY the answerer changes here: extraction + dream stay on DeepSeek
+# (HyMemAdapter, untouched), and the JUDGE stays DeepSeek always — swapping the
+# grader would move scores without moving capability, breaking the A/B. Each
+# provider exposes an OpenAI-compatible /chat/completions endpoint, so the same
+# LLMClient payload works. Spec form is "provider:model"
+# (e.g. "gemini:gemini-2.5-flash"); a bare model name ("deepseek-chat") stays on
+# DeepSeek for back-compat with the old --answer-model.
+ANSWER_PROVIDERS = {
+    "deepseek": ("https://api.deepseek.com", ("HYMEM_LLM_API_KEY", "DEEPSEEK_API_KEY")),
+    "gemini":   ("https://generativelanguage.googleapis.com/v1beta/openai", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
+    "openai":   ("https://api.openai.com/v1", ("OPENAI_API_KEY",)),
+}
+
+
+def resolve_answer_provider(spec: str, deepseek_key: str):
+    """Map an answer-model spec to (model, base_url, api_key, provider).
+
+    'provider:model' selects a provider and pulls its key from the first set
+    env var in that provider's tuple; a bare model name stays on DeepSeek and
+    reuses the already-resolved DeepSeek key. Exits if a non-DeepSeek provider
+    is selected without its key set."""
+    if ":" in spec and spec.split(":", 1)[0] in ANSWER_PROVIDERS:
+        provider, model = spec.split(":", 1)
+    else:
+        provider, model = "deepseek", spec
+    base_url, key_envs = ANSWER_PROVIDERS[provider]
+    if provider == "deepseek":
+        api_key = deepseek_key
+    else:
+        api_key = next((os.environ[e] for e in key_envs if os.environ.get(e)), "")
+        if not api_key:
+            print(f"ERROR: answer provider '{provider}' needs one of {key_envs} set.", flush=True)
+            sys.exit(1)
+    return model, base_url, api_key, provider
 
 
 # ── BEAM Dataset Loader ───────────────────────────────────────────────
@@ -784,7 +823,9 @@ def main():
     parser.add_argument("--scales", default=DEFAULT_SCALE)
     parser.add_argument("--sample", type=int, default=DEFAULT_SAMPLE)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
-    parser.add_argument("--answer-model", default=ANSWER_MODEL)
+    parser.add_argument("--answer-model", default=os.environ.get("BEAM_ANSWER_MODEL", ANSWER_MODEL),
+                        help="Answerer spec 'provider:model' (e.g. gemini:gemini-2.5-flash) "
+                             "or a bare DeepSeek model. Env: BEAM_ANSWER_MODEL.")
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
     parser.add_argument("--api-key", default="")
     parser.add_argument("--keep-db", action="store_true")
@@ -815,8 +856,9 @@ def main():
     print(f"  Scales: {scales}")
     print(f"  Max conversations: {max_conv or 'all'}")
     print(f"  Top-K: {top_k}")
-    print(f"  Answer model: {args.answer_model}")
-    print(f"  Judge model: {args.judge_model}")
+    ans_model, ans_base, ans_key, ans_provider = resolve_answer_provider(args.answer_model, DEEPSEEK_API_KEY)
+    print(f"  Answer model: {ans_model} (provider={ans_provider}, base={ans_base})")
+    print(f"  Judge model: {args.judge_model} (provider=deepseek)")
 
     # Temp DB
     tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-beam-"))
@@ -828,7 +870,7 @@ def main():
     hy.open()
 
     # LLM clients
-    answer_llm = LLMClient(args.answer_model, DEEPSEEK_API_KEY)
+    answer_llm = LLMClient(ans_model, ans_key, base_url=ans_base)
     judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY)
 
     # Load data
