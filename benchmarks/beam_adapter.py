@@ -584,9 +584,15 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     # only ordering signal the answer model gets, and it cannot sort shuffled
     # snippets itself (every EO question failed that way).
     if ability == "EO":
-        # Episodes (the coverage overview search() loaded for EO) lead, so the
-        # char budget can't truncate them; then the dated raw-turn timeline;
-        # then any other undated tiers.
+        # The answer model orders events by PRESENTATION ORDER, not by reading the
+        # [MEM] dates (confirmed: 14/20 EO failures followed context order). So
+        # presentation order MUST be chronological. Earlier this block led with the
+        # UNDATED RAPTOR episode/aggregation nodes (for coverage) — but leading with
+        # undated summaries put non-timeline entries at the front and the model
+        # ordered by them, sabotaging the very signal we sorted. Lead with the
+        # date-sorted raw-turn timeline so following presentation order IS correct;
+        # demote the undated episodes BELOW it (kept for coverage, not truncated out
+        # by EO's doubled budget) and any other undated tiers last.
         episodes = [m for m in memories if m["type"] == "episode"]
         dated = sorted(
             (m for m in memories if m["type"] != "episode" and m.get("created_at")),
@@ -594,7 +600,7 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         )
         other = [m for m in memories
                  if m["type"] != "episode" and not m.get("created_at")]
-        memories = episodes + dated + other
+        memories = dated + episodes + other
     elif ability == "TR":
         dated = sorted(
             (m for m in memories if m.get("created_at")),
