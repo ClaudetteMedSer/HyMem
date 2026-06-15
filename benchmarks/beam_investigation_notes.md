@@ -429,3 +429,60 @@ reorder. See *Open levers*.
   (`answer`/`ideal`/`rubric`/`scores`) so runs can be re-judged and diffed.
 - **BEAM measures per-conversation memory.** Its conversations are independent
   personas; it cannot validly reward cross-conversation recall. Use LME for that.
+
+---
+
+## Answer-side ceiling: KU / CR / EO (2026-06)
+
+After exhausting the retrieval/assembly levers, three BEAM floors closed for the
+**same reason** — the answerer fails on context that is *already present*, not a
+retrieval or assembly gap. Recorded so we don't re-mine them.
+
+- **KU closed ~45%.** Graph coverage dead (values genuinely absent from the KG —
+  DeepSeek mints predicate + head noun but drops the value/quantifier, 1/207
+  `value_numeric`); a procedural KU prompt **regressed 45→20** (DeepSeek executes
+  the simple "use the latest value" clause better than an explicit procedure);
+  ranking/budget headroom zero (bucket split A=2 / **B=0** / C=70 — the
+  value-bearing turn is in context for 70/72 and the model mis-picks).
+  Synthesis-bound, same verdict as LME KU.
+- **CR ~52%, answer-side.** Both contradiction sides are always in context; the
+  model answers the surface question instead of flagging the planted negation.
+  Mid-pack, not a floor — not worth procedural-prompt risk.
+- **EO assembly fix LANDED, then EO closed ~10.7%.** The fix: lead the EO context
+  with the date-sorted raw-turn timeline and demote the undated RAPTOR episode
+  nodes below it (`memories = dated + episodes + other`, was `episodes + dated +
+  other`) — the model orders by *presentation order*, so leading with undated
+  summaries sabotaged the chronological sort. A/B = **+1.9pp (8.8→10.7%)**, 8/11
+  changed favoring it; **keep it**. But a composition probe then showed zero vs
+  non-zero EO contexts are statistically identical on every axis (unique dates
+  4.2 vs 4.3, etc.), and the one regression (Conv 19) had *varied* dates and still
+  failed — so the **event-date-extraction hypothesis is falsified**; EO is
+  answer-side too. Both models fail EO ⇒ task ceiling, not answerer-fixable.
+
+### Answerer-swap A/B — DeepSeek vs Gemini 2.5 Flash (CONFOUNDED)
+
+A `--answer-model provider:model` knob (env `BEAM_ANSWER_MODEL`) swaps the
+**answerer only** — extraction + dream stay DeepSeek, and the **judge stays
+DeepSeek** so scoring is held constant. Adapter-only; HyMem ships no backend.
+(`ANSWER_PROVIDERS` registry + `resolve_answer_provider`; `LLMClient` gained a
+`base_url` arg.)
+
+Result: KU 30.0→7.5 (−22.5), CR 51.9→63.1 (**+11.2, 11 conv wins**), EO
+10.3→12.4 (+2.1 = noise), OVERALL 50.6→42.7 (−7.9); IE **−28.8**, MR **−23.4**.
+
+- **Floors move on a pure answerer swap ⇒ answer-side diagnosis CONFIRMED.**
+- **But the run is confounded — do not build per-ability routing off it.** IE is
+  the most retrieval-trivial ability; a strong model does not lose 29pp at basic
+  extraction. Broad simultaneous IE+MR+KU collapse is the signature of a
+  systematic artifact, not cognition. Two confounds to rule out first: (1) **API
+  errors** — `LLMClient.chat` returns `[LLM_ERROR]` after 3 retries, scoring 0 on
+  *every* ability (grep the predictions / check call counts; ≥~10% ⇒ re-run with
+  longer backoff); (2) **prompts + judge are DeepSeek-tuned** — we held both fixed
+  while swapping the answerer, so we measured "Gemini on DeepSeek-shaped prompts,
+  DeepSeek-judged" (pull IE/KU zero transcripts: correct-but-mis-shaped/abstained
+  → artifact; genuinely-wrong → real).
+- **Survives regardless:** CR +11pp is robust (Gemini reasons contradictions
+  better); EO failing under *both* models double-confirms it as a task ceiling.
+- **Decision:** do **not** globally swap (net −7.9pp on this ability mix).
+  Per-ability model routing (Gemini→CR, DeepSeek→KU) is a candidate but **gated**
+  on the two confound checks above. Deferred for now.
