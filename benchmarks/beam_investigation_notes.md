@@ -486,3 +486,46 @@ Result: KU 30.0→7.5 (−22.5), CR 51.9→63.1 (**+11.2, 11 conv wins**), EO
 - **Decision:** do **not** globally swap (net −7.9pp on this ability mix).
   Per-ability model routing (Gemini→CR, DeepSeek→KU) is a candidate but **gated**
   on the two confound checks above. Deferred for now.
+
+### Five-way answerer comparison (2026-06-16, 100K, DeepSeek judge)
+
+Added Granite 4.1 8B, Nemotron 30B, Command-R. OVERALL: DeepSeek 50.6 / Gemini
+42.7 / **Granite 51.6** / Nemotron 32.8 / Cmd-R 38.6. This **supersedes the
+earlier "grounded vs reasoning" hypothesis** — the real structure is a single
+**eagerness-to-answer** tradeoff axis.
+
+- **Two anti-correlated ability clusters.** *Extraction/utilization* (IE, KU, MR,
+  IF, PF) rewards producing the answer that's in context; *discrimination* (CR,
+  ABS) rewards *withholding* it (flag the contradiction; refuse when unsupported).
+  Models line up on how eager they are to answer:
+  - **Granite & Command-R (eager):** top the extraction cluster, bottom the
+    discrimination cluster. Command-R is the most eager → worst CR (**10.0%**, the
+    real CR floor) *and* worst ABS (55%) — one mechanism, two abilities.
+  - **Gemini (cautious):** mirror image — best CR (63.1) + best ABS (95), tanks
+    IE/KU/MR. The hedging that lost it the extraction cluster is what wins it
+    discrimination.
+  - **DeepSeek (balanced middle):** best CR among the competent extractors, strong
+    ABS, no cluster collapse → best all-rounder.
+- **Real, not noise.** Within each model CR and ABS move *together* and *opposite*
+  to IE/KU. A measurement/parse artifact would not selectively hit the two
+  withholding-abilities while sparing extraction ⇒ Command-R's CR=10 is a real
+  maximally-eager model that never withholds, not a glitch.
+- **EO confirmed STRUCTURAL.** Five architectures, none above 12.4% (Nemotron
+  0.5). Decisive evidence EO is not answer-side — the dated-first assembly fix is
+  the correct lever; stop testing answerers against EO.
+- **KU is answer-side elastic** (Granite 51.2 / Cmd-R 42.5 both beat DeepSeek 30)
+  — unlike EO. CR is an answer-side ceiling but DeepSeek already sits near its top.
+- **No single model dominates.** Granite edges overall only because this benchmark
+  weights extraction (5 abilities) over discrimination (2); weight CR/ABS more and
+  DeepSeek/Gemini win. The data-indicated config is a **2-bucket route** (eager
+  grounded → extraction abilities; cautious → CR/ABS) — e.g. Granite + Gemini
+  combines KU 51.2 + CR 63.1 + ABS 95 + IF 65, beating every single model. **This
+  is the deferred routing item; NOT built (architecture frozen per user).**
+- **One single model can only beat the tradeoff by going up a capability tier**
+  (GPT-4o / Claude / Qwen2.5-72B-class) calibrated enough to do both — at the cost
+  of the small/local/cheap appeal. No free 8B does both.
+- **Gating probe before trusting Gemini for the discrimination bucket:** are
+  Gemini's IE/KU zeros actually *refusals*? Grep its predictions for "I don't have
+  enough information"-type phrases. If yes, Gemini's whole profile reduces to one
+  over-refusal calibration knob (and its CR/ABS "wins" are that refusal landing
+  favorably) — a prompt tweak might recalibrate it rather than routing to it.
