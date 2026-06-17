@@ -35,6 +35,10 @@ class EnvConfig:
     embedding_api_key: str | None
     embedding_base_url: str
     embedding_model: str
+    # None = env var unset → fall back to the HyMemConfig dataclass default
+    # (don't hard-code it here, so a future default change stays authoritative).
+    aggregation_nodes_enabled: bool | None
+    aggregation_digest_enabled: bool | None
 
     @property
     def has_llm_key(self) -> bool:
@@ -43,6 +47,18 @@ class EnvConfig:
     @property
     def has_embedding_key(self) -> bool:
         return bool(self.embedding_api_key)
+
+
+def _env_flag(name: str) -> bool | None:
+    """Parse a boolean env var, or None when unset.
+
+    None lets the caller defer to the dataclass default instead of forcing a
+    value. Truthy set: 1/true/yes/on (case-insensitive); anything else is False.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def resolve_env() -> EnvConfig:
@@ -67,6 +83,8 @@ def resolve_env() -> EnvConfig:
         embedding_api_key=embedding_key,
         embedding_base_url=env("HYMEM_EMBEDDING_BASE_URL", DEFAULT_BASE_URL),
         embedding_model=env("HYMEM_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
+        aggregation_nodes_enabled=_env_flag("HYMEM_AGGREGATION_NODES_ENABLED"),
+        aggregation_digest_enabled=_env_flag("HYMEM_AGGREGATION_DIGEST_ENABLED"),
     )
 
 
@@ -116,7 +134,23 @@ def build_from_env() -> HyMem:
             "(set HYMEM_EMBEDDING_API_KEY to enable vector search)"
         )
 
-    instance = HyMem(HyMemConfig(root=cfg.root), llm=llm, embedding_client=embedder)
+    # Only env vars that were actually set override the dataclass defaults, so
+    # the shipped default (aggregation off) stays in force until the 3c flip.
+    overrides: dict[str, object] = {}
+    if cfg.aggregation_nodes_enabled is not None:
+        overrides["aggregation_nodes_enabled"] = cfg.aggregation_nodes_enabled
+    if cfg.aggregation_digest_enabled is not None:
+        overrides["aggregation_digest_enabled"] = cfg.aggregation_digest_enabled
+
+    mem_cfg = HyMemConfig(root=cfg.root, **overrides)
+    if mem_cfg.aggregation_nodes_enabled:
+        log.info(
+            "aggregation layer enabled via env (digest=%s) — dream will report "
+            "aggregation_nodes_built/reused; watch the dream.end log line",
+            mem_cfg.aggregation_digest_enabled,
+        )
+
+    instance = HyMem(mem_cfg, llm=llm, embedding_client=embedder)
     _clear_orphaned_dream_lock(instance.conn)
     return instance
 

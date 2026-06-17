@@ -349,6 +349,32 @@ via `HYMEM_LOG_LEVEL`, default INFO) to the `hymem-server` entry point, which
 also closes the parallel blind spot where the `aggregate.build_failure`
 exception was being dropped. 663 tests green.
 
+**ENABLE PATH LANDED (2026-06-17, this branch).** The June-13 columns were
+accruing `0/0` every cycle because the layer was never actually ON in prod:
+`build_from_env` threaded only `root` into `HyMemConfig`, so the server always
+ran the `aggregation_nodes_enabled = False` default — there was no env var to
+flip it. (The flat-34 "steady-state reuse" was the June-12 one-shot demo
+script's nodes, not a production signal — production had never built any.) Three
+fixes so the week-scale data can actually start:
+- `HYMEM_AGGREGATION_NODES_ENABLED` (+ `HYMEM_AGGREGATION_DIGEST_ENABLED` to
+  isolate level-0 node-build cost from digest-rollup cost) are now resolved in
+  `resolve_env`/`build_from_env` via an overrides dict — an *unset* var stays
+  `None` and the dataclass default wins, so the shipped default stays off until
+  the flip, and a future default change stays authoritative.
+- A startup `log.info` confirms when the layer is enabled (and the effective
+  digest state), so a deploy can verify the flag took.
+- Re-added the counts to the `dream.end` log line (`agg_nodes=/agg_reused=`) —
+  they were persisted to `dream_runs` but absent from the log, so the grep-able
+  signal this criterion describes did not exist.
+*Status: criteria 1 and 2 still MET. Criterion 3 (week-scale cost) is now
+actually collectable — the clock starts at the next server deploy with
+`HYMEM_AGGREGATION_NODES_ENABLED=true`. Read it right: the first dream reports
+~all-built / ~zero-reused (full-replace wipes the stale demo nodes, whose
+member-set hashes no longer match the grown store); reuse climbs toward
+near-full on runs 2..N — that ratio is the flip signal. The flip itself stays
+the one-line config-default change, now backed by data rather than the demo
+pass.*
+
 ---
 
 ## Stage 4 — Query-time consumption v2 (only after Stage 3)

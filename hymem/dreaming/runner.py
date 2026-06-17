@@ -640,7 +640,7 @@ def run_dreaming(
             ),
         )
         log.info(
-            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d budget_exhausted=%s",
+            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d budget_exhausted=%s",
             run_id,
             report.sessions_processed,
             report.chunks_processed,
@@ -649,6 +649,8 @@ def run_dreaming(
             report.markers_extracted,
             report.chunks_embedded_from_cache,
             report.edges_embedded_from_cache,
+            report.aggregation_nodes_built,
+            report.aggregation_nodes_reused,
             report.budget_exhausted,
         )
         return report

@@ -28,6 +28,15 @@ Key variables:
     HYMEM_EMBEDDING_MODEL    Embedding model (default: deepseek-embedding)
     HYMEM_ROOT               Directory for hymem.sqlite, MEMORY.md, USER.md
                              (default: ~/.hermes)
+    HYMEM_AGGREGATION_NODES_ENABLED
+                             Turn on the RAPTOR aggregation/digest layer at dream
+                             time (default: off). Set true to gather steady-state
+                             nodes/reused cost data before flipping the shipped
+                             default (raptor_digest_plan.md 3c).
+    HYMEM_AGGREGATION_DIGEST_ENABLED
+                             Override the digest sub-switch independently (default:
+                             on whenever aggregation is enabled). Set false to
+                             measure level-0 node-build cost in isolation.
 
 If the embedding client cannot be constructed (e.g. API key absent), the server
 logs a warning and falls back to FTS-only retrieval — no other functionality
