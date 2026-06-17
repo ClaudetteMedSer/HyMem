@@ -64,6 +64,23 @@ def test_fast_path_when_already_healthy(monkeypatch):
         httpd.shutdown()
 
 
+def test_health_probed_at_origin_not_v1_path(monkeypatch):
+    # base_url carries the OpenAI-style /v1 path for /v1/embeddings, but /health
+    # lives at the server root. The probe must hit /health, not /v1/health —
+    # otherwise a healthy server reads as down and gets spuriously restarted.
+    port = _free_port()
+    httpd = _serve_health(port)  # only answers 200 at exactly /health
+    try:
+        monkeypatch.setenv("HYMEM_EMBEDDING_BASE_URL", f"http://127.0.0.1:{port}/v1")
+        monkeypatch.setattr(
+            api.subprocess, "Popen",
+            lambda *a, **k: pytest.fail("healthy server must not be restarted"),
+        )
+        assert api._ensure_embedding_server() is True
+    finally:
+        httpd.shutdown()
+
+
 def test_local_down_without_command_returns_false(monkeypatch):
     monkeypatch.setenv("HYMEM_EMBEDDING_BASE_URL", f"http://127.0.0.1:{_free_port()}")
     monkeypatch.delenv("HYMEM_EMBEDDING_SERVER_CMD", raising=False)

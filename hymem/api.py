@@ -78,12 +78,17 @@ def _ensure_embedding_server(timeout: float = 45.0) -> bool:
     if not base_url:
         return True
 
-    host = (urlsplit(base_url).hostname or "").lower()
+    parts = urlsplit(base_url)
+    host = (parts.hostname or "").lower()
     if host not in _LOCAL_HOSTS:
         # Remote provider: not ours to manage. Skip rather than fail.
         return True
 
-    health_url = base_url.rstrip("/") + "/health"
+    # Health lives at the server root, not under the OpenAI-style path segment
+    # base_url carries for /v1/embeddings (e.g. .../v1). Build it from the origin
+    # only — appending to base_url would probe /v1/health, which 404s, falsely
+    # reporting a healthy server as down (spurious restart + full-timeout stall).
+    health_url = f"{parts.scheme}://{parts.netloc}/health"
     if _embedding_health_ok(health_url):
         return True  # already up — nothing to do
 
