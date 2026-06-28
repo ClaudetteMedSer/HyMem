@@ -599,7 +599,20 @@ def run_dreaming(
         # nothing for clients that haven't opted in.
         if cfg.aggregation_nodes_enabled:
             try:
-                agg = build_aggregation_nodes(conn, cfg, llm, embedding_client)
+                # Freeze the episode set the clusterer reads at this phase-3
+                # boundary: episodes embedded just above are in scope, but the
+                # MCP server writes episodes asynchronously, and any landing
+                # between here and the clustering read would shift cluster
+                # membership -> new node ids -> a spurious near-full refusion
+                # (dream runs 678/680, 2026-06-28). Strays land at a higher
+                # rowid and defer to the next dream.
+                episode_ceiling = conn.execute(
+                    "SELECT MAX(rowid) AS m FROM episodes"
+                ).fetchone()["m"]
+                agg = build_aggregation_nodes(
+                    conn, cfg, llm, embedding_client,
+                    episode_ceiling_rowid=episode_ceiling,
+                )
                 report.aggregation_nodes_built = agg.nodes
                 report.aggregation_nodes_reused = agg.reused
             except Exception:

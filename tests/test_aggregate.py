@@ -253,6 +253,50 @@ def test_build_uncapped_when_config_cap_is_zero(conn, cfg):
     assert row["n_members"] == 7                     # the raw mega-component
 
 
+# ── phase-3 snapshot ceiling: async episodes must not poison the rebuild ──────
+# The MCP server writes episodes asynchronously; one landing between the dream's
+# phase-3 boundary and the clustering read shifts a cluster's member set → new
+# `_node_id` → a spurious near-full refusion (prod dream runs 678/680,
+# 2026-06-28). The runner snapshots MAX(episodes.rowid) at that boundary and
+# threads it in as `episode_ceiling_rowid`.
+
+def _level0_members(conn) -> set[str]:
+    members: set[str] = set()
+    for r in conn.execute(
+            "SELECT member_episode_ids FROM aggregation_nodes WHERE level = 0"):
+        members.update(json.loads(r["member_episode_ids"]))
+    return members
+
+
+def test_aggregation_ceiling_excludes_post_snapshot_episodes(conn, cfg):
+    cfg = _enabled(cfg)
+    llm = _agg_llm()
+    for eid, sid in (("e1", "s1"), ("e2", "s2")):     # one cross-session cluster
+        _seed_episode(conn, eid, sid, eid, eid, ["postgres", "billing"])
+
+    ceiling = conn.execute("SELECT MAX(rowid) AS m FROM episodes").fetchone()["m"]
+
+    first = build_aggregation_nodes(conn, cfg, llm, None,
+                                    episode_ceiling_rowid=ceiling)
+    assert (first.nodes, first.reused) == (1, 0)      # fused fresh
+    assert _level0_members(conn) == {"e1", "e2"}
+
+    # An async stray lands AFTER the snapshot, sharing the cluster's entities so
+    # that — uncapped — it WOULD join and change the member set.
+    _seed_episode(conn, "e3", "s3", "e3", "e3", ["postgres", "billing"])
+
+    second = build_aggregation_nodes(conn, cfg, llm, None,
+                                     episode_ceiling_rowid=ceiling)
+    assert _level0_members(conn) == {"e1", "e2"}      # stray above the ceiling
+    assert (second.nodes, second.reused) == (1, 1)    # cached fusion reused
+
+    # Control: lift the ceiling and the same stray DOES join → membership change
+    # → fresh fusion. Proves the ceiling, not luck, is what excluded it.
+    third = build_aggregation_nodes(conn, cfg, llm, None)
+    assert _level0_members(conn) == {"e1", "e2", "e3"}
+    assert third.reused == 0
+
+
 # ── Stage-3b candidate blocking: O(n²) all-pairs → entity index + vec KNN ────
 # Prod timing (2026-06-12): 395 episodes → 77,815 pair tests → 4.04s per dream,
 # past the 2s gate. Blocking only generates the candidate pair list; the pure

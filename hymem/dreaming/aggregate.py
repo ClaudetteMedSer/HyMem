@@ -256,18 +256,33 @@ def _norm_entity(x: str) -> str:
     return normalize_text(x).strip()
 
 
-def load_clusterable_episodes(conn: sqlite3.Connection) -> list[dict]:
+def load_clusterable_episodes(
+    conn: sqlite3.Connection, *, max_rowid: int | None = None,
+) -> list[dict]:
     """All episodes with their summary vector + normalized entity set, ordered so
-    a stable member list / id falls out of clustering. Mirrors the probe loader."""
+    a stable member list / id falls out of clustering. Mirrors the probe loader.
+
+    `max_rowid` caps the set to episodes that existed at a snapshot the dream
+    runner takes just before aggregation (the phase-3 boundary, after this
+    dream's own episode-embedding pass). The MCP server writes episodes
+    asynchronously; without the ceiling a stray landing mid-build joins the
+    clustering, shifts a member set, and forces a spurious near-full refusion
+    (dream runs 678/680, 2026-06-28). episodes.rowid is monotonic at insert and
+    nothing is deleted after the snapshot within a dream, so `rowid <= max_rowid`
+    is exactly 'present at the snapshot'; strays land above it and defer to the
+    next dream, which clusters them deterministically."""
+    where = "WHERE e.rowid <= ?" if max_rowid is not None else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT e.rowid AS rowid, e.id, e.session_id, e.title, e.summary,
                e.start_message_id, e.end_message_id, e.key_entities,
                em.vector_json
         FROM episodes e
         LEFT JOIN episode_embeddings em ON em.episode_id = e.id
+        {where}
         ORDER BY e.session_id, e.start_message_id, e.id
-        """
+        """,
+        () if max_rowid is None else (max_rowid,),
     ).fetchall()
     episodes: list[dict] = []
     for r in rows:
@@ -622,6 +637,8 @@ def build_aggregation_nodes(
     cfg: HyMemConfig,
     llm: LLMClient,
     embedding_client: EmbeddingClient | None = None,
+    *,
+    episode_ceiling_rowid: int | None = None,
 ) -> AggregationResult:
     """Rebuild the cross-session aggregation layer from the current episodes.
 
@@ -633,11 +650,15 @@ def build_aggregation_nodes(
     Full rebuild (DELETE then INSERT) because membership is a pure function of
     the present episodes; the content-hash id means an unchanged cluster keeps
     both its fusion and its embedding. Caller need not hold a transaction.
+    `episode_ceiling_rowid` (set by the dream runner) freezes that 'present
+    episodes' set at the phase-3 boundary so an async write mid-build can't
+    shift membership and trigger a spurious refusion; see
+    :func:`load_clusterable_episodes`.
     """
     if not cfg.aggregation_nodes_enabled:
         return AggregationResult(0, 0)
 
-    episodes = load_clusterable_episodes(conn)
+    episodes = load_clusterable_episodes(conn, max_rowid=episode_ceiling_rowid)
     clusters = select_clusters(episodes, cfg, conn)
 
     # The content-hash node id makes the previous fusion reusable: an unchanged
