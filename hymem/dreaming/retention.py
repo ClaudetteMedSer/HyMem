@@ -98,21 +98,25 @@ def prune_retracted_edges(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
 
 
 def prune_episodes_and_procedures(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
-    """Age out old episodes and stale procedures using the retention_days
-    window. FTS shadow tables and episode_embeddings are cleaned by the
+    """Age out stale procedures using the retention_days window. Episodes are
+    only aged out when episode_retention_days > 0: the default (0) keeps them
+    forever because they're the leaves of the aggregation/digest tree, which
+    full-rebuilds from live episodes each dream — deleting them makes the
+    digest forget. FTS shadow tables and episode_embeddings are cleaned by the
     existing delete triggers / ON DELETE CASCADE."""
-    cutoff = f"-{int(cfg.retention_days)} days"
+    pruned = 0
 
-    cur = conn.execute(
-        "DELETE FROM episodes WHERE created_at < datetime('now', ?)",
-        (cutoff,),
-    )
-    pruned = cur.rowcount or 0
+    if cfg.episode_retention_days > 0:
+        cur = conn.execute(
+            "DELETE FROM episodes WHERE created_at < datetime('now', ?)",
+            (f"-{int(cfg.episode_retention_days)} days",),
+        )
+        pruned += cur.rowcount or 0
 
     cur = conn.execute(
         "DELETE FROM procedures WHERE status = 'stale' "
         "AND created_at < datetime('now', ?)",
-        (cutoff,),
+        (f"-{int(cfg.retention_days)} days",),
     )
     pruned += cur.rowcount or 0
 

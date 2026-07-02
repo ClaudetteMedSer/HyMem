@@ -502,3 +502,281 @@ def test_value_supersession_across_sessions(cfg, flag_on):
             assert XS_OLD not in objs, f"stale cross-session value still retrievable: {sorted(objs)}"
     finally:
         hy.close()
+
+
+# ── Step 1 (v3): VERSION-typed values ─────────────────────────────────────────
+# A version update (requires_version 2.3.1 -> 2.4.0, uses python_3.12 ->
+# python_3.13) is the remaining single-valued class v2 left as free text. The
+# alpha prefix is the compatibility key, so python_* can never compete with
+# node_* — and undotted single-number names (sprint_3, node_20, endpoint_v2)
+# stay free text so distinct coexisting entities are never collapsed. NOTE:
+# canonicalization flattens dots to underscores, so "2.3.1" MINTS as "2_3_1";
+# the classifier accepts both shapes and the integration tests below assert
+# against the flattened canonical form.
+
+
+def test_classify_object_versions():
+    """v3 discriminator: a dotted numeric core is a VERSION keyed on its alpha
+    prefix; undotted single-number names stay free text; nothing previously
+    typed (numbers, dates) changes class."""
+    # Bare dotted core with >=3 components.
+    assert _classify_object("2.3.1") == ("ver", None)
+    assert _classify_object("2.4.0") == ("ver", None)
+    # Alpha-prefixed dotted core with >=2 components — prefix = compatibility key.
+    assert _classify_object("python_3.12") == ("ver", "python")
+    assert _classify_object("python_3.13") == ("ver", "python")
+    assert _classify_object("api_v2.3") == ("ver", "api")
+    # A leading `v` on the core is allowed and stripped.
+    assert _classify_object("v2.3") == ("ver", None)
+    # The underscore-flattened shapes that canonicalization actually mints
+    # classify identically.
+    assert _classify_object("2_3_1") == ("ver", None)
+    assert _classify_object("python_3_12") == ("ver", "python")
+    assert _classify_object("api_v2_3") == ("ver", "api")
+    assert _classify_object("v2_3") == ("ver", None)
+    # NOT versions: single-number suffixed names with no dotted core are
+    # typically distinct coexisting entities — collapsing them would destroy
+    # multi-valued facts.
+    assert _classify_object("sprint_3") is None
+    assert _classify_object("sprint_4") is None
+    assert _classify_object("endpoint_v2") is None
+    assert _classify_object("node_20") is None
+    assert _classify_object("v2") is None
+    # Unchanged classifications: the version check runs AFTER date/number, so
+    # a bare two-part decimal stays a number and dates stay dates.
+    assert _classify_object("3.12") == ("num", None)
+    assert _classify_object("165") == ("num", None)
+    assert _classify_object("65_percent") == ("num", "percent")
+    assert _classify_object("$120") == ("num", "$")
+    assert _classify_object("-3.5_kg") == ("num", "kg")
+    assert _classify_object("april_5_2024") == ("date", None)
+    assert _classify_object("2024-04-05") == ("date", None)
+
+
+VER_SUBJECT = "billing_service"
+VER_PRED = "requires_version"
+VER_OLD = "2.3.1"
+VER_NEW = "2.4.0"
+VER_OLD_CANON = "2_3_1"  # what normalize() mints for "2.3.1"
+VER_NEW_CANON = "2_4_0"
+
+
+def _version_update_llm() -> StubLLMClient:
+    """A bare version bump — POSITIVE evidence only, no value_numeric; the
+    version lives only in the object string, as the real extractor emits."""
+    first = _chunk_extraction_response(
+        [{"subject": VER_SUBJECT, "predicate": VER_PRED, "object": VER_OLD, "polarity": 1}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": VER_SUBJECT, "predicate": VER_PRED, "object": VER_NEW, "polarity": 1}]
+    )
+    return StubLLMClient(fixtures={"2.3.1": first, "2.4.0": second}, default="[]")
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_value_supersession_version_update(cfg, flag_on):
+    """A requires_version bump (2.3.1 -> 2.4.0): with the flag on the older
+    version is retracted with its interval closed at the newer valid_at."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_ver"
+        hy.open_session(sid)
+        hy.log_message(
+            sid, "user",
+            "The billing service requires framework version 2.3.1 right now.",
+            created_at="2024-03-01 09:00:00",
+        )
+        hy.log_message(
+            sid, "user",
+            "Update: the billing service now requires framework version 2.4.0.",
+            created_at="2024-03-20 09:00:00",
+        )
+        hy.close_session(sid)
+
+        hy.set_llm(_version_update_llm())
+        hy.dream()
+
+        conn = hy.conn
+        rows = {
+            r["object_canonical"]: r
+            for r in conn.execute(
+                "SELECT object_canonical, status, valid_at, invalid_at "
+                "FROM knowledge_graph WHERE subject_canonical = ? AND predicate = ?",
+                (VER_SUBJECT, VER_PRED),
+            ).fetchall()
+        }
+        assert {VER_OLD_CANON, VER_NEW_CANON} <= set(rows), (
+            f"both version edges should mint (flattened canonicals), got {set(rows)}"
+        )
+        if not flag_on:
+            assert rows[VER_OLD_CANON]["status"] == "active"
+            assert rows[VER_NEW_CANON]["status"] == "active"
+            return
+        assert rows[VER_NEW_CANON]["status"] == "active"
+        assert rows[VER_OLD_CANON]["status"] == "retracted", "older version not superseded"
+        # Interval closed at the world date the new version took over.
+        assert rows[VER_OLD_CANON]["invalid_at"] == rows[VER_NEW_CANON]["valid_at"]
+    finally:
+        hy.close()
+
+
+def _python_bump_llm() -> StubLLMClient:
+    first = _chunk_extraction_response(
+        [{"subject": "backend", "predicate": "uses", "object": "python_3.12", "polarity": 1}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": "backend", "predicate": "uses", "object": "python_3.13", "polarity": 1}]
+    )
+    return StubLLMClient(fixtures={"Python 3.12": first, "Python 3.13": second}, default="[]")
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_value_supersession_prefixed_version_update(cfg, flag_on):
+    """`uses python_3.12` -> `python_3.13`: same alpha prefix, so the versions
+    compete and the older one is superseded when the flag is on."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_py"
+        hy.open_session(sid)
+        hy.log_message(
+            sid, "user",
+            "Our backend uses Python 3.12 across every service today.",
+            created_at="2024-03-01 09:00:00",
+        )
+        hy.log_message(
+            sid, "user",
+            "Update: the backend now uses Python 3.13 after the migration.",
+            created_at="2024-03-20 09:00:00",
+        )
+        hy.close_session(sid)
+
+        hy.set_llm(_python_bump_llm())
+        hy.dream()
+
+        conn = hy.conn
+        rows = {
+            r["object_canonical"]: r
+            for r in conn.execute(
+                "SELECT object_canonical, status, valid_at, invalid_at "
+                "FROM knowledge_graph "
+                "WHERE subject_canonical = 'backend' AND predicate = 'uses'",
+            ).fetchall()
+        }
+        assert {"python_3_12", "python_3_13"} <= set(rows), f"both edges should mint: {set(rows)}"
+        if not flag_on:
+            assert rows["python_3_12"]["status"] == "active"
+            assert rows["python_3_13"]["status"] == "active"
+            return
+        assert rows["python_3_13"]["status"] == "active"
+        assert rows["python_3_12"]["status"] == "retracted", "older python version not superseded"
+        assert rows["python_3_12"]["invalid_at"] == rows["python_3_13"]["valid_at"]
+    finally:
+        hy.close()
+
+
+def _python_vs_node_llm() -> StubLLMClient:
+    """Two DIFFERENT technologies on one subject+predicate. Both evidences carry
+    value_numeric (3.12 / 20) to pin the has_numeric fast-path decision: without
+    the version override, both rows would route as bare numbers and node_20
+    would wrongly supersede python_3.12."""
+    first = _chunk_extraction_response(
+        [{"subject": "backend", "predicate": "uses", "object": "python_3.12",
+          "polarity": 1, "value_numeric": 3.12}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": "backend", "predicate": "uses", "object": "node_20",
+          "polarity": 1, "value_numeric": 20}]
+    )
+    return StubLLMClient(fixtures={"Python 3.12": first, "Node 20": second}, default="[]")
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_no_supersession_across_version_prefixes(cfg, flag_on):
+    """python_3.12 vs node_20 on the same subject+predicate: different
+    compatibility keys (and node_20 is not a version at all), so BOTH stay
+    active whatever the flag — a multi-valued tech stack is never collapsed."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_stack"
+        hy.open_session(sid)
+        hy.log_message(
+            sid, "user",
+            "Our backend uses Python 3.12 for the API layer services.",
+            created_at="2024-03-01 09:00:00",
+        )
+        hy.log_message(
+            sid, "user",
+            "The backend also uses Node 20 for the build tooling.",
+            created_at="2024-03-20 09:00:00",
+        )
+        hy.close_session(sid)
+
+        hy.set_llm(_python_vs_node_llm())
+        hy.dream()
+
+        conn = hy.conn
+        rows = {
+            r["object_canonical"]: r
+            for r in conn.execute(
+                "SELECT object_canonical, status, invalid_at FROM knowledge_graph "
+                "WHERE subject_canonical = 'backend' AND predicate = 'uses'",
+            ).fetchall()
+        }
+        assert {"python_3_12", "node_20"} <= set(rows), f"both edges should mint: {set(rows)}"
+        assert rows["python_3_12"]["status"] == "active", (
+            "python_3_12 must never be superseded by node_20"
+        )
+        assert rows["node_20"]["status"] == "active"
+        assert rows["python_3_12"]["invalid_at"] is None
+        assert rows["node_20"]["invalid_at"] is None
+    finally:
+        hy.close()
+
+
+def _sprints_llm() -> StubLLMClient:
+    first = _chunk_extraction_response(
+        [{"subject": "project_atlas", "predicate": "contains", "object": "sprint_3", "polarity": 1}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": "project_atlas", "predicate": "contains", "object": "sprint_4", "polarity": 1}]
+    )
+    return StubLLMClient(fixtures={"sprint 3": first, "sprint 4": second}, default="[]")
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_no_supersession_undotted_numbered_names(cfg, flag_on):
+    """sprint_3 vs sprint_4: single-number suffixed names have no dotted core,
+    classify as free text, and NEVER compete — both stay active whatever the
+    flag. Distinct coexisting entities must not be collapsed."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_sprints"
+        hy.open_session(sid)
+        hy.log_message(
+            sid, "user",
+            "Project Atlas contains sprint 3 with the payments milestone.",
+            created_at="2024-03-01 09:00:00",
+        )
+        hy.log_message(
+            sid, "user",
+            "Project Atlas also contains sprint 4 with the reporting milestone.",
+            created_at="2024-03-20 09:00:00",
+        )
+        hy.close_session(sid)
+
+        hy.set_llm(_sprints_llm())
+        hy.dream()
+
+        conn = hy.conn
+        rows = {
+            r["object_canonical"]: r
+            for r in conn.execute(
+                "SELECT object_canonical, status FROM knowledge_graph "
+                "WHERE subject_canonical = 'project_atlas' AND predicate = 'contains'",
+            ).fetchall()
+        }
+        assert {"sprint_3", "sprint_4"} <= set(rows), f"both edges should mint: {set(rows)}"
+        assert rows["sprint_3"]["status"] == "active", "sprint_3 must not be superseded"
+        assert rows["sprint_4"]["status"] == "active"
+    finally:
+        hy.close()

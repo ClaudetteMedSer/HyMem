@@ -29,6 +29,7 @@ from hymem.dreaming.runner import DreamReport, run_dreaming
 from hymem.dreaming.user_profile import ProfileEntry, load_profile
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
+from hymem.query.ask import Answer, ask as query_ask
 from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
 from hymem.query.conflicts import Conflict, find_conflicts
 from hymem.query.entities import (
@@ -320,6 +321,50 @@ class HyMem:
             session_id=session_id,
             ability=ability,
         )
+
+    def ask(
+        self,
+        question: str,
+        *,
+        session_id: str | None = None,
+        ability: str | None = None,
+        include_digest: bool = False,
+    ) -> Answer:
+        """The dialectic/synthesis endpoint: one call, a reasoned answer,
+        grounded in the retrieval tiers.
+
+        Where `augment()` returns raw tiers for the HOST to assemble into its
+        own prompt, `ask()` closes the loop inside HyMem: it runs the same
+        retrieval (`session_id`/`ability` pass straight through), renders the
+        tiers into a compact most-authoritative-first context block (capped at
+        `cfg.ask_max_context_chars`), and makes ONE completion against the
+        host-provided LLM under `ASK_PROMPT_V1` — answer only from the
+        context, quote concrete values/dates, state contradictions with their
+        dates (most recent value-bearing statement wins), soften
+        low-confidence facts, and say plainly when the memory doesn't contain
+        the answer. The returned `Answer` keeps the full `AugmentedContext`
+        for provenance/drill-down plus the rendered block size actually sent.
+
+        `include_digest=True` additionally loads the standing whole-store
+        digest (see `digest()`) into the context, so a global "what do you
+        know about me?" can draw on it; off by default because per-query
+        retrieval usually answers better without dream-time standing context.
+
+        Hosts that want the raw tiers (Hermes) keep using `augment()` — this
+        endpoint exists for one-call consumers (the MCP `hymem_ask` tool,
+        Honcho-style dialectic chat). Requires an LLMClient, like `dream()`.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "HyMem.ask requires an LLMClient. Pass one to the constructor "
+                "or call set_llm() before asking."
+            )
+        ctx = self.augment(question, session_id=session_id, ability=ability)
+        # `ctx.digest` may already be populated when cfg.augment_include_digest
+        # is on; only load it here when the caller asked and augment didn't.
+        if include_digest and ctx.digest is None:
+            ctx.digest = load_digest(self.read_conn)
+        return query_ask(self.config, self._llm, question, ctx)
 
     def digest(self) -> Digest | None:
         """The standing whole-store summary — the root of the RAPTOR

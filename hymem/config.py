@@ -363,7 +363,15 @@ class HyMemConfig:
 
     retention_days: int = 90
     """Chunks newer than this are always kept regardless of graph references.
-    Also the age window for pruning old episodes and stale procedures."""
+    Also the age window for pruning stale procedures. Episodes are governed by
+    episode_retention_days instead."""
+
+    episode_retention_days: int = 0
+    """Age window for pruning old episodes; 0 (the default) keeps them forever.
+    Episodes are the leaves of the aggregation/digest tree, which full-rebuilds
+    from live episodes each dream — deleting them makes the digest forget, so
+    this is decoupled from retention_days. Set to a positive number of days to
+    restore age-based pruning."""
 
     message_retention_days: int = 90
     """Raw messages of a session are pruned once the session is older than this
@@ -422,6 +430,16 @@ class HyMemConfig:
     the pool exceeds `message_fts_top_k`. Set False to restore the raw-BM25
     behaviour (no extra rerank cost). No effect on the MR aggregate path, which
     counts rather than ranks."""
+
+    ask_max_context_chars: int = 8000
+    """Char budget for the rendered memory-context block `HyMem.ask()` sends to
+    the synthesis LLM. The block is assembled most-authoritative-first (profile
+    → graph facts → dated raw turns → ... → recent turns) and truncated from
+    the tail, so tightening the budget sheds the softest evidence first.
+    0 disables the cap."""
+
+    ask_max_tokens: int = 1024
+    """max_tokens for the single synthesis completion behind `HyMem.ask()`."""
 
     hedge_confidence_threshold: float = 0.75
     """Below this Laplace-smoothed confidence, a GraphFact is flagged

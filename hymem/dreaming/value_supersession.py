@@ -13,8 +13,8 @@ newer-``valid_at`` value supersedes the older — the older edge is retracted an
 its validity interval closed at the newer edge's ``valid_at`` (the world date the
 new value took over).
 
-Discriminator (v2). A value is "typed" when it is a NUMBER (count / percentage /
-quantity / currency) or a DATE. The type is read from the ``object_canonical``
+Discriminator (v3). A value is "typed" when it is a NUMBER (count / percentage /
+quantity / currency), a DATE, or a VERSION. The type is read from the ``object_canonical``
 string itself — ``"165"``, ``"65_percent"``, ``"april_5_2024"`` — and NOT from the
 ``kg_evidence.value_numeric`` metadata column. v1 keyed on that column and never
 fired against a real extractor: production LLMs capture the number in the object
@@ -27,6 +27,16 @@ edges compete only when they parse to the **same class** and (for numbers) a
 tools, a person with several preferences) are never collapsed. This is the
 correctness guard, in place of a predicate allow-list (cf. the functional
 ``_EXCLUSIVE_PREDICATES`` in ``query/conflicts.py``).
+
+A VERSION (v3) is a dotted numeric core that v2 left as free text: a bare
+``2.3.1`` (three or more components) or an alpha-prefixed ``python_3.12`` /
+``api_v2.3`` (canonicalization flattens dots to underscores, so ``2_3_1`` and
+``python_3_12`` are the shapes that actually mint and are recognised too). The
+alpha prefix is the compatibility key — versions of *different* things must
+never compete, so ``python_3.12`` can only ever supersede another ``python_*``
+version, never ``node_20``. Undotted single-number names (``sprint_3``,
+``endpoint_v2``, ``node_20``) are NOT versions: those are typically distinct
+coexisting entities, and collapsing them would destroy multi-valued facts.
 
 Residual risk: a genuinely *multi-valued numeric* attribute on one subject +
 predicate (two exam scores, say) would be seen as competing. That is why every
@@ -65,6 +75,17 @@ _ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _NUMERIC = re.compile(
     r"([$€£]?)\s*([+-]?\d+(?:\.\d+)?)\s*[_\s]*([a-z%][a-z_%]*)?"
 )
+# A whole-string version: an optional alpha prefix (the compatibility key), an
+# optional literal ``v``, then a dotted numeric core with at least two
+# components: "2.3.1", "python_3.12", "api_v2.3", "v2.3". Canonicalization
+# flattens dots to underscores ("2.3.1" mints as "2_3_1"), so "_" is accepted
+# as a core separator too. The core REQUIRES a separator, so single-number
+# names ("sprint_3", "endpoint_v2", "node_20") never match. Checked only after
+# the number check, so bare two-part decimals ("3.12") keep classifying as
+# numbers.
+_VERSION = re.compile(
+    r"(?:([a-z][a-z_]*?)[_\s]+)?(v?)(\d+(?:[._]\d+)+)"
+)
 
 
 def _norm_unit(unit: str | None) -> str | None:
@@ -77,9 +98,12 @@ def _classify_object(obj: str | None) -> tuple[str, str | None] | None:
     """Classify a canonical object string as a typed value.
 
     Returns ``("date", None)`` for a calendar date, ``("num", unit)`` for a
-    number (``unit`` normalised, ``None`` for a bare count), or ``None`` for a
-    free-text object that must never be treated as a single-valued quantity.
-    Dates are checked first so an embedded year is not mistaken for a count.
+    number (``unit`` normalised, ``None`` for a bare count), ``("ver", key)``
+    for a version (``key`` is the alpha prefix, ``None`` for a bare/``v``-only
+    core), or ``None`` for a free-text object that must never be treated as a
+    single-valued quantity. Dates are checked first so an embedded year is not
+    mistaken for a count; versions are checked last so only strings that would
+    otherwise be free text can become versions (a bare decimal stays a number).
     """
     if not obj:
         return None
@@ -100,6 +124,18 @@ def _classify_object(obj: str | None) -> tuple[str, str | None] | None:
         currency, _, suffix = m.group(1), m.group(2), m.group(3)
         unit = suffix or (currency or None)
         return ("num", _norm_unit(unit))
+
+    # Version: only reached by strings the number check rejected, so nothing
+    # previously classified can change class. A prefixed core needs >=2
+    # components; a bare core needs >=3 (or an explicit leading "v") — a bare
+    # two-component core is a decimal and was already caught above.
+    m = _VERSION.fullmatch(s)
+    if m:
+        prefix, vee, core = m.group(1), m.group(2), m.group(3)
+        if prefix:
+            return ("ver", prefix)
+        if vee or len(re.split(r"[._]", core)) >= 3:
+            return ("ver", None)
 
     return None
 
@@ -137,12 +173,19 @@ def supersede_competing_values(conn: sqlite3.Connection, cfg: HyMemConfig) -> in
     # class is parsed from the object string.
     groups: dict[tuple[str, str, str, str | None], list[sqlite3.Row]] = defaultdict(list)
     for r in rows:
-        if r["has_numeric"]:
+        cls = _classify_object(r["obj"])
+        if cls is not None and cls[0] == "ver":
+            # A version-shaped object wins over the has_numeric fast-path: an
+            # extractor that saw "python_3.12" may well tag value_numeric=3.12,
+            # but routing the row as a plain number would drop its prefix key
+            # and let it compete with unrelated quantities. The object-string
+            # parse is authoritative for versions.
+            kind, unit = cls
+        elif r["has_numeric"]:
             kind, unit = "num", _norm_unit(r["ev_unit"])
+        elif cls is None:
+            continue  # free-text object — never a single-valued quantity
         else:
-            cls = _classify_object(r["obj"])
-            if cls is None:
-                continue  # free-text object — never a single-valued quantity
             kind, unit = cls
         groups[(r["subj"], r["pred"], kind, unit)].append(r)
 

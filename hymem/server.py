@@ -1,10 +1,11 @@
 """MCP server for HyMem.
 
-Exposes eight tools to the Hermes Agent platform:
+Exposes nine tools to the Hermes Agent platform:
   hymem_capture  — log a full conversation at once + optionally dream (preferred)
   hymem_log      — log one conversational turn (fallback for turn-by-turn use)
   hymem_dream    — run a dreaming cycle (extract, consolidate, decay)
   hymem_augment  — retrieve graph facts + FTS context for a user message
+  hymem_ask      — ask the memory a question, get one LLM-reasoned answer
   hymem_profile  — return USER.md (behavioral profile) + MEMORY.md (project insights)
   hymem_digest   — return the standing whole-store memory digest (RAPTOR root)
   hymem_alias    — register a surface-form alias for an entity
@@ -148,6 +149,10 @@ def _do_augment(message: str) -> str:
     return "\n\n".join(parts) if parts else ""
 
 
+def _do_ask(question: str) -> str:
+    return _get_hy().ask(question).answer
+
+
 def _do_profile() -> str:
     hy = _get_hy()
     cfg = hy.config
@@ -238,6 +243,21 @@ def hymem_augment(message: str) -> str:
     return _do_augment(message)
 
 
+def hymem_ask(question: str) -> str:
+    """Ask the memory store a question and get one reasoned answer.
+
+    The dialectic counterpart to hymem_augment: instead of returning raw
+    retrieval context for YOU to interpret, this runs the same retrieval and
+    makes a single LLM call that synthesizes a grounded answer — quoting
+    concrete values and dates, stating both sides of a contradiction (most
+    recent statement wins), hedging low-confidence facts, and saying plainly
+    when the memory does not contain the answer. Use it for direct questions
+    about the user or past sessions ("what database does the user prefer?");
+    use hymem_augment when you want the raw evidence tiers instead.
+    """
+    return _do_ask(question)
+
+
 def hymem_profile() -> str:
     """Return the user's behavioral profile and project insights.
 
@@ -301,6 +321,7 @@ def main() -> None:
     mcp_instance.tool()(hymem_log)
     mcp_instance.tool()(hymem_dream)
     mcp_instance.tool()(hymem_augment)
+    mcp_instance.tool()(hymem_ask)
     mcp_instance.tool()(hymem_profile)
     mcp_instance.tool()(hymem_digest)
     mcp_instance.tool()(hymem_alias)

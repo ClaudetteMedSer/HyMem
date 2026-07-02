@@ -1,13 +1,22 @@
-# Additional Planning — Two BrainDB-Inspired Borrowings
+# Additional Planning
 
 Two ideas borrowed from [BrainDB](https://github.com/dimknaf/braindb), adapted to
-HyMem's embedded, edge-typed architecture:
+HyMem's embedded, edge-typed architecture, plus the episode-granularity plan
+(added 2026-07-02, see [Plan C](#plan-c--episode-granularity-in-dreaming)):
 
 - **Idea A** — query-time multi-hop graph traversal with compounding edge weights.
 - **Idea B** — `always_on` Rules as a first-class node type.
+- **Plan C** — decision-grained episode extraction in dreaming.
 
-Both have been checked against the current RAPTOR/aggregation architecture (see
-[§0](#0-raptor-interference-check)) and are clear to build.
+Ideas A and B have been checked against the current RAPTOR/aggregation
+architecture (see [§0](#0-raptor-interference-check)) and are clear to build.
+Plan C is sequenced BEHIND the RAPTOR Stage 3c flip decision (see its
+sequencing constraint).
+
+> Reviewed for staleness 2026-07-02: `aggregate.py` line refs updated after the
+> Option B snapshot fix landed (commit 8b36501); schema still v21; suite at 695
+> after the day's landings (`episode_retention_days`, value-supersession v3
+> version class, `HyMem.ask()`).
 
 ---
 
@@ -19,7 +28,7 @@ query-side consumption is `_aggregation_search` (`query/augment.py`), gated by
 `cfg.aggregation_nodes_enabled` + `_aggregation_tier_fires` (default abilities
 `("TR",)`). It operates over episodes/clusters; its only contact with
 `knowledge_graph` is the digest's `_anchor_facts` block
-(`aggregate.py:515`), which reads `status='active' AND derived=0 AND
+(`aggregate.py:530`), which reads `status='active' AND derived=0 AND
 invalid_at IS NULL` edges **at dream time**.
 
 **Idea A is clear.** Multi-hop lives entirely inside `_graph_lookup`
@@ -33,7 +42,7 @@ interference.
 sequential/idempotent and don't touch the aggregation tables. The new
 `ctx.rules` tier is independent of `_aggregation_search`.
 **Constraint:** do NOT feed rules into `_anchor_facts`. That block's content
-hashes into the RAPTOR root digest's cache id (`aggregate.py:529`), so wiring
+hashes into the RAPTOR root digest's cache id (`aggregate.py:~544`), so wiring
 rules in would couple every rule edit to digest regeneration. Keep rules a
 parallel augment tier only.
 
@@ -252,7 +261,9 @@ CREATE INDEX IF NOT EXISTS idx_rules_active ON rules(scope, status, invalid_at);
   (`correction`/`rejection` that are imperative + durable) during Phase-2
   consolidation — no new LLM call, preserving one-call-per-chunk discipline.
 - **Direct API:** `hy.add_rule(text, scope=...)` + an MCP tool, since rules are
-  often *told*, not inferred.
+  often *told*, not inferred. Follow the `HyMem.ask()` / `hymem_ask` pattern
+  (landed 2026-07-02: `hymem/query/ask.py` + `server.py`) for the API-plus-tool
+  pairing.
 - **Supersession** reuses `bitemporal.py` interval-closing — a contradicting
   rule closes the prior's `invalid_at` rather than overwriting.
 
@@ -261,7 +272,7 @@ Rules ride along in `GET .../context` and `peers/{pid}/card`, ahead of MEMORY.md
 — matching how BrainDB's `always_on` injects into every context call.
 
 ### Constraint (from §0)
-Do **not** add rules to `_anchor_facts` (`aggregate.py:515`). That block hashes
+Do **not** add rules to `_anchor_facts` (`aggregate.py:530`). That block hashes
 into the RAPTOR root digest cache id; coupling rule edits to digest regeneration
 is undesired. Rules stay a parallel augment tier.
 
@@ -285,6 +296,83 @@ Mirror the P4 profile-tier box gate ([project_p4_profile_tier], ~95% pass):
 
 ---
 
+## Plan C — Episode granularity in dreaming
+
+*(added 2026-07-02 — the "point 5" carry-over from the competitive/architecture
+review)*
+
+### Motivation
+
+- **BEAM floor post-mortem** (benchmarks/beam_investigation_notes.md): EO/SUM
+  failures traced to episodes too ABSTRACT ("developed budget tracker with
+  Flask, added auth") to decompose into the rubric's event sequence. The one EO
+  question that flipped did so exactly when detailed episodes led the context —
+  mechanism verified, magnitude unmeasurable at sample=3. Episode granularity is
+  a CORE dreaming concern, not an adapter knob.
+- **Digest coverage gap**: 65/91 sessions covered on the prod store (~42%
+  episode-recall gap upstream) — the digest tree can only fuse what episodes
+  carry.
+- **Rate-distortion framing** ("Remember the Decision, Not the Description",
+  arXiv 2605.10870): store *decisions and outcomes* at retrieval granularity.
+  The `episodes.outcome` field already exists; the failure is granularity, not
+  schema.
+- **Retention decoupling** (`episode_retention_days = 0`, landed 2026-07-02):
+  episodes are now permanent, so each one should carry more retrievable signal —
+  and `HyMem.ask()` consumes them directly in its evidence block.
+
+### Sketch
+
+- Prompt-side change to the per-session digest call
+  (`hymem/dreaming/digest.py`; bounded by `dream_digest_max_chars` 12000 /
+  `dream_digest_max_tokens` 3072): decompose into event-grained episodes — one
+  episode per decision/change/outcome, concrete values (names, numbers, dates,
+  versions) in the summary, target roughly 3–8 per substantive session instead
+  of 1–2 blobs. Keep the outcome discipline (outcome REQUIRED when the session
+  reached one).
+- New `dream_max_episodes_per_session` config cap (mirror
+  `profile_max_items_per_session = 16`) so a runaway response is truncated
+  before persistence.
+- **Version the prompt + re-extraction guard.** Mirror the
+  `PROFILE_PROMPT_VERSION` / fusion-salt lesson: a granularity change must
+  invalidate prior extractions or old blob episodes silently persist (UPSERT
+  refreshes only matching message ranges). Reuse the per-session skip-guard
+  pattern (`sessions.profile_prompt_version`, schema v19) with an episodes
+  prompt version so unchanged sessions cost zero tail calls.
+
+### Validation — box gate + probes, explicitly NOT BEAM EO
+
+The variance-band discipline applies twice over: BEAM EO at sample=3 has a
+±12.5pp/category noise floor (measured, via the CR control), so the aggregate
+cannot see this change. Gates, in order:
+
+1. **Mechanical pytest** (StubLLMClient): multi-episode persistence per
+   session, cap enforcement, stable-id UPSERT semantics on re-dream, prompt
+   version guard.
+2. **Qualitative box gate** (mirror the P4 profile gate, pass ≥ 0.9): hand-score
+   ~20 sessions' episodes on (a) traceability — every episode grounded in actual
+   turns, no invented outcomes; (b) granularity — decision-level with concrete
+   values; (c) session coverage. `HyMem.ask()` doubles as a cheap spot-check
+   harness here.
+3. **`benchmarks/episode_coverage_probe.py`** before/after — coverage should
+   rise from the ~42% gap.
+4. **LME full guard as NON-REGRESSION only** (canonical 70.0 full-dream, MS
+   floor 51.9). Not a tuning signal.
+5. **Cost watch**: more episodes ⇒ more `vec_episodes` embeddings + a larger
+   clustering input each dream. Blocking (`aggregation_blocking_top_k = 24`)
+   bounds the pair tests; measure dream wall-clock and fusion-call counts
+   before/after.
+
+### Sequencing constraint (hard)
+
+Run AFTER the RAPTOR Stage 3c flip decision. The flip gate is a quiescent-dream
+node-reuse watch (~90%+ hold, no spikes) following the Option B snapshot-ceiling
+fix (commit 8b36501). A granularity change rewrites episode membership
+wholesale — under the watch it is indistinguishable from the spurious-rebuild
+failure mode it exists to rule out. Land the flip (or the no-flip verdict)
+first, then granularity, then re-verify reuse once on the new episode set.
+
+---
+
 ## Recommended sequencing
 
 1. **Idea A at `max_hops=2`** first — measurable, attacks a concrete retrieval
@@ -294,3 +382,6 @@ Mirror the P4 profile-tier box gate ([project_p4_profile_tier], ~95% pass):
 2. **Idea B** second — lower implementation risk (purely additive context), but
    the payoff is behavioral and only validatable via the compliance gate, so it
    won't move headline numbers and shouldn't be judged by them.
+3. **Plan C** independently of A/B but strictly after the RAPTOR flip decision
+   (see its sequencing constraint) — A/B don't touch episodes, so they can
+   proceed while the reuse watch runs.
