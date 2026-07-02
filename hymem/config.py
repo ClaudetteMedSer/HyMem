@@ -319,18 +319,25 @@ class HyMemConfig:
     under many negatives). Keep small; raising shields more edges from
     retraction."""
 
-    value_supersession_enabled: bool = False
-    """Opt-in (schema v15 bi-temporal). When True, the dream cycle closes the
+    value_supersession_enabled: bool = True
+    """Schema v15 bi-temporal consumer. When True, the dream cycle closes the
     validity interval of an OLDER value-edge the moment a NEWER one supersedes it:
     among active, non-derived edges sharing subject + predicate but differing on a
-    *typed-value* object (a numeric quantity / percentage / count, identified via
-    `kg_evidence.value_numeric`, with `value_unit` as the compatibility key), the
-    edge with the earlier `valid_at` is retracted and its `invalid_at` set to the
-    newer edge's `valid_at`. This is single-assertion supersession — one
-    authoritative update suffices — distinct from the evidence-accumulation
-    retract rule above which needs repeated negatives. Typed-value scoping means
-    multi-valued facts (a project using many tools) are never collapsed. Default
-    off until the LME guard clears. See `hymem/dreaming/value_supersession.py`."""
+    *typed-value* object (a number / percentage / count, a DATE, or a VERSION —
+    classified from the object string; `kg_evidence.value_numeric`/`value_unit`
+    only refine a bare number's missing unit), the edge with the earlier
+    `valid_at` is retracted and its `invalid_at` set to the newer edge's
+    `valid_at`. This is single-assertion supersession — one authoritative update
+    suffices — distinct from the evidence-accumulation retract rule above which
+    needs repeated negatives. Typed-value scoping means multi-valued facts (a
+    project using many tools) are never collapsed. Default ON since the LME
+    guard cleared (2026-07-02, 500q A/B: score-neutral +0.8pp overall, zero
+    false positives across all firings — a footprint the benchmark cannot size,
+    so the flip is a correctness call: a superseded edge left active is wrong
+    context for the digest anchor, profile, ask() and conflicts()). Every firing
+    logs `bitemporal.supersede ...` at INFO — a `prefers`/multi-valued row there
+    is the rollback signal. Set False to disable.
+    See `hymem/dreaming/value_supersession.py`."""
 
     reinforce_window_days: int = 30
     """Window for soft positive reinforcement from co-mention. Symmetric to

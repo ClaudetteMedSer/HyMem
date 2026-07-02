@@ -410,7 +410,7 @@ class HyMemAdapter:
                  rerank_top_k: int | None = None, rerank_model: str | None = None,
                  rerank_message_hits: bool | None = None,
                  aggregation_nodes: bool = False, aggregation_broad: bool = False,
-                 value_supersession: bool = False):
+                 value_supersession: bool = True):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -449,9 +449,12 @@ class HyMemAdapter:
         if self.aggregation_broad:
             overrides["aggregation_inject_abilities"] = ()
         # Bi-temporal KU lever: dream-cycle single-assertion value supersession.
-        # Off by default; the headline baseline is the paired comparison.
-        if self.value_supersession:
-            overrides["value_supersession_enabled"] = True
+        # Pinned explicitly BOTH ways so a run is reproducible whatever the
+        # library default: ON since 2026-07-02 (guard cleared — score-neutral,
+        # zero false positives); --no-value-supersession restores the historical
+        # flag-off control arm (the pre-flip canonical baselines, e.g.
+        # full-dream 70.0, ran off).
+        overrides["value_supersession_enabled"] = self.value_supersession
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,
@@ -1552,14 +1555,18 @@ def main():
                              "broad-injection G4 A/B that lost 69.0 vs 70.0 (KU −9.0pp from "
                              "nodes crowding gold turns out of the answer pool). For "
                              "comparison runs only.")
-    parser.add_argument("--value-supersession", action="store_true",
+    parser.add_argument("--value-supersession", action=argparse.BooleanOptionalAction,
+                        default=True,
                         help="Bi-temporal KU lever (cfg.value_supersession_enabled): the "
                              "dream cycle retracts the OLDER of two competing typed-value "
-                             "edges (numeric/percentage/count) sharing subject+predicate, "
+                             "edges (number/date/version) sharing subject+predicate, "
                              "closing its invalid_at at the newer value's valid_at — so an "
                              "updated fact supersedes the stale one instead of both staying "
-                             "active. DEFAULT OFF. Requires a dream pass (do NOT combine "
-                             "with --no-dream). Confirm it fired via the dream-log line "
+                             "active. Default ON, matching the library default since the "
+                             "2026-07-02 guard run (score-neutral, zero false positives); "
+                             "--no-value-supersession restores the historical flag-off "
+                             "control arm. Requires a dream pass (do NOT combine "
+                             "with --no-dream). Confirm firing via the dream-log line "
                              "'bitemporal.value_superseded count=' before reading results.")
     parser.add_argument("--inspect-floor", default=None, metavar="RUN.json",
                         help="DIAGNOSTIC: characterize WHY the floor questions (ranking "

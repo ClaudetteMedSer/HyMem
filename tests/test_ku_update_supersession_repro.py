@@ -11,9 +11,13 @@ the new value emits POSITIVE evidence for the new object and NOTHING against the
 old one, so the April-1 edge stays `status='active'` with `invalid_at IS NULL`
 and both values coexist in retrieval.
 
-This test pins the CURRENT behavior. The assertions marked `# GAP:` encode the
-behavior we intend to flip once supersession is implemented; the test will then
-start failing on exactly those lines, which is the signal the fix landed.
+This test pins the FLAG-OFF baseline. It was written when supersession did not
+exist ("the assertions marked `# GAP:` will start failing when the fix lands" —
+which happened: the consumer landed and its default flipped ON 2026-07-02 after
+the LME guard cleared). The repro now runs with
+`value_supersession_enabled=False` and keeps two things pinned: the raw gap the
+consumer closes, and the extraction-side routing fact (a plain update emits no
+negative evidence), which is flag-independent.
 
 It uses the supported deterministic-extraction path: a `StubLLMClient` keyed on
 a substring unique to each user turn's chunk text (see `tests/conftest.py` and
@@ -75,7 +79,21 @@ def _update_routed_llm() -> StubLLMClient:
     )
 
 
-def test_ku_update_does_not_supersede_old_edge_REPRO(hy):
+@pytest.fixture
+def hy_supersession_off(cfg):
+    """Flag-off HyMem for the Step-0 repro: the default flipped ON 2026-07-02,
+    so the raw gap (both values active) only reproduces with the consumer
+    disabled."""
+    instance = HyMem(
+        replace(cfg, value_supersession_enabled=False),
+        llm=StubLLMClient(default="[]"),
+    )
+    yield instance
+    instance.close()
+
+
+def test_ku_update_does_not_supersede_old_edge_REPRO(hy_supersession_off):
+    hy = hy_supersession_off
     # 1. Ingest the original assertion and the later authoritative update as two
     #    user turns with distinct WORLD dates (created_at). Each is long/explicit
     #    enough to become its own high-salience chunk.

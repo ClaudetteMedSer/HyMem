@@ -351,6 +351,25 @@ reorder. See *Open levers*.
         the older, `invalid_at`=newer `valid_at`, stale gone from retrieval; flag OFF
         no-op. Proves classify→group→compare end-to-end for a dataset (BEAM) that DOES
         drift cross-session. Suite 670 green. **v2 lands DORMANT (flag OFF), no LME claim.**
+      - **v3 + v3.1 + GUARD CLEARED → DEFAULT FLIPPED ON (2026-07-02).** v3 adds a
+        VERSION class (`("ver", prefix_key)`: dotted numeric cores, alpha prefix =
+        compatibility key, canonicalized `2_3_1`/`python_3_12` shapes recognised;
+        `sprint_3`/`endpoint_v2`/`node_20` excluded — no dotted core). v3.1 (external
+        bug report, confirmed): the string parse is now AUTHORITATIVE over the
+        `has_numeric` fast-path — a free-text object with tagged `value_numeric` (a
+        year in a possession name) no longer enters the numeric pool; `ev_unit`
+        survives only as fill-only unit refinement for bare numbers; the v3 ver-wins
+        special case is subsumed by class-first ordering. **Guard A/B (500q, same
+        codebase, v3.1): OVERALL 70.8→71.6 (+0.8pp), KU 80.8→83.3 (+2.5pp), 3 firings
+        across 500 questions — all legit `has_attribute` updates, ZERO false
+        positives.** Causal footprint ≤3 questions ⇒ every larger per-category delta
+        (SS-P +13.3pp) is provably mostly run noise; **LME sizing is CLOSED
+        (structurally underpowered)** — note it fired at all only because the v9
+        personal-predicate extension lifted extraction coverage. Default flipped ON as
+        a correctness call (digest anchor / profile / ask() / conflicts() hygiene);
+        the `bitemporal.supersede` INFO audit line is the production tripwire; the
+        adapter now pins the flag explicitly both ways (`--no-value-supersession` =
+        historical flag-off control arm matching the pre-flip canonical 70.0).
 - [ ] **[MEM]-consumption lever (the real KU lever; BEAM not LME-S).** KU zeros were
       8/8 [MEM] (raw turns), but the graph never re-ranks/annotates [MEM] with its
       validity knowledge; [MEM] dates are MENTION-time (why the Borda blend failed).

@@ -49,9 +49,14 @@ predicate (two exam scores, say) would be seen as competing. That is why every
 supersession is logged at INFO as ``bitemporal.supersede ...`` — the log is a free
 collateral audit across a whole dream run, independent of any downstream scoring.
 
-Opt-in via ``cfg.value_supersession_enabled`` (default off until the LME guard
-clears). Idempotent: it only flips ``active`` -> ``retracted`` and write-once
-``invalid_at`` via COALESCE, so re-running a dream cycle is a no-op.
+Default ON via ``cfg.value_supersession_enabled`` since 2026-07-02: the LME
+guard A/B (500q) came back score-neutral (+0.8pp overall) with zero false
+positives across all three firings — too small a footprint for the benchmark to
+size, so the flip is a correctness call (a superseded edge left active is wrong
+context wherever graph facts are consumed) and the INFO audit line above is the
+production tripwire. Set the flag False to disable. Idempotent: it only flips
+``active`` -> ``retracted`` and write-once ``invalid_at`` via COALESCE, so
+re-running a dream cycle is a no-op.
 """
 
 from __future__ import annotations
