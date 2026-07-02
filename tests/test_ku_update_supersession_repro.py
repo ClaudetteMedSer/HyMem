@@ -676,9 +676,11 @@ def test_value_supersession_prefixed_version_update(cfg, flag_on):
 
 def _python_vs_node_llm() -> StubLLMClient:
     """Two DIFFERENT technologies on one subject+predicate. Both evidences carry
-    value_numeric (3.12 / 20) to pin the has_numeric fast-path decision: without
-    the version override, both rows would route as bare numbers and node_20
-    would wrongly supersede python_3.12."""
+    value_numeric (3.12 / 20) to pin the class-first grouping: the object-string
+    parse is authoritative, so python_3.12 keeps its ("ver", "python") key and
+    node_20 (free text) never enters any pool — under the old has_numeric
+    fast-path both routed as bare numbers and node_20 wrongly superseded
+    python_3.12."""
     first = _chunk_extraction_response(
         [{"subject": "backend", "predicate": "uses", "object": "python_3.12",
           "polarity": 1, "value_numeric": 3.12}]
@@ -778,5 +780,140 @@ def test_no_supersession_undotted_numbered_names(cfg, flag_on):
         assert {"sprint_3", "sprint_4"} <= set(rows), f"both edges should mint: {set(rows)}"
         assert rows["sprint_3"]["status"] == "active", "sprint_3 must not be superseded"
         assert rows["sprint_4"]["status"] == "active"
+    finally:
+        hy.close()
+
+
+# ── v3.1: string parse is authoritative over has_numeric ─────────────────────
+
+def _possessions_llm() -> StubLLMClient:
+    """Two possessions whose evidence carries value_numeric (years the extractor
+    lifted from the phrasing) on FREE-TEXT objects. Pins the v3.1 bug: the old
+    has_numeric fast-path routed both into the ("num", None) pool although
+    _classify_object correctly returned None, and the older possession was
+    retracted as a "superseded value" — a collapsed multi-valued fact."""
+    first = _chunk_extraction_response(
+        [{"subject": "atta", "predicate": "owns",
+          "object": "vintage_omega_seamaster_watch",
+          "polarity": 1, "value_numeric": 1960}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": "atta", "predicate": "owns", "object": "leica_m6_camera",
+          "polarity": 1, "value_numeric": 1984}]
+    )
+    return StubLLMClient(
+        fixtures={"Omega Seamaster": first, "Leica M6": second}, default="[]"
+    )
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_no_supersession_free_text_with_value_numeric(cfg, flag_on):
+    """value_numeric tagged on a free-text object must NOT route it into the
+    numeric pool: the string parse (None) is authoritative, so two possessions
+    both stay active whatever the flag."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_owns"
+        hy.open_session(sid)
+        hy.log_message(
+            sid, "user",
+            "I still own my vintage Omega Seamaster watch from the 1960s.",
+            created_at="2024-03-01 09:00:00",
+        )
+        hy.log_message(
+            sid, "user",
+            "I also own a Leica M6 camera built in 1984.",
+            created_at="2024-03-20 09:00:00",
+        )
+        hy.close_session(sid)
+
+        hy.set_llm(_possessions_llm())
+        hy.dream()
+
+        conn = hy.conn
+        rows = {
+            r["object_canonical"]: r
+            for r in conn.execute(
+                "SELECT object_canonical, status, invalid_at FROM knowledge_graph "
+                "WHERE subject_canonical = 'atta' AND predicate = 'owns'",
+            ).fetchall()
+        }
+        assert {"vintage_omega_seamaster_watch", "leica_m6_camera"} <= set(rows), (
+            f"both edges should mint: {set(rows)}"
+        )
+        assert rows["vintage_omega_seamaster_watch"]["status"] == "active", (
+            "free-text possession must never be superseded on tagged value_numeric"
+        )
+        assert rows["leica_m6_camera"]["status"] == "active"
+        assert rows["vintage_omega_seamaster_watch"]["invalid_at"] is None
+        assert rows["leica_m6_camera"]["invalid_at"] is None
+    finally:
+        hy.close()
+
+
+def _bare_number_unit_refinement_llm() -> StubLLMClient:
+    """A bare-number object ("165", parses to unit None) whose evidence carries
+    value_unit, updated by a unit-suffixed object ("90_minutes"). Pins the
+    fill-only refinement: ev_unit fills the missing unit so the bare number
+    joins the ("num", "minutes") pool and the update supersedes it."""
+    first = _chunk_extraction_response(
+        [{"subject": "api_error_budget", "predicate": "configured_with",
+          "object": "165", "polarity": 1, "value_numeric": 165,
+          "value_unit": "minutes"}]
+    )
+    second = _chunk_extraction_response(
+        [{"subject": "api_error_budget", "predicate": "configured_with",
+          "object": "90_minutes", "polarity": 1, "value_numeric": 90,
+          "value_unit": "minutes"}]
+    )
+    return StubLLMClient(
+        fixtures={"165 minutes": first, "90 minutes": second}, default="[]"
+    )
+
+
+@pytest.mark.parametrize("flag_on", [False, True])
+def test_bare_number_unit_refined_from_evidence_supersedes(cfg, flag_on):
+    """has_numeric survives as a fill-only unit refinement: "165" + evidence
+    unit "minutes" competes with "90_minutes", and the older value is
+    superseded when the flag is on."""
+    hy = HyMem(replace(cfg, value_supersession_enabled=flag_on), llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_budget"
+        hy.open_session(sid)
+        hy.log_message(
+            sid, "user",
+            "The API error budget is 165 minutes per quarter.",
+            created_at="2024-03-01 09:00:00",
+        )
+        hy.log_message(
+            sid, "user",
+            "We tightened the API error budget to 90 minutes per quarter.",
+            created_at="2024-03-20 09:00:00",
+        )
+        hy.close_session(sid)
+
+        hy.set_llm(_bare_number_unit_refinement_llm())
+        hy.dream()
+
+        conn = hy.conn
+        rows = {
+            r["object_canonical"]: r
+            for r in conn.execute(
+                "SELECT object_canonical, status, valid_at, invalid_at "
+                "FROM knowledge_graph "
+                "WHERE subject_canonical = 'api_error_budget' "
+                "AND predicate = 'configured_with'",
+            ).fetchall()
+        }
+        assert {"165", "90_minutes"} <= set(rows), f"both edges should mint: {set(rows)}"
+        if not flag_on:
+            assert rows["165"]["status"] == "active"
+            assert rows["90_minutes"]["status"] == "active"
+            return
+        assert rows["90_minutes"]["status"] == "active"
+        assert rows["165"]["status"] == "retracted", (
+            "bare number with evidence-refined unit should be superseded"
+        )
+        assert rows["165"]["invalid_at"] == rows["90_minutes"]["valid_at"]
     finally:
         hy.close()

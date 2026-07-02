@@ -19,14 +19,20 @@ string itself — ``"165"``, ``"65_percent"``, ``"april_5_2024"`` — and NOT fr
 ``kg_evidence.value_numeric`` metadata column. v1 keyed on that column and never
 fired against a real extractor: production LLMs capture the number in the object
 string but almost never populate ``value_numeric`` (a box run measured 1 of 207
-evidence rows). The column is still honoured as a fast-path/typing hint when
-present, but parsing the object is what makes the lever reach real updates. Two
-edges compete only when they parse to the **same class** and (for numbers) a
-**compatible unit**; a string object like ``adidas_black_sneakers`` parses to
-``None`` and never competes — so multi-valued relations (a project that uses many
-tools, a person with several preferences) are never collapsed. This is the
-correctness guard, in place of a predicate allow-list (cf. the functional
-``_EXCLUSIVE_PREDICATES`` in ``query/conflicts.py``).
+evidence rows). The string parse is AUTHORITATIVE for the class: a free-text
+object never competes, even when an extractor tagged its evidence numeric — a
+year lifted from ``vintage_omega_seamaster_watch`` must not route the possession
+into the numeric pool (v3.1 fix; the earlier fast-path that trusted the column
+over the parse was the v1 mistake resurfacing). The column survives only as a
+unit REFINEMENT: it fills the missing unit on an object that already parsed as a
+bare number, so ``"165"`` with evidence unit ``percent`` competes with
+``"78_percent"``. Two edges compete only when they parse to the **same class**
+and (for numbers) a **compatible unit**; a string object like
+``adidas_black_sneakers`` parses to ``None`` and never competes — so
+multi-valued relations (a project that uses many tools, a person with several
+possessions) are never collapsed. This is the correctness guard, in place of a
+predicate allow-list (cf. the functional ``_EXCLUSIVE_PREDICATES`` in
+``query/conflicts.py``).
 
 A VERSION (v3) is a dotted numeric core that v2 left as free text: a bare
 ``2.3.1`` (three or more components) or an alpha-prefixed ``python_3.12`` /
@@ -168,25 +174,24 @@ def supersede_competing_values(conn: sqlite3.Connection, cfg: HyMemConfig) -> in
     ).fetchall()
 
     # Sub-group by (subject, predicate, value-class, unit) so only same-class,
-    # same-unit values ever compete. A number tagged by the extractor
-    # (has_numeric) is trusted directly, with its evidence unit; otherwise the
-    # class is parsed from the object string.
+    # same-unit values ever compete. The object-string parse is AUTHORITATIVE
+    # for the class: a free-text object never competes, even when an extractor
+    # tagged its evidence with value_numeric (a year embedded in a possession
+    # name, say) — trusting the column over the parse routed free text into the
+    # numeric pool and collapsed multi-valued facts. Class-first also makes a
+    # version-shaped object keep its prefix key when value_numeric is tagged,
+    # without a special case. has_numeric survives only as a refinement: it
+    # fills the MISSING unit on an object that already parsed as a bare number
+    # ("165" + evidence unit "percent" competes with "78_percent"); a unit the
+    # string itself asserts ("65_percent") is never overridden by metadata.
     groups: dict[tuple[str, str, str, str | None], list[sqlite3.Row]] = defaultdict(list)
     for r in rows:
         cls = _classify_object(r["obj"])
-        if cls is not None and cls[0] == "ver":
-            # A version-shaped object wins over the has_numeric fast-path: an
-            # extractor that saw "python_3.12" may well tag value_numeric=3.12,
-            # but routing the row as a plain number would drop its prefix key
-            # and let it compete with unrelated quantities. The object-string
-            # parse is authoritative for versions.
-            kind, unit = cls
-        elif r["has_numeric"]:
-            kind, unit = "num", _norm_unit(r["ev_unit"])
-        elif cls is None:
+        if cls is None:
             continue  # free-text object — never a single-valued quantity
-        else:
-            kind, unit = cls
+        kind, unit = cls
+        if kind == "num" and unit is None and r["has_numeric"]:
+            unit = _norm_unit(r["ev_unit"])
         groups[(r["subj"], r["pred"], kind, unit)].append(r)
 
     to_retract: list[tuple[int, str]] = []  # (older_edge_id, invalid_at)
