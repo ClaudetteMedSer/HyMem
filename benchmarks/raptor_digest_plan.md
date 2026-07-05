@@ -271,7 +271,18 @@ BOTH-arms alternative is union-find order-dependent). Recency signal is
 clock; session_id is lexicographic, NOT chronological on the prod store); full
 windows align to the most-recent end so the one possibly-undersized window
 holds the OLDEST episodes — downstream min-members/min-sessions filtering then
-drops the least recent slice, never the newest. Applied at BOTH call sites
+drops the least recent slice, never the newest.
+**REVERSED 2026-07-05 (dream runs 685-693): windows now anchor at the OLDEST
+end.** Newest-end alignment shifted every window boundary whenever an episode
+joined the mega-component between dreams, re-keying all ~24 windows plus the
+rollup chain above them — reuse collapsed to ~30% on every episode-adding
+dream (the constant ~13 reused nodes were the small clusters outside the
+component). The 678/680 rowid ceiling (8b36501) couldn't catch this: it guards
+mid-build arrivals, not between-dream ones. Oldest-anchored windows confine an
+append to the still-filling newest tail window; the undersized-newest slice a
+min-size filter drops stays retrievable as episodes and enters the digest as
+leftover leaves. No salt bump (blocking precedent: member-set hashes re-key
+naturally). Applied at BOTH call sites
 (level-0 `select_clusters` and the rollup loop — a frontier mega-component
 would otherwise fuse from a truncation of itself). Salt bumped
 `cluster.v2 → cluster.v3` (membership semantics changed); `rollup.v2`/`root.v4`

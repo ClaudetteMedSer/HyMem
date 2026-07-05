@@ -138,9 +138,11 @@ class HyMemConfig:
     store the probe (benchmarks/cluster_size_probe.py, 2026-06-12) found ONE
     component of 348 episodes spanning 61 sessions — fusing that yields a mush
     summary. Components larger than the cap are split deterministically into
-    recency-ordered windows of at most this many episodes (full windows aligned
-    to the newest end; an undersized oldest window is dropped by the normal
-    min-members/min-sessions policy). 0 translates to None (uncapped) at the
+    recency-ordered windows of at most this many episodes (full windows
+    anchored at the OLDEST end so between-dream arrivals only re-fuse the
+    newest tail window — see cluster_episodes — and the undersized newest
+    window is dropped by the normal min-members/min-sessions policy). 0
+    translates to None (uncapped) at the
     `cluster_episodes` call sites — matching the `aggregation_digest_anchor_facts`
     "0 disables" house style."""
 

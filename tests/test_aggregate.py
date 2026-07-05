@@ -144,7 +144,12 @@ def test_node_id_stable_for_membership_and_order_independent():
 # transitive OR-link chaining (cluster_size_probe, 2026-06-12); the guard
 # splits over-cap components into recency windows. Membership semantics changed
 # → cluster salt bumped to v3 (rollup/root salts unchanged: their cache ids key
-# on member sets, which change naturally).
+# on member sets, which change naturally). Windows anchor at the OLDEST end
+# (2026-07-05, dream runs 685-693): newest-end alignment shifted every window
+# boundary on each between-dream episode arrival, re-keying the whole
+# mega-component + rollup chain (~30% reuse); no salt bump — the blocking
+# precedent applies, changed member sets re-key naturally and coinciding ones
+# keep still-valid fusions.
 
 def _entity_chain(n: int, start_message_ids: list[int] | None = None) -> list[dict]:
     """n episodes where ONLY consecutive pairs entity-link at jaccard exactly
@@ -171,19 +176,24 @@ def test_salts_pinned():
     assert _ROOT_SALT == "root.v4"
 
 
+def _windows(capped: dict[str, int]) -> set[frozenset[str]]:
+    grouped: dict[int, set[str]] = {}
+    for eid, label in capped.items():
+        grouped.setdefault(label, set()).add(eid)
+    return {frozenset(w) for w in grouped.values()}
+
+
 def test_over_cap_component_splits_into_windows_deterministically():
     eps = _entity_chain(7)                      # ONE component of 7, uncapped
     uncapped = cluster_episodes(eps, 0.55, 0.50)
     assert len(set(uncapped.values())) == 1
 
     capped = cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3)
-    windows: dict[int, set[str]] = {}
-    for eid, label in capped.items():
-        windows.setdefault(label, set()).add(eid)
-    assert all(len(w) <= 3 for w in windows.values())
-    # 7 = 1 + 3 + 3: full windows align to the newest end, the undersized
-    # window holds the OLDEST episodes (input order = recency fallback).
-    assert sorted(len(w) for w in windows.values()) == [1, 3, 3]
+    windows = _windows(capped)
+    assert all(len(w) <= 3 for w in windows)
+    # 7 = 3 + 3 + 1: full windows anchor at the oldest end, the undersized
+    # window holds the NEWEST episode (input order = recency fallback).
+    assert sorted(len(w) for w in windows) == [1, 3, 3]
     # Deterministic: a second run is identical, label for label.
     assert cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3) == capped
 
@@ -203,12 +213,26 @@ def test_windows_are_recency_ordered_by_start_message_id():
     eps = [eps[i] for i in (4, 0, 6, 2, 5, 1, 3)]   # shuffle input order
 
     capped = cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3)
-    windows: dict[int, set[str]] = {}
-    for eid, label in capped.items():
-        windows.setdefault(label, set()).add(eid)
-    # Consecutive recency slices, full windows at the newest end:
-    assert sorted(windows.values(), key=len) == sorted(
-        [{"e0"}, {"e1", "e2", "e3"}, {"e4", "e5", "e6"}], key=len)
+    # Consecutive recency slices, full windows anchored at the oldest end:
+    assert _windows(capped) == {frozenset({"e0", "e1", "e2"}),
+                                frozenset({"e3", "e4", "e5"}),
+                                frozenset({"e6"})}
+
+
+def test_window_split_is_append_stable():
+    # THE fusion-cache property (prod dream runs 685-693, 2026-07-03..05): an
+    # episode appended at the newest end of an over-cap component must leave
+    # every already-full window's member set untouched, so those nodes keep
+    # their cached fusions. Newest-end-anchored windows shifted EVERY boundary
+    # by one on each arrival, re-keying the whole mega-component and its
+    # rollup chain (~30% reuse) — invisible to the 678/680 rowid ceiling,
+    # which only guards against arrivals landing MID-build, not between dreams.
+    eps = _entity_chain(8, start_message_ids=[10, 20, 30, 40, 50, 60, 70, 80])
+    before = _windows(cluster_episodes(eps[:7], 0.55, 0.50, max_cluster_size=3))
+    after = _windows(cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3))
+    # e7 (newest) joins the undersized tail; both full windows are unchanged.
+    assert before - after == {frozenset({"e6"})}
+    assert after - before == {frozenset({"e6", "e7"})}
 
 
 def test_component_exactly_at_cap_is_not_split():
@@ -220,8 +244,8 @@ def test_component_exactly_at_cap_is_not_split():
 def test_build_respects_aggregation_max_cluster_size(conn, cfg):
     # Integration: a 7-episode transitive chain across 7 sessions, cap 3 → no
     # persisted level-0 node may exceed 3 members. Windows of 3 span 3 sessions
-    # (pass min_members/min_sessions); the undersized window of 1 is dropped by
-    # the SAME downstream policy as any singleton.
+    # (pass min_members/min_sessions); the undersized newest window of 1 is
+    # dropped by the SAME downstream policy as any singleton.
     for k in range(7):
         j = k // 2
         ents = [f"t{j}"] if k % 2 == 0 else [f"t{j}", f"t{j + 1}"]
@@ -235,8 +259,34 @@ def test_build_respects_aggregation_max_cluster_size(conn, cfg):
     assert n == len(rows) == 2                       # two full windows kept
     assert all(r["n_members"] <= 3 for r in rows)
     members = {frozenset(json.loads(r["member_episode_ids"])) for r in rows}
-    assert members == {frozenset({"e1", "e2", "e3"}),
-                       frozenset({"e4", "e5", "e6"})}
+    assert members == {frozenset({"e0", "e1", "e2"}),
+                       frozenset({"e3", "e4", "e5"})}
+
+
+def test_build_reuses_full_window_fusions_when_component_grows(conn, cfg):
+    # Build-level pin for append stability: a dream over the same store plus
+    # ONE new episode extending the over-cap chain must reuse every full
+    # window's cached fusion. Under the newest-end alignment this rebuilt
+    # everything from scratch — the runs-685-693 collapse in miniature.
+    for k in range(7):
+        j = k // 2
+        ents = [f"t{j}"] if k % 2 == 0 else [f"t{j}", f"t{j + 1}"]
+        _seed_episode(conn, f"e{k}", f"s{k}", f"ep {k}", f"about {ents}",
+                      ents, start=10 * (k + 1), end=10 * (k + 1) + 1)
+    cfg = replace(_enabled(cfg), aggregation_max_cluster_size=3)
+    llm = _agg_llm()
+    first = build_aggregation_nodes(conn, cfg, llm)
+    assert (first.nodes, first.reused) == (2, 0)     # two full windows, fresh
+
+    # One episode lands between dreams, chaining onto the newest end (shares
+    # t3 with e6 at jaccard exactly 0.50 → same component).
+    _seed_episode(conn, "e7", "s7", "ep 7", "about t3 t4", ["t3", "t4"],
+                  start=80, end=81)
+    second = build_aggregation_nodes(conn, cfg, llm)
+    # Tail window {e6, e7} now passes min-members/min-sessions → 3 nodes; both
+    # full windows kept their member sets → cached fusions reused, only the
+    # tail fused fresh.
+    assert (second.nodes, second.reused) == (3, 2)
 
 
 def test_build_uncapped_when_config_cap_is_zero(conn, cfg):

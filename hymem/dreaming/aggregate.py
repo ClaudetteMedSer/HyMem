@@ -170,9 +170,19 @@ def cluster_episodes(
     cross-session ingestion-order clock — the loader already carries it),
     falling back to input position (rollup items and bare test dicts carry no
     message ids; input position is the loader's stable order). Full windows are
-    aligned to the most-RECENT end, so the one possibly-undersized window holds
-    the OLDEST episodes — if downstream min-size filtering drops it, what is
-    lost is the least recent slice, never the newest.
+    anchored at the OLDEST end, so the one possibly-undersized window holds the
+    NEWEST episodes. The anchoring is load-bearing for fusion-cache reuse: new
+    episodes join a component at the newest end of the order, and oldest-anchored
+    boundaries leave every already-full window's member set — hence its node id
+    and cached fusion — untouched; only the still-filling tail window (and its
+    rollup ancestors) re-fuse. The original newest-end alignment shifted EVERY
+    boundary by one on each arrival, re-keying all ~24 windows of the prod
+    mega-component plus their whole rollup chain — the ~30%-reuse dreams of
+    runs 685-693 (2026-07-03..05), which the 678/680 rowid ceiling could not
+    stop because those episodes land BETWEEN dreams, not mid-build. The price
+    is that min-members/min-sessions filtering now drops the newest slice while
+    it is undersized, not the oldest — acceptable: its episodes stay directly
+    retrievable and still reach the digest as leftover pass-through leaves.
     """
     if max_cluster_size is not None and max_cluster_size < 1:
         raise ValueError(f"max_cluster_size must be >= 1, got {max_cluster_size}")
@@ -238,10 +248,9 @@ def cluster_episodes(
             next_label += 1
             continue
         ordered = sorted(members, key=_recency_key)   # oldest → newest
-        head = len(ordered) % max_cluster_size        # undersized window = oldest
-        bounds = ([0] if head else []) + list(
-            range(head, len(ordered), max_cluster_size))
-        for start in bounds:
+        # Anchored at the oldest end (undersized window = newest): appends only
+        # touch the tail window, so full windows keep their cached fusions.
+        for start in range(0, len(ordered), max_cluster_size):
             for m in ordered[start:start + max_cluster_size]:
                 capped[m["id"]] = next_label
             next_label += 1
@@ -441,8 +450,9 @@ def select_clusters(
     Clustering runs with the `aggregation_max_cluster_size` chaining guard
     (0 in config = uncapped → None here): an over-cap component arrives as
     recency windows, and each window flows through the SAME min-members /
-    min-sessions policy below — an undersized trailing window is dropped here
-    exactly like any other too-small cluster.
+    min-sessions policy below — an undersized trailing window (the NEWEST,
+    still-filling slice) is dropped here exactly like any other too-small
+    cluster; its episodes still reach the digest as leftover leaves.
 
     `conn` enables Stage-3b candidate blocking (the KNN cosine arm needs the
     store's `vec_episodes` table); None — pure offline callers — means exact
