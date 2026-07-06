@@ -4,13 +4,13 @@
 
 ## TL;DR / Executive Summary
 
-**HyMem** is a local-first, embedded memory system for AI agents. It gives the **Hermes** agent persistent memory across conversations by extracting a structured SQLite knowledge graph from chat logs during idle "dreaming" cycles, then making that knowledge queryable at conversation time via keyword search, vector search, semantic graph search, and entity lookup — plus a working-memory tier of recent raw turns so facts from the current session are recallable before they're dreamed. It also auto-maintains two Markdown files (`MEMORY.md` and `USER.md`) that the agent reads before each conversation.
+**HyMem** is a local-first, embedded memory system for AI agents. It gives the **Hermes** agent persistent memory across conversations by extracting a structured SQLite knowledge graph from chat logs during idle "dreaming" cycles, then making that knowledge queryable at conversation time via keyword search, vector search, semantic graph search, and entity lookup — plus a working-memory tier of recent raw turns so facts from the current session are recallable before they're dreamed. It also auto-maintains two Markdown files (`MEMORY.md` and `USER.md`) that the agent reads before each conversation, and — with aggregation enabled — a standing whole-store digest (`HyMem.digest()`, the RAPTOR root) answering "what do you know about this user?" for system-prompt injection.
 
 **No cloud, no Postgres, no 500MB Docker images.** One SQLite file, two Markdown files, and a Python library. Query-time retrieval defaults to LLM-free — FTS5 + sqlite-vec ANN + graph traversal. An optional hybrid reranker (cross-encoder *or* the configured LLM) can be enabled to break ties when keyword and semantic search disagree, gated by an ambiguity threshold so the LLM hot path stays the exception, not the rule.
 
 **Two deployment modes:** an MCP tools server for direct agent integration, and a **Honcho v3-compatible HTTP server** so Hermes can use the standard `honcho-ai` SDK and treat HyMem as a drop-in replacement for Honcho's managed cloud service.
 
-**~9,400 lines of Python**, zero npm, zero Docker required.
+**~15,000 lines of Python**, zero npm, zero Docker required.
 
 **Benchmarked on LongMemEval.** On the 500-question LongMemEval-S suite, HyMem scores **70.0% overall on the production path** — the in-library ability router shaping retrieval with *no* oracle labels, so the number reflects what real Hermes gets, not a benchmark-only ceiling. The headline runs with **dreaming on** (worth +3.6pp; the A/B and per-category lifts are in §11). Full table and methodology in [§11](#11-benchmark-results-longmemeval).
 
@@ -27,6 +27,8 @@ pip install 'hymem[server]'
 export HYMEM_LLM_API_KEY=sk-...        # extraction LLM (DeepSeek/OpenAI/...)
 export HYMEM_EMBEDDING_API_KEY=sk-...  # optional — omit for FTS-only retrieval
 export HYMEM_ROOT=~/.hermes            # optional — SQLite + Markdown live here
+export HYMEM_AGGREGATION_NODES_ENABLED=true  # optional — standing whole-store
+                                             # digest (see §7 Hermes integration)
 
 hymem-doctor      # preflight: verify config before launching
 hymem-honcho      # Honcho v3-compatible HTTP server on :8765
@@ -75,7 +77,7 @@ All of this is surfaced automatically to Hermes before each user message via the
            ▼                      ▼
     ┌──────────────┐    ┌────────────────────┐
     │  server.py   │    │  honcho/  package  │
-    │  7 MCP tools │    │  19 HTTP endpoints │
+    │  9 MCP tools │    │  19 HTTP endpoints │
     └──────┬───────┘    └─────────┬──────────┘
            │                      │
            └──────────┬───────────┘
@@ -117,8 +119,8 @@ hymem/
 ├── bootstrap.py        Env-var resolution + build_from_env() + shared singleton
 ├── doctor.py           hymem-doctor — preflight diagnostics (keys, endpoints,
 │                         sqlite-vec, schema, embedding-dim drift, canonical drift)
-├── server.py           MCP server — 7 tools (capture, log, dream, augment,
-│                         profile, alias, retract)
+├── server.py           MCP server — 9 tools (capture, log, dream, augment,
+│                         ask, profile, digest, alias, retract)
 ├── honcho_server.py    Back-compat shim → hymem.honcho
 │
 ├── honcho/             Honcho v3-compatible HTTP server
@@ -128,15 +130,19 @@ hymem/
 │
 ├── core/
 │   ├── db.py           SQLite connection management (WAL), schema init, migrations
-│   ├── schema.sql      19 tables + FTS5 virtual tables + triggers
+│   ├── schema.sql      28 tables + 5 FTS5 virtual tables + triggers
 │   └── markdown_io.py  Read/write HTML-comment-delimited sections in MD files
 │
 ├── dreaming/
 │   ├── runner.py       Orchestrates full pipeline with advisory lock
+│   ├── scheduler.py    Long-lived daemon thread owning background dream cycles
+│   │                   (one forked HyMem connection for its whole lifetime)
 │   ├── chunks.py       Regex-based high-salience chunk extraction
 │   ├── canonicalize.py Deterministic entity name normalization + aliases +
 │   │                   drift detection/repair (find_/repair_canonical_drift)
 │   ├── mentions.py     Entity mention indexing for decay calculations
+│   ├── temporal.py     Per-message date-mention indexing (temporal_mentions)
+│   ├── dates.py        Stdlib-only date extraction primitives for the TR path
 │   ├── embeddings.py   Batch embedding of chunks + knowledge-graph edges (JSON + sqlite-vec)
 │   ├── phase1.py       Extraction persist + dedup (lock-free embed, same-wave collapse)
 │   ├── digest.py       Batched per-session episodes+summary+procedures (one LLM call)
@@ -144,9 +150,17 @@ hymem/
 │   ├── phase3.py       Co-occurrence-aware decay + retraction
 │   ├── inference.py    Transitive closure over depends_on edges
 │   ├── bitemporal.py   Valid-time stamping: valid_at/invalid_at on edges
+│   ├── value_supersession.py  Single-assertion supersession for typed-value
+│   │                   edges — a knowledge UPDATE closes the old value without
+│   │                   waiting for evidence accumulation
+│   ├── user_profile.py Typed personal-fact slots (role/employer/location/…)
+│   │                   the tech-domain graph vocabulary never captures
 │   ├── episodes.py     LLM-powered episodic memory extraction
 │   ├── procedures.py   LLM-powered procedural memory extraction
 │   ├── summary.py      LLM-powered session summarization
+│   ├── aggregate.py    RAPTOR cross-session aggregation: cluster episodes →
+│   │                   fuse → hierarchy levels up to the root standing digest
+│   ├── behavioral_dedup.py  Dry-run report of pre-collapse behavioral duplicates
 │   └── retention.py    Chunk pruning with graph-aware eviction
 │
 ├── extraction/
@@ -164,6 +178,11 @@ hymem/
 │   ├── augment.py      FTS5 + vector + RRF merge + LLM rerank + hybrid graph
 │   │                   ranker (routed + per-candidate fallback branches,
 │   │                   token-overlap entity expansion)
+│   ├── ask.py          Dialectic endpoint behind HyMem.ask() — renders the
+│   │                   retrieval tiers and makes one synthesis LLM call
+│   ├── rerank.py       Cross-source rerank after RRF (LLM or cross-encoder
+│   │                   backend, ambiguity-gated)
+│   ├── count_routing.py Graph-native exact counting for in-domain MR queries
 │   ├── intent.py       detect_ability() router — infers MR/TR question-type from
 │   │                   the query alone (EN+NL regex, label-free) + AbilitySignal
 │   │                   observability, so ability shaping fires in production with
@@ -180,11 +199,12 @@ hymem/
 
 ---
 
-## 4. The Data Model (19 SQLite Tables)
+## 4. The Data Model (28 SQLite Tables + 5 FTS5 Indexes)
 
 **Conversation storage:**
 - `sessions` — session ID + start/end timestamps + LLM-generated summary
 - `messages` — raw turns (user, assistant, system, tool)
+- `messages_fts` — FTS5 over raw turns, indexed live at ingest; powers the `message_hits` tier so a turn is recallable before any dream chunks it
 
 **Extraction artifacts:**
 - `chunks` — high-salience conversation segments
@@ -193,6 +213,9 @@ hymem/
 - `processed_chunks` — idempotency tracking per (chunk_id, prompt_version)
 - `entity_mentions` — inverted index: chunk → canonical entity
 - `entity_types` — canonical entity → type classification (language, framework, database, etc.)
+- `entity_properties` — free-form key/value attributes per canonical entity (e.g. `language=python`), extracted alongside types
+- `temporal_mentions` — per-message date mentions extracted at dream time; feeds the `ability="TR"` chronology
+- `embedding_cache` — content-addressed (text, model) → vector cache deduplicating embedding-API calls across chunks/edges/episodes
 
 **Knowledge graph:**
 - `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges. **Bi-temporal** (schema v15): alongside the transaction-time columns (`first_seen`/`last_seen` — when HyMem *learned* a fact), each edge carries a valid-time interval `valid_at`/`invalid_at` — when the fact was true *in the world*, sourced from the originating message's date — so supersession is a closed interval (`invalid_at IS NULL` = still valid) rather than a status flip that erases the "what was true as of date X" axis
@@ -203,20 +226,29 @@ hymem/
 **Behavioral profiling:**
 - `behavioral_markers` — raw extracted signals (correction, preference, rejection, style)
 - `profile_entries` — structured profile with evidence tracking
+- `user_profile` — typed personal-fact slots (role, name, employer, location, language, …) with bi-temporal `valid_at`/`invalid_at`; consumed by the digest's verified-facts anchor, `ctx.user_profile`, and `HyMem.profile()`
 
 **Episodic & procedural memory:**
 - `episodes` — named, summarized conversation segments with outcomes and entities
 - `episodes_fts` — FTS5 search over episode titles and summaries
+- `episode_embeddings` — vectors for semantic episode search (`vec_episodes`)
 - `procedures` — step-by-step workflows with triggers and involved entities
 - `procedures_fts` — FTS5 search over procedure names, descriptions, and steps
+
+**Aggregation & digest (RAPTOR):**
+- `aggregation_nodes` — cross-session cluster summaries plus hierarchy levels rolled up to one root **standing digest** (`HyMem.digest()`); levels ≥ 1 never enter query-time retrieval
+- `aggregation_nodes_fts` — FTS5 over node summaries for the (opt-in, additive) query-time tier
+- `aggregation_node_embeddings` — cache-keyed summary vectors, so re-dreaming a stable store re-fuses nothing
 
 **Self-improvement:**
 - `extraction_feedback` — wrongly-extracted triples stored as negative examples for future extraction
 
 **Operational:**
+- `schema_meta` — schema version guard (see §8)
 - `peers` — Honcho peer registry (peer_id → role mapping)
 - `run_lock` — advisory mutex for dreaming concurrency
 - `dream_runs` — per-cycle audit log
+- `token_overlap_index` — persisted token → canonical map backing the overlap-expansion cache (empty = cold start; rebuilt on demand)
 
 ---
 
@@ -361,7 +393,7 @@ It's pure SQL over the existing schema — no LLM call — and ignores retracted
 
 ### MCP Server (`hymem-server` → `server.py`)
 
-Exposes 8 tools via the Model Context Protocol:
+Exposes 9 tools via the Model Context Protocol:
 
 | Tool | Purpose |
 |---|---|
@@ -369,6 +401,7 @@ Exposes 8 tools via the Model Context Protocol:
 | `hymem_log` | Log one turn at a time (fallback) |
 | `hymem_dream` | Run a dreaming cycle manually |
 | `hymem_augment` | Retrieve graph facts + FTS context for a message |
+| `hymem_ask` | Dialectic Q&A — same retrieval, plus one LLM call that synthesizes a grounded answer (quotes values/dates, states both sides of a contradiction, says plainly when memory has no answer) |
 | `hymem_profile` | Return USER.md + MEMORY.md |
 | `hymem_digest` | Standing whole-store digest (RAPTOR root) with coverage + generated-at footer |
 | `hymem_alias` | Register surface-form→canonical mapping |
@@ -410,6 +443,13 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 - **Role inference**: Peer IDs matching `user[-_]|human|client|telegram|discord|slack` → user role, `agent|hermes|assistant|ai[-_]|bot|llm` → assistant role.
 - **LLM-free query path by default**: Search, context, and chat endpoints only call `hy.augment()`. With the default config (`rerank_model="llm"`, ambiguity-gated) the reranker fires only when FTS and vec disagree enough to trigger ambiguity; pick `rerank_model="cross-encoder"` for a local sentence-transformers reranker, or raise `rerank_ambiguity_threshold` to suppress it entirely. SQLite-only is the steady state.
 - **Explainability surfaced as metadata, not prose**: `graph_fact` results carry `metadata.why` with the ranker's reason codes (`fallback:entity_anchored`, `semantic_0.83`, `predicate:uses`, `recency_3d`, …). The `/chat` endpoint returns clean prose alongside a structured `facts[]` array — Hermes-friendly text without losing the trail.
+
+### Getting the standing digest into the host agent's context (Hermes)
+
+HyMem's whole-store digest (the RAPTOR root, §11) is served by this server: the peer `card`/`context` routes **and** the session-scoped `GET .../sessions/{sid}/context` all return `peer_representation` = digest + USER.md. That is the entire HyMem side — it ships with the package, nothing to patch after `pip install`. For the digest to actually reach the agent's auto-injected context block, two things must hold on the *host* side:
+
+1. **Aggregation is enabled** — set `HYMEM_AGGREGATION_NODES_ENABLED=true` (§9) and let one dream complete so a digest exists. Until then `peer_representation` degrades byte-for-byte to plain `USER.md`.
+2. **The host harness reads `peer_representation` from the session-context response.** Stock Hermes harness builds (as of 2026-07) drop the field there and overwrite it with a digest-less representation fetched from the peer endpoint. [hymem/Hermes_instruction.md](hymem/Hermes_instruction.md) is the operator runbook for the Hermes instance: the two-line harness patch, a restart-surviving auto-patch hook, and how to verify — in a **fresh** session, since the harness caches its assembled base context.
 
 ---
 
@@ -480,6 +520,8 @@ dimension).
 | `HYMEM_HONCHO_HOST` | `127.0.0.1` | Honcho server bind address |
 | `HYMEM_HONCHO_PORT` | `8765` | Honcho server port |
 | `HYMEM_DREAM_COOLDOWN_SECONDS` | `60` | Min seconds between bg dream kicks |
+| `HYMEM_AGGREGATION_NODES_ENABLED` | unset (config default: off) | Master switch: RAPTOR aggregation + standing digest built at dream time |
+| `HYMEM_AGGREGATION_DIGEST_ENABLED` | unset (config default: on) | Sub-switch: roll cluster nodes up into the root digest (active only with the master switch on) |
 
 Tunable in `HyMemConfig` dataclass (programmatic):
 
@@ -510,7 +552,10 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
 | `profile_max_entries` | 16 | Max profile entries in USER.md |
 | `insights_max_entries` | 12 | Max insights in MEMORY.md |
-| `prompt_version` | `"v8"` | Bump to force full reprocessing |
+| `prompt_version` | `"v9"` | Bump to force full reprocessing |
+| `aggregation_nodes_enabled` | `False` | Master switch for the RAPTOR aggregation layer + digest |
+| `aggregation_digest_enabled` | `True` | Build the root standing digest at dream time (needs the master switch) |
+| `aggregation_inject_abilities` | `("TR",)` | Abilities whose queries surface aggregation nodes at query time (additive tier) |
 | `dream_budget` | 50 | Max chunks to process per dreaming cycle |
 | `max_chunks` | 50000 | Soft cap on total stored chunks |
 | `retention_days` | 90 | Chunks newer than this always kept |
@@ -523,7 +568,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**564 tests total, 100% passing** across 44 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
+**702 tests total, 100% passing** across 51 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling, numeric / temporal value parsing
@@ -541,7 +586,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_markdown_io.py` — Section read/write atomicity
 - `test_integration.py` — End-to-end capture→dream→augment, retract workflow
 - `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
-- `test_mcp_server.py` — MCP tool correctness (all 7 tools)
+- `test_mcp_server.py` — MCP tool correctness (all 9 tools, incl. `hymem_ask` synthesis and `hymem_digest`)
 - `test_retract.py` — Edge retraction, alias resolution, idempotency, feedback-row recording
 - `test_bitemporal.py` — Valid-time interval: valid_at from positive-evidence world date (write-once), invalid_at on supersession from newest negative-evidence date, as-of resolution, retract_edge interval-close, migration backfill + export round-trip
 - `test_raptor_cluster_probe.py` — Pure connected-components clustering core of the Phase-2 RAPTOR front-run gate (`benchmarks/raptor_cluster_probe.py`): cosine/Jaccard primitives, OR-link predicate (embedding *or* entity overlap), transitive closure, embedding-bridge across disjoint entity sets, threshold sensitivity. The DB/dream side runs only on the box; this pins the clusterer the build reuses (re-exported from `hymem.dreaming.aggregate`, so probe/tests/production share one clusterer)
@@ -640,7 +685,7 @@ python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8
 | **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (19 endpoints, real-SDK contract tests) | Native |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
 | **SDKs** | Python + MCP + Honcho SDK | Python + TypeScript |
-| **Maturity** | v0.1.0, ~9,400 lines | v3.0.6, 514 commits, 3.4k stars |
+| **Maturity** | v0.1.0, ~15,000 lines | v3.0.6, 514 commits, 3.4k stars |
 | **License** | Not specified | AGPL-3.0 |
 
 **The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, semantic-and-explainable graph ranking, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
