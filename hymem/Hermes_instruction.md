@@ -4,18 +4,22 @@ Runbook for a Hermes instance that wants HyMem's cross-session RAPTOR digest —
 the whole-store "what do you know about this user?" narrative — to appear in
 the agent's per-turn auto-injected context block.
 
-**The split:** the HyMem side ships with the package (commit `0b5eb55` and
-later) — nothing to patch there. The Hermes-harness side is a two-line patch
-you apply on your box, plus a hook so it survives container restarts. Remove
-both when the fix is upstreamed into the Hermes harness.
+**Update 2026-07-06 — the fix is now entirely HyMem-side.** The peer-context
+route returns an SDK-parseable response carrying the representation under
+*both* field names, working around the honcho-ai SDK bugs described in §Root
+cause. A **stock, unpatched** Hermes harness receives the digest from a HyMem
+server at or after this fix. The harness patch + post-restart hook below are
+only needed while running an **older** HyMem server.
 
-**Checklist:**
+**Checklist (current HyMem):**
 
-1. HyMem at or after commit `0b5eb55` — any current `pip install` qualifies (§Prerequisites).
+1. Upgrade HyMem to a build at or after 2026-07-06 (dual-field peer-context response; the session-context wiring from commit `0b5eb55` is older still) (§Prerequisites).
 2. `HYMEM_AGGREGATION_NODES_ENABLED=true` in the HyMem server environment, then let one dream run (§Prerequisites).
-3. Apply the two-part patch to the harness's `plugins/memory/honcho/session.py` (§Harness patch).
-4. Install the post-restart auto-patch hook (§Post-restart survival).
-5. Verify — server first with `curl`, then the harness **in a fresh session**; an existing session's cached base context will make the patch look inert (§Verification).
+3. Verify — server first with `curl`, then the harness **in a fresh session**; an existing session's cached base context serves a stale block (§Verification).
+
+**Checklist (HyMem older than 2026-07-06):** as above, plus apply the two-part
+patch to the harness's `plugins/memory/honcho/session.py` (§Harness patch) and
+install the post-restart auto-patch hook (§Post-restart survival).
 
 ---
 
@@ -39,7 +43,37 @@ Two gaps, one on each side of the Honcho ↔ Hermes boundary:
    `get_prefetch_context()` called the session context to get the summary but
    **dropped** `peer_representation` (it only read `ctx.summary`). The
    representation was then re-fetched separately from the **peer** context
-   endpoint, which returns a different representation without the digest.
+   endpoint — a path that never delivers the digest because of an upstream
+   honcho-ai SDK bug (below).
+
+**The peer-path smoking gun (upstream SDK bug):** the peer context endpoint
+returns `peer_representation`, but the SDK's `PeerContextResponse` model
+declares the field as `representation` with no alias:
+
+```
+API returns:  {"peer_representation": "digest..."}
+SDK model:    PeerContextResponse(representation: str | None = None)
+                        ↑                         ↑
+                   field name              JSON field name
+                   MISMATCH
+```
+
+Pydantic doesn't map `peer_representation` → `representation`, so the value is
+silently dropped. The harness's `_fetch_peer_context()` fallback chain —
+`getattr(ctx, "representation") or getattr(ctx, "peer_representation")` —
+returns `None` on both names (the first is never populated from the mismatched
+JSON key; the second isn't an attribute of the model). Result: the peer path
+yields an empty representation every time, and never surfaced the digest even
+before the session-context fix. `SessionContext.peer_representation` *is*
+mapped correctly, which is why Fix 1 below works.
+
+It's worse than a silent drop: `PeerContextResponse` also *requires*
+`peer_id` and `target_id`, which the endpoint didn't return — so
+`peer.context()` didn't even parse; it raised a `ValidationError` inside the
+SDK, swallowed by the harness into an empty result. Both problems are fixed
+server-side as of 2026-07-06: the route now returns `peer_id`/`target_id` and
+sends the representation under both names, pinned by a real-SDK contract test
+(`test_honcho_contract.py::test_peer_context_representation_reaches_sdk`).
 
 ---
 
@@ -47,13 +81,17 @@ Two gaps, one on each side of the Honcho ↔ Hermes boundary:
 
 ### HyMem version
 
-The HyMem-side fix landed in commit `0b5eb55`: the session-scoped
-`get_context()` now returns `peer_representation` via the same
-`_peer_representation()` helper the peer routes use — standing digest (when
-built) above `USER.md`. This is zero API-contract change — same string field,
-and when no digest exists the helper degrades to plain `USER.md`, i.e. the old
-behavior. Any install at or after that commit already has it; there is nothing
-to patch on the HyMem side.
+Two HyMem-side fixes matter:
+
+- **Commit `0b5eb55`** — the session-scoped `get_context()` returns
+  `peer_representation` via the same `_peer_representation()` helper the peer
+  routes use — standing digest (when built) above `USER.md`. Zero
+  API-contract change; when no digest exists the helper degrades to plain
+  `USER.md`, i.e. the old behavior.
+- **2026-07-06** — the peer-context route returns an SDK-parseable response:
+  the required `peer_id`/`target_id` fields plus the representation under
+  both field names. With this, the stock harness's existing peer-path fetch
+  delivers the digest and **no harness patch is needed**.
 
 ### Enable aggregation
 
@@ -85,7 +123,12 @@ operational notes:
 
 ---
 
-## Harness patch
+## Harness patch (only for HyMem servers older than 2026-07-06)
+
+With a current HyMem server this section is unnecessary — skip to
+§Verification. On an older server, the two fixes below make the harness read
+the representation from the session-context response, which the SDK maps
+correctly.
 
 **File:** `plugins/memory/honcho/session.py` (in the installed Hermes harness,
 e.g. `/usr/local/lib/hermes/hermes-agent/`)
@@ -109,7 +152,8 @@ if ctx.peer_representation:
 
 The Honcho SDK always populates `ctx.peer_representation` from the API
 response regardless of whether `peer_target`/`peer_perspective` are passed —
-no need to change the call signature.
+no need to change the call signature. (`SessionContext` maps the field
+correctly, unlike `PeerContextResponse` — see the smoking gun in §Root cause.)
 
 **Fix 2 — Prevent overwrite.** The code then fetches user context from the
 peer endpoint, which unconditionally overwrites `result["representation"]`:
@@ -127,7 +171,7 @@ peer-context representation otherwise.
 
 ---
 
-## Post-restart survival
+## Post-restart survival (only with the harness patch)
 
 The Hermes harness lives in an installed package path
 (`/usr/local/lib/hermes/hermes-agent/`). Container restarts restore it from
@@ -194,6 +238,14 @@ Expected: the digest block first (it carries a coverage + generated-at
 footer), then `USER.md`. The peer card route (`GET .../peers/<pid>/card`)
 should show the same.
 
+On a current HyMem server, also confirm the peer-context route carries the
+SDK-visible field name — this is exactly what the unpatched harness reads:
+
+```bash
+curl -s http://127.0.0.1:8765/v3/workspaces/<wid>/peers/<pid>/context \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["representation"][:200])'
+```
+
 If you get plain `USER.md` instead, the harness patch is irrelevant — the
 digest doesn't exist yet. Check, in order: `HYMEM_AGGREGATION_NODES_ENABLED`
 is set in the *server's* environment (not just your shell), a dream has
@@ -221,7 +273,9 @@ session.
 
 ## Removal
 
-Both fixes are a stopgap for a harness-side bug. When the Hermes harness ships
-`get_prefetch_context()` reading `peer_representation` from the session
-context natively, delete the hook block from `post-restart.sh`; the HyMem side
-needs no rollback (it is the intended contract).
+The harness patch and hook are a stopgap for older HyMem servers only. Once
+the HyMem server is upgraded past 2026-07-06 (the dual-field peer-context
+response), delete the hook block from `post-restart.sh` — the stock harness
+path works unmodified. The HyMem side needs no rollback: it is the intended
+contract, pinned by
+`test_honcho_contract.py::test_peer_context_representation_reaches_sdk`.

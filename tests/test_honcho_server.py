@@ -263,6 +263,9 @@ def test_peer_context_representation_includes_digest(client, hy_with_embed):
     rep = r.json()["peer_representation"]
     assert "Works on HyMem and Hermes." in rep
     assert "prefers uv" in rep
+    # honcho-ai's PeerContextResponse expects `representation` (it has no
+    # alias for `peer_representation`), so the route sends both names.
+    assert r.json()["representation"] == rep
 
 
 def test_session_context_representation_includes_digest(client, hy_with_embed):

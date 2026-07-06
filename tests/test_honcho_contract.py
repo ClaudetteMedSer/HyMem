@@ -147,6 +147,34 @@ def test_peer_card_parses(honcho, hy_with_embed):
     assert card is None or isinstance(card, list)
 
 
+def test_peer_context_representation_reaches_sdk(honcho, hy_with_embed):
+    """Regression: the peer context endpoint returned only
+    `peer_representation`, but the SDK's PeerContextResponse declares the field
+    as `representation` with no alias — Pydantic silently dropped the value, so
+    SDK consumers (e.g. the Hermes harness prefetch path) saw an empty
+    representation on this route every time. The route now sends both names;
+    the *parsed model* must carry the digest + USER.md content.
+    """
+    hy_with_embed.config.user_md_path.write_text(
+        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
+    )
+    # A root aggregation node, inserted directly: the representation surfaces
+    # only read it via load_digest(), no aggregation build needed.
+    hy_with_embed.conn.execute(
+        "INSERT INTO aggregation_nodes "
+        "(id, title, summary, member_episode_ids, session_ids, "
+        " n_members, n_sessions, level, is_root) "
+        "VALUES ('root-test', 'User digest', 'Works on HyMem and Hermes.', "
+        " '[]', '[]', 3, 3, 1, 1)"
+    )
+    hy_with_embed.conn.commit()
+
+    ctx = honcho.peer("user-1").context()
+    assert ctx.representation, "SDK dropped the representation field"
+    assert "Works on HyMem and Hermes." in ctx.representation
+    assert "prefers uv" in ctx.representation
+
+
 def _seed_docker_graph(honcho, hy_with_embed):
     """Log a turn and dream a 2-edge graph the docker query reliably retrieves."""
     session = honcho.session("sess-seed")
@@ -219,6 +247,8 @@ def test_all_supported_sdk_methods_round_trip(honcho, hy_with_embed):
 
     # peer card / context / search / chat
     assert (user.get_card() is None) or isinstance(user.get_card(), list)
+    peer_ctx = user.context()
+    assert peer_ctx.peer_id == "user-1"
     assert isinstance(user.search("docker"), list)
     chat = user.chat("should we use docker for dev?")
     assert chat is None or isinstance(chat, str)

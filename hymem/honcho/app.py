@@ -600,6 +600,17 @@ def get_peer_context(
             summary_obj = adapters.summary_obj(memory_text, "memory")
 
     return {
+        # honcho-ai's PeerContextResponse requires peer_id/target_id and
+        # declares the representation field as `representation` with no alias
+        # (SessionContext, by contrast, maps `peer_representation` correctly).
+        # Without all three the SDK either raises a ValidationError or silently
+        # drops the value — either way SDK consumers (e.g. the Hermes harness
+        # prefetch path) got an empty representation from this route. Send the
+        # required ids plus both representation names so the digest arrives
+        # without a client-side patch.
+        "peer_id": peer_id,
+        "target_id": target or peer_id,
+        "representation": peer_representation,
         "summary": summary_obj,
         "messages": messages,
         "peer_representation": peer_representation,

@@ -449,7 +449,7 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 HyMem's whole-store digest (the RAPTOR root, §11) is served by this server: the peer `card`/`context` routes **and** the session-scoped `GET .../sessions/{sid}/context` all return `peer_representation` = digest + USER.md. That is the entire HyMem side — it ships with the package, nothing to patch after `pip install`. For the digest to actually reach the agent's auto-injected context block, two things must hold on the *host* side:
 
 1. **Aggregation is enabled** — set `HYMEM_AGGREGATION_NODES_ENABLED=true` (§9) and let one dream complete so a digest exists. Until then `peer_representation` degrades byte-for-byte to plain `USER.md`.
-2. **The host harness reads `peer_representation` from the session-context response.** Stock Hermes harness builds (as of 2026-07) drop the field there and overwrite it with a digest-less representation fetched from the peer endpoint. [hymem/Hermes_instruction.md](hymem/Hermes_instruction.md) is the operator runbook for the Hermes instance: the two-line harness patch, a restart-surviving auto-patch hook, and how to verify — in a **fresh** session, since the harness caches its assembled base context.
+2. **HyMem is at or after 2026-07-06** — then a stock, unpatched harness receives the digest. The peer-context route now returns an SDK-parseable response with the representation under both field names, working around two upstream `honcho-ai` SDK issues: `PeerContextResponse` expects `representation` (no alias for the wire name `peer_representation`) and requires `peer_id`/`target_id`, so the route previously failed SDK validation and the peer path came back empty. Pinned by a real-SDK contract test. Older HyMem servers instead need the two-line harness patch in [hymem/Hermes_instruction.md](hymem/Hermes_instruction.md) — the runbook also covers verification, always in a **fresh** session, since the harness caches its assembled base context.
 
 ---
 
@@ -568,7 +568,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**702 tests total, 100% passing** across 51 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
+**703 tests total, 100% passing** across 51 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling, numeric / temporal value parsing
