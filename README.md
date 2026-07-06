@@ -392,7 +392,7 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 | `POST .../sessions/{sid}/messages/upload` | File upload as message | For migrating MEMORY.md/USER.md |
 | `POST .../sessions/{sid}/messages/list` | Paginated message listing | page + size, returns total/pages |
 | `POST .../sessions/{sid}/search` | `hy.augment()` as Message objects | Graph facts + FTS hits |
-| `GET .../sessions/{sid}/context` | MEMORY.md + USER.md + recent turns + summary | Session summary from dreaming |
+| `GET .../sessions/{sid}/context` | MEMORY.md + recent turns + summary | `peer_representation` = digest + USER.md, like the peer routes |
 | `POST .../sessions/{sid}/peers` | Register peers + role mappings | |
 | `GET .../sessions/{sid}/peers/{pid}/config` | Per-session peer config | |
 | `GET .../peers/{pid}/card` | Standing digest + USER.md behavioral profile | Digest block (when built) precedes USER.md |

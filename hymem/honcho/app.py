@@ -408,10 +408,6 @@ def get_context(
         cfg.memory_md_path.read_text(encoding="utf-8")
         if cfg.memory_md_path.exists() else ""
     )
-    user_text = (
-        cfg.user_md_path.read_text(encoding="utf-8")
-        if cfg.user_md_path.exists() else ""
-    )
 
     session_row = hy.conn.execute(
         "SELECT summary FROM sessions WHERE id = ?", (session_id,)
@@ -444,7 +440,7 @@ def get_context(
     return {
         "summary": summary_obj,
         "messages": messages,
-        "peer_representation": user_text,
+        "peer_representation": _peer_representation(),
         "peers": [{"id": role} for role in peer_roles],
     }
 
@@ -513,9 +509,9 @@ def search_peer_messages(
 
 
 def _peer_representation() -> str:
-    """The user-representation text the peer card/context endpoints return:
-    the standing root digest (when the aggregation layer has built one) above
-    USER.md. The digest is HyMem's analogue of Honcho's dialectic user model —
+    """The user-representation text the peer card/context and session context
+    endpoints return: the standing root digest (when the aggregation layer has
+    built one) above USER.md. The digest is HyMem's analogue of Honcho's dialectic user model —
     a whole-store "what do you know about me?" narrative — so it belongs on
     exactly the endpoints the SDK reads a user representation from. Rendered
     via Digest.as_context_block(), whose footer carries coverage + generated_at

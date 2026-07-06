@@ -265,6 +265,27 @@ def test_peer_context_representation_includes_digest(client, hy_with_embed):
     assert "prefers uv" in rep
 
 
+def test_session_context_representation_includes_digest(client, hy_with_embed):
+    # The session-scoped context endpoint carries the same digest + USER.md
+    # representation as the peer routes, so harnesses that auto-inject from
+    # session context get the standing digest without an explicit call.
+    hy_with_embed.config.user_md_path.write_text(
+        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
+    )
+    _seed_root_digest(hy_with_embed)
+    sid = "s-ctx-digest"
+    hy_with_embed.open_session(sid)
+    hy_with_embed.log_message(sid, "user", "hello")
+    hy_with_embed.close_session(sid)
+
+    r = client.get(f"/v3/workspaces/hermes/sessions/{sid}/context")
+    assert r.status_code == 200
+    rep = r.json()["peer_representation"]
+    assert "Works on HyMem and Hermes." in rep
+    assert "prefers uv" in rep
+    assert rep.index("Works on HyMem and Hermes.") < rep.index("prefers uv")
+
+
 def test_peer_representation_plain_user_md_without_digest(client, hy_with_embed):
     # No digest built → today's behavior: USER.md verbatim, no digest block.
     hy_with_embed.config.user_md_path.write_text(
