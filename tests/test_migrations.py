@@ -239,6 +239,10 @@ def test_v21_rebuilds_predicate_check_preserving_data_and_fk(tmp_path: Path):
         """
         CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         INSERT INTO schema_meta VALUES ('schema_version', '20');
+        -- a real v20 store carries dream_runs (v22 ALTERs it on the way up)
+        CREATE TABLE dream_runs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TIMESTAMP NOT NULL);
         CREATE TABLE knowledge_graph(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_canonical TEXT NOT NULL,

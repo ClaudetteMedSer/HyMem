@@ -72,6 +72,9 @@ class DreamReport:
     episodes_embedded_from_cache: int = 0
     aggregation_nodes_built: int = 0
     aggregation_nodes_reused: int = 0
+    aggregation_fusion_failures: int = 0
+    aggregation_input_episodes: int = 0
+    aggregation_blocking: str = ""
     profile_items_extracted: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
@@ -573,10 +576,33 @@ def run_dreaming(
 
         # VACUUM can't run inside a transaction, so it goes after the phase-3
         # block commits. Only pay the full-rewrite cost when a sweep actually
-        # freed a meaningful number of pages.
+        # freed a meaningful number of pages. VACUUM may RENUMBER the implicit
+        # rowids of the TEXT-PK tables (episodes/chunks/aggregation_nodes),
+        # divorcing their FTS and vec_* shadows — the resync restores the
+        # mapping before anything (this dream's aggregation included) reads
+        # through it. Skipping it caused the 29%-reuse storms of dream runs
+        # 725/730 (2026-07-09/10): each post-gap prune crossed the VACUUM
+        # threshold, renumbered episodes, and left KNN candidate blocking
+        # translating neighbors to the wrong episode ids.
         if cfg.vacuum_after_prune and pruned >= cfg.vacuum_min_pruned:
             conn.execute("VACUUM")
+            core_db.resync_rowid_shadows(conn)
             log.info("retention.vacuum pruned=%d", pruned)
+
+        # Freeze the episode set the clusterer reads BEFORE the episode-
+        # embedding drain below, so every episode inside the snapshot has its
+        # vector persisted by the time clustering reads it. The ceiling itself
+        # exists because the MCP server writes episodes asynchronously: a stray
+        # landing mid-build would shift cluster membership -> new node ids -> a
+        # spurious near-full refusion (dream runs 678/680, 2026-06-28). Taking
+        # it AFTER the drain (the original order) left a second hole: a stray
+        # landing between drain and ceiling joined the snapshot vector-less,
+        # clustered on entities alone, then re-clustered WITH its vector next
+        # dream — a guaranteed two-dream membership flip. Strays now land above
+        # the ceiling and defer wholesale to the next dream.
+        episode_ceiling = conn.execute(
+            "SELECT MAX(rowid) AS m FROM episodes"
+        ).fetchone()["m"]
 
         if embedding_client is not None:
             pending_edges = fetch_edge_embeddings(conn, embedding_client)
@@ -599,22 +625,21 @@ def run_dreaming(
         # nothing for clients that haven't opted in.
         if cfg.aggregation_nodes_enabled:
             try:
-                # Freeze the episode set the clusterer reads at this phase-3
-                # boundary: episodes embedded just above are in scope, but the
-                # MCP server writes episodes asynchronously, and any landing
-                # between here and the clustering read would shift cluster
-                # membership -> new node ids -> a spurious near-full refusion
-                # (dream runs 678/680, 2026-06-28). Strays land at a higher
-                # rowid and defer to the next dream.
-                episode_ceiling = conn.execute(
-                    "SELECT MAX(rowid) AS m FROM episodes"
-                ).fetchone()["m"]
+                # Repair step for stores skewed by a pre-fix VACUUM (the
+                # resync above only covers VACUUMs from now on): a proven
+                # vec_episodes/rowid mismatch rebuilds all rowid shadows so
+                # candidate blocking stops clustering on garbage neighborhoods.
+                if core_db.heal_rowid_shadows(conn):
+                    log.info("aggregate.pre_build_shadow_heal")
                 agg = build_aggregation_nodes(
                     conn, cfg, llm, embedding_client,
                     episode_ceiling_rowid=episode_ceiling,
                 )
                 report.aggregation_nodes_built = agg.nodes
                 report.aggregation_nodes_reused = agg.reused
+                report.aggregation_fusion_failures = agg.fusion_failures
+                report.aggregation_input_episodes = agg.input_episodes
+                report.aggregation_blocking = agg.blocking
             except Exception:
                 log.exception("aggregate.build_failure")
 
@@ -636,6 +661,9 @@ def run_dreaming(
                 markers_extracted = ?,
                 aggregation_nodes_built = ?,
                 aggregation_nodes_reused = ?,
+                aggregation_fusion_failures = ?,
+                aggregation_input_episodes = ?,
+                aggregation_blocking = ?,
                 skipped_locked = 0
             WHERE id = ?
             """,
@@ -649,11 +677,14 @@ def run_dreaming(
                 report.markers_extracted,
                 report.aggregation_nodes_built,
                 report.aggregation_nodes_reused,
+                report.aggregation_fusion_failures,
+                report.aggregation_input_episodes,
+                report.aggregation_blocking,
                 run_id,
             ),
         )
         log.info(
-            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d budget_exhausted=%s",
+            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_blocking=%s budget_exhausted=%s",
             run_id,
             report.sessions_processed,
             report.chunks_processed,
@@ -664,6 +695,9 @@ def run_dreaming(
             report.edges_embedded_from_cache,
             report.aggregation_nodes_built,
             report.aggregation_nodes_reused,
+            report.aggregation_fusion_failures,
+            report.aggregation_input_episodes,
+            report.aggregation_blocking,
             report.budget_exhausted,
         )
         return report

@@ -27,9 +27,11 @@ from hymem.dreaming.aggregate import (
     load_clusterable_episodes,
     load_digest,
     _CLUSTER_SALT,
+    _content_defined_groups,
     _node_id,
     _ROLLUP_SALT,
     _ROOT_SALT,
+    _stable_sample,
     select_clusters,
 )
 from hymem.extraction.llm import StubLLMClient
@@ -168,11 +170,13 @@ def _entity_chain(n: int, start_message_ids: list[int] | None = None) -> list[di
 
 
 def test_salts_pinned():
-    # Membership semantics changed (recency-window split) → cluster salt MUST
-    # be v3, or cached pre-guard mega-cluster fusions survive the fix (the
-    # "Acme Corp" lesson). Rollup/root deliberately NOT bumped.
-    assert _CLUSTER_SALT == "cluster.v3"
-    assert _ROLLUP_SALT == "rollup.v2"
+    # Membership semantics changed again (content-defined window cuts,
+    # 2026-07-12 reuse instability) → cluster AND rollup salts MUST bump, or
+    # cached positional-window fusions survive the fix (the "Acme Corp"
+    # lesson). Root deliberately NOT bumped: its member ids change anyway when
+    # the levels below re-key.
+    assert _CLUSTER_SALT == "cluster.v4"
+    assert _ROLLUP_SALT == "rollup.v3"
     assert _ROOT_SALT == "root.v4"
 
 
@@ -190,10 +194,12 @@ def test_over_cap_component_splits_into_windows_deterministically():
 
     capped = cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3)
     windows = _windows(capped)
-    assert all(len(w) <= 3 for w in windows)
-    # 7 = 3 + 3 + 1: full windows anchor at the oldest end, the undersized
-    # window holds the NEWEST episode (input order = recency fallback).
-    assert sorted(len(w) for w in windows) == [1, 3, 3]
+    # Content-defined cuts: window shapes come from the member ids' hashes, so
+    # exact sizes aren't pinned here — the guarantees are the cap, full
+    # coverage, and at least ceil(7/3) windows.
+    assert all(1 <= len(w) <= 3 for w in windows)
+    assert set().union(*windows) == {e["id"] for e in eps}
+    assert len(windows) >= 3
     # Deterministic: a second run is identical, label for label.
     assert cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3) == capped
 
@@ -209,30 +215,62 @@ def test_windows_are_recency_ordered_by_start_message_id():
     # AUTOINCREMENT messages.id in prod, carried by load_clusterable_episodes)
     # is the ordering signal, not list position. Recency order by message id:
     # e0(10) e1(20) e2(30) e3(40) e4(50) e5(60) e6(70).
-    eps = _entity_chain(7, start_message_ids=[10, 20, 30, 40, 50, 60, 70])
-    eps = [eps[i] for i in (4, 0, 6, 2, 5, 1, 3)]   # shuffle input order
+    ordered = _entity_chain(7, start_message_ids=[10, 20, 30, 40, 50, 60, 70])
+    shuffled = [ordered[i] for i in (4, 0, 6, 2, 5, 1, 3)]
 
-    capped = cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3)
-    # Consecutive recency slices, full windows anchored at the oldest end:
-    assert _windows(capped) == {frozenset({"e0", "e1", "e2"}),
-                                frozenset({"e3", "e4", "e5"}),
-                                frozenset({"e6"})}
+    windows = _windows(cluster_episodes(shuffled, 0.55, 0.50, max_cluster_size=3))
+    # Every window is a CONSECUTIVE slice of the recency order (no window may
+    # skip over an episode that sits between its members in time)...
+    recency_pos = {f"e{k}": k for k in range(7)}
+    for w in windows:
+        pos = sorted(recency_pos[eid] for eid in w)
+        assert pos == list(range(pos[0], pos[0] + len(pos)))
+    # ...and the cut layout is input-order independent: the shuffled input
+    # yields exactly the windows the recency-ordered input yields.
+    assert windows == _windows(
+        cluster_episodes(ordered, 0.55, 0.50, max_cluster_size=3))
 
 
 def test_window_split_is_append_stable():
     # THE fusion-cache property (prod dream runs 685-693, 2026-07-03..05): an
     # episode appended at the newest end of an over-cap component must leave
-    # every already-full window's member set untouched, so those nodes keep
-    # their cached fusions. Newest-end-anchored windows shifted EVERY boundary
-    # by one on each arrival, re-keying the whole mega-component and its
-    # rollup chain (~30% reuse) — invisible to the 678/680 rowid ceiling,
-    # which only guards against arrivals landing MID-build, not between dreams.
-    eps = _entity_chain(8, start_message_ids=[10, 20, 30, 40, 50, 60, 70, 80])
-    before = _windows(cluster_episodes(eps[:7], 0.55, 0.50, max_cluster_size=3))
+    # every non-tail window's member set untouched, so those nodes keep their
+    # cached fusions. Newest-end-anchored windows shifted EVERY boundary by
+    # one on each arrival, re-keying the whole mega-component and its rollup
+    # chain (~30% reuse) — invisible to the 678/680 rowid ceiling, which only
+    # guards against arrivals landing MID-build, not between dreams. Under
+    # content-defined cuts the only window that may change is the one holding
+    # the previously-newest episode (it either absorbs the arrival or closes).
+    eps = _entity_chain(20, start_message_ids=[10 * (k + 1) for k in range(20)])
+    before = _windows(cluster_episodes(eps[:19], 0.55, 0.50, max_cluster_size=3))
     after = _windows(cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3))
-    # e7 (newest) joins the undersized tail; both full windows are unchanged.
-    assert before - after == {frozenset({"e6"})}
-    assert after - before == {frozenset({"e6", "e7"})}
+    assert all("e18" in w for w in before - after)      # only the tail may go
+    assert all("e19" in w for w in after - before)      # only tail-side arrives
+    assert len(before - after) <= 1
+
+
+def test_window_split_is_mid_churn_stable():
+    # The property positional windows lacked — and the reason runs 725-736
+    # (2026-07-09..10) kept re-keying: an episode leaving or joining MID-order
+    # (supersession, retention, a bridge merge interleaving two components)
+    # must only re-cut its local window(s), not shift every boundary after it.
+    eps = _entity_chain(30, start_message_ids=[10 * (k + 1) for k in range(30)])
+    before = _windows(cluster_episodes(eps, 0.55, 0.50, max_cluster_size=3))
+    without = [e for e in eps if e["id"] != "e14"]      # drop a mid episode
+    after = _windows(cluster_episodes(without, 0.55, 0.50, max_cluster_size=3))
+    # The CDC contract: re-cutting is confined to the stretch from the window
+    # holding the removed id to the NEXT hash-cut id (e20 for these ids), where
+    # the scan phases realign. Positional slicing re-cut every window past
+    # index 14. Windows wholly before e13 and wholly after e20 must survive.
+    changed = (before - after) | (after - before)
+    region = {f"e{k}" for k in range(13, 21)}
+    assert changed and all(w <= region for w in changed)
+    assert before - after == {frozenset({"e13", "e14", "e15"}),
+                              frozenset({"e16", "e17", "e18"}),
+                              frozenset({"e19", "e20"})}
+    assert after - before == {frozenset({"e13"}),
+                              frozenset({"e15", "e16", "e17"}),
+                              frozenset({"e18", "e19", "e20"})}
 
 
 def test_component_exactly_at_cap_is_not_split():
@@ -243,9 +281,10 @@ def test_component_exactly_at_cap_is_not_split():
 
 def test_build_respects_aggregation_max_cluster_size(conn, cfg):
     # Integration: a 7-episode transitive chain across 7 sessions, cap 3 → no
-    # persisted level-0 node may exceed 3 members. Windows of 3 span 3 sessions
-    # (pass min_members/min_sessions); the undersized newest window of 1 is
-    # dropped by the SAME downstream policy as any singleton.
+    # persisted level-0 node may exceed 3 members. Content cuts for e0..e6
+    # fall after e2, e4 and e5 (id-hash property), so the windows are
+    # {e0,e1,e2} {e3,e4} {e5} {e6}; the singletons are dropped by the SAME
+    # min-members/min-sessions policy as any too-small cluster.
     for k in range(7):
         j = k // 2
         ents = [f"t{j}"] if k % 2 == 0 else [f"t{j}", f"t{j + 1}"]
@@ -256,11 +295,11 @@ def test_build_respects_aggregation_max_cluster_size(conn, cfg):
     rows = conn.execute(
         "SELECT n_members, member_episode_ids FROM aggregation_nodes "
         "WHERE level = 0").fetchall()
-    assert n == len(rows) == 2                       # two full windows kept
+    assert n == len(rows) == 2                       # two multi-member windows
     assert all(r["n_members"] <= 3 for r in rows)
     members = {frozenset(json.loads(r["member_episode_ids"])) for r in rows}
     assert members == {frozenset({"e0", "e1", "e2"}),
-                       frozenset({"e3", "e4", "e5"})}
+                       frozenset({"e3", "e4"})}
 
 
 def test_build_reuses_full_window_fusions_when_component_grows(conn, cfg):
@@ -771,21 +810,30 @@ def test_digest_converges_on_fully_disjoint_episodes(cfg, conn):
     assert levels and all(lv >= 1 for lv in levels)   # no level-0 clusters formed
 
 
-def test_digest_leaf_cap_samples_across_history_not_recency(cfg, conn):
-    # 4 disjoint episodes, leaf cap 2: a recency slice would digest only
-    # {e3, e4} (the narrow "last fortnight" digest seen on the first prod
-    # build); even sampling must keep the span's endpoints {e1, e4}.
-    acfg = replace(_enabled(cfg, digest=True), aggregation_digest_max_leaves=2)
-    with core_db.transaction(conn):
-        for i in range(1, 5):
-            _seed_episode(conn, f"e{i}", f"s{i}", f"Topic {i}",
-                          f"Notes about topic {i}.", [f"topic{i}"])
-    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
-
-    root = conn.execute(
-        "SELECT member_episode_ids FROM aggregation_nodes WHERE is_root = 1"
-    ).fetchone()
-    assert set(json.loads(root["member_episode_ids"])) == {"e1", "e4"}
+def test_digest_leaf_cap_is_stable_under_churn_and_spans_history(cfg, conn):
+    # The leaf cap must not be a recency slice (the narrow "last fortnight"
+    # digest seen on the first prod build) AND must be stable under churn: the
+    # index-arithmetic `_evenly_spaced` predecessor recomputed every pick from
+    # len(leftovers), so ONE new episode swapped a large fraction of the
+    # selected leaves and re-keyed most rollup fusions above them — the
+    # dominant amplifier of the 2026-07-12 reuse instability.
+    leaves = [{"id": f"e{i:03d}"} for i in range(200)]
+    picked = _stable_sample(leaves, 50)
+    assert len(picked) == 50
+    assert picked == _stable_sample(leaves, 50)              # deterministic
+    order = {e["id"]: i for i, e in enumerate(leaves)}
+    idx = [order[e["id"]] for e in picked]
+    assert idx == sorted(idx)                                # input order kept
+    assert min(idx) < 100 < max(idx)                         # spans history,
+    #                                                          not a recency slice
+    # Churn stability: one appended leaf displaces at most one selected leaf.
+    grown = leaves + [{"id": "e200"}]
+    after = {e["id"] for e in _stable_sample(grown, 50)}
+    beforeset = {e["id"] for e in picked}
+    assert len(beforeset - after) <= 1 and len(after - beforeset) <= 1
+    # Uncapped semantics preserved: cap <= 0 means everything.
+    assert _stable_sample(leaves, 0) == leaves
+    assert _stable_sample(leaves, 500) == leaves
 
 
 def test_digest_rebuild_reuses_fusions(cfg, conn):
@@ -816,6 +864,116 @@ def test_digest_rebuild_reuses_fusions(cfg, conn):
     assert poisoned.calls == []                  # every fusion reused
     after = load_digest(conn)
     assert after is not None and after.summary == before.summary
+
+
+def test_cluster_fusion_failure_is_contained(cfg, conn):
+    # A failed level-0 fusion must cost exactly its own node: members stay
+    # counted as clustered (NO leak into the digest leftovers), the failure is
+    # counted, and the node id retries unchanged next dream. The old behavior
+    # leaked the members into the leftover pool — resampling the pass-through
+    # leaves, re-keying the rollup chain, and feeding the failing content into
+    # parent prompts all the way to the root (repro 2026-07-12: one poisoned
+    # cluster → built 46 → 19 and a vanished digest).
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres"])
+        _seed_episode(conn, "e3", "s3", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"])
+    failing = StubLLMClient(
+        fixtures={
+            "fuse several related episodes": "NOT JSON {",   # cluster fusion dies
+            "standing digest of everything known": _DIGEST_JSON,
+            "combined summary that loses no thread": _ROLLUP_JSON,
+        },
+        default="[]",
+    )
+    result = build_aggregation_nodes(conn, acfg, failing, None)
+    assert result.fusion_failures == 1
+    # The failed cluster's episodes are NOT in the root's leaf members — they
+    # were contained, not leaked as pass-through leaves.
+    root = conn.execute(
+        "SELECT member_episode_ids FROM aggregation_nodes WHERE is_root = 1"
+    ).fetchone()
+    root_members = set(json.loads(root["member_episode_ids"]))
+    assert "e1" not in root_members and "e2" not in root_members
+    assert "e3" in root_members                    # genuine leftover still leafs
+
+    # Heal: the retry (same node id) fuses fresh; the untouched remainder of
+    # the tree reuses — the fail→heal transition stays local.
+    healed = build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    assert healed.fusion_failures == 0
+    assert healed.nodes >= result.nodes
+    level0 = conn.execute(
+        "SELECT member_episode_ids FROM aggregation_nodes WHERE level = 0"
+    ).fetchall()
+    assert {frozenset(json.loads(r["member_episode_ids"])) for r in level0} \
+        == {frozenset({"e1", "e2"})}
+
+
+def test_root_fusion_failure_keeps_previous_root(cfg, conn):
+    # HyMem.digest() is host-facing standing context: when only the ROOT
+    # fusion fails, the previous root must survive the full-replace (one dream
+    # stale, footer already names generated_at) instead of the store going
+    # digest-less until the retry heals.
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres"])
+        _seed_episode(conn, "e3", "s3", "Weekend cycling",
+                      "Started cycling on weekends.", ["cycling"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    before = load_digest(conn)
+    assert before is not None
+
+    # New member (new leftover leaf) re-keys the root; its re-fusion fails.
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e4", "s4", "Sourdough baking",
+                      "Started baking sourdough.", ["sourdough"])
+    root_fails = StubLLMClient(
+        fixtures={
+            "fuse several related episodes": _NODE_JSON,
+            "combined summary that loses no thread": _ROLLUP_JSON,
+            "standing digest of everything known": "NOT JSON {",
+        },
+        default="[]",
+    )
+    result = build_aggregation_nodes(conn, acfg, root_fails, None)
+    assert result.fusion_failures == 1
+    kept = load_digest(conn)
+    assert kept is not None
+    assert kept.node_id == before.node_id          # the previous root survived
+    assert kept.summary == before.summary
+
+    # Heal: the retry replaces the stale root with one covering the new leaf.
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    fresh = load_digest(conn)
+    assert fresh is not None and fresh.node_id != before.node_id
+    fresh_members = set(json.loads(conn.execute(
+        "SELECT member_episode_ids FROM aggregation_nodes WHERE is_root = 1"
+    ).fetchone()["member_episode_ids"]))
+    assert "e4" in fresh_members
+
+
+def test_content_defined_groups_cap_coverage_and_locality():
+    items = [{"id": f"n{i}"} for i in range(40)]
+    groups = _content_defined_groups(items, 5)
+    assert all(1 <= len(g) <= 5 for g in groups)
+    assert [m["id"] for g in groups for m in g] == [m["id"] for m in items]
+    assert groups == _content_defined_groups(items, 5)      # deterministic
+    # Insertion locality: a new item re-cuts only groups at/after it up to the
+    # next hash-cut id; groups before the insertion point are untouched.
+    grown = items[:20] + [{"id": "nNEW"}] + items[20:]
+    regrouped = _content_defined_groups(grown, 5)
+    before_sets = {frozenset(m["id"] for m in g) for g in groups}
+    after_sets = {frozenset(m["id"] for m in g) for g in regrouped}
+    untouched = before_sets & after_sets
+    prefix_ids = {f"n{i}" for i in range(20)}
+    assert {g for g in before_sets if g <= prefix_ids} <= untouched
 
 
 def test_digest_root_fusion_is_grounded_in_graph_facts(cfg, conn):

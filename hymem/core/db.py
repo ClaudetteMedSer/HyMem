@@ -14,7 +14,7 @@ from hymem.core.vectors import decode_vector
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 21
+EXPECTED_SCHEMA_VERSION = 22
 
 
 def _load_schema() -> str:
@@ -303,6 +303,115 @@ def _backfill_vec_episodes(conn: sqlite3.Connection, dim: int) -> None:
 
 def _pack_vector(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rowid-shadow integrity. episodes / chunks / aggregation_nodes have TEXT
+# primary keys, so their rowids are implicit — and SQLite's VACUUM may RENUMBER
+# implicit rowids (it compacts freelist gaps). Everything keyed on those rowids
+# from the outside silently decouples when that happens: the external-content
+# FTS tables (chunks_fts / episodes_fts / aggregation_nodes_fts) start joining
+# match hits to the wrong content rows, and the vec_* mirrors translate KNN
+# hits to the wrong ids. Worse, the drift then compounds: each new episode
+# INSERTs its vector at its (new) rowid, overwriting whichever old row happened
+# to sit there. This was a root cause of the 2026-07-12 RAPTOR reuse
+# instability — candidate blocking clustered on garbage neighborhoods after
+# post-prune VACUUMs — and it quietly degrades plain FTS/vec retrieval too.
+# messages_fts (content_rowid='id', INTEGER PRIMARY KEY) and vec_edges (rowid =
+# knowledge_graph.id, INTEGER PRIMARY KEY) are VACUUM-stable and need nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ROWID_FTS_TABLES = ("chunks_fts", "episodes_fts", "aggregation_nodes_fts")
+
+
+def resync_rowid_shadows(conn: sqlite3.Connection) -> None:
+    """Rebuild every index keyed on an implicit (renumberable) rowid from its
+    content table's CURRENT rowids. Must be called immediately after VACUUM;
+    also the repair step for stores VACUUMed by earlier releases. Idempotent,
+    and cheap next to the VACUUM that makes it necessary."""
+    for fts in _ROWID_FTS_TABLES:
+        with contextlib.suppress(sqlite3.OperationalError, sqlite3.DatabaseError):
+            conn.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+    if not _load_vec_extension(conn):
+        return
+    dim_row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
+    ).fetchone()
+    if not dim_row:
+        return
+    dim = int(dim_row["value"])
+    for table, backfill in (
+        ("vec_chunks", _backfill_vec),
+        ("vec_episodes", _backfill_vec_episodes),
+    ):
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            _ensure_vec_table_named(conn, table, dim)
+            backfill(conn, dim)
+    log.info("rowid shadows resynced (fts rebuilt, vec_chunks/vec_episodes refilled)")
+
+
+def vec_episodes_aligned(conn: sqlite3.Connection, sample: int = 8) -> bool:
+    """Cheap probe: do vec_episodes rows still hold the vectors of the episodes
+    whose rowids they sit at? Compares the stored blob against the packed
+    mirror vector for up to `sample` episodes drawn from both ends of the rowid
+    range (a renumber shifts everything above the first closed gap, so the
+    newest rows drift the most). Returns True when unverifiable (extension or
+    table absent, no embedded episodes) so callers only act on a proven
+    mismatch."""
+    if not _load_vec_extension(conn) or not has_vec_table(conn, table="vec_episodes"):
+        return True
+    dim_row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
+    ).fetchone()
+    if not dim_row:
+        return True
+    dim = int(dim_row["value"])
+    half = max(1, sample // 2)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT e.rowid AS rid, em.vector_json
+                FROM episodes e JOIN episode_embeddings em ON em.episode_id = e.id
+                ORDER BY e.rowid ASC LIMIT ?
+            )
+            UNION
+            SELECT * FROM (
+                SELECT e.rowid AS rid, em.vector_json
+                FROM episodes e JOIN episode_embeddings em ON em.episode_id = e.id
+                ORDER BY e.rowid DESC LIMIT ?
+            )
+            """,
+            (half, half),
+        ).fetchall()
+        for r in rows:
+            vec = decode_vector(r["vector_json"])
+            if len(vec) != dim:
+                vec = list(vec) + [0.0] * (dim - len(vec))
+            stored = conn.execute(
+                "SELECT embedding FROM vec_episodes WHERE rowid = ?", (r["rid"],)
+            ).fetchone()
+            if stored is None or bytes(stored["embedding"]) != _pack_vector(vec):
+                return False
+    except (sqlite3.OperationalError, json.JSONDecodeError, TypeError, ValueError):
+        return True    # unverifiable ≠ misaligned; never resync on a probe error
+    return True
+
+
+def heal_rowid_shadows(conn: sqlite3.Connection) -> bool:
+    """Probe vec_episodes alignment and, on a proven mismatch, resync every
+    rowid shadow. Returns True when a repair ran. Called by the dream runner
+    before aggregation so stores skewed by pre-fix VACUUMs heal on their next
+    dream instead of their next VACUUM."""
+    if vec_episodes_aligned(conn):
+        return False
+    log.warning(
+        "vec_episodes misaligned with episodes rowids (post-VACUUM renumber); "
+        "resyncing all rowid shadows"
+    )
+    resync_rowid_shadows(conn)
+    return True
 
 
 def vec_search(

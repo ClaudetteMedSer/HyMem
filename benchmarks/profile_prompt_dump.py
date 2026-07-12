@@ -37,13 +37,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from hymem.dreaming.aggregate import _evenly_spaced  # noqa: E402
 from hymem.dreaming.user_profile import (  # noqa: E402
     PROFILE_PROMPT_VERSION,
     build_profile_user_prompt,
     fetch_user_turns,
 )
 from hymem.extraction.prompts import USER_PROFILE_SYSTEM  # noqa: E402
+
+
+def _evenly_spaced(seq: list, cap: int) -> list:
+    """At most `cap` elements spread evenly across `seq` (first and last kept).
+    Local copy: the aggregation layer replaced its version with a churn-stable
+    hash-rank sample (2026-07-12 reuse fix); for a one-shot offline dump, even
+    spacing over the store's history is still exactly right."""
+    n = len(seq)
+    if cap <= 0 or n <= cap:
+        return list(seq)
+    if cap == 1:
+        return [seq[-1]]
+    idx = sorted({round(i * (n - 1) / (cap - 1)) for i in range(cap)})
+    return [seq[i] for i in idx]
 
 
 def main() -> int:

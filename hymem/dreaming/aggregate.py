@@ -65,9 +65,19 @@ class AggregationResult(NamedTuple):
     were served from cache (a content-hash id that already existed) instead of
     being recomputed. ``reused`` is the dream-cost signal the RAPTOR flip
     criteria watches — near-full reuse on an unchanged store means steady
-    state. See benchmarks/raptor_digest_plan.md Stage 3c."""
+    state. See benchmarks/raptor_digest_plan.md Stage 3c.
+
+    ``fusion_failures``/``input_episodes``/``blocking`` are the attribution
+    fields the 2026-07-12 reuse instability hunt was missing: a low-reuse run
+    with failures > 0 is an LLM-flakiness event (retries next dream), a shifted
+    input_episodes explains a built-count drift, and a blocking-mode change
+    between runs means the two dreams clustered with different candidate
+    generators (e.g. one process has sqlite-vec, the other doesn't)."""
     nodes: int
     reused: int
+    fusion_failures: int = 0
+    input_episodes: int = 0
+    blocking: str = "exact"
 
 # Fusion-prompt versions, baked into the node-id salt of the level the prompt
 # serves. Reuse is keyed by node id, so bumping a version when its prompt
@@ -77,10 +87,13 @@ class AggregationResult(NamedTuple):
 # incident lived in a persisted rollup and survived a root-only fix), so a
 # prompt hardened against an artifact must invalidate the level that produced
 # it, or the artifact outlives the fix.
-_CLUSTER_SALT = "cluster.v3"  # v3: recency-window split at max_cluster_size
-                              #     (membership semantics changed — Stage 3a
-                              #     chaining guard); v2: identity evidence-bound
-_ROLLUP_SALT = "rollup.v2"    # v2: identity evidence-bound
+_CLUSTER_SALT = "cluster.v4"  # v4: content-defined window cuts (positional
+                              #     windows re-keyed the whole component on any
+                              #     mid-order membership change — 2026-07-12
+                              #     reuse instability); v3: recency-window split
+                              #     at max_cluster_size; v2: identity evidence-bound
+_ROLLUP_SALT = "rollup.v3"    # v3: content-defined fallback grouping (same
+                              #     2026-07-12 fix); v2: identity evidence-bound
 _ROOT_SALT = "root.v4"        # v4: VERIFIED FACTS anchor block
 
 
@@ -169,20 +182,27 @@ def cluster_episodes(
     present (messages.id is a store-wide AUTOINCREMENT, so it is a true
     cross-session ingestion-order clock — the loader already carries it),
     falling back to input position (rollup items and bare test dicts carry no
-    message ids; input position is the loader's stable order). Full windows are
-    anchored at the OLDEST end, so the one possibly-undersized window holds the
-    NEWEST episodes. The anchoring is load-bearing for fusion-cache reuse: new
-    episodes join a component at the newest end of the order, and oldest-anchored
-    boundaries leave every already-full window's member set — hence its node id
-    and cached fusion — untouched; only the still-filling tail window (and its
-    rollup ancestors) re-fuse. The original newest-end alignment shifted EVERY
-    boundary by one on each arrival, re-keying all ~24 windows of the prod
-    mega-component plus their whole rollup chain — the ~30%-reuse dreams of
-    runs 685-693 (2026-07-03..05), which the 678/680 rowid ceiling could not
-    stop because those episodes land BETWEEN dreams, not mid-build. The price
-    is that min-members/min-sessions filtering now drops the newest slice while
-    it is undersized, not the oldest — acceptable: its episodes stay directly
-    retrievable and still reach the digest as leftover pass-through leaves.
+    message ids; input position is the loader's stable order). Window
+    boundaries over that order are CONTENT-DEFINED (`_content_defined_groups`):
+    a window closes after any member whose own id hashes to a cut, or at
+    `max_cluster_size` members, whichever comes first. Boundaries are therefore
+    properties of the member ids themselves, not of positions: appending at the
+    newest end only grows/cuts the tail window (same append-stability the
+    oldest-anchored v3 split had), and — the part v3 lacked — a MID-order
+    membership change (an episode joining or leaving between two dreams, a
+    bridge episode merging two components and interleaving their orders, a
+    superseded/pruned episode dropping out) re-cuts only the window(s) around
+    the change instead of shifting every downstream boundary. Positional
+    windows turned any such change into a full component re-key — the
+    2026-07-12 reuse instability (runs 725-736), the same failure class as the
+    newest-end alignment fixed on 2026-07-05 (runs 685-693). The expected
+    window size under content cuts is a little under `max_cluster_size` (a cut
+    fires with probability 1/max_cluster_size per member, plus the forced cut
+    at the cap), so the tree carries somewhat more, smaller windows — finer
+    fusions, one-time refusion on deploy (salt v4). Undersized windows are
+    dropped by the min-members/min-sessions policy exactly like v3's tail
+    window; their episodes stay directly retrievable and still reach the
+    digest as leftover pass-through leaves.
     """
     if max_cluster_size is not None and max_cluster_size < 1:
         raise ValueError(f"max_cluster_size must be >= 1, got {max_cluster_size}")
@@ -248,13 +268,41 @@ def cluster_episodes(
             next_label += 1
             continue
         ordered = sorted(members, key=_recency_key)   # oldest → newest
-        # Anchored at the oldest end (undersized window = newest): appends only
-        # touch the tail window, so full windows keep their cached fusions.
-        for start in range(0, len(ordered), max_cluster_size):
-            for m in ordered[start:start + max_cluster_size]:
+        # Content-defined cuts: boundaries belong to member ids, so a
+        # membership change anywhere re-cuts only its local window(s).
+        for window in _content_defined_groups(ordered, max_cluster_size):
+            for m in window:
                 capped[m["id"]] = next_label
             next_label += 1
     return capped
+
+
+def _is_cut_id(item_id: str, avg_size: int) -> bool:
+    """True when this id closes a content-defined group. Pure function of the
+    id, so boundaries survive any reordering/insertion/removal around it."""
+    digest = hashlib.sha1(f"cut::{item_id}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % avg_size == 0
+
+
+def _content_defined_groups(ordered: list[dict], max_size: int) -> list[list[dict]]:
+    """Split `ordered` into consecutive groups whose boundaries are decided by
+    each item's own id hash (content-defined chunking, the rsync trick): a
+    group closes after a cut id, or at `max_size` members (the fusion-input
+    cap) — so the expected group size is a little under `max_size` and no
+    group ever exceeds it. Because a boundary is a property of the id at which
+    it falls, inserting or removing items re-cuts only the group(s) touching
+    the change; positional slicing (`seq[i:i+size]`) shifted every downstream
+    boundary instead, re-keying whole chains of cached fusions."""
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    for item in ordered:
+        current.append(item)
+        if len(current) >= max_size or _is_cut_id(item["id"], max_size):
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,11 +406,15 @@ def generate_candidate_pairs(
     # The declines are logged because the fallback is invisible from results
     # (identical components, just slower) — a bare core_db.connect() without
     # vec initialization once made a hand-timed box run measure the exact path.
+    # WARNING, not debug: a decline is invisible from results (identical-ish
+    # components, just slower) yet it changes WHICH pairs get tested — a
+    # deployment where one trigger path declines and another doesn't alternates
+    # between two different clusterings, re-keying cached fusions every switch.
     if not core_db._load_vec_extension(conn):
-        log.debug("blocking.decline reason=vec_extension_unavailable (exact all-pairs)")
+        log.warning("blocking.decline reason=vec_extension_unavailable (exact all-pairs)")
         return None
     if not core_db.has_vec_table(conn, table="vec_episodes"):
-        log.debug("blocking.decline reason=no_vec_episodes_table (exact all-pairs)")
+        log.warning("blocking.decline reason=no_vec_episodes_table (exact all-pairs)")
         return None
 
     pairs: set[tuple[str, str]] = set()
@@ -410,19 +462,33 @@ def _node_id(member_ids: list[str], *, salt: str = "") -> str:
     return f"agg_{digest}"
 
 
-def _evenly_spaced(seq: list, cap: int) -> list:
-    """At most `cap` elements spread evenly across `seq` (first and last always
-    kept). Used to cap the digest's pass-through leaves: a recency slice
-    (`seq[-cap:]`) would make a first build over a long backlog digest only the
-    newest stretch of history — even spacing keeps the digest spanning the
-    user's whole span at the same LLM cost."""
-    n = len(seq)
-    if cap <= 0 or n <= cap:
+def _stable_sample(seq: list[dict], cap: int) -> list[dict]:
+    """At most `cap` items chosen by id-hash rank, returned in input order.
+    Caps the digest's pass-through leaves. Two properties matter, in this
+    order:
+
+    1. STABILITY UNDER CHURN: adding or removing one item displaces at most
+       one selected leaf (its hash rank bumps exactly one other item across
+       the cap line). The index-arithmetic predecessor (`_evenly_spaced`,
+       round(i*(n-1)/(cap-1))) recomputed every pick from `len(seq)`, so a
+       single new leftover episode swapped a large fraction of the selected
+       leaves, re-keying most rollup fusions above them — the dominant
+       amplifier in the 2026-07-12 reuse instability (one quiet episode →
+       ~50% reuse).
+    2. WHOLE-SPAN COVERAGE: the hash rank is uniform over items, so the
+       selection still spans the full backlog in expectation (a recency slice
+       `seq[-cap:]` would digest only the newest stretch); it is merely no
+       longer perfectly evenly spaced, which the fusion never depended on.
+
+    `cap <= 0` means uncapped, matching the old semantics."""
+    if cap <= 0 or len(seq) <= cap:
         return list(seq)
-    if cap == 1:
-        return [seq[-1]]
-    idx = sorted({round(i * (n - 1) / (cap - 1)) for i in range(cap)})
-    return [seq[i] for i in idx]
+    ranked = sorted(
+        seq,
+        key=lambda e: hashlib.sha1(f"leaf::{e['id']}".encode("utf-8")).hexdigest(),
+    )
+    keep_ids = {e["id"] for e in ranked[:cap]}
+    return [e for e in seq if e["id"] in keep_ids]
 
 
 def _centroid(vectors: list[list[float] | None]) -> list[float] | None:
@@ -481,17 +547,30 @@ def select_clusters(
         if len({m["session_id"] for m in members}) < cfg.aggregation_min_sessions:
             continue
         kept.append(members)
-    # Deterministic order: larger clusters first, then by first member id.
-    kept.sort(key=lambda c: (-len(c), sorted(m["id"] for m in c)[0]))
+    # Deterministic CHRONOLOGY-STABLE order: by oldest member (ingestion order,
+    # id tiebreak). The previous larger-clusters-first sort reordered the whole
+    # rollup frontier whenever any cluster's size changed relative to another,
+    # recomposing downstream rollup groups and re-keying their cached fusions
+    # for a membership change that touched one cluster.
+    def _oldest_member(c: list[dict]) -> tuple:
+        return min(
+            (m["start_message_id"] if isinstance(m.get("start_message_id"), int)
+             else float("inf"), m["id"])
+            for m in c
+        )
+    kept.sort(key=_oldest_member)
     return kept
 
 
 def _llm_fuse(
-    user_prompt: str, llm: LLMClient, *, system: str
+    user_prompt: str, llm: LLMClient, *, system: str, kind: str = "fusion"
 ) -> dict | None:
     """One LLM call fusing the prepared `user_prompt` into {title, summary}.
     Returns None when the call fails or yields nothing usable (so no empty
-    node is persisted)."""
+    node is persisted). Every failure path logs at WARNING with `kind`
+    (cluster/rollup/root): a failed fusion retries on every subsequent dream
+    until it succeeds, and each fail→heal transition costs reuse — silent
+    failures made the 2026-07-12 low-reuse runs unattributable."""
     request = LLMRequest(
         system=system,
         user=user_prompt,
@@ -500,20 +579,25 @@ def _llm_fuse(
     try:
         raw = llm.complete(request)
     except Exception:
-        log.exception("aggregate.llm_failure")
+        log.exception("aggregate.fusion_failure kind=%s stage=call", kind)
         return None
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
+        log.warning("aggregate.fusion_failure kind=%s stage=parse raw_len=%d",
+                    kind, len(raw))
         return None
     if not isinstance(data, dict):
+        log.warning("aggregate.fusion_failure kind=%s stage=shape", kind)
         return None
     title = data.get("title", "")
     summary = data.get("summary", "")
     if not isinstance(title, str) or not isinstance(summary, str):
+        log.warning("aggregate.fusion_failure kind=%s stage=shape", kind)
         return None
     title, summary = title.strip(), summary.strip()
     if not title or not summary:
+        log.warning("aggregate.fusion_failure kind=%s stage=empty", kind)
         return None
     return {"title": title, "summary": summary}
 
@@ -527,7 +611,7 @@ def _summarize_cluster(
         f"[{m['session_id']}] {m['title']}\n{m['summary']}" for m in capped
     )
     return _llm_fuse(AGGREGATE_USER_TEMPLATE.format(text=text), llm,
-                     system=AGGREGATE_SYSTEM)
+                     system=AGGREGATE_SYSTEM, kind="cluster")
 
 
 def _items_text(items: list[dict], cfg: HyMemConfig) -> str:
@@ -671,6 +755,22 @@ def build_aggregation_nodes(
     episodes = load_clusterable_episodes(conn, max_rowid=episode_ceiling_rowid)
     clusters = select_clusters(episodes, cfg, conn)
 
+    # Attribution: which candidate generator clustered this dream. Node ids
+    # are a function of membership, and membership can differ between the KNN
+    # and the exact path (the cosine arm of blocking is approximate) — so two
+    # trigger paths with different environments (one missing sqlite-vec)
+    # silently alternate between two self-consistent trees, re-keying on every
+    # switch. Persisting the mode makes that alternation visible in dream_runs.
+    if cfg.aggregation_blocking_top_k <= 0:
+        blocking = "exact:disabled"
+    elif not core_db._load_vec_extension(conn):
+        blocking = "exact:no_vec_extension"
+    elif not core_db.has_vec_table(conn, table="vec_episodes"):
+        blocking = "exact:no_vec_table"
+    else:
+        blocking = "knn"
+    vectorless = sum(1 for e in episodes if not e["vector"])
+
     # The content-hash node id makes the previous fusion reusable: an unchanged
     # member set keeps its title/summary without a new LLM call, so a dream over
     # a mostly-stable store rebuilds the whole tree only paying for memberships
@@ -685,6 +785,7 @@ def build_aggregation_nodes(
     items: list[dict] = []          # hierarchy frontier: level-0 nodes first
     clustered_ids: set[str] = set()
     reused = 0
+    failures = 0
     for members in clusters:
         member_ids = [m["id"] for m in members]
         node_id = _node_id(member_ids, salt=_CLUSTER_SALT)
@@ -694,6 +795,17 @@ def build_aggregation_nodes(
         else:
             fused = _summarize_cluster(members, cfg, llm)
             if fused is None:
+                # CONTAINMENT: the members still count as clustered so they do
+                # NOT leak into the digest leftovers. Before this, one failed
+                # fusion pushed its members into the leftover pool, which
+                # resampled the pass-through leaves, re-keyed the rollup chain,
+                # and fed the members' raw text into rollup prompts — if the
+                # content itself tripped the failure, it cascaded to the root
+                # (repro 2026-07-12: one poisoned cluster → built 46 → 19 and
+                # a vanished digest). Now the tree just misses this one node
+                # for a dream; the unchanged node id retries next dream.
+                failures += 1
+                clustered_ids.update(member_ids)
                 continue
         session_ids = sorted({m["session_id"] for m in members})
         rows.append({
@@ -709,28 +821,39 @@ def build_aggregation_nodes(
             "session_ids": set(session_ids),
         })
 
+    root_failed = False
     if cfg.aggregation_digest_enabled:
         # Digest leaves = the level-0 nodes plus every episode no cluster
-        # absorbed (capped, sampled evenly across the backlog), so the root
+        # absorbed (capped by a churn-stable hash-rank sample), so the root
         # covers the WHOLE store — full time span, not just recent threads.
         leftovers = [e for e in episodes if e["id"] not in clustered_ids]
-        leftovers = _evenly_spaced(leftovers, cfg.aggregation_digest_max_leaves)
+        leftovers = _stable_sample(leftovers, cfg.aggregation_digest_max_leaves)
         items += [{
             "id": e["id"], "title": e["title"] or "", "summary": e["summary"] or "",
             "vector": e["vector"], "entities": e["entities"],
             "session_ids": {e["session_id"]},
         } for e in leftovers]
-        digest_rows, digest_reused = _build_digest_levels(
+        digest_rows, digest_reused, digest_failures, root_failed = _build_digest_levels(
             items, cfg, llm, existing,
             anchor_facts=_anchor_facts(conn, cfg.aggregation_digest_anchor_facts),
         )
         rows += digest_rows
         reused += digest_reused
+        failures += digest_failures
 
     with core_db.transaction(conn):
         # Full replace: rows the new clustering no longer produces must not linger.
         # ON DELETE CASCADE clears aggregation_node_embeddings for dropped nodes.
-        conn.execute("DELETE FROM aggregation_nodes")
+        # Exception: when the ROOT fusion failed, the previous root survives —
+        # a one-dream-stale digest (its footer already names generated_at)
+        # beats HyMem.digest() returning nothing until the retry heals. Its
+        # member ids may point at replaced nodes; expand_node reports those as
+        # missing_member_ids rather than failing.
+        if root_failed:
+            log.warning("aggregate.root_fusion_failed keeping previous root")
+            conn.execute("DELETE FROM aggregation_nodes WHERE is_root = 0")
+        else:
+            conn.execute("DELETE FROM aggregation_nodes")
         for r in rows:
             conn.execute(
                 """
@@ -751,34 +874,47 @@ def build_aggregation_nodes(
         with core_db.transaction(conn):
             _persist_node_embeddings(conn, embedding_client)
 
-    log.info("aggregate.built nodes=%d reused=%d (from %d episodes)",
-             len(rows), reused, len(episodes))
-    return AggregationResult(len(rows), reused)
+    log.info(
+        "aggregate.built nodes=%d reused=%d failures=%d blocking=%s "
+        "vectorless=%d (from %d episodes)",
+        len(rows), reused, failures, blocking, vectorless, len(episodes),
+    )
+    return AggregationResult(len(rows), reused, failures, len(episodes), blocking)
 
 
 def _build_digest_levels(
     items: list[dict], cfg: HyMemConfig, llm: LLMClient,
     existing: dict[str, dict], *, anchor_facts: list[str],
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, int, bool]:
     """RAPTOR rollup: recursively cluster-and-fuse the frontier `items` (each
     {"id","title","summary","vector","entities","session_ids"}) until at most
     `aggregation_max_members` remain, then fuse those into the single ROOT
-    digest node. Returns (node rows for every level >= 1, reused-fusion count).
+    digest node. Returns (node rows for every level >= 1, reused-fusion count,
+    failed-fusion count, root_failed).
 
     Each pass clusters with the SAME `_linked` rule as level 0 (centroid
     vectors, union entity sets); when nothing links — disjoint topics, exactly
-    the case a digest must still cover — it falls back to fusing consecutive
-    runs of `fan_in` items, which guarantees the loop converges. A failed
-    fusion passes its members through unfused (the tree degrades, never
-    blocks); if a whole pass makes no progress the loop bails out and the root
-    fuses whatever frontier remains (capped inside `_items_text`).
+    the case a digest must still cover — it falls back to content-defined
+    groups of ~`fan_in` items (`_content_defined_groups`), which guarantees the
+    loop converges and keeps group boundaries stable under frontier churn
+    (positional `items[i:i+fan_in]` slabs shifted every downstream group when
+    one item appeared or vanished). A failed fusion DROPS its group for this
+    dream (counted, retried next dream at the same node id); the previous
+    pass-through of raw members reshaped every level above AND propagated the
+    very content that failed into the parent prompts — one poisoned cluster
+    took out the whole chain to the root. If a whole pass makes no progress
+    the loop bails out and the root fuses whatever frontier remains (capped
+    inside `_items_text`).
 
     The root fusion is GROUNDED: `anchor_facts` (top knowledge-graph edges)
     render as a VERIFIED FACTS block the digest prompt treats as ground truth
     over the machine-generated summaries, and the block's hash joins the root's
-    cache id so a changed graph regenerates the digest."""
+    cache id so a changed graph regenerates the digest. `root_failed` tells the
+    caller the root specifically failed, so it can keep the previous root row
+    instead of leaving the store digest-less until the retry heals."""
     rows: list[dict] = []
     reused = 0
+    failures = 0
     fan_in = max(2, cfg.aggregation_max_members)
     level = 1
     while len(items) > fan_in:
@@ -794,10 +930,12 @@ def _build_digest_levels(
         grouped: dict[int, list[dict]] = {}
         for it in items:
             grouped.setdefault(labels[it["id"]], []).append(it)
-        groups = sorted(grouped.values(),
-                        key=lambda g: (-len(g), sorted(m["id"] for m in g)[0]))
+        # First-seen order (dict insertion follows `items` order): stable under
+        # membership churn. Sorting by size reordered the whole level whenever
+        # any group's size changed, re-keying unrelated parents downstream.
+        groups = list(grouped.values())
         if all(len(g) < 2 for g in groups):
-            groups = [items[i:i + fan_in] for i in range(0, len(items), fan_in)]
+            groups = _content_defined_groups(items, fan_in)
 
         next_items: list[dict] = []
         for g in groups:
@@ -817,10 +955,12 @@ def _build_digest_levels(
                 # whole-store digest degrades into a recap of one topic.
                 fused = _llm_fuse(
                     ROLLUP_USER_TEMPLATE.format(text=_items_text(g, cfg)),
-                    llm, system=ROLLUP_SYSTEM,
+                    llm, system=ROLLUP_SYSTEM, kind="rollup",
                 )
                 if fused is None:
-                    next_items.extend(g)
+                    # CONTAINMENT (see the level-0 twin): the group sits this
+                    # dream out rather than leaking raw members upward.
+                    failures += 1
                     continue
             session_ids: set[str] = set().union(*(m["session_ids"] for m in g))
             rows.append({
@@ -841,7 +981,7 @@ def _build_digest_levels(
         level += 1
 
     if not items:
-        return rows, reused
+        return rows, reused, failures, False
     member_ids = [m["id"] for m in items]
     # The VERIFIED FACTS anchor is part of the root's INPUT, so it joins the
     # cache key: a changed graph (new fact, supersession) regenerates the
@@ -858,17 +998,17 @@ def _build_digest_levels(
         fused = _llm_fuse(
             DIGEST_USER_TEMPLATE.format(facts=facts_block,
                                         text=_items_text(items, cfg)),
-            llm, system=DIGEST_SYSTEM,
+            llm, system=DIGEST_SYSTEM, kind="root",
         )
     if fused is None:
-        return rows, reused
+        return rows, reused, failures + 1, True
     session_ids = sorted(set().union(*(m["session_ids"] for m in items)))
     rows.append({
         "id": root_id, "title": fused["title"], "summary": fused["summary"],
         "member_ids": member_ids, "session_ids": session_ids,
         "level": level, "is_root": 1,
     })
-    return rows, reused
+    return rows, reused, failures, False
 
 
 @dataclass

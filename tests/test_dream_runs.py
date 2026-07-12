@@ -58,7 +58,10 @@ def test_dream_persists_aggregation_counters(hy, monkeypatch):
 
     monkeypatch.setattr(
         runner_mod, "build_aggregation_nodes",
-        lambda *a, **kw: AggregationResult(nodes=3, reused=2),
+        lambda *a, **kw: AggregationResult(
+            nodes=3, reused=2, fusion_failures=1, input_episodes=41,
+            blocking="exact:no_vec_extension",
+        ),
     )
 
     enabled = HyMem(
@@ -70,13 +73,21 @@ def test_dream_persists_aggregation_counters(hy, monkeypatch):
         report = enabled.dream()
         assert report.aggregation_nodes_built == 3
         assert report.aggregation_nodes_reused == 2
+        assert report.aggregation_fusion_failures == 1
+        assert report.aggregation_input_episodes == 41
+        assert report.aggregation_blocking == "exact:no_vec_extension"
 
         row = enabled.conn.execute(
-            "SELECT aggregation_nodes_built, aggregation_nodes_reused "
+            "SELECT aggregation_nodes_built, aggregation_nodes_reused, "
+            "       aggregation_fusion_failures, aggregation_input_episodes, "
+            "       aggregation_blocking "
             "FROM dream_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert row["aggregation_nodes_built"] == 3
         assert row["aggregation_nodes_reused"] == 2
+        assert row["aggregation_fusion_failures"] == 1
+        assert row["aggregation_input_episodes"] == 41
+        assert row["aggregation_blocking"] == "exact:no_vec_extension"
     finally:
         enabled.close()
 
