@@ -683,14 +683,37 @@ class HyMemAdapter:
 # ~20 MS synthesis misses (fuse ~15 one-line facts, not 45 raw slots), and D2's
 # can't-tally (tallying a short extracted list is easier).
 
-# Versioned so a prompt change is visible in diffs/tests and an A/B against a
-# future V2 can key on the constant, mirroring ASK_PROMPT_V1 / the fusion salts.
+# Versioned so a prompt change is visible in diffs/tests and an A/B can key on
+# the constant, mirroring ASK_PROMPT_V1 / the fusion salts.
 DISTILL_PROMPT_V1 = (
     "From the memory excerpt below, extract every statement relevant to this "
     "question, quoting concrete values, names, and dates verbatim. One line per "
     "statement. If nothing is relevant, reply exactly NONE.\n"
     "Question: {question}"
 )
+
+# V2 (G-P1a iteration): V1's "extract EVERY statement RELEVANT to..." over-extracts
+# — the dry-run banked 6 flips but 6 control regressions (net-zero), 3.3 lines/Q
+# kept, the distilled block crowding raw turns with on-topic-but-not-answer-bearing
+# noise (the RAPTOR KU −9pp lesson). V2 tightens the RELEVANCE bar, not the line
+# count: "directly answer" + "omit merely on-topic". It deliberately keeps
+# "at most one line PER DISTINCT answer-bearing fact" (NOT one line total) so a
+# multi-value tally turn — "drove 3h Monday, 2h Tuesday" — still yields both items;
+# those multi-value turns are among the flips, and a single-value cap would
+# undercount them back to wrong.
+DISTILL_PROMPT_V2 = (
+    "From the memory excerpt below, extract ONLY facts that directly answer the "
+    "question — the specific value, name, date, or count it asks about, quoted "
+    "verbatim. Omit anything merely on-topic but not answer-bearing. At most one "
+    "line per distinct answer-bearing fact. If the excerpt contains no fact that "
+    "directly answers the question, reply exactly NONE.\n"
+    "Question: {question}"
+)
+
+DISTILL_PROMPTS = {"v1": DISTILL_PROMPT_V1, "v2": DISTILL_PROMPT_V2}
+# The active default. Bumped to v2 after the V1 G-P1a FAIL (net-zero on
+# regressions); v1 stays selectable via --distill-prompt-version for repro.
+DEFAULT_DISTILL_PROMPT_VERSION = "v2"
 
 # Distillation reads raw turn / chunk / episode text; graph_facts are already
 # atomic subject-predicate-object triples, so distilling them is redundant.
@@ -705,13 +728,15 @@ DISTILL_ABILITIES = frozenset({"MR", "TR"})
 DISTILL_MAX_CALLS = 24
 
 
-def _distill_hit(llm: LLMClient, question: str, excerpt: str) -> list[str]:
+def _distill_hit(llm: LLMClient, question: str, excerpt: str,
+                 *, prompt_version: str = DEFAULT_DISTILL_PROMPT_VERSION) -> list[str]:
     """One extraction call over a single rendered hit. Returns kept statement
     lines; an explicit NONE (or an LLM error) yields []. Label-free by
     construction: reads only the question + hit text, never a question_type or
     gold mark."""
+    template = DISTILL_PROMPTS[prompt_version]
     resp = llm.chat(
-        [{"role": "system", "content": DISTILL_PROMPT_V1.format(question=question)},
+        [{"role": "system", "content": template.format(question=question)},
          {"role": "user", "content": f"Memory excerpt:\n{excerpt}"}],
         temperature=0.0, max_tokens=256,
     )
@@ -727,7 +752,8 @@ def _distill_hit(llm: LLMClient, question: str, excerpt: str) -> list[str]:
 
 
 def distill_memories(llm: LLMClient, question: str, memories: list[dict],
-                     *, max_calls: int = DISTILL_MAX_CALLS) -> tuple[list[str], int]:
+                     *, max_calls: int = DISTILL_MAX_CALLS,
+                     prompt_version: str = DEFAULT_DISTILL_PROMPT_VERSION) -> tuple[list[str], int]:
     """Map DISTILL_PROMPT over the distillable hits in render order, capped at
     `max_calls`. Returns (kept_lines, calls_made). The caller renders these ABOVE
     the raw memories, never in place of them."""
@@ -739,7 +765,7 @@ def distill_memories(llm: LLMClient, question: str, memories: list[dict],
         if m.get("type") not in DISTILLABLE_TYPES:
             continue
         calls += 1
-        kept.extend(_distill_hit(llm, question, m["content"]))
+        kept.extend(_distill_hit(llm, question, m["content"], prompt_version=prompt_version))
     return kept, calls
 
 
@@ -995,6 +1021,7 @@ def evaluate_question(
     graph_facts_first: bool = False,
     permissive_default: bool = False,
     distill: bool = False,
+    distill_prompt_version: str = DEFAULT_DISTILL_PROMPT_VERSION,
 ) -> dict:
     """Evaluate a single LongMemEval question."""
     question_id = q_data["question_id"]
@@ -1079,8 +1106,10 @@ def evaluate_question(
     distilled_lines, distill_calls, distill_fired = None, 0, False
     if distill and distill_should_fire(ability, memories):
         distill_fired = True
-        distilled_lines, distill_calls = distill_memories(llm, question, memories)
-        print(f"    Distill: {distill_calls} calls → {len(distilled_lines)} lines kept", flush=True)
+        distilled_lines, distill_calls = distill_memories(
+            llm, question, memories, prompt_version=distill_prompt_version)
+        print(f"    Distill[{distill_prompt_version}]: {distill_calls} calls → "
+              f"{len(distilled_lines)} lines kept", flush=True)
 
     # Answer
     ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
@@ -1405,6 +1434,7 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
             graph_facts_first=args.graph_facts_first,
             permissive_default=args.permissive_default,
             distill=args.distill,
+            distill_prompt_version=args.distill_prompt_version,
         )
     except Exception as e:
         print(f"    ERROR: {e}", flush=True)
@@ -1636,7 +1666,8 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                                              temporal_events, aggregation_nodes, distilled=None)
             out["gold_in_context"] = bool(gold_turns) and _gold_in_pool(gold_turns, [raw_ctx])
 
-        distilled, calls = distill_memories(answer_llm, question, memories)
+        distilled, calls = distill_memories(answer_llm, question, memories,
+                                            prompt_version=args.distill_prompt_version)
         out["distill_calls"], out["distill_kept"], out["distilled"] = calls, len(distilled), distilled
         ai_answer = answer_question(answer_llm, memories, question, ability=ability,
                                     total_matches=total_matches, graph_count=graph_count,
@@ -1706,7 +1737,8 @@ def _distill_dryrun_questions(questions: list[dict], args, api_key: str) -> None
     if args.answer_base_url != DEEPSEEK_BASE_URL:
         print(f"  answer reader: {args.answer_model} @ {args.answer_base_url}  "
               f"(judge frozen: {args.judge_model} @ {DEEPSEEK_BASE_URL})")
-    print(f"  distill prompt: V1   max calls/q: {DISTILL_MAX_CALLS}\n{'='*72}", flush=True)
+    print(f"  distill prompt: {args.distill_prompt_version.upper()}   "
+          f"max calls/q: {DISTILL_MAX_CALLS}\n{'='*72}", flush=True)
 
     answer_llm = LLMClient(args.answer_model, args.answer_api_key or api_key,
                            base_url=args.answer_base_url)
@@ -1782,9 +1814,16 @@ def _distill_dryrun_questions(questions: list[dict], args, api_key: str) -> None
         for line in r["distilled"][:12]:
             print(f"      • {line[:160]}")
     if regressions:
-        print(f"\n{'─'*72}\nCONTROL REGRESSIONS (were correct, now wrong under distill):")
+        print(f"\n{'─'*72}\nCONTROL REGRESSIONS (were correct, now wrong under distill) —"
+              f"\n  read the distilled lines: over-extraction (on-topic noise) vs a lossy"
+              f"\n  line the model trusted over the raw turn tells which lever failed:")
         for r in regressions:
-            print(f"  [{r['question_id']}]  answer: {r['ai_answer'][:200]}")
+            print(f"\n  [{r['question_id']}]  Q: {r['question'][:140]}")
+            print(f"    gold: {r['gold_answer'][:160]}")
+            print(f"    answer: {r['ai_answer'][:240]}")
+            print(f"    distilled ({r['distill_kept']} lines from {r['distill_calls']} calls):")
+            for line in r["distilled"][:12]:
+                print(f"      • {line[:160]}")
     print(f"\n{'='*72}\nBank this block + the verdict in longmemeval_roadmap.md under P1.\n")
 
 
@@ -1938,6 +1977,12 @@ def main():
                              f"{DISTILL_MAX_CALLS} small LLM calls per fired question. "
                              "Run the free --distill-dryrun front-run gate FIRST; A/B "
                              "against the paired baseline on a fixed seed.")
+    parser.add_argument("--distill-prompt-version", default=DEFAULT_DISTILL_PROMPT_VERSION,
+                        choices=sorted(DISTILL_PROMPTS.keys()),
+                        help="Which DISTILL_PROMPT to map (default v2). v2 tightens the "
+                             "relevance bar to answer-bearing facts only after v1's G-P1a "
+                             "FAIL (6 flips / 6 control regressions — over-extraction "
+                             "crowding). v1 stays selectable to reproduce that run.")
     parser.add_argument("--distill-dryrun", default=None, metavar="RUN.json",
                         help="FRONT-RUN GATE (G-P1a) for --distill: reads an instrumented "
                              "run JSON, recovers the banked MS synthesis misses (MS, "
@@ -2154,7 +2199,7 @@ def main():
             "answer_base_url": args.answer_base_url,
             "judge_model": args.judge_model,
             "distill": args.distill,
-            "distill_prompt_version": "V1" if args.distill else None,
+            "distill_prompt_version": args.distill_prompt_version.upper() if args.distill else None,
             "distill_fired_count": sum(1 for r in all_results if r.get("distill_fired")),
             "distill_total_calls": sum(r.get("distill_calls", 0) for r in all_results),
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
