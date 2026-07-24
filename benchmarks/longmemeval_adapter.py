@@ -278,10 +278,14 @@ QUESTION_TYPE_TO_ABILITY = {
 # ── LLM Client ──────────────────────────────────────────────────────
 
 class LLMClient:
-    def __init__(self, model: str, api_key: str):
+    def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL):
         self.model = model
         self.api_key = api_key
-        self.base_url = DEEPSEEK_BASE_URL.rstrip("/")
+        # Default keeps every existing caller byte-path-identical; only the ANSWER
+        # client is ever pointed elsewhere (via --answer-base-url), so the judge
+        # posture — deepseek-chat @ DEEPSEEK_BASE_URL — stays the frozen
+        # comparability contract with the canonical 70.0 run.
+        self.base_url = base_url.rstrip("/")
         self.call_count = 0
         self.total_tokens = 0
         # Guards the two counters so they aggregate correctly when many worker
@@ -667,32 +671,105 @@ class HyMemAdapter:
 
 # ── Answer & Judge ──────────────────────────────────────────────────
 
-def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str = None,
-                    total_matches: int = 0, graph_count=None, temporal_events: list | None = None,
-                    aggregation_nodes: list | None = None,
-                    question_date: str = "", permissive_default: bool = False) -> str:
-    """Ask LLM to answer based on retrieved memories.
+# ── P1 read-side synthesis: question-conditioned fact distillation ──
+# A bounded single-step approximation of Hindsight's ≤10-iteration "reflect"
+# loop: before the final answer call, map a small extraction call over each
+# retrieved hit — "extract statements relevant to {question}, else NONE" — then
+# answer over the distilled list PLUS the raw hits. ADDITIVE by contract: the
+# distilled facts JOIN the raw memories, never replace them (the MR-filter lesson
+# is an invariant). Question-conditioned + transient sidesteps the over-extraction
+# risk that shelved write-time incidental extraction. Targets three banked
+# buckets: the 14-floor sparse-signal misses (each turn read individually), the
+# ~20 MS synthesis misses (fuse ~15 one-line facts, not 45 raw slots), and D2's
+# can't-tally (tallying a short extracted list is easier).
 
-    Uses ability-aware prompts and expanded context for multi-session
-    and temporal reasoning questions that need more cross-session data.
-    For MR questions, prefers graph_count (exact graph-native count) over
-    total_matches (keyword candidate). For TR questions, injects
-    temporal_events as a date-ordered chronology. `aggregation_nodes` (RAPTOR
-    cross-session summaries, TR-gated upstream) render as a separate block so
-    they never compete with raw turns for top_k slots or context budget.
+# Versioned so a prompt change is visible in diffs/tests and an A/B against a
+# future V2 can key on the constant, mirroring ASK_PROMPT_V1 / the fusion salts.
+DISTILL_PROMPT_V1 = (
+    "From the memory excerpt below, extract every statement relevant to this "
+    "question, quoting concrete values, names, and dates verbatim. One line per "
+    "statement. If nothing is relevant, reply exactly NONE.\n"
+    "Question: {question}"
+)
 
-    `question_date` is the "now" the question is asked at — the reference point
-    relative-date questions ("how many days ago?", "a month ago") subtract from.
-    Without it the chronology gives event dates but the model has no anchor to
-    compute an interval against, and answers "current date not provided".
-    """
+# Distillation reads raw turn / chunk / episode text; graph_facts are already
+# atomic subject-predicate-object triples, so distilling them is redundant.
+DISTILLABLE_TYPES = frozenset({"message_hit", "fts_hit", "episode"})
+
+# Abilities that fire distillation unconditionally (count/synthesis-heavy). The
+# gate is a COST control, not a quality filter — additive either way.
+DISTILL_ABILITIES = frozenset({"MR", "TR"})
+
+# Hard cap on the map fan-out per question so a wide retrieval can't explode the
+# distill call budget. Mirrors ask_distill_max_calls in the productization path.
+DISTILL_MAX_CALLS = 24
+
+
+def _distill_hit(llm: LLMClient, question: str, excerpt: str) -> list[str]:
+    """One extraction call over a single rendered hit. Returns kept statement
+    lines; an explicit NONE (or an LLM error) yields []. Label-free by
+    construction: reads only the question + hit text, never a question_type or
+    gold mark."""
+    resp = llm.chat(
+        [{"role": "system", "content": DISTILL_PROMPT_V1.format(question=question)},
+         {"role": "user", "content": f"Memory excerpt:\n{excerpt}"}],
+        temperature=0.0, max_tokens=256,
+    )
+    stripped = (resp or "").strip()
+    if not stripped or stripped.upper() == "NONE" or stripped.startswith("[LLM_ERROR"):
+        return []
+    lines = []
+    for ln in stripped.splitlines():
+        s = ln.strip().lstrip("-•*").strip()
+        if s and s.upper() != "NONE":
+            lines.append(s)
+    return lines
+
+
+def distill_memories(llm: LLMClient, question: str, memories: list[dict],
+                     *, max_calls: int = DISTILL_MAX_CALLS) -> tuple[list[str], int]:
+    """Map DISTILL_PROMPT over the distillable hits in render order, capped at
+    `max_calls`. Returns (kept_lines, calls_made). The caller renders these ABOVE
+    the raw memories, never in place of them."""
+    kept: list[str] = []
+    calls = 0
+    for m in memories:
+        if calls >= max_calls:
+            break
+        if m.get("type") not in DISTILLABLE_TYPES:
+            continue
+        calls += 1
+        kept.extend(_distill_hit(llm, question, m["content"]))
+    return kept, calls
+
+
+def distill_should_fire(ability: str | None, memories: list[dict]) -> bool:
+    """COST gate (label-free): fire on the count/synthesis-heavy abilities, or
+    when the retrieval is wide enough (≥12 hits) that fusing a short extracted
+    list beats reading many raw slots. Otherwise the question runs untouched."""
+    return ability in DISTILL_ABILITIES or len(memories) >= 12
+
+
+def _render_answer_context(memories: list[dict], ability: str | None,
+                           total_matches: int, graph_count,
+                           temporal_events: list | None,
+                           aggregation_nodes: list | None,
+                           distilled: list[str] | None = None) -> str:
+    """Build the CONTEXT block the answerer sees from the retrieved tiers.
+
+    Extracted from answer_question so (a) the distillation dry-run can re-render
+    the IDENTICAL context (same char caps) to decide the deep-lexical split, and
+    (b) the additive [DISTILLED EVIDENCE] block has one canonical insertion point
+    — directly ABOVE the raw memories, mirroring how aggregation_nodes render as
+    a separate non-competing block (never consuming a raw-turn slot or budget
+    ahead of the turns; the crowding that cost KU −9.0pp once already)."""
     # MR and TR questions span many sessions — expand context window
     context_limit = MAX_CONTEXT_CHARS * 2 if ability in ("MR", "TR") else MAX_CONTEXT_CHARS
 
     # MR counting: prefer graph_count (EXACT graph-native count) over
     # total_matches (keyword candidate). When graph_count is present it is
     # the dedup-correct answer — trust it.
-    parts = []
+    parts: list[str] = []
     if ability == "MR" and graph_count is not None:
         count = graph_count.count
         counted = getattr(graph_count, 'counted', 'items')
@@ -729,6 +806,18 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         for node in aggregation_nodes:
             parts.append(f"  {node}\n")
         parts.append("[END SUMMARIES]\n\n")
+
+    # Distilled evidence (P1): question-conditioned facts extracted per-turn,
+    # rendered ABOVE the raw memories as their own non-competing block. Additive
+    # — the raw turns stay below, unchanged. Verify-against-source framing so the
+    # answerer treats it as a lens, not a replacement.
+    if distilled:
+        parts.append("[DISTILLED EVIDENCE — extracted per-turn, verify against "
+                     "the memories below:]\n")
+        for line in distilled:
+            parts.append(f"  • {line}\n")
+        parts.append("[END DISTILLED EVIDENCE]\n\n")
+
     total_chars = 0
     for m in memories:
         content = m["content"]
@@ -745,7 +834,35 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         parts.append(f"{tag} {content}")
         total_chars += len(content) + len(tag) + 2
 
-    context = "\n".join(parts) if parts else "No relevant memories found."
+    return "\n".join(parts) if parts else "No relevant memories found."
+
+
+def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str = None,
+                    total_matches: int = 0, graph_count=None, temporal_events: list | None = None,
+                    aggregation_nodes: list | None = None,
+                    question_date: str = "", permissive_default: bool = False,
+                    distilled: list[str] | None = None) -> str:
+    """Ask LLM to answer based on retrieved memories.
+
+    Uses ability-aware prompts and expanded context for multi-session
+    and temporal reasoning questions that need more cross-session data.
+    For MR questions, prefers graph_count (exact graph-native count) over
+    total_matches (keyword candidate). For TR questions, injects
+    temporal_events as a date-ordered chronology. `aggregation_nodes` (RAPTOR
+    cross-session summaries, TR-gated upstream) render as a separate block so
+    they never compete with raw turns for top_k slots or context budget.
+
+    `question_date` is the "now" the question is asked at — the reference point
+    relative-date questions ("how many days ago?", "a month ago") subtract from.
+    Without it the chronology gives event dates but the model has no anchor to
+    compute an interval against, and answers "current date not provided".
+    """
+    # Render the CONTEXT block from the retrieved tiers (+ the additive distilled
+    # block, above the raw turns). Shared with the distillation dry-run so both
+    # see identical char caps and insertion order.
+    context = _render_answer_context(
+        memories, ability, total_matches, graph_count,
+        temporal_events, aggregation_nodes, distilled=distilled)
 
     # The default (unknown-ability) prompt. When --permissive-default is set this
     # is the permissive preference-style prompt (D4 fix) instead of the strict
@@ -877,6 +994,7 @@ def evaluate_question(
     no_dream: bool = False,
     graph_facts_first: bool = False,
     permissive_default: bool = False,
+    distill: bool = False,
 ) -> dict:
     """Evaluate a single LongMemEval question."""
     question_id = q_data["question_id"]
@@ -954,11 +1072,22 @@ def evaluate_question(
     router_str = f"{oracle_ability or '∅'}/det={detected_ability or '∅'}{used_marker}"
     print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, agg_nodes={len(aggregation_nodes)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str}, ability={router_str})", flush=True)
 
+    # P1 distillation (additive, cost-gated, label-free): map an extraction call
+    # over the distillable hits, then answer over the kept lines PLUS the raw
+    # turns. The gate is a COST control (fires on MR/TR or a wide retrieval), not
+    # a quality filter — the raw memories are always passed through untouched.
+    distilled_lines, distill_calls, distill_fired = None, 0, False
+    if distill and distill_should_fire(ability, memories):
+        distill_fired = True
+        distilled_lines, distill_calls = distill_memories(llm, question, memories)
+        print(f"    Distill: {distill_calls} calls → {len(distilled_lines)} lines kept", flush=True)
+
     # Answer
     ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
                                  graph_count=graph_count, temporal_events=temporal_events,
                                  aggregation_nodes=aggregation_nodes,
-                                 question_date=question_date, permissive_default=permissive_default)
+                                 question_date=question_date, permissive_default=permissive_default,
+                                 distilled=distilled_lines)
 
     # Judge (binary yes/no)
     correct = judge_answer(judge_llm, question_type, question, answer, ai_answer)
@@ -985,6 +1114,12 @@ def evaluate_question(
         "oracle_ability": oracle_ability,
         "detected_ability": detected_ability,
         "ability_used": ability,
+        # P1 distillation instrumentation (fired/not per question, map fan-out,
+        # lines kept) — so the A/B can tell whether the mechanism hit its named
+        # targets (mechanism > score) and read distill cost per question.
+        "distill_fired": distill_fired,
+        "distill_calls": distill_calls,
+        "distill_kept": len(distilled_lines) if distilled_lines else 0,
     }
 
 
@@ -1269,6 +1404,7 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
             auto_ability=args.auto_ability, no_dream=args.no_dream,
             graph_facts_first=args.graph_facts_first,
             permissive_default=args.permissive_default,
+            distill=args.distill,
         )
     except Exception as e:
         print(f"    ERROR: {e}", flush=True)
@@ -1444,6 +1580,214 @@ def _inspect_floor_questions(questions: list[dict], args, api_key: str) -> None:
           "  doesn't help real Hermes is out of scope.")
 
 
+# ── Distillation dry-run (G-P1a front-run gate for --distill) ────────
+# Offline test of the P1 bounded-reflect mechanism on the banked MS synthesis
+# misses BEFORE spending a full A/B. Mirrors the --inspect-floor pattern: rebuild
+# a per-question temp DB from the source run's dataset, ingest/dream/search with
+# the SAME config, then run the distillation arm and judge. The deep-lexical
+# split (2.1) is verified LIVE — a candidate only counts as a synthesis miss if
+# its gold turn actually survived into the char-capped context the answerer sees.
+
+def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMClient,
+                     api_key: str, *, check_gold_in_context: bool) -> dict:
+    """Rebuild one question's store, retrieve, distill, answer over distilled+raw,
+    and judge. Returns a result dict; never raises (an error → incorrect). When
+    `check_gold_in_context`, also renders the RAW (no-distill) context and reports
+    whether a gold turn survived into it — the live deep-lexical split."""
+    question = q_data["question"]
+    question_type = q_data["question_type"]
+    answer = q_data["answer"]
+    sessions = q_data.get("haystack_sessions", [])
+    sids = q_data.get("haystack_session_ids", [str(i) for i in range(len(sessions))])
+    dates = q_data.get("haystack_dates", [])
+    question_date = q_data.get("question_date", "") or (max(dates) if dates else "")
+    oracle_ability = QUESTION_TYPE_TO_ABILITY.get(question_type, None)
+    ability = _detect_ability_safe(question) if args.auto_ability else oracle_ability
+
+    out = {"question_id": q_data.get("question_id"), "question": question,
+           "gold_answer": str(answer), "ability": ability, "gold_in_context": None,
+           "distill_calls": 0, "distill_kept": 0, "distilled": [], "ai_answer": "",
+           "correct": False, "error": None}
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-distill-"))
+    hy = None
+    try:
+        hy = HyMemAdapter(tmp_dir / "hymem.sqlite", api_key=api_key,
+                          embeddings=args.embeddings,
+                          rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model,
+                          rerank_message_hits=args.rerank_message_hits,
+                          aggregation_nodes=args.aggregation_nodes,
+                          aggregation_broad=args.aggregation_broad,
+                          value_supersession=args.value_supersession)
+        hy.open()
+        hy.ingest_sessions(sessions, sids, dates)
+        if not args.no_dream:
+            hy.dream_and_wait()
+        memories, total_matches, graph_count, temporal_events, aggregation_nodes, pool = hy.search(
+            question, ability=ability, top_k=args.top_k * 3,
+            graph_facts_first=args.graph_facts_first)
+
+        if check_gold_in_context:
+            gold_turns, _ = _extract_gold_turns(q_data)
+            # Render the RAW context exactly as the answerer would see it (same
+            # char caps) and check the gold turn survived the cut. Gold below the
+            # cut = deep-lexical (retrieval-ranking loss, not synthesis) → excluded.
+            raw_ctx = _render_answer_context(memories, ability, total_matches, graph_count,
+                                             temporal_events, aggregation_nodes, distilled=None)
+            out["gold_in_context"] = bool(gold_turns) and _gold_in_pool(gold_turns, [raw_ctx])
+
+        distilled, calls = distill_memories(answer_llm, question, memories)
+        out["distill_calls"], out["distill_kept"], out["distilled"] = calls, len(distilled), distilled
+        ai_answer = answer_question(answer_llm, memories, question, ability=ability,
+                                    total_matches=total_matches, graph_count=graph_count,
+                                    temporal_events=temporal_events,
+                                    aggregation_nodes=aggregation_nodes,
+                                    question_date=question_date,
+                                    permissive_default=args.permissive_default,
+                                    distilled=distilled)
+        out["ai_answer"] = ai_answer
+        out["correct"] = judge_answer(judge_llm, question_type, question, answer, ai_answer)
+    except Exception as e:
+        out["error"] = str(e)
+    finally:
+        if hy:
+            hy.close()
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        gc.collect()
+    return out
+
+
+def _distill_dryrun_questions(questions: list[dict], args, api_key: str) -> None:
+    """G-P1a front-run gate. Reads the instrumented source run, recovers the MS
+    synthesis misses (with a live deep-lexical split), runs the distillation arm
+    on each + an equal-sized MS-hit control, and reports the flip rate + control
+    regressions against G-P1a — plus every flipped answer for the hand-read."""
+    with open(args.distill_dryrun) as f:
+        run = json.load(f)
+    pq = run.get("per_question", [])
+    if not any("gold_turn_tiers" in r for r in pq):
+        print(f"\n⚠ {Path(args.distill_dryrun).name} has no 'gold_turn_tiers' — the "
+              "synthesis-miss selection needs an instrumented run. Re-run the baseline "
+              "with this adapter first.")
+        return
+    by_id = {q.get("question_id"): q for q in questions}
+
+    def _is_ms(r):  # multi-session, answerable (non-_abs)
+        return r.get("question_type") == "multi-session"
+
+    # 2.1 selection (pre deep-lexical split — that is verified live below):
+    # MS, wrong, recall_ceiling=true (gold was in the pool), NOT floor (no "none"
+    # gold-turn tier).
+    candidates = [r["question_id"] for r in pq
+                  if _is_ms(r) and not r.get("correct")
+                  and r.get("recall_ceiling") is True
+                  and not any(t == "none" for t in (r.get("gold_turn_tiers") or []))
+                  and r.get("question_id") in by_id]
+    # Control: MS hits (correct=true), equal-sized random sample (seeded → paired).
+    hit_ids = [r["question_id"] for r in pq
+               if _is_ms(r) and r.get("correct") and r.get("question_id") in by_id]
+    import random
+    rng = random.Random(args.seed)
+    n_ctrl = min(len(candidates), len(hit_ids))
+    control = rng.sample(hit_ids, n_ctrl) if n_ctrl < len(hit_ids) else list(hit_ids)
+
+    missing = [r["question_id"] for r in pq
+               if _is_ms(r) and not r.get("correct") and r.get("recall_ceiling") is True
+               and not any(t == "none" for t in (r.get("gold_turn_tiers") or []))
+               and r.get("question_id") not in by_id]
+
+    print(f"\n{'='*72}\nDISTILL DRY-RUN (G-P1a) — source: {Path(args.distill_dryrun).name}")
+    print(f"  candidates (MS synthesis-miss, pre split): {len(candidates)}   "
+          f"control (MS hits): {len(control)}")
+    if missing:
+        print(f"  ⚠ {len(missing)} candidate qid(s) not in the loaded sample — "
+              f"re-run with --sample 0: {missing[:5]}")
+    if args.answer_base_url != DEEPSEEK_BASE_URL:
+        print(f"  answer reader: {args.answer_model} @ {args.answer_base_url}  "
+              f"(judge frozen: {args.judge_model} @ {DEEPSEEK_BASE_URL})")
+    print(f"  distill prompt: V1   max calls/q: {DISTILL_MAX_CALLS}\n{'='*72}", flush=True)
+
+    answer_llm = LLMClient(args.answer_model, args.answer_api_key or api_key,
+                           base_url=args.answer_base_url)
+    judge_llm = LLMClient(args.judge_model, api_key)
+
+    tasks = [("cand", qid) for qid in candidates] + [("ctrl", qid) for qid in control]
+
+    def _run(kind: str, qid: str) -> dict:
+        res = _distill_run_one(by_id[qid], args, answer_llm, judge_llm, api_key,
+                               check_gold_in_context=(kind == "cand"))
+        res["_kind"] = kind
+        return res
+
+    results: list[dict] = []
+    if args.workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = [pool.submit(_run, k, q) for k, q in tasks]
+            for i, fut in enumerate(as_completed(futs), 1):
+                results.append(fut.result())
+                if i % 5 == 0:
+                    print(f"  ── {i}/{len(tasks)} done", flush=True)
+    else:
+        for i, (k, q) in enumerate(tasks, 1):
+            results.append(_run(k, q))
+            if i % 5 == 0:
+                print(f"  ── {i}/{len(tasks)} done", flush=True)
+
+    cand_res = [r for r in results if r["_kind"] == "cand"]
+    ctrl_res = [r for r in results if r["_kind"] == "ctrl"]
+    # Live deep-lexical split: only gold-in-context candidates are true synthesis
+    # misses; gold-below-cut rows are deep-lexical (retrieval/ranking loss).
+    synthesis = [r for r in cand_res if r.get("gold_in_context") and not r.get("error")]
+    deeplexical = [r for r in cand_res if not r.get("gold_in_context") and not r.get("error")]
+    cand_errors = [r for r in cand_res if r.get("error")]
+    flips = [r for r in synthesis if r["correct"]]
+    regressions = [r for r in ctrl_res if not r["correct"] and not r.get("error")]
+    ctrl_errors = [r for r in ctrl_res if r.get("error")]
+
+    n_syn = len(synthesis)
+    flip_rate = (len(flips) / n_syn) if n_syn else 0.0
+
+    print(f"\n{'='*72}\nRESULT — G-P1a")
+    print(f"  candidates run: {len(cand_res)}  "
+          f"(synthesis: {n_syn}, deep-lexical excluded: {len(deeplexical)}, "
+          f"errors: {len(cand_errors)})")
+    if n_syn != 20:
+        print(f"  ⚠ recovered synthesis set = {n_syn}, not the banked 20 — reconcile "
+              f"against the decomposition; the gate scales as a FRACTION (≥25%), not ≥5.")
+    print(f"  FLIPS to correct: {len(flips)}/{n_syn}  ({flip_rate*100:.0f}%)")
+    print(f"  control regressions (MS hit → wrong under distill): "
+          f"{len(regressions)}/{len(ctrl_res)}"
+          + (f"  (+{len(ctrl_errors)} errors)" if ctrl_errors else ""))
+    avg_calls = (sum(r["distill_calls"] for r in synthesis) / n_syn) if n_syn else 0
+    avg_kept = (sum(r["distill_kept"] for r in synthesis) / n_syn) if n_syn else 0
+    print(f"  distill cost (synthesis rows): avg {avg_calls:.1f} calls, "
+          f"{avg_kept:.1f} lines kept per question")
+
+    pass_flip = flip_rate >= 0.25
+    pass_ctrl = len(regressions) <= 1
+    verdict = "PASS (pending hand-read)" if (pass_flip and pass_ctrl) else "FAIL"
+    print(f"\n  GATE: flip≥25% {'✓' if pass_flip else '✗'}  "
+          f"regressions≤1 {'✓' if pass_ctrl else '✗'}  →  {verdict}")
+    print("  Hand-read every FLIPPED answer below for INVENTED facts before "
+          "accepting the pass (the judge can be charitable — this is the honesty check).")
+
+    print(f"\n{'─'*72}\nFLIPPED ANSWERS (hand-read for invention):")
+    for r in flips:
+        print(f"\n  [{r['question_id']}]  Q: {r['question'][:140]}")
+        print(f"    gold: {r['gold_answer'][:160]}")
+        print(f"    answer: {r['ai_answer'][:240]}")
+        print(f"    distilled ({r['distill_kept']} lines from {r['distill_calls']} calls):")
+        for line in r["distilled"][:12]:
+            print(f"      • {line[:160]}")
+    if regressions:
+        print(f"\n{'─'*72}\nCONTROL REGRESSIONS (were correct, now wrong under distill):")
+        for r in regressions:
+            print(f"  [{r['question_id']}]  answer: {r['ai_answer'][:200]}")
+    print(f"\n{'='*72}\nBank this block + the verdict in longmemeval_roadmap.md under P1.\n")
+
+
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
@@ -1457,6 +1801,20 @@ def main():
                         help="RNG seed for stratified sampling; fixed so runs are paired/comparable")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--answer-model", default=ANSWER_MODEL)
+    parser.add_argument("--answer-base-url", default=DEEPSEEK_BASE_URL,
+                        help="P0 parity lever: OpenAI-compatible endpoint for the "
+                             "ANSWER client only (default DeepSeek). Point at a "
+                             "gpt-oss-120b-class reader to measure how much of the "
+                             "gap to Hindsight's 91.4 is reader vs architecture. "
+                             "The JUDGE stays deepseek-chat @ DeepSeek regardless — "
+                             "judge posture is the frozen comparability contract, "
+                             "never varied. Recorded in the output metadata so a "
+                             "run is self-describing.")
+    parser.add_argument("--answer-api-key", default=None,
+                        help="API key for the --answer-base-url endpoint. Defaults "
+                             "to the resolved --api-key/env/config DeepSeek key, so "
+                             "the default path is unchanged; set this only when the "
+                             "answer endpoint needs a different credential.")
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
     parser.add_argument("--api-key", default="")
     parser.add_argument("--data-dir", default=str(_repo_root.parent / "hymem_beam" / "data"))
@@ -1568,6 +1926,28 @@ def main():
                              "control arm. Requires a dream pass (do NOT combine "
                              "with --no-dream). Confirm firing via the dream-log line "
                              "'bitemporal.value_superseded count=' before reading results.")
+    parser.add_argument("--distill", action="store_true",
+                        help="P1 read-side lever: before the final answer call, map a "
+                             "question-conditioned extraction call over the retrieved "
+                             "hits (message/fts/episode) and answer over the distilled "
+                             "one-line facts PLUS the raw turns — a bounded single-step "
+                             "'reflect'. ADDITIVE (distilled facts join, never replace "
+                             "the raw memories); the distill block renders ABOVE the "
+                             "turns as a non-competing tier. Cost-gated: fires only on "
+                             "MR/TR or a ≥12-hit retrieval (label-free). Adds up to "
+                             f"{DISTILL_MAX_CALLS} small LLM calls per fired question. "
+                             "Run the free --distill-dryrun front-run gate FIRST; A/B "
+                             "against the paired baseline on a fixed seed.")
+    parser.add_argument("--distill-dryrun", default=None, metavar="RUN.json",
+                        help="FRONT-RUN GATE (G-P1a) for --distill: reads an instrumented "
+                             "run JSON, recovers the banked MS synthesis misses (MS, "
+                             "wrong, recall_ceiling, no floor turn, gold survived into "
+                             "the sent context — the deep-lexical split is verified live), "
+                             "runs the distillation arm on each, and reports how many flip "
+                             "to correct. Also runs an equal-sized random control of MS "
+                             "HITS to catch regressions. LLM cost is ~40 small questions, "
+                             "not a full run. Skips the benchmark. Bank the verdict before "
+                             "spending a full --distill A/B.")
     parser.add_argument("--inspect-floor", default=None, metavar="RUN.json",
                         help="DIAGNOSTIC: characterize WHY the floor questions (ranking "
                              "misses whose gold reaches NO tier) are unrecoverable. Reads an "
@@ -1615,6 +1995,9 @@ def main():
     print(f"  Seed: {args.seed}")
     print(f"  Top-K: {args.top_k}")
     print(f"  Answer model: {args.answer_model}")
+    if args.answer_base_url != DEEPSEEK_BASE_URL:
+        print(f"  ⚠ Answer endpoint: {args.answer_base_url} (PARITY READER — "
+              f"judge stays deepseek-chat @ {DEEPSEEK_BASE_URL})")
     print(f"  Judge model: {args.judge_model}")
     print(f"  Workers: {args.workers}")
     if args.embeddings:
@@ -1658,8 +2041,18 @@ def main():
         _inspect_floor_questions(questions, args, DEEPSEEK_API_KEY)
         return
 
-    # LLM clients
-    answer_llm = LLMClient(args.answer_model, DEEPSEEK_API_KEY)
+    # Distillation dry-run (G-P1a front-run gate): offline test on the banked
+    # synthesis misses — dump the verdict and exit, no full benchmark.
+    if args.distill_dryrun:
+        _distill_dryrun_questions(questions, args, DEEPSEEK_API_KEY)
+        return
+
+    # LLM clients. The ANSWER client can be pointed at a non-DeepSeek reader
+    # (P0 parity lever); its key falls back to the resolved DeepSeek key so the
+    # default path is unchanged. The JUDGE is deliberately left on
+    # deepseek-chat @ DEEPSEEK_BASE_URL — frozen judge posture.
+    answer_api_key = args.answer_api_key or DEEPSEEK_API_KEY
+    answer_llm = LLMClient(args.answer_model, answer_api_key, base_url=args.answer_base_url)
     judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY)
 
     # Evaluate each question. Questions are fully independent (own temp DB +
@@ -1712,6 +2105,11 @@ def main():
     print(f"\nEvaluation complete in {elapsed:.0f}s")
     print(f"  Answer calls: {answer_llm.call_count}, Judge calls: {judge_llm.call_count}")
     print(f"  Total tokens: {answer_llm.total_tokens + judge_llm.total_tokens}")
+    if args.distill:
+        n_fired = sum(1 for r in all_results if r.get("distill_fired"))
+        n_calls = sum(r.get("distill_calls", 0) for r in all_results)
+        print(f"  Distill: fired on {n_fired}/{len(all_results)} questions, "
+              f"{n_calls} extraction calls (included in Answer calls above)")
     print(f"  Avg time/question: {elapsed/len(questions):.0f}s")
 
     # Report
@@ -1753,7 +2151,12 @@ def main():
             "rerank_model": args.rerank_model,
             "rerank_message_hits": args.rerank_message_hits,
             "answer_model": args.answer_model,
+            "answer_base_url": args.answer_base_url,
             "judge_model": args.judge_model,
+            "distill": args.distill,
+            "distill_prompt_version": "V1" if args.distill else None,
+            "distill_fired_count": sum(1 for r in all_results if r.get("distill_fired")),
+            "distill_total_calls": sum(r.get("distill_calls", 0) for r in all_results),
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
             "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix, recall-ceiling instrumentation (retrieval-vs-ranking miss split), ability-router shadow/auto measurement (detect_ability vs oracle)",
             "elapsed_s": elapsed,
