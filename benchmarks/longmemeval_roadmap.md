@@ -352,6 +352,32 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   misses**. Don't spend a run on KU ranking/top_k/budget/rerank — exhausted. The dating lever (§2) is
   the KU win; further KU gains would need conflict-resolution prompt strength or the 2 recall misses,
   both low-yield.
+- **D10. P1 read-side fact distillation ("bounded reflect").** DEAD via the free front-run
+  gate (G-P1a), 2026-07-24 — banked before any full A/B, exactly as the plan's two-failure
+  rule prescribes. Mechanism: map a question-conditioned extraction call over the
+  message/fts/episode hits ("extract statements relevant to {question}, else NONE"), answer
+  over the distilled lines PLUS the raw turns (additive, distilled block rendered ABOVE the
+  turns). Built in `longmemeval_adapter.py` as `--distill` / `--distill-dryrun` /
+  `--distill-prompt-version {v1,v2}` (all default OFF).
+  **V1** ("extract *every* statement relevant"): 6/23 synthesis-miss flips (26%, cleared the
+  ≥25% flip bar) but **6 control regressions** (gate needs ≤1) → FAIL. Over-extraction
+  (~15 calls/Q, 3.3 lines kept); the distilled block crowds the raw turns with
+  on-topic-but-not-answer-bearing noise — the RAPTOR KU −9pp crowding lesson, re-derived.
+  **V2** ("extract ONLY facts that *directly answer*; omit merely on-topic; ≤1 line per
+  *distinct* fact") — the one plan-sanctioned prompt iteration: regressions halved (6→**3**)
+  but 3 > 1 → FAIL. Second failure ⇒ banked dead, no full `--distill` run.
+  **The kill is deeper than the arithmetic (mechanism > score):** 4 of the 6 V2 flips carried
+  **zero distilled lines** — the win came from the *reader* (the dry-run answered under a
+  stronger model, v4-flash, not canonical deepseek-chat) reading the raw context, not from
+  distillation. Distillation is not attributable. V2's tighter bar also *lost* the one
+  genuine distill win (`aae3761f`, "driving hours", +1 under V1). Recovered synthesis set was
+  23 not the banked 20 (coarser "any none-tier → exclude" selection); the deep-lexical split
+  passed all 23 (gold survived into the sent context). **Do NOT re-chase as a score lever.**
+  Carry-over dividend: the accidental non-canonical reader turned the dry-run into a 23-Q
+  reader-parity probe — 4 reader-only flips are the first evidence the Hindsight gap is partly
+  reader, which is exactly what P0/1.3 measures. The `--distill*` code stays in the tree as an
+  inert, default-OFF diagnostic (and as the working `--answer-base-url` reader-swap plumbing P0
+  needs).
 
 ---
 
@@ -720,7 +746,10 @@ lesson); nothing reads the oracle label. None re-chase D1–D9. Roughly EV-order
   the gap is distributed and the reader is the dominant unmeasured variable (D2/D8/KU
   residual are all documented deepseek reader weaknesses). Report the reader alongside
   the number — condition-honesty, not gaming.
-- **P1. Question-conditioned fact distillation at read time (map-reduce reader).** Before
+- **P1. Question-conditioned fact distillation at read time (map-reduce reader).**
+  **DEAD 2026-07-24 — failed G-P1a twice (V1 + the one sanctioned V2 iteration); banked in
+  §3 D10. Flips were reader-driven, not distill-driven. No full A/B run.** (original proposal
+  kept below for the record.) Before
   the final answer call, map over retrieved hits ("extract any statement relevant to
   {question}, else NONE"), then answer over the distilled list. Targets THREE banked
   buckets at once: the 14 sparse-signal floor (each turn read individually → the
