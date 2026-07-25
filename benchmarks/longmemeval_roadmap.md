@@ -746,6 +746,38 @@ lesson); nothing reads the oracle label. None re-chase D1–D9. Roughly EV-order
   the gap is distributed and the reader is the dominant unmeasured variable (D2/D8/KU
   residual are all documented deepseek reader weaknesses). Report the reader alongside
   the number — condition-honesty, not gaming.
+
+  **RESULT (2026-07-25) — P0/1.3 parity run, reader = `gpt-oss-120b`.** Canonical config
+  mirrored except the answer endpoint; judge = `deepseek-v4-flash` (thinking-disabled — the
+  post-deprecation judge). Judge verified live (72.6%, not the 0% a dead judge yields).
+  - **Overall 72.6%** vs canonical 70.0% = **+2.6pp**. Per-category ≥5pp:
+    **single-session-preference −26.7pp** (120B 40% vs deepseek-chat 67%);
+    **multi-session +11.6pp answerable / +16.7pp abstention**.
+  - **Attribution: ARCHITECTURAL.** Reader closes ≈13% of the ~21pp gap (70.0→91.4);
+    ~87% is retrieval/assembly. At ~73 HyMem is in the retrieval/synthesis-bottleneck
+    regime; the §1.4 reader-dominance threshold (~80) is NOT reached → §2.5 parity×distill
+    cell does not apply (and P1 is dead regardless, D10).
+  - **Caveat 1 — attribution is PROVISIONAL (judge mismatch).** The +2.6pp conflates the
+    reader swap with a judge swap: the parity run judged under v4-flash, the canonical 70.0
+    under the now-deprecated deepseek-chat. The clean reader gap needs the 70.0 re-judged
+    under v4-flash (`--rejudge`, built 2026-07-24) → re-paired baseline 70.0′; then
+    reader gap := 72.6 − 70.0′. Until that runs, read +2.6 as reader-drift + judge-drift
+    combined. (The 70.0 `per_question` predates the un-truncation fix, so its rejudge is
+    approximate — the tool warns; short answers usually survive the 500-char clip.)
+  - **Caveat 2 — preference collapse is a reader-PROMPT mismatch, not architecture.** The
+    §2 permissive-default preference clause (D4) was tuned for deepseek-chat; the 120B reads
+    the same first-person monologue and declines to infer the preference. This −26.7pp is a
+    reader artifact that DEPRESSES the net reader gain — so +2.6pp is a FLOOR on the reader's
+    real contribution, not a ceiling. Even generously credited the reader stays well under
+    ~80 → the ARCHITECTURAL verdict holds. **New standing finding: answer prompts are
+    reader-specific — a reader swap requires per-reader prompt re-tuning.** Load-bearing for
+    Hermes, where the reader prompt isn't ours; a fixed permissive clause is not portable.
+  - **Consequence for this plan.** The architectural residual is dominated by cross-session
+    synthesis/assembly — precisely P1's target, and P1 is DEAD (D10). The plan's two
+    LME-number threads (P0 measurement + P1 synthesis) are now spent; a further LME gain
+    needs a genuinely new mechanism (true multi-iteration reflect, or an assembly change) —
+    deliberately NOT imported from Hindsight here. Remaining live work is off the LME number:
+    Phase 0 RAPTOR flip (box; product/reuse) and Track A multi-hop (Hermes recall).
 - **P1. Question-conditioned fact distillation at read time (map-reduce reader).**
   **DEAD 2026-07-24 — failed G-P1a twice (V1 + the one sanctioned V2 iteration); banked in
   §3 D10. Flips were reader-driven, not distill-driven. No full A/B run.** (original proposal

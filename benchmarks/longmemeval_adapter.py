@@ -278,14 +278,20 @@ QUESTION_TYPE_TO_ABILITY = {
 # ── LLM Client ──────────────────────────────────────────────────────
 
 class LLMClient:
-    def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL):
+    def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
+                 extra_body: dict | None = None):
         self.model = model
         self.api_key = api_key
         # Default keeps every existing caller byte-path-identical; only the ANSWER
         # client is ever pointed elsewhere (via --answer-base-url), so the judge
-        # posture — deepseek-chat @ DEEPSEEK_BASE_URL — stays the frozen
-        # comparability contract with the canonical 70.0 run.
+        # posture stays the frozen comparability contract with the canonical run.
         self.base_url = base_url.rstrip("/")
+        # Extra top-level request-body fields merged into every call — the raw-HTTP
+        # equivalent of the OpenAI SDK's `extra_body`. Needed post-2026-07-24: the
+        # deepseek-chat deprecation moved reader/judge to deepseek-v4-flash, a
+        # REASONING model that prepends thinking tokens (corrupting the yes/no judge
+        # parse) unless sent {"thinking":{"type":"disabled"}}. Empty = unchanged.
+        self.extra_body = dict(extra_body) if extra_body else {}
         self.call_count = 0
         self.total_tokens = 0
         # Guards the two counters so they aggregate correctly when many worker
@@ -311,14 +317,18 @@ class LLMClient:
         return f"[LLM_ERROR: {last_error[:100]}]"
 
     def _call(self, messages: list, temperature: float, max_tokens: int) -> tuple[str, dict]:
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        # Merge last so a caller can force provider-specific fields (e.g. disable
+        # v4-flash thinking). Collisions with the four keys above are the caller's.
+        body.update(self.extra_body)
         resp = http.post(
             f"{self.base_url}/chat/completions",
-            json={
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
+            json=body,
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             timeout=120,
         )
@@ -1125,9 +1135,12 @@ def evaluate_question(
     return {
         "question_id": question_id,
         "question_type": question_type,
-        "question": question[:200],
-        "answer": str(answer)[:200],
-        "hypothesis": ai_answer[:500],
+        # Full text (previously q[:200]/a[:200]/hyp[:500]) — the judge saw the full
+        # strings, so storing them un-clipped makes a later --rejudge byte-faithful
+        # (needed once a judge model is deprecated and the baseline must be re-paired).
+        "question": question,
+        "answer": str(answer),
+        "hypothesis": ai_answer,
         "correct": correct,
         "num_sessions": stats["sessions"],
         "num_messages": stats["messages"],
@@ -1741,8 +1754,10 @@ def _distill_dryrun_questions(questions: list[dict], args, api_key: str) -> None
           f"max calls/q: {DISTILL_MAX_CALLS}\n{'='*72}", flush=True)
 
     answer_llm = LLMClient(args.answer_model, args.answer_api_key or api_key,
-                           base_url=args.answer_base_url)
-    judge_llm = LLMClient(args.judge_model, api_key)
+                           base_url=args.answer_base_url,
+                           extra_body=getattr(args, "answer_extra_body_obj", None))
+    judge_llm = LLMClient(args.judge_model, api_key,
+                          extra_body=getattr(args, "judge_extra_body_obj", None))
 
     tasks = [("cand", qid) for qid in candidates] + [("ctrl", qid) for qid in control]
 
@@ -1827,6 +1842,112 @@ def _distill_dryrun_questions(questions: list[dict], args, api_key: str) -> None
     print(f"\n{'='*72}\nBank this block + the verdict in longmemeval_roadmap.md under P1.\n")
 
 
+# ── Re-judge (re-pair a banked baseline under a new judge) ───────────
+# Built for the 2026-07-24 deepseek-chat hard-deprecation: the canonical 70.0
+# baseline was answered AND judged by deepseek-chat, so it can't be reproduced.
+# A parity run judged by the replacement (deepseek-v4-flash) is only comparable
+# to a baseline judged by the SAME judge — but re-answering the baseline is
+# wasteful. This re-runs ONLY the judge over the stored hypotheses, no ingest /
+# no answer, and reports the per-category judge drift.
+
+def _rejudge_run(args, api_key: str) -> None:
+    """Re-judge a stored results JSON under the current --judge-model
+    (+ --judge-extra-body). Writes a re-judged copy and prints original-vs-new
+    per-category drift. Rows with no hypothesis (or an [LLM_ERROR] answer) keep
+    their prior verdict, uncounted as re-judged."""
+    src = Path(args.rejudge)
+    with open(src) as f:
+        run = json.load(f)
+    pq = run.get("per_question", [])
+    if not pq:
+        print(f"ERROR: {src.name} has no per_question rows to re-judge.")
+        return
+    orig_judge = (run.get("config", {}) or {}).get("judge_model", "unknown")
+
+    judge_llm = LLMClient(args.judge_model, api_key,
+                          extra_body=getattr(args, "judge_extra_body_obj", None))
+
+    # Flag the pre-untruncation artifact (q[:200]/a[:200]/hyp[:500]) so the
+    # approximation caveat is raised only when it actually applies.
+    clipped = sum(1 for r in pq
+                  if len(str(r.get("hypothesis", ""))) == 500
+                  or len(str(r.get("question", ""))) == 200
+                  or len(str(r.get("answer", ""))) == 200)
+
+    print(f"\n{'='*72}\nRE-JUDGE — {src.name}")
+    print(f"  rows: {len(pq)}   original judge: {orig_judge}   new judge: {args.judge_model}"
+          + (f"  +extra_body={args.judge_extra_body_obj}" if args.judge_extra_body_obj else ""))
+    if not args.judge_extra_body_obj and "v4-flash" in args.judge_model:
+        print("  ⚠ v4-flash judge WITHOUT --judge-extra-body "
+              "'{\"thinking\":{\"type\":\"disabled\"}}' — reasoning tokens may corrupt the yes/no parse.")
+    if clipped:
+        print(f"  ⚠ ~{clipped} rows look field-clipped (pre-untruncation run) — "
+              "re-judge is a close approximation for those, not byte-faithful.")
+    print(f"{'='*72}", flush=True)
+
+    def _rj(r: dict) -> dict:
+        hyp = str(r.get("hypothesis", ""))
+        if not hyp or hyp.startswith("[LLM_ERROR") or r.get("error"):
+            new, judged = bool(r.get("correct")), False   # nothing judgeable → keep prior
+        else:
+            new = judge_answer(judge_llm, r.get("question_type", ""),
+                               r.get("question", ""), str(r.get("answer", "")), hyp)
+            judged = True
+        out = dict(r)
+        out["correct_original"] = r.get("correct")
+        out["correct"] = new
+        out["_rejudged"] = judged
+        return out
+
+    new_rows: list[dict] = [None] * len(pq)
+    if args.workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = {pool.submit(_rj, r): i for i, r in enumerate(pq)}
+            done = 0
+            for fut in as_completed(futs):
+                new_rows[futs[fut]] = fut.result()
+                done += 1
+                if done % 25 == 0:
+                    print(f"  ── re-judged {done}/{len(pq)}", flush=True)
+    else:
+        for i, r in enumerate(pq):
+            new_rows[i] = _rj(r)
+
+    orig_scores = compute_scores(
+        [{**r, "correct": r.get("correct_original")} for r in new_rows])
+    new_scores = compute_scores(new_rows)
+
+    print(f"\n{'─'*72}\nJUDGE DRIFT  ({orig_judge} → {args.judge_model})")
+    print(f"  {'category':<26} {'orig':>7} {'rejudged':>9} {'Δpp':>7} {'n':>5}")
+    for qtype in sorted(new_scores.keys()):
+        o = orig_scores.get(qtype, {}).get("accuracy", 0) * 100
+        n = new_scores[qtype]["accuracy"] * 100
+        print(f"  {qtype:<26} {o:>6.1f} {n:>8.1f} {n - o:>+7.1f} {new_scores[qtype]['count']:>5}")
+    to_wrong = [r for r in new_rows if r["_rejudged"] and r.get("correct_original") and not r["correct"]]
+    to_right = [r for r in new_rows if r["_rejudged"] and not r.get("correct_original") and r["correct"]]
+    n_judged = sum(1 for r in new_rows if r["_rejudged"])
+    print(f"\n  flips: correct→wrong {len(to_wrong)}, wrong→correct {len(to_right)}, "
+          f"net {len(to_right) - len(to_wrong):+d}   (re-judged {n_judged}/{len(new_rows)})")
+
+    out = dict(run)
+    out["per_question"] = new_rows
+    out["scores"] = {qtype: {"accuracy": round(d["accuracy"] * 100, 1), "count": d["count"]}
+                     for qtype, d in new_scores.items()}
+    cfg = dict(out.get("config", {}) or {})
+    cfg.update({"rejudged_from": src.name, "rejudge_original_judge": orig_judge,
+                "judge_model": args.judge_model,
+                "judge_extra_body": getattr(args, "judge_extra_body_obj", None)})
+    out["config"] = cfg
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = src.with_name(f"{src.stem}-rejudged-{args.judge_model.replace('/', '_')}-{stamp}.json")
+    with open(dest, "w") as f:
+        json.dump(out, f, indent=2, default=str)
+    print(f"\n  Archived re-judged results → {dest.name}")
+    print(f"{'='*72}\n  Use the re-judged OVERALL as the paired baseline for a parity run "
+          f"judged by {args.judge_model}.\n")
+
+
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
@@ -1855,6 +1976,29 @@ def main():
                              "the default path is unchanged; set this only when the "
                              "answer endpoint needs a different credential.")
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
+    parser.add_argument("--answer-extra-body", default=None, metavar="JSON",
+                        help="JSON object merged into the ANSWER request body (raw-HTTP "
+                             "`extra_body`). Use for a reasoning reader that needs "
+                             "thinking off, e.g. deepseek-v4-flash: "
+                             "'{\"thinking\":{\"type\":\"disabled\"}}'. gpt-oss-120b "
+                             "does not need it.")
+    parser.add_argument("--judge-extra-body", default=None, metavar="JSON",
+                        help="JSON object merged into the JUDGE request body. REQUIRED "
+                             "when judging with deepseek-v4-flash (deepseek-chat was "
+                             "hard-deprecated 2026-07-24): "
+                             "'{\"thinking\":{\"type\":\"disabled\"}}' — else the "
+                             "reasoning preamble corrupts the yes/no parse.")
+    parser.add_argument("--rejudge", default=None, metavar="RUN.json",
+                        help="Re-judge a stored results JSON under the current "
+                             "--judge-model (+ --judge-extra-body) — NO ingest, NO answer "
+                             "calls, just the judge pass over each stored hypothesis. "
+                             "Built for the deepseek-chat deprecation: re-pair the banked "
+                             "70.0 baseline under deepseek-v4-flash so a parity run judged "
+                             "by the same new judge is comparable. Reports per-category "
+                             "judge drift (original vs re-judged) and archives a new JSON. "
+                             "Skips the benchmark. NOTE: runs produced before the "
+                             "field-truncation was lifted carry clipped q/a/hypothesis — "
+                             "the re-judge is then a close approximation, not byte-faithful.")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--data-dir", default=str(_repo_root.parent / "hymem_beam" / "data"))
     parser.add_argument("--keep-db", action="store_true")
@@ -2021,6 +2165,29 @@ def main():
 
     print(f"API key: ...{DEEPSEEK_API_KEY[-4:]}", flush=True)
 
+    # Parse the optional per-client extra_body JSON (fail fast on bad JSON).
+    def _parse_extra_body(raw: str | None, which: str) -> dict | None:
+        if not raw:
+            return None
+        try:
+            val = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: --{which}-extra-body is not valid JSON: {e}")
+            sys.exit(1)
+        if not isinstance(val, dict):
+            print(f"ERROR: --{which}-extra-body must be a JSON object, got {type(val).__name__}")
+            sys.exit(1)
+        return val
+    args.answer_extra_body_obj = _parse_extra_body(args.answer_extra_body, "answer")
+    args.judge_extra_body_obj = _parse_extra_body(args.judge_extra_body, "judge")
+
+    # Re-judge a stored results JSON under the current judge — no dataset needed,
+    # so dispatch before the (large) dataset load. Built for the deepseek-chat
+    # deprecation: re-pair the banked baseline under deepseek-v4-flash.
+    if args.rejudge:
+        _rejudge_run(args, DEEPSEEK_API_KEY)
+        return
+
     # Determine dataset path
     scale = args.scales.upper()
     if scale == "S":
@@ -2094,11 +2261,14 @@ def main():
 
     # LLM clients. The ANSWER client can be pointed at a non-DeepSeek reader
     # (P0 parity lever); its key falls back to the resolved DeepSeek key so the
-    # default path is unchanged. The JUDGE is deliberately left on
-    # deepseek-chat @ DEEPSEEK_BASE_URL — frozen judge posture.
+    # default path is unchanged. The JUDGE stays on DEEPSEEK_BASE_URL; post the
+    # deepseek-chat deprecation it must be deepseek-v4-flash + --judge-extra-body
+    # '{"thinking":{"type":"disabled"}}' to keep the yes/no parse clean.
     answer_api_key = args.answer_api_key or DEEPSEEK_API_KEY
-    answer_llm = LLMClient(args.answer_model, answer_api_key, base_url=args.answer_base_url)
-    judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY)
+    answer_llm = LLMClient(args.answer_model, answer_api_key, base_url=args.answer_base_url,
+                           extra_body=args.answer_extra_body_obj)
+    judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY,
+                          extra_body=args.judge_extra_body_obj)
 
     # Evaluate each question. Questions are fully independent (own temp DB +
     # HyMem instance), so --workers > 1 fans them across a thread pool — the work
@@ -2197,7 +2367,9 @@ def main():
             "rerank_message_hits": args.rerank_message_hits,
             "answer_model": args.answer_model,
             "answer_base_url": args.answer_base_url,
+            "answer_extra_body": args.answer_extra_body_obj,
             "judge_model": args.judge_model,
+            "judge_extra_body": args.judge_extra_body_obj,
             "distill": args.distill,
             "distill_prompt_version": args.distill_prompt_version.upper() if args.distill else None,
             "distill_fired_count": sum(1 for r in all_results if r.get("distill_fired")),
