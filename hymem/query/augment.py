@@ -1483,6 +1483,8 @@ def _graph_lookup(
                 "entity_types": set(),
                 "overlap_tokens": set(),
                 "direct_anchor": False,
+                "multihop_score": 0.0,
+                "hop": 1,
             }
             candidates[key] = c
         return c
@@ -1546,6 +1548,18 @@ def _graph_lookup(
         for r in rows:
             _ensure(r)
 
+    # Source 4 — multi-hop expansion from DIRECTLY-anchored entities only.
+    # Chaining a fuzzy (token-overlap) link N times produces garbage, so seeds
+    # exclude overlap-only anchors. Additive: dedups against Sources 1/3 on
+    # (s, p, o) via `_ensure`, so a bridged edge that is also a direct/routed hit
+    # keeps its stronger native score and multi-hop never double-counts.
+    if cfg.graph_multihop_enabled:
+        direct_seeds = [e for e in entities if e not in overlap_info]
+        for d in _multihop_edges(conn, cfg, direct_seeds).values():
+            c = _ensure(d["row"])
+            c["multihop_score"] = max(c["multihop_score"], d["path_score"])
+            c["hop"] = d["hop"]
+
     # Recency-only seeding: if the fallback path has no candidates at all
     # (no entity match, no semantic hit), pull a small set of recent active
     # edges so the graph_facts list isn't empty when something could be shown.
@@ -1559,9 +1573,22 @@ def _graph_lookup(
         recency_weight = math.exp(-c["days_since"] / cfg.graph_recency_half_life_days)
         semantic_score = c["semantic_score"]
         in_routed = c["p"] in routed
+        # A candidate reached ONLY via multi-hop chaining (not a direct entity
+        # anchor, semantic hit, or routed predicate) scores by its compounding
+        # path_score — always below a 1-hop hit by construction (decay < 1), so
+        # the additive invariant holds: bridged edges add, never displace.
+        multihop_only = (
+            c["multihop_score"] > 0.0
+            and not c["entity_match"]
+            and not c["semantic_retrieved"]
+            and not in_routed
+        )
 
         why: list[str] = []
-        if fallback:
+        if multihop_only:
+            score = c["multihop_score"] * recency_weight
+            why.append(f"fallback:multihop:{c['hop']}hop")
+        elif fallback:
             if c["entity_match"]:
                 overlap_only = not c["direct_anchor"]
                 if overlap_only:
@@ -1624,6 +1651,81 @@ def _graph_lookup(
 
     results.sort(key=lambda f: f.score, reverse=True)
     return results[: cfg.graph_top_k]
+
+
+# Hard safety bound on BFS frontier width per hop. Not a tuning knob — a hub
+# node (e.g. `uv`) could otherwise explode the frontier and blow the query
+# latency budget; `graph_multihop_min_score` is the primary bound, this is the
+# backstop. Keep only the highest-scoring frontier nodes into the next hop.
+_MULTIHOP_FRONTIER_CAP = 256
+
+
+def _multihop_edges(
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+    seeds: list[str],
+) -> dict[tuple[str, str, str], dict]:
+    """Read-only BFS outward from seed entities up to `cfg.graph_multihop_max_hops`
+    edges, returning the bridging edges that 1-hop retrieval (Source 1) misses.
+
+    Each returned edge carries a compounding `path_score` = product over the chain
+    of (smoothed_confidence × `graph_multihop_decay`), so a longer chain is strictly
+    weaker than a shorter one. Only edges at hop >= 2 are returned: the first BFS
+    round traverses the seeds' own 1-hop edges, which Source 1 already retrieves —
+    re-emitting them would double-count. (The Idea-A sketch's `range(1, max_hops)`
+    stopped one round short and mislabeled those 1-hop edges as hop-2; the loop
+    below runs `max_hops` rounds and emits from round 2 on, so `max_hops=2` reaches
+    the true 2-hop bridge — verified by tests/test_multihop.py.)
+
+    Returns `{(s, p, o): {"row": sqlite3.Row, "path_score": float, "hop": int}}`.
+    """
+    if cfg.graph_multihop_max_hops < 2 or not seeds:
+        return {}
+
+    seeds_set = set(seeds)
+    reached: dict[str, float] = {s: 1.0 for s in seeds}  # node -> best path score
+    out: dict[tuple[str, str, str], dict] = {}
+    frontier = list(seeds)
+
+    for hop in range(1, cfg.graph_multihop_max_hops + 1):
+        if not frontier:
+            break
+        ph = ",".join("?" * len(frontier))
+        rows = conn.execute(
+            _EDGE_SELECT
+            + f"""
+            WHERE status = 'active'
+              AND (subject_canonical IN ({ph}) OR object_canonical IN ({ph}))
+            """,
+            frontier + frontier,
+        ).fetchall()
+
+        next_scores: dict[str, float] = {}
+        for r in rows:
+            conf = (r["pos"] + 1.0) / (r["pos"] + r["neg"] + 2.0)
+            # Never emit a seed-incident edge: it is 1-hop from a seed and Source 1
+            # already has it (emitting would double-count / mislabel it as a bridge).
+            seed_incident = r["s"] in seeds_set or r["o"] in seeds_set
+            for near, far in ((r["s"], r["o"]), (r["o"], r["s"])):
+                if near not in reached:
+                    continue
+                path_score = reached[near] * conf * cfg.graph_multihop_decay
+                if path_score < cfg.graph_multihop_min_score:
+                    continue
+                if hop >= 2 and not seed_incident:  # emit true bridges only
+                    key = (r["s"], r["p"], r["o"])
+                    prev = out.get(key)
+                    if prev is None or path_score > prev["path_score"]:
+                        out[key] = {"row": r, "path_score": path_score, "hop": hop}
+                if far not in reached or path_score > reached[far]:
+                    reached[far] = path_score
+                    if path_score > next_scores.get(far, 0.0):
+                        next_scores[far] = path_score
+        # Advance only the strongest frontier nodes into the next hop.
+        frontier = sorted(next_scores, key=next_scores.get, reverse=True)[
+            :_MULTIHOP_FRONTIER_CAP
+        ]
+    return out
 
 
 def _recency_edges(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:

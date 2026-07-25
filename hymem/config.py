@@ -299,6 +299,26 @@ class HyMemConfig:
     graph_token_overlap_max_per_entity: int = 5
     """Max token-overlap expansions allowed per matched canonical."""
 
+    graph_multihop_enabled: bool = False
+    """Source 4 of `_graph_lookup`: query-time read-only BFS from directly-anchored
+    entities across ALL predicates (vs. offline `inference.py`, which only chains
+    `depends_on`). Bridges edges 1-hop retrieval misses — e.g.
+    `atta —part_of→ medflow —deploys_to→ fly.io` from the seed `atta`. Additive
+    (never filters; multi-hop-only candidates are discounted below any direct hit).
+    Off by default — flip only after the bridging-edge recall probe clears the LME
+    guard (Track A / `additional_planning.md` Idea A; tests/test_multihop.py)."""
+    graph_multihop_max_hops: int = 2
+    """Max chain length (edges from a seed) explored by Source 4. `2` reaches the
+    bridge two edges out (the cheap first step, most of the gain); `3` goes deeper.
+    < 2 disables the traversal entirely."""
+    graph_multihop_decay: float = 0.5
+    """Per-hop score multiplier (< 1) so a longer chain is strictly weaker than a
+    shorter one — BrainDB's compounding edge-weight model. A fresh 2-hop chain
+    scores ~conf²·decay² ≈ 0.5²·0.5² so it never outranks a 1-hop direct hit."""
+    graph_multihop_min_score: float = 0.05
+    """Prune frontier paths whose compounding score falls below this — bounds
+    fan-out from hub nodes and keeps the query path LLM-free and fast."""
+
     decay_window_days: int = 30
     decay_factor: float = 0.9
     retract_threshold: float = 0.15

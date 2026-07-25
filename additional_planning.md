@@ -207,6 +207,35 @@ appears in `graph_facts[:graph_top_k]`.
 `min_score ∈ {0.02,0.05,0.1}`, scored recall@8 vs p95 latency — pick the Pareto
 knee. `max_hops=2` is the likely first ship (cheapest, most of the gain).
 
+### STATUS 2026-07-25 — steps 1–2 BUILT (probe + feature), default OFF
+
+- **Feature** landed in `hymem/query/augment.py`: `_multihop_edges` (read-only
+  BFS) + Source 4 wiring (direct seeds only, dedups Sources 1/3 on `(s,p,o)`) +
+  a discounted-scoring branch emitting `fallback:multihop:{n}hop`. Four config
+  knobs in `hymem/config.py` (`graph_multihop_{enabled=False,max_hops=2,
+  decay=0.5,min_score=0.05}`). **Two sketch bugs fixed** (probe-before-code paid
+  off): the BFS `range(1, max_hops)` was one round short — with `max_hops=2` it
+  never reached the worked example's own bridge — corrected to `range(1,
+  max_hops+1)` emitting from round 2; and the seed's 1-hop edges were re-emitted
+  as hop-2 (only the `entity_match` dedup masked it) — now an explicit
+  seed-incident filter drops them. Compounding verified exactly: hop-2 = conf²·
+  decay² = 1/9, hop-3 = conf³·decay³ = 1/27 (fresh 3-hop chains sit ~min_score).
+- **Probe — synthetic half**: `tests/test_multihop.py` (10 pytest, all green in
+  the 720-test suite). Encodes G-A1 as assertions: bridge recall 0→present on
+  flip, 1-hop control non-regression (same score, no multihop chip), decay/
+  min_score/depth/dedup determinism.
+- **Probe — mined half**: `benchmarks/multihop_probe.py` (+ `_example.json`
+  schema/demo). LLM/embedding-free `gold_rank_probe.py`-style harness; consumes
+  a labeled probe JSON (fresh-seed OR `--store <built.sqlite>` read-only), runs
+  the off→on recall@k A/B per set + p50/p95 `_graph_lookup` latency, prints the
+  G-A1 advisory (multihop rose / control held / p95<1.5× with a sub-1ms noise
+  floor). Sweep points drive via `--max-hops/--decay/--min-score`.
+- **PENDING (box)**: hand-label the mined LME/BEAM multi-hop slice (~60–100
+  items) into a probe JSON → run `multihop_probe.py` for the real **G-A1** read
+  → sweep the Pareto knee → one full LME **G-A2** guard (non-regression only vs
+  the 68.4% v4-flash-judged baseline). Ship default stays `False` until both
+  gates hold.
+
 ---
 
 ## Idea B — `always_on` Rules as a first-class node type
