@@ -70,10 +70,32 @@ measures recall with the feature blind to the label.)
    per-question, so there is no single ready-made store — build one combined
    store: ingest the selected questions' sessions into one `hymem.sqlite` and
    dream it (reuse the adapter's ingest path), **or** point at a persistent
-   Hermes store. Confirm it has edges:
+   Hermes store.
+   > **CRITICAL — dream to completion.** `dream()` processes at most
+   > `cfg.dream_budget` (=50) chunks per call, then stops with
+   > `report.budget_exhausted = True`. A 100k-message combined store is thousands
+   > of chunks, so a single `dream()` call consolidates ~1% of it (~20 episodes,
+   > ~37 edges) — which produces a **false 0% G-A1** (nothing to bridge). Loop
+   > until drained, or raise the budget:
+   > ```python
+   > while True:
+   >     report = dream_hy.dream()
+   >     if not report.budget_exhausted:
+   >         break
+   > # or one-shot: HyMemConfig(..., dream_budget=100000)
+   > ```
+   > You only need ~60–100 probe items, so a **bounded ~30–40-question subset**
+   > dreamed to completion is enough and far cheaper than all 248.
+   Confirm the store is actually dreamed (hundreds+ of edges, many subjects — not
+   tens):
    ```bash
-   sqlite3 STORE.sqlite "SELECT COUNT(*) FROM knowledge_graph WHERE status='active';"
+   sqlite3 STORE.sqlite "SELECT COUNT(*) edges,
+     COUNT(DISTINCT subject_canonical) subjects
+     FROM knowledge_graph WHERE status='active';"
    ```
+   Even fully dreamed, LME is personal-memory (user-centric), so genuine
+   cross-entity bridges are a minority — a small multihop set is expected; the
+   real G-A1 substrate is a Hermes production store.
 2. **Mine** (LLM-free, seconds). `--from` takes a results JSON (uses its
    `per_question`: question + gold `answer` + `question_type`) or a bare
    `[{id,question,answer}]` list:
