@@ -184,6 +184,36 @@ def _run(conn, off_cfg, on_cfg, items: list[dict], cut: int,
             "per_item": per_item}
 
 
+def _summary(res: dict, cut: int) -> dict:
+    """Machine-readable roll-up: per-set recall off/on, latency, gate booleans."""
+    by_set = res["by_set"]
+
+    def _set(name: str) -> dict:
+        r = by_set.get(name, {"n": 0, "off": 0, "on": 0})
+        n = r["n"] or 1
+        return {"n": r["n"], "off": r["off"], "on": r["on"],
+                "recall_off": 100.0 * r["off"] / n, "recall_on": 100.0 * r["on"] / n}
+
+    p95_off, p95_on = _pctile(res["lat_off"], 95), _pctile(res["lat_on"], 95)
+    mh, ct = _set("multihop"), _set("control")
+    lat_meaningful = p95_off >= _LATENCY_FLOOR_MS
+    gate = {
+        "multihop_rose": mh["on"] > mh["off"],
+        "control_held": ct["on"] >= ct["off"],
+        "latency_ok": (not lat_meaningful) or (p95_on < 1.5 * p95_off),
+    }
+    return {
+        "cut": cut, "multihop": mh, "control": ct,
+        "latency_ms": {
+            "off_p50": _pctile(res["lat_off"], 50), "off_p95": p95_off,
+            "on_p50": _pctile(res["lat_on"], 50), "on_p95": p95_on,
+            "p95_ratio": (p95_on / p95_off) if p95_off else None,
+            "gated": lat_meaningful,
+        },
+        "gate": gate, "pass": all(gate.values()),
+    }
+
+
 def _report(res: dict, cut: int, verbose: bool) -> bool:
     by_set = res["by_set"]
     p50_off, p95_off = _pctile(res["lat_off"], 50), _pctile(res["lat_off"], 95)
@@ -259,6 +289,9 @@ def main() -> None:
     ap.add_argument("--decay", type=float, default=None, help="sweep override")
     ap.add_argument("--min-score", type=float, default=None, help="sweep override")
     ap.add_argument("--verbose", action="store_true", help="per-item table")
+    ap.add_argument("--json", action="store_true",
+                    help="emit one machine-readable JSON summary line (for the "
+                         "sweep loop) instead of the human report")
     args = ap.parse_args()
 
     spec = json.loads(args.probe.read_text())
@@ -272,10 +305,11 @@ def main() -> None:
     try:
         if args.store is not None:
             conn = _open_store_ro(args.store)
-            print(f"[store] read-only {args.store} — {len(items)} items")
+            print(f"[store] read-only {args.store} — {len(items)} items", file=sys.stderr)
         else:
             conn = _seed_store(Path(tmp.name), spec.get("edges", []))
-            print(f"[seed] {len(spec.get('edges', []))} edges — {len(items)} items")
+            print(f"[seed] {len(spec.get('edges', []))} edges — {len(items)} items",
+                  file=sys.stderr)
 
         # graph_top_k = cut so _graph_lookup returns exactly the top-cut window.
         base = HyMemConfig(root=Path(tmp.name), graph_top_k=args.cut)
@@ -291,10 +325,20 @@ def main() -> None:
         on_cfg = dataclasses.replace(base, graph_multihop_enabled=True, **on_over)
         print(f"[cfg] on: max_hops={on_cfg.graph_multihop_max_hops} "
               f"decay={on_cfg.graph_multihop_decay} "
-              f"min_score={on_cfg.graph_multihop_min_score}")
+              f"min_score={on_cfg.graph_multihop_min_score}", file=sys.stderr)
 
         res = _run(conn, off_cfg, on_cfg, items, args.cut, args.latency_reps)
-        passed = _report(res, args.cut, args.verbose)
+        if args.json:
+            summary = _summary(res, args.cut)
+            summary["config"] = {
+                "max_hops": on_cfg.graph_multihop_max_hops,
+                "decay": on_cfg.graph_multihop_decay,
+                "min_score": on_cfg.graph_multihop_min_score,
+            }
+            print(json.dumps(summary))
+            passed = summary["pass"]
+        else:
+            passed = _report(res, args.cut, args.verbose)
     finally:
         tmp.cleanup()
 

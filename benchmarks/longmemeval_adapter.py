@@ -424,7 +424,11 @@ class HyMemAdapter:
                  rerank_top_k: int | None = None, rerank_model: str | None = None,
                  rerank_message_hits: bool | None = None,
                  aggregation_nodes: bool = False, aggregation_broad: bool = False,
-                 value_supersession: bool = True):
+                 value_supersession: bool = True,
+                 graph_multihop: bool = False,
+                 graph_multihop_max_hops: int | None = None,
+                 graph_multihop_decay: float | None = None,
+                 graph_multihop_min_score: float | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -434,6 +438,10 @@ class HyMemAdapter:
         self.aggregation_nodes = aggregation_nodes
         self.aggregation_broad = aggregation_broad
         self.value_supersession = value_supersession
+        self.graph_multihop = graph_multihop
+        self.graph_multihop_max_hops = graph_multihop_max_hops
+        self.graph_multihop_decay = graph_multihop_decay
+        self.graph_multihop_min_score = graph_multihop_min_score
         self.hy = None
 
     def open(self):
@@ -469,6 +477,19 @@ class HyMemAdapter:
         # flag-off control arm (the pre-flip canonical baselines, e.g.
         # full-dream 70.0, ran off).
         overrides["value_supersession_enabled"] = self.value_supersession
+        # Track A / Idea A: query-time multi-hop graph traversal (Source 4 of
+        # _graph_lookup). Default OFF; --graph-multihop enables it for the G-A2
+        # non-regression guard. The three knob overrides are the swept Pareto
+        # point from the recall probe (benchmarks/multihop_probe.py); when None
+        # the config defaults (max_hops=2, decay=0.5, min_score=0.05) win.
+        if self.graph_multihop:
+            overrides["graph_multihop_enabled"] = True
+            if self.graph_multihop_max_hops is not None:
+                overrides["graph_multihop_max_hops"] = self.graph_multihop_max_hops
+            if self.graph_multihop_decay is not None:
+                overrides["graph_multihop_decay"] = self.graph_multihop_decay
+            if self.graph_multihop_min_score is not None:
+                overrides["graph_multihop_min_score"] = self.graph_multihop_min_score
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,
@@ -1439,7 +1460,11 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
                           rerank_message_hits=args.rerank_message_hits,
                           aggregation_nodes=args.aggregation_nodes,
                           aggregation_broad=args.aggregation_broad,
-                          value_supersession=args.value_supersession)
+                          value_supersession=args.value_supersession,
+                          graph_multihop=args.graph_multihop,
+                          graph_multihop_max_hops=args.graph_multihop_max_hops,
+                          graph_multihop_decay=args.graph_multihop_decay,
+                          graph_multihop_min_score=args.graph_multihop_min_score)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -2096,6 +2121,24 @@ def main():
                              "broad-injection G4 A/B that lost 69.0 vs 70.0 (KU −9.0pp from "
                              "nodes crowding gold turns out of the answer pool). For "
                              "comparison runs only.")
+    parser.add_argument("--graph-multihop", action="store_true",
+                        help="Track A / Idea A lever (cfg.graph_multihop_enabled): enable "
+                             "query-time multi-hop graph traversal (Source 4 of _graph_lookup) "
+                             "— a read-only BFS from directly-anchored entities that bridges "
+                             "edges 1-hop retrieval misses (e.g. atta —part_of→ medflow "
+                             "—deploys_to→ fly.io). Additive (never displaces direct hits). "
+                             "DEFAULT OFF. This is the G-A2 non-regression guard arm; the recall "
+                             "gate G-A1 runs separately via benchmarks/multihop_probe.py. "
+                             "Requires a dream pass (edges come from dreaming).")
+    parser.add_argument("--graph-multihop-max-hops", type=int, default=None,
+                        help="(with --graph-multihop) override cfg.graph_multihop_max_hops — "
+                             "the swept Pareto point (default 2). None = config default.")
+    parser.add_argument("--graph-multihop-decay", type=float, default=None,
+                        help="(with --graph-multihop) override cfg.graph_multihop_decay "
+                             "(default 0.5). None = config default.")
+    parser.add_argument("--graph-multihop-min-score", type=float, default=None,
+                        help="(with --graph-multihop) override cfg.graph_multihop_min_score "
+                             "(default 0.05). None = config default.")
     parser.add_argument("--value-supersession", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Bi-temporal KU lever (cfg.value_supersession_enabled): the "
@@ -2370,6 +2413,13 @@ def main():
             "answer_extra_body": args.answer_extra_body_obj,
             "judge_model": args.judge_model,
             "judge_extra_body": args.judge_extra_body_obj,
+            "graph_multihop": args.graph_multihop,
+            "graph_multihop_knobs": (
+                {"max_hops": args.graph_multihop_max_hops,
+                 "decay": args.graph_multihop_decay,
+                 "min_score": args.graph_multihop_min_score}
+                if args.graph_multihop else None
+            ),
             "distill": args.distill,
             "distill_prompt_version": args.distill_prompt_version.upper() if args.distill else None,
             "distill_fired_count": sum(1 for r in all_results if r.get("distill_fired")),
