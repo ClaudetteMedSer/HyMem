@@ -229,7 +229,20 @@ knee. `max_hops=2` is the likely first ship (cheapest, most of the gain).
   a labeled probe JSON (fresh-seed OR `--store <built.sqlite>` read-only), runs
   the off→on recall@k A/B per set + p50/p95 `_graph_lookup` latency, prints the
   G-A1 advisory (multihop rose / control held / p95<1.5× with a sub-1ms noise
-  floor). Sweep points drive via `--max-hops/--decay/--min-score`.
+  floor). Sweep points drive via `--max-hops/--decay/--min-score`; `--json` for
+  the sweep loop.
+- **Miner**: `benchmarks/multihop_miner.py` — pre-fills the labeled probe set so
+  Phase A is a verify pass, not authoring. Reuses `_multihop_edges` (so a
+  proposed bridge is exactly what Source 4 fetches) + `match_known_entities` over
+  a dreamed `--store`, ranks candidate edges by gold-answer token overlap, and
+  auto-sorts each MR/TR question into multihop (a hop≥2 bridge explains the
+  answer) / control (a direct 1-hop edge does) / dropped. Emits probe-compatible
+  items + `_`-hints (`_gold/_hop/_answer_overlap/_alt_bridges`). LLM-free.
+  Gold-for-labeling is legitimate (ground truth), not read at retrieval time.
+  End-to-end verified: miner → mined JSON → probe G-A1 PASS.
+- **Guard flag**: `longmemeval_adapter.py --graph-multihop` (+
+  `--graph-multihop-max-hops/--decay/--min-score`) wires the swept knobs into the
+  adapter config and records them in run metadata — makes G-A2 runnable.
 - **PENDING (box)**: hand-label the mined LME/BEAM multi-hop slice (~60–100
   items) into a probe JSON → run `multihop_probe.py` for the real **G-A1** read
   → sweep the Pareto knee → one full LME **G-A2** guard (non-regression only vs

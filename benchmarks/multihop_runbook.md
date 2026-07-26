@@ -14,13 +14,15 @@ non-regression) and, on pass, flips it on.
   python -m pytest tests/test_multihop.py -q          # expect 10 passed
   ```
 - Recall probe harness: `benchmarks/multihop_probe.py` (+ `multihop_probe_example.json`).
+- Probe-set miner: `benchmarks/multihop_miner.py` (pre-fills the labeled set from a
+  run's questions + a store, so Phase A is a verify pass, not authoring).
 - LME guard arm: `benchmarks/longmemeval_adapter.py --graph-multihop` (new flag;
   `--help` lists it and the three knob overrides).
 
 ## The four remaining steps (in order)
 | Step | What | Gate | Cost |
 |------|------|------|------|
-| A | Build the labeled probe set | — (human input) | manual |
+| A | Build the labeled probe set (miner pre-fills → you verify) | — (human input) | mostly auto |
 | B | Run the recall probe | **G-A1** | seconds |
 | C | Sweep the Pareto knee | — (tuning) | minutes |
 | D | Full LME guard, OFF vs ON | **G-A2** | 2 runs |
@@ -55,64 +57,82 @@ worked example live in `benchmarks/multihop_probe_example.json` and the
 
 Target **~60–100 items total**, roughly half multihop / half control.
 
-### Path 1 (recommended for the real G-A1) — mine + introspect a built store
+### Path 1 (recommended) — mine, then verify
 
-This is what makes G-A1 mean more than the pytest: real edges, real canonical
-forms, real graph density. Use an existing dreamed LME/BEAM store (the ones your
-LME runs build) or build one.
+The **miner** (`benchmarks/multihop_miner.py`) does the labeling for you and
+leaves you a *verification* pass. It reuses the feature's own traversal to
+propose bridges, so a proposed bridge is exactly what Source 4 would fetch, and
+uses the gold answer to auto-sort each question into `multihop` / `control`.
+(Using gold here is legitimate — it LABELS the ground-truth set; the probe still
+measures recall with the feature blind to the label.)
 
-1. **Pick a store** with dreamed edges. Any `hymem.sqlite` from a full-dream LME
-   run works. Confirm it has edges:
+1. **Get a store** with dreamed edges for these questions. LME haystacks are
+   per-question, so there is no single ready-made store — build one combined
+   store: ingest the selected questions' sessions into one `hymem.sqlite` and
+   dream it (reuse the adapter's ingest path), **or** point at a persistent
+   Hermes store. Confirm it has edges:
    ```bash
    sqlite3 STORE.sqlite "SELECT COUNT(*) FROM knowledge_graph WHERE status='active';"
    ```
-2. **Shortlist multi-hop questions.** From the LME set, pick multi-session
-   questions whose answer plausibly needs chaining two facts across sessions via
-   *different* predicates (e.g. "where is the project X works on deployed?" →
-   `X —part_of→ P —deploys_to→ where`). ~30–50 of them.
-3. **Find the canonical seed + bridge for each** by inspecting the store. For a
-   candidate seeded on entity `E`:
+2. **Mine** (LLM-free, seconds). `--from` takes a results JSON (uses its
+   `per_question`: question + gold `answer` + `question_type`) or a bare
+   `[{id,question,answer}]` list:
    ```bash
-   # 1-hop neighbours of E (these are Source 1 — NOT bridges):
-   sqlite3 STORE.sqlite "SELECT subject_canonical,predicate,object_canonical
-     FROM knowledge_graph WHERE status='active'
-       AND (subject_canonical='E' OR object_canonical='E');"
-
-   # 2-hop bridges: edges incident to a neighbour N but NOT to E.
-   # (replace N with each neighbour from the query above)
-   sqlite3 STORE.sqlite "SELECT subject_canonical,predicate,object_canonical
-     FROM knowledge_graph WHERE status='active'
-       AND (subject_canonical='N' OR object_canonical='N')
-       AND subject_canonical!='E' AND object_canonical!='E';"
+   python benchmarks/multihop_miner.py \
+     --from ~/.hermes/benchmarks/<run>.json \
+     --store STORE.sqlite --out SLICE.json
+   # prints: scanned N → multihop M, control C, dropped D (no-seed …)
    ```
-   The answer-relevant row from the second query is your `bridge`; `E` is the
-   `seed`. Record verbatim (canonical strings, exact predicate).
-4. **Build the control set** (equal size): questions answered by a *direct* edge
-   of a seed — `bridge` = a row from the first query (incident to `E`).
-5. Assemble everything into `SLICE.json` (same shape as the example). Because you
-   run against the real store, **omit the `edges` block** and pass `--store`.
+   It mines MR+TR types by default (`--types` to change), enumerates bridges at
+   `--max-hops 3 --min-score 0.01` (broad — the probe/sweep tunes later), and
+   writes probe-ready items with `_`-prefixed hints (`_gold`, `_hop`,
+   `_answer_overlap`, `_alt_bridges`).
+3. **Verify** `SLICE.json` by hand — this is the human step, now short:
+   - For each `multihop` item, confirm `bridge` is the answer-bearing edge. If a
+     different edge is right, swap in one from `_alt_bridges`; if none fit (the
+     store lacks the fact, or the question isn't really multi-hop), delete the item.
+   - Spot-check `control` items: the direct edge should plainly answer the question.
+   - `dropped` questions (no edge overlapped the gold, or no seed matched) aren't
+     emitted — add any real ones by hand using the SQL in Path 2 if you want them.
+   - The `_`-prefixed fields can stay; `multihop_probe.py` ignores unknown keys.
+4. Because you mined against the real store, **run the probe with `--store` and
+   omit any `edges` block**.
 
-> **Labour-saver:** if hand-labeling 60–100 items is too much, ask the assistant
-> to build the **miner** — a script that pre-filters LME/BEAM multi-session items
-> to multi-hop candidates and pre-fills seeds/bridge suggestions from the store,
-> so you only verify a short list. Not built yet (offered).
+### Path 2 (manual add / fix, or when a store isn't handy)
 
-### Path 2 (fast sanity, lower fidelity) — hand-authored fresh-seed chains
+To add an item by hand (or check what the miner dropped), inspect the store
+directly. For a candidate seeded on entity `E`:
+```bash
+# 1-hop neighbours of E (Source 1 — NOT bridges; these are control edges):
+sqlite3 STORE.sqlite "SELECT subject_canonical,predicate,object_canonical
+  FROM knowledge_graph WHERE status='active'
+    AND (subject_canonical='E' OR object_canonical='E');"
+
+# 2-hop bridges: edges incident to a neighbour N but NOT to E.
+sqlite3 STORE.sqlite "SELECT subject_canonical,predicate,object_canonical
+  FROM knowledge_graph WHERE status='active'
+    AND (subject_canonical='N' OR object_canonical='N')
+    AND subject_canonical!='E' AND object_canonical!='E';"
+```
+The answer-relevant row from the second query is the `bridge`; `E` is the `seed`.
+Record verbatim (canonical strings, exact predicate).
+
+### Path 3 (offline sanity, lower fidelity) — hand-authored fresh-seed chains
 
 Write ~40–60 chains directly in an `edges` block + `items` (as in the example
 JSON), drawn from real LME/BEAM content but using canonical predicates. No store
 needed (`multihop_probe.py` seeds a temp store from `edges`). This is basically a
 bigger pytest — use it to smoke the harness or if a real store isn't handy, but
-prefer Path 1 for the decision.
+prefer the mined path (1) for the decision.
 
 ---
 
 ## Phase B — G-A1 recall read
 
 ```bash
-# Path 1 (real store):
+# mined / manual against the real store (Paths 1–2):
 python benchmarks/multihop_probe.py --probe SLICE.json --store STORE.sqlite --verbose
-# Path 2 (fresh-seed):
+# fresh-seed (Path 3, edges block in the JSON):
 python benchmarks/multihop_probe.py --probe SLICE.json --verbose
 ```
 
@@ -252,7 +272,8 @@ participates_in, has_attribute`.
 - G-A1: multihop recall@8 ↑ ; control recall@8 Δ ≥ 0 ; p95_on < 1.5× p95_off.
 - G-A2: overall ON ≥ OFF−1pp ; no category < −5pp ; MS ≥ floor. Non-regression only.
 
-**Files:** feature `hymem/query/augment.py` + `hymem/config.py` · probe
+**Files:** feature `hymem/query/augment.py` + `hymem/config.py` · miner
+`benchmarks/multihop_miner.py` (pre-fills the probe set) · probe
 `benchmarks/multihop_probe.py` (`--json` for sweeps) · guard flag in
 `benchmarks/longmemeval_adapter.py` · ground truth `tests/test_multihop.py` ·
 design `additional_planning.md` §Idea A.
