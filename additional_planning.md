@@ -233,13 +233,23 @@ knee. `max_hops=2` is the likely first ship (cheapest, most of the gain).
   the sweep loop.
 - **Miner**: `benchmarks/multihop_miner.py` — pre-fills the labeled probe set so
   Phase A is a verify pass, not authoring. Reuses `_multihop_edges` (so a
-  proposed bridge is exactly what Source 4 fetches) + `match_known_entities` over
-  a dreamed `--store`, ranks candidate edges by gold-answer token overlap, and
-  auto-sorts each MR/TR question into multihop (a hop≥2 bridge explains the
-  answer) / control (a direct 1-hop edge does) / dropped. Emits probe-compatible
-  items + `_`-hints (`_gold/_hop/_answer_overlap/_alt_bridges`). LLM-free.
-  Gold-for-labeling is legitimate (ground truth), not read at retrieval time.
-  End-to-end verified: miner → mined JSON → probe G-A1 PASS.
+  proposed bridge is exactly what Source 4 fetches) + `match_known_entities`,
+  ranks candidate edges by gold-answer token overlap, and auto-sorts each MR/TR
+  question into multihop (a hop≥2 bridge explains the answer) / control (a direct
+  1-hop edge does) / dropped. Emits probe-compatible items + `_`-hints
+  (`_gold/_hop/_answer_overlap/_alt_bridges`). Gold-for-labeling is legitimate
+  (ground truth), not read at retrieval time. **Two modes:**
+  (1) **`--store`** — mine an existing dreamed store, LLM-free, seconds.
+  (2) **`--lme-data`** — per-question: rebuild + **dream each question's own
+  haystack to completion** (loops `dream()` until `not budget_exhausted`), then
+  mine it. Sidesteps the `dream_budget=50`-per-cycle under-dream that made a
+  combined LME store yield a false-empty graph (37 edges / 4 subjects → false 0%
+  G-A1); faithful to LME's isolated per-question retrieval. Emits a self-contained
+  fresh-seed `edges` block (probe needs no `--store`); prints per-question dream
+  health (avg edges/store) to catch a non-extracting dream LLM. Dreams via
+  `--dream-model` (default v4-flash, thinking-disabled; `stub` = plumbing test).
+  Both modes share `_mine_question`. End-to-end verified: store→probe PASS,
+  per-question plumbing + self-contained edges→probe PASS.
 - **Guard flag**: `longmemeval_adapter.py --graph-multihop` (+
   `--graph-multihop-max-hops/--decay/--min-score`) wires the swept knobs into the
   adapter config and records them in run metadata — makes G-A2 runnable.

@@ -66,7 +66,29 @@ uses the gold answer to auto-sort each question into `multihop` / `control`.
 (Using gold here is legitimate — it LABELS the ground-truth set; the probe still
 measures recall with the feature blind to the label.)
 
-1. **Get a store** with dreamed edges for these questions. LME haystacks are
+**Two miner modes — pick one:**
+- **`--lme-data` (per-question, recommended, LLM-bound):** rebuilds and dreams
+  *each question's own haystack* to completion, then mines it. Small store per
+  question → one/few dream cycles fully drain it, so it **sidesteps the
+  dream_budget under-dream entirely** and is faithful to how LME retrieves
+  (isolated per-question store). Emits a self-contained `edges` block → probe with
+  **no `--store`**. This is the path that avoids step 1's combined-store hazard —
+  jump to step 2b.
+  ```bash
+  python benchmarks/multihop_miner.py \
+    --lme-data <longmemeval.json> --types multi-session --limit 40 \
+    --dream-model deepseek-v4-flash --out SLICE.json
+  # per-question dream stats print per item; watch the "avg edges/store" line —
+  # if it's tiny, the dream LLM isn't extracting (check thinking-disable).
+  python benchmarks/multihop_probe.py --probe SLICE.json --verbose   # NO --store
+  ```
+  Cost: one dream per question (~40 dreams for a 40-question slice). Requires the
+  box's extraction LLM (deepseek-v4-flash, thinking disabled).
+- **`--store` (mine an existing dreamed store, LLM-free, seconds):** faster, but
+  you must supply a store already dreamed to completion (step 1 below).
+
+1. **[store mode only] Get a store** with dreamed edges for these questions. LME
+   haystacks are
    per-question, so there is no single ready-made store — build one combined
    store: ingest the selected questions' sessions into one `hymem.sqlite` and
    dream it (reuse the adapter's ingest path), **or** point at a persistent
@@ -96,8 +118,8 @@ measures recall with the feature blind to the label.)
    Even fully dreamed, LME is personal-memory (user-centric), so genuine
    cross-entity bridges are a minority — a small multihop set is expected; the
    real G-A1 substrate is a Hermes production store.
-2. **Mine** (LLM-free, seconds). `--from` takes a results JSON (uses its
-   `per_question`: question + gold `answer` + `question_type`) or a bare
+2. **[store mode] Mine** (LLM-free, seconds). `--from` takes a results JSON (uses
+   its `per_question`: question + gold `answer` + `question_type`) or a bare
    `[{id,question,answer}]` list:
    ```bash
    python benchmarks/multihop_miner.py \
@@ -105,11 +127,11 @@ measures recall with the feature blind to the label.)
      --store STORE.sqlite --out SLICE.json
    # prints: scanned N → multihop M, control C, dropped D (no-seed …)
    ```
-   It mines MR+TR types by default (`--types` to change), enumerates bridges at
-   `--max-hops 3 --min-score 0.01` (broad — the probe/sweep tunes later), and
-   writes probe-ready items with `_`-prefixed hints (`_gold`, `_hop`,
+   Both modes mine MR+TR types by default (`--types` to change), enumerate bridges
+   at `--max-hops 3 --min-score 0.01` (broad — the probe/sweep tunes later), and
+   write probe-ready items with `_`-prefixed hints (`_gold`, `_hop`,
    `_answer_overlap`, `_alt_bridges`).
-3. **Verify** `SLICE.json` by hand — this is the human step, now short:
+3. **Verify** `SLICE.json` by hand (both modes) — this is the human step, now short:
    - For each `multihop` item, confirm `bridge` is the answer-bearing edge. If a
      different edge is right, swap in one from `_alt_bridges`; if none fit (the
      store lacks the fact, or the question isn't really multi-hop), delete the item.
