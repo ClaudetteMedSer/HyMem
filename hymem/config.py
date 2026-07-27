@@ -265,6 +265,21 @@ class HyMemConfig:
     the cap keeps the tier from bloating host prompts. Identity slots sort
     first, so they always survive the cut. `HyMem.profile()` is uncapped."""
 
+    rules_enabled: bool = False
+    """Idea B: load the `always_on` Rules tier (`hymem/rules.py`) into
+    `ctx.rules` on every `augment()` call — standing behavioral imperatives
+    ("always run the tests before pushing", "never suggest Docker") that are
+    rules, not facts/preferences. `always_on` rules inject unconditionally;
+    `contextual` rules inject only on a `trigger_entities`/`matched_entities`
+    overlap. Purely additive (own SELECT, never a retrieval competitor). Off by
+    default — rules add fixed token cost to the hot path, so flip only after the
+    box compliance gate clears (Idea B; tests/test_rules.py). A pre-v23 store
+    degrades to an empty tier."""
+    rules_context_cap: int = 16
+    """Max ACTIVE rules `augment()` returns in `ctx.rules` — `always_on` first,
+    then triggered `contextual`, stable by insertion order. Bounds the fixed
+    per-call token cost the rules tier adds to every context."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 
@@ -318,6 +333,15 @@ class HyMemConfig:
     graph_multihop_min_score: float = 0.05
     """Prune frontier paths whose compounding score falls below this — bounds
     fan-out from hub nodes and keeps the query path LLM-free and fast."""
+    graph_multihop_hub_degree_max: int = 32
+    """Hub guard: a node whose active degree (edges where it is subject OR object)
+    exceeds this is REACHED but never EXPANDED — the BFS will not fan out through
+    it. In a personal-memory star every leaf is 2 hops from every other leaf via
+    the `user` hub (degree = all facts about the user), so expanding hubs emits a
+    flood of hub-mediated non-bridges (`road_trip ← user → driving_trip`) that
+    dilute the true bridge out of `graph_top_k`. A genuine intermediate entity
+    (`medflow`, degree ~2) stays well below this, so real chains still bridge. Set
+    ≤ 0 to disable the guard (raw traversal). Only active when multi-hop is on."""
 
     decay_window_days: int = 30
     decay_factor: float = 0.9

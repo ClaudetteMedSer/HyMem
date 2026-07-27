@@ -5,15 +5,41 @@ from the repo root. The feature is already built and default-OFF; this runbook
 takes it through its two gates (**G-A1** recall probe → **G-A2** LME
 non-regression) and, on pass, flips it on.
 
+> ### ⚠️ UPDATE 2026-07-26 — read this first; it changes what the box should do
+> A box run took the miner→probe path on 40 LME MR/TR questions with **healthy
+> dreams** (200+ edges/question) and got **G-A1 FAIL, 0/4 bridges**. Root cause is
+> now understood and **fixed in the feature**, and it changes the plan below:
+> - **LME cannot validate Track A.** LME's graph is a personal-memory **star**
+>   centred on `user`; its only 2-hop paths run through that super-hub
+>   (`road_trip ← user → driving_trip`), which is a *hub-mediated non-bridge*, true
+>   of every pair of things the user mentioned. Genuine intermediate-entity bridges
+>   are ~0 in LME regardless of dream quality. **Do not spend box time hand-labeling
+>   an LME multi-hop slice — the substrate isn't bridge-shaped.**
+> - **Hub guard added** (`graph_multihop_hub_degree_max=32`): super-hubs are reached
+>   but never expanded, so on a star the feature is provably **inert** (ON == OFF),
+>   and genuine low-degree bridges still fire.
+> - **The mechanism gate is now CLOSED locally**, no box/LME needed:
+>   ```bash
+>   python benchmarks/multihop_probe.py --probe benchmarks/multihop_genuine_bridges.json --verbose
+>   # expect: multihop 0→100%, control held, ── G-A1 advisory: PASS ──
+>   ```
+> - **The box's remaining role is substrate-scoped to Hermes.** Phases A–E below
+>   apply **only to a Hermes production graph** (which has real intermediate
+>   entities), not LME. On LME there is nothing left to gate.
+
 ## State (already done, nothing to build)
-- Feature: `hymem/query/augment.py` (`_multihop_edges` + Source 4) +
-  `hymem/config.py` (`graph_multihop_{enabled=False,max_hops=2,decay=0.5,min_score=0.05}`).
+- Feature: `hymem/query/augment.py` (`_multihop_edges` + Source 4 + `_active_degrees`
+  hub guard) + `hymem/config.py`
+  (`graph_multihop_{enabled=False,max_hops=2,decay=0.5,min_score=0.05,hub_degree_max=32}`).
   **Default OFF** — no behaviour change until you flip it.
-- Synthetic ground-truth: `tests/test_multihop.py` (10 tests). Sanity-check:
+- Synthetic ground-truth: `tests/test_multihop.py` (14 tests, incl. 4 hub-guard).
+  Sanity-check:
   ```bash
-  python -m pytest tests/test_multihop.py -q          # expect 10 passed
+  python -m pytest tests/test_multihop.py -q          # expect 14 passed
   ```
-- Recall probe harness: `benchmarks/multihop_probe.py` (+ `multihop_probe_example.json`).
+- Recall probe harness: `benchmarks/multihop_probe.py`. Substrates:
+  `multihop_genuine_bridges.json` (**canonical local G-A1**, PASSES today) and
+  `multihop_probe_example.json` (schema demo).
 - Probe-set miner: `benchmarks/multihop_miner.py` (pre-fills the labeled set from a
   run's questions + a store, so Phase A is a verify pass, not authoring).
 - LME guard arm: `benchmarks/longmemeval_adapter.py --graph-multihop` (new flag;

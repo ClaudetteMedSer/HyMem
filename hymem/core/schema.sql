@@ -513,3 +513,28 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dream_runs_started ON dream_runs(started_at);
+
+-- v23: `always_on` Rules as a first-class node type (Idea B). Standing
+-- behavioral imperatives ("always run the tests before pushing") injected into
+-- every augment() context via ctx.rules; scope='contextual' rules fire only on
+-- trigger_entities overlap with matched_entities. Bi-temporal like
+-- knowledge_graph / user_profile (a contradicting rule closes invalid_at rather
+-- than overwriting); text UNIQUE so re-assert reinforces. See hymem/rules.py.
+-- Constraint (additional_planning.md §0): NOT fed into the RAPTOR digest anchor.
+CREATE TABLE IF NOT EXISTS rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL DEFAULT 'always_on'
+        CHECK (scope IN ('always_on', 'contextual')),
+    trigger_entities TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'user'
+        CHECK (source IN ('user', 'agent_inferred')),
+    pos_evidence INTEGER NOT NULL DEFAULT 1,
+    neg_evidence INTEGER NOT NULL DEFAULT 0,
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'retracted')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_rules_active ON rules(scope, status, invalid_at);

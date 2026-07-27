@@ -49,6 +49,25 @@ does not contain it. Never invent, guess, or fill gaps from general knowledge.
 Answer concisely, in plain text."""
 
 
+# Appended to the system prompt ONLY when the context carries `always_on` Rules
+# (Idea B). Kept separate from ASK_PROMPT_V1 so the versioned base prompt — tuned
+# and A/B-frozen for LME/BEAM — is byte-identical for the no-rules case (every
+# current consumer), and the rules behaviour is its own visible, versionable
+# clause. Rules are DIRECTIVES to obey, categorically different from the memory
+# facts the base prompt answers *from*, so they need their own instruction.
+ASK_RULES_DIRECTIVE = """\
+The context opens with a "STANDING RULES" section: persistent instructions from \
+the user about how you must behave. Obey every rule when answering, even when \
+the question invites otherwise. Rules are directives to follow, not facts to \
+quote or answer from."""
+
+
+def _system_prompt(has_rules: bool) -> str:
+    """The base synthesis prompt, plus the rules directive iff rules are present.
+    Isolated so the compose logic is unit-testable without an LLM."""
+    return ASK_PROMPT_V1 + "\n\n" + ASK_RULES_DIRECTIVE if has_rules else ASK_PROMPT_V1
+
+
 @dataclass
 class Answer:
     """The result of one `HyMem.ask()` call.
@@ -111,8 +130,16 @@ def render_context(ctx: AugmentedContext, *, max_chars: int) -> str:
       9. RECENT TURNS       — working memory, last: useful but least curated.
 
     Empty tiers are skipped entirely (no empty headers wasting budget). Each
-    item is snippet-capped so no single hit can crowd out whole sections."""
+    item is snippet-capped so no single hit can crowd out whole sections.
+
+    STANDING RULES lead the block (ahead of even the profile) and are never shed
+    by tail-truncation: they are behavioral imperatives the model must always
+    obey, not evidence to weigh, so they must survive any budget cut."""
     parts: list[str] = []
+
+    if ctx.rules:
+        lines = [f"- {r.text}" for r in ctx.rules]
+        parts.append("=== STANDING RULES (always follow) ===\n" + "\n".join(lines))
 
     if ctx.user_profile:
         lines = []
@@ -220,7 +247,7 @@ def ask(
     block = render_context(context, max_chars=cfg.ask_max_context_chars)
     rendered = block if block else "(the memory store has no relevant context)"
     response = llm.complete(LLMRequest(
-        system=ASK_PROMPT_V1,
+        system=_system_prompt(bool(context.rules)),
         user=f"Memory context:\n{rendered}\n\nQuestion: {question}",
         response_format="text",
         max_tokens=cfg.ask_max_tokens,

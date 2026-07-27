@@ -253,11 +253,53 @@ knee. `max_hops=2` is the likely first ship (cheapest, most of the gain).
 - **Guard flag**: `longmemeval_adapter.py --graph-multihop` (+
   `--graph-multihop-max-hops/--decay/--min-score`) wires the swept knobs into the
   adapter config and records them in run metadata — makes G-A2 runnable.
-- **PENDING (box)**: hand-label the mined LME/BEAM multi-hop slice (~60–100
-  items) into a probe JSON → run `multihop_probe.py` for the real **G-A1** read
-  → sweep the Pareto knee → one full LME **G-A2** guard (non-regression only vs
-  the 68.4% v4-flash-judged baseline). Ship default stays `False` until both
-  gates hold.
+
+### STATUS 2026-07-26 — box G-A1 on LME FAILED → real cause = hub-dilution → hub guard added, G-A1 PASSES locally
+
+The box ran the per-question miner on 40 MR/TR questions (dreams **healthy** —
+200+ edges / 30+ subjects each; the `dream_budget` loop worked), then G-A1 on the
+self-contained slice: **0/4 bridges, FAIL**. The box's stated cause ("BFS is
+subject→object only, object-only seeds have no outgoing edges") is **wrong** —
+`_multihop_edges` traverses `((s,o),(o,s))` (augment.py:1709), so it is already
+bidirectional and an object-only seed *does* reach `user`. The **real** cause:
+
+- **Hub dilution.** Every LME "bridge" runs through the `user` super-hub
+  (`road_trip ← user → driving_trip`). A leaf seed reaches `user` in 1 hop; hop 2
+  expands `user`, which is incident to *hundreds* of edges (worse in the merged
+  slice, which unions 40 questions' `user` edges). All emit as ~equal-weight
+  hop-2 candidates; `graph_top_k=8` truncates; the true bridge is buried. **Not
+  "can't reach" — "reaches everything and keeps 8."**
+- **The deeper truth:** a path through a super-hub is not a bridge — it holds for
+  *every pair* of things the user mentioned. **LME's personal-memory star has ~0
+  genuine (non-hub) intermediate-entity bridges** (40 questions → 4, all
+  hub-mediated). LME **cannot validate Track A** regardless of dream quality; this
+  confirms the standing prediction empirically. Hub paths are also net-negative in
+  production (flood query-irrelevant `user` edges).
+
+**Fix — hub guard (degree-cap):** new knob `graph_multihop_hub_degree_max=32`
+(config.py) + `_active_degrees` helper. A node whose active degree exceeds the cap
+is **reached but never expanded** — edges INTO it can still emit, but the BFS never
+fans OUT through it. Genuine intermediates (`medflow`, degree 2) stay far below the
+cap so real chains still bridge; the `user` hub (degree hundreds) is inert. `≤0`
+disables. **Deliberately does NOT rescue the 4 LME items** (they aren't bridges) —
+mechanism > score, no tuning toward them.
+
+- **pytest** (`tests/test_multihop.py`, now 14, all green in the 724-suite): guard
+  blocks fan-out through a degree-40 hub; guard-off floods ~39 siblings (proves the
+  guard is what suppresses it); low-degree intermediate still bridges with a hub in
+  the same store; end-to-end leaf-seed of a star yields **no** `fallback:multihop`
+  fact (ON == OFF on a star → inert, not harmful).
+- **Local G-A1 substrate**: `benchmarks/multihop_genuine_bridges.json` — 5 genuine
+  low-degree chains + 4 controls, needs **no box, no LME**. `multihop_probe.py`
+  reads **G-A1 PASS**: multihop 0→100%, control 100→100%, latency sub-floor. This
+  is the canonical mechanism gate; LME/BEAM slices only measure *substrate
+  richness*, which for personal-memory graphs is ~0.
+
+- **PENDING (box, now optional/Hermes-scoped)**: the mechanism gate is CLOSED
+  locally. The remaining reads are substrate-dependent and belong on a **Hermes
+  production graph** (which has genuine intermediate entities), not LME: mine that
+  graph → G-A1 on real bridges → sweep → G-A2 non-regression (vs 68.4%). Ship
+  default stays `False`; on LME the feature is provably inert with the guard on.
 
 ---
 
@@ -345,6 +387,57 @@ Mirror the P4 profile-tier box gate ([project_p4_profile_tier], ~95% pass):
    tests); retracted rules never surface.
 3. **Cost watch.** Rules add fixed token cost to every call — log it; "every
    context call" is the hot path.
+
+### STATUS 2026-07-26 — core mechanism BUILT (probe-first), default OFF
+
+The mechanical compliance gate and the tier it depends on are landed; the
+LLM-adherence half stays a box gate.
+
+- **Schema**: migration `023_rules.sql` + the `rules` table in `schema.sql`;
+  `EXPECTED_SCHEMA_VERSION` 22 → **23**. (The §0 note above is stale — it was
+  written when head was 21 and called this "v22"; head had already moved to 22,
+  so the rules table is **v23**.) Bi-temporal (`valid_at`/`invalid_at` +
+  `status`), `text UNIQUE`, `scope` and `source` CHECK-constrained.
+- **Feature** `hymem/rules.py`: `Rule` + `load_rules` (always_on unconditional;
+  contextual gated on `trigger_entities`∩`matched_entities`, canonicalized both
+  sides; always_on-first, capped; degrades to `[]` pre-v23) + `add_rule`
+  (redaction-scrubbed persist; `text`-UPSERT reinforces `pos_evidence` and
+  revives a retracted row; `supersedes` closes a prior interval) + `retract_rule`.
+- **Wiring**: `AugmentedContext.rules` + a `load_rules` call in `augment()`
+  right after `matched_entities` resolves, gated by `cfg.rules_enabled`
+  (default **False**) + `cfg.rules_context_cap=16`. Purely additive (own SELECT,
+  no tier's budget touched). **NOT** in `_anchor_facts` (§0 honoured).
+- **API**: `HyMem.add_rule(text, scope=, trigger_entities=, source=,
+  supersedes=)` / `HyMem.retract_rule(id)` — the *told-not-inferred* direct path,
+  mirroring `HyMem.ask()`.
+- **Render wiring** (added 2026-07-27): `render_context` in `hymem/query/ask.py`
+  emits a `=== STANDING RULES (always follow) ===` section FIRST (never shed by
+  tail-truncation), and `_system_prompt(has_rules)` appends `ASK_RULES_DIRECTIVE`
+  (obey-not-quote) to `ASK_PROMPT_V1` ONLY when rules are present — so the
+  versioned base prompt is byte-identical for every current (no-rules) consumer.
+  Without this the answerer never saw the rules; it is what makes adherence
+  measurable. Covered by 3 more pytests (render-first, directive-iff-rules,
+  ask() end-to-end).
+- **Gate — mechanical (`tests/test_rules.py`, 12 green in the 736-suite)**:
+  always_on injects on every query; default-OFF stays empty; contextual fires
+  iff trigger overlaps; always_on ranks before contextual; supersession +
+  retraction interval-close and stop surfacing; re-assert reinforces without
+  duplicating; pre-v23 degrades; rules render first + directive composes. E2E
+  smoke: fresh store → v23, rule surfaces on an unrelated query.
+- **Gate — LLM adherence (BOX-TESTABLE NOW)**: `benchmarks/rules_compliance.py`
+  + `benchmarks/rules_compliance_runbook.md`. Self-contained (6 rule/tempting-probe
+  triples, no LME/BEAM, no dream). Runs `ask()` ON vs OFF per triple, LLM-judges
+  compliance, and gates on THREE checks: (1) ON adherence ≥ `--threshold` (0.8),
+  (2) **ON > OFF** (the rule caused it, not the base model), (3) rule present in
+  every ON / no OFF context (mechanical invariant). Stub-mode plumbing verified;
+  needs a box run with a real answerer + an INDEPENDENT judge.
+- **PENDING**: (1) **run the box adherence gate** above (default flips to `True`
+  only on PASS with an independent judge; record answerer/judge/threshold here).
+  (2) **Extraction routing** — route the imperative+durable sub-slice of
+  `behavioral_markers` (`correction`/`rejection`) into `rules` during Phase-2
+  consolidation (`source='agent_inferred'`), no new LLM call. (3) **Surfaces** —
+  `hymem_add_rule` MCP tool + rules ahead of MEMORY.md in the Honcho
+  `context`/`card`. (4) **Cost watch** on the hot path.
 
 ---
 

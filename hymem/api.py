@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from hymem import portability
 from hymem import redaction
+from hymem import rules as rules_mod
 from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
@@ -283,6 +284,47 @@ class HyMem:
                 )
                 for role, content, created_at in prepared
             ]
+
+    def add_rule(
+        self,
+        text: str,
+        *,
+        scope: str = "always_on",
+        trigger_entities: list[str] | None = None,
+        source: str = "user",
+        supersedes: int | None = None,
+    ) -> int:
+        """Add (or reinforce) a standing behavioral rule; return its id.
+
+        Rules are the imperative subset of "always loaded" context ("always run
+        the tests before pushing", "never suggest Docker") — a first-class node
+        type (schema v23) injected into every `augment()` call via `ctx.rules`
+        when `cfg.rules_enabled` is set. `scope='always_on'` (default) injects
+        unconditionally; `scope='contextual'` injects only when a
+        `trigger_entities` member overlaps the call's matched entities.
+
+        Rules are often *told*, not inferred, so this mirrors the `HyMem.ask()`
+        direct-API pattern. `supersedes` closes a prior rule's validity interval
+        (bi-temporal — a contradicting instruction supersedes rather than
+        overwrites). Re-asserting identical text reinforces instead of
+        duplicating. Text is redaction-scrubbed at persist time.
+        """
+        with core_db.transaction(self.conn):
+            return rules_mod.add_rule(
+                self.conn,
+                text,
+                scope=scope,
+                trigger_entities=trigger_entities,
+                source=source,
+                supersedes=supersedes,
+            )
+
+    def retract_rule(self, rule_id: int) -> None:
+        """Retire a rule by closing its validity interval (`status='retracted'`
+        + `invalid_at`); it stops surfacing in `ctx.rules` but stays in the table
+        as auditable history. Idempotent."""
+        with core_db.transaction(self.conn):
+            rules_mod.retract_rule(self.conn, rule_id)
 
     # ---- query-time --------------------------------------------------
 

@@ -18,6 +18,7 @@ from hymem.query.entities import GraphCount, count_relations, match_known_entiti
 from hymem.query.intent import detect_ability_signal
 from hymem.query.predicate_routing import route_predicates
 from hymem.query.rerank import rerank as run_rerank
+from hymem.rules import Rule, load_rules
 from hymem.session import Message, recent_messages
 
 log = logging.getLogger("hymem.query.augment")
@@ -236,6 +237,17 @@ class AugmentedContext:
     extracted profile facts, when `cfg.profile_extraction_enabled` is False, or
     on a pre-v18 store. Capped at `cfg.profile_context_cap`, identity slots
     first; values are already redaction-scrubbed at persist time."""
+    rules: list[Rule] = field(default_factory=list)
+    """ACTIVE `always_on` Rules (schema v23) — standing behavioral imperatives
+    ("always run the tests before pushing", "never suggest Docker") loaded into
+    EVERY call when `cfg.rules_enabled` is set. `always_on` rules load
+    unconditionally; `contextual` rules load only when a `trigger_entities`
+    member overlaps `matched_entities`. ADDITIVE like the profile/aggregation
+    tiers: a standalone SELECT (`hymem.rules.load_rules`) that never consumes a
+    slot from any retrieval tier. Capped at `cfg.rules_context_cap`, `always_on`
+    first. Empty when `rules_enabled` is False or on a pre-v23 store. Values are
+    redaction-scrubbed at persist time. Deliberately NOT in the RAPTOR digest
+    anchor (additional_planning.md §0)."""
     digest: Digest | None = None
     """The standing whole-store root digest (see `HyMem.digest()`), populated
     only when `cfg.augment_include_digest` is True — the Stage-5 convenience
@@ -529,6 +541,14 @@ def augment(
         if e not in combined:
             combined.append(e)
     ctx.matched_entities = combined
+
+    # Idea B `always_on` Rules tier — loaded here (after matched_entities is
+    # resolved) so `contextual` rules can gate on entity overlap; `always_on`
+    # rules inject unconditionally. Its own SELECT, so purely additive — no
+    # other tier's budget is touched. Degrades to [] on a pre-v23 store.
+    if cfg.rules_enabled:
+        ctx.rules = load_rules(conn, ctx.matched_entities, cap=cfg.rules_context_cap)
+
     routed = route_predicates(user_message)
     ctx.graph_facts = _graph_lookup(
         conn, cfg, user_message, ctx.matched_entities, expansion_info, routed,
@@ -1721,11 +1741,51 @@ def _multihop_edges(
                     reached[far] = path_score
                     if path_score > next_scores.get(far, 0.0):
                         next_scores[far] = path_score
-        # Advance only the strongest frontier nodes into the next hop.
-        frontier = sorted(next_scores, key=next_scores.get, reverse=True)[
-            :_MULTIHOP_FRONTIER_CAP
-        ]
+        # Advance the strongest frontier nodes into the next hop — but apply the
+        # hub guard first. A super-hub (degree > graph_multihop_hub_degree_max) is
+        # REACHED (it stays in `reached`, so an edge INTO it can still emit) but is
+        # never EXPANDED: fanning out from it would make every one of its leaves a
+        # 2-hop "bridge" of every other leaf (`road_trip ← user → driving_trip`),
+        # flooding graph_top_k with hub-mediated non-bridges and diluting the true
+        # bridge out of recall. A genuine intermediate (degree ~2) is far below the
+        # cap, so real chains still bridge. `<= 0` disables the guard.
+        candidates = sorted(next_scores, key=next_scores.get, reverse=True)
+        if cfg.graph_multihop_hub_degree_max > 0 and candidates:
+            probe = candidates[: _MULTIHOP_FRONTIER_CAP * 2]
+            degrees = _active_degrees(conn, probe)
+            candidates = [
+                n
+                for n in probe
+                if degrees.get(n, 0) <= cfg.graph_multihop_hub_degree_max
+            ]
+        frontier = candidates[:_MULTIHOP_FRONTIER_CAP]
     return out
+
+
+def _active_degrees(
+    conn: sqlite3.Connection, nodes: list[str]
+) -> dict[str, int]:
+    """Active degree (count of active edges where the node is subject OR object)
+    for each node, in a single query — the hub guard's fan-out test in
+    `_multihop_edges`. A node absent from the result has degree 0. (A self-loop
+    edge, subject==object, is counted twice; those are effectively absent in this
+    graph, so degree == incident-edge count in practice.)"""
+    if not nodes:
+        return {}
+    ph = ",".join("?" * len(nodes))
+    rows = conn.execute(
+        f"""
+        SELECT node, COUNT(*) AS deg FROM (
+            SELECT subject_canonical AS node FROM knowledge_graph
+             WHERE status = 'active' AND subject_canonical IN ({ph})
+            UNION ALL
+            SELECT object_canonical AS node FROM knowledge_graph
+             WHERE status = 'active' AND object_canonical IN ({ph})
+        ) GROUP BY node
+        """,
+        nodes + nodes,
+    ).fetchall()
+    return {r["node"]: r["deg"] for r in rows}
 
 
 def _recency_edges(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
