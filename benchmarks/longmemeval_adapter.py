@@ -428,7 +428,9 @@ class HyMemAdapter:
                  graph_multihop: bool = False,
                  graph_multihop_max_hops: int | None = None,
                  graph_multihop_decay: float | None = None,
-                 graph_multihop_min_score: float | None = None):
+                 graph_multihop_min_score: float | None = None,
+                 rules_enabled: bool | None = None,
+                 rules_extraction: bool | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -442,6 +444,8 @@ class HyMemAdapter:
         self.graph_multihop_max_hops = graph_multihop_max_hops
         self.graph_multihop_decay = graph_multihop_decay
         self.graph_multihop_min_score = graph_multihop_min_score
+        self.rules_enabled = rules_enabled
+        self.rules_extraction = rules_extraction
         self.hy = None
 
     def open(self):
@@ -490,6 +494,17 @@ class HyMemAdapter:
                 overrides["graph_multihop_decay"] = self.graph_multihop_decay
             if self.graph_multihop_min_score is not None:
                 overrides["graph_multihop_min_score"] = self.graph_multihop_min_score
+        # Idea B rules tier. READ side (rules_enabled) is inert on LME — the
+        # harness never calls add_rule() and there are no rule-obedience
+        # questions — so --no-rules vs default is a flat non-regression control.
+        # WRITE side (--rules-extraction) is the only lever that changes the LME
+        # answer path: it routes dream markers into agent_inferred rules that then
+        # inject into every ask(). None = keep the config default (rules on,
+        # extraction off).
+        if self.rules_enabled is not None:
+            overrides["rules_enabled"] = self.rules_enabled
+        if self.rules_extraction is not None:
+            overrides["rules_extraction_enabled"] = self.rules_extraction
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,
@@ -1464,7 +1479,9 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
                           graph_multihop=args.graph_multihop,
                           graph_multihop_max_hops=args.graph_multihop_max_hops,
                           graph_multihop_decay=args.graph_multihop_decay,
-                          graph_multihop_min_score=args.graph_multihop_min_score)
+                          graph_multihop_min_score=args.graph_multihop_min_score,
+                          rules_enabled=args.rules,
+                          rules_extraction=args.rules_extraction)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -2139,6 +2156,22 @@ def main():
     parser.add_argument("--graph-multihop-min-score", type=float, default=None,
                         help="(with --graph-multihop) override cfg.graph_multihop_min_score "
                              "(default 0.05). None = config default.")
+    parser.add_argument("--rules", action=argparse.BooleanOptionalAction, default=None,
+                        help="Idea B READ side (cfg.rules_enabled). None = config default "
+                             "(ON). Pass --no-rules for the pre-Idea-B control arm. NOTE: "
+                             "INERT on LME — the harness never calls add_rule() and LME has "
+                             "no rule-obedience questions, so --rules vs --no-rules is a flat "
+                             "non-regression check, NOT a needle-mover. Rule adherence is "
+                             "gated by benchmarks/rules_compliance.py, not here.")
+    parser.add_argument("--rules-extraction", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Idea B WRITE side (cfg.rules_extraction_enabled). None = config "
+                             "default (OFF). The ONLY rules lever that changes the LME answer "
+                             "path: it routes dream markers into agent_inferred rules that then "
+                             "inject into every ask(). This is the non-regression guard for "
+                             "flipping the write-side default — expected FLAT on LME (factual "
+                             "recall, not behavior); a regression means auto-rules pollute "
+                             "answers, so DON'T flip. Requires a dream pass.")
     parser.add_argument("--value-supersession", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Bi-temporal KU lever (cfg.value_supersession_enabled): the "

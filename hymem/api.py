@@ -326,6 +326,13 @@ class HyMem:
         with core_db.transaction(self.conn):
             rules_mod.retract_rule(self.conn, rule_id)
 
+    def rules(self) -> list[rules_mod.Rule]:
+        """Every ACTIVE rule (always_on + contextual), the whole rulebook — the
+        read-side counterpart to `add_rule`, mirroring `profile()`. Unlike the
+        per-call `ctx.rules` (trigger-gated, capped) this is the full set, for a
+        host that wants to show or audit what standing rules exist. Read-only."""
+        return rules_mod.list_rules(self.read_conn)
+
     # ---- query-time --------------------------------------------------
 
     def augment(

@@ -265,20 +265,33 @@ class HyMemConfig:
     the cap keeps the tier from bloating host prompts. Identity slots sort
     first, so they always survive the cut. `HyMem.profile()` is uncapped."""
 
-    rules_enabled: bool = False
+    rules_enabled: bool = True
     """Idea B: load the `always_on` Rules tier (`hymem/rules.py`) into
     `ctx.rules` on every `augment()` call — standing behavioral imperatives
     ("always run the tests before pushing", "never suggest Docker") that are
     rules, not facts/preferences. `always_on` rules inject unconditionally;
     `contextual` rules inject only on a `trigger_entities`/`matched_entities`
-    overlap. Purely additive (own SELECT, never a retrieval competitor). Off by
-    default — rules add fixed token cost to the hot path, so flip only after the
-    box compliance gate clears (Idea B; tests/test_rules.py). A pre-v23 store
-    degrades to an empty tier."""
+    overlap. Purely additive (own SELECT, never a retrieval competitor). ON by
+    default since the box adherence gate cleared 2026-07-27 (answerer
+    deepseek-v4-flash, INDEPENDENT judge gpt-oss-120b, threshold 0.8, ON>OFF —
+    `benchmarks/rules_compliance.py`). Inert until rules exist: an empty `rules`
+    table (or a pre-v23 store) yields an empty tier, so the default adds no cost
+    until a host calls `add_rule()`."""
     rules_context_cap: int = 16
     """Max ACTIVE rules `augment()` returns in `ctx.rules` — `always_on` first,
     then triggered `contextual`, stable by insertion order. Bounds the fixed
     per-call token cost the rules tier adds to every context."""
+    rules_extraction_enabled: bool = False
+    """Idea B write-side: during Phase-2 consolidation, route the imperative,
+    durable sub-slice of `behavioral_markers` (rejection/style, and imperative-
+    shaped corrections) into the `rules` table as `source='agent_inferred'`
+    rules — so a standing instruction the user *stated in passing* ("stop
+    suggesting Docker") becomes an always_on rule without a `add_rule()` call
+    and WITHOUT a new LLM call (it reuses markers the dream already extracted).
+    Off by default: an auto-rule injects into EVERY context, so a false positive
+    is costly — flip only after the extraction precision probe clears on real
+    dream markers (`benchmarks/rule_extraction_probe.py`; precision is the gated
+    metric, not recall). Independent of `rules_enabled` (read side)."""
 
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000

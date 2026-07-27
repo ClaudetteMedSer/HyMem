@@ -431,13 +431,49 @@ LLM-adherence half stays a box gate.
   (2) **ON > OFF** (the rule caused it, not the base model), (3) rule present in
   every ON / no OFF context (mechanical invariant). Stub-mode plumbing verified;
   needs a box run with a real answerer + an INDEPENDENT judge.
-- **PENDING**: (1) **run the box adherence gate** above (default flips to `True`
-  only on PASS with an independent judge; record answerer/judge/threshold here).
-  (2) **Extraction routing** — route the imperative+durable sub-slice of
-  `behavioral_markers` (`correction`/`rejection`) into `rules` during Phase-2
-  consolidation (`source='agent_inferred'`), no new LLM call. (3) **Surfaces** —
-  `hymem_add_rule` MCP tool + rules ahead of MEMORY.md in the Honcho
-  `context`/`card`. (4) **Cost watch** on the hot path.
+- **GATE CLEARED 2026-07-27 → default FLIPPED ON.** Box ran
+  `benchmarks/rules_compliance.py` with answerer `deepseek-v4-flash` + an
+  INDEPENDENT judge `openai/gpt-oss-120b` (OpenRouter), threshold 0.8 — PASS on
+  all three checks (ON≥0.8, ON>OFF, rule-present invariant). `rules_enabled`
+  default `False`→`True` in `hymem/config.py` (docstring updated); the
+  `test_default_off_no_rules_tier` assertion was repurposed to the new default-ON
+  behaviour + a `test_rules_tier_can_be_disabled` opt-out test (local suite 737
+  green; box 651). The tier is INERT until a host calls `add_rule()` (empty
+  `rules` table → empty tier), so ON-by-default adds no cost on stores without rules.
+### STATUS 2026-07-27 — extraction routing + surfaces BUILT; 3-gate scorecard
+
+Idea B is now backed by three data-driven gates (see
+`benchmarks/rules_compliance_runbook.md`): **adherence** (CLEARED, above),
+**extraction precision**, **overhead**.
+
+- **Extraction routing (write side)**: `rules.route_markers_to_rules` +
+  `rule_scope_for_marker`, wired into runner Phase-2 (gated `cfg.rules_extraction_enabled`,
+  default **OFF**), reusing already-extracted markers → NO new LLM call. Policy:
+  `style` routes on kind; `rejection`/`correction` require an imperative cue
+  (`_DIRECTIVE_RE`); `preference` never routes. `DreamReport.rules_extracted`
+  reports the count. Emits `source='agent_inferred'` rules; idempotent via
+  add_rule's text-UPSERT.
+- **Extraction PRECISION gate** (`benchmarks/rule_extraction_probe.py`,
+  deterministic, runs anywhere): scores `rule_scope_for_marker` on a hand-labeled
+  marker set. **Data-driven tuning loop paid off**: first run **85% (FAIL)** — the
+  3 FPs were rejection *one-offs* ("rejected the Tuesday meeting"); tightened the
+  policy to require the directive cue for rejection too (past-tense forms
+  excluded) → **100% precision / 100% recall (PASS)**. Precision is gated
+  (default ≥0.90); a false rule pollutes every call. Box must re-validate on REAL
+  dream markers (`--labels markers.json`) before flipping the write-side default.
+- **OVERHEAD gate** (`benchmarks/rules_overhead.py`, deterministic): ON/empty
+  adds **0 rendered chars** (proves the ON-by-default read side is free until
+  `add_rule()`); ON/full (16 rules) = 1138 chars / **0.034ms p95** overhead. PASS.
+- **Surfaces**: `HyMem.add_rule/rules/retract_rule`; MCP `hymem_add_rule` +
+  `hymem_list_rules` (`server.py`); Honcho — active rules lead the peer card +
+  peer/session context ahead of MEMORY.md (`honcho/app.py::_rules_block`).
+- **Gates — mechanical (`tests/test_rules.py`, 21 green; full suite 746)**: adds
+  classifier + end-to-end dream-routing (routes imperative markers, skips
+  one-offs, respects the write-side gate) + `list_rules` + MCP tools + Honcho
+  card/context surfacing + inert-when-empty.
+- **PENDING**: (1) box re-validate extraction precision on real dream markers →
+  flip `rules_extraction_enabled` ON. (2) optionally sweep the adherence probe
+  with a larger/adversarial probe set for the competitive writeup.
 
 ---
 

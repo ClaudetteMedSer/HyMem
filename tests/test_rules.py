@@ -25,8 +25,15 @@ from dataclasses import replace
 import pytest
 
 from hymem import HyMem
-from hymem.rules import add_rule, load_rules, retract_rule
-from tests.conftest import seed_edge
+from hymem.rules import (
+    add_rule,
+    list_rules,
+    load_rules,
+    retract_rule,
+    route_markers_to_rules,
+    rule_scope_for_marker,
+)
+from tests.conftest import make_routed_llm, seed_edge
 
 
 @pytest.fixture
@@ -49,10 +56,29 @@ def test_always_on_rule_injected_regardless_of_query(hyr):
         assert "always run the tests before pushing" in _rule_texts(hyr.augment(q))
 
 
-def test_default_off_no_rules_tier(hy):
-    """The stock `hy` fixture has rules_enabled=False → tier stays empty."""
+def test_default_config_loads_rules(hy):
+    """Default flipped ON 2026-07-27 (box adherence gate cleared): the stock `hy`
+    fixture (default config) loads the tier, so a rule surfaces on any query."""
     hy.add_rule("always run the tests before pushing")
+    assert "always run the tests before pushing" in _rule_texts(hy.augment("anything at all"))
+
+
+def test_rules_enabled_but_empty_is_inert(hy):
+    """Default is ON, but with no rules added the tier is empty — the basis of
+    the zero-overhead claim (benchmarks/rules_overhead.py) that makes ON-by-
+    default safe on every existing rule-less store."""
     assert hy.augment("anything at all").rules == []
+
+
+def test_rules_tier_can_be_disabled(cfg, stub_llm):
+    """A host can still opt out: rules_enabled=False → tier stays empty even with
+    a rule present."""
+    off = HyMem(replace(cfg, rules_enabled=False), llm=stub_llm)
+    try:
+        off.add_rule("always run the tests before pushing")
+        assert off.augment("anything at all").rules == []
+    finally:
+        off.close()
 
 
 # ── 2. contextual fires only on trigger overlap (load_rules unit) ───────────
@@ -171,3 +197,67 @@ def test_ask_end_to_end_surfaces_rules(hyr, stub_llm):
     hyr.add_rule("never suggest docker")
     ans = hyr.ask("how should I containerize this app?")
     assert "never suggest docker" in {r.text for r in ans.context.rules}
+
+
+# ── list_rules (the whole rulebook, trigger-agnostic) ───────────────────────
+
+def test_list_rules_returns_all_active_regardless_of_trigger(hyr):
+    hyr.add_rule("always one")
+    add_rule(hyr.conn, "ctx one", scope="contextual", trigger_entities=["redis"])
+    hyr.conn.commit()
+    assert {r.text for r in hyr.rules()} == {"always one", "ctx one"}
+    # ordering: always_on first
+    assert hyr.rules()[0].text == "always one"
+
+
+# ── marker → rule routing (write-side extraction) ───────────────────────────
+
+def test_rule_scope_classifier():
+    # rejection / style are directive by kind
+    assert rule_scope_for_marker("rejection", "The user rejects using MongoDB") == "always_on"
+    assert rule_scope_for_marker("style", "Write commit messages in imperative mood") == "always_on"
+    # a correction routes only when imperative-shaped
+    assert rule_scope_for_marker("correction", "Always run the tests before pushing") == "always_on"
+    assert rule_scope_for_marker("correction", "The meeting is Tuesday, not Monday") is None
+    # a preference is a taste, never a rule (even if phrased with 'never')
+    assert rule_scope_for_marker("preference", "Never uses tabs, prefers spaces") is None
+
+
+def _dream_with_markers(cfg, stub_llm, markers, *, extraction_on):
+    hy = HyMem(
+        replace(cfg, rules_enabled=True, rules_extraction_enabled=extraction_on),
+        llm=make_routed_llm([], markers),
+    )
+    hy.log_message("s1", "user",
+                   "Correction: never suggest Docker. Always use systemd instead.")
+    hy.log_message("s1", "assistant", "Understood.")
+    hy.dream()
+    return hy
+
+
+def test_dream_routes_imperative_markers_to_rules(cfg, stub_llm):
+    markers = [
+        {"kind": "rejection", "statement": "Never suggest Docker"},
+        {"kind": "style", "statement": "Write commit messages in the imperative mood"},
+        {"kind": "correction", "statement": "The meeting is Tuesday, not Monday"},  # one-off
+    ]
+    hy = _dream_with_markers(cfg, stub_llm, markers, extraction_on=True)
+    try:
+        active = hy.rules()
+        texts = {r.text for r in active}
+        assert "Never suggest Docker" in texts
+        assert "Write commit messages in the imperative mood" in texts
+        assert "The meeting is Tuesday, not Monday" not in texts   # non-imperative correction
+        agent = [r for r in active if r.source == "agent_inferred"]
+        assert len(agent) == 2 and all(r.scope == "always_on" for r in agent)
+    finally:
+        hy.close()
+
+
+def test_dream_extraction_disabled_mints_no_rules(cfg, stub_llm):
+    markers = [{"kind": "rejection", "statement": "Never suggest Docker"}]
+    hy = _dream_with_markers(cfg, stub_llm, markers, extraction_on=False)
+    try:
+        assert hy.rules() == []       # write-side gated off → no agent_inferred rules
+    finally:
+        hy.close()

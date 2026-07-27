@@ -192,3 +192,18 @@ def test_hymem_retract_succeeds_for_existing_edge(hy):
     srv.set_hy(hy)
     result = srv._do_retract("med_flow", "depends_on", "redis")
     assert result == "retracted"
+
+
+def test_hymem_add_and_list_rules(hy):
+    srv.set_hy(hy)
+    assert srv._do_add_rule("never suggest docker").startswith("rule #")
+    srv._do_add_rule("prefer pytest", "contextual", "pytest, tests")
+    listed = srv._do_list_rules()
+    assert "never suggest docker" in listed
+    assert "[always_on]" in listed
+    assert "contextual(" in listed and "pytest" in listed
+
+
+def test_hymem_add_rule_rejects_empty(hy):
+    srv.set_hy(hy)
+    assert srv._do_add_rule("   ").startswith("error")

@@ -1,82 +1,85 @@
-# Idea B (`always_on` Rules) — box runbook: the LLM-adherence gate
+# Idea B (`always_on` Rules) — data-driven scorecard + box runbook
 
-**Audience:** whoever runs the Hermes box. The feature is built and **default
-OFF**; this is the one gate it needs before the default can flip — does the
-answering model actually OBEY a standing rule? It mirrors the P4 profile box gate
-(a pass/fail adherence gate, NOT a benchmark number). Copy-paste from the repo root.
+**Audience:** whoever runs the Hermes box. Idea B gives standing behavioral
+imperatives ("always run the tests before pushing", "never suggest Docker") a
+first-class home injected into every context call. To beat other memory systems
+on this, the claim is backed by three measurable gates, not vibes:
 
-## What's already done (nothing to build)
-- Feature: `hymem/rules.py` + `ctx.rules` in `augment()` (gated on
-  `cfg.rules_enabled`, default False) + `HyMem.add_rule()`/`retract_rule()` +
-  rules rendered FIRST in `hymem/query/ask.py` with an obey-directive appended to
-  the system prompt when rules are present. Schema v23 (`rules` table).
-- Mechanical gate (no LLM, runs anywhere):
-  ```bash
-  python -m pytest tests/test_rules.py -q          # expect 12 passed
-  ```
-- Adherence harness: `benchmarks/rules_compliance.py` (self-contained — 6
-  rule/tempting-probe triples, no LME/BEAM data, no dream).
+| Gate | Question | Metric | Where it runs | Status |
+|------|----------|--------|---------------|--------|
+| **Adherence** | Does the model OBEY a rule in context? | ON>OFF compliance, ON≥0.8 | box (needs LLM) | **CLEARED** 2026-07-27 (judge gpt-oss-120b) → read side default ON |
+| **Extraction precision** | Are auto-inferred rules CORRECT? | precision ≥ 0.90 | anywhere (deterministic) | **PASS** locally 100% — pending box run on real markers → write side default OFF |
+| **Overhead** | What does the tier COST per call? | 0 chars when empty; p95 Δ ≤ 1ms | anywhere (deterministic) | **PASS** locally (0 chars empty; 1138 chars / 0.034ms at 16 rules) |
 
-## Prerequisites
-- An OpenAI-compatible LLM endpoint + key. Install the client extra once:
-  ```bash
-  pip install 'hymem[server]'
-  export HYMEM_LLM_API_KEY=...          # or DEEPSEEK_API_KEY / OPENAI_API_KEY
-  ```
-- Optional dry run (no API — proves the pipeline, not adherence):
-  ```bash
-  python benchmarks/rules_compliance.py --answer-model stub --judge-model stub
-  # expect: rule@ON all "yes", the "rule present in every ON / no OFF" check ✓.
-  ```
+Two switches, gated independently:
+- `rules_enabled` (read side) — **ON** (adherence gate cleared). Inert until rules exist.
+- `rules_extraction_enabled` (write side) — **OFF** until the extraction gate clears on *real* dream markers (below).
 
-## Run the gate
+---
+
+## Gate 1 — Adherence (LLM, box)
+Does the answering model actually obey a rule that's in context? Mirrors the P4
+profile box gate.
 ```bash
+python -m pytest tests/test_rules.py -q            # mechanical prereq: expect all green
+pip install 'hymem[server]'
+export HYMEM_LLM_API_KEY=...                        # or DEEPSEEK_API_KEY / OPENAI_API_KEY
 python benchmarks/rules_compliance.py \
     --answer-model deepseek-v4-flash \
-    --judge-model  deepseek-v4-flash \
+    --judge-model  openai/gpt-oss-120b --judge-base-url <openrouter-url> \
     --verbose
 ```
-For a machine-readable line instead: add `--json`. To point at a different
-answerer (gpt-oss, a local vLLM, Claude): `--answer-model <name>
---answer-base-url <url> [--answer-api-key <key>]` (same trio for `--judge-*`).
+> Use an INDEPENDENT judge (answerer ≠ judge). PASS = ON adherence ≥ 0.8 **and**
+> ON > OFF **and** rule present in every ON / no OFF context. This cleared
+> 2026-07-27 (answerer deepseek-v4-flash, judge gpt-oss-120b), so `rules_enabled`
+> ships ON. Re-run only if the render/prompt wiring changes.
 
-> **Judge independence.** The harness defaults answerer == judge for
-> convenience, but a model grading its own output can flatter itself. For the
-> gate of record, prefer a DIFFERENT (ideally stronger/neutral) judge, e.g.
-> `--answer-model deepseek-v4-flash --judge-model gpt-oss-120b
-> --judge-base-url <gpt-oss-url>`. Hold the judge fixed across any re-runs.
+## Gate 2 — Extraction precision (deterministic; box validates on real markers)
+`route_markers_to_rules` promotes the imperative sub-slice of behavioral markers
+into `agent_inferred` rules during dreaming. A false positive becomes a rule
+injected into EVERY call, so **precision is the gate** (recall is reported only).
 
-## How the harness works
-Per triple it asks the SAME question twice on a fresh store:
-- **ON** (`rules_enabled=True`) — the rule is in context + the obey-directive.
-- **OFF** (`rules_enabled=False`) — no standing rule; the base model's default.
+The classifier is deterministic, so the probe runs anywhere:
+```bash
+python benchmarks/rule_extraction_probe.py          # built-in labeled set → PASS at 100%
+```
+**But the built-in set is hand-written.** Before flipping `rules_extraction_enabled`
+ON, validate the classifier against the markers YOUR dream LLM actually produces:
+```bash
+# 1. Dream over real sessions, then dump the markers the LLM produced:
+sqlite3 -json "$HYMEM_ROOT/hymem.sqlite" \
+  "SELECT kind, statement FROM behavioral_markers" > markers.json
+# 2. Hand-label each with "is_rule": true/false (is it a STANDING imperative,
+#    or a one-off fact/preference?), then:
+python benchmarks/rule_extraction_probe.py --labels markers.json --verbose
+```
+PASS (precision ≥ 0.90) on real markers → flip `rules_extraction_enabled` default
+to `True` and record the precision + n here. FAIL → read the FP list; the fix is
+the classifier in `hymem/rules.py::rule_scope_for_marker` (e.g. tighten the
+directive-cue vocabulary), NOT the probe. Local tuning already caught the
+rejection one-off leak (85%→100%) this way.
 
-A judge scores each answer `comply` / `violate` / `unclear`. The OFF arm is the
-control: it isolates whether the RULE caused compliance or the model already
-behaved that way.
+## Gate 3 — Overhead (deterministic, the cost watch)
+Rules ride on the hot path, so the tier must be near-free.
+```bash
+python benchmarks/rules_overhead.py --reps 400
+```
+PASS = ON-but-empty adds 0 rendered chars (the default is free until `add_rule()`),
+and a saturated rulebook (cap=16) stays within the p95 latency budget. Local:
+1138 chars / 0.034ms p95 at 16 rules.
 
-## Read the result — the gate PASSES iff all three hold
-1. **ON adherence ≥ threshold** (`--threshold`, default 0.8) — the model obeys
-   when told.
-2. **ON > OFF** — compliance is caused by the rule, not the base model's habits.
-   *A rule that "passes" only because OFF also complies has proven nothing.*
-3. **rule present in every ON context and no OFF context** — the mechanical
-   invariant; a ✗ here is a wiring regression, not a model result.
+---
 
-Exit code is 0 on PASS, 1 on FAIL (0 for a stub run — its gate is meaningless).
+## Surfaces (already wired)
+- **Direct/MCP**: `HyMem.add_rule()`/`rules()`/`retract_rule()`; MCP tools
+  `hymem_add_rule` + `hymem_list_rules` (registered in `hymem/server.py`).
+- **Honcho**: active rules lead the peer card + peer/session context
+  representation, ahead of MEMORY.md (`hymem/honcho/app.py::_rules_block`).
+- **Ask renderer**: rules render first in `ask()` context + an obey-directive is
+  appended to the system prompt when rules are present.
 
 ## Decide
-- **PASS** → the tier is safe to enable. Flip `rules_enabled` default to `True`
-  in `hymem/config.py`, bank the adherence table + the answerer/judge/threshold
-  used in `additional_planning.md` §Idea B STATUS, then commit.
-- **FAIL on (1)** → the model ignores rules even in-context; a system-prompt/
-  directive change is needed (test as its own A/B — recall the DeepSeek procedural
-  regression, keep it simple). Default stays OFF.
-- **FAIL on (2) only** → the probe set is too easy (base model already complies).
-  Sharpen the probes to tempt violation harder (`--probes my_probes.json`,
-  same `{id,rule,question,watch}` schema) and re-run; not a feature failure.
-- **FAIL on (3)** → a rendering/wiring regression — re-run the mechanical pytest
-  and fix before trusting any LLM numbers.
-
-The ship default stays `False` until (1)+(2)+(3) hold on a run with an
-independent judge.
+- Read side is ON. Leave it — inert on rule-less stores.
+- Flip **write side** (`rules_extraction_enabled`) only after Gate 2 passes on
+  real dream markers. Then commit and record the numbers in
+  `additional_planning.md` §Idea B STATUS.

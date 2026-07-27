@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -41,6 +42,99 @@ log = logging.getLogger("hymem.rules")
 
 RULE_SCOPES = frozenset({"always_on", "contextual"})
 RULE_SOURCES = frozenset({"user", "agent_inferred"})
+
+# ── marker → rule routing (Idea B write-side) ───────────────────────────────
+# Which behavioral_marker kinds can become a standing rule. `preference` is
+# excluded on purpose: a preference is a taste ("likes dark mode"), not an
+# imperative the agent must obey on every turn — it belongs in profile_entries,
+# not in a rule injected into every context.
+_RULE_KINDS = frozenset({"rejection", "style", "correction"})
+
+# High-precision imperative test. A rule injects into EVERY call, so a false
+# positive is costly. The cue vocabulary is the standing-directive words a
+# durable rule uses ("never use X", "avoid Y", "prefer Z"). Inflections are
+# matched (avoids?, refuses?) but PAST-TENSE one-off forms are deliberately NOT:
+# `rejects?` matches "rejects X" (a standing avoidance) but not "rejected the
+# Tuesday meeting" (a one-off event) — the extraction probe caught exactly those
+# rejection one-offs as the precision leak, so the policy below requires this cue
+# for rejection AND correction, trusting the kind only for `style`.
+_DIRECTIVE_RE = re.compile(
+    r"\b(always|never|do\s*not|don'?t|must(?:\s*not)?|avoids?|rejects?|refuses?|"
+    r"forbids?|requires?|prefers?|instead|only\s+ever|no\s+longer|stop|ensure|"
+    r"make\s+sure|should\s+(?:always|never))\b",
+    re.IGNORECASE,
+)
+
+
+def rule_scope_for_marker(kind: str, statement: str) -> str | None:
+    """Classify a behavioral marker: return the rule scope it should become, or
+    None if it is not a standing imperative. Deterministic, LLM-free — this is
+    the whole routing policy, and the metric the extraction probe gates on.
+
+    Policy (precision-first, tuned against `rule_extraction_probe.py`):
+      - `style` markers are inherently durable directives → routed on kind alone.
+      - `rejection` / `correction` must carry an imperative cue (`_DIRECTIVE_RE`),
+        which separates a standing avoidance ("never use Mongo") from a one-off
+        event ("rejected the Tuesday meeting", "the deadline is March 3") that
+        must NOT become a rule injected into every call.
+      - `preference` is a taste, never a rule (excluded from `_RULE_KINDS`).
+
+    Everything routed is `always_on`: an agent-inferred rule has no explicit
+    trigger entities (the told-path `add_rule` carries those), so it cannot be
+    `contextual`."""
+    if kind not in _RULE_KINDS:
+        return None
+    if kind == "style":
+        return "always_on"
+    return "always_on" if _DIRECTIVE_RE.search(statement or "") else None
+
+
+def route_markers_to_rules(conn: sqlite3.Connection, cfg) -> int:
+    """Promote the imperative sub-slice of UNCONSOLIDATED behavioral markers into
+    `agent_inferred` rules. Returns the number of rules minted/reinforced.
+
+    Runs during Phase-2 consolidation, BEFORE `consolidate_profile` stamps the
+    markers consolidated (both read `consolidated_at IS NULL`). Reuses the
+    already-extracted marker text, so it adds NO new LLM call. Idempotent via
+    `add_rule`'s text-UPSERT: a marker whose statement matches an existing rule
+    reinforces it instead of duplicating. Degrades to 0 on a pre-v23 store."""
+    try:
+        rows = conn.execute(
+            "SELECT kind, statement FROM behavioral_markers "
+            "WHERE consolidated_at IS NULL ORDER BY id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    minted = 0
+    for r in rows:
+        scope = rule_scope_for_marker(r["kind"], r["statement"])
+        if scope is None:
+            continue
+        try:
+            add_rule(conn, r["statement"], scope=scope, source="agent_inferred")
+            minted += 1
+        except (ValueError, sqlite3.OperationalError):
+            continue  # a bad/duplicate statement never blocks the rest
+    if minted:
+        log.info("rules.extracted count=%d (agent_inferred from markers)", minted)
+    return minted
+
+
+def list_rules(conn: sqlite3.Connection) -> list["Rule"]:
+    """Every ACTIVE rule (always_on AND contextual), ignoring triggers — the
+    "show me the rulebook" reader behind `HyMem.rules()` / the MCP tool. Unlike
+    `load_rules` (a per-call, trigger-gated retrieval), this lists the whole
+    active set. Read-only; `[]` on a pre-v23 store."""
+    try:
+        rows = conn.execute(
+            f"SELECT {_RULE_COLS} FROM rules "
+            "WHERE status = 'active' AND invalid_at IS NULL ORDER BY scope, id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out = [_row_to_rule(r) for r in rows]
+    out.sort(key=lambda x: (x.scope != "always_on", x.id))
+    return out
 
 
 @dataclass
@@ -58,6 +152,12 @@ class Rule:
     valid_at: str = ""
 
 
+_RULE_COLS = (
+    "id, text, scope, trigger_entities, source, "
+    "pos_evidence, neg_evidence, valid_at"
+)
+
+
 def _parse_triggers(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -66,6 +166,19 @@ def _parse_triggers(raw: str | None) -> list[str]:
     except (json.JSONDecodeError, TypeError):
         return []
     return [str(t) for t in parsed] if isinstance(parsed, list) else []
+
+
+def _row_to_rule(r: sqlite3.Row) -> "Rule":
+    return Rule(
+        id=int(r["id"]),
+        text=r["text"],
+        scope=r["scope"],
+        trigger_entities=_parse_triggers(r["trigger_entities"]),
+        source=r["source"],
+        pos_evidence=int(r["pos_evidence"]),
+        neg_evidence=int(r["neg_evidence"]),
+        valid_at=r["valid_at"] or "",
+    )
 
 
 def load_rules(
@@ -78,12 +191,8 @@ def load_rules(
     ``matched_entities``. Read-only; returns ``[]`` on a pre-v23 store."""
     try:
         rows = conn.execute(
-            """
-            SELECT id, text, scope, trigger_entities, source,
-                   pos_evidence, neg_evidence, valid_at
-            FROM rules
-            WHERE status = 'active' AND invalid_at IS NULL
-            """
+            f"SELECT {_RULE_COLS} FROM rules "
+            "WHERE status = 'active' AND invalid_at IS NULL"
         ).fetchall()
     except sqlite3.OperationalError:
         return []
@@ -91,22 +200,11 @@ def load_rules(
     matched = set(matched_entities)
     out: list[Rule] = []
     for r in rows:
-        triggers = _parse_triggers(r["trigger_entities"])
         if r["scope"] == "contextual":
+            triggers = _parse_triggers(r["trigger_entities"])
             if not matched or matched.isdisjoint(triggers):
                 continue
-        out.append(
-            Rule(
-                id=int(r["id"]),
-                text=r["text"],
-                scope=r["scope"],
-                trigger_entities=triggers,
-                source=r["source"],
-                pos_evidence=int(r["pos_evidence"]),
-                neg_evidence=int(r["neg_evidence"]),
-                valid_at=r["valid_at"] or "",
-            )
-        )
+        out.append(_row_to_rule(r))
     # always_on before contextual, then stable by id (insertion order).
     out.sort(key=lambda x: (x.scope != "always_on", x.id))
     return out[:cap] if cap is not None else out

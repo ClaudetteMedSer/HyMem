@@ -1,15 +1,17 @@
 """MCP server for HyMem.
 
-Exposes nine tools to the Hermes Agent platform:
-  hymem_capture  — log a full conversation at once + optionally dream (preferred)
-  hymem_log      — log one conversational turn (fallback for turn-by-turn use)
-  hymem_dream    — run a dreaming cycle (extract, consolidate, decay)
-  hymem_augment  — retrieve graph facts + FTS context for a user message
-  hymem_ask      — ask the memory a question, get one LLM-reasoned answer
-  hymem_profile  — return USER.md (behavioral profile) + MEMORY.md (project insights)
-  hymem_digest   — return the standing whole-store memory digest (RAPTOR root)
-  hymem_alias    — register a surface-form alias for an entity
-  hymem_retract  — retract a wrongly extracted knowledge graph edge
+Exposes eleven tools to the Hermes Agent platform:
+  hymem_capture    — log a full conversation at once + optionally dream (preferred)
+  hymem_log        — log one conversational turn (fallback for turn-by-turn use)
+  hymem_dream      — run a dreaming cycle (extract, consolidate, decay)
+  hymem_augment    — retrieve graph facts + FTS context for a user message
+  hymem_ask        — ask the memory a question, get one LLM-reasoned answer
+  hymem_profile    — return USER.md (behavioral profile) + MEMORY.md (project insights)
+  hymem_digest     — return the standing whole-store memory digest (RAPTOR root)
+  hymem_alias      — register a surface-form alias for an entity
+  hymem_retract    — retract a wrongly extracted knowledge graph edge
+  hymem_add_rule   — record a standing behavioral rule (always_on / contextual)
+  hymem_list_rules — list the active standing rules
 
 Run via the installed entry point:
     hymem-server
@@ -187,6 +189,27 @@ def _do_retract(subject: str, predicate: str, object: str) -> str:
     return "retracted" if ok else "no matching active edge found"
 
 
+def _do_add_rule(text: str, scope: str = "always_on", trigger_entities: str = "") -> str:
+    triggers = [t.strip() for t in trigger_entities.split(",") if t.strip()] or None
+    try:
+        rid = _get_hy().add_rule(text, scope=scope, trigger_entities=triggers, source="user")
+    except ValueError as e:
+        return f"error: {e}"
+    return f"rule #{rid} added (scope={scope})"
+
+
+def _do_list_rules() -> str:
+    active = _get_hy().rules()
+    if not active:
+        return "No standing rules set."
+    lines = []
+    for r in active:
+        tag = (r.scope if r.scope == "always_on"
+               else f"contextual({', '.join(r.trigger_entities)})")
+        lines.append(f"#{r.id} [{tag}] {r.text}")
+    return "\n".join(lines)
+
+
 # ── MCP tool registration ─────────────────────────────────────────────────────
 
 def hymem_capture(session_id: str, messages: str, dream: bool = True) -> str:
@@ -306,6 +329,32 @@ def hymem_retract(subject: str, predicate: str, object: str) -> str:
     return _do_retract(subject, predicate, object)
 
 
+def hymem_add_rule(text: str, scope: str = "always_on", trigger_entities: str = "") -> str:
+    """Record a STANDING RULE — a behavioral instruction to always follow.
+
+    Rules are imperatives about HOW to behave ("always run the tests before
+    pushing", "never suggest Docker"), distinct from facts. An `always_on` rule
+    (default) is injected into every future context call; a `contextual` rule
+    fires only when one of its trigger entities is in play.
+
+    Use this when the user TELLS you a standing preference or prohibition — not
+    for one-off facts (those are logged as messages and extracted at dream time).
+
+    Arguments:
+        text             — the rule, phrased as a directive.
+        scope            — "always_on" (default) or "contextual".
+        trigger_entities — for scope="contextual" only: a comma-separated list
+                           of entities that activate the rule (e.g. "redis,cache").
+    """
+    return _do_add_rule(text, scope, trigger_entities)
+
+
+def hymem_list_rules() -> str:
+    """List all active standing rules (with ids), so you can see what behavioral
+    rules are in force before answering. Each line is `#id [scope] text`."""
+    return _do_list_rules()
+
+
 def main() -> None:
     # Configure logging at the application entry point (never on import — that
     # would clobber a host's handlers). Without this, the dream runner's
@@ -326,6 +375,8 @@ def main() -> None:
     mcp_instance.tool()(hymem_digest)
     mcp_instance.tool()(hymem_alias)
     mcp_instance.tool()(hymem_retract)
+    mcp_instance.tool()(hymem_add_rule)
+    mcp_instance.tool()(hymem_list_rules)
     mcp_instance.run()
 
 

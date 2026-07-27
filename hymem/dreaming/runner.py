@@ -64,6 +64,7 @@ class DreamReport:
     chunks_processed: int = 0
     triples_extracted: int = 0
     markers_extracted: int = 0
+    rules_extracted: int = 0
     chunks_embedded: int = 0
     chunks_embedded_from_cache: int = 0
     edges_embedded: int = 0
@@ -515,6 +516,13 @@ def run_dreaming(
 
         log.info("phase2.start")
         with core_db.transaction(conn):
+            # Idea B write-side: route imperative markers into agent_inferred
+            # rules BEFORE consolidate_profile stamps them consolidated (both
+            # read consolidated_at IS NULL). Gated; no new LLM call. Additive —
+            # markers still become profile entries too.
+            if cfg.rules_extraction_enabled:
+                from hymem import rules as rules_mod
+                report.rules_extracted += rules_mod.route_markers_to_rules(conn, cfg)
             phase2.consolidate_profile(conn, cfg)
             phase2.consolidate_insights(conn, cfg)
         profile_count = conn.execute(
