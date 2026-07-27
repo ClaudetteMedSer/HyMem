@@ -52,14 +52,19 @@ _RULE_KINDS = frozenset({"rejection", "style", "correction"})
 
 # High-precision imperative test. A rule injects into EVERY call, so a false
 # positive is costly. The cue vocabulary is the standing-directive words a
-# durable rule uses ("never use X", "avoid Y", "prefer Z"). Inflections are
-# matched (avoids?, refuses?) but PAST-TENSE one-off forms are deliberately NOT:
-# `rejects?` matches "rejects X" (a standing avoidance) but not "rejected the
-# Tuesday meeting" (a one-off event) — the extraction probe caught exactly those
-# rejection one-offs as the precision leak, so the policy below requires this cue
-# for rejection AND correction, trusting the kind only for `style`.
+# durable rule uses ("never use X", "avoid Y", "prefer Z").
+#
+# `rejects?`/`refuses?` were REMOVED (2026-07-27, real-marker precision run): the
+# extractor writes EVERY rejection marker as "User rejects X" in the present
+# tense, one-off or standing alike, so those cues fired on 100% of rejection
+# markers — zero discriminative power, just re-detecting the kind. That let
+# one-offs ("User rejects the LOWER() patch", "…rejects LoCoMo as a benchmark")
+# mint rules. The earlier present-vs-past-tense heuristic assumed the extractor
+# varies tense with durability; it does not. A rejection now routes ONLY on a
+# genuine imperative modal (never/always/must/should/…), which a durable
+# avoidance carries and a one-off does not.
 _DIRECTIVE_RE = re.compile(
-    r"\b(always|never|do\s*not|don'?t|must(?:\s*not)?|avoids?|rejects?|refuses?|"
+    r"\b(always|never|do\s*not|don'?t|must(?:\s*not)?|avoids?|"
     r"forbids?|requires?|prefers?|instead|only\s+ever|no\s+longer|stop|ensure|"
     r"make\s+sure|should\s+(?:always|never))\b",
     re.IGNORECASE,
@@ -73,10 +78,12 @@ def rule_scope_for_marker(kind: str, statement: str) -> str | None:
 
     Policy (precision-first, tuned against `rule_extraction_probe.py`):
       - `style` markers are inherently durable directives → routed on kind alone.
-      - `rejection` / `correction` must carry an imperative cue (`_DIRECTIVE_RE`),
-        which separates a standing avoidance ("never use Mongo") from a one-off
-        event ("rejected the Tuesday meeting", "the deadline is March 3") that
-        must NOT become a rule injected into every call.
+      - `rejection` / `correction` must carry an imperative modal cue
+        (`_DIRECTIVE_RE`), which separates a standing avoidance ("never use
+        Mongo") from a one-off event ("User rejects the LOWER() patch", "the
+        deadline is March 3") that must NOT become a rule injected into every
+        call. The cue is the modal itself, NOT the word "rejects" — see
+        `_DIRECTIVE_RE`'s note on why that token was removed.
       - `preference` is a taste, never a rule (excluded from `_RULE_KINDS`).
 
     Everything routed is `always_on`: an agent-inferred rule has no explicit

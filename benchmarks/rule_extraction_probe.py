@@ -10,8 +10,10 @@ This probe scores the deterministic classifier `rules.rule_scope_for_marker`
 against a hand-labeled set of realistic dream-marker outputs. It is LLM-free, so
 it runs anywhere (local + box) and is the data-driven gate for flipping
 `rules_extraction_enabled` on. The labeled set deliberately includes
-rejection/style *one-offs* to stress the "trust the kind" policy — if precision
-falls below the gate, the classifier (not the probe) is what changes.
+rejection/correction *one-offs* — including the present-tense "User rejects X"
+form that is the real-marker failure mode — to stress the imperative-modal
+policy; if precision falls below the gate, the classifier (not the probe) is
+what changes.
 
   precision = routed-correctly / all-routed        (GATED — default ≥ 0.90)
   recall    = routed-correctly / all-true-rules     (reported, not gated)
@@ -60,6 +62,13 @@ LABELS: list[dict] = [
     {"kind": "rejection", "statement": "The user rejected the proposed Tuesday meeting", "is_rule": False},
     {"kind": "rejection", "statement": "Rejected the first logo mockup", "is_rule": False},
     {"kind": "rejection", "statement": "Declined the vendor's initial quote", "is_rule": False},
+    # PRESENT-TENSE one-offs — the real-marker failure mode. The extractor writes
+    # a one-off decision as "User rejects X", identical in form to a standing
+    # avoidance, so the word "rejects" cannot gate them. These guard the
+    # 2026-07-27 fix (regex dropped `rejects?`) against regressing locally.
+    {"kind": "rejection", "statement": "The user rejects the LOWER() patch for HyMem", "is_rule": False},
+    {"kind": "rejection", "statement": "The user rejects LoCoMo as a benchmark", "is_rule": False},
+    {"kind": "rejection", "statement": "The user rejects the mega-store approach", "is_rule": False},
     # style directives → rule
     {"kind": "style", "statement": "Write commit messages in the imperative mood", "is_rule": True},
     {"kind": "style", "statement": "Use British English spelling", "is_rule": True},

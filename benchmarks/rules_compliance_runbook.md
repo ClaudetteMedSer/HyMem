@@ -9,6 +9,7 @@ on this, the claim is backed by three measurable gates, not vibes:
 |------|----------|--------|---------------|--------|
 | **Adherence** | Does the model OBEY a rule in context? | ON>OFF compliance, ON≥0.8 | box (needs LLM) | **CLEARED** 2026-07-27 (judge gpt-oss-120b) → read side default ON |
 | **Extraction precision** | Are auto-inferred rules CORRECT? | precision ≥ 0.90 | anywhere (deterministic) | **PASS** locally 100% — pending box run on real markers → write side default OFF |
+| _LME non-regression_ | Do auto-rules HURT factual recall? | ON ≥ OFF within variance | box (LME) | **MET** 2026-07-27 (`--rules-extraction` A/B = +1.4pp flat). Necessary, not sufficient — LME is blind to rule *correctness*, so it does NOT substitute for the precision gate. |
 | **Overhead** | What does the tier COST per call? | 0 chars when empty; p95 Δ ≤ 1ms | anywhere (deterministic) | **PASS** locally (0 chars empty; 1138 chars / 0.034ms at 16 rules) |
 
 Two switches, gated independently:

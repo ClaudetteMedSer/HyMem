@@ -213,9 +213,14 @@ def test_list_rules_returns_all_active_regardless_of_trigger(hyr):
 # ── marker → rule routing (write-side extraction) ───────────────────────────
 
 def test_rule_scope_classifier():
-    # rejection / style are directive by kind
-    assert rule_scope_for_marker("rejection", "The user rejects using MongoDB") == "always_on"
+    # style is a durable directive, routed on kind alone
     assert rule_scope_for_marker("style", "Write commit messages in imperative mood") == "always_on"
+    # rejection routes ONLY on a genuine imperative modal, never on the word
+    # "rejects": the extractor writes a one-off ("rejects the LOWER() patch") and
+    # a standing avoidance ("rejects MongoDB") in the same present tense, so the
+    # token carries no signal (2026-07-27 real-marker precision fix).
+    assert rule_scope_for_marker("rejection", "Never use MongoDB") == "always_on"
+    assert rule_scope_for_marker("rejection", "The user rejects the LOWER() patch") is None
     # a correction routes only when imperative-shaped
     assert rule_scope_for_marker("correction", "Always run the tests before pushing") == "always_on"
     assert rule_scope_for_marker("correction", "The meeting is Tuesday, not Monday") is None
