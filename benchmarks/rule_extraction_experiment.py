@@ -156,7 +156,7 @@ class MarkerJudgment:
     canonical: str
 
 
-def judge_corpus(corpus: list[dict], mode: str, llm) -> list[MarkerJudgment]:
+def judge_corpus(corpus: list[dict], mode: str, llm, batch_size: int = 20) -> list[MarkerJudgment]:
     markers = [(c["kind"], c["statement"]) for c in corpus]
     lexical = [rule_scope_for_marker(k, s) is not None for k, s in markers]
 
@@ -172,7 +172,8 @@ def judge_corpus(corpus: list[dict], mode: str, llm) -> list[MarkerJudgment]:
             if not (mode == "llm_fastpath" and lexical[i])]
     judged: dict[int, rules_extract.DurabilityJudgment] = {}
     if need and llm is not None:
-        sub = rules_extract.judge_durability_batch(llm, [markers[i] for i in need])
+        sub = rules_extract.judge_durability_batch(
+            llm, [markers[i] for i in need], batch_size=batch_size)
         judged = {need[j]: sub[j] for j in range(len(sub))}
 
     out: list[MarkerJudgment] = []
@@ -281,6 +282,8 @@ def main() -> None:
     ap.add_argument("--tau-high", type=float, default=0.9,
                     help="confidence bar for the 'or_highconf' single-shot promotion")
     ap.add_argument("--threshold", type=float, default=0.90, help="precision gate")
+    ap.add_argument("--batch-size", type=int, default=20,
+                    help="markers per durability call (a mega-batch collapses the judge)")
     ap.add_argument("--sim", action="store_true", help="use the offline SimJudge (no API)")
     ap.add_argument("--sim-noise", type=float, default=0.0, help="SimJudge label-flip prob")
     ap.add_argument("--answer-model", default=None)
@@ -306,7 +309,7 @@ def main() -> None:
     marker_rows: list[dict] = []
     policy_rows: list[dict] = []
     for mode in modes:
-        judgments = judge_corpus(corpus, mode, llm_for(mode))
+        judgments = judge_corpus(corpus, mode, llm_for(mode), batch_size=args.batch_size)
         sweep_taus = [1.0] if mode == "lexical" else taus
         for tau in sweep_taus:
             mm = marker_metrics(judgments, mode, tau)

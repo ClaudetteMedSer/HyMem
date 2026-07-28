@@ -9,14 +9,34 @@ rest; and every failure mode degrades to "don't mint" (never a spurious rule).
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from hymem.extraction.llm import StubLLMClient
+from hymem.extraction.llm import LLMRequest, StubLLMClient
 from hymem.rules_extract import (
     _parse_batch,
     judge_durability_batch,
     route_decisions,
 )
+
+
+class _EchoJudge:
+    """A fake judge that reads the markers out of the request and returns a
+    standing verdict for each — recording how many markers each call carried,
+    so tests can assert sub-batching."""
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def complete(self, req: LLMRequest) -> str:
+        body = req.user.split("Markers:", 1)[1].rsplit("Return", 1)[0].strip()
+        payload = json.loads(body)
+        self.calls.append(len(payload))
+        return json.dumps([
+            {"index": m["index"], "standing": True, "confidence": 0.9, "rule": m["statement"]}
+            for m in payload
+        ])
 
 
 # ── batch parsing: index-aligned, precision-safe ────────────────────────────
@@ -82,6 +102,37 @@ def test_judge_batch_empty_makes_no_call():
     stub = StubLLMClient(default="[]")
     assert judge_durability_batch(stub, []) == []
     assert stub.calls == []
+
+
+def test_judge_batch_splits_into_subbatches():
+    # 5 markers at batch_size=2 → three calls (2,2,1), globally index-aligned.
+    judge = _EchoJudge()
+    markers = [("style", f"marker {i}") for i in range(5)]
+    out = judge_durability_batch(judge, markers, batch_size=2)
+    assert judge.calls == [2, 2, 1]
+    assert len(out) == 5 and all(j.standing for j in out)
+    assert [j.index for j in out] == [0, 1, 2, 3, 4]
+    assert [j.rule for j in out] == [f"marker {i}" for i in range(5)]
+
+
+def test_judge_batch_subbatch_failure_is_isolated():
+    # A judge that fails on the 2nd call: only that slice degrades, not the rest.
+    class _FlakyJudge:
+        def __init__(self):
+            self.n = 0
+
+        def complete(self, req):
+            self.n += 1
+            if self.n == 2:
+                raise RuntimeError("slice down")
+            body = req.user.split("Markers:", 1)[1].rsplit("Return", 1)[0].strip()
+            payload = json.loads(body)
+            return json.dumps([{"index": m["index"], "standing": True,
+                                "confidence": 0.9, "rule": m["statement"]} for m in payload])
+
+    markers = [("style", f"m{i}") for i in range(4)]
+    out = judge_durability_batch(_FlakyJudge(), markers, batch_size=2)
+    assert [j.standing for j in out] == [True, True, False, False]  # 2nd slice degraded only
 
 
 def test_judge_batch_error_degrades_to_non_standing():

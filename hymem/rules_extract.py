@@ -9,8 +9,10 @@ one-off corrections carry incidental modals ("X was Dutch *instead* of English")
 This module is the semantic instrument. It asks the LLM the one question the
 regex can't: **is this marker a standing behavioral rule the assistant must obey
 on EVERY future turn, or a one-off fact / event / decision?** It reuses the dream
-LLM (pluggable `LLMClient`), so a durability pass is one batched call per dream —
-NOT one per marker. It also returns a CANONICAL imperative form ("Never use
+LLM (pluggable `LLMClient`) in bounded sub-batches (~20 markers/call — a single
+mega-batch makes the judge collapse to all-non-standing), so a durability pass is
+a handful of calls per dream, NOT one per marker. It also returns a CANONICAL
+imperative form ("Never use
 MongoDB"), which normalizes paraphrases ("rejects Mongo", "avoid MongoDB") to a
 single `rules.text`, so `add_rule`'s UNIQUE UPSERT accumulates `pos_evidence`
 across sessions — the recurrence signal that repetition-gated promotion needs.
@@ -36,7 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.rules import rule_scope_for_marker
@@ -186,34 +188,56 @@ def _parse_batch(raw: str, n: int) -> list[DurabilityJudgment]:
     return out
 
 
-def judge_durability_batch(
-    llm: LLMClient, markers: list[tuple[str, str]]
-) -> list[DurabilityJudgment]:
-    """One batched durability call for a list of (kind, statement) markers.
+# Markers per durability call. A real judge (deepseek-v4-flash) is accurate on a
+# small batch but COLLAPSES to all-non-standing on a large one (observed: 100% at
+# 10 markers, 0% at 111) — a mix of attention degradation and output truncation.
+# Keep each call small and size its token budget to the slice.
+_DURABILITY_BATCH_SIZE = 20
 
-    Index-aligned to the input. Empty input → no call. Any LLM/parse failure
-    degrades to all-non-standing (precision-safe: never mints on error)."""
-    if not markers:
-        return []
+
+def _judge_one_batch(llm: LLMClient, sub: list[tuple[str, str]]) -> list[DurabilityJudgment]:
+    """Single durability call over a small slice, index-aligned to ``sub``. Any
+    LLM/parse failure degrades ONLY this slice to non-standing (precision-safe)."""
     payload = [
         {"index": i, "kind": kind, "statement": statement}
-        for i, (kind, statement) in enumerate(markers)
+        for i, (kind, statement) in enumerate(sub)
     ]
     request = LLMRequest(
         system=DURABILITY_SYSTEM,
         user=DURABILITY_USER_TEMPLATE.format(markers_json=json.dumps(payload, ensure_ascii=False)),
         response_format="json",
-        max_tokens=2048,
+        max_tokens=min(4096, 128 * len(sub) + 256),  # sized so the array never truncates
     )
     try:
         raw = llm.complete(request)
     except Exception as exc:  # noqa: BLE001 - a bad tag pass must never break dreaming
-        log.warning("rules_extract.durability_call_failed err=%s", exc)
-        return [
-            DurabilityJudgment(standing=False, confidence=0.0, rule=None, index=i)
-            for i in range(len(markers))
-        ]
-    return _parse_batch(raw, len(markers))
+        log.warning("rules_extract.durability_call_failed n=%d err=%s", len(sub), exc)
+        return [DurabilityJudgment(standing=False, confidence=0.0, rule=None, index=i)
+                for i in range(len(sub))]
+    return _parse_batch(raw, len(sub))
+
+
+def judge_durability_batch(
+    llm: LLMClient,
+    markers: list[tuple[str, str]],
+    *,
+    batch_size: int = _DURABILITY_BATCH_SIZE,
+) -> list[DurabilityJudgment]:
+    """Durability verdicts for (kind, statement) markers, in input order.
+
+    Splits into sub-batches of ``batch_size`` (default 20) — one call each —
+    because a single mega-batch makes the judge collapse to all-non-standing
+    (100% at 10, 0% at 111). Empty input → no call. A failed sub-batch degrades
+    only its own slice. The returned ``index`` is the GLOBAL position."""
+    if not markers:
+        return []
+    bs = max(1, batch_size)
+    out: list[DurabilityJudgment] = []
+    for start in range(0, len(markers), bs):
+        sub = markers[start:start + bs]
+        for k, j in enumerate(_judge_one_batch(llm, sub)):
+            out.append(replace(j, index=start + k))
+    return out
 
 
 @dataclass(frozen=True)
@@ -237,11 +261,13 @@ def route_decisions(
     mode: str,
     llm: LLMClient | None,
     confidence_min: float,
+    batch_size: int = _DURABILITY_BATCH_SIZE,
 ) -> list[RouteDecision]:
     """Compute per-marker routing decisions for a batch under the given mode.
 
     Pure/deterministic for ``lexical``; the ``llm`` / ``llm_fastpath`` arms issue
-    at most ONE batched durability call. Index-aligned to ``markers``."""
+    sub-batched durability calls (``batch_size`` markers each). Index-aligned to
+    ``markers``."""
     if mode not in RULES_EXTRACTION_MODES:
         raise ValueError(f"unknown rules_extraction_mode {mode!r} (expected {sorted(RULES_EXTRACTION_MODES)})")
 
@@ -263,7 +289,7 @@ def route_decisions(
     ]
     judged: dict[int, DurabilityJudgment] = {}
     if need_llm and llm is not None:
-        sub = judge_durability_batch(llm, [markers[i] for i in need_llm])
+        sub = judge_durability_batch(llm, [markers[i] for i in need_llm], batch_size=batch_size)
         judged = {need_llm[j]: sub[j] for j in range(len(sub))}
 
     out: list[RouteDecision] = []

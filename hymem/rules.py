@@ -126,6 +126,7 @@ def route_markers_to_rules(conn: sqlite3.Connection, cfg, llm=None) -> int:
         mode=getattr(cfg, "rules_extraction_mode", "lexical"),
         llm=llm,
         confidence_min=getattr(cfg, "rules_extraction_confidence_min", 0.75),
+        batch_size=getattr(cfg, "rules_extraction_batch_size", 20),
     )
     minted = 0
     for d in decisions:

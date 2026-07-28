@@ -307,6 +307,11 @@ class HyMemConfig:
     """Min LLM standing-confidence to mint a rule in `llm`/`llm_fastpath` mode.
     Higher = more precise, fewer rules. Swept by the extraction experiment to the
     point where precision clears 0.90 at max recall; the sweep result sets this."""
+    rules_extraction_batch_size: int = 20
+    """Markers per durability call in `llm`/`llm_fastpath` mode. A real judge is
+    accurate on a small batch but collapses to all-non-standing on a large one
+    (deepseek-v4-flash: 100% at 10, 0% at 111), so a dream's markers are judged in
+    sub-batches of this size. Lower if a weaker judge still collapses."""
 
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
