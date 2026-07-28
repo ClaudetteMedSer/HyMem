@@ -115,6 +115,29 @@ rather than reimplementing them.
 > stated near-verbatim in any ingested session) — embeddings may not recover
 > them; don't count them in the lever's ceiling.
 
+> **STATUS 2026-07-28 (v4 + v5) — MSC RECALL CLOSED AT 84.0% CANONICAL.**
+> v4 (answerability clause): **84.0%, +5pp** — all 5 abstentions flipped plus
+> the msc_187 hedge, landing inside the +3-6pp prediction. v5 (`--embeddings`
+> on top): **84.0%, FLAT — zero retrieval losses recovered**, which confirms
+> the annotation-side hypothesis for the tail: the gold persona facts are never
+> stated near-verbatim in any ingested session, so no retrieval method can
+> surface what the corpus doesn't contain. Consequences: (1) **embeddings stay
+> OFF for canonical MSC** (no gain, real cost) — canonical posture = the v4
+> command (FTS-only, seed 0, n=100, deepseek-v4-flash answerer+judge, thinking
+> disabled, perspective + answerability clauses); (2) the ~7-loss retrieval
+> tail is reclassified benchmark-artifact, not architecture; (3) the honest
+> architecture residual is the **~6-7 genuine synthesis errors** (near-miss /
+> partial / wrong-pick). E1 final: 100/90/78/84% at 1-4-back — no cross-session
+> distance penalty. **Full ledger: 42.0 (broken harness) → 65.0 (parity
+> feeding, +23) → 79.0 (deixis clause, +14) → 84.0 (answerability clause, +5);
+> the entire climb was adapter/prompt-side and `hymem/` core was never
+> touched.** 84.0 is now the FROZEN MSC baseline for regression-checking future
+> core changes (RAPTOR flip, schema migrations), the MSC analogue of LME's
+> 68.4. Closed lesson, three instances deep (×3 multiplier, deixis,
+> answerability): an adapter reusing another benchmark's driver must restate
+> the target benchmark's full contract — feeding parity, question deixis, and
+> answerability.
+
 ---
 
 ## 1. Data contract (VERIFIED 2026-07-28 against MemGPT/MSC-Self-Instruct)
