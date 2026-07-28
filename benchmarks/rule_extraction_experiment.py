@@ -284,6 +284,10 @@ def main() -> None:
     ap.add_argument("--threshold", type=float, default=0.90, help="precision gate")
     ap.add_argument("--batch-size", type=int, default=20,
                     help="markers per durability call (a mega-batch collapses the judge)")
+    ap.add_argument("--policy-from-canonical", action="store_true",
+                    help="group policies by the LLM canonical rule (paraphrase-robust) "
+                         "rather than the corpus policy_id — unblocks E3 when the dump "
+                         "carries session_id but no policy_id")
     ap.add_argument("--sim", action="store_true", help="use the offline SimJudge (no API)")
     ap.add_argument("--sim-noise", type=float, default=0.0, help="SimJudge label-flip prob")
     ap.add_argument("--answer-model", default=None)
@@ -310,6 +314,11 @@ def main() -> None:
     policy_rows: list[dict] = []
     for mode in modes:
         judgments = judge_corpus(corpus, mode, llm_for(mode), batch_size=args.batch_size)
+        if args.policy_from_canonical:
+            # collapse paraphrases: a policy is the LLM's canonical rule text, so
+            # "reject Mongo"/"avoid MongoDB" share a policy and their sessions sum.
+            for j in judgments:
+                j.item["policy_id"] = normalize(j.canonical)
         sweep_taus = [1.0] if mode == "lexical" else taus
         for tau in sweep_taus:
             mm = marker_metrics(judgments, mode, tau)

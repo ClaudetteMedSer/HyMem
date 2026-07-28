@@ -89,6 +89,25 @@ def test_parse_batch_garbage_is_safe():
     assert all(not j.standing for j in _parse_batch("not json at all", 3))
 
 
+def test_parse_batch_captures_rationale():
+    raw = '[{"index":0,"standing":true,"confidence":0.9,"rule":"x","reason":"durable directive"}]'
+    out = _parse_batch(raw, 1)
+    assert out[0].rationale == "durable directive"
+
+
+def test_judge_batch_honors_system_override():
+    # the adjudicator swaps the prompt; verify the override reaches the request.
+    seen = {}
+
+    class _CaptureJudge:
+        def complete(self, req):
+            seen["system"] = req.system
+            return '[{"index":0,"standing":false}]'
+
+    judge_durability_batch(_CaptureJudge(), [("style", "x")], system="MY BLIND PROMPT")
+    assert seen["system"] == "MY BLIND PROMPT"
+
+
 def test_confidence_is_clamped():
     raw = ('[{"index":0,"standing":true,"confidence":5,"rule":"x"},'
            '{"index":1,"standing":true,"confidence":-2,"rule":"y"}]')

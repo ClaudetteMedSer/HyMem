@@ -69,6 +69,7 @@ class DurabilityJudgment:
     confidence: float
     rule: str | None = None
     index: int = -1
+    rationale: str = ""
 
 
 DURABILITY_SYSTEM = """You decide whether each behavioral signal from a user is a STANDING RULE or a ONE-OFF.
@@ -179,11 +180,14 @@ def _parse_batch(raw: str, n: int) -> list[DurabilityJudgment]:
         rule = raw_rule.strip() if isinstance(raw_rule, str) and raw_rule.strip() else None
         conf = item.get("confidence")
         confidence = _coerce_conf(conf) if conf is not None else (1.0 if standing else 0.0)
+        reason = item.get("reason") or item.get("rationale") or item.get("why")
+        rationale = reason.strip() if isinstance(reason, str) else ""
         out[idx] = DurabilityJudgment(
             standing=standing,
             confidence=confidence,
             rule=rule if standing else None,
             index=idx,
+            rationale=rationale,
         )
     return out
 
@@ -195,15 +199,19 @@ def _parse_batch(raw: str, n: int) -> list[DurabilityJudgment]:
 _DURABILITY_BATCH_SIZE = 20
 
 
-def _judge_one_batch(llm: LLMClient, sub: list[tuple[str, str]]) -> list[DurabilityJudgment]:
+def _judge_one_batch(
+    llm: LLMClient, sub: list[tuple[str, str]], system: str = DURABILITY_SYSTEM
+) -> list[DurabilityJudgment]:
     """Single durability call over a small slice, index-aligned to ``sub``. Any
-    LLM/parse failure degrades ONLY this slice to non-standing (precision-safe)."""
+    LLM/parse failure degrades ONLY this slice to non-standing (precision-safe).
+    ``system`` lets a caller (e.g. the adjudicator) swap the prompt while keeping
+    the sub-batching, token sizing, and robust parse."""
     payload = [
         {"index": i, "kind": kind, "statement": statement}
         for i, (kind, statement) in enumerate(sub)
     ]
     request = LLMRequest(
-        system=DURABILITY_SYSTEM,
+        system=system,
         user=DURABILITY_USER_TEMPLATE.format(markers_json=json.dumps(payload, ensure_ascii=False)),
         response_format="json",
         max_tokens=min(4096, 128 * len(sub) + 256),  # sized so the array never truncates
@@ -222,20 +230,22 @@ def judge_durability_batch(
     markers: list[tuple[str, str]],
     *,
     batch_size: int = _DURABILITY_BATCH_SIZE,
+    system: str = DURABILITY_SYSTEM,
 ) -> list[DurabilityJudgment]:
     """Durability verdicts for (kind, statement) markers, in input order.
 
     Splits into sub-batches of ``batch_size`` (default 20) — one call each —
     because a single mega-batch makes the judge collapse to all-non-standing
     (100% at 10, 0% at 111). Empty input → no call. A failed sub-batch degrades
-    only its own slice. The returned ``index`` is the GLOBAL position."""
+    only its own slice. The returned ``index`` is the GLOBAL position. ``system``
+    overrides the prompt (the adjudicator reuses this with its blind prompt)."""
     if not markers:
         return []
     bs = max(1, batch_size)
     out: list[DurabilityJudgment] = []
     for start in range(0, len(markers), bs):
         sub = markers[start:start + bs]
-        for k, j in enumerate(_judge_one_batch(llm, sub)):
+        for k, j in enumerate(_judge_one_batch(llm, sub, system)):
             out.append(replace(j, index=start + k))
     return out
 

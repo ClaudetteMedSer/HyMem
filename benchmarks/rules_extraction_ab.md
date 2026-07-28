@@ -46,15 +46,47 @@ python benchmarks/rule_extraction_experiment.py --labels real_markers.json \
     --answer-model deepseek-v4-flash --answer-base-url <url>
 ```
 Decision: if `llm` clears 0.90 and `lexical` doesn't → the semantic instrument is
-justified. (Offline `--sim`: lexical 70%, llm 100% — mechanics confirmed.)
+justified. (Real run 2026-07-28: **llm 59% vs lexical 8%** — 7× on precision at 95%
+recall. Instrument confirmed; 59% doesn't clear the gate yet, so run E1.5 next.)
+
+**E1.5 — Adjudicate the disagreements (ground-truth check).** A 59% "precision" is
+only real if the labels are. Some tagger FPs are suspected label errors (the tagger
+right, the hand-label wrong). Resolve them the disciplined way — an INDEPENDENT,
+BLIND third judge (different model family) breaks every label-vs-tagger tie, with a
+control sample of agreements to measure that judge's reliability. Corrected truth =
+original label on agreements, independent verdict on the contested items (the tagger
+never votes on its own trial).
+```bash
+python benchmarks/rule_extraction_adjudicate.py --labels real_markers.json \
+    --answer-model deepseek-v4-flash --answer-base-url <url> \
+    --judge-model  openai/gpt-oss-120b --judge-base-url <openrouter-url> \
+    --out corrected.json --verbose
+```
+Decision: read RAW vs ADJUDICATED precision. If the independent judge calls many
+"FPs" rules → the labels were wrong; re-run E1/E2 on `corrected.json` for the true
+number. Guardrails: C's control accuracy must be ≥ 0.8 (else distrust it), and C
+must be a *different* model from the tagger (correlated errors otherwise inflate).
 
 **E2 — τ sweep (precision/recall frontier).** Read the per-marker table: the
 lowest τ that holds precision ≥ 0.90 maximizes recall; raise τ for margin against
 judge drift. Decision: set `rules_extraction_confidence_min` to the elbow. Watch
 for `llm_fastpath` **losing** to `llm` — the lexical shortcut re-imports the FP
-leak (offline: fastpath 77% vs llm 100%). If so, `llm_fastpath` is out.
+leak (offline: fastpath 77% vs llm 100%). If so, `llm_fastpath` is out. NOTE: if the
+real judge omits `confidence` (defaults to 1.0), τ is inert and the sweep is flat —
+lean on adjudicated verdict quality + repetition, don't tune a flat τ.
 
-**E3 — Repetition value.** Does per-policy promotion beat `immediate`? Compare the
+**E3 — Repetition value.** Needs a corpus with `session_id` (recurrence is counted
+over distinct sessions per policy). Re-dump markers with provenance, and let the
+tagger's canonical rule collapse paraphrases into policies:
+```bash
+sqlite3 -json "$HYMEM_ROOT/hymem.sqlite" \
+  "SELECT bm.kind, bm.statement, c.session_id
+     FROM behavioral_markers bm JOIN chunks c ON bm.chunk_id = c.id" > markers_sess.json
+# hand-add is_rule (or reuse corrected.json's), then:
+python benchmarks/rule_extraction_experiment.py --labels markers_sess.json \
+    --answer-model deepseek-v4-flash --answer-base-url <url> --policy-from-canonical
+```
+Does per-policy promotion beat `immediate`? Compare the
 `immediate` row to the best `and`/`recurrence`/`or_highconf` row.
 Decision:
 - If `immediate` already clears 0.90 at good recall → **do NOT build repetition**
