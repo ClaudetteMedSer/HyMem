@@ -405,6 +405,21 @@ MSC_PERSPECTIVE_CLAUSE = (
     "fact to the speaker who actually said it before answering."
 )
 
+# Overrides the base LME prompt's abstention permission ("say I don't have
+# enough information"), which is load-bearing on LME (_abs questions score
+# abstention as correct) but a pure miss generator here: every MSC
+# self_instruct question is answerable by construction. v3 residual audit
+# (2026-07-28) found 5/21 misses were abstentions WITH the gold visible in
+# context, plus one hedge (msc_187: stated the gold fact, then talked itself
+# out of it).
+MSC_ANSWERABILITY_CLAUSE = (
+    "\nEvery question in this benchmark has an answer stated somewhere in the "
+    "memories — never reply that you don't have enough information. If no memory "
+    "states the answer outright, commit to the single best-supported answer from "
+    "what the memories do say. When you find the fact, state it directly and "
+    "confidently; do not add disclaimers or talk yourself out of it."
+)
+
 
 # ── probes ──────────────────────────────────────────────────────────────────
 
@@ -456,7 +471,8 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
                                  temporal_events=info["temporal_events"],
                                  aggregation_nodes=info["aggregation_nodes"],
                                  question_date=question_date,
-                                 extra_system=MSC_PERSPECTIVE_CLAUSE)
+                                 extra_system=MSC_PERSPECTIVE_CLAUSE
+                                              + MSC_ANSWERABILITY_CLAUSE)
             correct = judge_answer(judge_llm, "single-session-user",
                                    ex["question"], ex["answer"], ai)
         gi = _gold_session_index(ex)

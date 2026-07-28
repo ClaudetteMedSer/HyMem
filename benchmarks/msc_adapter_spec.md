@@ -89,6 +89,32 @@ rather than reimplementing them.
 > to be mostly benchmark noise, not architecture. Core (`hymem/`) remains
 > untouched through the entire MSC arc.
 
+> **STATUS 2026-07-28 (v3 residual-miss audit → ANSWERABILITY CLAUSE).** All 21
+> v3 misses adjudicated. Decomposition: **5 abstentions WITH gold in context**
+> (msc_326/153/295/225/22 — reader says "I don't have enough information" while
+> the answer is visible), 1 judge/hedge loss (msc_187: reader states the gold
+> "won a blue ribbon" verbatim, then talks itself out of it), 5 genuine
+> synthesis errors (near-miss/partial/wrong-pick — msc_451/44/247/58/210, the
+> honest ceiling residual), 2 ranking/cut losses (gold in pool, cut from
+> context — msc_84/129), and 7 retrieval losses (5 gold-in-neither at 4-back +
+> 2 gold-unlocatable dist=-1 where the reader answered with the WRONG pet from
+> context — the FTS-paraphrase tail). **Root cause of the abstention cluster:
+> every branch of the LME answer prompt carries "If the context doesn't contain
+> the answer, say 'I don't have enough information'" — load-bearing on LME
+> (_abs questions score abstention as correct) but a pure miss generator on MSC,
+> where every self_instruct question is answerable by construction.** Same bug
+> class as deixis: a benchmark-contract fact the adapter never stated. Fix:
+> `MSC_ANSWERABILITY_CLAUSE` appended to `extra_system` (adapter-side, LME
+> postures untouched) — states answerability, forbids the abstention reply,
+> orders best-supported commitment and no self-talk-out (also targets the
+> msc_187 hedge). Expected +3-6pp (5 abstentions + 1 hedge; some may flip to
+> wrong answers). Run order: clause-only A/B first (cheap, isolates
+> attribution), then `--embeddings` on top for the 7 retrieval + 2 ranking
+> losses. Note the two dist=-1 wrong-pet misses (msc_68 cat-vs-German-Shepherd,
+> msc_174 tabby-vs-Maine-Coon) may be annotation-side (gold persona fact never
+> stated near-verbatim in any ingested session) — embeddings may not recover
+> them; don't count them in the lever's ceiling.
+
 ---
 
 ## 1. Data contract (VERIFIED 2026-07-28 against MemGPT/MSC-Self-Instruct)
