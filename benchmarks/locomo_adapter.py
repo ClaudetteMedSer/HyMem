@@ -309,33 +309,49 @@ def sample_questions(convs: list[dict], sample: int, seed: int) -> list[dict]:
 # ── per-question evaluation ─────────────────────────────────────────────────
 
 def _evidence_diagnostics(q: dict, conv: dict, context_texts: list[str],
-                          pool_texts: list[str]) -> dict:
+                          pool_texts: list[str], rendered: str | None = None) -> dict:
     """Step-0 diagnostics from LoCoMo's OWN evidence annotations (stronger than
     MSC's answer-text heuristic — the gold turn text is known exactly, the
-    lexical τ=0.6 only absorbs the 600-char context truncation):
-      gold_in_context  — ALL evidence turns surfaced to the reader (multi-hop
-                         needs every hop; a partial surface is recorded in
-                         evidence_in_context_frac)
+    lexical τ=0.6 only absorbs the 600-char context truncation).
+
+    FOUR nested surfaces, because there are FOUR places evidence can die and
+    conflating the last two mislabels a truncation loss as a reader failure:
       gold_in_pool     — all evidence turns retrievable pre-truncation
-      gold_distance    — sessions back from the last session to the FARTHEST-
-                         BACK evidence turn (1 = final session; -1 = no
-                         locatable evidence)
+      gold_in_topk     — survived the `memories[:top_k]` retrieval cut
+      gold_in_render   — survived `_render_answer_context`'s MAX_CONTEXT_CHARS
+                         budget, i.e. ACTUALLY REACHED THE READER. The renderer
+                         `break`s at the first item that overflows, so at wide
+                         apertures the top_k list is much larger than the text
+                         the model sees; `gold_in_topk` alone silently credits
+                         evidence the reader never got.
+      gold_in_context  — alias of gold_in_render when a rendered context is
+                         supplied (the honest definition), else gold_in_topk.
+    `gold_distance` is sessions back from the last session to the FARTHEST-BACK
+    evidence turn (1 = final session; -1 = no locatable evidence).
+
     On cat-5 the evidence points at the TRAP-SOURCE turn, not a gold answer —
     recorded for completeness, excluded from the miss decomposition."""
     ev = [(conv["evidence_map"][e]) for e in q["evidence"] if e in conv["evidence_map"]]
     if not ev:
         return {"gold_in_context": False, "gold_in_pool": False,
+                "gold_in_topk": False, "gold_in_render": False,
                 "gold_distance": -1, "evidence_in_context_frac": 0.0,
                 "n_evidence": 0}
-    joined_ctx = " ".join(context_texts)
-    joined_pool = joined_ctx + " " + " ".join(pool_texts)
-    in_ctx = [_lex_match(text, joined_ctx, tau=0.6) for _, text in ev]
+    joined_topk = " ".join(context_texts)
+    joined_pool = joined_topk + " " + " ".join(pool_texts)
+    in_topk = [_lex_match(text, joined_topk, tau=0.6) for _, text in ev]
     in_pool = [_lex_match(text, joined_pool, tau=0.6) for _, text in ev]
+    if rendered is None:
+        in_render = in_topk
+    else:
+        in_render = [_lex_match(text, rendered, tau=0.6) for _, text in ev]
     return {
-        "gold_in_context": all(in_ctx),
+        "gold_in_context": all(in_render),
+        "gold_in_render": all(in_render),
+        "gold_in_topk": all(in_topk),
         "gold_in_pool": all(in_pool),
         "gold_distance": conv["n_sessions"] - min(idx for idx, _ in ev),
-        "evidence_in_context_frac": sum(in_ctx) / len(in_ctx),
+        "evidence_in_context_frac": sum(in_render) / len(in_render),
         "n_evidence": len(ev),
     }
 
@@ -348,8 +364,20 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
     # regression AND the first 23pp of the MSC arc; never again).
     memories, info = adapter.search(q["question"], top_k=args.top_k * 3)
 
+    # Re-render the EXACT context the answerer will build (same helper, same
+    # char caps — cat-2 routes to ability="TR", which doubles the budget) so
+    # gold-surface is measured against what the reader actually receives, not
+    # against the pre-render top_k list. Pure string work, no LLM call.
+    ability = "TR" if cat == 2 else None
+    rendered = None
+    if not args.sim:
+        from longmemeval_adapter import _render_answer_context
+        rendered = _render_answer_context(
+            memories, ability, info["total_matches"], info["graph_count"],
+            info["temporal_events"], info["aggregation_nodes"])
+
     diag = _evidence_diagnostics(q, conv, [m["content"] for m in memories],
-                                 info["pool"])
+                                 info["pool"], rendered=rendered)
 
     extra = locomo_perspective_clause(conv["speaker_a"], conv["speaker_b"],
                                       user_is_a=(args.user_speaker == "a"))
@@ -396,16 +424,22 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
            "answer": q["answer"] if cat != 5 else f"[unanswerable; trap: {q['adversarial_answer']}]",
            "ai_answer": ai, "n_sessions": conv["n_sessions"],
            "evidence": q["evidence"], **diag,
-           "n_memories": len(memories), "n_profile": info["n_profile"]}
-    if args.dump_context:
-        from longmemeval_adapter import _render_answer_context
-        rec["context"] = _render_answer_context(
-            memories, "TR" if cat == 2 else None, info["total_matches"],
-            info["graph_count"], info["temporal_events"], info["aggregation_nodes"])
+           "n_memories": len(memories), "n_profile": info["n_profile"],
+           # Rendered lines carry a [MEM …]/[FACT] tag; counting them measures
+           # how many retrieved memories survived the char budget.
+           "n_rendered": (None if rendered is None
+                          else rendered.count("[MEM") + rendered.count("[FACT"))}
+    if args.dump_context and rendered is not None:
+        rec["context"] = rendered
     return rec
 
 
 # ── per-conversation driver ─────────────────────────────────────────────────
+
+# Set from --max-context-chars in main(); read by the report line. A list so
+# the worker threads and the report share one cell without a global statement.
+_MAX_CTX: list[int | None] = [None]
+
 
 def _aperture(args) -> dict:
     """Lever-L6 retrieval-aperture overrides; None means 'keep the default'."""
@@ -539,14 +573,33 @@ def _print_report(results: list[dict], args) -> None:
 
         misses = [r for r in answerable if not r["correct"]]
         if misses:
+            # Four buckets, not three: `budget` is evidence that won the
+            # retrieval cut and was then dropped by MAX_CONTEXT_CHARS before the
+            # reader saw it. It used to be counted as synthesis, which reads as
+            # "the reader failed" when in fact the reader was never shown it —
+            # and that mislabel grows with the aperture.
             retrieval = sum(not r["gold_in_pool"] for r in misses)
-            ranking = sum(r["gold_in_pool"] and not r["gold_in_context"] for r in misses)
+            ranking = sum(r["gold_in_pool"] and not r.get("gold_in_topk", r["gold_in_context"])
+                          for r in misses)
+            budget = sum(r.get("gold_in_topk", r["gold_in_context"])
+                         and not r["gold_in_context"] for r in misses)
             synthesis = sum(r["gold_in_context"] for r in misses)
             n = len(misses)
             print(f"\n  ── miss decomposition ({n} answerable-cat misses) ──")
             print(f"  retrieval loss   (evidence in neither pool nor ctx): {retrieval:>3}  ({retrieval/n*100:.0f}%)")
-            print(f"  ranking/cut loss (evidence in pool, not in ctx):     {ranking:>3}  ({ranking/n*100:.0f}%)")
-            print(f"  synthesis/judge  (evidence IN ctx, still wrong):     {synthesis:>3}  ({synthesis/n*100:.0f}%)")
+            print(f"  ranking/cut loss (evidence in pool, not in top_k):   {ranking:>3}  ({ranking/n*100:.0f}%)")
+            print(f"  budget loss      (in top_k, cut by context chars):   {budget:>3}  ({budget/n*100:.0f}%)")
+            print(f"  synthesis/judge  (evidence REACHED reader, wrong):   {synthesis:>3}  ({synthesis/n*100:.0f}%)")
+
+        # How much of the retrieved list actually reaches the reader. At a wide
+        # aperture with an unchanged char budget this is the binding constraint,
+        # and it is invisible in every other line of the report.
+        rendered_frac = [r["n_rendered"] / r["n_memories"] for r in results
+                         if r.get("n_rendered") is not None and r.get("n_memories")]
+        if rendered_frac:
+            print(f"\n  context budget: {sum(rendered_frac)/len(rendered_frac)*100:.0f}% "
+                  f"of retrieved memories survive MAX_CONTEXT_CHARS "
+                  f"({_MAX_CTX[0] or 'default'} chars, x2 on cat-2/TR)")
 
     by_conv: dict[str, list[dict]] = defaultdict(list)
     for r in results:
@@ -600,6 +653,11 @@ def main() -> None:
                     help="dreamed-chunk slots (default 10)")
     ap.add_argument("--graph-top-k", type=int, default=None,
                     help="graph-fact slots (default 10)")
+    ap.add_argument("--max-context-chars", type=int, default=None,
+                    help="reader context budget (LME default 8000; doubled for "
+                         "cat-2/TR). Must scale WITH the aperture — a wider "
+                         "top_k against an unchanged budget is truncated away "
+                         "by _render_answer_context before the reader sees it")
     ap.add_argument("--user-speaker", choices=["a", "b"], default="a",
                     help="which speaker HyMem models as the user (default speaker_a)")
     ap.add_argument("--name-prefix", action="store_true",
@@ -658,6 +716,14 @@ def main() -> None:
           f"{'  [SIM]' if args.sim else ''}", flush=True)
 
     answer_llm = judge_llm = None
+    if args.max_context_chars:
+        _MAX_CTX[0] = args.max_context_chars
+        if not args.sim:
+            # MAX_CONTEXT_CHARS is read as a module global inside
+            # _render_answer_context, so rebinding it here covers both the
+            # answer path and the diagnostic re-render.
+            import longmemeval_adapter as _lme
+            _lme.MAX_CONTEXT_CHARS = args.max_context_chars
     if not args.sim:
         ab = json.loads(args.answer_extra_body) if args.answer_extra_body else None
         jb = json.loads(args.judge_extra_body) if args.judge_extra_body else None
