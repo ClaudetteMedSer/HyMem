@@ -386,6 +386,26 @@ class MSCAdapter:
         return out
 
 
+# MSC deixis: self_instruct questions are asked BY the conversation partner TO
+# the user ("B asks A"). With the default --start-role user (turn 0 = speaker A
+# = [user]) that means: "you"/"your" in the question is the USER; "I"/"me"/"my"
+# is the PARTNER ([assistant] turns). The LME prompt never needed this — its
+# questions are third-person — and the parity-run audit showed the reader
+# resolving it wrong in BOTH directions: rejecting a gold [assistant] fact as
+# "no memory of YOUR parents teaching you an instrument" (msc_431), and
+# answering AS the partner persona with the partner's fact when asked about the
+# user's (msc_108: "my favorite food is Italian" vs the user's stated Mexican).
+# NOTE: the mapping inverts under --start-role assistant.
+MSC_PERSPECTIVE_CLAUSE = (
+    "\nThe memories are turns from past conversations between the user ([user] turns) "
+    "and their conversation partner ([assistant] turns). The QUESTION is asked by the "
+    "conversation partner TO the user. So in the question, 'you'/'your' refers to the "
+    "USER — answer from [user] turns and user-profile facts; 'I'/'me'/'my' refers to "
+    "the PARTNER asking the question — answer from [assistant] turns. Attribute each "
+    "fact to the speaker who actually said it before answering."
+)
+
+
 # ── probes ──────────────────────────────────────────────────────────────────
 
 def _gold_session_index(ex: dict) -> int:
@@ -435,7 +455,8 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
                                  graph_count=info["graph_count"],
                                  temporal_events=info["temporal_events"],
                                  aggregation_nodes=info["aggregation_nodes"],
-                                 question_date=question_date)
+                                 question_date=question_date,
+                                 extra_system=MSC_PERSPECTIVE_CLAUSE)
             correct = judge_answer(judge_llm, "single-session-user",
                                    ex["question"], ex["answer"], ai)
         gi = _gold_session_index(ex)

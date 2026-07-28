@@ -913,7 +913,8 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
                     total_matches: int = 0, graph_count=None, temporal_events: list | None = None,
                     aggregation_nodes: list | None = None,
                     question_date: str = "", permissive_default: bool = False,
-                    distilled: list[str] | None = None) -> str:
+                    distilled: list[str] | None = None,
+                    extra_system: str | None = None) -> str:
     """Ask LLM to answer based on retrieved memories.
 
     Uses ability-aware prompts and expanded context for multi-session
@@ -958,6 +959,11 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         system_prompt = ANSWERING_TR_PROMPT
     else:
         system_prompt = default_prompt
+
+    # Benchmark-specific system-prompt suffix (e.g. the MSC perspective clause).
+    # Additive and None by default, so every LME posture is byte-identical.
+    if extra_system:
+        system_prompt = system_prompt + extra_system
 
     # The reference "now" for relative-date math. Stated explicitly so the model
     # can subtract event dates from it ("how many days ago", "a month ago")

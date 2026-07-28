@@ -56,6 +56,20 @@ rather than reimplementing them.
 > then a gpt-oss-120b reader-parity probe (LME P0 method, judge frozen). Prompt
 > fixes deliberately deferred until the audit says which failure mode dominates.
 
+> **STATUS 2026-07-28 (synthesis-miss audit → PERSPECTIVE CLAUSE).** The audited
+> synthesis misses share one mechanism: **deixis inversion**. self_instruct
+> questions are asked BY the partner TO the user, and the reader had no account
+> of it — it rejected a gold `[assistant]` fact as "no memory of YOUR parents
+> teaching you an instrument" (msc_431, the fact was the *asker's*), and answered
+> AS the partner persona with the partner's fact when asked for the user's
+> (msc_108, "Italian" vs the user's stated "Mexican"). Not memory failures —
+> retrieval surfaced the gold both times. Fix: `MSC_PERSPECTIVE_CLAUSE` appended
+> via a new additive `extra_system` param on `answer_question` (default None →
+> every LME posture byte-identical). Re-run pending; expect the 24-miss
+> synthesis bucket to shrink materially. Judge posture untouched. Side
+> observation for later: profile `name`/`role` slots occasionally hold junk
+> ("name: short black hair and blue eyes") — extractor quality, separate issue.
+
 ---
 
 ## 1. Data contract (VERIFIED 2026-07-28 against MemGPT/MSC-Self-Instruct)
