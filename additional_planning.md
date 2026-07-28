@@ -475,6 +475,43 @@ Idea B is now backed by three data-driven gates (see
   flip `rules_extraction_enabled` ON. (2) optionally sweep the adherence probe
   with a larger/adversarial probe set for the competitive writeup.
 
+### STATUS 2026-07-27 — lexical extraction FAILED on real markers → LLM-durability-tag extractor + A/B experiment engine prototyped
+
+The write-side precision gate ran on **real** dream markers and **failed at 8.3%**
+(1 TP / 11 FP / 37 FN). Two rounds of lexical tightening confirmed a ~14% ceiling:
+`rejects?`/`refuses?` fired on 100% of rejection markers (kind-restatement leak;
+removed, FP 73→11 + present-tense one-offs added to `rule_extraction_probe.py` as
+local regression guards), and the residual FPs are one-off *corrections* carrying
+incidental modals ("X was Dutch **instead** of English", "**should** be automatic").
+**Standing-vs-one-off is semantic, not lexical** — the gate correctly blocks the
+flip; further regex trimming is a dead end. Decision: `rules_extraction_enabled`
+**stays OFF**; auto-extraction is **R&D**, not a launch blocker. Shippable value =
+read side (ON, adherence-cleared) + told-path surfaces (`add_rule` via API/MCP/Honcho).
+
+**Prototype (option b + a):**
+- `hymem/rules_extract.py` — batched **LLM durability tagger** (`judge_durability_batch`,
+  ONE call per dream; asks standing-rule-vs-one-off; returns standing/confidence/
+  **canonical rule** which collapses paraphrases so `add_rule`'s UPSERT `pos_evidence`
+  becomes a cross-session recurrence counter). `route_decisions` dispatches
+  `cfg.rules_extraction_mode` ∈ `lexical`|`llm`|`llm_fastpath`, gated on
+  `rules_extraction_confidence_min`; every failure degrades to "don't mint".
+- Wired live: `route_markers_to_rules(conn, cfg, llm=)` ← runner passes `llm`.
+  Config `rules_extraction_mode` (default `lexical`) + `rules_extraction_confidence_min`.
+- **Experiment engine** `benchmarks/rule_extraction_experiment.py` — scores every
+  arm (mode × τ-sweep × promotion{immediate/and/recurrence/or_highconf} × N) in one
+  judgment pass; `--sim` fake-judge offline, real `--answer-model` on box; precision
+  gated 0.90, prints best arm at max recall. Spec + decision rules =
+  `benchmarks/rules_extraction_ab.md` (E1 instrument, E2 τ-frontier, E3 repetition,
+  E4 independent-judge, E5 cost, E6 LME non-regression).
+- **Offline `--sim` findings** (synthetic, NOT real numbers — mechanics only):
+  llm 100% vs lexical 70%; **`llm_fastpath` DOMINATED (77%) — the lexical shortcut
+  re-imports the FP leak**; repetition gating is a **robustness** lever (restores
+  precision a noisy judge loses, at a recall cost), so build schema v24
+  (`status='provisional'`) ONLY if E3 on real markers earns it.
+- Tests: `tests/test_rules_extract.py` (13); full suite 759 passed.
+- **NEXT (box):** run `rule_extraction_experiment.py` on real labeled markers
+  (E1–E6) → set `(mode, τ)` + repetition, wire winner, re-gate E6, then flip.
+
 ---
 
 ## Plan C — Episode granularity in dreaming

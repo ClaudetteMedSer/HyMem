@@ -96,15 +96,18 @@ def rule_scope_for_marker(kind: str, statement: str) -> str | None:
     return "always_on" if _DIRECTIVE_RE.search(statement or "") else None
 
 
-def route_markers_to_rules(conn: sqlite3.Connection, cfg) -> int:
-    """Promote the imperative sub-slice of UNCONSOLIDATED behavioral markers into
+def route_markers_to_rules(conn: sqlite3.Connection, cfg, llm=None) -> int:
+    """Promote the durable sub-slice of UNCONSOLIDATED behavioral markers into
     `agent_inferred` rules. Returns the number of rules minted/reinforced.
 
     Runs during Phase-2 consolidation, BEFORE `consolidate_profile` stamps the
-    markers consolidated (both read `consolidated_at IS NULL`). Reuses the
-    already-extracted marker text, so it adds NO new LLM call. Idempotent via
-    `add_rule`'s text-UPSERT: a marker whose statement matches an existing rule
-    reinforces it instead of duplicating. Degrades to 0 on a pre-v23 store."""
+    markers consolidated (both read `consolidated_at IS NULL`). The routing
+    instrument is `cfg.rules_extraction_mode` (`lexical` = deterministic, no LLM;
+    `llm`/`llm_fastpath` = one batched durability call via `rules_extract`). The
+    LLM arms rewrite each kept marker to a CANONICAL imperative, so `add_rule`'s
+    text-UPSERT collapses paraphrases and accumulates `pos_evidence` — the
+    recurrence signal repetition-gated promotion will read. Idempotent; degrades
+    to 0 on a pre-v23 store; a bad/duplicate statement never blocks the rest."""
     try:
         rows = conn.execute(
             "SELECT kind, statement FROM behavioral_markers "
@@ -112,18 +115,30 @@ def route_markers_to_rules(conn: sqlite3.Connection, cfg) -> int:
         ).fetchall()
     except sqlite3.OperationalError:
         return 0
+    if not rows:
+        return 0
+
+    from hymem import rules_extract
+
+    markers = [(r["kind"], r["statement"]) for r in rows]
+    decisions = rules_extract.route_decisions(
+        markers,
+        mode=getattr(cfg, "rules_extraction_mode", "lexical"),
+        llm=llm,
+        confidence_min=getattr(cfg, "rules_extraction_confidence_min", 0.75),
+    )
     minted = 0
-    for r in rows:
-        scope = rule_scope_for_marker(r["kind"], r["statement"])
-        if scope is None:
+    for d in decisions:
+        if not d.route:
             continue
         try:
-            add_rule(conn, r["statement"], scope=scope, source="agent_inferred")
+            add_rule(conn, d.text, scope=d.scope, source="agent_inferred")
             minted += 1
         except (ValueError, sqlite3.OperationalError):
             continue  # a bad/duplicate statement never blocks the rest
     if minted:
-        log.info("rules.extracted count=%d (agent_inferred from markers)", minted)
+        log.info("rules.extracted count=%d mode=%s (agent_inferred from markers)",
+                 minted, getattr(cfg, "rules_extraction_mode", "lexical"))
     return minted
 
 

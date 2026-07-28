@@ -522,7 +522,7 @@ def run_dreaming(
             # markers still become profile entries too.
             if cfg.rules_extraction_enabled:
                 from hymem import rules as rules_mod
-                report.rules_extracted += rules_mod.route_markers_to_rules(conn, cfg)
+                report.rules_extracted += rules_mod.route_markers_to_rules(conn, cfg, llm=llm)
             phase2.consolidate_profile(conn, cfg)
             phase2.consolidate_insights(conn, cfg)
         profile_count = conn.execute(

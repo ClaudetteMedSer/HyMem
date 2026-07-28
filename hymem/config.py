@@ -292,6 +292,21 @@ class HyMemConfig:
     is costly — flip only after the extraction precision probe clears on real
     dream markers (`benchmarks/rule_extraction_probe.py`; precision is the gated
     metric, not recall). Independent of `rules_enabled` (read side)."""
+    rules_extraction_mode: str = "lexical"
+    """Idea B write-side routing instrument (`hymem/rules_extract.py`), active only
+    when `rules_extraction_enabled`. `lexical` = the deterministic classifier
+    (`rule_scope_for_marker`, ~14% precision on real markers — the baseline arm).
+    `llm` = an LLM durability tag decides (route iff standing AND confidence ≥
+    `rules_extraction_confidence_min`); ONE batched call per dream, and it returns
+    a canonical rule form that collapses paraphrases. `llm_fastpath` = trust a
+    lexical imperative modal as standing (no call) and send only the ambiguous
+    rest to the LLM. Arms are compared head-to-head by
+    `benchmarks/rule_extraction_experiment.py`; the winning arm is what flips the
+    write-side default. `lexical` keeps the current behaviour with no LLM cost."""
+    rules_extraction_confidence_min: float = 0.75
+    """Min LLM standing-confidence to mint a rule in `llm`/`llm_fastpath` mode.
+    Higher = more precise, fewer rules. Swept by the extraction experiment to the
+    point where precision clears 0.90 at max recall; the sweep result sets this."""
 
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000

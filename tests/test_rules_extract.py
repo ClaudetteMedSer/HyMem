@@ -1,0 +1,118 @@
+"""Idea B write-side — LLM durability tagger (`hymem/rules_extract.py`).
+
+The semantic instrument that replaces the lexical classifier's ~14% ceiling.
+These lock the pieces the live routing depends on: batch parsing is index-aligned
+and precision-safe on garbage; the confidence threshold gates minting; the
+fastpath shortcuts lexical hits WITHOUT an LLM call and sends only the ambiguous
+rest; and every failure mode degrades to "don't mint" (never a spurious rule).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hymem.extraction.llm import StubLLMClient
+from hymem.rules_extract import (
+    _parse_batch,
+    judge_durability_batch,
+    route_decisions,
+)
+
+
+# ── batch parsing: index-aligned, precision-safe ────────────────────────────
+
+def test_parse_batch_wellformed():
+    raw = ('[{"index":0,"standing":true,"confidence":0.9,"rule":"Never use X"},'
+           '{"index":1,"standing":false,"confidence":0.1,"rule":null}]')
+    out = _parse_batch(raw, 2)
+    assert out[0].standing and out[0].rule == "Never use X" and out[0].confidence == 0.9
+    assert not out[1].standing and out[1].rule is None
+
+
+def test_parse_batch_standing_without_rule_does_not_route():
+    # standing=true but no canonical rule → nothing to store → treat as non-standing
+    out = _parse_batch('[{"index":0,"standing":true,"confidence":0.95,"rule":null}]', 1)
+    assert not out[0].standing and out[0].rule is None
+
+
+def test_parse_batch_missing_and_out_of_range_default_nonrouting():
+    # index 5 is invalid for n=2; both slots stay non-standing (nothing minted).
+    out = _parse_batch('[{"index":5,"standing":true,"confidence":1.0,"rule":"x"}]', 2)
+    assert all(not j.standing for j in out)
+
+
+def test_parse_batch_garbage_is_safe():
+    assert all(not j.standing for j in _parse_batch("not json at all", 3))
+
+
+def test_confidence_is_clamped():
+    raw = ('[{"index":0,"standing":true,"confidence":5,"rule":"x"},'
+           '{"index":1,"standing":true,"confidence":-2,"rule":"y"}]')
+    out = _parse_batch(raw, 2)
+    assert out[0].confidence == 1.0 and out[1].confidence == 0.0
+
+
+# ── batched call: empty short-circuits, errors degrade ──────────────────────
+
+def test_judge_batch_empty_makes_no_call():
+    stub = StubLLMClient(default="[]")
+    assert judge_durability_batch(stub, []) == []
+    assert stub.calls == []
+
+
+def test_judge_batch_error_degrades_to_non_standing():
+    class Boom:
+        def complete(self, req):
+            raise RuntimeError("llm down")
+
+    out = judge_durability_batch(Boom(), [("style", "x"), ("style", "y")])
+    assert len(out) == 2 and all(not j.standing for j in out)
+
+
+# ── routing modes ───────────────────────────────────────────────────────────
+
+def test_route_lexical_parity():
+    markers = [("style", "Use British spelling"),
+               ("correction", "The meeting is Tuesday, not Monday")]
+    out = route_decisions(markers, mode="lexical", llm=None, confidence_min=0.75)
+    assert out[0].route is True            # style routes by kind
+    assert out[1].route is False           # non-imperative correction one-off
+
+
+def test_route_llm_confidence_threshold():
+    raw = '[{"index":0,"standing":true,"confidence":0.8,"rule":"Never use Mongo"}]'
+    hi = route_decisions([("rejection", "rejects mongo")], mode="llm",
+                         llm=StubLLMClient(default=raw), confidence_min=0.75)
+    assert hi[0].route and hi[0].text == "Never use Mongo"   # canonical, not raw
+    lo = route_decisions([("rejection", "rejects mongo")], mode="llm",
+                         llm=StubLLMClient(default=raw), confidence_min=0.90)
+    assert not lo[0].route                                   # 0.8 < 0.90
+
+
+def test_route_fastpath_shortcuts_lexical_without_calling_llm():
+    stub = StubLLMClient(default="[]")
+    out = route_decisions([("style", "Use British spelling")], mode="llm_fastpath",
+                          llm=stub, confidence_min=0.75)
+    assert out[0].route and out[0].source_mode == "lexical_fastpath"
+    assert stub.calls == []                                  # no LLM needed for a lexical hit
+
+
+def test_route_fastpath_sends_ambiguous_to_llm():
+    raw = '[{"index":0,"standing":false,"confidence":0.1,"rule":null}]'
+    stub = StubLLMClient(default=raw)
+    out = route_decisions([("rejection", "rejects the LOWER() patch")],
+                          mode="llm_fastpath", llm=stub, confidence_min=0.75)
+    assert not out[0].route                                  # LLM says one-off
+    assert len(stub.calls) == 1                              # the ambiguous marker was judged
+
+
+def test_route_llm_without_client_is_precision_safe():
+    # mode wants an LLM but none supplied → mint nothing rather than guess.
+    out = route_decisions([("rejection", "rejects mongo")], mode="llm",
+                          llm=None, confidence_min=0.5)
+    assert not out[0].route
+
+
+def test_unknown_mode_raises():
+    with pytest.raises(ValueError):
+        route_decisions([("style", "x")], mode="bogus", llm=None, confidence_min=0.5)
