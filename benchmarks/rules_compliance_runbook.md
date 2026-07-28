@@ -8,7 +8,7 @@ on this, the claim is backed by three measurable gates, not vibes:
 | Gate | Question | Metric | Where it runs | Status |
 |------|----------|--------|---------------|--------|
 | **Adherence** | Does the model OBEY a rule in context? | ON>OFF compliance, ON≥0.8 | box (needs LLM) | **CLEARED** 2026-07-27 (judge gpt-oss-120b) → read side default ON |
-| **Extraction precision** | Are auto-inferred rules CORRECT? | precision ≥ 0.90 | anywhere (deterministic) | **FAILED on real markers** 2026-07-27 — 8.3% (1 TP / 11 FP / 37 FN); lexical approach exhausted (~14% ceiling). Write side STAYS OFF; auto-extraction is now R&D. Built-in set still 100% (deterministic guard). |
+| **Extraction precision** | Are auto-inferred rules CORRECT? | precision ≥ 0.90 | anywhere (deterministic) / box (LLM tagger) | **AUTO-INJECTION CLOSED 2026-07-28.** Lexical FAILED (8.3%, ~14% ceiling). The LLM durability tagger works where it matters (`rejection` 69% prec / 99% recall) but overall can't clear 0.90 — the drag is degenerate labels (`style` markers are durable directives *mislabeled* not-rule) + genuine one-off semantics; repetition-gating has no corpus to validate on (nothing recurs). **Superseded by the candidate-SUGGESTION surface** (`suggest_rules`): tagger proposes, human confirms = precision gate. Write side stays OFF. |
 | _LME non-regression_ | Do auto-rules HURT factual recall? | ON ≥ OFF within variance | box (LME) | **MET** 2026-07-27 (`--rules-extraction` A/B = +1.4pp flat). Necessary, not sufficient — LME is blind to rule *correctness*, so it does NOT substitute for the precision gate. |
 | **Overhead** | What does the tier COST per call? | 0 chars when empty; p95 Δ ≤ 1ms | anywhere (deterministic) | **PASS** locally (0 chars empty; 1138 chars / 0.034ms at 16 rules) |
 
@@ -63,10 +63,38 @@ Two rounds of classifier tightening (`rejects?`/`refuses?` removed, cutting FP
 carrying incidental modals ("X was Dutch **instead** of English", "…**should** be
 automatic"). Standing-vs-one-off is a SEMANTIC distinction a word list can't make,
 so further directive-vocabulary trimming is a dead end. **Do NOT keep tuning the
-regex.** The path to ≥0.90 is a semantic layer — either repetition-gated routing
-(deterministic, needs cross-session recurrence + provenance) or an LLM `standing`
-tag folded into marker extraction — tracked in `additional_planning.md` §Idea B.
-The built-in probe stays 100% as a deterministic regression guard for the regex.
+regex.** The built-in probe stays 100% as a deterministic regression guard.
+
+**Semantic layer built + tested (2026-07-28) → AUTO-INJECTION CLOSED.** The LLM
+durability tagger (`hymem/rules_extract.py`, the `llm` routing mode) is the
+semantic instrument the lexical ceiling demanded. On real markers it is **7×**
+lexical (59% vs 8% on the enriched set; ~45–73% on the natural-base-rate set), and
+the per-KIND breakdown (`rule_extraction_experiment.py --by-kind`) localizes what's
+left:
+
+| kind | llm precision | recall | reading |
+|------|--------------|--------|---------|
+| `rejection` | **69%** | 99% | the signal-bearing kind — the tagger works |
+| `style` | "0%" | — | **labeling artifact**: the markers ARE durable directives ("be concise", "class-level skills") *mislabeled* `is_rule=false`; they also duplicate the profile tier |
+| `correction` | ~0% | — | genuinely one-off (2.4% FP rate) — tagger already conservative |
+
+The FPs are **not concentrated in a kind** (so no `_RULE_KINDS` surgery helps) —
+they're bad `style` labels plus `rejection`'s genuine one-offs ("rejects LoCoMo"),
+which only *recurrence* could separate. But **repetition-gating has no corpus to
+validate on**: the policy layer clears 0.90 only at ~3–5% recall (nothing recurs)
+on LME (star topology), MSC (preference-shaped — see `msc_adapter_spec.md`), *and*
+real Honcho session data. Of the three, only Honcho could show recurring
+imperatives and it shows them sparse — a hypothesis (one real data point) that
+standing rules are said once and expected to hold, so the sparsity is intrinsic.
+
+**Decision: auto-*injection* is a dead-end on available data; the answer is
+candidate SUGGESTION** — the tagger reliably *finds* standing directives (high
+recall), so surface them and let the human confirm (which also makes the
+profile-vs-rules *tier-placement* call a classifier can't). See `HyMem.suggest_rules`
+/ `hymem_suggest_rules` below. Repetition-gating (schema v24) is not built —
+gated behind a WATCH ITEM: if imperative recurrence turns dense as the Honcho store
+grows, the E3 path reopens (`msc_adapter.py --probe-mode recurrence` dumps straight
+into `rule_extraction_experiment.py`).
 
 ## Gate 3 — Overhead (deterministic, the cost watch)
 Rules ride on the hot path, so the tier must be near-free.
@@ -82,6 +110,12 @@ and a saturated rulebook (cap=16) stays within the p95 latency budget. Local:
 ## Surfaces (already wired)
 - **Direct/MCP**: `HyMem.add_rule()`/`rules()`/`retract_rule()`; MCP tools
   `hymem_add_rule` + `hymem_list_rules` (registered in `hymem/server.py`).
+- **Candidate suggestion** (the write-side answer): `HyMem.suggest_rules()` + MCP
+  `hymem_suggest_rules` — read-only, runs the durability tagger over unconsolidated
+  markers, returns ranked de-duped `RuleCandidate`s (text / scope / confidence /
+  marker & session counts / `already_active`) for a human to adopt via `add_rule`.
+  Nothing auto-persists; the confirming human is the precision + tier-placement gate.
+  Flow: log → `suggest_rules` → `add_rule` the good ones → dream.
 - **Honcho**: active rules lead the peer card + peer/session context
   representation, ahead of MEMORY.md (`hymem/honcho/app.py::_rules_block`).
 - **Ask renderer**: rules render first in `ask()` context + an obey-directive is
@@ -89,9 +123,16 @@ and a saturated rulebook (cap=16) stays within the p95 latency budget. Local:
 
 ## Decide
 - Read side is ON. Leave it — inert on rule-less stores.
-- **Write side stays OFF.** Gate 2 failed on real markers (8.3%); the lexical
-  classifier can't reach ≥0.90. Do not flip, do not keep trimming the regex.
-- **Ship the value that's ready:** read side + the told-path surfaces above
-  (`add_rule` via API/MCP/Honcho) — explicit rules have no precision problem.
-- **Auto-extraction is R&D** (repetition-gated vs LLM `standing` tag). It re-enters
-  this gate only when a semantic layer exists; then re-run Gate 2 on real markers.
+- **Write-side auto-injection stays OFF — CLOSED as a dead-end on available data.**
+  Lexical can't reach 0.90 (semantic); the LLM tagger works on `rejection` (69%)
+  but the overall gate is blocked by mislabeled `style` + genuine one-offs, and
+  repetition-gating has no corpus with enough recurrence to gate on. Do not flip,
+  do not trim the regex, do not do `_RULE_KINDS` surgery.
+- **Ship the value that's ready:** read side + told-path (`add_rule`) + the
+  **candidate-suggestion** surface (`suggest_rules` / `hymem_suggest_rules`) — the
+  tagger triages, the human is the gate. No 0.90 auto-gate to clear.
+- **WATCH ITEM (the one live thread):** as the Honcho store grows, re-check whether
+  standing imperatives recur across sessions (`msc_adapter.py --probe-mode
+  recurrence` → `rule_extraction_experiment.py --policy-from-canonical`). Stays
+  sparse → close repetition-gating + schema v24 permanently. Turns dense → the E3
+  auto-promotion path reopens with real data.

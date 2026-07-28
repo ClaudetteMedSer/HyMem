@@ -13,6 +13,38 @@ This spec mirrors `longmemeval_adapter.py` section-for-section so the two adapte
 share machinery and conventions; it **reuses** that file's proven parts by import
 rather than reimplementing them.
 
+> **STATUS 2026-07-28 — BUILT (`benchmarks/msc_adapter.py`, ~430 lines).** Data
+> contract verified against the real MemGPT/MSC-Self-Instruct schema (§1). Both
+> probe modes implemented; `--sim` mechanics green (loader, date synthesis,
+> gold-session location, marker-dump labeling all validated offline). Real numbers
+> need the box. **Key finding the build already surfaced:** MSC's durable content is
+> *preference/fact-shaped* ("I have two dogs") → `preference`-kind markers →
+> excluded from rules by `is_rule_eligible_kind`, so the recurrence/E3 path is
+> **largely inert on MSC for the RULES tier** — MSC exercises the *profile* tier's
+> cross-session accumulation, not rule durability. So MSC's strong, honest fit is
+> **`recall`** (cross-session fact retrieval — the capability LME can't isolate);
+> validating repetition-gating *for rules* still needs a corpus of recurring
+> *imperatives*, which no available benchmark provides. The `recurrence` mode prints
+> this explicitly (a NOTE when 0 rule-eligible markers appear).
+
+> **STATUS 2026-07-28 (later) — FIRST RUN + PARITY FIXES.** First real `recall` run
+> (100 samples, v4-flash answer+judge): **42.0%**, E1 decay 54% at 1-back → 33-40%
+> at 2-4-back. Analysis showed the number was a FLOOR, not an architecture verdict —
+> the MSC answer path was not at parity with LME's: (1) no `top_k*3` at the pipeline
+> layer (the LME driver's multiplier — the same silent drop as the BEAM June
+> regression); (2) `search()` cut `[:10]` after 15 message_hits, so consolidated
+> tiers NEVER reached the reader; (3) the P4 `user_profile` tier — the tier MSC
+> content is shaped for — plus episodes/graph/procedures/aggregation nodes were
+> unread. **All fixed in the adapter:** LME-parity tier collection + ordering,
+> `top_k*3`, profile prepended ADDITIVELY (never consumes a raw-turn slot),
+> aggregation nodes/temporal events/graph_count passed through to
+> `answer_question`, `--embeddings` fallbacks now import the LME `LOCAL_EMBED_*`
+> constants (same local server posture), and `--dream-per-session` implemented.
+> **Step-0 diagnostics added:** per-question `gold_in_context` / `gold_in_pool`
+> (lexical, τ=0.6) with a per-distance table and a miss decomposition
+> (retrieval vs ranking/cut vs synthesis/judge) — this split decides Step 2.
+> Core (`hymem/`) deliberately untouched pending the parity re-run.
+
 ---
 
 ## 1. Data contract (VERIFIED 2026-07-28 against MemGPT/MSC-Self-Instruct)

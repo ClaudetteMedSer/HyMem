@@ -140,15 +140,39 @@ config). Decision: overall must stay within the variance band vs baseline — au
 rules must not poison factual recall. (The lexical arm already passed this at
 +1.4pp; the LLM arm must re-clear it because it mints *more* rules.)
 
-## From experiment to production
+## OUTCOME 2026-07-28 — experiments ran; auto-injection CLOSED, suggestion shipped
 
-1. E1–E5 on real markers pick `(mode, τ)` and whether repetition is needed.
-2. Wire the winner: set `rules_extraction_mode` / `rules_extraction_confidence_min`
-   defaults. If repetition wins, add schema **v24** (a `status='provisional'`
-   state: rules accumulate `pos_evidence` but stay out of `load_rules` until
-   promoted at N), and a promotion step in `route_markers_to_rules`.
-3. E6 gate, then flip `rules_extraction_enabled` default ON + commit + record the
-   numbers in `additional_planning.md` §Idea B and the runbook scorecard.
+The plan above was executed on real markers. Result: **the instrument is validated
+but the auto-injection gate is unclearable on available data, so the write-side
+answer is candidate SUGGESTION, not a flip.**
 
-Until then: `rules_extraction_enabled` stays **OFF**; the shipped value is the
-read side (ON) + told-path surfaces. This is R&D, not a launch blocker.
+- **E1 (instrument):** llm **7×** lexical (59% vs 8% enriched; ~45% at natural base
+  rate). Instrument confirmed; 0.90 not reached.
+- **E1.5 (adjudication):** INCONCLUSIVE — the independent judge failed its own
+  control gate (50% = chance), so it couldn't confirm or refute the labels.
+- **`--by-kind` (the decider):** the drag isn't a kind to filter — it's **degenerate
+  labels**. `rejection` **69%**/99% (the tagger works); `style` "0%" is a labeling
+  artifact (durable directives mislabeled not-rule, and already profile-owned →
+  auto-minting = duplication); `correction` genuinely one-off. Corrected precision
+  ~73%. No `_RULE_KINDS` lever helps.
+- **E3 (repetition):** no validation corpus — clears 0.90 only at ~3–5% recall
+  (nothing recurs) on LME (star), MSC (preference-shaped), AND real Honcho data.
+  Only Honcho could show recurring imperatives; it shows them sparse.
+
+**Shipped instead:** `HyMem.suggest_rules()` + MCP `hymem_suggest_rules` — the tagger
+(high recall) proposes ranked, de-duped `RuleCandidate`s (marker/session counts,
+`already_active`); the human confirms via `add_rule` (which also settles the
+profile-vs-rules tier-placement a classifier can't). `rules_extraction_enabled`
+stays **OFF**; the kind-eligibility gate leak found here is fixed in
+`rules.is_rule_eligible_kind` (both routing paths). Repetition-gating / schema v24
+is **not built** — WATCH ITEM: re-run E3 as the Honcho store grows
+(`msc_adapter.py --probe-mode recurrence` dumps into this engine); dense recurrence
+reopens the auto-promotion path, sparse closes v24 for good.
+
+## From experiment to production (SUPERSEDED — kept for the reopen path)
+
+*If E3 ever earns it (dense recurrence appears):* wire `(mode, τ)`, add schema v24
+(`status='provisional'`: accumulate `pos_evidence`, stay out of `load_rules` until
+promoted at N) + a promotion step in `route_markers_to_rules`, re-gate E6 (LME
+non-regression), then flip. Until then the shipped value is read side (ON) +
+told-path + suggestion surface — no auto-gate to clear.

@@ -509,8 +509,51 @@ read side (ON, adherence-cleared) + told-path surfaces (`add_rule` via API/MCP/H
   precision a noisy judge loses, at a recall cost), so build schema v24
   (`status='provisional'`) ONLY if E3 on real markers earns it.
 - Tests: `tests/test_rules_extract.py` (13); full suite 759 passed.
-- **NEXT (box):** run `rule_extraction_experiment.py` on real labeled markers
-  (E1–E6) → set `(mode, τ)` + repetition, wire winner, re-gate E6, then flip.
+
+### STATUS 2026-07-28 — write-side auto-injection CLOSED; candidate-SUGGESTION shipped
+
+The box ran the experiment on real markers across the full pipeline. Findings, in
+order:
+
+1. **Instrument confirmed, gate not cleared.** The LLM tagger is **7×** lexical on
+   precision (59% vs 8% on the rule-enriched set) at ~95% recall — but 59% is short
+   of 0.90, and drops to ~45% on the natural-base-rate 614-marker set (a base-rate
+   effect, the *more* honest number).
+2. **A kind-filter LEAK, fixed.** The full run first read **5.8%** because
+   `route_decisions`/`judge_corpus` sent EVERY kind to the tagger — 1,768
+   `preference` markers flooded it. The `_RULE_KINDS` gate lived only in the lexical
+   classifier; the LLM path bypassed it. Fixed with `rules.is_rule_eligible_kind`,
+   a single eligibility gate BOTH paths call BEFORE the tagger (durability ≠
+   eligibility; a durable preference still belongs in the profile tier).
+3. **Adjudication was inconclusive, not confirmatory.** An independent blind judge
+   (gpt-oss-120b) to check whether the tagger's "FPs" were mislabels scored **50% on
+   its controls** — chance — tripping the distrust guard. So "0/25 overturned" is
+   not evidence; the labels stayed suspect.
+4. **The labels WERE the problem (`--by-kind`).** Per-kind at τ=0.90 the tagger is
+   `rejection` **69%**/99%, `style` "0%", `correction` ~0%. All 90 gold rules were
+   labeled `rejection`; `style`/`correction` had ZERO — impossible. Eyeballing
+   settled it: the `style` markers ("be concise", "class-level skills", "active
+   updates") ARE durable directives *mislabeled* not-rule (and already live in the
+   profile as preferences → auto-minting them = duplication); `correction` markers
+   are genuinely one-off. Corrected precision ~73%. The FPs are **not concentrated
+   in a kind** — no `_RULE_KINDS` lever helps.
+5. **Repetition-gating has no validation corpus.** The policy layer clears 0.90 only
+   at ~3–5% recall (nothing recurs) on LME (star topology), MSC (preference-shaped),
+   AND real Honcho data. Only Honcho could show recurring imperatives, and it shows
+   them sparse — suggesting the sparsity is intrinsic (rules are said once, expected
+   to hold).
+
+**Decision: auto-*injection* is closed as a dead-end on available data.** The tagger
+is a strong high-recall *detector*, so the answer is **candidate SUGGESTION** —
+`HyMem.suggest_rules()` + MCP `hymem_suggest_rules` (read-only; ranked, de-duped
+`RuleCandidate`s with marker/session counts + `already_active`; the human confirms
+via `add_rule`, which also makes the profile-vs-rules tier-placement call). Built +
+tested 2026-07-28 (`tests/test_rules.py`, full suite 775). `rules_extraction_enabled`
+stays OFF. Repetition-gating / schema v24 is NOT built — WATCH ITEM: as the Honcho
+store grows, re-check imperative recurrence (`msc_adapter.py --probe-mode recurrence`
+→ `rule_extraction_experiment.py --policy-from-canonical`); sparse → close v24
+permanently, dense → the E3 path reopens. Full scorecard:
+`benchmarks/rules_compliance_runbook.md`; experiment design: `rules_extraction_ab.md`.
 
 ---
 

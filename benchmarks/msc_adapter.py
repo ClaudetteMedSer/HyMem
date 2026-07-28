@@ -248,12 +248,17 @@ class MSCAdapter:
                 base_url=self.hymem_base_url, model=self.hymem_model)
             if self.embeddings:
                 from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
+                # Fallback constants imported from the LME adapter so --embeddings
+                # means the SAME local embed server/model in both benchmarks
+                # (comparability frame); env vars still override.
+                from longmemeval_adapter import (LOCAL_EMBED_API_KEY, LOCAL_EMBED_BASE_URL,
+                                                 LOCAL_EMBED_DIM, LOCAL_EMBED_MODEL)
                 env = os.environ.get
                 embedding_client = OpenAICompatibleEmbeddingClient(
-                    api_key=env("HYMEM_EMBEDDING_API_KEY") or env("HYMEM_LLM_API_KEY") or "sk-local",
-                    base_url=env("HYMEM_EMBEDDING_BASE_URL") or "http://localhost:8000/v1",
-                    model=env("HYMEM_EMBEDDING_MODEL") or "BAAI/bge-small-en-v1.5",
-                    dim=int(env("HYMEM_EMBEDDING_DIM") or 384))
+                    api_key=env("HYMEM_EMBEDDING_API_KEY") or env("HYMEM_LLM_API_KEY") or LOCAL_EMBED_API_KEY,
+                    base_url=env("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL,
+                    model=env("HYMEM_EMBEDDING_MODEL") or LOCAL_EMBED_MODEL,
+                    dim=int(env("HYMEM_EMBEDDING_DIM") or LOCAL_EMBED_DIM))
         self.hy = HyMem(cfg, llm=llm, embedding_client=embedding_client)
         return self
 
@@ -262,13 +267,18 @@ class MSCAdapter:
             self.hy.close()
             self.hy = None
 
-    def ingest(self, ex: dict) -> None:
+    def ingest(self, ex: dict, *, dream_each: bool = False) -> None:
         """One HyMem session per MSC session — NEVER merged (session_count is the
-        whole point of the corpus), each stamped with its synthesized date."""
+        whole point of the corpus), each stamped with its synthesized date.
+        `dream_each` dreams after EVERY session (the live-store posture): profile
+        and episode evidence accumulates across dreams instead of arriving in one
+        end-of-history batch."""
         for i, (turns, date) in enumerate(zip(ex["sessions"], ex["session_dates"])):
             self.hy.log_messages(
                 f'{ex["id"]}_s{i}',
                 [(t["role"], t["content"], date) for t in turns])
+            if dream_each:
+                self.dream()
 
     def dream(self) -> None:
         dh = self.hy.fork()
@@ -277,22 +287,85 @@ class MSCAdapter:
         finally:
             dh.close()
 
-    def search(self, query: str, top_k: int = 10) -> tuple[list[dict], int]:
-        """Minimal message-first retrieval shaped for the reused `answer_question`
-        (raw turns lead; MSC recall is a retrieval-over-turns task)."""
+    def search(self, query: str, top_k: int = 10) -> tuple[list[dict], dict]:
+        """LME-parity retrieval: the same tiers and message-first ordering as
+        `HyMemAdapter.search` (raw turns + procedures lead; episodes/chunks/graph
+        facts confidence-ranked behind), same `[:top_k]` cut — the caller passes
+        `top_k * 3` exactly like the LME pipeline does. Two MSC additions, both
+        ADDITIVE (never consuming a raw-turn slot): the P4 `user_profile` tier is
+        prepended ahead of the cut result (MSC content is profile-shaped and the
+        tier is distance-invariant by construction — neither adapter consumed it
+        before, which on MSC discarded the tier built for exactly this content),
+        and `info` carries the FULL pre-truncation pool so misses can be split
+        into retrieval loss vs ranking loss (the LME recall-ceiling discipline)."""
         result = self.hy.augment(query)
-        memories: list[dict] = []
+
+        message_hits = []
         for hit in getattr(result, "message_hits", None) or []:
             text = (getattr(hit, "text", "") or "")[:600]
             if text.strip():
-                memories.append({"content": f'[{getattr(hit, "role", "?")}] {text}',
-                                 "type": "message_hit", "confidence": 0.7,
-                                 "created_at": getattr(hit, "created_at", "") or ""})
+                message_hits.append({"content": f'[{getattr(hit, "role", "?")}] {text}',
+                                     "type": "message_hit", "confidence": 0.7,
+                                     "created_at": getattr(hit, "created_at", "") or ""})
+        fts_hits = []
         for hit in getattr(result, "fts_hits", None) or []:
             text = (getattr(hit, "text", "") or "")[:600]
             if text.strip():
-                memories.append({"content": text, "type": "fts_hit", "confidence": 0.6})
-        return memories[:top_k], getattr(result, "total_message_matches", 0)
+                fts_hits.append({"content": text, "type": "fts_hit", "confidence": 0.6})
+        procedure_hits = []
+        for proc in getattr(result, "procedures", None) or []:
+            name = getattr(proc, "name", "")
+            desc = (getattr(proc, "description", "") or "")[:400]
+            content = f"Procedure: {name}: {desc}" if name else desc
+            if content.strip():
+                procedure_hits.append({"content": content[:600], "type": "procedure",
+                                       "confidence": 0.75})
+        episode_hits = []
+        for ep in getattr(result, "episodes", None) or []:
+            title = getattr(ep, "title", "")
+            summary = (getattr(ep, "summary", "") or "")[:500]
+            content = f"{title}: {summary}" if title else summary
+            if content.strip():
+                episode_hits.append({"content": content, "type": "episode",
+                                     "confidence": 0.8})
+        graph_facts = []
+        for fact in getattr(result, "graph_facts", None) or []:
+            graph_facts.append({"content": f"{fact.subject} {fact.predicate} {fact.object}",
+                                "type": "graph_fact",
+                                "confidence": getattr(fact, "confidence", 0.5)})
+
+        memories = message_hits + procedure_hits
+        rest = episode_hits + fts_hits + graph_facts
+        rest.sort(key=lambda m: -m.get("confidence", 0))
+        memories = (memories + rest)[:top_k]
+
+        profile = []
+        for p in getattr(result, "user_profile", None) or []:
+            key = f" ({p.slot_key})" if getattr(p, "slot_key", None) else ""
+            since = (getattr(p, "valid_at", "") or "")[:10]
+            profile.append({"content": f"Known user profile — {p.slot}{key}: {p.value}"
+                                       + (f" (since {since})" if since else ""),
+                            "type": "profile",
+                            "confidence": getattr(p, "confidence", 0.9)})
+        memories = profile + memories
+
+        aggregation_nodes = []
+        for node in getattr(result, "aggregation_nodes", None) or []:
+            title = getattr(node, "title", "")
+            summary = (getattr(node, "summary", "") or "")[:600]
+            content = f"{title}: {summary}" if title else summary
+            if content.strip():
+                aggregation_nodes.append(content)
+
+        info = {
+            "total_matches": getattr(result, "total_message_matches", 0),
+            "graph_count": getattr(result, "graph_count", None),
+            "temporal_events": getattr(result, "temporal_events", []) or [],
+            "aggregation_nodes": aggregation_nodes,
+            "n_profile": len(profile),
+            "pool": [m["content"] for m in message_hits + fts_hits + episode_hits],
+        }
+        return memories, info
 
     def dump_markers(self, ex: dict) -> list[dict]:
         """Extracted behavioral markers with HyMem session_id + an is_rule label
@@ -333,21 +406,36 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
                          embeddings=args.embeddings, rules_extraction=args.rules_extraction,
                          graph_multihop=args.graph_multihop).open()
     try:
-        adapter.ingest(ex)
-        if not args.no_dream:
+        dream_each = args.dream_per_session and not args.no_dream
+        adapter.ingest(ex, dream_each=dream_each)
+        if not args.no_dream and not dream_each:
             adapter.dream()
-        memories, total = adapter.search(ex["question"], top_k=args.top_k)
+        # top_k * 3 at the pipeline layer, EXACTLY like the LME driver — the
+        # silently-missing ×3 was the whole BEAM June regression, and here it
+        # additionally starved the consolidated tiers out of memories[:top_k].
+        memories, info = adapter.search(ex["question"], top_k=args.top_k * 3)
+        # Step-0 diagnostics (lexical, tau=0.6 — a signal, not ground truth):
+        # gold_in_context = the reader COULD have answered (miss ⇒ synthesis/judge);
+        # gold_in_pool = retrievable pre-truncation (in pool but not context ⇒
+        # ranking/cut loss; in neither ⇒ retrieval loss).
+        joined = " ".join(m["content"] for m in memories)
+        gold_in_context = _lex_match(ex["answer"], joined, tau=0.6)
+        gold_in_pool = gold_in_context or _lex_match(
+            ex["answer"], " ".join(info["pool"]), tau=0.6)
         if args.sim:
             # Offline: no answer/judge LLM. Test the thing --sim CAN test — did
-            # retrieval surface the gold answer? — via a lexical check.
-            joined = " ".join(m["content"] for m in memories)
+            # retrieval surface the gold answer?
             ai = memories[0]["content"] if memories else ""
-            correct = _lex_match(ex["answer"], joined, tau=0.6)
+            correct = gold_in_context
         else:
             from longmemeval_adapter import answer_question, judge_answer
             question_date = ex["session_dates"][-1] if ex["session_dates"] else ""
             ai = answer_question(answer_llm, memories, ex["question"],
-                                 total_matches=total, question_date=question_date)
+                                 total_matches=info["total_matches"],
+                                 graph_count=info["graph_count"],
+                                 temporal_events=info["temporal_events"],
+                                 aggregation_nodes=info["aggregation_nodes"],
+                                 question_date=question_date)
             correct = judge_answer(judge_llm, "single-session-user",
                                    ex["question"], ex["answer"], ai)
         gi = _gold_session_index(ex)
@@ -355,7 +443,9 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
                 "question": ex["question"], "answer": ex["answer"], "ai_answer": ai,
                 "n_sessions": ex["n_sessions"], "gold_session": gi,
                 "gold_distance": (ex["n_sessions"] - gi) if gi >= 0 else -1,
-                "n_memories": len(memories)}
+                "gold_in_context": bool(gold_in_context),
+                "gold_in_pool": bool(gold_in_pool),
+                "n_memories": len(memories), "n_profile": info["n_profile"]}
     finally:
         adapter.close()
         if not args.keep_db:
@@ -369,8 +459,9 @@ def run_recurrence_dump(ex: dict, args) -> list[dict]:
                          hymem_model=args.hymem_model, hymem_base_url=args.hymem_base_url,
                          rules_extraction=args.rules_extraction).open()
     try:
-        adapter.ingest(ex)
-        if not args.no_dream:
+        dream_each = args.dream_per_session and not args.no_dream
+        adapter.ingest(ex, dream_each=dream_each)
+        if not args.no_dream and not dream_each:
             adapter.dream()
         return adapter.dump_markers(ex)
     finally:
@@ -388,17 +479,41 @@ def _print_recall_report(results: list[dict]) -> None:
     ov = scores["OVERALL"]
     print(f"\n=== MSC recall — n={ov['count']} ===")
     print(f"  overall accuracy: {ov['accuracy']*100:.1f}%\n")
-    # E1: accuracy by how many sessions back the gold fact was stated.
+    # E1: accuracy by how many sessions back the gold fact was stated, with the
+    # gold-surface diagnostics alongside (lexical tau=0.6 — signal, not truth):
+    # in-ctx = gold visible to the reader; in-pool = retrievable pre-truncation.
     from collections import defaultdict
-    by_dist: dict[int, list[bool]] = defaultdict(list)
+    by_dist: dict[int, list[dict]] = defaultdict(list)
     for r in results:
-        by_dist[r.get("gold_distance", -1)].append(r["correct"])
-    print("  ── accuracy by session distance (E1: recall vs how far back) ──")
-    print(f"  {'distance':>9} {'acc':>7} {'n':>5}")
+        by_dist[r.get("gold_distance", -1)].append(r)
+    print("  ── E1: recall vs session distance (+ gold-surface diagnostics) ──")
+    print(f"  {'distance':>9} {'acc':>7} {'in-ctx':>7} {'in-pool':>8} {'n':>5}")
     for d in sorted(by_dist):
-        c = by_dist[d]
+        rs = by_dist[d]
+        acc = sum(r["correct"] for r in rs) / len(rs)
+        ctx = sum(r.get("gold_in_context", False) for r in rs) / len(rs)
+        pool = sum(r.get("gold_in_pool", False) for r in rs) / len(rs)
         label = "unknown" if d < 0 else f"{d} back"
-        print(f"  {label:>9} {sum(c)/len(c)*100:>6.1f}% {len(c):>5}")
+        print(f"  {label:>9} {acc*100:>6.1f}% {ctx*100:>6.1f}% {pool*100:>7.1f}% {len(rs):>5}")
+
+    # Miss decomposition: where do the failures actually sit? This is the Step-0
+    # split that decides whether the next lever is retrieval, ranking, or the
+    # reader — the same discipline as the LME reader-parity P0.
+    misses = [r for r in results if not r["correct"]]
+    if misses:
+        retrieval = sum(not r.get("gold_in_pool", False) for r in misses)
+        ranking = sum(r.get("gold_in_pool", False)
+                      and not r.get("gold_in_context", False) for r in misses)
+        synthesis = sum(r.get("gold_in_context", False) for r in misses)
+        n = len(misses)
+        print(f"\n  ── miss decomposition ({n} misses; lexical tau=0.6) ──")
+        print(f"  retrieval loss   (gold in neither pool nor ctx): {retrieval:>3}  ({retrieval/n*100:.0f}%)")
+        print(f"  ranking/cut loss (gold in pool, not in ctx):     {ranking:>3}  ({ranking/n*100:.0f}%)")
+        print(f"  synthesis/judge  (gold IN ctx, still wrong):     {synthesis:>3}  ({synthesis/n*100:.0f}%)")
+    n_prof = [r.get("n_profile", 0) for r in results]
+    if n_prof:
+        print(f"\n  profile tier: {sum(n_prof)/len(n_prof):.1f} entries/question avg "
+              f"({sum(1 for p in n_prof if p == 0)} questions saw zero)")
 
 
 def _print_recurrence_summary(markers: list[dict], out_path: str | None) -> None:
@@ -443,7 +558,8 @@ def main() -> None:
     ap.add_argument("--sample", type=int, default=0, help="0 = all")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=1)
-    ap.add_argument("--top-k", type=int, default=10)
+    ap.add_argument("--top-k", type=int, default=10,
+                    help="base K; the pipeline searches top_k*3 like the LME driver")
     ap.add_argument("--start-role", choices=["user", "assistant"], default="user")
     ap.add_argument("--session-gap-days", type=float, default=1.0,
                     help="fallback inter-session spacing when MSC gaps are missing")
@@ -461,6 +577,9 @@ def main() -> None:
     ap.add_argument("--rules-extraction", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--graph-multihop", action="store_true")
     ap.add_argument("--no-dream", action="store_true")
+    ap.add_argument("--dream-per-session", action="store_true",
+                    help="dream after EACH session (live-store posture: profile/"
+                         "episode evidence accumulates across dreams)")
     ap.add_argument("--keep-db", action="store_true")
     ap.add_argument("--out", default=None, help="recurrence: write the marker dump here")
     ap.add_argument("--sim", action="store_true", help="offline: StubLLM, no API")
