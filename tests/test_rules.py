@@ -266,3 +266,147 @@ def test_dream_extraction_disabled_mints_no_rules(cfg, stub_llm):
         assert hy.rules() == []       # write-side gated off → no agent_inferred rules
     finally:
         hy.close()
+
+
+# ── candidate-suggestion pathway (read-only, no auto-write) ──────────────────
+# The tagger is a high-RECALL detector that over-fires on one-offs, so instead of
+# auto-injecting inferred rules (which never cleared the precision gate), we
+# SUGGEST candidates and let the confirming human/agent be the precision gate.
+
+class _DurabilityStub:
+    """A fake durability tagger: any statement mentioning 'mongo' → the SAME
+    canonical rule (so paraphrases across sessions collapse into one candidate
+    with recurrence), 'docker' → its own rule, everything else one-off."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, req):
+        import json
+        self.calls += 1
+        body = req.user.split("Markers:", 1)[1].rsplit("Return", 1)[0].strip()
+        payload = json.loads(body)
+        out = []
+        for m in payload:
+            s = m["statement"].lower()
+            if "mongo" in s:
+                out.append({"index": m["index"], "standing": True,
+                            "confidence": 0.95, "rule": "Never use MongoDB"})
+            elif "docker" in s:
+                out.append({"index": m["index"], "standing": True,
+                            "confidence": 0.9, "rule": "Never suggest Docker"})
+            else:
+                out.append({"index": m["index"], "standing": False,
+                            "confidence": 0.1, "rule": None})
+        return json.dumps(out)
+
+
+def _seed_marker(conn, kind, statement, session_id, *, consolidated=False):
+    conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES (?)", (session_id,))
+    chunk_id = f"chunk_{session_id}_{abs(hash(statement)) % 10**6}"
+    conn.execute(
+        "INSERT OR IGNORE INTO chunks(id, session_id, start_message_id, "
+        "end_message_id, salience_reason, text) VALUES (?,?,?,?,?,?)",
+        (chunk_id, session_id, 0, 0, "test", statement))
+    conn.execute(
+        "INSERT INTO behavioral_markers(kind, statement, chunk_id, consolidated_at) "
+        "VALUES (?,?,?,?)",
+        (kind, statement, chunk_id, "2020-01-01T00:00:00" if consolidated else None))
+
+
+def _suggest(cfg, judge, seed):
+    """A HyMem whose markers are seeded directly; returns (inst, candidates)."""
+    from hymem.core.db import transaction
+    from hymem.rules import suggest_rules_from_markers
+    inst = HyMem(replace(cfg, rules_enabled=True), llm=judge)
+    with transaction(inst.conn):
+        seed(inst.conn)
+    # read via the write conn so freshly-seeded rows are visible in one process
+    return inst, suggest_rules_from_markers(inst.conn, inst.config, judge)
+
+
+def test_suggest_groups_paraphrases_and_counts_sessions(cfg):
+    judge = _DurabilityStub()
+
+    def seed(conn):
+        _seed_marker(conn, "rejection", "The user rejects using MongoDB", "s1")
+        _seed_marker(conn, "rejection", "Avoid MongoDB, use Postgres", "s2")
+        _seed_marker(conn, "correction", "The meeting is Tuesday not Monday", "s1")
+
+    inst, cands = _suggest(cfg, judge, seed)
+    try:
+        # the two Mongo paraphrases collapse to ONE candidate over TWO sessions;
+        # the one-off correction is not standing → no candidate.
+        assert [c.text for c in cands] == ["Never use MongoDB"]
+        c = cands[0]
+        assert c.marker_count == 2 and c.session_count == 2
+        assert c.kinds == ["rejection"] and not c.already_active
+        # nothing was persisted — suggestion is read-only.
+        assert inst.rules() == []
+    finally:
+        inst.close()
+
+
+def test_suggest_flags_already_active_and_ranks_novel_first(cfg):
+    judge = _DurabilityStub()
+
+    def seed(conn):
+        _seed_marker(conn, "rejection", "avoid mongodb entirely", "s1")   # → already active
+        _seed_marker(conn, "rejection", "never suggest docker here", "s1")  # → novel
+        _seed_marker(conn, "rejection", "and mongo again", "s2")          # reinforces the active one
+
+    inst = HyMem(replace(cfg, rules_enabled=True), llm=judge)
+    try:
+        inst.add_rule("Never use MongoDB")           # already in force
+        from hymem.core.db import transaction
+        with transaction(inst.conn):
+            seed(inst.conn)
+        cands = inst.suggest_rules()
+        by_text = {c.text: c for c in cands}
+        assert by_text["Never use MongoDB"].already_active is True
+        assert by_text["Never suggest Docker"].already_active is False
+        # novel candidate ranks before the already-active one.
+        assert cands[0].text == "Never suggest Docker"
+    finally:
+        inst.close()
+
+
+def test_suggest_requires_llm_and_respects_limit(cfg, stub_llm):
+    # no LLM → explicit error (the tagger is required, like ask()/dream()).
+    no_llm = HyMem(replace(cfg, rules_enabled=True), llm=None)
+    try:
+        with pytest.raises(RuntimeError):
+            no_llm.suggest_rules()
+    finally:
+        no_llm.close()
+
+    judge = _DurabilityStub()
+
+    def seed(conn):
+        _seed_marker(conn, "rejection", "avoid mongodb", "s1")
+        _seed_marker(conn, "rejection", "never suggest docker", "s1")
+
+    inst = HyMem(replace(cfg, rules_enabled=True), llm=judge)
+    try:
+        from hymem.core.db import transaction
+        with transaction(inst.conn):
+            seed(inst.conn)
+        assert len(inst.suggest_rules(limit=1)) == 1
+    finally:
+        inst.close()
+
+
+def test_suggest_ignores_consolidated_and_empty_is_safe(cfg):
+    judge = _DurabilityStub()
+
+    def seed(conn):
+        _seed_marker(conn, "rejection", "avoid mongodb", "s1", consolidated=True)
+
+    inst, cands = _suggest(cfg, judge, seed)
+    try:
+        # a consolidated marker is out of the fresh-signal window → no candidate,
+        # and a tagger with nothing to judge is never even called.
+        assert cands == []
+        assert judge.calls == 0
+    finally:
+        inst.close()

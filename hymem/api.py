@@ -333,6 +333,41 @@ class HyMem:
         host that wants to show or audit what standing rules exist. Read-only."""
         return rules_mod.list_rules(self.read_conn)
 
+    def suggest_rules(
+        self,
+        *,
+        limit: int | None = None,
+        mode: str = "llm",
+        confidence_min: float | None = None,
+    ) -> list[rules_mod.RuleCandidate]:
+        """Propose standing rules the durability tagger infers from recent
+        (unconsolidated) behavioral markers, ranked and de-duplicated — for a
+        human or agent to confirm via `add_rule`. **Read-only: nothing is
+        persisted.**
+
+        This is the candidate-suggestion counterpart to the (default-OFF)
+        write-side auto-extraction. Auto-*injecting* inferred rules didn't clear
+        the precision gate on real markers — the tagger reliably FINDS standing
+        directives (high recall) but over-fires on one-offs — so instead of
+        silently minting rules, this surfaces candidates and lets the confirming
+        human/agent be the precision gate. Each `RuleCandidate` shows its
+        corroboration (markers over distinct sessions), confidence, source kinds,
+        the raw supporting statements, and whether it's `already_active`.
+
+        Typical flow: log a session → `suggest_rules()` to review → `add_rule()`
+        the good ones → `dream()`. Requires an LLMClient (the tagger), like
+        `ask()`/`dream()`; returns `[]` when no marker clears the tagger.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "HyMem.suggest_rules requires an LLMClient (the durability tagger). "
+                "Pass one to the constructor or call set_llm() before suggesting."
+            )
+        return rules_mod.suggest_rules_from_markers(
+            self.read_conn, self.config, self._llm,
+            limit=limit, mode=mode, confidence_min=confidence_min,
+        )
+
     # ---- query-time --------------------------------------------------
 
     def augment(

@@ -12,6 +12,7 @@ Exposes eleven tools to the Hermes Agent platform:
   hymem_retract    — retract a wrongly extracted knowledge graph edge
   hymem_add_rule   — record a standing behavioral rule (always_on / contextual)
   hymem_list_rules — list the active standing rules
+  hymem_suggest_rules — propose inferred standing rules to review (no auto-add)
 
 Run via the installed entry point:
     hymem-server
@@ -210,6 +211,23 @@ def _do_list_rules() -> str:
     return "\n".join(lines)
 
 
+def _do_suggest_rules(limit: int = 10) -> str:
+    try:
+        cands = _get_hy().suggest_rules(limit=limit)
+    except RuntimeError as e:
+        return f"error: {e}"
+    if not cands:
+        return ("No rule candidates (no recent markers cleared the durability "
+                "tagger). Suggestions read UNCONSOLIDATED markers — call after "
+                "logging a session and before dreaming.")
+    lines = ["Candidate standing rules — NOT added yet; adopt with hymem_add_rule:"]
+    for c in cands:
+        prov = f"{c.marker_count} marker(s)/{c.session_count} session(s), conf {c.confidence:.2f}"
+        dup = "  [already active — would reinforce]" if c.already_active else ""
+        lines.append(f"- {c.text}  ({prov}; kinds={','.join(c.kinds)}){dup}")
+    return "\n".join(lines)
+
+
 # ── MCP tool registration ─────────────────────────────────────────────────────
 
 def hymem_capture(session_id: str, messages: str, dream: bool = True) -> str:
@@ -355,6 +373,19 @@ def hymem_list_rules() -> str:
     return _do_list_rules()
 
 
+def hymem_suggest_rules(limit: int = 10) -> str:
+    """Propose standing rules inferred from RECENT behavior, to review and confirm
+    — this does NOT add anything. Auto-adding inferred rules is deliberately off:
+    a rule injects into every future call, so a human/agent confirms first.
+
+    Each candidate shows its corroboration — how many markers over how many
+    distinct sessions support it (more sessions = more durable) — its confidence,
+    and its source kinds; ones matching an active rule are flagged. To adopt one,
+    call `hymem_add_rule` with its text; skip the rest. Reads unconsolidated
+    markers, so call it after logging a session and before dreaming."""
+    return _do_suggest_rules(limit)
+
+
 def main() -> None:
     # Configure logging at the application entry point (never on import — that
     # would clobber a host's handlers). Without this, the dream runner's
@@ -377,6 +408,7 @@ def main() -> None:
     mcp_instance.tool()(hymem_retract)
     mcp_instance.tool()(hymem_add_rule)
     mcp_instance.tool()(hymem_list_rules)
+    mcp_instance.tool()(hymem_suggest_rules)
     mcp_instance.run()
 
 

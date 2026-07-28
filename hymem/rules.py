@@ -161,6 +161,118 @@ def route_markers_to_rules(conn: sqlite3.Connection, cfg, llm=None) -> int:
     return minted
 
 
+@dataclass
+class RuleCandidate:
+    """A standing rule the durability tagger INFERRED from behavioral markers,
+    offered for human/agent confirmation via `add_rule` — NEVER auto-persisted.
+
+    This is the candidate-suggestion surface: write-side auto-injection didn't
+    clear the precision gate on real markers (the tagger is a strong high-RECALL
+    detector but over-fires on one-offs — "rejects LoCoMo" reads standing without
+    the recurrence a live store would show), so the human confirming is the
+    precision gate. Each candidate carries the corroboration a reviewer needs:
+    ``marker_count`` supporting markers over ``session_count`` distinct sessions
+    (more sessions = more durable), the ``kinds`` that fed it, the tagger's max
+    ``confidence``, the raw ``supporting_statements`` to eyeball, and
+    ``already_active`` (its canonical text already matches an active rule, i.e.
+    confirming would reinforce, not add)."""
+
+    text: str
+    scope: str
+    confidence: float
+    kinds: list[str]
+    marker_count: int
+    session_count: int
+    supporting_statements: list[str] = field(default_factory=list)
+    already_active: bool = False
+
+
+def suggest_rules_from_markers(
+    conn: sqlite3.Connection,
+    cfg,
+    llm,
+    *,
+    limit: int | None = None,
+    mode: str = "llm",
+    confidence_min: float | None = None,
+) -> list["RuleCandidate"]:
+    """Propose standing rules from UNCONSOLIDATED behavioral markers — the manual,
+    NO-WRITE twin of `route_markers_to_rules`. Reads the same marker set (plus a
+    session join for recurrence), runs the durability tagger, collapses
+    paraphrases by canonical text, and returns ranked candidates for confirmation.
+    Nothing is persisted.
+
+    Intended flow: log a session, call this to review the standing rules it
+    implies, adopt the good ones via `add_rule`, THEN dream (which consolidates
+    the markers). Because it reads `consolidated_at IS NULL`, it operates on the
+    fresh signal since the last dream — bounded cost, natural cadence. Requires an
+    LLM (the tagger); `[]` on a pre-v23 store or when no marker clears the tagger.
+
+    Ranking surfaces the most adoptable first: NOVEL before already-active, then
+    most-corroborated (distinct sessions, then markers), then most confident.
+    De-dups against active rules via `already_active` so re-review doesn't
+    re-propose what's already adopted (a *declined* one-off can still recur — a
+    dismissed-candidate store is the natural v2, gated behind real usage)."""
+    if confidence_min is None:
+        confidence_min = getattr(cfg, "rules_extraction_confidence_min", 0.75)
+    try:
+        rows = conn.execute(
+            "SELECT bm.kind AS kind, bm.statement AS statement, c.session_id AS session_id "
+            "FROM behavioral_markers bm LEFT JOIN chunks c ON bm.chunk_id = c.id "
+            "WHERE bm.consolidated_at IS NULL ORDER BY bm.id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    if not rows:
+        return []
+
+    from hymem import rules_extract
+
+    markers = [(r["kind"], r["statement"]) for r in rows]
+    sessions = [r["session_id"] for r in rows]
+    decisions = rules_extract.route_decisions(
+        markers,
+        mode=mode,
+        llm=llm,
+        confidence_min=confidence_min,
+        batch_size=getattr(cfg, "rules_extraction_batch_size", 20),
+    )
+
+    # Normalized text of every active rule → flag candidates that would reinforce
+    # rather than add (so a reviewer isn't offered rules already in force).
+    active_norm = {normalize(r.text) for r in list_rules(conn)}
+
+    groups: dict[str, dict] = {}
+    for (kind, stmt), sess, d in zip(markers, sessions, decisions):
+        if not d.route:
+            continue
+        key = normalize(d.text)
+        g = groups.setdefault(key, {
+            "text": d.text, "scope": d.scope, "confidence": 0.0,
+            "kinds": set(), "statements": [], "sessions": set(),
+        })
+        g["confidence"] = max(g["confidence"], d.confidence)
+        g["kinds"].add(kind)
+        g["statements"].append(stmt)
+        if sess:
+            g["sessions"].add(sess)
+
+    candidates = [
+        RuleCandidate(
+            text=g["text"], scope=g["scope"], confidence=g["confidence"],
+            kinds=sorted(g["kinds"]), marker_count=len(g["statements"]),
+            session_count=len(g["sessions"]),
+            supporting_statements=g["statements"],
+            already_active=key in active_norm,
+        )
+        for key, g in groups.items()
+    ]
+    # Novel first, then most-corroborated (sessions, markers), then confident.
+    candidates.sort(key=lambda c: (c.already_active, -c.session_count,
+                                   -c.marker_count, -c.confidence, c.text))
+    return candidates[:limit] if limit is not None else candidates
+
+
 def list_rules(conn: sqlite3.Connection) -> list["Rule"]:
     """Every ACTIVE rule (always_on AND contextual), ignoring triggers — the
     "show me the rulebook" reader behind `HyMem.rules()` / the MCP tool. Unlike
