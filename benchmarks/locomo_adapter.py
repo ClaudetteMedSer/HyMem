@@ -356,6 +356,22 @@ def _evidence_diagnostics(q: dict, conv: dict, context_texts: list[str],
     }
 
 
+# The cat-5 judge takes an EXPLANATION of unanswerability, not a gold answer.
+# Factored out of evaluate_qa so --rejudge can rebuild the identical judge input
+# from a stored results file — a re-judge that reconstructed this differently
+# would measure prompt drift, not judge nondeterminism.
+def _gold_for_judge(cat: int, answer, trap) -> str:
+    if cat != 5:
+        return answer if answer is not None else ""
+    s = ("The conversation never establishes this — the question's "
+         "premise is false or the asked detail was never mentioned. ")
+    if trap:
+        s += (f"A tempting but WRONG answer (it belongs to a different "
+              f"speaker or event) would be: '{trap}'. "
+              f"A response giving that answer is incorrect.")
+    return s
+
+
 def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
                 answer_llm, judge_llm) -> dict:
     cat = q["category"]
@@ -403,19 +419,8 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
             question_date=question_date,
             permissive_default=(cat == 3),
             extra_system=extra)
-        if cat == 5:
-            # The _abs judge takes an EXPLANATION of unanswerability, not a gold
-            # answer. Naming the trap answer lets the judge fail a reader that
-            # fell for the premise swap.
-            explanation = ("The conversation never establishes this — the question's "
-                           "premise is false or the asked detail was never mentioned. ")
-            if q["adversarial_answer"]:
-                explanation += (f"A tempting but WRONG answer (it belongs to a different "
-                                f"speaker or event) would be: '{q['adversarial_answer']}'. "
-                                f"A response giving that answer is incorrect.")
-            gold_for_judge = explanation
-        else:
-            gold_for_judge = q["answer"] or ""
+        gold_for_judge = _gold_for_judge(cat, q["answer"] or "",
+                                         q["adversarial_answer"])
         correct = judge_answer(judge_llm, q["judge_type"], q["question"],
                                gold_for_judge, ai)
 
@@ -617,6 +622,91 @@ def _print_report(results: list[dict], args) -> None:
 
 # ── main ────────────────────────────────────────────────────────────────────
 
+# ── Re-judge (split the churn floor into reader share vs judge share) ───────
+# Identical-config reruns move ~10 of 200 questions even though answer AND judge
+# both run at temperature=0.0 (spec §8). Two nondeterministic LLMs sit in that
+# loop and the accuracy line cannot separate them. Re-judging ONE stored answer
+# file with the SAME judge holds the reader fixed: every flip that survives is
+# the judge's share, and the remainder is the reader's. If the judge dominates,
+# majority-of-3 judging shrinks the floor for the whole triad at once.
+#
+# LME has the same facility (`longmemeval_adapter.py:_rejudge_run`) but reads
+# `hypothesis` out of a {config, per_question} envelope; LoCoMo `--out` writes a
+# bare list keyed on `ai_answer`, hence this shim rather than a shared call.
+
+_TRAP_RE = re.compile(r"^\[unanswerable; trap: (.*)\]$", re.S)
+
+
+def _rejudge_file(args, judge_llm) -> None:
+    """Re-judge a stored `--out` file, writing a flip-compatible copy."""
+    from longmemeval_adapter import judge_answer
+
+    rows = json.loads(Path(args.rejudge).read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or not rows:
+        sys.exit(f"{args.rejudge}: expected a non-empty list of per-question results")
+
+    print(f"\n=== LoCoMo RE-JUDGE — {Path(args.rejudge).name} ===")
+    print(f"  rows: {len(rows)}   judge: {args.judge_model}"
+          + (f"  +extra_body={args.judge_extra_body}" if args.judge_extra_body else ""))
+    print("  reader output is held FIXED — every flip below is judge nondeterminism\n",
+          flush=True)
+
+    def _rj(r: dict) -> dict:
+        cat, ai = r["category"], str(r.get("ai_answer") or "")
+        if not ai or ai.startswith("[LLM_ERROR"):
+            new, judged = bool(r.get("correct")), False   # nothing judgeable
+        else:
+            gold = r.get("answer")
+            if cat == 5:
+                m = _TRAP_RE.match(str(gold))
+                gold = _gold_for_judge(5, None, m.group(1) if m else "")
+            new = judge_answer(judge_llm, CATEGORY_JUDGE[cat], r["question"],
+                               gold if gold is not None else "", ai)
+            judged = True
+        return {**r, "correct": new, "correct_original": r.get("correct"),
+                "_rejudged": judged}
+
+    out_rows: list[dict] = [None] * len(rows)
+    if args.workers > 1:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = {pool.submit(_rj, r): i for i, r in enumerate(rows)}
+            for done, fut in enumerate(as_completed(futs), 1):
+                out_rows[futs[fut]] = fut.result()
+                if done % 25 == 0:
+                    print(f"  ── re-judged {done}/{len(rows)}", flush=True)
+    else:
+        for i, r in enumerate(rows):
+            out_rows[i] = _rj(r)
+
+    judged = [r for r in out_rows if r["_rejudged"]]
+    flipped = [r for r in judged if bool(r["correct"]) != bool(r["correct_original"])]
+    t_to_f = [r for r in flipped if r["correct_original"]]
+    o = sum(bool(r["correct_original"]) for r in out_rows) / len(out_rows)
+    n = sum(bool(r["correct"]) for r in out_rows) / len(out_rows)
+    print(f"\n  original: {o*100:.1f}%   re-judged: {n*100:.1f}%   ({(n-o)*100:+.1f}pp)")
+    print(f"  judge churn: {len(flipped)}/{len(judged)} judged rows flipped "
+          f"({len(flipped)/max(len(judged),1)*100:.1f}%)   "
+          f"[{len(t_to_f)} correct→wrong, {len(flipped)-len(t_to_f)} wrong→correct]")
+    if len(judged) < len(out_rows):
+        print(f"  ({len(out_rows)-len(judged)} rows unjudgeable — kept prior verdict)")
+    by_cat = defaultdict(lambda: [0, 0])
+    for r in judged:
+        c = by_cat[CATEGORY_NAME[r["category"]].replace("_abs", "")]
+        c[1] += 1
+        c[0] += bool(r["correct"]) != bool(r["correct_original"])
+    print(f"\n  {'category':<14} {'flipped':>8} {'n':>5}")
+    for name in sorted(by_cat):
+        f, tot = by_cat[name]
+        print(f"  {name:<14} {f:>8} {tot:>5}")
+
+    # Written in the SAME bare-list shape as --out, so locomo_flip.py compares
+    # this against the source file directly: that flip run IS the judge share.
+    dest = args.out or str(Path(args.rejudge).with_suffix(".rejudged.json"))
+    Path(dest).write_text(json.dumps(out_rows, indent=2), encoding="utf-8")
+    print(f"\n  re-judged results → {dest}")
+    print(f"  compare: python locomo_flip.py {args.rejudge} {dest}")
+
+
 def _build_llm(model, base_url, api_key, extra_body):
     import os
     from longmemeval_adapter import LLMClient
@@ -695,9 +785,21 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="write per-question results JSON here")
     ap.add_argument("--dump-context", action="store_true",
                     help="include the exact rendered answer context in each result")
+    ap.add_argument("--rejudge", default=None, metavar="RESULTS.json",
+                    help="re-judge a stored --out file with the SAME reader output "
+                         "(no ingest, no answering) and report judge-only churn; "
+                         "writes a flip-compatible copy to --out or *.rejudged.json")
     ap.add_argument("--sim", action="store_true", help="offline: StubLLM, no API")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+
+    if args.rejudge:
+        if args.sim:
+            sys.exit("--rejudge needs a real judge; drop --sim.")
+        jb = json.loads(args.judge_extra_body) if args.judge_extra_body else None
+        _rejudge_file(args, _build_llm(args.judge_model, _DEEPSEEK_BASE_URL,
+                                       args.answer_api_key, jb))
+        return
 
     categories = ({int(c) for c in args.categories.split(",")}
                   if args.categories else None)

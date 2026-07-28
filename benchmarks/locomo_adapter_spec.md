@@ -22,17 +22,23 @@ lever, supersession, and dream consolidation at a depth MSC never reaches. It is
 also the de-facto industry comparison corpus (Mem0, Zep, MemGPT re-evals all
 report on it).
 
-> **STATUS 2026-07-28 — BUILT (`benchmarks/locomo_adapter.py`, ~600 lines), all
-> offline mechanics validated.** Data contract verified against the REAL
-> `data/locomo10.json` downloaded from snap-research/locomo (not from a paper
-> description — the file has quirks a spec-first build would have missed, §1).
-> Validated offline: `--sim` fixture end-to-end (all 5 categories, coercion
-> quirks included); real-file loader (10 convs / 1986 QA loaded, category counts
-> exactly match raw inspection, dates parse monotonically, **1979/1986 questions
-> have fully locatable evidence turns**); real ingest of conv-26 (19 sessions,
-> 419 turns) with StubLLM — FTS-only retrieval surfaces evidence even 16+
-> sessions back; `--db-dir` persistence + reuse; `--workers` conversation
-> parallelism (deterministic across runs). Real numbers need the box.
+> **STATUS 2026-07-28 — CANONICAL 70.2% answerable / 76.0% overall** (n=200,
+> seed 0, `--top-k` ×3 aperture + `--embeddings` + `--max-context-chars 24000`,
+> reader thinking OFF). Arc: 53.0 → 59.6 (3× aperture) → 65.6 (embeddings at 3×)
+> → **70.2** (24k budget). Everything above was adapter/config-side; the core was
+> never touched — the same pattern as the MSC arc ([[project_msc_benchmark]]).
+> Residual at canonical: 13 retrieval misses (query→turn paraphrase tail,
+> `--name-prefix` territory) and 32 synthesis. **Read every delta here against
+> the churn floor in §8 — it is larger than several of the levers that produced
+> this number.**
+>
+> Build validation (2026-07-28, still current): data contract verified against the
+> REAL `data/locomo10.json` from snap-research/locomo (not a paper description —
+> the file has quirks a spec-first build would have missed, §1); `--sim` fixture
+> end-to-end (all 5 categories); real-file loader (10 convs / 1986 QA, category
+> counts match raw inspection, dates parse monotonically, **1979/1986 questions
+> have fully locatable evidence turns**); real conv-26 ingest with StubLLM;
+> `--db-dir` persistence + reuse; `--workers` parallelism.
 
 ---
 
@@ -194,22 +200,35 @@ then the miss decomposition decides the next lever, per the LME/MSC discipline.
 
 ## 6. Levers queue (pre-registered, so post-hoc tuning stays honest)
 
-- **L1 `--graph-multihop` on cat-1** — the Track-A A/B this corpus exists for:
-  282 labeled multi-hop questions on a NON-star topology. Compare cat-1
-  accuracy and `evidence_in_context_frac` ON vs OFF.
-- **L2 `--name-prefix`** — prepend `Name: ` to ingested turns so FTS can match
-  the names questions use (currently names appear only when speakers address
-  each other). Changes extraction input → non-canonical until A/B'd.
-- **L3 `--answerable-clause`** — sizes the abstention-miss cost the honest
-  posture pays on cats 1-4. Label-leaky, never canonical (§2); its honest
-  counterpart, if the cost is real, is a corpus-blind "check the premise
-  against the memories before answering" clause applied to ALL questions.
-- **L4 `--dream-per-session`** — live-store posture at 19-32 dreams/conv; also
-  the first real reuse-rate observation window for the RAPTOR CDC fixes
-  ([[project_raptor_g4_verdict]]) outside LME.
-- **L5 `--embeddings`** — expect MORE headroom than MSC's flat result: LoCoMo
-  paraphrase distance at 16+ sessions is where FTS should thin out; the
-  distance-bucket table will show it directly.
+Verdicts as of 2026-07-28. "Net" = flip-script net questions on n=200; compare
+against the §8 churn floor (net ≈ ±4, ~10 questions moving) before reading a
+delta as a signal.
+
+- **L1 `--graph-multihop` on cat-1** — ran, null (31.6% cat-1 OFF vs ON). **Not
+  closed: instrument mismatch, not a verdict.** Multi-hop feeds `graph_facts`
+  rendered as three-word `"s p o"` triples, which cannot clear the `_lex_match`
+  τ=0.6 evidence check against full turn text — the A/B had no path to a
+  positive on the diagnostic. Re-run needs a triple-aware surfacing check.
+- **L2 `--name-prefix`** — UNRUN, now the top candidate: it targets the 13-miss
+  retrieval residual (query→turn paraphrase gaps) that survives at canonical.
+  Ingest-side → requires `--fresh`, so it re-pays ingest+dream.
+- **L3 `--answerable-clause`** — label-leaky, never canonical (§2); unrun.
+- **L4 `--dream-per-session`** — unrun.
+- **L5 `--embeddings`** — **VERDICT REVERSED.** First read (52.3% at the default
+  aperture) called it dead; it was bottlenecked by a fixed `[:30]` cut discarding
+  the pool gain. At 3× aperture it is **+6.0pp (59.6 → 65.6)** and part of
+  canonical. The near-miss: this is the same mistake as the BEAM June regression
+  — judging a pool-widening lever through a binding downstream cut.
+- **L6 retrieval aperture + context budget** (added after the runs; the largest
+  lever on this corpus). The MSC-sized constants (15/10/10, rerank pool 20)
+  surface ~2% of a 369-689-turn LoCoMo history. `--top-k` ×3 = **+6.6pp**;
+  ×5 = **−3.3pp, within the churn floor → no dilution demonstrated** (§8).
+  `--max-context-chars` must scale WITH the aperture: at the 8000 default the
+  render loop truncated the extra evidence away and it scored as *synthesis*
+  loss, which is what made the first "reader is drowning" read wrong. 24k = **+4.6pp**.
+- **L7 reader thinking** — enabled at 3×/24k scored WORSE in every category. Even
+  if the magnitude is inside the floor, there is no measured benefit, so OFF
+  stays canonical (and it is the cheaper setting).
 
 ## 7. Risks / honest caveats
 
@@ -228,3 +247,51 @@ then the miss decomposition decides the next lever, per the LME/MSC discipline.
   the perspective clause makes it attributable, not invisible.
 - **License.** CC BY-NC 4.0 — local benchmark use is fine; the data file stays
   gitignored, redistribution is an explicit decision not a default.
+
+## 8. The churn floor (MEASURED — read every delta against it)
+
+Two runs of the **identical** config, differing only by `--dump-context` (which
+records the rendered string and cannot change an answer), scored 70.2% and 67.5%
+answerable: **7 broken / 3 fixed, ~10 of 200 questions moving, net −4.**
+
+That is the floor. It is not a temperature setting — answer generation and
+judging are both already at `temperature=0.0`
+(`longmemeval_adapter.py:978`, `:1059`); this is server-side nondeterminism at
+temp 0 and cannot be tuned away client-side.
+
+Consequences, all load-bearing:
+
+- **A single A/B cannot resolve anything smaller than ~net 5 on n=200.** The 5×
+  aperture arm (net −5, 9 broken / 4 fixed) is one question past the floor — its
+  "dilution confirmed" reading does not survive. Dilution remains *unobserved on
+  this corpus at any setting*, not disproven.
+- **Two runs of the same config are not interchangeable as an A arm.** A
+  canonical-vs-replicate baseline mix-up put 2.0pp of drift inside one reported
+  delta. Flip comparisons must name which file is A.
+- **`locomo_flip.py` is the instrument, not the accuracy line** — but its counts
+  need the floor subtracted too. Rule of thumb for calling a lever real on
+  n=200: broken count ≥ 2× floor (≥14) **or** net ≥ |8|, ideally with a
+  mechanism visible in the four-surface bucket migration.
+- **Not a LoCoMo property — MEASURED on MSC too.** Per-question churn is ~5% here
+  and **4% on MSC** (replicate 2026-07-28: 3 fixed / 1 broken, 84.0 → **86.0**),
+  matching the ~4-questions/category band [[project_lme_variance_band]] recorded
+  on LME. Two consequences for the MSC baseline: the churn *rate* is comparable
+  across the triad, but at n=100 it buys a **wider** pp band (2σ ≈ ±4pp vs ±3.2pp
+  at n=200 — sd ≈ √(p/n)), and 84.0 is now known to be one draw, not a center.
+  Two draws put the mean near **85 ± ~1.4pp**, so an MSC regression gate written
+  as "≥ 84.0" passes a no-op change about half the time. Restate it as a band.
+- **A floor measured from one replicate is itself one draw.** MSC's 4 movers
+  carry ≈ ±2 of counting noise; 4% and 5% are not distinguishable at this number
+  of reruns. Treat both as "~5%", not as a ranking of the two benchmarks.
+- **Splitting reader churn from judge churn — BUILT.**
+  `locomo_adapter.py --rejudge RESULTS.json` re-judges a stored `--out` file with
+  the same judge, no ingest and no re-answering, and writes a flip-compatible
+  copy. Every flip it reports is judge nondeterminism with the reader held
+  byte-identical; `locomo_flip.py` detects that case and relabels its
+  "dilution" line accordingly. If the judge owns most of the floor, majority-of-3
+  judging shrinks it for all three benchmarks at once. Cat-5 golds round-trip
+  through `_gold_for_judge()` (shared with the live path) so the re-judge sees
+  the same abstention explanation, not a reconstruction — otherwise the run would
+  measure prompt drift. LME's own `--rejudge`
+  (`longmemeval_adapter.py:1901`) is envelope-shaped (`{config, per_question}`,
+  `hypothesis`) and cannot read LoCoMo's bare list, hence the separate path.

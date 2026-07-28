@@ -92,6 +92,15 @@ def main() -> None:
         stale = args.base if not a_staged else args.new
         print(f"  [note] {stale} predates the four-surface diagnostic: its budget\n"
               f"         losses are still folded into `synthesis` (see bucket table)")
+    # A --rejudge pair holds the reader byte-identical, so nothing that moves can
+    # be dilution — it is judge nondeterminism by construction. Detect it rather
+    # than trusting the caller to remember which pair they are looking at.
+    judge_only = all(a_rows[i].get("ai_answer") == b_rows[i].get("ai_answer")
+                     for i in shared)
+    if judge_only:
+        print("  [judge-only] every shared answer is byte-identical — B is a "
+              "re-judge of A.\n               All flips below are JUDGE churn; "
+              "the reader never moved.")
     print(f"\n  A accuracy: {a_acc*100:.1f}%")
     print(f"  B accuracy: {b_acc*100:.1f}%   ({(b_acc-a_acc)*100:+.1f}pp)")
 
@@ -119,7 +128,7 @@ def main() -> None:
         lost_ev = [i for i in regressions if i not in same_ev]
         print(f"\n  ── regression cause ──")
         print(f"  reader-side  (evidence reached reader in BOTH, now wrong): {len(same_ev):>3}"
-              f"   ← dilution")
+              f"   {'← JUDGE churn (same answer text)' if judge_only else '← dilution'}")
         print(f"  evidence lost (surfaced in A, not in B):                   {len(lost_ev):>3}")
         by_cat = Counter(_CATNAME.get(a_rows[i].get("category"), "?") for i in same_ev)
         if by_cat:
