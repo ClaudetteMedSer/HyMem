@@ -439,13 +439,22 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
             correct = judge_answer(judge_llm, "single-session-user",
                                    ex["question"], ex["answer"], ai)
         gi = _gold_session_index(ex)
-        return {"id": ex["id"], "question_type": "recall", "correct": bool(correct),
-                "question": ex["question"], "answer": ex["answer"], "ai_answer": ai,
-                "n_sessions": ex["n_sessions"], "gold_session": gi,
-                "gold_distance": (ex["n_sessions"] - gi) if gi >= 0 else -1,
-                "gold_in_context": bool(gold_in_context),
-                "gold_in_pool": bool(gold_in_pool),
-                "n_memories": len(memories), "n_profile": info["n_profile"]}
+        rec = {"id": ex["id"], "question_type": "recall", "correct": bool(correct),
+               "question": ex["question"], "answer": ex["answer"], "ai_answer": ai,
+               "n_sessions": ex["n_sessions"], "gold_session": gi,
+               "gold_distance": (ex["n_sessions"] - gi) if gi >= 0 else -1,
+               "gold_in_context": bool(gold_in_context),
+               "gold_in_pool": bool(gold_in_pool),
+               "n_memories": len(memories), "n_profile": info["n_profile"]}
+        if args.dump_context:
+            # Re-render the IDENTICAL context the answerer saw (same function,
+            # same char caps — the LME distillation dry-run trick) so synthesis
+            # misses can be audited from the results JSON alone.
+            from longmemeval_adapter import _render_answer_context
+            rec["context"] = _render_answer_context(
+                memories, None, info["total_matches"], info["graph_count"],
+                info["temporal_events"], info["aggregation_nodes"])
+        return rec
     finally:
         adapter.close()
         if not args.keep_db:
@@ -581,7 +590,12 @@ def main() -> None:
                     help="dream after EACH session (live-store posture: profile/"
                          "episode evidence accumulates across dreams)")
     ap.add_argument("--keep-db", action="store_true")
-    ap.add_argument("--out", default=None, help="recurrence: write the marker dump here")
+    ap.add_argument("--out", default=None,
+                    help="recall: write per-question results JSON here; "
+                         "recurrence: the marker dump")
+    ap.add_argument("--dump-context", action="store_true",
+                    help="recall: include the exact rendered answer context in "
+                         "each result (synthesis-miss audits)")
     ap.add_argument("--sim", action="store_true", help="offline: StubLLM, no API")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
@@ -624,6 +638,9 @@ def main() -> None:
             print(json.dumps(results, indent=2))
         else:
             _print_recall_report(results)
+        if args.out:
+            Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
+            print(f"\n  per-question results → {args.out}")
 
     else:  # recurrence
         all_markers: list[dict] = []

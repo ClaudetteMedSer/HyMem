@@ -45,6 +45,17 @@ rather than reimplementing them.
 > (retrieval vs ranking/cut vs synthesis/judge) — this split decides Step 2.
 > Core (`hymem/`) deliberately untouched pending the parity re-run.
 
+> **STATUS 2026-07-28 (parity re-run) — 65.0% (+23pp; the 42% was harness).**
+> Same 100 samples/seed 0/frozen posture. E1 flattened (69.2/70.0/55.6/66.1 at
+> 1/2/3/4-back; gold-in-ctx 100/100/89/89%); profile tier populated (6.2/q, zero
+> empty). Miss decomposition (35): **synthesis/judge 24 (69%)**, retrieval 9
+> (26%, all at 3-4-back — the FTS-paraphrase tail), ranking/cut 2 (6%). At n=100
+> (σ≈4.8pp) 65.0 is statistically indistinguishable from LME's 68.4 — the
+> "cross-session recall is harder" read is retracted. Next: audit the 24
+> synthesis misses (recall `--out` + `--dump-context` added for exactly this),
+> then a gpt-oss-120b reader-parity probe (LME P0 method, judge frozen). Prompt
+> fixes deliberately deferred until the audit says which failure mode dominates.
+
 ---
 
 ## 1. Data contract (VERIFIED 2026-07-28 against MemGPT/MSC-Self-Instruct)
