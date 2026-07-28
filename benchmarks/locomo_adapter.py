@@ -407,6 +407,14 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
 
 # ── per-conversation driver ─────────────────────────────────────────────────
 
+def _aperture(args) -> dict:
+    """Lever-L6 retrieval-aperture overrides; None means 'keep the default'."""
+    return {"message_fts_top_k": args.message_fts_top_k,
+            "rerank_top_k": args.rerank_top_k,
+            "fts_top_k": args.fts_top_k,
+            "graph_top_k": args.graph_top_k}
+
+
 def evaluate_conversation(conv: dict, args, answer_llm, judge_llm) -> list[dict]:
     """Ingest one conversation into its own store, then answer its questions.
     With --db-dir the store persists and is REUSED on later runs (ingest+dream
@@ -427,7 +435,8 @@ def evaluate_conversation(conv: dict, args, answer_llm, judge_llm) -> list[dict]
     adapter = MSCAdapter(root / "hymem.sqlite", api_key=args.api_key, sim=args.sim,
                          hymem_model=args.hymem_model, hymem_base_url=args.hymem_base_url,
                          embeddings=args.embeddings, rules_extraction=args.rules_extraction,
-                         graph_multihop=args.graph_multihop).open()
+                         graph_multihop=args.graph_multihop,
+                         aperture=_aperture(args)).open()
     try:
         if reuse:
             print(f"  [{conv['id']}] reusing store at {root}", flush=True)
@@ -487,7 +496,15 @@ def _print_report(results: list[dict], args) -> None:
     if args.answerable_clause:
         print("  [NON-CANONICAL] --answerable-clause is label-leaky "
               "(conditions the prompt on the adversarial label)")
-    print(f"  overall accuracy: {ov['accuracy']*100:.1f}%\n")
+    print(f"  overall accuracy: {ov['accuracy']*100:.1f}%")
+    # Stamp the aperture: a run is only comparable to another at the SAME one,
+    # and message_fts_top_k is the hard ceiling on gold-turn surfacing.
+    ap_eff = {**MSCAdapter.APERTURE,
+              **{k: v for k, v in _aperture(args).items() if v is not None}}
+    print(f"  aperture: msg={ap_eff['message_fts_top_k']} "
+          f"rerank_pool={ap_eff.get('rerank_top_k', 20)} "
+          f"chunk={ap_eff['fts_top_k']} graph={ap_eff['graph_top_k']} "
+          f"cut={args.top_k * 3}  embeddings={'on' if args.embeddings else 'off'}\n")
     print(f"  {'category':<16} {'acc':>7} {'n':>6}")
     for name, s in sorted(scores.items()):
         print(f"  {name:<16} {s['accuracy']*100:>6.1f}% {s['count']:>6}")
@@ -569,6 +586,20 @@ def main() -> None:
                     help="parallel CONVERSATIONS (each owns its store; ≤10 useful)")
     ap.add_argument("--top-k", type=int, default=10,
                     help="base K; the pipeline searches top_k*3 like the LME driver")
+    # Lever L6 — retrieval aperture. The MSC-sized defaults (15/10/10, rerank
+    # pool 20) surface ~15 of a 369-689-turn LoCoMo history, and `message_hits`
+    # is the ONLY tier that can carry a gold *turn* to the reader. Note
+    # --rerank-top-k must stay comfortably ABOVE --message-fts-top-k or the
+    # reranker has no room to lift a weak-lexical turn into the cut (at the
+    # defaults it reranks 20 down to 15 — it can drop 5 items).
+    ap.add_argument("--message-fts-top-k", type=int, default=None,
+                    help="raw-turn slots surfaced (default 15)")
+    ap.add_argument("--rerank-top-k", type=int, default=None,
+                    help="BM25 candidate pool fed to the reranker (default 20)")
+    ap.add_argument("--fts-top-k", type=int, default=None,
+                    help="dreamed-chunk slots (default 10)")
+    ap.add_argument("--graph-top-k", type=int, default=None,
+                    help="graph-fact slots (default 10)")
     ap.add_argument("--user-speaker", choices=["a", "b"], default="a",
                     help="which speaker HyMem models as the user (default speaker_a)")
     ap.add_argument("--name-prefix", action="store_true",

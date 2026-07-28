@@ -214,10 +214,18 @@ class MSCAdapter:
     adapter hardcodes the deprecated deepseek-chat) and carries only the levers
     MSC needs."""
 
+    # Retrieval aperture. These three were sized for MSC (histories of 20-60
+    # turns, so 15 raw-turn slots is a ~25% aperture). LoCoMo histories are
+    # 369-689 turns — the SAME constants there surface ~2% of the history, and
+    # `message_hits` is the only channel that can carry a gold *turn* to the
+    # reader. Kept as the defaults (MSC's 84.0 baseline is frozen against them),
+    # but now overridable per-run so the aperture can be A/B'd per corpus.
+    APERTURE = {"message_fts_top_k": 15, "fts_top_k": 10, "graph_top_k": 10}
+
     def __init__(self, db_path: Path, *, api_key: str = "", sim: bool = False,
                  hymem_model: str = _HYMEM_MODEL, hymem_base_url: str = _DEEPSEEK_BASE_URL,
                  embeddings: bool = False, rules_extraction: bool | None = None,
-                 graph_multihop: bool = False):
+                 graph_multihop: bool = False, aperture: dict | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.sim = sim
@@ -226,6 +234,10 @@ class MSCAdapter:
         self.embeddings = embeddings
         self.rules_extraction = rules_extraction
         self.graph_multihop = graph_multihop
+        # None-valued entries mean "unset" so callers can pass argparse results
+        # straight through without reimplementing the defaults.
+        self.aperture = {**self.APERTURE,
+                         **{k: v for k, v in (aperture or {}).items() if v is not None}}
         self.hy = None
 
     def open(self):
@@ -235,8 +247,8 @@ class MSCAdapter:
             overrides["rules_extraction_enabled"] = self.rules_extraction
         if self.graph_multihop:
             overrides["graph_multihop_enabled"] = True
-        cfg = HyMemConfig(root=self.db_path.parent, message_fts_top_k=15,
-                          fts_top_k=10, graph_top_k=10, **overrides)
+        overrides.update(self.aperture)
+        cfg = HyMemConfig(root=self.db_path.parent, **overrides)
         embedding_client = None
         if self.sim:
             from hymem.extraction.llm import StubLLMClient
