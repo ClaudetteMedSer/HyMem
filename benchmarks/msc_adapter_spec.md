@@ -70,6 +70,25 @@ rather than reimplementing them.
 > observation for later: profile `name`/`role` slots occasionally hold junk
 > ("name: short black hair and blue eyes") — extractor quality, separate issue.
 
+> **STATUS 2026-07-28 (v3 + reader-parity probe) — 79.0% (+15pp from the deixis
+> clause alone; arc: 42.0 harness → 65.0 parity → 79.0 deixis, ALL adapter-side,
+> zero core changes).** Deixis inversion was confirmed dominant: one prompt
+> clause cut 15 of 26 synthesis misses. MSC recall now sits ~10pp ABOVE the LME
+> frozen baseline (68.4%) — the "cross-session penalty" is not just gone, it
+> inverted (MSC recall probes are single-fact persona lookups, nearest to LME's
+> SS-user class at 91.4%, so don't over-read the comparison either way).
+> **Reader-parity probe (gpt-oss-120b, judge frozen): NULL — slightly lower,
+> i.e. no detectable reader gap, the OPPOSITE of LME's +4.2pp.** The residual
+> is therefore NOT reader-capability bound → the distilled-block idea is dead
+> for MSC, and the per-session-quota core lever stays unmotivated (decay is
+> flat; the retrieval tail is paraphrase-shaped, not crowding-shaped). Remaining
+> levers, sized: (1) `--embeddings` A/B targeting the 7-9 FTS-paraphrase losses
+> at 3-4-back (realistic +3-5pp; needs the :8766 local embed server); (2) audit
+> the ~11 residual in-ctx misses (results JSON on the box: /tmp/msc_results_v3.json)
+> for judge-strictness vs τ=0.6 diagnostic FPs vs genuine ambiguity — expected
+> to be mostly benchmark noise, not architecture. Core (`hymem/`) remains
+> untouched through the entire MSC arc.
+
 ---
 
 ## 1. Data contract (VERIFIED 2026-07-28 against MemGPT/MSC-Self-Instruct)
