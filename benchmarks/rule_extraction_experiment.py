@@ -231,6 +231,26 @@ def marker_metrics(judgments: list[MarkerJudgment], mode: str, tau: float) -> di
     return _metrics(tp, fp, fn)
 
 
+def kind_metrics(judgments: list[MarkerJudgment], mode: str, tau: float) -> dict[str, dict]:
+    """Per-KIND precision/recall at a fixed τ, from the same judgment table (no
+    extra LLM call). Answers 'where do the false positives live?' — if the FPs
+    concentrate in one kind (e.g. `correction` one-offs), a kind-aware bar is a
+    cheap deterministic precision lever; if they're spread evenly the ceiling is
+    genuinely semantic and no cheap lever exists."""
+    buckets: dict[str, dict] = {}
+    for j in judgments:
+        b = buckets.setdefault(j.item["kind"], {"tp": 0, "fp": 0, "fn": 0, "n": 0})
+        routed = _routes(j, mode, tau)
+        gold = bool(j.item["is_rule"])
+        b["n"] += 1
+        b["tp"] += routed and gold
+        b["fp"] += routed and not gold
+        b["fn"] += (not routed) and gold
+    return {k: {**_metrics(v["tp"], v["fp"], v["fn"]),
+                "n": v["n"], "tp": v["tp"], "fp": v["fp"], "fn": v["fn"]}
+            for k, v in sorted(buckets.items())}
+
+
 def policy_metrics(judgments: list[MarkerJudgment], mode: str, tau: float,
                    *, promotion: str, n: int, tau_high: float) -> dict:
     """Per-policy promotion metrics. A policy is promoted per `promotion`:
@@ -297,6 +317,11 @@ def main() -> None:
     ap.add_argument("--threshold", type=float, default=0.90, help="precision gate")
     ap.add_argument("--batch-size", type=int, default=20,
                     help="markers per durability call (a mega-batch collapses the judge)")
+    ap.add_argument("--by-kind", action="store_true",
+                    help="print per-kind precision/recall at --by-kind-tau, to locate "
+                         "where the FPs live (no extra LLM call — a re-slice)")
+    ap.add_argument("--by-kind-tau", type=float, default=0.9,
+                    help="τ at which to break the marker metrics down by kind")
     ap.add_argument("--policy-from-canonical", action="store_true",
                     help="group policies by the LLM canonical rule (paraphrase-robust) "
                          "rather than the corpus policy_id — unblocks E3 when the dump "
@@ -325,8 +350,10 @@ def main() -> None:
 
     marker_rows: list[dict] = []
     policy_rows: list[dict] = []
+    judgments_by_mode: dict[str, list[MarkerJudgment]] = {}
     for mode in modes:
         judgments = judge_corpus(corpus, mode, llm_for(mode), batch_size=args.batch_size)
+        judgments_by_mode[mode] = judgments
         if args.policy_from_canonical:
             # collapse paraphrases: a policy is the LLM's canonical rule text, so
             # "reject Mongo"/"avoid MongoDB" share a policy and their sessions sum.
@@ -384,6 +411,16 @@ def main() -> None:
               f"{r['precision']*100:>5.1f}% {r['recall']*100:>6.1f}% {r['policies']:>4}")
     if not shown:
         print("  (no policy arm cleared the gate)")
+
+    if args.by_kind:
+        print(f"\n── by-KIND breakdown (τ={args.by_kind_tau:.2f}) — where the FPs live ──")
+        print(f"  {'mode':<13} {'kind':<12} {'prec':>6} {'recall':>7} {'n':>4}  {'TP/FP/FN':>10}")
+        for mode in modes:
+            t = 1.0 if mode == "lexical" else args.by_kind_tau
+            for kind, km in kind_metrics(judgments_by_mode[mode], mode, t).items():
+                print(f"  {mode:<13} {kind:<12} {km['precision']*100:>5.1f}% "
+                      f"{km['recall']*100:>6.1f}% {km['n']:>4}  "
+                      f"{km['tp']}/{km['fp']}/{km['fn']:>2}")
 
     print("\n── WINNER ─────────────────────────────────────────────────────────────")
     if best_marker:
