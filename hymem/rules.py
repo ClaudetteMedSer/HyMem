@@ -50,6 +50,24 @@ RULE_SOURCES = frozenset({"user", "agent_inferred"})
 # not in a rule injected into every context.
 _RULE_KINDS = frozenset({"rejection", "style", "correction"})
 
+
+def is_rule_eligible_kind(kind: str) -> bool:
+    """Whether a behavioral_marker kind may become a standing rule AT ALL — the
+    single eligibility gate BOTH routing paths must share.
+
+    This is ORTHOGONAL to durability. `preference` is excluded on purpose: a
+    preference is a taste that belongs in `profile_entries` (the profile tier
+    already surfaces it), so minting it ALSO as an always_on rule is redundant and
+    inflates every context. The LLM durability tagger answers a DIFFERENT question
+    ("standing vs one-off"), and a *durable* preference ("prefers dark mode") is
+    still not a rule — so the kind gate must run BEFORE the tagger, not be left to
+    it. The lexical path gets this for free via `rule_scope_for_marker`; the LLM
+    path (`rules_extract.route_decisions`) MUST apply it explicitly, or preference
+    markers flood the tagger and mint hundreds of false rules (box full run:
+    1,768 preferences → 1,476 FPs, precision 5.8%)."""
+    return kind in _RULE_KINDS
+
+
 # High-precision imperative test. A rule injects into EVERY call, so a false
 # positive is costly. The cue vocabulary is the standing-directive words a
 # durable rule uses ("never use X", "avoid Y", "prefer Z").

@@ -41,7 +41,7 @@ import logging
 from dataclasses import dataclass, replace
 
 from hymem.extraction.llm import LLMClient, LLMRequest
-from hymem.rules import rule_scope_for_marker
+from hymem.rules import is_rule_eligible_kind, rule_scope_for_marker
 
 log = logging.getLogger("hymem.rules_extract")
 
@@ -282,6 +282,14 @@ def route_decisions(
         raise ValueError(f"unknown rules_extraction_mode {mode!r} (expected {sorted(RULES_EXTRACTION_MODES)})")
 
     n = len(markers)
+    # Kind eligibility is ORTHOGONAL to durability and gates BOTH paths. The
+    # lexical classifier already applies it (`rule_scope_for_marker` → None for an
+    # ineligible kind); the LLM path must apply it too, BEFORE the durability call,
+    # or `preference` markers flood the tagger and mint hundreds of false rules
+    # (box full run: 1,768 preferences → 1,476 FPs). Gating here (not inside the
+    # tagger) keeps the two paths' scope identical — they can never silently
+    # diverge again — and preferences never cost an API call.
+    eligible = [is_rule_eligible_kind(kind) for kind, _ in markers]
     lexical = [rule_scope_for_marker(kind, stmt) for kind, stmt in markers]
 
     if mode == "lexical":
@@ -291,11 +299,12 @@ def route_decisions(
             for scope, (_, stmt) in zip(lexical, markers)
         ]
 
-    # Which markers need the LLM. For llm_fastpath, a lexical modal is trusted as
-    # standing (confidence 1.0, no call) and only the rest are judged.
+    # Which markers need the LLM: eligible kinds only, and for llm_fastpath a
+    # lexical modal is trusted as standing (confidence 1.0, no call) so only the
+    # ambiguous eligible rest are judged.
     need_llm = [
         i for i in range(n)
-        if not (mode == "llm_fastpath" and lexical[i] is not None)
+        if eligible[i] and not (mode == "llm_fastpath" and lexical[i] is not None)
     ]
     judged: dict[int, DurabilityJudgment] = {}
     if need_llm and llm is not None:
@@ -304,6 +313,9 @@ def route_decisions(
 
     out: list[RouteDecision] = []
     for i, (_, stmt) in enumerate(markers):
+        if not eligible[i]:  # ineligible kind (e.g. preference) never mints a rule
+            out.append(RouteDecision(route=False, text=stmt, source_mode=mode))
+            continue
         if mode == "llm_fastpath" and lexical[i] is not None:
             out.append(RouteDecision(route=True, text=stmt, scope="always_on",
                                      confidence=1.0, source_mode="lexical_fastpath"))

@@ -48,7 +48,7 @@ from pathlib import Path
 from hymem import rules_extract
 from hymem.dreaming.canonicalize import normalize
 from hymem.extraction.llm import LLMRequest
-from hymem.rules import rule_scope_for_marker
+from hymem.rules import is_rule_eligible_kind, rule_scope_for_marker
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,6 +159,15 @@ class MarkerJudgment:
 def judge_corpus(corpus: list[dict], mode: str, llm, batch_size: int = 20) -> list[MarkerJudgment]:
     markers = [(c["kind"], c["statement"]) for c in corpus]
     lexical = [rule_scope_for_marker(k, s) is not None for k, s in markers]
+    # Kind eligibility gates BOTH paths, mirroring production `route_decisions`.
+    # Without it the llm arm sends `preference` markers to the tagger, which calls
+    # many of them standing on their own merits — inflating FPs and cratering
+    # precision (box full run: 1,768 preferences → precision 5.8%). Preferences
+    # belong in the profile tier, not an always_on rule; the durability question
+    # is only asked of eligible kinds. NOTE: `--sim` never exposed this because the
+    # SimJudge reads gold labels and so faithfully calls preferences non-standing;
+    # only a real LLM judges "prefers dark mode" as standing-on-its-merits.
+    eligible = [is_rule_eligible_kind(k) for k, _ in markers]
 
     if mode == "lexical":
         return [
@@ -167,9 +176,9 @@ def judge_corpus(corpus: list[dict], mode: str, llm, batch_size: int = 20) -> li
             for c, lh in zip(corpus, lexical)
         ]
 
-    # llm / llm_fastpath: judge the markers the fastpath doesn't shortcut.
+    # llm / llm_fastpath: judge only eligible markers the fastpath doesn't shortcut.
     need = [i for i in range(len(markers))
-            if not (mode == "llm_fastpath" and lexical[i])]
+            if eligible[i] and not (mode == "llm_fastpath" and lexical[i])]
     judged: dict[int, rules_extract.DurabilityJudgment] = {}
     if need and llm is not None:
         sub = rules_extract.judge_durability_batch(
@@ -178,6 +187,10 @@ def judge_corpus(corpus: list[dict], mode: str, llm, batch_size: int = 20) -> li
 
     out: list[MarkerJudgment] = []
     for i, c in enumerate(corpus):
+        if not eligible[i]:  # ineligible kind (preference) — never a rule candidate
+            out.append(MarkerJudgment(item=c, lexical_hit=False, standing=False,
+                                      confidence=0.0, canonical=c["statement"]))
+            continue
         if mode == "llm_fastpath" and lexical[i]:
             out.append(MarkerJudgment(item=c, lexical_hit=True, standing=True,
                                       confidence=1.0, canonical=c["statement"]))

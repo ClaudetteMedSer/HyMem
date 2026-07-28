@@ -67,6 +67,17 @@ Decision: read RAW vs ADJUDICATED precision. If the independent judge calls many
 number. Guardrails: C's control accuracy must be ≥ 0.8 (else distrust it), and C
 must be a *different* model from the tagger (correlated errors otherwise inflate).
 
+RESULT 2026-07-28 — **INCONCLUSIVE**: C (gpt-oss-120b, blind prompt) scored **50%
+on the controls** (= chance), tripping the distrust guard, so its verdicts are
+inadmissible. "0/25 FPs overturned" is NOT confirmation — it's the signature of a
+one-off-BIASED adjudicator (calls ~everything non-standing, which simultaneously
+zeroes overturns AND halves control accuracy). So the 59% is **unadjudicated** —
+neither confirmed nor refuted. To make C admissible if we ever need it: balanced
+few-shot (equal standing/one-off examples), ≥30 controls, and report C's PER-CLASS
+accuracy to confirm the bias. But this is CONTINGENT on E3: if repetition gating
+clears 0.90, the 25-FP question is moot (recurrence filters eager one-offs
+structurally, independent of the disputed labels) and C never needs fixing.
+
 **E2 — τ sweep (precision/recall frontier).** Read the per-marker table: the
 lowest τ that holds precision ≥ 0.90 maximizes recall; raise τ for margin against
 judge drift. Decision: set `rules_extraction_confidence_min` to the elbow. Watch
@@ -75,7 +86,20 @@ leak (offline: fastpath 77% vs llm 100%). If so, `llm_fastpath` is out. NOTE: if
 real judge omits `confidence` (defaults to 1.0), τ is inert and the sweep is flat —
 lean on adjudicated verdict quality + repetition, don't tune a flat τ.
 
-**E3 — Repetition value.** Needs a corpus with `session_id` (recurrence is counted
+**E3 — Repetition value.** ⚠ **FULL-RUN LEAK FIXED 2026-07-28.** The first
+full-2,384-marker run gave precision **5.8%** — not a regression but a kind-filter
+leak: `route_decisions` / `judge_corpus` sent EVERY kind to the tagger, so 1,768
+`preference` markers flooded it → 1,476 FPs. The `_RULE_KINDS` gate lived only
+inside the lexical classifier (`rule_scope_for_marker`); the LLM path bypassed it,
+and `--sim` never caught it (the SimJudge reads gold, so it faithfully calls
+preferences non-standing — only a real LLM judges "prefers dark mode" standing).
+FIXED: `rules.is_rule_eligible_kind` now gates BOTH paths BEFORE the call (single
+source of truth; preferences never cost an API call). **Re-run E3 on the ~616
+eligible (rejection/correction/style) markers** — read precision there (expect the
+~59% regime), THEN the promotion sweep. Watch the label provenance of the eligible
+subset when reading the number (per-item hand labels, not an auto-heuristic).
+
+Needs a corpus with `session_id` (recurrence is counted
 over distinct sessions per policy). Re-dump markers with provenance, and let the
 tagger's canonical rule collapse paraphrases into policies:
 ```bash

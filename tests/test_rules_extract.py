@@ -209,6 +209,52 @@ def test_route_fastpath_sends_ambiguous_to_llm():
     assert len(stub.calls) == 1                              # the ambiguous marker was judged
 
 
+def test_route_llm_excludes_ineligible_kind_without_calling_llm():
+    # A `preference` marker is not rule-eligible: it belongs in the profile tier,
+    # must never reach the tagger, and must never route — even when the LLM WOULD
+    # call it standing. This is the box regression: 1,768 preference markers
+    # flooded the tagger and minted 1,476 false rules (precision 5.8%). The kind
+    # gate is orthogonal to durability and runs BEFORE the call.
+    always_standing = StubLLMClient(default='[{"index":0,"standing":true,"confidence":1.0,"rule":"x"}]')
+    out = route_decisions([("preference", "prefers dark mode")], mode="llm",
+                          llm=always_standing, confidence_min=0.5)
+    assert out[0].route is False
+    assert always_standing.calls == []            # never sent to the LLM
+
+
+def test_route_llm_judges_only_eligible_markers():
+    # Mixed batch: the preference is dropped pre-call; only the eligible rejection
+    # is judged. Proves the two paths share one eligibility scope.
+    class _CountingStub:
+        def __init__(self):
+            self.seen: list[list[str]] = []
+
+        def complete(self, req):
+            body = req.user.split("Markers:", 1)[1].rsplit("Return", 1)[0].strip()
+            payload = json.loads(body)
+            self.seen.append([m["statement"] for m in payload])
+            return json.dumps([{"index": m["index"], "standing": True,
+                                "confidence": 0.9, "rule": m["statement"]} for m in payload])
+
+    stub = _CountingStub()
+    out = route_decisions([("preference", "likes dark mode"),
+                           ("rejection", "never use Mongo")],
+                          mode="llm", llm=stub, confidence_min=0.5)
+    assert out[0].route is False                  # preference dropped pre-call
+    assert out[1].route is True                   # eligible rejection judged + routed
+    assert stub.seen == [["never use Mongo"]]     # ONLY the eligible marker was sent
+
+
+def test_route_fastpath_excludes_ineligible_kind():
+    # The fastpath must gate kind too — a preference is not a lexical hit AND not
+    # eligible, so it drops without an LLM call.
+    stub = StubLLMClient(default='[{"index":0,"standing":true,"confidence":1.0,"rule":"x"}]')
+    out = route_decisions([("preference", "prefers dark mode")], mode="llm_fastpath",
+                          llm=stub, confidence_min=0.5)
+    assert out[0].route is False
+    assert stub.calls == []
+
+
 def test_route_llm_without_client_is_precision_safe():
     # mode wants an LLM but none supplied → mint nothing rather than guess.
     out = route_decisions([("rejection", "rejects mongo")], mode="llm",
