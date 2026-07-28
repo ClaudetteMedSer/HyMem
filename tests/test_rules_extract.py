@@ -29,10 +29,34 @@ def test_parse_batch_wellformed():
     assert not out[1].standing and out[1].rule is None
 
 
-def test_parse_batch_standing_without_rule_does_not_route():
-    # standing=true but no canonical rule → nothing to store → treat as non-standing
-    out = _parse_batch('[{"index":0,"standing":true,"confidence":0.95,"rule":null}]', 1)
-    assert not out[0].standing and out[0].rule is None
+def test_parse_batch_standing_without_rule_still_routes():
+    # A correct standing verdict with no canonical rewrite must NOT be dropped —
+    # the raw statement is the fallback rule text downstream.
+    out = _parse_batch('[{"index":0,"standing":true,"confidence":0.95}]', 1)
+    assert out[0].standing and out[0].rule is None and out[0].confidence == 0.95
+
+
+def test_parse_batch_verdict_string_shape():
+    # deepseek-v4-flash returned {"verdict": "STANDING RULE"} instead of the spec.
+    # Honor it, and default the absent confidence high (a crisp verdict).
+    out = _parse_batch('[{"index":0,"verdict":"STANDING RULE"}]', 1)
+    assert out[0].standing and out[0].confidence == 1.0
+
+
+def test_parse_batch_verdict_oneoff_is_false():
+    out = _parse_batch('[{"index":0,"verdict":"one-off"},{"index":1,"label":"not standing"}]', 2)
+    assert not out[0].standing and not out[1].standing
+
+
+def test_parse_batch_missing_index_uses_position():
+    out = _parse_batch('[{"standing":true,"confidence":0.9,"rule":"x"}]', 1)
+    assert out[0].standing and out[0].rule == "x"
+
+
+def test_parse_batch_no_verdict_signal_stays_nonrouting():
+    # an object with no standing/verdict/label signal keeps the safe default.
+    out = _parse_batch('[{"index":0,"confidence":0.9}]', 1)
+    assert not out[0].standing
 
 
 def test_parse_batch_missing_and_out_of_range_default_nonrouting():
@@ -87,6 +111,15 @@ def test_route_llm_confidence_threshold():
     lo = route_decisions([("rejection", "rejects mongo")], mode="llm",
                          llm=StubLLMClient(default=raw), confidence_min=0.90)
     assert not lo[0].route                                   # 0.8 < 0.90
+
+
+def test_route_llm_verdict_shape_routes_with_statement_fallback():
+    # end-to-end: judge returns the drifted {"verdict":...} shape, no rule/conf.
+    # It must route (conf defaults high) and fall back to the raw statement text.
+    stub = StubLLMClient(default='[{"index":0,"verdict":"STANDING RULE"}]')
+    out = route_decisions([("rejection", "the user rejects MongoDB")], mode="llm",
+                          llm=stub, confidence_min=0.75)
+    assert out[0].route and out[0].text == "the user rejects MongoDB"
 
 
 def test_route_fastpath_shortcuts_lexical_without_calling_llm():

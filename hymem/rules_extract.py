@@ -45,7 +45,9 @@ log = logging.getLogger("hymem.rules_extract")
 
 # Bump when the durability prompt wording changes materially, so a re-run is
 # distinguishable in experiment logs (mirrors PROFILE_PROMPT_VERSION).
-DURABILITY_PROMPT_VERSION = 1
+# v2 (2026-07-28): hammer the exact output schema after deepseek-v4-flash was
+# observed returning {"verdict": "STANDING RULE"} instead of {"standing": true}.
+DURABILITY_PROMPT_VERSION = 2
 
 RULES_EXTRACTION_MODES = frozenset({"lexical", "llm", "llm_fastpath"})
 
@@ -84,12 +86,14 @@ A ONE-OFF is a decision, correction, or rejection about ONE specific thing, even
 The word "rejects"/"refuses"/"instead"/"should" does NOT make something standing — one-offs use those words too. Judge the SUBSTANCE: would obeying this on every future turn make sense, or only in the one situation it describes?
 
 Input is a JSON array of numbered markers: [{"index": 0, "kind": "...", "statement": "..."}, ...].
-Output a strict JSON array, one object per input index, no prose, no markdown:
-  {"index": 0, "standing": true, "confidence": 0.0-1.0, "rule": "canonical imperative"}
-- "standing": true only for durable, generalizing directives; false for one-offs.
-- "confidence": how clearly the statement is a STANDING directive (1.0 = unmistakably standing; lower when specific/hedged/ambiguous).
-- "rule": when standing, rewrite it as a short canonical imperative the assistant can obey ("Never use MongoDB", "Always run the tests before pushing"). Use the SAME canonical wording for equivalent statements so duplicates collapse. When not standing, use null.
-Return exactly one object per input marker, in index order."""
+Output a strict JSON array with ONE object per input marker, in index order. No prose, no markdown, no code fences. Each object has EXACTLY these keys:
+  {"index": <int>, "standing": <boolean>, "confidence": <number 0.0-1.0>, "rule": <string or null>}
+- "standing" MUST be a JSON boolean, true or false. Do NOT return a string, and do NOT use a "verdict" key — the key is "standing" and the value is true (durable, generalizing directive) or false (one-off).
+- "confidence": how clearly the statement is a STANDING directive (1.0 = unmistakable; lower when specific/hedged/ambiguous).
+- "rule": when standing, a short canonical imperative to obey ("Never use MongoDB", "Always run the tests before pushing"); reuse identical wording for equivalent statements so duplicates collapse. When not standing, null.
+
+Example input:  [{"index":0,"kind":"rejection","statement":"the user rejects MongoDB"},{"index":1,"kind":"correction","statement":"the meeting is Tuesday not Monday"}]
+Example output: [{"index":0,"standing":true,"confidence":0.95,"rule":"Never use MongoDB"},{"index":1,"standing":false,"confidence":0.1,"rule":null}]"""
 
 
 DURABILITY_USER_TEMPLATE = """Markers:
@@ -106,10 +110,49 @@ def _coerce_conf(v: object) -> float:
     return 0.0 if c < 0 else 1.0 if c > 1 else c
 
 
+_STANDING_TRUE = frozenset({"true", "yes", "standing", "standing rule",
+                            "standing_rule", "rule", "1"})
+_STANDING_FALSE = frozenset({"false", "no", "one-off", "one off", "one_off",
+                             "oneoff", "not standing", "not_standing", "0",
+                             "none", "null"})
+
+
+def _parse_standing(item: dict) -> bool | None:
+    """Extract the standing verdict, tolerant of schema drift. Despite the prompt
+    demanding ``"standing": true``, real judges (deepseek-v4-flash) were observed
+    returning ``"verdict": "STANDING RULE"``; silently dropping a *correct*
+    classification is a false-negative bug, not precision safety. Accepts a
+    boolean/int ``standing`` or a string verdict under several keys. Returns None
+    only when no verdict signal is present at all."""
+    v = item.get("standing")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    for key in ("standing", "verdict", "label", "class", "classification", "decision"):
+        s = item.get(key)
+        if not isinstance(s, str):
+            continue
+        t = s.strip().lower()
+        if t in _STANDING_TRUE:
+            return True
+        if t in _STANDING_FALSE:
+            return False
+        if "standing" in t:
+            return "not" not in t and "one" not in t
+        if "one" in t and "off" in t:
+            return False
+    return None
+
+
 def _parse_batch(raw: str, n: int) -> list[DurabilityJudgment]:
-    """Parse the LLM array into n index-aligned judgments. A missing / malformed
-    entry defaults to a NON-routing verdict (standing=False, conf=0) — the
-    precision-safe failure mode: a dropped verdict never mints a rule."""
+    """Parse the LLM array into n index-aligned judgments. A genuinely
+    unparseable / signal-less entry keeps the NON-routing default (standing=False,
+    conf=0) — precision-safe: garbage never mints a rule. But a recognizable
+    verdict is honored even under schema drift (see `_parse_standing`), and a
+    standing verdict with no confidence or no canonical rewrite still routes: an
+    absent confidence on a crisp verdict defaults high, and the raw statement is
+    the fallback rule text downstream."""
     out = [DurabilityJudgment(standing=False, confidence=0.0, rule=None, index=i) for i in range(n)]
     try:
         data = json.loads(raw)
@@ -117,21 +160,26 @@ def _parse_batch(raw: str, n: int) -> list[DurabilityJudgment]:
         return out
     if not isinstance(data, list):
         return out
-    for item in data:
+    for pos, item in enumerate(data):
         if not isinstance(item, dict):
             continue
+        raw_idx = item.get("index")
         try:
-            idx = int(item.get("index"))
+            idx = int(raw_idx)
         except (TypeError, ValueError):
-            continue
+            idx = pos  # ordinal fallback when the model omits "index"
         if not (0 <= idx < n):
             continue
-        standing = bool(item.get("standing"))
-        rule = item.get("rule")
-        rule = rule.strip() if isinstance(rule, str) and rule.strip() else None
+        standing = _parse_standing(item)
+        if standing is None:
+            continue  # no verdict signal → keep the non-routing default
+        raw_rule = item.get("rule")
+        rule = raw_rule.strip() if isinstance(raw_rule, str) and raw_rule.strip() else None
+        conf = item.get("confidence")
+        confidence = _coerce_conf(conf) if conf is not None else (1.0 if standing else 0.0)
         out[idx] = DurabilityJudgment(
-            standing=standing and rule is not None,
-            confidence=_coerce_conf(item.get("confidence")),
+            standing=standing,
+            confidence=confidence,
             rule=rule if standing else None,
             index=idx,
         )
