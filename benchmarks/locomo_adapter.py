@@ -456,6 +456,13 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
         # composition loss from a recall loss. Only re-scoring both strings at a
         # strict τ can.
         rec["topk_text"] = " ".join(m["content"] for m in memories)
+        # THE PRE-CUT POOL. `memories` is already cut to top_k*3, so topk_text
+        # alone cannot tell "never retrieved" from "retrieved, then lost the
+        # ranking competition" — and those two pick DIFFERENT levers (indexing
+        # /aperture vs matching quality). Widening --message-fts-top-k while the
+        # cut stays fixed only moves the second kind, so the pool surface is the
+        # one that makes a sweep interpretable.
+        rec["pool_text"] = " ".join(info["pool"])
     return rec
 
 

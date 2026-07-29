@@ -57,9 +57,14 @@ def main() -> None:
 
     rows = json.loads(Path(args.results).read_text(encoding="utf-8"))
     topk: dict[str, str] = {}
+    pool: dict[str, str] = {}
     if args.topk_dump:
         dump = json.loads(Path(args.topk_dump).read_text(encoding="utf-8"))
         topk = {d["id"]: d.get("topk_text", "") for d in dump}
+        # pool ⊇ topk: _evidence_diagnostics scores gold_in_pool against
+        # topk_text + pool_text, so reproduce that same concatenation here.
+        pool = {d["id"]: (d.get("topk_text", "") + " " + d.get("pool_text", ""))
+                for d in dump if d.get("pool_text") is not None}
         missing = sum(r["id"] not in topk for r in rows)
         if missing:
             print(f"[warn] {missing}/{len(rows)} results have no row in the dump "
@@ -91,7 +96,10 @@ def main() -> None:
             tk = topk.get(r["id"])
             strict_tk = (all(_lex_match(t, tk, tau=args.tau_strict) for t in texts)
                          if (texts and tk) else None)
-            out.append((r, texts, strict, strict_tk))
+            pl = pool.get(r["id"])
+            strict_pl = (all(_lex_match(t, pl, tau=args.tau_strict) for t in texts)
+                         if (texts and pl) else None)
+            out.append((r, texts, strict, strict_tk, strict_pl))
         return out
 
     scored = _score(misses)
@@ -142,29 +150,36 @@ def main() -> None:
     # possible answer.
     if topk and suspect:
         comp = [s for s in suspect if s[3] is True]
-        recall = [s for s in suspect if s[3] is False]
-        unk = [s for s in suspect if s[3] is None]
+        lost = [s for s in suspect if s[3] is False and s[4] is True]
+        gone = [s for s in suspect if s[3] is False and s[4] is False]
+        unk = [s for s in suspect if s[3] is None
+               or (s[3] is False and s[4] is None)]
         print(f"\n  ── where the {len(suspect)} suspects actually died "
-              f"(strict tau={args.tau_strict} at BOTH surfaces) ──")
-        print(f"  composition  (strict-passes top_k, fails render): {len(comp):>3}"
-              f"   -> render/tier ordering, NOT recall")
-        print(f"  recall       (strict-fails top_k too):            {len(recall):>3}"
-              f"   -> never retrieved; --name-prefix territory")
+              f"(strict tau={args.tau_strict}, three surfaces) ──")
+        print(f"  composition  (in top_k, lost the render):    {len(comp):>3}"
+              f"   -> render/tier ordering; budget or profile tier")
+        print(f"  ranking      (in POOL, lost the top_k cut):  {len(lost):>3}"
+              f"   -> matching quality; --name-prefix / bigger cut")
+        print(f"  recall       (not even in the pool):         {len(gone):>3}"
+              f"   -> never retrieved; indexing/pool aperture")
         if unk:
-            print(f"  unchecked    (no dump row / no evidence text):    {len(unk):>3}")
+            print(f"  unchecked    (dump lacks pool_text or row):  {len(unk):>3}"
+                  f"   -> re-run --diag-only to get the pool surface")
 
-    by_cat = Counter(CATEGORY_NAME[r["category"]] for r, _, _, _ in scored)
+    by_cat = Counter(CATEGORY_NAME[r["category"]] for r, *_ in scored)
     print("  by category: " + ", ".join(f"{k} {v}" for k, v in sorted(by_cat.items())))
 
     show = ctrl_bad if args.show_control else (suspect if args.suspect_only else scored)
     if args.limit:
         show = show[:args.limit]
-    for r, texts, strict, strict_tk in show:
+    for r, texts, strict, strict_tk, strict_pl in show:
         tag = {True: "gold present", False: "SUSPECT — gold not really present",
                None: "unchecked"}[strict]
         if strict is False and strict_tk is not None:
             tag += " | " + ("COMPOSITION (was in top_k)" if strict_tk
-                            else "RECALL (not in top_k either)")
+                            else "RANKING (in pool, missed the cut)" if strict_pl
+                            else "RECALL (not even in the pool)" if strict_pl is False
+                            else "top_k-miss (pool surface unchecked)")
         print(f"\n{'─'*72}\n[{r['id']}] {CATEGORY_NAME[r['category']]}  ({tag})")
         print(f"  Q:    {r.get('question','')}")
         print(f"  gold: {str(r.get('answer'))[:300]}")
