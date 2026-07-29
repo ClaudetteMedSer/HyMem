@@ -41,6 +41,12 @@ def main() -> None:
                          "are the τ=0.6 false-positive candidates (default 0.85)")
     ap.add_argument("--suspect-only", action="store_true",
                     help="only show the likely false positives")
+    ap.add_argument("--topk-dump", default=None, metavar="DIAG.json",
+                    help="a --diag-only sidecar carrying `topk_text`; joined by "
+                         "question id so each suspect is ALSO re-scored at the "
+                         "top_k surface. This is what separates a composition "
+                         "loss (strict-passes at top_k, fails in the render) "
+                         "from a recall loss (strict-fails at both)")
     ap.add_argument("--show-control", action="store_true",
                     help="dump the CONTROL rows (correct answers failing the strict "
                          "check) instead of the misses — read these to see what a "
@@ -50,6 +56,14 @@ def main() -> None:
     args = ap.parse_args()
 
     rows = json.loads(Path(args.results).read_text(encoding="utf-8"))
+    topk: dict[str, str] = {}
+    if args.topk_dump:
+        dump = json.loads(Path(args.topk_dump).read_text(encoding="utf-8"))
+        topk = {d["id"]: d.get("topk_text", "") for d in dump}
+        missing = sum(r["id"] not in topk for r in rows)
+        if missing:
+            print(f"[warn] {missing}/{len(rows)} results have no row in the dump "
+                  f"— sample/seed mismatch? Those are scored as unchecked.\n")
     ev_map: dict[str, dict] = {}
     for conv in load_locomo_data(args.data, user_speaker=args.user_speaker):
         ev_map[conv["id"]] = conv["evidence_map"]
@@ -74,7 +88,10 @@ def main() -> None:
             ctx = r.get("context") or ""
             strict = (all(_lex_match(t, ctx, tau=args.tau_strict) for t in texts)
                       if (texts and ctx) else None)
-            out.append((r, texts, strict))
+            tk = topk.get(r["id"])
+            strict_tk = (all(_lex_match(t, tk, tau=args.tau_strict) for t in texts)
+                         if (texts and tk) else None)
+            out.append((r, texts, strict, strict_tk))
         return out
 
     scored = _score(misses)
@@ -115,15 +132,39 @@ def main() -> None:
         else:
             print("  [warn] no correct+gold_in_context rows — control unavailable, "
                   "so the miss rate above is UNINTERPRETABLE on its own.")
-    by_cat = Counter(CATEGORY_NAME[r["category"]] for r, _, _ in scored)
+    # THE LEVER TEST. Every suspect strict-fails in the render by construction;
+    # the question is whether it strict-PASSES one surface earlier. Passing at
+    # top_k means the memory was retrieved and then lost a render slot
+    # (composition — the profile tier is the suspect). Failing at both means it
+    # was never really retrieved (recall — --name-prefix). The tau=0.6 booleans
+    # cannot make this call: render text is a SUBSET of top_k text, so
+    # gold_in_context=True forces gold_in_topk=True and 100% is the only
+    # possible answer.
+    if topk and suspect:
+        comp = [s for s in suspect if s[3] is True]
+        recall = [s for s in suspect if s[3] is False]
+        unk = [s for s in suspect if s[3] is None]
+        print(f"\n  ── where the {len(suspect)} suspects actually died "
+              f"(strict tau={args.tau_strict} at BOTH surfaces) ──")
+        print(f"  composition  (strict-passes top_k, fails render): {len(comp):>3}"
+              f"   -> render/tier ordering, NOT recall")
+        print(f"  recall       (strict-fails top_k too):            {len(recall):>3}"
+              f"   -> never retrieved; --name-prefix territory")
+        if unk:
+            print(f"  unchecked    (no dump row / no evidence text):    {len(unk):>3}")
+
+    by_cat = Counter(CATEGORY_NAME[r["category"]] for r, _, _, _ in scored)
     print("  by category: " + ", ".join(f"{k} {v}" for k, v in sorted(by_cat.items())))
 
     show = ctrl_bad if args.show_control else (suspect if args.suspect_only else scored)
     if args.limit:
         show = show[:args.limit]
-    for r, texts, strict in show:
+    for r, texts, strict, strict_tk in show:
         tag = {True: "gold present", False: "SUSPECT — gold not really present",
                None: "unchecked"}[strict]
+        if strict is False and strict_tk is not None:
+            tag += " | " + ("COMPOSITION (was in top_k)" if strict_tk
+                            else "RECALL (not in top_k either)")
         print(f"\n{'─'*72}\n[{r['id']}] {CATEGORY_NAME[r['category']]}  ({tag})")
         print(f"  Q:    {r.get('question','')}")
         print(f"  gold: {str(r.get('answer'))[:300]}")

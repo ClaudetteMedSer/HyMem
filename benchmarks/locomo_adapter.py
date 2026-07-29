@@ -405,7 +405,13 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
     if args.answerable_clause and cat != 5:
         extra += LOCOMO_ANSWERABLE_CLAUSE
 
-    if args.sim:
+    if args.diag_only:
+        # Retrieval + render only — no reader, no judge. `correct` stays None
+        # because this pass CANNOT produce accuracy; locomo_audit.py joins the
+        # dumped surfaces onto a real run by question id. Retrieval is
+        # deterministic given the same store, so the top_k reproduces exactly.
+        ai, correct = "", None
+    elif args.sim:
         # Offline: no answer/judge LLM. "correct" = retrieval surfaced every
         # evidence turn — a retrieval-surface rate, NOT benchmark accuracy
         # (on cat-5 it reports whether the trap-source turn surfaces).
@@ -428,7 +434,9 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
                                gold_for_judge, ai)
 
     rec = {"id": q["qa_id"], "conv_id": conv["id"], "question_type": q["qtype"],
-           "category": cat, "correct": bool(correct), "question": q["question"],
+           "category": cat,
+           "correct": (None if correct is None else bool(correct)),
+           "question": q["question"],
            "answer": q["answer"] if cat != 5 else f"[unanswerable; trap: {q['adversarial_answer']}]",
            "ai_answer": ai, "n_sessions": conv["n_sessions"],
            "evidence": q["evidence"], **diag,
@@ -437,8 +445,17 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
            # how many retrieved memories survived the char budget.
            "n_rendered": (None if rendered is None
                           else rendered.count("[MEM") + rendered.count("[FACT"))}
-    if args.dump_context and rendered is not None:
+    if (args.dump_context or args.diag_only) and rendered is not None:
         rec["context"] = rendered
+    if args.dump_topk or args.diag_only:
+        # EXACTLY the string _evidence_diagnostics scores gold_in_topk against,
+        # so a strict re-check in the audit runs on the identical haystack.
+        # Dumping both this and `context` is the whole point: the surfaces are
+        # NESTED (render ⊆ top_k), so gold_in_context=True forces
+        # gold_in_topk=True and the boolean pair can never separate a
+        # composition loss from a recall loss. Only re-scoring both strings at a
+        # strict τ can.
+        rec["topk_text"] = " ".join(m["content"] for m in memories)
     return rec
 
 
@@ -788,6 +805,15 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="write per-question results JSON here")
     ap.add_argument("--dump-context", action="store_true",
                     help="include the exact rendered answer context in each result")
+    ap.add_argument("--dump-topk", action="store_true",
+                    help="include the joined top_k memory text (the haystack "
+                         "gold_in_topk is scored against) in each result")
+    ap.add_argument("--diag-only", action="store_true",
+                    help="retrieval + render only: NO answering, NO judging, so "
+                         "it costs no reader calls. Implies --dump-context and "
+                         "--dump-topk and writes correct=null. Join it onto a "
+                         "real run by question id (locomo_audit.py --topk-dump) "
+                         "to re-score the gold surfaces at a strict tau")
     ap.add_argument("--rejudge", default=None, metavar="RESULTS.json",
                     help="re-judge a stored --out file with the SAME reader output "
                          "(no ingest, no answering) and report judge-only churn; "
@@ -796,6 +822,13 @@ def main() -> None:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    if args.diag_only:
+        # --sim leaves `rendered` None, which is the one surface this pass exists
+        # to capture; a sim diag dump would silently be topk-only.
+        if args.sim:
+            sys.exit("--diag-only needs the real renderer; drop --sim.")
+        if not args.out:
+            sys.exit("--diag-only produces a sidecar to join; pass --out FILE.")
     if args.rejudge:
         if args.sim:
             sys.exit("--rejudge needs a real judge; drop --sim.")
@@ -829,7 +862,7 @@ def main() -> None:
             # answer path and the diagnostic re-render.
             import longmemeval_adapter as _lme
             _lme.MAX_CONTEXT_CHARS = args.max_context_chars
-    if not args.sim:
+    if not args.sim and not args.diag_only:
         ab = json.loads(args.answer_extra_body) if args.answer_extra_body else None
         jb = json.loads(args.judge_extra_body) if args.judge_extra_body else None
         answer_llm = _build_llm(args.answer_model, args.answer_base_url, args.answer_api_key, ab)
@@ -850,6 +883,17 @@ def main() -> None:
 
     if args.json:
         print(json.dumps(results, indent=2))
+    elif args.diag_only:
+        ans = [r for r in results if r["category"] != 5]
+        n = len(ans) or 1
+        print(f"\n  ── diagnostics-only pass ({len(ans)} answerable-cat questions, "
+              f"no reader, no judge) ──")
+        for k in ("gold_in_pool", "gold_in_topk", "gold_in_render"):
+            print(f"  {k:<16} {sum(bool(r[k]) for r in ans)/n*100:>5.1f}%  (tau=0.6)")
+        print("  These are the LEXICAL surfaces and they are NESTED — read them "
+              "only after\n  a strict re-score. Join onto a real run:\n"
+              f"    python locomo_audit.py REAL_RUN.json --data {args.data} "
+              f"--topk-dump {args.out}")
     else:
         _print_report(results, args)
     if args.out:
