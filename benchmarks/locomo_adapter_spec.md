@@ -22,12 +22,19 @@ lever, supersession, and dream consolidation at a depth MSC never reaches. It is
 also the de-facto industry comparison corpus (Mem0, Zep, MemGPT re-evals all
 report on it).
 
-> **STATUS 2026-07-29 — CANONICAL 64.0% answerable at n=800** (seed 0, `--top-k`
-> ×3 aperture + `--embeddings` + `--max-context-chars 24000`, reader thinking
-> OFF; adversarial abstention 96.1%). This **supersedes the 70.2% measured at
-> n=200** — same config, 4× the sample. The 6.2pp gap is *sampling* error, not a
+> **STATUS 2026-07-29 — CANONICAL 68.2% answerable / 74.1% overall at n=800**
+> (seed 0, `--top-k` ×3 aperture + `--embeddings` + `--max-context-chars 24000`,
+> reader thinking OFF, **+ the two non-leaky reader clauses of L8 Step 2**;
+> adversarial abstention 94.9%). This supersedes the 64.1% pre-Step-2 line, which
+> in turn superseded 70.2% at n=200 (that 6.2pp gap was *sampling* error, not a
 > regression and not a "harsher slice": 2σ on a 151-question proportion is ±7.4pp
-> (§8). 64.0 is simply the better estimate; 70.2 was a high draw.
+> — see §8a).
+>
+> **Report overall (correct/800), not `answerable% + abstention%`.** A sum of the
+> two rates weights 178 adversarial questions equally with 622 answerable ones,
+> giving cat-5 ~3.5× its true leverage; a lever that trades 10 answerable for 5
+> abstention reads as a *gain* on the sum. Baseline 570/800 = 71.3% → Step 2
+> 593/800 = 74.1%.
 >
 > **Canonical stays 3×/24k deliberately; the wide rungs are DIAGNOSTIC, not the
 > headline.** Ladder at n=800: 3×/24k 64.0% → 5×/40k 66.7% → 7×/56k 68.3%
@@ -40,18 +47,23 @@ report on it).
 > demonstration than 68.3 at 56k) points the same way, but sensitivity is the
 > load-bearing reason.
 >
-> **Honest residual decomposition at canonical** (604 answerable, ~224 misses),
-> using the ladder to split the retrieval bucket:
+> **Honest residual decomposition** (622 answerable), using the ladder to split
+> the retrieval bucket. Pre-Step-2 the misses were 159 synthesis (71%) / 38
+> cut-recoverable (17%) / ~27 genuine retrieval tail (12%). Step 2 converted 41
+> synthesis→correct against 19 regressions, so at the new canonical:
 > | bucket | n | share | what it is |
 > |---|---|---|---|
-> | synthesis | 159 | 71% | reader — **the whole remaining game** |
-> | retrieval, cut-recoverable | 38 | 17% | harness aperture, NOT architecture |
-> | retrieval, genuine tail | ~27 | 12% | paraphrase/annotation; ~12-15 irreducible |
+> | synthesis | ~137 | 69% | reader — still the whole remaining game |
+> | retrieval, cut-recoverable | 38 | 19% | harness aperture, NOT architecture |
+> | retrieval, genuine tail | ~27 | 13% | paraphrase/annotation; ~12-15 irreducible |
 >
-> So retrieval work of any kind is worth **≤ +2.5pp** beyond what a wider aperture
-> already recovers. Everything above ~71% on this corpus is reader/synthesis work.
-> **The 159-miss synthesis bucket has never been audited** — on MSC the equivalent
-> audit found deixis (+14pp) and answerability (+5pp).
+> Retrieval work of any kind remains worth **≤ +2.5pp** beyond what a wider
+> aperture already recovers. **The synthesis-bucket audit (2026-07-29) is the
+> single most productive thing done on this corpus** — it produced Step 2's
+> +4.1pp answerable for two prompt clauses at zero token cost, i.e. *more than the
+> entire 3×→7× aperture ladder (+4.3pp) delivered for 2.3× the context budget.*
+> Same lesson as MSC, where the equivalent audit found deixis (+14pp) and
+> answerability (+5pp). `locomo_audit.py` is the instrument.
 >
 > Everything above is adapter/config-side; the core was never touched — the same
 > pattern as the MSC arc ([[project_msc_benchmark]]). **Read every delta against
@@ -248,7 +260,8 @@ delta as a signal.
 - **L2 `--name-prefix`** — UNRUN, now the top candidate: it targets the 13-miss
   retrieval residual (query→turn paraphrase gaps) that survives at canonical.
   Ingest-side → requires `--fresh`, so it re-pays ingest+dream.
-- **L3 `--answerable-clause`** — label-leaky, never canonical (§2); unrun.
+- **L3 `--answerable-clause`** — label-leaky, never canonical (§2); unrun, and
+  now superseded: L8 Step 3 is its non-leaky reformulation and did not clear.
 - **L4 `--dream-per-session`** — unrun.
 - **L5 `--embeddings`** — **VERDICT REVERSED.** First read (52.3% at the default
   aperture) called it dead; it was bottlenecked by a fixed `[:30]` cut discarding
@@ -284,6 +297,37 @@ delta as a signal.
 - **L7 reader thinking** — enabled at 3×/24k scored WORSE in every category. Even
   if the magnitude is inside the floor, there is no measured benefit, so OFF
   stays canonical (and it is the cheaper setting).
+- **L8 reader-prompt clauses from the synthesis audit (n=800, 2026-07-29).** The
+  audit split the synthesis bucket into contract mismatches, judge-strictness
+  artifacts, genuine reader errors, and possible τ=0.6 lexical FPs, then split the
+  fixes by *leakiness* — a clause is only canonical-eligible if it encodes no
+  information about whether an answer exists.
+  - **Step 2 (no self-retraction + enumerate every part of a conjunctive gold) —
+    ADOPTED, now canonical.** 64.1 → **68.2% answerable** (+25 q, 4.5σ against the
+    n=622 band of ±11); all-800 net +23 vs a ±13 floor. Mechanism clean: 41
+    synthesis→correct / 19 back, concentrated in multi-hop (+7.6pp) and temporal
+    (+5.6pp). Both clauses are grounded in *verified judge behaviour* (§2): the
+    "subset of the required information ⇒ answer no" rule makes partial answers a
+    real miss, and the conv-43_q128 self-contradiction is the msc_187 pattern.
+    Cat-5 went 171 → 169; at n=178 the churn band is ±6, so that is
+    indistinguishable from zero — **do not build a mitigation for it.**
+  - **Step 3 (evidence-conditional abstention: decline only when nothing bears on
+    the question; name the contradiction when the premise is false) — NOT
+    ADOPTED.** All-800 net +12 vs ±13. *The number alone does not decide it:* the
+    answerable-only net is +14 against that subset's ±11 band, so the two readings
+    disagree, and the pre-registration was ambiguous about the population.
+    **Standing rule adopted from this: a lever that can move both populations is
+    gated on all 800**, because an answerable-only gate lets a lever pass by
+    cannibalising cat-5. What actually decides it is the *mechanism*: temporal came
+    in **11 fixed / 11 broken** — twenty-two questions moving with zero net is a
+    lever that reshuffles rather than improves, the same signature that killed the
+    MR filter ([[project_mr_filter_killed]]). Cat-5 3 fixed / 5 broken is likewise
+    noise, so the "contradiction-naming works" read is unsupported.
+  - **Open, and free to settle:** both arms were measured against the same
+    baseline, so neither answers whether Step 3 *adds* to Step 2. Run
+    `locomo_flip.py step2.json step3.json` (no API cost) — heavy overlap in the
+    fixed-sets closes the stack outright; substantial disjointness justifies one
+    stacked run gated at all-800 net ≥ +13 over **Step 2** as the A arm.
 
 ## 7. Risks / honest caveats
 
