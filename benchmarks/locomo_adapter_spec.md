@@ -22,15 +22,41 @@ lever, supersession, and dream consolidation at a depth MSC never reaches. It is
 also the de-facto industry comparison corpus (Mem0, Zep, MemGPT re-evals all
 report on it).
 
-> **STATUS 2026-07-28 — CANONICAL 70.2% answerable / 76.0% overall** (n=200,
-> seed 0, `--top-k` ×3 aperture + `--embeddings` + `--max-context-chars 24000`,
-> reader thinking OFF). Arc: 53.0 → 59.6 (3× aperture) → 65.6 (embeddings at 3×)
-> → **70.2** (24k budget). Everything above was adapter/config-side; the core was
-> never touched — the same pattern as the MSC arc ([[project_msc_benchmark]]).
-> Residual at canonical: 13 retrieval misses (query→turn paraphrase tail,
-> `--name-prefix` territory) and 32 synthesis. **Read every delta here against
-> the churn floor in §8 — it is larger than several of the levers that produced
-> this number.**
+> **STATUS 2026-07-29 — CANONICAL 64.0% answerable at n=800** (seed 0, `--top-k`
+> ×3 aperture + `--embeddings` + `--max-context-chars 24000`, reader thinking
+> OFF; adversarial abstention 96.1%). This **supersedes the 70.2% measured at
+> n=200** — same config, 4× the sample. The 6.2pp gap is *sampling* error, not a
+> regression and not a "harsher slice": 2σ on a 151-question proportion is ±7.4pp
+> (§8). 64.0 is simply the better estimate; 70.2 was a high draw.
+>
+> **Canonical stays 3×/24k deliberately; the wide rungs are DIAGNOSTIC, not the
+> headline.** Ladder at n=800: 3×/24k 64.0% → 5×/40k 66.7% → 7×/56k 68.3%
+> (§6/L6). Canonical is kept narrow because a regression gate must be *sensitive
+> to the thing it gates*: at 3× only ~30 items reach the reader, so ranking
+> quality is load-bearing and a core change to fusion/recency/supersession moves
+> the score. At 7× the net is wide enough that gold arrives almost regardless of
+> rank — the wide config would mask exactly the regressions this benchmark
+> exists to catch. The efficiency argument (64.0 at 24k is a better memory-system
+> demonstration than 68.3 at 56k) points the same way, but sensitivity is the
+> load-bearing reason.
+>
+> **Honest residual decomposition at canonical** (604 answerable, ~224 misses),
+> using the ladder to split the retrieval bucket:
+> | bucket | n | share | what it is |
+> |---|---|---|---|
+> | synthesis | 159 | 71% | reader — **the whole remaining game** |
+> | retrieval, cut-recoverable | 38 | 17% | harness aperture, NOT architecture |
+> | retrieval, genuine tail | ~27 | 12% | paraphrase/annotation; ~12-15 irreducible |
+>
+> So retrieval work of any kind is worth **≤ +2.5pp** beyond what a wider aperture
+> already recovers. Everything above ~71% on this corpus is reader/synthesis work.
+> **The 159-miss synthesis bucket has never been audited** — on MSC the equivalent
+> audit found deixis (+14pp) and answerability (+5pp).
+>
+> Everything above is adapter/config-side; the core was never touched — the same
+> pattern as the MSC arc ([[project_msc_benchmark]]). **Read every delta against
+> §8: the churn floor and the sampling band are different quantities and are the
+> two most common ways to misread this table.**
 >
 > Build validation (2026-07-28, still current): data contract verified against the
 > REAL `data/locomo10.json` from snap-research/locomo (not a paper description —
@@ -136,10 +162,20 @@ The entire MSC climb (42.0 → 84.0) was adapter-side contract restatement
   routing anywhere** ([[project_mr_filter_killed]] — the MR user-only filter is
   a suppress-filter and stays dead).
 - **Judges** (all reused verbatim from LME): cat 1 → `multi-session`, cat 2 →
-  `temporal-reasoning` (off-by-one-day tolerance fits LoCoMo's date golds),
-  cats 3/4 → `single-session-user`, cat 5 → the `_abs` abstention judge with a
+  `temporal-reasoning`, cats 3/4 → `single-session-user`, cat 5 → the `_abs`
+  abstention judge with a
   constructed explanation that NAMES the trap answer so the judge fails a reader
   that fell for the premise swap.
+  **Two judge properties verified 2026-07-29 in `get_judge_prompt`, both of which
+  change how the synthesis bucket is adjudicated:** (1) `temporal-reasoning`'s
+  off-by-one tolerance covers **durations only** ("19 days when the answer is
+  18") — calendar dates get *no* tolerance, so a one-day-off date is a genuine
+  reader error, not a judge artifact (an earlier comment here claimed the
+  opposite); (2) every answerable branch says "**if the response only contains a
+  subset of the information required by the answer, answer no**" — so partial
+  answers to conjunctive golds ("ring-toss" for "ring-toss and chili cook-off")
+  are the judge working as designed. That failure mode is fixable only
+  reader-side, by telling the reader to enumerate every part.
 - **question_type strings** `multi-hop / temporal / open-domain / single-hop /
   adversarial_abs` flow through `compute_scores` (per-category table for free)
   and `compute_abstention_scores` (the `_abs` suffix keeps the answerable-vs-
@@ -219,6 +255,25 @@ delta as a signal.
   the pool gain. At 3× aperture it is **+6.0pp (59.6 → 65.6)** and part of
   canonical. The near-miss: this is the same mistake as the BEAM June regression
   — judging a pool-widening lever through a binding downstream cut.
+- **L6 RE-MEASURED AT n=800 (2026-07-29) — supersedes the n=200 readings below.**
+  `--max-context-chars` 8k vs 24k: **+2.1pp** (net +13, 47 budget-bucket losses at
+  8k → 0 at 24k, 11 converting straight to correct). Confirmed on mechanism;
+  note the effect *halved* from the +4.6pp measured at n=200 — expected
+  regression-to-the-mean for a lever adopted because it looked good on a small
+  sample. Assume every n=200-selected effect size here is inflated ~2×.
+  5×/40k vs 3×/24k: **+2.7pp (net +15)** — sign-flipped from n=200's −3.3pp.
+  Dilution is real and now measured (20 reader-side regressions) but retrieval
+  recovery dominates (65 → 36 retrieval misses; temporal gains most, 15 fixed /
+  3 broken). **APERTURE LADDER CLOSED at n=800** — 3×/24k 64.0% (65 retrieval
+  misses) → 5×/40k 66.7% (36) → 7×/56k 68.3% (27); marginal gain +2.7 → +1.6,
+  halving each rung, so the next rung projects to ~+0.9pp — **below the ±1.6pp
+  resolution at n=800.** The ladder ends because it becomes unmeasurable, not
+  because it stops paying. Two things it established: (a) **38 of the 65
+  retrieval misses at canonical are artifacts of the CUT, not retrieval
+  capability** — recoverable by a harness knob alone; (b) **synthesis misses are
+  FLAT across 5× and 7× (171 → 170)** — the reader does not degrade as context
+  widens, which retires the original "drowning" narrative outright. Dilution
+  exists but is stable, not escalating.
 - **L6 retrieval aperture + context budget** (added after the runs; the largest
   lever on this corpus). The MSC-sized constants (15/10/10, rerank pool 20)
   surface ~2% of a 369-689-turn LoCoMo history. `--top-k` ×3 = **+6.6pp**;
@@ -247,6 +302,26 @@ delta as a signal.
   the perspective clause makes it attributable, not invisible.
 - **License.** CC BY-NC 4.0 — local benchmark use is fine; the data file stays
   gitignored, redistribution is an explicit decision not a default.
+
+## 8a. Two different bands — do not mix them
+
+The single most available mistake on this benchmark, made once already:
+
+| | what varies | size |
+|---|---|---|
+| **Churn floor** (§8) | same questions, LLM nondeterminism at T=0 | ±3.2pp @ n=200, ±1.6pp @ n=800 |
+| **Sampling band** | *different questions* drawn from the same pool | **±7.4pp @ n=151 answerable**, ±3.9pp @ n=604 |
+
+A/B levers are **paired** — both arms answer the same questions — so sampling
+error cancels and only the churn floor applies. That is why every lever verdict
+below survived the n=200 → n=800 move even though the absolute number did not.
+Comparing two runs at *different* `--sample` values is the one case where the
+sampling band governs, and it is roughly twice as wide.
+
+Per-category counts at n=200 were far too small to read at all: 2σ was ±19pp
+(multi-hop, n≈28), ±17pp (temporal, n≈29), ±25pp (open-domain, n≈12). All four
+n=200→n=800 category "moves" sit inside those intervals. **Do not narrate
+per-category deltas below n≈100 in a category.**
 
 ## 8. The churn floor (MEASURED — read every delta against it)
 
@@ -283,6 +358,22 @@ Consequences, all load-bearing:
 - **A floor measured from one replicate is itself one draw.** MSC's 4 movers
   carry ≈ ±2 of counting noise; 4% and 5% are not distinguishable at this number
   of reruns. Treat both as "~5%", not as a ranking of the two benchmarks.
+- **The floor is ALL reader — MEASURED 2026-07-29.** Re-judging canonical with the
+  same judge flipped **0 of 200**. By rule of three, zero observed in 200 bounds
+  judge churn at **< 1.5%** (95%), i.e. at most ~30% of the ~5% floor and most
+  likely ~0. **Majority-of-3 judging is therefore dead as a floor-reduction
+  lever** — there is nothing on the judge side to average out. Scope: this covers
+  the judge branches LoCoMo routes to (`multi-session`, `temporal-reasoning`,
+  `single-session-user`, `…_abs`). LME's open-ended `single-session-preference`
+  RUBRIC branch is not exercised here and is the one plausible place judge
+  nondeterminism could still live; re-judge an LME run before assuming triad-wide
+  zero. **The floor can only be documented and out-sampled, not tuned away.**
+- **Out-sampling is the only remaining lever, and it is pure reader cost.** Band
+  scales as √(p/n), so resolution improves only with more questions or more
+  replicates: LoCoMo ships **1986** questions and canonical samples 200, so
+  n=800 would take the 2σ band from ±3.2pp to **±1.6pp** — enough to settle the
+  24k-budget lever (+4.6pp) and the 5× dilution question, both currently
+  unresolvable. Nothing else on the table buys that.
 - **Splitting reader churn from judge churn — BUILT.**
   `locomo_adapter.py --rejudge RESULTS.json` re-judges a stored `--out` file with
   the same judge, no ingest and no re-answering, and writes a flip-compatible

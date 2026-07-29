@@ -104,8 +104,11 @@ _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 # untouched; compute_scores strips it for the per-category table).
 CATEGORY_NAME = {1: "multi-hop", 2: "temporal", 3: "open-domain",
                  4: "single-hop", 5: "adversarial_abs"}
-# Which LME judge each category maps to. Cat 2 gets the temporal judge's
-# off-by-one-day tolerance (LoCoMo temporal golds are dates/durations); cat 5
+# Which LME judge each category maps to. Cat 2 gets the temporal judge — but
+# NOTE (verified 2026-07-29 against get_judge_prompt): its off-by-one tolerance
+# covers DURATIONS only ("19 days when the answer is 18"), NOT calendar dates.
+# LoCoMo cat-2 golds are mostly dates, so a one-day-off date IS scored wrong;
+# do not adjudicate those as judge artifacts. Cat 5
 # routes to the abstention judge via the _abs suffix inside judge_answer.
 CATEGORY_JUDGE = {1: "multi-session", 2: "temporal-reasoning",
                   3: "single-session-user", 4: "single-session-user",
