@@ -57,8 +57,21 @@ report on it).
 > | retrieval, cut-recoverable | 38 | 19% | harness aperture, NOT architecture |
 > | retrieval, genuine tail | ~27 | 13% | paraphrase/annotation; ~12-15 irreducible |
 >
-> Retrieval work of any kind remains worth **≤ +2.5pp** beyond what a wider
-> aperture already recovers. **The synthesis-bucket audit (2026-07-29) is the
+> **RETRACTED 2026-07-29 — the "≤ +2.5pp retrieval ceiling" was wrong.** The
+> τ=0.6 surface check false-positives badly: on misses it fails a strict τ=0.85
+> re-check 55% of the time vs **11% on a control of questions the reader answered
+> CORRECTLY** (gold delivered by construction, so that 11% is the check's own
+> false-alarm rate). The +44pp excess ⇒ **~half the synthesis bucket was misfiled
+> retrieval.** Rescaled from the n=300 audit, the pre-Step-2 n=800 split of 159
+> synthesis / 65 retrieval becomes roughly **~81 synthesis / ~143 retrieval —
+> retrieval is the MAJORITY bucket**, not 29% of it. Two methodological rules fall
+> out: (a) the four surfaces are **NESTED** (`render ⊆ top_k ⊆ pool`), so
+> `gold_in_context=True` *forces* `gold_in_topk=True` — the booleans can never
+> localise a loss, only a strict re-score at two surfaces can; (b) a wider
+> aperture lengthens the context string, which makes τ=0.6 fire MORE, so the
+> ladder's own 38-cut-recoverable / 27-genuine split is contaminated the same way.
+>
+> **The synthesis-bucket audit (2026-07-29) is the
 > single most productive thing done on this corpus** — it produced Step 2's
 > +4.1pp answerable for two prompt clauses at zero token cost, i.e. *more than the
 > entire 3×→7× aperture ladder (+4.3pp) delivered for 2.3× the context budget.*
@@ -257,9 +270,32 @@ delta as a signal.
   rendered as three-word `"s p o"` triples, which cannot clear the `_lex_match`
   τ=0.6 evidence check against full turn text — the A/B had no path to a
   positive on the diagnostic. Re-run needs a triple-aware surfacing check.
-- **L2 `--name-prefix`** — UNRUN, now the top candidate: it targets the 13-miss
-  retrieval residual (query→turn paraphrase gaps) that survives at canonical.
-  Ingest-side → requires `--fresh`, so it re-pays ingest+dream.
+- **L2 `--name-prefix`** — UNRUN. Targets query→turn paraphrase gaps, i.e. how
+  well a query *matches* a turn. **Demoted behind L9:** that only pays if the turn
+  is in the candidate pool at all, and L9 shows the pool is the binding
+  constraint. Ingest-side → requires `--fresh`, so it re-pays ingest+dream; L9 is
+  query-side and reuses stores. Run L9 first, then re-measure whether this is
+  still needed.
+- **L9 `--message-fts-top-k` (NEW 2026-07-29, now the top candidate).** The
+  strict re-score localised all 27 audited suspects as **RECALL failures (27/27
+  strict-fail at top_k, 0 composition)** — the evidence turns were never
+  retrieved, not crowded out of the render. Mechanism: `message_fts_top_k`
+  defaults to **15 raw-turn slots over a 369-689-turn history**, and
+  `message_hits` is the ONLY tier that can carry a gold *turn* to the reader.
+  **The entire L6 ladder varied `--top-k`, which is the final CUT — downstream of
+  that 15-slot ceiling.** That is exactly why 7× recovered 38 misses and then
+  stalled while the synthesis bucket never moved. Keep `--rerank-top-k` above it
+  (defaults rerank 20→15, so an equal setting leaves no lift room).
+  **Sweep it with `--diag-only` at ZERO reader cost** and read the
+  composition/recall migration; only pay for a reader run once the migration
+  flattens.
+  - *Why the 27/27 verdict is safe:* `_lex_match` is asymmetric Jaccard
+    normalised by `|fact|` (`msc_adapter.py:94`), so it is **monotone in the
+    haystack** — strict-pass at render implies strict-pass at top_k, making the
+    split informative (a composition case *could* have appeared), and bounding
+    the top_k false-alarm rate by the render one (11%). Under composition ~24 of
+    27 should have passed; 0 did. The check would have to be wrong >90% of the
+    time for that to be unremarkable.
 - **L3 `--answerable-clause`** — label-leaky, never canonical (§2); unrun, and
   now superseded: L8 Step 3 is its non-leaky reformulation and did not clear.
 - **L4 `--dream-per-session`** — unrun.

@@ -509,9 +509,18 @@ def evaluate_conversation(conv: dict, args, answer_llm, judge_llm) -> list[dict]
             results.append(evaluate_qa(q, conv, adapter, args, answer_llm, judge_llm))
             if k % 20 == 0:
                 print(f"  [{conv['id']}] {k}/{len(conv['qa'])}", flush=True)
-        acc = sum(r["correct"] for r in results) / len(results) if results else 0.0
-        print(f"  [{conv['id']}] done — {len(results)} q, {acc*100:.1f}%"
-              f" ({conv['n_sessions']} sessions)", flush=True)
+        # --diag-only writes correct=None (no reader ran), so there is no accuracy
+        # to report here — summing it would TypeError, and printing 0.0% would be
+        # worse: a run that measured nothing would look like a run that scored zero.
+        if args.diag_only:
+            surf = sum(bool(r["gold_in_render"]) for r in results) / len(results) if results else 0.0
+            print(f"  [{conv['id']}] done — {len(results)} q, gold_in_render "
+                  f"{surf*100:.1f}% (tau=0.6, no reader)"
+                  f" ({conv['n_sessions']} sessions)", flush=True)
+        else:
+            acc = sum(r["correct"] for r in results) / len(results) if results else 0.0
+            print(f"  [{conv['id']}] done — {len(results)} q, {acc*100:.1f}%"
+                  f" ({conv['n_sessions']} sessions)", flush=True)
         return results
     finally:
         adapter.close()
