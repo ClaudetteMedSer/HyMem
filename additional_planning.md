@@ -770,6 +770,29 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 > the gate UNREAD when both arms return the same extreme or the control fails to
 > beat the misses. `--rescore <dump>.json` recomputes all readings from a prior
 > run's stored facts at ZERO LLM cost, so the fix does not re-spend Trial 3.
+>
+> **Rescore of Trial 3: provenance 9/10 misses (90%) vs 10/10 control.** Three
+> follow-ups, all instrument-side, all fixed 2026-07-30 at zero LLM cost:
+> 1. **The gap is ONE question at n=10.** Discrimination is now judged in
+>    questions, not percentage points (at n=10, 10pp *is* one row — the LME
+>    churn-floor discipline applied to this probe), and the report says so.
+>    The 90% still reads against the 60% threshold; the miss-vs-control CONTRAST
+>    does not read at this n.
+> 2. **Answer-string containment was 0 on BOTH arms** — including questions the
+>    live pipeline answered correctly, whose facts demonstrably reach the answer.
+>    That is a non-firing check (LME `answer` fields are prose, so exact substring
+>    never matches), not evidence that facts drop values. Auto-labelled as such.
+> 3. **The faithfulness sample was unstratified**, so it drew ~20 UltraChat/
+>    ShareGPT sessions. NOT store contamination — LongMemEval *builds* haystacks
+>    by padding gold sessions with UltraChat/ShareGPT distractors (~50 filler to
+>    ~5 gold), so a uniform draw is ~all filler by construction, and the probe
+>    reads them from the dataset file, never from a store. Hand-scoring it would
+>    have measured faithfulness on the padding. `build_faithfulness_sample` now
+>    reserves half the budget for gold-bearing sessions, tags every entry with
+>    `stratum`, and refuses (loudly) when no gold-bearing session made the sample.
+>
+> **G-F1 remains INCOMPLETE**: re-dump with `--rescore … --out`, hand-score the
+> STRATIFIED sample, then supply `--faithfulness`.
 
 **Idea.** Extract narrative facts with a draft prompt from the haystacks of the
 ~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and

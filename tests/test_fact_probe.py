@@ -26,6 +26,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 from fact_probe import (  # noqa: E402
     _MAX_FACT_CHARS,
+    build_faithfulness_sample,
     _MAX_FACTS_PER_SESSION,
     gold_session_ids,
     index_facts,
@@ -418,3 +419,73 @@ def test_rescore_recomputes_density_without_re_extracting() -> None:
 def test_rescore_flags_a_question_missing_from_the_dataset() -> None:
     [row] = rescore_rows([{"question_id": "ghost", "retrieved": []}], {})
     assert "not in --dataset" in row["error"]
+
+
+# ── Stratified faithfulness sample (the 2026-07-30 distractor-flood defect) ──
+
+def _dumped_row(qid: str, gold_sid: str, filler: int) -> dict:
+    """A row whose extraction covered one gold session and `filler` distractors —
+    the real LME shape (LongMemEval pads every haystack with UltraChat/ShareGPT)."""
+    dump = [{"session_id": gold_sid, "date": None,
+             "facts": [{"text": "gold fact", "date": None, "entities": []}],
+             "source_turns": "gold turns"}]
+    dump += [{"session_id": f"ultrachat_{i}", "date": None,
+              "facts": [{"text": f"filler {i}", "date": None, "entities": []}],
+              "source_turns": f"filler turns {i}"} for i in range(filler)]
+    return {"question_id": qid, "dump": dump}
+
+
+def test_faithfulness_sample_reserves_half_for_gold_sessions() -> None:
+    """A uniform sample over ~50 distractors to ~1 gold session is ~all
+    distractors, so the hand-score would measure faithfulness on LME's padding
+    instead of on the dated/numeric content the gate is about."""
+    q = _q_data()                                   # gold session is "s1"
+    rows = [_dumped_row(q["question_id"], "s1", filler=50)]
+    by_id = {q["question_id"]: q}
+
+    sample = build_faithfulness_sample(rows, by_id, size=20, seed=0)
+    assert len(sample) == 20
+    strata = [e["stratum"] for e in sample]
+    # Only one gold session exists here, so the gold half cannot be filled — but
+    # it must be present, and the budget must not shrink.
+    assert "gold_bearing" in strata
+    assert strata.count("distractor") == 19
+
+
+def test_faithfulness_sample_fills_the_gold_half_when_it_can() -> None:
+    q = _q_data()
+    rows = [_dumped_row(f"q{i}", "s1", filler=20) for i in range(10)]
+    by_id = {f"q{i}": q for i in range(10)}
+    sample = build_faithfulness_sample(rows, by_id, size=20, seed=0)
+    n_gold = sum(1 for e in sample if e["stratum"] == "gold_bearing")
+    assert n_gold == 10                             # half the budget, as reserved
+    assert len(sample) == 20
+
+
+def test_uniform_sampling_would_have_missed_gold_entirely() -> None:
+    """Pins WHY stratification was added: the old uniform draw over the same
+    pool returns a sample with (almost) no gold-bearing sessions."""
+    import random as _random
+
+    q = _q_data()
+    rows = [_dumped_row(q["question_id"], "s1", filler=50)]
+    pool = [{"question_id": r["question_id"], **d}
+            for r in rows for d in r["dump"]]
+    uniform = _random.Random(0).sample(pool, 20)
+    gold_hits = sum(1 for e in uniform if e["session_id"] == "s1")
+    assert gold_hits <= 1                           # the defect, reproduced
+    stratified = build_faithfulness_sample(rows, {q["question_id"]: q},
+                                           size=20, seed=0)
+    assert any(e["stratum"] == "gold_bearing" for e in stratified)
+
+
+def test_sample_entries_carry_their_source_turns() -> None:
+    """The hand-read must be self-contained: a value is scored against the turns
+    shipped with it, never by re-joining the dataset."""
+    q = _q_data()
+    rows = [_dumped_row(q["question_id"], "s1", filler=3)]
+    for entry in build_faithfulness_sample(rows, {q["question_id"]: q},
+                                           size=4, seed=0):
+        assert entry["source_turns"]
+        assert entry["facts"]
+        assert entry["question_id"] == q["question_id"]

@@ -196,6 +196,13 @@ _FACT_TOP_K = 5
 # appear inside some fact by chance, which would report as signal.
 _MIN_ANSWER_CHARS = 4
 
+# Discrimination floor for the miss-vs-control contrast. A gap of this many
+# questions or fewer — or any arm smaller than `_MIN_N_FOR_DISCRIMINATION` — is
+# reported as too small to read, so a one-row difference is never narrated as a
+# separation between the arms.
+_MIN_DISCRIMINATING_GAP_Q = 2
+_MIN_N_FOR_DISCRIMINATION = 20
+
 
 def gold_session_ids(q_data: dict) -> set[str]:
     """Haystack session ids that CONTAIN the answer — the provenance ground truth.
@@ -557,6 +564,65 @@ def _median(xs: list[float]) -> float:
     return float(statistics.median(xs)) if xs else 0.0
 
 
+def build_faithfulness_sample(
+    rows: list[dict], by_id: dict[str, dict], *, size: int, seed: int = 0
+) -> list[dict]:
+    """Stratified hand-score sample: GOLD-BEARING sessions first, then distractors.
+
+    An LME haystack is mostly distractor padding — LongMemEval surrounds each
+    question's gold sessions with UltraChat/ShareGPT filler, typically ~50 filler
+    to ~5 gold. A uniform sample over extracted sessions is therefore ~all filler,
+    and hand-scoring it measures extractor faithfulness on generic chat instead of
+    on the dated, numeric, name-bearing content where a verbatim-value error
+    actually costs an answer. Half the budget is reserved for gold-bearing
+    sessions so the audit covers the material the gate is about; the distractor
+    half is kept because over-extraction and invention on filler is a real failure
+    mode too (those facts compete for the same top-5 slots).
+
+    Each entry is tagged `stratum` so the hand-read — and any later dispute about
+    what was scored — can be split by it.
+    """
+    gold: list[dict] = []
+    filler: list[dict] = []
+    for r in rows:
+        q_data = by_id.get(r.get("question_id"))
+        gold_sids = gold_session_ids(q_data) if q_data else set()
+        for d in r.get("dump", []) or []:
+            entry = {"question_id": r.get("question_id"), **d}
+            if d.get("session_id") in gold_sids:
+                entry["stratum"] = "gold_bearing"
+                gold.append(entry)
+            else:
+                entry["stratum"] = "distractor"
+                filler.append(entry)
+
+    rng = random.Random(seed)
+    half = max(size // 2, 1)
+    take_gold = rng.sample(gold, min(half, len(gold)))
+    # Any unfilled gold budget rolls over to filler rather than shrinking the
+    # sample — a question set with few gold sessions still gets a full audit.
+    take_filler = rng.sample(filler, min(size - len(take_gold), len(filler)))
+    out = take_gold + take_filler
+    rng.shuffle(out)  # so the hand-reader is not primed by ordering
+    return out
+
+
+def _print_sample_note(path: Path, sample: list[dict]) -> None:
+    n_gold = sum(1 for e in sample if e.get("stratum") == "gold_bearing")
+    print(f"\n  dump → {path}")
+    print(f"  hand-score `faithfulness_sample`: {len(sample)} sessions "
+          f"({n_gold} gold-bearing, {len(sample) - n_gold} distractor) — every "
+          f"value/name/date must appear in that entry's `source_turns`.")
+    if not n_gold:
+        print("  ⚠ NO gold-bearing sessions in the sample — the hand-score would "
+              "measure faithfulness on LME's UltraChat/ShareGPT padding only. "
+              "Do not score it; check that the dump rows carry `dump[].session_id` "
+              "matching the dataset's gold sessions.")
+    print("  Note: most LME haystack sessions ARE UltraChat/ShareGPT distractors "
+          "by dataset design (LongMemEval pads each haystack with them), so "
+          "seeing them here is expected — that is why the sample is stratified.")
+
+
 def rescore_rows(rows: list[dict], by_id: dict[str, dict]) -> list[dict]:
     """Recompute the density readings on ALREADY-EXTRACTED rows.
 
@@ -690,7 +756,13 @@ def report(s: dict, diag: dict, miss_rows: list[dict], verbose: bool) -> bool:
     print(f"    {'verbatim gold turn (diagnostic)':<34}"
           f"{dm['verbatim']:>7}/{dm['n']:<4}{'':>6}{dc['verbatim']:>9}/{dc['n']:<4}")
     # The control column IS the validity check, not decoration. Read it first.
+    # Discrimination is judged in QUESTIONS, never in percentage points: at n=10
+    # one question IS ten points, so a 10pp "gap" between the arms is a single row
+    # and means nothing. Same discipline as the LME churn floor — a delta smaller
+    # than the unit of measurement is not a delta.
     if dm["n"] and dc["n"]:
+        gap_q = abs(dm["gold_session"]
+                    - round(dc["gold_session_rate"] * dm["n"] / 100.0))
         if dm["gold_session_rate"] == dc["gold_session_rate"] in (0.0, 100.0):
             print(f"    ⚠ both arms returned the SAME extreme "
                   f"({dm['gold_session_rate']:.0f}%) — that is the signature of a "
@@ -700,6 +772,20 @@ def report(s: dict, diag: dict, miss_rows: list[dict], verbose: bool) -> bool:
             print("    ⚠ the CONTROL (questions the live pipeline answered "
                   "correctly) scores no better than the misses — the measure is "
                   "not discriminating. Treat the gate as unread.")
+        elif (gap_q <= _MIN_DISCRIMINATING_GAP_Q
+                or dm["n"] < _MIN_N_FOR_DISCRIMINATION):
+            print(f"    ⚠ the arms differ by ~{gap_q} question(s) at n={dm['n']} — "
+                  f"inside this set's resolution, so the measure is only weakly "
+                  f"discriminating. The RATE can still be read against the "
+                  f"{_MIN_GOLD_IN_FACTS:.0%} threshold, but do NOT read the "
+                  f"miss-vs-control CONTRAST as evidence of anything.")
+        if (dm["answer_checkable"] and dc["answer_checkable"]
+                and dm["answer"] == dc["answer"] == 0):
+            print("    ⚠ answer-string containment is 0 on BOTH arms — including "
+                  "questions the pipeline ANSWERED CORRECTLY, whose facts "
+                  "demonstrably reach the answer. The check is not firing (LME "
+                  "`answer` fields are prose, so exact substring never matches). "
+                  "Ignore that row; it is NOT evidence that facts drop values.")
     print(f"  facts/session median: {s['median_facts_per_session']:.1f}  "
           f"(control: {s['median_facts_per_session_control']:.1f})")
     print(f"  facts/question mean:  {s['mean_facts_per_question']:.1f}")
@@ -876,10 +962,16 @@ def main() -> None:
         s = summarize(miss_rows, ctrl_rows, args.faithfulness)
         passed = report(s, diag, miss_rows, args.verbose)
         if args.out:
+            # Re-sample too: a rescore is exactly when the faithfulness sample
+            # needs rebuilding, since the stratification depends on the gold
+            # labels this pass just computed.
+            sample = build_faithfulness_sample(
+                rescored, by_id, size=args.faithfulness_sample, seed=args.seed)
             args.out.write_text(json.dumps(
                 {**prior, "summary": s, "per_question": rescored,
+                 "faithfulness_sample": sample,
                  "rescored_from": str(args.rescore)}, indent=2))
-            print(f"  rescored dump → {args.out}")
+            _print_sample_note(args.out, sample)
         sys.exit(0 if passed else 1)
 
     llm = None
@@ -919,11 +1011,8 @@ def main() -> None:
     passed = report(s, diag, miss_rows, args.verbose)
 
     if args.out:
-        rng = random.Random(args.seed)
-        pool = [{"question_id": r["question_id"], **d}
-                for r in results for d in r["dump"]]
-        sample = (rng.sample(pool, args.faithfulness_sample)
-                  if len(pool) > args.faithfulness_sample else pool)
+        sample = build_faithfulness_sample(
+            results, by_id, size=args.faithfulness_sample, seed=args.seed)
         args.out.write_text(json.dumps({
             "prompt_version": FACTS_PROMPT_VERSION_DRAFT,
             "sim": args.sim,
@@ -933,9 +1022,7 @@ def main() -> None:
             "faithfulness_sample": sample,
             "per_question": results,
         }, indent=2))
-        print(f"\n  dump → {args.out}   "
-              f"(hand-score `faithfulness_sample`: {len(sample)} sessions — every "
-              f"value/name/date must appear in `source_turns`)")
+        _print_sample_note(args.out, sample)
 
     sys.exit(0 if passed else 1)
 
