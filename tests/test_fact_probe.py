@@ -27,8 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 from fact_probe import (  # noqa: E402
     _MAX_FACT_CHARS,
     _MAX_FACTS_PER_SESSION,
+    gold_session_ids,
     index_facts,
     open_fact_index,
+    rescore_rows,
     run_question,
     search_facts,
     select_probe_sets,
@@ -222,7 +224,7 @@ def test_sim_run_finds_gold_and_spends_nothing() -> None:
     assert out["error"] is None
     assert out["calls"] == 0            # --sim never calls a model
     assert out["gold_turns"] == 1
-    assert out["gold_in_facts"] is True
+    assert out["gold_session_in_facts"] is True
     assert out["sessions_processed"] == 2
     assert len(out["retrieved"]) <= 5
     # The dump carries the source turns alongside the facts so the faithfulness
@@ -238,7 +240,7 @@ def test_sim_run_misses_when_no_fact_carries_the_gold() -> None:
     q["question"] = "kangaroo marsupial taxonomy classification"
     out = run_question(q, llm=None, sim=True, max_sessions=0)
     assert out["retrieved"] == []
-    assert out["gold_in_facts"] is False
+    assert out["gold_session_in_facts"] is False
 
 
 def test_max_sessions_keeps_the_most_recent(monkeypatch) -> None:
@@ -247,7 +249,7 @@ def test_max_sessions_keeps_the_most_recent(monkeypatch) -> None:
     assert out["sessions_processed"] == 1
     # The gold sits in the LAST session, so a recency cap of 1 still reaches it —
     # and the cap is label-free (it never consults which session holds gold).
-    assert out["gold_in_facts"] is True
+    assert out["gold_session_in_facts"] is True
 
 
 def test_sim_extract_skips_smalltalk_and_assistant_turns() -> None:
@@ -264,7 +266,9 @@ def test_sim_extract_skips_smalltalk_and_assistant_turns() -> None:
 # ── Gate arithmetic ─────────────────────────────────────────────────────────
 
 def _rows(n: int, covered: int, per_session: int) -> list[dict]:
-    return [{"error": None, "gold_in_facts": i < covered,
+    return [{"error": None, "gold_session_in_facts": i < covered,
+             "answer_in_facts": i < covered, "answer_checkable": True,
+             "gold_verbatim_in_facts": False,
              "facts_per_session": [per_session] * 3, "facts_total": per_session * 3,
              "parse_failures": 0, "calls": 3} for i in range(n)]
 
@@ -289,7 +293,9 @@ def test_missing_hand_score_is_incomplete_not_pass() -> None:
 
 
 def test_errored_rows_are_excluded_from_the_rate() -> None:
-    rows = _rows(4, 4, 5) + [{"error": "boom", "gold_in_facts": False,
+    rows = _rows(4, 4, 5) + [{"error": "boom", "gold_session_in_facts": False,
+                              "answer_in_facts": False, "answer_checkable": True,
+                              "gold_verbatim_in_facts": False,
                               "facts_per_session": [], "facts_total": 0,
                               "parse_failures": 0, "calls": 0}]
     s = summarize(rows, _rows(4, 4, 5), 0.95)
@@ -310,14 +316,14 @@ def test_session_cap_flags_a_cut_gold_session() -> None:
 
     cut = run_question(q, llm=None, sim=True, max_sessions=1)
     assert cut["gold_cut_by_session_cap"] is True
-    assert cut["gold_in_facts"] is False          # forced miss, not a real one
+    assert cut["gold_session_in_facts"] is False  # forced miss, not a real one
     s = summarize([cut], [], 0.95)
     assert s["gold_cut_by_session_cap"] == 1
 
     # Uncapped, the same question is found — proving the miss was the cap.
     full = run_question(q, llm=None, sim=True, max_sessions=0)
     assert full["gold_cut_by_session_cap"] is False
-    assert full["gold_in_facts"] is True
+    assert full["gold_session_in_facts"] is True
 
 
 def test_max_questions_budgets_are_nested() -> None:
@@ -328,3 +334,87 @@ def test_max_questions_budgets_are_nested() -> None:
     ] + [_row(f"ms-hit-{i}", correct=True) for i in range(5)]}
     misses, _, _ = select_probe_sets(run, seed=0)
     assert misses[:2] == misses[:3][:2]
+
+
+# ── The instrument fix: paraphrased facts (the 2026-07-30 0% artifact) ──────
+
+PARAPHRASE = ("The postgres connection pool for the checkout service was "
+              "raised to 40 to stop the timeouts.")
+
+
+def test_paraphrased_fact_scores_on_provenance_not_verbatim() -> None:
+    """THE regression for the 0%-vs-82% artifact.
+
+    A faithful narrative fact is a REWRITE of its turn, so verbatim containment
+    cannot fire — that is what made the first real run report a hard 0% while
+    --sim (canned verbatim "facts") read 82%. Provenance must score it, and the
+    verbatim reading must be visibly False so the lesson stays legible."""
+    conn = open_fact_index()
+    index_facts(conn, "s1", [{"text": PARAPHRASE, "date": None, "entities": []}])
+    hits = search_facts(conn, "what did I raise the postgres connection pool to?",
+                        top_k=5)
+    conn.close()
+    assert hits, "the paraphrase must still be RETRIEVABLE — only the check changed"
+    # The old check: structurally incapable of firing on a rewrite.
+    from fact_probe import _gold_in_pool
+    assert not _gold_in_pool([GOLD_TURN], [h["text"] for h in hits])
+    # The new check keys on WHICH SESSION the fact came from, so it fires.
+    assert hits[0]["session_id"] == "s1"
+
+
+def test_gold_session_ids_prefers_turn_flags_then_falls_back() -> None:
+    q = _q_data()
+    assert gold_session_ids(q) == {"s1"}          # via has_answer
+    for sess in q["haystack_sessions"]:           # strip the turn-level flags
+        for m in sess:
+            m.pop("has_answer", None)
+    assert gold_session_ids(q) == set()           # neither signal → excluded
+    q["answer_session_ids"] = ["s1"]
+    assert gold_session_ids(q) == {"s1"}          # via answer_session_ids
+
+
+def test_short_answers_are_excluded_from_the_answer_check() -> None:
+    """"40" would match inside some fact by chance and report as signal."""
+    q = _q_data()
+    q["answer"] = "40"
+    out = run_question(q, llm=None, sim=True, max_sessions=0)
+    assert out["answer_checkable"] is False
+    assert out["answer_in_facts"] is False
+
+
+def test_control_arm_density_is_reported_alongside_the_misses() -> None:
+    """The control column is the validity check on the new measure: a check that
+    returns the same constant on both arms is broken, not informative."""
+    s = summarize(_rows(10, 6, 5), _rows(10, 10, 6), 0.95)
+    assert s["density_misses"]["n"] == 10
+    assert s["density_control"]["n"] == 10
+    assert s["density_control"]["gold_session_rate"] == 100.0
+    assert s["density_misses"]["gold_session_rate"] == 60.0
+    # The gate reads the MISS arm only; the control is there to be looked at.
+    assert s["gate"]["density_ok"]
+
+
+def test_rescore_recomputes_density_without_re_extracting() -> None:
+    """An instrument fix must not cost a re-run: the dump already carries every
+    returned fact and its session, so the new readings are computable offline."""
+    q = _q_data()
+    q["answer"] = "40 connections after the checkout timeouts"
+    fresh = run_question(q, llm=None, sim=True, max_sessions=0)
+    fresh["_kind"] = "miss"
+
+    # Simulate a dump written by the OLD code: strip every field the fix added.
+    stale = {k: v for k, v in fresh.items()
+             if k not in {"gold_session_in_facts", "answer_in_facts",
+                          "answer_checkable", "gold_verbatim_in_facts",
+                          "gold_session_ids"}}
+    assert "gold_session_in_facts" not in stale
+
+    [rescored] = rescore_rows([stale], {q["question_id"]: q})
+    assert rescored["gold_session_in_facts"] is True
+    assert rescored["gold_session_ids"] == ["s1"]
+    assert rescored["calls"] == fresh["calls"]      # nothing re-extracted
+
+
+def test_rescore_flags_a_question_missing_from_the_dataset() -> None:
+    [row] = rescore_rows([{"question_id": "ghost", "retrieved": []}], {})
+    assert "not in --dataset" in row["error"]

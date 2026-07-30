@@ -745,6 +745,31 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 > verbatim behind `FACTS_PROMPT_VERSION`. The gate reports **INCOMPLETE** (never
 > PASS) until `--faithfulness` supplies the hand-score, so three-of-four can't
 > read as a pass.
+>
+> **First box trials, 2026-07-30.** Trial 0 (`--sim`, free): selection recovered
+> **28** candidates vs the banked ~20 — inside the documented widening (the
+> "gold survived into context" clause is inherited, not re-verified), so read the
+> gate as a fraction. Trial 2 (`--cost`): **2,759 extraction calls across 56
+> questions** — capped to `--max-questions 10` (~500 calls). Trial 1 (E3 M2)
+> blocked: OOM installing torch for sentence-transformers.
+>
+> **Trial 3 returned a hard 0% density, and it was an INSTRUMENT BUG, not a
+> finding — and NOT store contamination** (the probe opens no HyMem store: it
+> builds a fresh `:memory:` FTS5 index per question over that question's own
+> `haystack_sessions`, BM25-only, no vector path, so UltraChat cannot reach it).
+> The real cause: criterion 1 asked whether a returned fact CONTAINED the gold
+> TURN, but a narrative fact is a rewrite of its turn *by prompt design*, so the
+> check could never fire on real output. `--sim` read 82% only because canned
+> "facts" are verbatim turns. **Fixed 2026-07-30:** "reachable" is now
+> **gold-session provenance** (a returned fact was extracted from an answer-
+> bearing session), with answer-string containment as corroboration and the old
+> verbatim check retained as a diagnostic lower bound. The **0.60 threshold is
+> unchanged** — the instrument was repaired, not the gate — and because that
+> distinction only holds if the repair is itself controlled, the MS-hit control
+> arm is now measured and printed beside the misses, with the report declaring
+> the gate UNREAD when both arms return the same extreme or the control fails to
+> beat the misses. `--rescore <dump>.json` recomputes all readings from a prior
+> run's stored facts at ZERO LLM cost, so the fix does not re-spend Trial 3.
 
 **Idea.** Extract narrative facts with a draft prompt from the haystacks of the
 ~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and

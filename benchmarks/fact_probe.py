@@ -32,6 +32,34 @@ a second failure banks E1 dead. Faithfulness is a hand-read — the probe dumps 
 material and reports the verdict as INCOMPLETE until `--faithfulness` supplies the
 score, so the banner can never print PASS on three of four criteria.
 
+── "Reachable" is measured by PROVENANCE (instrument fix, 2026-07-30) ──────────
+The first real run returned a hard 0% against a `--sim` reading of 82%, and the
+gap was the INSTRUMENT, not the extraction. Criterion 1 originally asked whether
+a returned fact CONTAINED the gold turn (`_gold_in_pool`: substring or a shared
+40-char prefix). But a narrative fact is a REWRITE of its turn — this prompt
+demands exactly that ("self-contained without the source turn") — so containment
+can essentially never fire on real output. It fired under `--sim` only because
+canned "facts" are verbatim turns. The check was structurally incapable of
+returning true for the thing being tested.
+
+Three readings are now reported, on BOTH arms:
+  1. **gold-session provenance** (GATED): a returned fact was extracted from a
+     session that contains the answer. Exact, paraphrase-proof, and it is the
+     claim E1 actually makes — the fact tier puts the reader within reach.
+  2. **answer string present** (corroborating): the gold answer value survives
+     into a returned fact. The prompt demands verbatim values, so a faithful
+     fact about the right exchange should carry it. Answers under
+     `_MIN_ANSWER_CHARS` are excluded — "40" matches something by chance.
+  3. **verbatim gold turn** (diagnostic only): the original broken check, kept as
+     a strict lower bound and so the lesson stays visible in the output.
+
+The 0.60 THRESHOLD is unchanged. Repairing an instrument that cannot return true
+is not the same as moving a gate after seeing the numbers — but the distinction
+only holds if the repair is itself controlled, so the MS-hit control arm is now
+measured and printed alongside the misses. If both arms return the same extreme,
+or the control does not beat the misses, the report says the gate is UNREAD
+rather than letting a confident constant pass for a result.
+
 ── Why there is no per-question store rebuild ──────────────────────────────────
 The plan sketched the `--inspect-floor` pattern (rebuild a temp HyMem per
 question, ingest, retrieve). That pattern exists to reproduce a RETRIEVAL state;
@@ -98,6 +126,7 @@ from longmemeval_adapter import (  # noqa: E402
     LLMClient,
     _extract_gold_turns,
     _gold_in_pool,
+    _norm_text,
     _normalize_date,
     load_longmemeval_data,
 )
@@ -161,6 +190,34 @@ _MAX_CONTROL_MEDIAN_FACTS = 12
 
 # How many facts the tier is allowed to return per question — the density claim.
 _FACT_TOP_K = 5
+
+# Minimum normalized length for the answer-containment check to mean anything.
+# LME answers are often a bare value ("40", "ruff"); a 2-character answer will
+# appear inside some fact by chance, which would report as signal.
+_MIN_ANSWER_CHARS = 4
+
+
+def gold_session_ids(q_data: dict) -> set[str]:
+    """Haystack session ids that CONTAIN the answer — the provenance ground truth.
+
+    Mirrors `_extract_gold_turns`'s two modes: prefer the turn-level
+    `has_answer` flags, fall back to `answer_session_ids`. Returns an empty set
+    when the dataset carries neither, so such a question is excluded from the
+    rate rather than scored against a fabricated gold.
+
+    This reads a label, and that is fine BECAUSE it is applied strictly AFTER
+    retrieval, to score it. Nothing upstream — extraction, indexing, ranking —
+    ever sees it.
+    """
+    sessions = q_data.get("haystack_sessions", []) or []
+    sids = q_data.get("haystack_session_ids",
+                      [str(i) for i in range(len(sessions))])
+    out = {
+        sid for sid, sess in zip(sids, sessions)
+        if any(isinstance(m, dict) and m.get("has_answer")
+               and (m.get("content") or "").strip() for m in sess)
+    }
+    return out or {str(s) for s in (q_data.get("answer_session_ids") or [])}
 
 
 # ── Selection (pure; pinned by tests) ───────────────────────────────────────
@@ -426,8 +483,11 @@ def run_question(
     conn = open_fact_index()
     out = {"question_id": qid, "question": question, "sessions_processed": 0,
            "calls": 0, "parse_failures": 0, "facts_total": 0,
-           "facts_per_session": [], "retrieved": [], "gold_in_facts": False,
-           "gold_turns": 0, "gold_cut_by_session_cap": gold_cut,
+           "facts_per_session": [], "retrieved": [],
+           "gold_session_in_facts": False, "answer_in_facts": False,
+           "answer_checkable": False, "gold_verbatim_in_facts": False,
+           "gold_turns": 0, "gold_session_ids": [],
+           "gold_cut_by_session_cap": gold_cut,
            "error": None, "dump": []}
     try:
         for idx in order:
@@ -460,7 +520,28 @@ def run_question(
         out["retrieved"] = retrieved
         gold_turns, _ = _extract_gold_turns(q_data)
         out["gold_turns"] = len(gold_turns)
-        out["gold_in_facts"] = bool(gold_turns) and _gold_in_pool(
+        gold_sids = gold_session_ids(q_data)
+        out["gold_session_ids"] = sorted(gold_sids)
+
+        # PRIMARY: provenance. A returned fact was EXTRACTED FROM a gold-bearing
+        # session, so the tier put the reader within reach of the answer.
+        out["gold_session_in_facts"] = bool(gold_sids) and any(
+            r["session_id"] in gold_sids for r in retrieved)
+        # SECONDARY: the gold ANSWER value survives into a returned fact. The
+        # prompt demands verbatim values, so a faithful fact about the right
+        # exchange should carry it. Short answers ("40") match spuriously, so the
+        # length floor keeps this from becoming a coin flip.
+        answer = str(q_data.get("answer") or "").strip()
+        out["answer_checkable"] = len(_norm_text(answer)) >= _MIN_ANSWER_CHARS
+        out["answer_in_facts"] = out["answer_checkable"] and any(
+            _norm_text(answer) in _norm_text(r["text"]) for r in retrieved)
+        # DIAGNOSTIC ONLY: verbatim gold-TURN containment. This is what the probe
+        # originally gated on, and it was wrong — a narrative fact is a rewrite of
+        # its turn (the prompt demands it), so containment can essentially never
+        # fire on real extraction. It fires under --sim because canned "facts" are
+        # verbatim turns, which is exactly why sim read 82% and the first real run
+        # read 0%. Kept as a strict lower bound and to keep that lesson visible.
+        out["gold_verbatim_in_facts"] = bool(gold_turns) and _gold_in_pool(
             gold_turns, [r["text"] for r in retrieved]
         )
     except Exception as e:  # a probe row must never abort the run
@@ -476,12 +557,70 @@ def _median(xs: list[float]) -> float:
     return float(statistics.median(xs)) if xs else 0.0
 
 
+def rescore_rows(rows: list[dict], by_id: dict[str, dict]) -> list[dict]:
+    """Recompute the density readings on ALREADY-EXTRACTED rows.
+
+    The extraction is the expensive part and it is deterministic once done: a
+    dump's `retrieved` list carries each returned fact's `session_id` and text,
+    which is everything the provenance and answer checks need. So an instrument
+    fix costs zero LLM calls — re-read the dump instead of re-extracting. This is
+    the whole reason `--out` writes `per_question` in full.
+
+    Rows are mutated copies; anything the dump lacks (an old dump predating a
+    field) is recomputed from `by_id`, never assumed.
+    """
+    out = []
+    for r in rows:
+        row = dict(r)
+        q_data = by_id.get(row.get("question_id"))
+        retrieved = row.get("retrieved") or []
+        if q_data is None:
+            row["error"] = row.get("error") or "question not in --dataset"
+            out.append(row)
+            continue
+        gold_sids = gold_session_ids(q_data)
+        row["gold_session_ids"] = sorted(gold_sids)
+        row["gold_session_in_facts"] = bool(gold_sids) and any(
+            h.get("session_id") in gold_sids for h in retrieved)
+        answer = str(q_data.get("answer") or "").strip()
+        row["answer_checkable"] = len(_norm_text(answer)) >= _MIN_ANSWER_CHARS
+        row["answer_in_facts"] = row["answer_checkable"] and any(
+            _norm_text(answer) in _norm_text(h.get("text", "")) for h in retrieved)
+        gold_turns, _ = _extract_gold_turns(q_data)
+        row["gold_verbatim_in_facts"] = bool(gold_turns) and _gold_in_pool(
+            gold_turns, [h.get("text", "") for h in retrieved])
+        row.setdefault("gold_cut_by_session_cap", False)
+        out.append(row)
+    return out
+
+
 def summarize(miss_rows: list[dict], ctrl_rows: list[dict],
               faithfulness: float | None) -> dict:
     ok_miss = [r for r in miss_rows if not r["error"]]
     ok_ctrl = [r for r in ctrl_rows if not r["error"]]
     n = len(ok_miss) or 1
-    covered = sum(1 for r in ok_miss if r["gold_in_facts"])
+    covered = sum(1 for r in ok_miss if r["gold_session_in_facts"])
+
+    def _density(rows: list[dict]) -> dict:
+        """The three density readings for one arm. Reported TOGETHER on both arms
+        because a single number cannot be trusted on its own: the
+        diagnostic-controls lesson is that a broken check returns a confident
+        constant, and the only way to see that is a second population where the
+        answer is known to differ (here: MS HITS, which the live pipeline did
+        answer correctly)."""
+        m = len(rows) or 1
+        checkable = [r for r in rows if r.get("answer_checkable")]
+        return {
+            "n": len(rows),
+            "gold_session": sum(1 for r in rows if r["gold_session_in_facts"]),
+            "gold_session_rate": 100.0 * sum(
+                1 for r in rows if r["gold_session_in_facts"]) / m,
+            "answer": sum(1 for r in checkable if r["answer_in_facts"]),
+            "answer_checkable": len(checkable),
+            "answer_rate": (100.0 * sum(1 for r in checkable if r["answer_in_facts"])
+                            / (len(checkable) or 1)),
+            "verbatim": sum(1 for r in rows if r.get("gold_verbatim_in_facts")),
+        }
 
     per_sess_miss = [c for r in ok_miss for c in r["facts_per_session"]]
     per_sess_ctrl = [c for r in ok_ctrl for c in r["facts_per_session"]]
@@ -501,6 +640,8 @@ def summarize(miss_rows: list[dict], ctrl_rows: list[dict],
         "top_k": _FACT_TOP_K,
         "gold_in_facts": covered,
         "gold_in_facts_rate": 100.0 * covered / n,
+        "density_misses": _density(ok_miss),
+        "density_control": _density(ok_ctrl),
         "median_facts_per_session": median_miss,
         "median_facts_per_session_control": median_ctrl,
         "mean_facts_per_question": (sum(r["facts_total"] for r in ok_miss) / n),
@@ -537,8 +678,28 @@ def report(s: dict, diag: dict, miss_rows: list[dict], verbose: bool) -> bool:
               f"gate is a FRACTION (≥{_MIN_GOLD_IN_FACTS:.0%}), not a count; "
               f"reconcile against the decomposition before reading it.")
     print(f"{'='*72}")
-    print(f"\n  gold reachable in top-{s['top_k']} facts: "
-          f"{s['gold_in_facts']}/{s['n_misses']}  ({s['gold_in_facts_rate']:.0f}%)")
+    dm, dc = s["density_misses"], s["density_control"]
+    print(f"\n  DENSITY — is the answer reachable in top-{s['top_k']} facts?")
+    print(f"    {'':<34}{'MISSES':>16}{'CONTROL (hits)':>18}")
+    print(f"    {'gold-session provenance ←gated':<34}"
+          f"{dm['gold_session']:>7}/{dm['n']:<4}{dm['gold_session_rate']:>5.0f}%"
+          f"{dc['gold_session']:>9}/{dc['n']:<4}{dc['gold_session_rate']:>5.0f}%")
+    print(f"    {'answer string present':<34}"
+          f"{dm['answer']:>7}/{dm['answer_checkable']:<4}{dm['answer_rate']:>5.0f}%"
+          f"{dc['answer']:>9}/{dc['answer_checkable']:<4}{dc['answer_rate']:>5.0f}%")
+    print(f"    {'verbatim gold turn (diagnostic)':<34}"
+          f"{dm['verbatim']:>7}/{dm['n']:<4}{'':>6}{dc['verbatim']:>9}/{dc['n']:<4}")
+    # The control column IS the validity check, not decoration. Read it first.
+    if dm["n"] and dc["n"]:
+        if dm["gold_session_rate"] == dc["gold_session_rate"] in (0.0, 100.0):
+            print(f"    ⚠ both arms returned the SAME extreme "
+                  f"({dm['gold_session_rate']:.0f}%) — that is the signature of a "
+                  f"broken check, not a finding. Do NOT read the gate; debug the "
+                  f"measure (dump `retrieved` + `gold_session_ids` for one row).")
+        elif dc["gold_session_rate"] <= dm["gold_session_rate"]:
+            print("    ⚠ the CONTROL (questions the live pipeline answered "
+                  "correctly) scores no better than the misses — the measure is "
+                  "not discriminating. Treat the gate as unread.")
     print(f"  facts/session median: {s['median_facts_per_session']:.1f}  "
           f"(control: {s['median_facts_per_session_control']:.1f})")
     print(f"  facts/question mean:  {s['mean_facts_per_question']:.1f}")
@@ -566,8 +727,8 @@ def report(s: dict, diag: dict, miss_rows: list[dict], verbose: bool) -> bool:
 
     checks = [
         (s["gate"]["density_ok"],
-         f"gold in ≤{s['top_k']} facts ≥ {_MIN_GOLD_IN_FACTS:.0%} "
-         f"({s['gold_in_facts_rate']:.0f}%)"),
+         f"gold-session provenance in ≤{s['top_k']} facts ≥ "
+         f"{_MIN_GOLD_IN_FACTS:.0%} ({s['gold_in_facts_rate']:.0f}%)"),
         (s["gate"]["faithfulness_ok"],
          f"faithfulness ≥ {_MIN_FAITHFULNESS:.2f} "
          + (f"({s['faithfulness']:.2f})" if s["faithfulness"] is not None
@@ -626,6 +787,12 @@ def main() -> None:
                     help="sessions written to the hand-score sample (default 20)")
     ap.add_argument("--out", type=Path, default=None,
                     help="write the full fact dump + summary JSON here")
+    ap.add_argument("--rescore", type=Path, default=None,
+                    help="re-read a previous run's --out dump and recompute the "
+                         "density readings from its stored `retrieved` facts. "
+                         "ZERO LLM calls — use this after an instrument fix "
+                         "instead of re-extracting. Still needs --source and "
+                         "--dataset for the selection and the gold labels")
     ap.add_argument("--cost", action="store_true",
                     help="print the extraction-call count and exit, spending nothing")
     ap.add_argument("--verbose", action="store_true", help="per-question table")
@@ -666,11 +833,15 @@ def main() -> None:
         return min(n, args.max_sessions) if args.max_sessions else n
 
     total_calls = sum(_sessions_for(q) for q in miss_ids + ctrl_ids)
+    if args.rescore:
+        # No extraction is about to happen — printing a call estimate here would
+        # be actively misleading about what this invocation costs.
+        total_calls = 0
     print(f"\n[cost] {len(miss_ids)} misses + {len(ctrl_ids)} control = "
           f"{len(miss_ids) + len(ctrl_ids)} questions, "
           f"{total_calls} extraction calls"
-          + ("  (--sim: zero LLM calls)" if args.sim else
-             f"  @ {args.model}")
+          + ("  (--rescore: zero LLM calls, extraction reused)" if args.rescore
+             else "  (--sim: zero LLM calls)" if args.sim else f"  @ {args.model}")
           + (f"   [--max-questions {args.max_questions}]" if args.max_questions else "")
           + (f"   [--max-sessions {args.max_sessions}]" if args.max_sessions else ""),
           flush=True)
@@ -687,6 +858,29 @@ def main() -> None:
         print("  --cost: nothing spent. Re-run without it (bound spend with "
               "--max-questions, not --max-sessions) to execute.")
         return
+
+    if args.rescore:
+        prior = json.loads(args.rescore.read_text())
+        rows = prior.get("per_question", [])
+        if not rows:
+            print(f"ERROR: {args.rescore.name} has no `per_question` rows to "
+                  f"rescore (was it written with --out?).")
+            sys.exit(2)
+        rescored = rescore_rows(rows, by_id)
+        miss_rows = [r for r in rescored if r.get("_kind") == "miss"]
+        ctrl_rows = [r for r in rescored if r.get("_kind") == "ctrl"]
+        print(f"\n[rescore] {args.rescore.name} — {len(miss_rows)} misses + "
+              f"{len(ctrl_rows)} control, ZERO LLM calls "
+              f"(extraction reused; prompt {prior.get('prompt_version')}, "
+              f"model {prior.get('model')})", flush=True)
+        s = summarize(miss_rows, ctrl_rows, args.faithfulness)
+        passed = report(s, diag, miss_rows, args.verbose)
+        if args.out:
+            args.out.write_text(json.dumps(
+                {**prior, "summary": s, "per_question": rescored,
+                 "rescored_from": str(args.rescore)}, indent=2))
+            print(f"  rescored dump → {args.out}")
+        sys.exit(0 if passed else 1)
 
     llm = None
     if not args.sim:
