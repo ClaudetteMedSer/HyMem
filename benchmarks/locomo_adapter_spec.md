@@ -285,9 +285,16 @@ then the miss decomposition decides the next lever, per the LME/MSC discipline.
 
 ## 6. Levers queue (pre-registered, so post-hoc tuning stays honest)
 
-Verdicts as of 2026-07-28. "Net" = flip-script net questions on n=200; compare
+Verdicts as of 2026-07-30. "Net" = flip-script net questions on n=200; compare
 against the §8 churn floor (net ≈ ±4, ~10 questions moving) before reading a
 delta as a signal.
+
+**Standing state: the RETRIEVAL chapter is closed.** Adapter-side by the terminal
+finding, and core-side by L10 (a message-vector tier bridges 5% of true
+vocabulary gaps with the shipping encoder). What is left here is reader-side
+(L8-class prompt work — historically the biggest wins per token) and out-sampling
+(§8a). Before proposing any new retrieval lever, read the terminal finding and
+L10 first: three independent instruments across LoCoMo/LME already agree.
 
 - **L1 `--graph-multihop` on cat-1** — ran, null (31.6% cat-1 OFF vs ON). **Not
   closed: instrument mismatch, not a verdict.** Multi-hop feeds `graph_facts`
@@ -323,6 +330,62 @@ delta as a signal.
   needs a semantic path over raw turns — a CORE change, out of scope for this
   adapter work. The probe's query is an OR of the 8 longest content tokens, i.e.
   *more* generous than any real query builder, which strengthens the negative.
+  **→ That CORE change is now itself CLOSED — see L10.**
+- **L10 semantic path over raw turns (a "message-vector" tier) — CLOSED
+  2026-07-30 by probe, before any build.** The obvious fix implied by the
+  terminal finding: give `message_hits` a vector path so a turn with no lexical
+  overlap can still enter the pool. `benchmarks/locomo_message_vector_probe.py`
+  tests whether that would actually work — read-only, no LLM, local embeddings,
+  with the verdict thresholds pre-registered in its docstring (>=40% build /
+  15-40% marginal / <15% closed; control >=80% or the gap number is unreadable).
+  Method, per gold turn: production BM25 rank via `_message_fts_search`, then
+  cosine rank against a fresh embedding of *every* user/assistant turn in the
+  same store, then RRF of the two. Gap set = gold BM25 cannot deliver inside
+  `--top-k 15`; control = gold from CORRECT answers that BM25 *does* deliver.
+  **Result with the SHIPPING encoder** (`paraphrase-multilingual-MiniLM-L12-v2`,
+  384-dim — the same model Hermes runs): gap n=103 → vector@15 recovers **12
+  (12%)**, hybrid 10 (10%); control n=16 → vector 8 (50%), hybrid 12 (75%).
+  - **The split is what decides it, not the pooled number.** Of **54 TRUE
+    vocabulary gaps** (BM25 rank = None — the population this tier exists to
+    serve) only **3 are bridged (5%)**. The other 9 of 12 recoveries come from
+    the 49 **below-cut** turns (present in BM25, just past the cut) — that is
+    *ranking*, not vocabulary — and **4 of those 9 are already recovered by the
+    L9 `--message-fts-top-k` widening.** So the tier's unique contribution over a
+    config change is ~8 turns of 103, only 3 of them actual semantic bridges, in
+    exchange for embedding every turn at ingest. Below even the marginal bar.
+  - **The control miss is not "broken instrument" — read it as evidence.** The
+    80% control bar was written to catch a mis-wired probe (wrong dim, text
+    mismatch). But this encoder *is* what would ship, so a tier that ranks only
+    8/16 lexically-easy gold turns inside top-15 is a weak tier, not a bad
+    measurement. Closure is data-supported **for the production encoder**.
+  - **Do NOT read the below-cut half as an argument for widening.** Canonical
+    stays 3×/24k deliberately (L6: at wide apertures gold arrives regardless of
+    rank and a core ranking regression is MASKED). Those turns are an accepted
+    cost of a sensitive gate, not new headroom.
+  - **Two caveats if anyone re-runs it.** (a) The RRF is mis-specified for a real
+    design: equal-weight fusion of a 200-deep BM25 list lets a noisy vector arm
+    *demote* gold that BM25 had at rank 3 (1/61 + 1/110 > 1/63). The proof is in
+    the control — hybrid 75% came in BELOW BM25's by-construction 100%. **Never
+    quote the hybrid figure as a design number**; the vector arm's own recall is
+    the ceiling of what fusion can add. (b) A store with fewer turns than the cut
+    scores a trivial 100% (everything present is inside top_k), so those rows are
+    excluded and counted as `vacuous`; an all-vacuous set returns UNREADABLE.
+  - **The one untested variable is encoder strength.** Re-run via env swap
+    (`HYMEM_EMBEDDING_MODEL` / `HYMEM_EMBEDDING_BASE_URL`), no code change.
+    Pre-register the read: control >=80% BEFORE looking at the gap, then gap
+    >=15% to reopen. Note the multilingual encoder is a *production* constraint
+    (Dutch is prioritized), so an English-only model that wins here would not be
+    shippable as-is — a reopen would owe a multilingual answer too.
+  - Optional, cannot change the verdict: hand-read the 3 bridged turns
+    (`conv-47_q17 D8:36`, `conv-26_q70 D17:19`, `conv-41_q125 D27:14`) to see
+    whether they are genuine semantic matches or artifacts (short generic gold,
+    name coincidence). At 5% the decision holds either way; what it settles is
+    whether the true bridge rate is "rare but real" or flat zero.
+  - **Third independent agreement ⇒ retrieval is closed triad-wide.** LME L1
+    found no vec-only recovery bucket; LME L2's probe found NOT-in-BM25 = 0 for
+    MS; this probe finds 5% on true vocabulary gaps. Different corpora,
+    different instruments, same answer. The residual is reader/synthesis, sized
+    at ~80% architectural by the P0 reader-parity run (72.6% vs canonical 68.4%).
 - **L9 `--message-fts-top-k` (2026-07-29) — real but sharply diminishing.** The
   strict re-score at THREE surfaces (render / top_k / pre-cut pool) splits the 27
   as **5 composition / 6 ranking / 16 recall at M=120**. Note the two-surface
