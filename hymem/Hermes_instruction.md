@@ -15,7 +15,15 @@ only needed while running an **older** HyMem server.
 
 1. Upgrade HyMem to a build at or after 2026-07-06 (dual-field peer-context response; the session-context wiring from commit `0b5eb55` is older still) (§Prerequisites).
 2. `HYMEM_AGGREGATION_NODES_ENABLED=true` in the HyMem server environment, then let one dream run (§Prerequisites).
-3. Verify — server first with `curl`, then the harness **in a fresh session**; an existing session's cached base context serves a stale block (§Verification).
+3. **Pin `HYMEM_LLM_MODEL` explicitly** (and `HYMEM_EMBEDDING_MODEL`) rather than
+   relying on the shipped default. Model names get hard-deprecated out from
+   under a running server — `deepseek-chat` was, on 2026-07-24 — and a dead
+   model degrades silently: the digest, session digests, and fusions all log
+   and continue, so dreams keep reporting success while the tree stops growing.
+   The v25 `dream_runs.digest_failures` / `episodes_created` columns are the
+   place to check this (a run of `episodes_created = 0` against a rising
+   `chunks_seen` is the signature).
+4. Verify — server first with `curl`, then the harness **in a fresh session**; an existing session's cached base context serves a stale block (§Verification).
 
 **Checklist (HyMem older than 2026-07-06):** as above, plus apply the two-part
 patch to the harness's `plugins/memory/honcho/session.py` (§Harness patch) and

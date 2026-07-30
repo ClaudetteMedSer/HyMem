@@ -20,7 +20,7 @@ log = logging.getLogger("hymem.bootstrap")
 
 DEFAULT_ROOT = Path.home() / ".hermes"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_LLM_MODEL = "deepseek-chat"
+DEFAULT_LLM_MODEL = "deepseek-v4-flash"  # deepseek-chat hard-deprecated 2026-07-24
 DEFAULT_EMBEDDING_MODEL = "deepseek-embedding"
 
 

@@ -44,6 +44,61 @@ def test_dream_persists_run_report(hy):
     assert row["markers_extracted"] == report.markers_extracted
 
 
+def test_dream_persists_digest_counters(hy):
+    """Schema v25: episode creation and digest failures land in dream_runs.
+
+    The 2026-07-30 starvation bug (long-lived sessions never re-digested, so no
+    episode was created for six days) was invisible here — every run reported
+    success with a rising chunks_seen. `episodes_created` makes the stall a run
+    of zeros in the same row, and `digest_failures` counts the calls the runner
+    logs-and-continues past."""
+    import json
+
+    _seed_session(hy)
+    episode = {
+        "title": "Dropped Docker for local dev",
+        "summary": "Switched local development from Docker to uv and system Python.",
+        "outcome": "resolved",
+        "key_entities": ["uv", "docker"],
+        "chunk_ids": [],
+    }
+    hy.set_llm(StubLLMClient(
+        fixtures={"Return the JSON object now": json.dumps(
+            {"episodes": [episode], "summary": "", "procedures": []}
+        )},
+        default="[]",
+    ))
+
+    report = hy.dream()
+    row = hy.conn.execute(
+        "SELECT digest_failures, episodes_created FROM dream_runs "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert report.episodes_created == 1
+    assert row["episodes_created"] == 1
+    assert report.digest_failures == 0
+    assert row["digest_failures"] == 0
+
+
+def test_dream_counts_unparseable_digest_as_failure(hy):
+    """An unparseable digest reply is a failure, not an empty session: the
+    counter must fire so a broken tail is visible without reading the log."""
+    _seed_session(hy)
+    hy.set_llm(StubLLMClient(
+        fixtures={"Return the JSON object now": "definitely not json"},
+        default="[]",
+    ))
+
+    report = hy.dream()
+    row = hy.conn.execute(
+        "SELECT digest_failures, episodes_created FROM dream_runs "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert report.digest_failures == 1
+    assert row["digest_failures"] == 1
+    assert row["episodes_created"] == 0
+
+
 def test_dream_persists_aggregation_counters(hy, monkeypatch):
     # The RAPTOR flip criteria watch the built/reused split per cycle
     # (benchmarks/raptor_digest_plan.md Stage 3c). build_aggregation_nodes

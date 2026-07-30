@@ -243,6 +243,11 @@ def test_v21_rebuilds_predicate_check_preserving_data_and_fk(tmp_path: Path):
         CREATE TABLE dream_runs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at TIMESTAMP NOT NULL);
+        -- ...and sessions (v24 ALTERs it on the way up)
+        CREATE TABLE sessions(
+            id TEXT PRIMARY KEY,
+            digested_prompt_version TEXT,
+            profile_prompt_version TEXT);
         CREATE TABLE knowledge_graph(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_canonical TEXT NOT NULL,

@@ -35,7 +35,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- (same skip mechanics as digested_prompt_version, but decoupled so a
     -- profile-prompt bump alone re-extracts). Migration 019 adds this for
     -- existing DBs (ALTER lives there only).
-    profile_prompt_version TEXT
+    profile_prompt_version TEXT,
+    -- Highest message id covered by a successful digest. The digest reads only
+    -- chunks ABOVE this watermark, so a long-lived session's tail keeps getting
+    -- digested instead of the head being re-read forever (the truncation was
+    -- `combined[:max_chars]` over the whole session), and new traffic re-opens
+    -- the digest even when no chunk was freshly extracted. NULL = no coverage
+    -- recorded, so the next dream digests from the start of the session.
+    -- Migration 024 adds this for existing DBs (ALTER lives there only).
+    digested_message_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -509,6 +517,13 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     aggregation_fusion_failures INTEGER NOT NULL DEFAULT 0,
     aggregation_input_episodes INTEGER NOT NULL DEFAULT 0,
     aggregation_blocking TEXT NOT NULL DEFAULT '',
+    -- v25 digest attribution: a per-session digest that raises or returns an
+    -- unparseable payload is logged and skipped (one bad session must not abort
+    -- a dream), and episode creation can stall silently while chunks keep
+    -- arriving — the 2026-07-30 starvation bug. These make both visible without
+    -- a join against episodes.
+    digest_failures INTEGER NOT NULL DEFAULT 0,
+    episodes_created INTEGER NOT NULL DEFAULT 0,
     skipped_locked INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );

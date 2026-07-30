@@ -26,7 +26,7 @@ hymem/contrib/openai_client.py for the full list).
 Key variables:
     HYMEM_LLM_API_KEY        API key for the extraction LLM (or DEEPSEEK_API_KEY)
     HYMEM_LLM_BASE_URL       Base URL (default: https://api.deepseek.com)
-    HYMEM_LLM_MODEL          Model name (default: deepseek-chat)
+    HYMEM_LLM_MODEL          Model name (default: deepseek-v4-flash)
     HYMEM_EMBEDDING_API_KEY  API key for embeddings (falls back to LLM key)
     HYMEM_EMBEDDING_BASE_URL Embedding endpoint (default: https://api.deepseek.com)
     HYMEM_EMBEDDING_MODEL    Embedding model (default: deepseek-embedding)

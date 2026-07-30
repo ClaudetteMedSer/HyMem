@@ -16,7 +16,7 @@ class OpenAICompatibleClient:
     Environment variables (all optional if arguments are passed directly):
         HYMEM_LLM_API_KEY   — API key (falls back to OPENAI_API_KEY)
         HYMEM_LLM_BASE_URL  — base URL (default: https://api.deepseek.com)
-        HYMEM_LLM_MODEL     — model name (default: deepseek-chat)
+        HYMEM_LLM_MODEL     — model name (default: deepseek-v4-flash)
     """
 
     def __init__(
@@ -48,7 +48,7 @@ class OpenAICompatibleClient:
             or os.environ.get("HYMEM_LLM_BASE_URL")
             or "https://api.deepseek.com"
         )
-        self.model = model or os.environ.get("HYMEM_LLM_MODEL") or "deepseek-chat"
+        self.model = model or os.environ.get("HYMEM_LLM_MODEL") or "deepseek-v4-flash"
         self._client = OpenAI(api_key=resolved_key, base_url=resolved_base)
 
     def complete(self, request: LLMRequest) -> str:

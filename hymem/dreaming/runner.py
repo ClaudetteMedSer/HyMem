@@ -76,6 +76,8 @@ class DreamReport:
     aggregation_fusion_failures: int = 0
     aggregation_input_episodes: int = 0
     aggregation_blocking: str = ""
+    digest_failures: int = 0
+    episodes_created: int = 0
     profile_items_extracted: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
@@ -369,8 +371,8 @@ def run_dreaming(
             # prompt_version and no chunk was re-extracted this run, so
             # steady-state re-dreams of unchanged sessions cost zero tail calls.
             digested = conn.execute(
-                "SELECT summary, digested_prompt_version, profile_prompt_version "
-                "FROM sessions WHERE id = ?",
+                "SELECT summary, digested_prompt_version, profile_prompt_version, "
+                "digested_message_id FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             already_digested = (
@@ -378,20 +380,47 @@ def run_dreaming(
                 and digested["digested_prompt_version"] == cfg.prompt_version
             )
             has_summary = digested is not None and bool(digested["summary"])
-            if not (already_digested and not had_new_chunk_work):
+            # Schema v24: the guard also asks whether the session has traffic
+            # ABOVE the digest watermark. `had_new_chunk_work` alone was not
+            # enough — messages landing in an already-digested session produce
+            # no fresh extraction when their chunks were already processed (or
+            # when the baseline tier picked them up), so the session stayed
+            # skipped forever and its episodes froze while chunks kept growing.
+            watermark = digested["digested_message_id"] if digested is not None else None
+            newest_message_id = conn.execute(
+                "SELECT MAX(id) AS m FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["m"]
+            caught_up = (
+                newest_message_id is None
+                or (watermark is not None and watermark >= newest_message_id)
+            )
+            if not (already_digested and caught_up and not had_new_chunk_work):
                 try:
                     digest = extract_session_digest(
                         conn, session_id, llm,
                         max_tokens=cfg.dream_digest_max_tokens,
                         max_chars=cfg.dream_digest_max_chars,
+                        # Resume at the watermark only when this session is
+                        # already digested under the CURRENT prompt version. A
+                        # prompt bump (or a never-digested session) re-reads
+                        # from the start so the new prompt refreshes the
+                        # existing episodes via UPSERT — the watermark update
+                        # below is monotonic, so that re-read cannot un-cover a
+                        # tail this session already had.
+                        since_message_id=watermark if already_digested else None,
                     )
                 except Exception:
+                    report.digest_failures += 1
                     log.exception("digest.extraction_failure session_id=%s", session_id)
                 else:
+                    if digest is not None and digest.parse_failed:
+                        report.digest_failures += 1
                     if digest is not None:
                         with core_db.transaction(conn):
                             if digest.episodes.items:
                                 ep_count = persist_episodes(conn, session_id, digest.episodes)
+                                report.episodes_created += ep_count
                                 log.debug(
                                     "episodes session_id=%s count=%d", session_id, ep_count
                                 )
@@ -413,6 +442,18 @@ def run_dreaming(
                                 "UPDATE sessions SET digested_prompt_version = ? WHERE id = ?",
                                 (cfg.prompt_version, session_id),
                             )
+                            # Advance the watermark only over what the LLM
+                            # actually saw, and never backwards (a re-digest
+                            # forced by a prompt bump re-reads from NULL and
+                            # must not un-cover the tail). A parse failure
+                            # reports no coverage, so the slice retries.
+                            if digest.covered_message_id is not None:
+                                conn.execute(
+                                    "UPDATE sessions SET digested_message_id = "
+                                    "MAX(COALESCE(digested_message_id, -1), ?) "
+                                    "WHERE id = ?",
+                                    (digest.covered_message_id, session_id),
+                                )
 
             # P4 typed user-profile extraction: one LLM call over the session's
             # USER turns only (closed slot vocabulary, schema v18), piggybacking
@@ -672,6 +713,8 @@ def run_dreaming(
                 aggregation_fusion_failures = ?,
                 aggregation_input_episodes = ?,
                 aggregation_blocking = ?,
+                digest_failures = ?,
+                episodes_created = ?,
                 skipped_locked = 0
             WHERE id = ?
             """,
@@ -688,11 +731,13 @@ def run_dreaming(
                 report.aggregation_fusion_failures,
                 report.aggregation_input_episodes,
                 report.aggregation_blocking,
+                report.digest_failures,
+                report.episodes_created,
                 run_id,
             ),
         )
         log.info(
-            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_blocking=%s budget_exhausted=%s",
+            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_blocking=%s digest_failures=%d episodes_created=%d budget_exhausted=%s",
             run_id,
             report.sessions_processed,
             report.chunks_processed,
