@@ -269,6 +269,31 @@ def _report(gap: list[dict], control: list[dict], top_k: int, limit: int) -> str
     block("GAP SET — gold BM25 cannot deliver inside the production cut", gap,
           gap_vacuous)
 
+    # The gap set is NOT homogeneous, and the two halves are different problems.
+    # `bm25_rank is None` = a true vocabulary gap: the turn shares no usable term
+    # with the question, so no aperture, top_k, or reranker can ever reach it —
+    # this is the population the message-vector tier exists to serve. The rest
+    # ARE in BM25, just below the cut: a ranking/aperture question with its own
+    # (already-closed) levers. A recovery total that comes mostly from the
+    # below-cut half would mean vectors recover ~none of the turns that motivated
+    # the tier, so the two are reported separately and never pooled.
+    true_gap = [r for r in gap if r["bm25_rank"] is None]
+    below_cut = [r for r in gap if r["bm25_rank"] is not None]
+    if true_gap and below_cut:
+        lines.append(f"\n  ── gap-set decomposition (the read that decides closure) ──")
+        for label, rows in (("true vocab gap (BM25 None)", true_gap),
+                            ("below-cut (in BM25 > cut)", below_cut)):
+            vh, vn = _recall(rows, "vector_rank", top_k)
+            lines.append(f"    {label:<28} n={vn:>3}  "
+                         f"vector@{top_k}: {_pct(vh, vn):>5}% ({vh}/{vn})")
+        th, tn = _recall(true_gap, "vector_rank", top_k)
+        if tn and _pct(th, tn) < 15.0:
+            lines.append(
+                f"    → vectors recover {_pct(th, tn)}% of the TRUE vocabulary gaps: "
+                "the tier does not serve the population it was proposed for, "
+                "independent of the pooled number below."
+            )
+
     gh, gn = _recall(gap, "vector_rank", top_k)
     hh, hn = _recall(gap, "hybrid_rank", top_k)
     best = max(_pct(gh, gn), _pct(hh, hn))
