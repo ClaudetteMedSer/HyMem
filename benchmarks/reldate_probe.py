@@ -90,6 +90,12 @@ _MAX_CONTROL_FIRES = 0
 # Below this many fired-with-gold questions, precision is reported but NOT read
 # as a gate criterion: a 1-in-8 miss is not distinguishable from a 1-in-8 fluke.
 _MIN_N_FOR_PRECISION = 10
+# A window covering more than this share of a row's corpus is not a retrieval
+# signal — a ×1.5 boost applied to a fifth of the store reorders almost nothing
+# and is indistinguishable from raising the tier weight. NOT part of G-E4a,
+# which was pre-registered without it; reported so the omission is visible and
+# so successor gates can adopt it as criterion 1.
+_MAX_USEFUL_SELECTIVITY = 0.20
 
 _ISO = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
 
@@ -470,6 +476,10 @@ def load_locomo(path: Path) -> tuple[list[dict], list[dict]]:
         if not dates:
             continue
         last = max(dates.values())
+        # Every session date in this sample, NOT de-duplicated: selectivity is
+        # the share of the retrievable corpus a window covers, so two sessions
+        # sharing a date must count twice. De-duplicating flatters a wide range.
+        corpus = sorted(d.isoformat() for d in dates.values())
         for qi, qa in enumerate(sample.get("qa", []) or []):
             q = str(qa.get("question", "")).strip()
             if not q:
@@ -482,7 +492,7 @@ def load_locomo(path: Path) -> tuple[list[dict], list[dict]]:
             questions.append({
                 "id": f"{sample.get('sample_id', si)}-q{qi}", "text": q,
                 "anchor": last.isoformat(), "gold_dates": sorted(set(gold)),
-                "category": qa.get("category"),
+                "category": qa.get("category"), "corpus_dates": corpus,
             })
         for key, val in conv.items():
             m = re.fullmatch(r"session_(\d+)", key)
@@ -497,7 +507,7 @@ def load_locomo(path: Path) -> tuple[list[dict], list[dict]]:
                     turns.append({
                         "id": f"{sample.get('sample_id', si)}-s{m.group(1)}t{ti}",
                         "text": text, "anchor": anchor.isoformat(),
-                        "gold_dates": [],
+                        "gold_dates": [], "corpus_dates": corpus,
                     })
     return questions, turns
 
@@ -538,11 +548,21 @@ def load_lme(path: Path) -> list[dict]:
         gold = sorted({d for s, d in zip(sids, dates) if s in gold_ids and d})
         rows.append({"id": str(q.get("question_id", len(rows))), "text": text,
                      "anchor": anchor, "gold_dates": gold,
-                     "category": q.get("question_type")})
+                     "category": q.get("question_type"),
+                     # Not de-duplicated — see load_locomo.
+                     "corpus_dates": sorted(d for d in dates if d)})
     return rows
 
 
 # ── measurement ─────────────────────────────────────────────────────────────────
+def _median(vals: list[float]) -> float | None:
+    if not vals:
+        return None
+    s = sorted(vals)
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+
 def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
     """Score one population. Gold is applied strictly AFTER resolution."""
     fired: list[dict] = []
@@ -613,6 +633,17 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
                 before = sum(g < hit.start for g in row["gold_dates"])
                 rec["gold_side"] = "after" if after >= before else "before"
                 sides[rec["gold_side"]] = sides.get(rec["gold_side"], 0) + 1
+        # SELECTIVITY: the share of this row's corpus the window covers.
+        # Precision asks "is the gold inside?"; selectivity asks "what ELSE is
+        # inside?". They are independent, and a boost needs BOTH — a range can
+        # be 100% precise and 100% non-selective at once ("this year" over a
+        # corpus that is entirely one year), which is a global boost wearing a
+        # why-code. This is the quantity G-E4a was missing.
+        corpus = row.get("corpus_dates") or []
+        if corpus:
+            inside = sum(1 for d in corpus if hit.start <= d <= hit.end)
+            rec["selectivity"] = inside / len(corpus)
+            rec["corpus_n"] = len(corpus)
         fired.append(rec)
 
     n = len(rows) or 1
@@ -621,13 +652,32 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
     # construction is broken and rarely-firing rules carry the average — and a
     # boost that is wrong on the expression people actually use is worse than
     # no boost, however good the mean looks.
-    by_rule: dict[str, dict[str, int]] = {}
+    by_rule: dict[str, dict[str, object]] = {}
+    sels: list[float] = []
     for rec in fired:
-        slot = by_rule.setdefault(rec["rule"], {"fired": 0, "scored": 0, "hits": 0})
+        slot = by_rule.setdefault(
+            rec["rule"], {"fired": 0, "scored": 0, "hits": 0, "sels": []})
         slot["fired"] += 1
         if "gold_covered" in rec:
             slot["scored"] += 1
             slot["hits"] += bool(rec["gold_covered"])
+        if "selectivity" in rec:
+            slot["sels"].append(rec["selectivity"])
+            sels.append(rec["selectivity"])
+    for slot in by_rule.values():
+        slot["selectivity"] = _median(slot.pop("sels"))
+    # The fires that could actually discriminate. This is the number criterion
+    # 1 should have been read against: a fire on a window covering most of the
+    # corpus is not a fire the feature gets credit for.
+    #
+    # BOTH tails are dead, and they look identical in a median. A window
+    # covering >20% boosts nearly everything; a window covering NOTHING boosts
+    # nothing and is a no-op fire, not a narrow one. Reporting "0% selectivity"
+    # as the good end is the trap this split exists to avoid — on a corpus
+    # where "three months ago" lands before the conversation started, 0% and
+    # 0% precision are the same event seen twice.
+    narrow = [s for s in sels if 0.0 < s <= _MAX_USEFUL_SELECTIVITY]
+    empty = [s for s in sels if s == 0.0]
     return {
         "name": name, "gating": gating, "n": len(rows),
         "fired": len(fired), "fire_rate": 100.0 * len(fired) / n,
@@ -644,6 +694,12 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
         "rows_with_gold": sum(1 for r in rows if r.get("gold_dates")),
         "by_category": by_cat,
         "by_rule": dict(sorted(by_rule.items(), key=lambda kv: -kv[1]["fired"])),
+        "selectivity": _median(sels) if sels else None,
+        "selectivity_n": len(sels),
+        "wide_ranges": len(sels) - len(narrow) - len(empty),
+        "empty_ranges": len(empty),
+        "selective_fired": len(narrow),
+        "selective_fire_rate": (100.0 * len(narrow) / n) if sels else None,
         "precision_n": scored,
         "precision": (100.0 * hits / scored) if scored else None,
         "rules": dict(sorted(rules.items(), key=lambda kv: -kv[1])),
@@ -717,6 +773,55 @@ def report(pops: list[dict], summary: dict, *, verbose: bool,
             print(f"\n  {p['name']} rules: {top}")
             print(f"  {p['name']} anchors: {p['reanchored']} re-anchored to a "
                   f"date stated in the text")
+            sel_rules = [(k, v) for k, v in (p.get("by_rule") or {}).items()
+                         if v.get("selectivity") is not None]
+            if sel_rules:
+                line = "  ".join(f"{k}={v['selectivity']:.0%} (n={v['fired']})"
+                                 for k, v in sel_rules)
+                print(f"  {p['name']} median selectivity by rule: {line}")
+                wide = [k for k, v in sel_rules
+                        if v["selectivity"] > _MAX_USEFUL_SELECTIVITY]
+                if wide:
+                    print(f"    ⚠ {', '.join(wide)} cover more than "
+                          f"{_MAX_USEFUL_SELECTIVITY:.0%} of the corpus at the "
+                          f"median. A boost on a window that\n      wide is a "
+                          f"GLOBAL boost with a why-code attached — precision "
+                          f"says the gold is inside,\n      selectivity says so "
+                          f"is everything else, and a range needs BOTH.")
+                sfr = p.get("selective_fire_rate")
+                if sfr is not None:
+                    print(f"  {p['name']} SELECTIVE fire rate: "
+                          f"{p['selective_fired']}/{p['n']} = {sfr:.1f}% "
+                          f"(of {p['selectivity_n']} fired ranges, "
+                          f"{p['wide_ranges']} too WIDE to discriminate and "
+                          f"{p['empty_ranges']} cover NOTHING)")
+                    if p["empty_ranges"] > p["selective_fired"] and p["gating"]:
+                        print("      ⚠ most fires resolve to a window with no "
+                              "corpus in it at all. A 0% selectivity is not "
+                              "the good\n        end of the scale — it is a "
+                              "no-op boost, and it reads identically to a "
+                              "narrow one in a median.")
+                    elif p["empty_ranges"] > p["selective_fired"]:
+                        # Do NOT carry the query-side reading over here. An
+                        # empty window on the CONTENT side is not a no-op: it
+                        # means the mentioned event predates the corpus, and a
+                        # `valid_at` written from it is still correct — just
+                        # unreachable from any in-corpus range. That is a
+                        # coverage question, not a discrimination one.
+                        print("      → on the content side an empty window is "
+                              "NOT a no-op: it dates an event that predates "
+                              "the corpus.\n        The `valid_at` write stays "
+                              "correct; what is unknown is whether any query "
+                              "ever resolves to\n        that period. Measure "
+                              "the ingest candidate against the QUERY range "
+                              "distribution, not corpus density.")
+                    if p["gating"] and sfr < 100 * _MIN_FIRE_RATE:
+                        print(f"      ⚠ criterion 1 was read against the RAW "
+                              f"fire rate ({p['fire_rate']:.1f}%). Against the "
+                              f"selective one it\n        reads "
+                              f"{sfr:.1f}% < {100 * _MIN_FIRE_RATE:.0f}% — the "
+                              f"feature does not clear its own gate once the "
+                              f"non-discriminative\n        fires are removed.")
             scored_rules = [(k, v) for k, v in (p.get("by_rule") or {}).items()
                             if v["scored"]]
             if scored_rules:
@@ -872,6 +977,18 @@ def report(pops: list[dict], summary: dict, *, verbose: bool,
                   f"relative dates EXIST in this corpus but not in its "
                   f"questions. That points at ingest-side normalization, NOT "
                   f"at E4's query-side boost.")
+            # The raw rate is what recommends the ingest candidate, so say
+            # immediately how much of it survives contact with the corpus —
+            # otherwise this line hands the successor an unearned green light.
+            empty_share = (best["empty_ranges"] / best["selectivity_n"]
+                           if best.get("selectivity_n") else None)
+            if empty_share is not None and empty_share > 0.3:
+                print(f"    → but {empty_share:.0%} of those windows contain no "
+                      f"other session at all. That does not sink the ingest\n"
+                      f"      candidate (an out-of-corpus `valid_at` is still a "
+                      f"correct write) — it means its front-run must ask what\n"
+                      f"      share of resolved mentions land where a QUERY "
+                      f"range can reach them, not just how many resolve.")
 
     checks = [
         (s["gate"]["fire_rate_ok"],

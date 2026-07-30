@@ -569,7 +569,12 @@ review)*
 > The `narrative_facts` artifact class that was to have absorbed this plan's
 > decision-grained granularity goal does not exist and will not be built:
 > extraction faithfulness measured 0.55–0.76 against a required 0.90, twice,
-> across a deliberate prompt revision.
+> across a deliberate prompt revision. *(Amended later the same day: revival
+> gate `G-F1b` — one pre-registered new-dreamer arm, Campaign E Step 1 — is now
+> authorized; if it passes and Step 4 builds, the subsumption comes back into
+> force. The warning below applies to G-F1b's candidate model identically:
+> Plan C's episode rewrite must clear the same faithfulness bar on THAT model
+> before it runs.)*
 >
 > **Read that as evidence about THIS plan too, not just about E1.** Plan C is
 > also a generative rewrite — it asks a model to re-cut episodes at decision
@@ -687,10 +692,10 @@ reads oracle labels, per-category LME deltas under ~±5pp are noise.*
 
 | Item | State | Verdict in one line |
 |---|---|---|
-| **E1 narrative facts** | **DEAD (G-F1 failed twice)** | Faithfulness 0.55–0.76 vs required 0.90; identical inventions reproduced under the one allowed prompt revision → model-side failure, banked by the pre-registered rule. `fact_probe.py` retained as the repo's faithfulness instrument; revival needs a NEW faithfulness result (e.g. a changed dream model), never a re-read of this one. |
+| **E1 narrative facts** | **SUSPENDED — `G-F1b` revival gate is the campaign's next LLM spend** | G-F1 failed twice ON deepseek-v4-flash (faithfulness 0.55–0.76 vs 0.90; identical inventions under the one allowed prompt revision → model-side). Judged the largest lever vs Hindsight (E0 thesis), so one new-dreamer arm is authorized: gate `G-F1b`, protocol at the end of Step 1. No third prompt, no model ladder; a G-F1b FAIL = dead for real. |
 | **E5 anaphora** | **SHIPPED ✓** | `hymem/query/coref.py`, on by default; 31/31 resolution, 0/12 no-harm. The hedge that paid. |
 | **E3 rerank A/B (M1+M2)** | **BUILT, UNRUN — the only live scored item** | Blocked on environment only: M1 needs an API key for the LLM arm; M2 needs sentence-transformers (torch OOM on box). Adoption stays Step 6. |
-| **E6 supersession over facts** | **CANCELLED with E1** | Target artifact doesn't exist; at E1's faithfulness it was the amplifier of fabrication, not a feature. |
+| **E6 supersession over facts** | **SUSPENDED with E1** | Revives automatically iff G-F1b → Step 4 land. At v4-flash's faithfulness it was the amplifier of fabrication, not a feature — which is exactly why it must never precede a faithfulness pass. |
 | **E4 temporal boost (query-side)** | **NOT BUILT — closed by decomposition** | LME gate technically PASSED (8.8% / 90.9% / 0) but the same two rules (`calendar_last`, `n_units_ago`) fail in BOTH corpora on the speech-time/event-time axis; revision budget spent. Carry-forward = ingest-side `valid_at` normalization, which needs its own front-run **with a selectivity criterion** (free, dataset-side). |
 | **E2 per-entity observations** | **DORMANT (double-blocked)** | Needs flip-watch green (currently red AND untestable — box store quiescent since ~Jul 12) AND a new faithfulness result clearing `fact_probe.py`'s bar. Not schedulable as pending work. |
 | **E7 usage feedback** | **OPEN, ungated** | Artifact-agnostic long game; no front-run designed yet. |
@@ -699,10 +704,13 @@ reads oracle labels, per-category LME deltas under ~±5pp are noise.*
 per-rule-precision + small-n-caveat instrument additions in
 `benchmarks/reldate_probe.py`, and their tests. Suite 936 green.
 
-**Next actions, in order:** (1) commit the E4 verdict + instrument work;
-(2) run the free selectivity measurement for the ingest-side E4 candidate;
-(3) unblock E3's environment (API key + torch) and run M1/M2, then decide
-Step 6 adoption.
+**Next actions, in order:** (1) commit the E4 verdict + instrument work + the
+G-F1b protocol; (2) run the free selectivity measurement for the ingest-side
+E4 candidate (in progress); (3) pre-register the G-F1b candidate model and run
+the gate on the box (~500 calls + hand-score); (4) unblock E3 — CPU-only torch
+wheels (`--index-url https://download.pytorch.org/whl/cpu`) unblock BOTH M1 and
+M2 (M1 is CE-vs-LLM, so it needs the cross-encoder too; only its LLM arm needs
+an API key) — run M1/M2, then decide Step 6 adoption.
 
 ### E0. Evidence base and the six review constraints
 
@@ -754,8 +762,10 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 
 ### Step 1 — E1 front-run probe (`benchmarks/fact_probe.py`)
 
-> **BUILT + RUN 2026-07-30 → G-F1 FAILED, E1 BANKED DEAD** (verdict at the end of
-> this block; the probe itself is retained as the repo's faithfulness instrument).
+> **BUILT + RUN 2026-07-30 → G-F1 FAILED, E1 BANKED DEAD — then revival gate
+> `G-F1b` OPENED later the same day** (verdict AND the G-F1b protocol at the end
+> of this block; the probe itself is retained as the repo's faithfulness
+> instrument and is the instrument G-F1b reuses).
 >
 > **BUILT 2026-07-30, UNRUN** (no LLM spend yet, and no banked source run on this
 > box — `~/.hermes/benchmarks/` is empty here, so the gate must be executed on the
@@ -918,6 +928,47 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 > future generative-write proposal (E2 observations included) must clear the same
 > bar before it writes to the store. The V1/V2 dumps are the fixture. Cost of the
 > whole G-F1 decision: ~1,000 extraction calls, one dead build avoided.
+>
+> ---
+>
+> **REVIVAL GATE `G-F1b` — OPENED 2026-07-30 (user decision): change the dream
+> model and re-run the gate.** Rationale on record: the narrative-fact tier is
+> judged the **largest available lever against Hindsight** — the E0 thesis says
+> the middle-granularity unit is the one structural thing HyMem lacks, and
+> nothing else in the campaign addresses it. So E1 is **SUSPENDED, not dead**,
+> pending exactly one new-model arm. This is what the "revival requires a NEW
+> faithfulness result" clause anticipates — G-F1 discriminated a *model-side*
+> failure, so a model change is the responsive action, not score-fitting.
+> Protocol, fixed in advance:
+>
+> 1. **Gate first, migration second.** The gate run is identical whether the swap
+>    ends up wholesale (new project dreamer) or scoped (a facts-pass-only model
+>    via the pluggable `LLMClient`), so no migration decision is needed before
+>    the result exists. A wholesale swap is a separate migration event with the
+>    deepseek-precedent price tag (full re-pair, new frozen baselines, one-time
+>    RAPTOR refusion) — priced on its own merits, not smuggled in under E1.
+> 2. **ONE pre-registered candidate, chosen on grounds independent of this
+>    gate.** Natural candidate: `gpt-oss-120b` — already the project's P0
+>    reader-parity model and independent judge, so it is a model already trusted
+>    and paid for; no judge circularity because faithfulness is HAND-scored.
+>    Iterating models until one clears is the multiple-comparisons version of
+>    score-fitting and is not permitted.
+> 3. **The run:** `fact_probe.py --prompt-version v2 --model <candidate>
+>    --max-questions 10` on the same stratified gold-bearing sample (~500
+>    extraction calls; `--cost` first to confirm), hand-scored strict against the
+>    same 0.90 bar. No new plumbing needed — `--model`/`--api-key`/
+>    `--extra-body` already exist.
+> 4. **Borderline rule:** at n≈40 facts the hand-score has real width (V2's own
+>    read spanned 21–29/38). A result in ~0.85–0.95 is EXPAND-THE-SAMPLE, not a
+>    verdict in either direction.
+> 5. **Read the truncation-tail mode separately:** does the candidate stop at
+>    the char-cap cut or confabulate past it (the sessions-3/10 pattern)? A model
+>    that stops cleanly moots the secondary failure mode; one that doesn't
+>    re-opens the cap-vs-cost trade.
+> 6. **PASS** reopens Step 4 as specced (E6 behind it) and supplies the
+>    faithfulness result E2/Plan C are gated on (the flip-watch still blocks E2
+>    independently). **FAIL** banks E1 dead on a second model class — record and
+>    stop; at that point the finding is about the task, not the model.
 
 **Idea.** Extract narrative facts with a draft prompt from the haystacks of the
 ~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and
@@ -1077,16 +1128,17 @@ changes.
 
 ---
 
-### Step 4 — E1 build: the narrative-facts artifact ~~(gated on G-F1)~~ CANCELLED
+### Step 4 — E1 build: the narrative-facts artifact ~~(gated on G-F1)~~ SUSPENDED, re-gated on G-F1b
 
-> **CANCELLED 2026-07-30 — G-F1 FAILED TWICE. Do not build this.** Faithfulness
-> 0.55–0.76 vs a required 0.90, with the same inventions reproducing across the
-> one allowed prompt revision. Full verdict and its reasoning: Step 1 above.
-> The spec below is kept verbatim as the record of what was gated and why the
-> gate was worth running — **it is not a backlog item.** Reviving any part of it
-> requires a NEW faithfulness result, not a re-reading of this one. E6
-> (supersession over facts) is cancelled with it; E2/E4/E7 must be re-specified
-> over an artifact that exists.
+> **CANCELLED 2026-07-30 — G-F1 FAILED TWICE on deepseek-v4-flash. RE-GATED the
+> same day on `G-F1b` (Step 1): SUSPENDED, builds iff G-F1b passes. Do not build
+> before that.** Faithfulness 0.55–0.76 vs a required 0.90, with the same
+> inventions reproducing across the one allowed prompt revision. Full verdict
+> and its reasoning: Step 1 above. The spec below is kept verbatim and becomes
+> the build plan again ONLY on a G-F1b PASS — until then **it is not a backlog
+> item.** E6 (supersession over facts) is suspended with it; E4's verdict is
+> independent (its query-side closed on its own evidence); E2 remains gated on
+> the flip-watch plus a faithfulness result, which a G-F1b PASS would supply.
 
 **Idea.** Dream-time extraction of self-contained narrative facts, stored
 immutably (append-only, version-tagged), served as an additive retrieval tier
@@ -1199,11 +1251,12 @@ append-only + UNIQUE).
 
 ---
 
-### Step 5 — scored confirmation (box; protocol, not a build) — CANCELLED
+### Step 5 — scored confirmation (box; protocol, not a build) — SUSPENDED with Step 4
 
-> **CANCELLED 2026-07-30 with Step 4 — nothing to confirm.** The protocol below
-> is retained because Step 6 (E3 adoption) reuses its run discipline for the one
-> shared confirmation run it now carries itself.
+> **CANCELLED 2026-07-30 with Step 4; SUSPENDED the same day when `G-F1b`
+> opened — reinstated as written iff Step 4 builds.** Until then, Step 6 (E3
+> adoption) reuses this run discipline for the one shared confirmation run it
+> carries itself.
 
 - **LoCoMo, n=800, `--fresh` (core changed → stores rebuilt), seed 0, canonical
   3×/24k.** Pre-registered reads, in order: (a) mechanism — facts rendered in
@@ -1491,6 +1544,62 @@ not-in-anchor assertion.
 > wrong and rare rules carry the mean), and a small-n caveat on the
 > one-directional warning (4/0 arises by chance 12% of the time; 6/0 is the
 > p<0.05 point). Suite 936.
+>
+> ---
+>
+> **SELECTIVITY 2026-07-30 — the measurement the gate was missing, and it
+> CLOSES E4's query side on arithmetic rather than on judgement.** Built into
+> `reldate_probe.py` (loaders now carry `corpus_dates`; no second script, no
+> JSON round-trip, `normalize_date` shared). For each fired range: what share
+> of that row's corpus falls inside the window.
+>
+> **Correction to the block above, forced by the per-rule denominators.** With
+> `n` per rule now known, LME per-rule precision is `within_last_n` 19/19,
+> `n_units_ago` 13/14 (93%), `calendar_last` 3/6 (50%), rest 5/5. So "the same
+> two rules fail in both corpora" was half wrong: **`calendar_last` fails in
+> both (33% / 50%), but `n_units_ago` is 0/9 on LoCoMo and 13/14 on LME.** The
+> cross-corpus contradiction sits on ONE rule, not two.
+>
+> That rule is also the only one that was ever going to justify the feature,
+> and selectivity is what settles it. LME medians: `within_last_n` 100%,
+> `calendar_this` 100%, `since_n_units_ago` 100%, `before_day_word` 100%;
+> `calendar_last` 14%, `n_units_ago` 10%. **Every precise rule is
+> non-selective and every selective rule is imprecise.** 27 of 44 fired ranges
+> (61%) cover >20% of their haystack; 22 cover 100%.
+>
+> **Precision and selectivity are independent, and a boost needs both.** A
+> window can be 100% precise and 100% non-selective at once — "this year" over
+> a corpus that is entirely one year is perfectly precise and boosts the whole
+> store. G-E4a measured only the first, so it graded a global boost as a
+> retrieval signal.
+>
+> **BOTH TAILS ARE DEAD, and a median cannot tell them apart** — this is the
+> refinement the standalone script did not have. 0% selectivity is not the good
+> end of the scale: a window covering NOTHING boosts nothing. On LoCoMo
+> questions 13 of 21 fires are empty, which is the same event as `n_units_ago`
+> scoring 0/9 precision — the window lands before the conversation starts. The
+> probe now splits fires into narrow / wide / **empty** and counts only
+> `0 < selectivity ≤ 20%` as a fire the feature gets credit for.
+>
+> **The arithmetic that closes it.** Selective fire rate = narrow fires ÷ n:
+> **LoCoMo 5/1986 = 0.3%** (raw 1.1%); **LME 17/500 ≈ 3.4%** by the 61%-wide
+> figure, or 4.0% if only the four 100%-median rules are dropped. Both routes
+> land **below the pre-registered 5% criterion 1**. E4 does not clear its own
+> gate once non-discriminating fires are removed — no judgement call, no
+> retro-fitted threshold, just criterion 1 read against fires that could
+> actually reorder something. The probe prints this counterfactual explicitly
+> rather than silently re-scoring G-E4a.
+>
+> **The ingest-side carry-forward is NOT killed by this — do not carry the
+> query-side reading over.** LoCoMo turns: raw 5.2% → 1.8% "selective", with
+> 192 of 307 windows empty. But an empty window on the CONTENT side means the
+> mentioned event predates the corpus, and a `valid_at` written from it is
+> still a correct write; it is a coverage question, not a discrimination one.
+> **What its front-run must ask: what share of resolved mentions land where a
+> QUERY range can reach them** — i.e. measured against the query range
+> distribution, not corpus density. The probe now prints that distinction on
+> non-gating populations so the 5.2% cannot be read as a green light.
+> Suite 940.
 
 (a) New `hymem/query/reldates.py`: stdlib-only
 relative-date resolver, EN+NL (yesterday, N days/weeks/months ago, last
@@ -1505,12 +1614,14 @@ invariant test). **Tests:** resolver matrix EN+NL with fixed anchor; boost-only
 semantics; no-range query → byte-identical path; why codes; TR chronology
 unchanged.
 
-**~~E6 supersession over facts~~ — CANCELLED 2026-07-30 with E1** (its target
-artifact does not exist). Worth keeping the reason visible: supersession is the
+**~~E6 supersession over facts~~ — CANCELLED 2026-07-30 with E1; SUSPENDED the
+same day when `G-F1b` opened** (revives automatically iff G-F1b → Step 4 land).
+Worth keeping the reason visible: supersession is the
 mechanism that would have *defended* a fabricated fact — closing the older,
 correct row in favour of a newer invented one — so at 0.55–0.76 faithfulness E6
-was not merely unbuildable, it was the amplifier. Spec retained below only as
-the record of the intended design.
+was not merely unbuildable, it was the amplifier. That is also why E6 must
+never land before a faithfulness PASS on the model actually doing the
+extraction. Spec retained below as the intended design.
 
 **E6 supersession over facts** (after Step 4). Extend the
 `value_supersession.py` classify→group→compare pipeline to `narrative_facts`:
@@ -1538,17 +1649,25 @@ unused.
 
 | # | Item | Depends on | LLM cost | Gate |
 |---|------|-----------|----------|------|
-| 1 | E1 probe (`fact_probe.py`) — **RUN, VERDICT IN** | — | ~1,000 calls (v1 + v2) | **G-F1 FAILED** — faithfulness 0.55–0.76 vs 0.90, twice ✗ |
+| 1 | E1 probe (`fact_probe.py`) — **RUN, VERDICT IN** | — | ~1,000 calls (v1 + v2) | **G-F1 FAILED on v4-flash** — faithfulness 0.55–0.76 vs 0.90, twice ✗ |
+| 1b | **`G-F1b` revival gate — NEXT LLM SPEND** (one new-dreamer arm; protocol in Step 1) | ONE pre-registered candidate model (natural: gpt-oss-120b) | ~500 calls + hand-score | same criteria as G-F1 (faithfulness ≥0.90 strict); 0.85–0.95 at n≈40 → expand sample; **FAIL = E1 dead for real** |
 | 2 | E5 anaphora — **BUILT, GATE PASSED, SHIPPED** | — (parallel day one) | none (heuristic) | 31-item eval **100%**, no-harm **0/12** ✓ |
 | 3 | E3 measurements M1+M2 — **BUILT, UNRUN** | — (parallel, offline) | M1 LLM arm only | M1/M2 pre-registered parity |
-| ~~4~~ | ~~E1 build~~ — **CANCELLED** (G-F1) | — | — | — |
-| ~~5~~ | ~~Scored confirmation~~ — **CANCELLED** (nothing to confirm) | — | — | — |
-| 6 | E3 adoption (one rebaseline) | Step 3 only (Step 5 gone) | ≤1 shared run | offline parity held; baselines re-frozen |
-| 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a new faithfulness result** | capped per dream | must clear `fact_probe.py`'s bar first |
-| 8 | E4 — revision spent, **query-side NOT built**; carry-forward is the ingest-side `valid_at` candidate, which needs its own front-run incl. selectivity (E7 open; **E6 cancelled with E1**) | selectivity measurement (free) | none spent (probe is LLM-free) | LoCoMo 1.1%/23.8% ✗; LME 8.8% ✓ / 90.9% ✓ = gate PASS, **but all 4 misses one-directional and the same 2 rules fail in both corpora** |
+| 4 | E1 build — **SUSPENDED** (spec retained verbatim) | **G-F1b PASS** | build only | builds iff G-F1b ✓ |
+| 5 | Scored confirmation — **SUSPENDED with Step 4** | Step 4 | box runs | reinstated as written iff Step 4 builds |
+| 6 | E3 adoption (one rebaseline) | Step 3 only (Step 5 suspended) | ≤1 shared run | offline parity held; baselines re-frozen |
+| 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a faithfulness result (a G-F1b PASS supplies it)** | capped per dream | must clear `fact_probe.py`'s bar first |
+| 8 | E4 — **query-side CLOSED on arithmetic**, not built; carry-forward is the ingest-side `valid_at` candidate, needing a *coverage* front-run vs the query range distribution (E7 open; **E6 suspended with E1** — revives iff G-F1b → Step 4 land) | ingest-side coverage front-run (free) | none spent (probe is LLM-free) | raw gate: LoCoMo 1.1%/23.8% ✗, LME 8.8%/90.9% ✓ — **but SELECTIVE fire rate 0.3% / ~3.4%, both under criterion 1**; every precise rule non-selective, both tails dead |
 
-**Post-G-F1 campaign state.** Campaign E's generative half is closed; its
-retrieval half is what remains. Live work: **E3** (M1 needs an API key, M2
+**Post-G-F1 campaign state (amended 2026-07-30 when `G-F1b` opened).**
+Campaign E's generative half is **SUSPENDED, not closed**: G-F1's verdict is
+conditional on deepseek-v4-flash as extractor, and one new-dreamer arm is
+authorized on the recorded judgment that the narrative-fact tier is the largest
+available lever against Hindsight (the E0 thesis — no other campaign item
+addresses the middle-granularity gap). **G-F1b is the campaign's next LLM
+spend**; a PASS re-activates Steps 4→5 and supplies E2's faithfulness
+prerequisite; a FAIL banks E1 dead on a second model class — record and stop.
+Alongside it: **E3** (M1 needs an API key, M2
 blocked on the torch OOM) is now the only unblocked scored item, and it is
 independent of everything E1 touched — it reorders a pool retrieval already
 built and writes nothing. ~~**E4** (temporal-range boost) was specified over facts' `fact_date` but is

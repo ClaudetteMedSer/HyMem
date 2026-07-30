@@ -15,7 +15,7 @@ resolver parse dates" but the three ways a gate instrument can lie:
 from __future__ import annotations
 
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -159,6 +159,57 @@ def test_miss_direction_separates_axis_mismatch_from_resolver_error():
     assert res["miss_sides"] == {"after": 2}
 
 
+def test_a_range_can_be_perfectly_precise_and_perfectly_useless():
+    """The hole G-E4a had. Precision asks whether the gold is inside the window;
+    selectivity asks what ELSE is. 'this year' over a corpus that is entirely one
+    year scores 100% on the first and boosts every item in the store."""
+    corpus = [f"2024-{m:02d}-10" for m in range(1, 13)]
+    rows = [{"id": "a", "text": "what did I do this year?", "anchor": "2024-05-30",
+             "gold_dates": ["2024-03-10"], "corpus_dates": corpus}]
+    res = measure(rows, name="t", gating=True)
+    assert res["precision"] == 100.0
+    assert res["rows_fired"][0]["selectivity"] == 1.0
+    assert res["selective_fired"] == 0 and res["wide_ranges"] == 1
+
+
+def test_an_empty_window_is_not_the_good_end_of_the_selectivity_scale():
+    """0% selectivity reads as 'narrow' in a median and is really 'boosts
+    nothing'. Both tails are dead and they must not be pooled."""
+    corpus = [(date(2024, 1, 1) + timedelta(days=4 * i)).isoformat()
+              for i in range(40)]
+    rows = [
+        # resolves to 2022 — before anything in the corpus exists.
+        {"id": "a", "text": "what happened two years ago?",
+         "anchor": "2024-05-30", "gold_dates": [], "corpus_dates": corpus},
+        # resolves inside the corpus and covers 5% of it.
+        {"id": "b", "text": "what happened four weeks ago?",
+         "anchor": "2024-05-30", "gold_dates": [], "corpus_dates": corpus},
+    ]
+    res = measure(rows, name="t", gating=True)
+    assert res["empty_ranges"] == 1
+    assert res["selective_fired"] == 1
+    assert res["selective_fire_rate"] == 50.0
+
+
+def test_selectivity_counts_repeated_corpus_dates_separately():
+    """Two sessions on one date are two things a boost would lift. De-duplicating
+    the corpus flatters a wide window."""
+    rows = [{"id": "a", "text": "what did I do last week?", "anchor": "2024-05-30",
+             "gold_dates": [],
+             "corpus_dates": ["2024-05-22", "2024-05-22", "2024-05-22",
+                              "2024-01-01"]}]
+    res = measure(rows, name="t", gating=True)
+    assert res["rows_fired"][0]["selectivity"] == 0.75
+
+
+def test_selectivity_is_absent_when_the_corpus_is_unknown():
+    rows = [{"id": "a", "text": "what did I do last week?",
+             "anchor": "2024-05-30", "gold_dates": []}]
+    res = measure(rows, name="t", gating=True)
+    assert "selectivity" not in res["rows_fired"][0]
+    assert res["selectivity"] is None and res["selective_fire_rate"] is None
+
+
 def test_per_rule_precision_exposes_an_average_over_a_broken_rule():
     """An aggregate can clear 90% while the single most common construction is
     wrong, with rarely-firing rules carrying the mean. A boost that misses on the
@@ -175,7 +226,8 @@ def test_per_rule_precision_exposes_an_average_over_a_broken_rule():
          "anchor": "2024-05-30", "gold_dates": ["2024-05-09"]},
     ]
     by_rule = measure(rows, name="t", gating=True)["by_rule"]
-    assert by_rule["calendar_last"] == {"fired": 2, "scored": 2, "hits": 0}
+    assert by_rule["calendar_last"]["scored"] == 2
+    assert by_rule["calendar_last"]["hits"] == 0
     assert by_rule["n_units_ago"]["hits"] == 1
 
 
@@ -183,7 +235,8 @@ def test_per_rule_precision_skips_rules_with_no_scorable_gold():
     rows = [{"id": "a", "text": "what did I finish last month?",
              "anchor": "2024-05-30", "gold_dates": []}]
     by_rule = measure(rows, name="t", gating=True)["by_rule"]
-    assert by_rule["calendar_last"] == {"fired": 1, "scored": 0, "hits": 0}
+    assert by_rule["calendar_last"]["fired"] == 1
+    assert by_rule["calendar_last"]["scored"] == 0
 
 
 def test_future_windows_are_counted_but_never_fired():
