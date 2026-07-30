@@ -205,11 +205,22 @@ _VAGUE = (
 class RangeHit:
     """A resolved [start, end] window plus the rule and surface that produced it.
     `rule` is what the why-code would carry in production, so a probe row is
-    directly readable as the boost's justification."""
+    directly readable as the boost's justification.
+
+    `prospective` marks a window that lies ahead of the anchor ("tonight", "next
+    week"). It is resolved but must NOT be boosted on: stored content is past, so
+    the window can never match, and the fire is pure cost. The resolver reports
+    it rather than returning None so it can be counted as its own category — a
+    prospective question is neither a resolvable retrieval range nor a
+    marker-free control, and silently sorting it into either one is how the
+    2026-07-30 LME control read as clean while two prospective questions sat in
+    the fired bucket.
+    """
     start: str
     end: str
     rule: str
     surface: str
+    prospective: bool = False
 
 
 def _win(anchor: date, *, offset_days: int, tol: int) -> tuple[date, date]:
@@ -247,6 +258,57 @@ def _num(digits: str | None, word: str | None) -> int:
     return _NUMBERS.get((word or "").lower(), 1)
 
 
+# Day words that point AHEAD even though they share the anchor's date. "Tonight"
+# is the evening to come; "today" is genuinely ambiguous ("what did I log
+# today?") and is deliberately left retrospective.
+_PROSPECTIVE_DAY_WORDS = frozenset({"tonight", "vanavond", "tomorrow", "morgen"})
+
+# Directional qualifiers turn a POINT expression into a HALF-OPEN interval.
+# "before today" does not mean today; "since three weeks ago" does not mean that
+# week. Ignoring the qualifier emits a point window where the text denotes an
+# interval — the defect class found in the 2026-07-30 LME misses.
+_BACKWARD_CUES = ("before", "prior to", "up to", "up until", "until", "till",
+                  "earlier than", "voor ", "vóór ", "tot ")
+# NOTE: bare "from" is deliberately absent. "the plan from last month" means
+# *of* last month, not *since* it — including it turned three ordinary lookups
+# into open-ended ranges, one of which then covered its gold by accident and
+# inflated precision. A cue that widens a window can only ever help the score,
+# so it has to be held to a higher bar than one that narrows it.
+_FORWARD_CUES = ("since", "ever since", "after", "sinds", "vanaf", "na ")
+# An open-backward window still needs a concrete lower bound for a string
+# comparison; nothing in a conversation store predates this.
+_OPEN_START = "0001-01-01"
+# How far back of the matched span to look for a qualifier. "since I started
+# writing again three weeks ago" puts 30 characters between the two.
+_CUE_WINDOW = 40
+
+
+def _directional(low: str, match: re.Match) -> str:
+    """The directional qualifier governing the expression at `match`, if any.
+
+    Looks only at the text BEFORE the span, within a bounded window, so a cue
+    belonging to a later clause cannot capture this one.
+    """
+    prefix = low[max(0, match.start() - _CUE_WINDOW):match.start()]
+    back = max((prefix.rfind(c) for c in _BACKWARD_CUES), default=-1)
+    fwd = max((prefix.rfind(c) for c in _FORWARD_CUES), default=-1)
+    if back < 0 and fwd < 0:
+        return ""
+    # Whichever cue sits closest to the expression governs it.
+    return "before" if back > fwd else "since"
+
+
+def _apply_direction(hit: RangeHit, anchor: date, direction: str) -> RangeHit:
+    if direction == "before":
+        # Everything up to the window's end. A prospective base becomes
+        # retrospective ("before tomorrow" is a past-facing range).
+        return RangeHit(_OPEN_START, hit.end, f"before_{hit.rule}", hit.surface)
+    if direction == "since":
+        end = max(hit.end, anchor.isoformat())
+        return RangeHit(hit.start, end, f"since_{hit.rule}", hit.surface)
+    return hit
+
+
 def _absolute_context(low: str, match: re.Match) -> bool:
     """True when a relative-looking span is actually part of an ABSOLUTE
     construction ("the last week of August 2023")."""
@@ -275,14 +337,16 @@ def resolve_range(text: str, anchor: date) -> RangeHit | None:
         n = _num(m.group(1), m.group(2))
         days, tol = _UNITS[m.group(3)]
         s, e = _win(anchor, offset_days=-n * days, tol=tol)
-        return RangeHit(s.isoformat(), e.isoformat(), "n_units_ago", m.group(0))
+        return _finish(RangeHit(s.isoformat(), e.isoformat(), "n_units_ago",
+                                m.group(0)), anchor, low, m)
 
     m = _WITHIN.search(low)
     if m and not _absolute_context(low, m):
         n = _num(m.group(1), m.group(2))
         days, _tol = _UNITS[m.group(3)]
-        return RangeHit((anchor - timedelta(days=n * days)).isoformat(),
-                        anchor.isoformat(), "within_last_n", m.group(0))
+        return _finish(RangeHit((anchor - timedelta(days=n * days)).isoformat(),
+                                anchor.isoformat(), "within_last_n",
+                                m.group(0)), anchor, low, m)
 
     m = _CALENDAR.search(low)
     if m and not _absolute_context(low, m):
@@ -290,16 +354,34 @@ def resolve_range(text: str, anchor: date) -> RangeHit | None:
         direction = 1 if word in ("next", "volgende", "komende") else (
             0 if word in ("this", "deze", "dit") else -1)
         s, e = _calendar_span(anchor, unit, direction)
-        return RangeHit(s.isoformat(), e.isoformat(),
-                        f"calendar_{'next' if direction > 0 else 'this' if direction == 0 else 'last'}",
-                        m.group(0))
+        return _finish(RangeHit(
+            s.isoformat(), e.isoformat(),
+            f"calendar_{'next' if direction > 0 else 'this' if direction == 0 else 'last'}",
+            m.group(0)), anchor, low, m)
 
     m = _DAY_WORD_RE.search(low)
     if m:
-        off = _DAY_WORDS[m.group(1)]
-        s, e = _win(anchor, offset_days=off, tol=0)
-        return RangeHit(s.isoformat(), e.isoformat(), "day_word", m.group(1))
+        word = m.group(1)
+        s, e = _win(anchor, offset_days=_DAY_WORDS[word], tol=0)
+        return _finish(RangeHit(s.isoformat(), e.isoformat(), "day_word", word),
+                       anchor, low, m, prospective_word=word in _PROSPECTIVE_DAY_WORDS)
     return None
+
+
+def _finish(hit: RangeHit, anchor: date, low: str, match: re.Match,
+            *, prospective_word: bool = False) -> RangeHit:
+    """Apply the directional qualifier, then classify the result as prospective.
+
+    Order matters: the qualifier is applied FIRST, because it can flip a
+    prospective base into a retrospective range ("before tomorrow" asks about
+    the past). Classifying first would suppress a question the qualifier makes
+    perfectly answerable.
+    """
+    direction = _directional(low, match)
+    hit = _apply_direction(hit, anchor, direction)
+    prospective = (hit.start > anchor.isoformat()
+                   or (prospective_word and not direction))
+    return RangeHit(hit.start, hit.end, hit.rule, hit.surface, prospective)
 
 
 def effective_anchor(text: str, default: date) -> tuple[date, bool]:
@@ -465,10 +547,11 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
     """Score one population. Gold is applied strictly AFTER resolution."""
     fired: list[dict] = []
     vague_only: list[dict] = []
+    prospective: list[dict] = []
     control_fires: list[dict] = []
     n_control = 0
     hits = misses = 0
-    n_reanchored = n_future = 0
+    n_reanchored = 0
     rules: dict[str, int] = {}
     sides: dict[str, int] = {}
     # Fire rate by question category. A rate carried entirely by one
@@ -486,6 +569,14 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
         slot["n"] += 1
         slot["fired"] += hit is not None
         vague = vague_markers(row["text"])
+        if hit is not None and hit.prospective:
+            # Resolved, but forward-facing: no stored past item can fall in the
+            # window, so boosting on it is cost with no upside. Counted as its
+            # OWN category — not a fire (it would only ever be a miss) and not a
+            # control row (the question does carry temporal language).
+            prospective.append({**row, "start": hit.start, "end": hit.end,
+                                "rule": hit.rule, "surface": hit.surface})
+            continue
         if hit is None:
             if vague:
                 vague_only.append({**row, "markers": vague})
@@ -494,15 +585,9 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
             continue
         rules[hit.rule] = rules.get(hit.rule, 0) + 1
         n_reanchored += overridden
-        # A window entirely AFTER the anchor ("next month") cannot contain a
-        # stored past event. Counted, not dropped: it is a fire, and a boost
-        # that can never match anything is a cost with no upside — a fact about
-        # the feature, not a resolver error.
-        future = hit.start > anchor.isoformat()
-        n_future += future
         rec = {**row, "start": hit.start, "end": hit.end, "rule": hit.rule,
                "surface": hit.surface, "anchor_used": anchor.isoformat(),
-               "reanchored": overridden, "future": future}
+               "reanchored": overridden}
         # No temporal marker, yet the resolver fired → a false fire by
         # construction. `has_temporal_language` includes every resolvable form,
         # so this can only trip when the two disagree.
@@ -537,9 +622,11 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
         "fired": len(fired), "fire_rate": 100.0 * len(fired) / n,
         "vague_only": len(vague_only),
         "vague_rate": 100.0 * len(vague_only) / n,
-        "any_temporal": len(fired) + len(vague_only),
+        "prospective": len(prospective),
+        "prospective_rate": 100.0 * len(prospective) / n,
+        "any_temporal": len(fired) + len(vague_only) + len(prospective),
         "n_control": n_control, "control_fires": len(control_fires),
-        "reanchored": n_reanchored, "future_ranges": n_future,
+        "reanchored": n_reanchored,
         "miss_sides": sides,
         # How many rows carry gold AT ALL — separates "this corpus has no dated
         # gold" from "the loader dropped it", which look identical downstream.
@@ -549,6 +636,7 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
         "precision": (100.0 * hits / scored) if scored else None,
         "rules": dict(sorted(rules.items(), key=lambda kv: -kv[1])),
         "rows_fired": fired, "rows_vague": vague_only,
+        "rows_prospective": prospective,
         "rows_control_fires": control_fires,
     }
 
@@ -596,10 +684,11 @@ def summarize(pops: list[dict]) -> dict:
     }
 
 
-def report(pops: list[dict], summary: dict, *, verbose: bool) -> bool:
+def report(pops: list[dict], summary: dict, *, verbose: bool,
+           limit: int = 40) -> bool:
     print("\n=== E4 front-run — relative-date resolution ===\n")
     print(f"{'population':<20}{'n':>7}{'fired':>8}{'rate':>8}"
-          f"{'vague':>8}{'vague%':>8}{'prec':>8}{'ctl':>6}")
+          f"{'vague':>8}{'prosp':>7}{'prec':>8}{'ctl':>6}")
     for p in pops:
         if not p["n"]:
             continue
@@ -607,15 +696,15 @@ def report(pops: list[dict], summary: dict, *, verbose: bool) -> bool:
         tag = "" if p["gating"] else "  (non-gating)"
         print(f"{p['name']:<20}{p['n']:>7}{p['fired']:>8}"
               f"{p['fire_rate']:>7.1f}%{p['vague_only']:>8}"
-              f"{p['vague_rate']:>7.1f}%{prec:>8}{p['control_fires']:>6}{tag}")
+              f"{p.get('prospective', 0):>7}{prec:>8}"
+              f"{p['control_fires']:>6}{tag}")
 
     for p in pops:
         if p["rules"]:
             top = ", ".join(f"{k}={v}" for k, v in list(p["rules"].items())[:6])
             print(f"\n  {p['name']} rules: {top}")
             print(f"  {p['name']} anchors: {p['reanchored']} re-anchored to a "
-                  f"date stated in the text; {p['future_ranges']} future "
-                  f"windows (can never match stored past events)")
+                  f"date stated in the text")
             cats = {k: v for k, v in (p.get("by_category") or {}).items()
                     if v["n"] >= 10 and k != "?"}
             if len(cats) > 1:
@@ -650,13 +739,36 @@ def report(pops: list[dict], summary: dict, *, verbose: bool) -> bool:
                           "      arithmetic, wrong axis — that is a bi-temporal "
                           "gap, not a resolver bug, and no amount of\n"
                           "      resolver work closes it.")
+                elif after + before:
+                    # Said explicitly, because the ABSENCE of the warning above
+                    # is not self-interpreting: a reader who has seen a
+                    # one-directional corpus will carry that diagnosis over to
+                    # a balanced one unless the balanced case names itself.
+                    print("    → misses are BALANCED, so this is NOT the "
+                          "speech-time/event-time axis mismatch. Scattered "
+                          "misses mean\n      the resolver is inaccurate on "
+                          "specific expressions — a different failure with a "
+                          "different (and\n      fixable) remedy. Read them: "
+                          "--verbose.")
 
     if verbose:
         for p in pops:
             if not p["rows_fired"]:
                 continue
             print(f"\n── {p['name']}: fired ({len(p['rows_fired'])}) ──")
-            for r in p["rows_fired"][:40]:
+            # MISSES ARE NEVER TRUNCATED. They are the evidence the revision
+            # decision is made from, and a silently capped table hides some of
+            # them behind a row count that still reports the full total — the
+            # 2026-07-30 LME run displayed 8 of 9 misses because `fired` (47)
+            # overran a flat [:40] cap, and the gap was read as a counting bug.
+            missed = [r for r in p["rows_fired"] if r.get("gold_covered") is False]
+            rest = [r for r in p["rows_fired"] if r.get("gold_covered") is not False]
+            shown = missed + rest[:max(0, limit - len(missed))]
+            hidden = len(p["rows_fired"]) - len(shown)
+            if hidden:
+                print(f"  ({hidden} covered/unscored rows hidden; all "
+                      f"{len(missed)} misses shown — raise --limit for the rest)")
+            for r in shown:
                 mark = "" if "gold_covered" not in r else (
                     " ✓" if r["gold_covered"] else " ✗")
                 print(f"  [{r['rule']:<16}] {r['start']}..{r['end']}{mark}"
@@ -665,7 +777,7 @@ def report(pops: list[dict], summary: dict, *, verbose: bool) -> bool:
             if p["rows_vague"]:
                 print(f"\n── {p['name']}: vague, unresolvable "
                       f"({len(p['rows_vague'])}) ──")
-                for r in p["rows_vague"][:20]:
+                for r in p["rows_vague"][:limit]:
                     print(f"  {','.join(r['markers']):<24} {r['text'][:90]}")
         for p in pops:
             for r in p["rows_control_fires"]:
@@ -701,6 +813,13 @@ def report(pops: list[dict], summary: dict, *, verbose: bool) -> bool:
         print(f"  ⚠ precision UNREAD: {s['precision_n']} scored questions is "
               f"below the {_MIN_N_FOR_PRECISION}-question floor — reported, "
               f"not gated.")
+    prosp = sum(p.get("prospective", 0) for p in pops if p["gating"])
+    if prosp:
+        print(f"  → {prosp} PROSPECTIVE questions resolved a forward-facing "
+              f"window ('tonight', 'next week') and were NOT\n    fired on: no "
+              f"stored past item can fall in them. They are excluded from the "
+              f"fire rate AND from\n    the control, because they are neither "
+              f"a retrieval range nor a marker-free question.")
     if s["vague_only"] > s["fired"]:
         print(f"  ⚠ vague markers ({s['vague_only']}) OUTNUMBER resolvable "
               f"ones ({s['fired']}): most temporal intent in this corpus "
@@ -748,6 +867,8 @@ def main() -> None:
                     help="skip the non-gating content-side population")
     ap.add_argument("--verbose", action="store_true",
                     help="per-row fired/vague/control tables")
+    ap.add_argument("--limit", type=int, default=40,
+                    help="cap on per-row table length (misses are never capped)")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable summary instead of the report")
     ap.add_argument("--out", type=Path, help="write the full summary JSON")
@@ -774,7 +895,7 @@ def main() -> None:
     if args.json:
         print(json.dumps(summary))
     else:
-        report(pops, summary, verbose=args.verbose)
+        report(pops, summary, verbose=args.verbose, limit=args.limit)
     if args.out:
         args.out.write_text(json.dumps(
             {"summary": summary,

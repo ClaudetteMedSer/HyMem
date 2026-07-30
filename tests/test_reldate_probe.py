@@ -159,11 +159,13 @@ def test_miss_direction_separates_axis_mismatch_from_resolver_error():
     assert res["miss_sides"] == {"after": 2}
 
 
-def test_future_windows_are_counted_not_silently_dropped():
+def test_future_windows_are_counted_but_never_fired():
+    """Superseded by revision 1: a forward-facing window used to be a fire (and
+    therefore always a precision miss). It is now its own category."""
     rows = [{"id": "f", "text": "what is planned for next month?",
              "anchor": "2024-03-15", "gold_dates": ["2023-09-21"]}]
     res = measure(rows, name="t", gating=True)
-    assert res["fired"] == 1 and res["future_ranges"] == 1
+    assert res["fired"] == 0 and res["prospective"] == 1
 
 
 # ── gate arithmetic ─────────────────────────────────────────────────────────────
@@ -171,7 +173,7 @@ def _pop(**kw):
     base = {"name": "p", "gating": True, "n": 100, "fired": 10,
             "fire_rate": 10.0, "vague_only": 0, "vague_rate": 0.0,
             "any_temporal": 10, "n_control": 90, "control_fires": 0,
-            "reanchored": 0, "future_ranges": 0, "miss_sides": {},
+            "reanchored": 0, "prospective": 0, "miss_sides": {},
             "precision_n": 10, "precision": 100.0, "rules": {},
             "rows_fired": [], "rows_vague": [], "rows_control_fires": []}
     return {**base, **kw}
@@ -319,3 +321,112 @@ def test_by_category_tracks_fires_per_category():
     cats = measure(rows, name="t", gating=True)["by_category"]
     assert cats["temporal-reasoning"] == {"n": 1, "fired": 1}
     assert cats["single-session-user"] == {"n": 1, "fired": 0}
+
+
+def test_balanced_misses_are_not_the_axis_mismatch():
+    """The complement of `test_miss_direction_separates_axis_mismatch_...`.
+    A roughly even after/before split means the resolver is inaccurate on
+    particular expressions, NOT that the dates are on the wrong axis — the
+    2026-07-30 LME run (5 after / 4 before at 80.9%) was read as the LoCoMo
+    mechanism (15/4 at 20.8%) purely because the report said nothing when the
+    split was balanced."""
+    rows = [
+        # window lands before the gold
+        {"id": "a", "text": "what did we decide last week?",
+         "anchor": "2024-03-15", "gold_dates": ["2024-03-20"]},
+        # window lands after the gold
+        {"id": "b", "text": "what did we decide last week?",
+         "anchor": "2024-03-15", "gold_dates": ["2024-02-01"]},
+    ]
+    res = measure(rows, name="t", gating=True)
+    assert res["miss_sides"] == {"after": 1, "before": 1}
+    after, before = res["miss_sides"]["after"], res["miss_sides"]["before"]
+    assert after < 3 * max(before, 1)  # the axis warning must NOT fire
+
+
+def test_misses_are_never_hidden_by_the_row_cap(capsys):
+    """A capped diagnostic table that still reports the full miss COUNT hides
+    evidence: the 2026-07-30 LME run showed 8 of 9 misses because `fired` (47)
+    overran a flat [:40] cap, and the gap was read as a counting bug rather than
+    a truncated table. Misses drive the revision decision, so they are exempt."""
+    from reldate_probe import report
+
+    rows = [{"id": f"h{i}", "text": "what did we do last week?",
+             "anchor": "2024-03-15", "gold_dates": ["2024-03-06"]}
+            for i in range(12)]
+    rows.append({"id": "miss", "text": "what did we do last week?",
+                 "anchor": "2024-03-15", "gold_dates": ["2024-01-01"]})
+    pop = measure(rows, name="t", gating=True)
+    report([pop], summarize([pop]), verbose=True, limit=3)
+    out = capsys.readouterr().out
+    assert "miss" in out            # the single miss survives a limit of 3
+    assert "rows hidden" in out     # and the truncation is stated, not silent
+
+
+# ── revision 1 (pre-registered): directional qualifiers + prospective windows ───
+@pytest.mark.parametrize("text,rule,start,end", [
+    # "before today" denotes everything up to now, not the single day.
+    ("what is the order of airlines I flew with before today?",
+     "before_day_word", "0001-01-01", "2024-03-15"),
+    ("which projects did I finish before last week?",
+     "before_calendar_last", "0001-01-01", "2024-03-10"),
+    # "since X" opens forward to the anchor instead of sitting on X.
+    ("how much have I written since I started again three weeks ago?",
+     "since_n_units_ago", "2024-02-20", "2024-03-15"),
+    ("what changed since last month?",
+     "since_calendar_last", "2024-02-01", "2024-03-15"),
+])
+def test_directional_qualifiers_open_the_window(text, rule, start, end):
+    """The defect class the 2026-07-30 LME misses exposed: these expressions
+    denote HALF-OPEN intervals and the resolver emitted a point window."""
+    hit = _r(text)
+    assert hit is not None, text
+    assert (hit.rule, hit.start, hit.end) == (rule, start, end)
+    assert hit.prospective is False
+
+
+@pytest.mark.parametrize("text", [
+    "can you recommend a show for me to watch tonight?",
+    "I've got free time tonight, any documentary recommendations?",
+    "I'm planning my meal prep next week, any suggestions?",
+    "wat zal ik vanavond kijken?",
+])
+def test_prospective_windows_resolve_but_never_fire(text):
+    """A forward-facing window can never contain a stored past item, so boosting
+    on it is cost with no upside. It still RESOLVES — suppressing it silently
+    would sort a temporal question into the marker-free control."""
+    hit = _r(text)
+    assert hit is not None and hit.prospective is True
+    assert has_temporal_language(text)
+
+
+def test_prospective_questions_are_neither_fires_nor_controls():
+    """The bookkeeping that matters: the 2026-07-30 LME control read 0/453 as
+    clean partly because two prospective questions sat in the FIRED bucket."""
+    rows = [
+        {"id": "p", "text": "any recommendations for tonight?",
+         "anchor": "2024-03-15", "gold_dates": ["2024-03-01"]},
+        {"id": "f", "text": "what did we decide last week?",
+         "anchor": "2024-03-15", "gold_dates": ["2024-03-06"]},
+    ]
+    res = measure(rows, name="t", gating=True)
+    assert res["prospective"] == 1
+    assert res["fired"] == 1           # only the retrospective question
+    assert res["n_control"] == 0       # the prospective one is NOT a control row
+    assert res["precision"] == 100.0   # and never counts as a precision miss
+
+
+def test_a_qualifier_flips_a_prospective_base_back_to_retrospective():
+    """Order of operations: the qualifier is applied BEFORE the prospective
+    check, because 'before tomorrow' asks about the past."""
+    hit = _r("what did I log before tomorrow?")
+    assert hit.prospective is False and hit.start == "0001-01-01"
+
+
+def test_a_distant_qualifier_does_not_capture_the_expression():
+    """The cue window is bounded so a `since` belonging to another clause cannot
+    reach across the sentence and reshape an unrelated range."""
+    text = ("since the very beginning of this long and rambling account of "
+            "everything that happened, what did we decide last week?")
+    hit = _r(text)
+    assert hit.rule == "calendar_last"  # not since_calendar_last

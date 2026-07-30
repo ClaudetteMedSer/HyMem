@@ -1323,8 +1323,80 @@ not-in-anchor assertion.
 > largest category simply being largest (LoCoMo's category 4 is 42% of questions
 > and 62% of fires — size, not concentration).
 >
+> **LME RE-RUN 2026-07-30 with the fixed loader → G-E4a FAIL, but a DIFFERENT
+> failure from LoCoMo's.** n=500, fired 47 (**9.4% ✓**), vague-only 19, control
+> **0 ✓**, **precision 80.9% (n=47) ✗**. By category: multi-session 15.8%,
+> temporal-reasoning 14.3%, single-session-preference 10.0%, single-session-user
+> 2.9%, knowledge-update 2.6% — the concentration warning correctly stays quiet,
+> and **multi-session leading means E4 is NOT a temporal-reasoning-only
+> feature**, which was the live worry about the 9.4%.
+>
+> **The mechanism is NOT the LoCoMo one, and the distinction decides what
+> happens next.** LME misses split **5 after / 4 before — balanced.** LoCoMo's
+> were 15/4, one-directional, which is the speech-time/event-time signature.
+> Balanced misses mean the resolver is inaccurate on particular expressions: a
+> different failure with a different, *fixable* remedy. The probe's axis warning
+> requires `after ≥ 3× before` and correctly did not fire — but its SILENCE was
+> read as agreement with the LoCoMo diagnosis, so the balanced case now names
+> itself in the report (regression-tested).
+>
+> **Size of the gap:** 38/47. Reaching 90% needs **4 more questions**; σ at
+> n=47 is 5.7pp, so 90% sits **1.59σ** from 80.9%. The criterion fails as
+> pre-registered — that stands, and widening the floor post-hoc because the
+> number came in close would be exactly the score-fitting the campaign contract
+> forbids. But it is not a decisive failure, and the misses are readable for
+> free (`--verbose`).
+>
+> **PRE-REGISTERED BEFORE READING THEM** (the G-F1 rule, transplanted): **one**
+> resolver revision is allowed, and only on a VISIBLE defect class in the misses
+> — an unhandled construction, a wrong window for a specific form. Tuning
+> `_UNITS` tolerances until the score clears is NOT a visible defect and is not
+> permitted. **A second failure banks E4's query-side boost dead.** Two defect
+> classes of exactly this kind were already found and fixed mid-run (absolute
+> `"last week OF August"`, ignored in-text anchor), so the prior that a third
+> exists is reasonable rather than hopeful.
+>
+> **REVISION 1 SPENT 2026-07-30** (the one allowed; a second failure banks E4's
+> query-side dead). Two visible defect classes from the miss hand-read, no
+> threshold tuning:
+> - **Directional qualifiers.** `before X` / `since X` denote HALF-OPEN
+>   intervals and the resolver emitted a point window at X. Now
+>   `before_*` → `[0001-01-01, end]`, `since_*` → `[start, anchor]`, applied
+>   BEFORE the prospective check so `"before tomorrow"` stays retrospective.
+>   Cue search is bounded (40 chars, nearest cue wins) so a `since` in another
+>   clause cannot reach across the sentence.
+> - **Prospective windows are a THIRD category, not a fire.** `tonight`,
+>   `tomorrow`, `next week` resolve forward; no stored past item can fall in
+>   them, so boosting is cost with no upside. They are excluded from the fire
+>   rate AND from the control — a prospective question is neither a retrieval
+>   range nor a marker-free question, and **this was a real hole: the LME
+>   control read 0/453 partly because two `tonight` questions were sitting in
+>   the FIRED bucket.** `has_temporal_language` still returns True for them.
+>
+> **A defect in the revision itself, caught by the existing tests:** bare
+> `"from"` was in the forward-cue list, so `"the plan from last month"` became
+> an open-ended range — and one such range then covered its gold by accident
+> and *raised* precision. Removed. **A cue that widens a window can only help
+> the score, so it must clear a higher bar than one that narrows it.**
+>
+> LoCoMo after revision: 24 → 21 fires, precision 20.8% → 23.8%, verdict
+> unchanged (its failure is the axis mismatch plus a 1.1% fire rate, neither of
+> which a resolver revision touches). Suite 934.
+>
+> **HOW THE RE-RUN MUST BE READ, fixed in advance.** Expected LME arithmetic:
+> 3 prospective fires leave the denominator and 2 directional misses become
+> hits → ~40/44 ≈ 90.9%. **That is NOT a meaningful pass.** σ at n=44 is 4.3pp,
+> so 90.9% sits 0.2σ from the line; separating 80.9% from 90% at p<0.05 needs
+> ~150 fired questions ≈ 1,600 LME questions and the corpus has 500. **The
+> precision criterion is underpowered on this corpus by construction** (the
+> variance-band lesson: the band scales √(p/n), so a small n needs a large
+> delta). Most of the gain is denominator, not accuracy. **Decide E4 on the
+> miss DECOMPOSITION, not on the threshold crossing** — irreducible axis misses
+> ~4% of fires, prospective false fires ~6%, fixable construction gaps ~4%. The
+> thing that killed E4 on LoCoMo is marginal on LME.
+>
 > **Status: (a) `hymem/query/reldates.py` NOT written; (b) augment wiring NOT
-> written.** The build now hangs on ONE free re-run:
+> written.** ~~The build now hangs on ONE free re-run:~~
 > `python reldate_probe.py --dataset <lme_s>.json` with the fixed loader.
 > Criterion 2 is the one LoCoMo failed at 20.8% on a **corpus-independent**
 > mechanism, and LME's `haystack_dates` are session dates — SPEECH time, the
@@ -1386,7 +1458,7 @@ unused.
 | ~~5~~ | ~~Scored confirmation~~ — **CANCELLED** (nothing to confirm) | — | — | — |
 | 6 | E3 adoption (one rebaseline) | Step 3 only (Step 5 gone) | ≤1 shared run | offline parity held; baselines re-frozen |
 | 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a new faithfulness result** | capped per dream | must clear `fact_probe.py`'s bar first |
-| 8 | E4 — **G-E4a: FAIL on LoCoMo, INCOMPLETE on LME**, not built (E7 open; **E6 cancelled with E1**) | one free re-run with the fixed loader | none spent (probe is LLM-free) | LoCoMo 1.2%/20.8% ✗; LME fire 9.4% ✓, precision unmeasured |
+| 8 | E4 — **G-E4a FAILS on both corpora, not built**; one pre-registered resolver revision remains (E7 open; **E6 cancelled with E1**) | hand-read of the 9 LME misses (free) | none spent (probe is LLM-free) | LoCoMo 1.2%/20.8% ✗ (axis); LME 9.4% ✓ / **80.9%** ✗ (resolver, balanced misses) |
 
 **Post-G-F1 campaign state.** Campaign E's generative half is closed; its
 retrieval half is what remains. Live work: **E3** (M1 needs an API key, M2
