@@ -225,6 +225,30 @@ remains only to absorb the 600-char context truncation):
 - Per-conversation accuracy table (10 rows) — a cross-conversation contamination
   / difficulty check, and profile-tier population stats.
 
+> **READ THIS BEFORE READING ANY NUMBER ABOVE (added 2026-07-30).** These
+> surfaces are a *classifier*, and its error rate was never measured until this
+> week. Measured against the free control — questions the reader answered
+> CORRECTLY, where delivery is certain by construction — `_lex_match` at τ=0.85
+> misfires **11%** here and **13%** on MSC, while LME's containment-based
+> `_gold_in_pool` misfires **≤3%**. Only the EXCESS over the control is evidence
+> of anything; `locomo_audit.py` computes it and refuses to interpret the miss
+> rate without it. Three structural cautions: (a) the surfaces are **NESTED**
+> (`render ⊆ top_k ⊆ pool`), so `gold_in_context=True` FORCES
+> `gold_in_topk=True` — the booleans can never localise a loss, only a strict
+> re-score at two surfaces can; (b) the "in pool, lost the cut" bucket is
+> unreachable whenever the tier hits fit inside `top_k*3`, and reads 0 by
+> construction — check the pool EXCEEDS the cut first; (c) a wider aperture
+> lengthens the render, which makes τ=0.6 fire MORE, so aperture-ladder bucket
+> migrations are partly instrument drift.
+>
+> **Known fix, not yet applied:** LoCoMo has exact evidence text and its render
+> carries raw turns, so porting LME's `_gold_in_pool` containment test (one
+> string contains the other, or a shared 40-char prefix —
+> `longmemeval_adapter.py:115`) would replace soft overlap against a mixed
+> haystack and buy 11% → ~3%. Do this before the next decomposition is read.
+> It does NOT invalidate the terminal retrieval finding in §6, which came from
+> `locomo_index_probe.py` querying FTS directly and never touches τ.
+
 ---
 
 ## 5. Operational shape (where LoCoMo differs from MSC)
@@ -270,16 +294,42 @@ delta as a signal.
   rendered as three-word `"s p o"` triples, which cannot clear the `_lex_match`
   τ=0.6 evidence check against full turn text — the A/B had no path to a
   positive on the diagnostic. Re-run needs a triple-aware surfacing check.
-- **L2 `--name-prefix`** — UNRUN. Targets query→turn paraphrase gaps, i.e. how
-  well a query *matches* a turn. **Demoted behind L9:** that only pays if the turn
-  is in the candidate pool at all, and L9 shows the pool is the binding
-  constraint. Ingest-side → requires `--fresh`, so it re-pays ingest+dream; L9 is
-  query-side and reuses stores. Run L9 first, then re-measure whether this is
-  still needed.
-- **L9 `--message-fts-top-k` (NEW 2026-07-29, now the top candidate).** The
-  strict re-score localised all 27 audited suspects as **RECALL failures (27/27
-  strict-fail at top_k, 0 composition)** — the evidence turns were never
-  retrieved, not crowded out of the render. Mechanism: `message_fts_top_k`
+- **L2 `--name-prefix` — CLOSED UNRUN (2026-07-30), do not spend the `--fresh`
+  run.** Two independent reasons. (a) *Too small to measure:* the ranking bucket
+  it targets is 6/27 suspects at n=300 ≈ 19 at n=800, and only a fraction of
+  those convert to correct once the evidence arrives — expected ≈ +10 against a
+  ±13 floor, at the most expensive run type available (`--fresh` re-pays ingest
+  AND dream across all 10 conversations). (b) *Wrong mechanism:* it prepends the
+  SAME `Name: X` to every user turn in a conversation, so the token has near-zero
+  IDF and BM25 cannot use it to discriminate between turns. The documented miss
+  is *"What community service did Maria mention?"* vs *"I dropped off that stuff
+  I baked at the homeless shelter"* — the broken link is
+  community-service↔homeless-shelter, which a name prefix does not create.
+- **THE TERMINAL FINDING (2026-07-30) — LoCoMo retrieval is CLOSED adapter-side.**
+  Localising the 27 audited suspects to their true surface, then probing the
+  stores directly (`locomo_index_probe.py`, read-only, no model), gave:
+  **0 NOT INGESTED / 0 NOT INDEXED / 25 NOT MATCHED / 17 MATCHED** over 42
+  evidence turns. Zero defects — the corpus is fully ingested and fully indexed.
+  The misses are *vocabulary* gaps, and they are structural: `_message_fts_search`
+  builds the raw-message candidate pool by **BM25 alone**, and the optional
+  rerank only REORDERS what BM25 already returned
+  (`hymem/query/augment.py:402-420`). There is no vector path over raw messages —
+  `--embeddings` operates on the consolidated tiers. Yet the same file records
+  that `message_hits` is *"the dominant recovery source (most gold turns come back
+  here, not via dreamed chunks)"*. **So the tier carrying most gold turns is
+  keyword-only, and a turn with no lexical overlap cannot enter the pool at ANY
+  aperture.** That explains the whole arc: why the ladder stalled, why 8× moved
+  only 5 of 27, and why no aperture or prefix lever finishes the job. Closing it
+  needs a semantic path over raw turns — a CORE change, out of scope for this
+  adapter work. The probe's query is an OR of the 8 longest content tokens, i.e.
+  *more* generous than any real query builder, which strengthens the negative.
+- **L9 `--message-fts-top-k` (2026-07-29) — real but sharply diminishing.** The
+  strict re-score at THREE surfaces (render / top_k / pre-cut pool) splits the 27
+  as **5 composition / 6 ranking / 16 recall at M=120**. Note the two-surface
+  reading (27/27 "recall") was an artifact: the "ranking" bucket is unreachable
+  whenever the tier hits fit inside `top_k*3`, so it reads 0 by construction at
+  canonical — **always check that the pool EXCEEDS the cut before reading that
+  split.** Mechanism: `message_fts_top_k`
   defaults to **15 raw-turn slots over a 369-689-turn history**, and
   `message_hits` is the ONLY tier that can carry a gold *turn* to the reader.
   **The entire L6 ladder varied `--top-k`, which is the final CUT — downstream of
