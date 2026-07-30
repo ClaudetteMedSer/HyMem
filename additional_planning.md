@@ -1,0 +1,648 @@
+# Additional Planning
+
+Two ideas borrowed from [BrainDB](https://github.com/dimknaf/braindb), adapted to
+HyMem's embedded, edge-typed architecture, plus the episode-granularity plan
+(added 2026-07-02, see [Plan C](#plan-c--episode-granularity-in-dreaming)):
+
+- **Idea A** — query-time multi-hop graph traversal with compounding edge weights.
+- **Idea B** — `always_on` Rules as a first-class node type.
+- **Plan C** — decision-grained episode extraction in dreaming.
+
+Ideas A and B have been checked against the current RAPTOR/aggregation
+architecture (see [§0](#0-raptor-interference-check)) and are clear to build.
+Plan C is sequenced BEHIND the RAPTOR Stage 3c flip decision (see its
+sequencing constraint).
+
+> Reviewed for staleness 2026-07-02: `aggregate.py` line refs updated after the
+> Option B snapshot fix landed (commit 8b36501); schema still v21; suite at 695
+> after the day's landings (`episode_retention_days`, value-supersession v3
+> version class, `HyMem.ask()`).
+
+---
+
+## 0. RAPTOR interference check
+
+RAPTOR in HyMem is the **aggregation tier**: `dreaming/aggregate.py` builds the
+tree at dream time, `HyMem.digest()` / `load_digest` serve the root, and
+query-side consumption is `_aggregation_search` (`query/augment.py`), gated by
+`cfg.aggregation_nodes_enabled` + `_aggregation_tier_fires` (default abilities
+`("TR",)`). It operates over episodes/clusters; its only contact with
+`knowledge_graph` is the digest's `_anchor_facts` block
+(`aggregate.py:530`), which reads `status='active' AND derived=0 AND
+invalid_at IS NULL` edges **at dream time**.
+
+**Idea A is clear.** Multi-hop lives entirely inside `_graph_lookup`
+(`query/augment.py:1432`), writes only to `ctx.graph_facts`, and is read-only —
+it materializes no edges. `_aggregation_search` writes a different ctx field and
+shares no state. The digest anchor never sees query-time expansion. Zero
+interference.
+
+**Idea B is clear, with one constraint.** A new `rules` table is migration v22
+(schema is at `EXPECTED_SCHEMA_VERSION = 21`, `core/db.py:17`); migrations are
+sequential/idempotent and don't touch the aggregation tables. The new
+`ctx.rules` tier is independent of `_aggregation_search`.
+**Constraint:** do NOT feed rules into `_anchor_facts`. That block's content
+hashes into the RAPTOR root digest's cache id (`aggregate.py:~544`), so wiring
+rules in would couple every rule edit to digest regeneration. Keep rules a
+parallel augment tier only.
+
+---
+
+## Idea A — Query-time multi-hop traversal with compounding edge weights
+
+### Motivation
+
+The only multi-hop today is *offline* in `dreaming/inference.py`: a dream-time
+BFS that materializes `derived=1` edges, and **only for `depends_on` chains +
+the `uses→depends_on` cross-hop**. Every other predicate (`part_of`, `owns`,
+`located_in`, `participates_in`, `runs_on`, `deploys_to`, …) is never
+transitively connected. So a question like *"where is the project Atta works on
+deployed?"* needs `atta —part_of→ medflow —deploys_to→ fly.io`, which neither the
+offline closure (wrong predicates) nor `_graph_lookup` Source 1 (1-hop entity
+anchor) bridges. BrainDB's 3-hop compounding traversal fills exactly this gap.
+
+**Key decision:** this is a query-time, **read-only** expansion — Source 4 of
+`_graph_lookup` — not new materialized edges. Per the additive-MR invariant
+([project_mr_filter_killed]), it only ever *adds* candidates, never filters.
+
+### Sketch
+
+New helper near `_recency_edges` in `query/augment.py`:
+
+```python
+def _multihop_edges(
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+    seeds: list[str],
+) -> dict[tuple[str, str, str], dict]:
+    """BFS outward from seed entities up to cfg.graph_multihop_max_hops.
+
+    Each frontier edge carries a path score = product of per-hop
+    (smoothed_confidence × cfg.graph_multihop_decay). The decay (<1) makes a
+    longer chain strictly weaker than a shorter one — BrainDB's compounding
+    edge-weight model. Only hop>=2 edges are returned (hop-1 edges are already
+    Source 1; re-emitting double-counts).
+    """
+    if cfg.graph_multihop_max_hops < 2 or not seeds:
+        return {}
+
+    reached: dict[str, float] = {s: 1.0 for s in seeds}   # node -> best path score
+    out: dict[tuple[str, str, str], dict] = {}
+    frontier = list(seeds)
+
+    for hop in range(1, cfg.graph_multihop_max_hops):
+        if not frontier:
+            break
+        ph = ",".join("?" * len(frontier))
+        rows = conn.execute(
+            _EDGE_SELECT + f"""
+            WHERE status = 'active'
+              AND (subject_canonical IN ({ph}) OR object_canonical IN ({ph}))
+            """,
+            frontier + frontier,
+        ).fetchall()
+
+        next_frontier: list[str] = []
+        for r in rows:
+            conf = (r["pos"] + 1.0) / (r["pos"] + r["neg"] + 2.0)
+            for near, far in ((r["s"], r["o"]), (r["o"], r["s"])):
+                if near not in reached:
+                    continue
+                path_score = reached[near] * conf * cfg.graph_multihop_decay
+                if path_score < cfg.graph_multihop_min_score:
+                    continue
+                key = (r["s"], r["p"], r["o"])
+                prev = out.get(key)
+                if prev is None or path_score > prev["path_score"]:
+                    d = _ensure_dict_from_row(r)   # same shape as _ensure()
+                    d["path_score"] = path_score
+                    d["hop"] = hop + 1
+                    out[key] = d
+                if far not in reached or path_score > reached[far]:
+                    reached[far] = path_score
+                    next_frontier.append(far)
+        frontier = next_frontier
+    return out
+```
+
+Wiring into `_graph_lookup`, right after Source 1 — seeded by **direct** entity
+matches only (not overlap-only anchors; chaining a fuzzy link N times produces
+garbage):
+
+```python
+    # Source 4 — multi-hop expansion from directly-anchored entities.
+    if cfg.graph_multihop_enabled and not fallback_only_overlap:
+        direct_seeds = [e for e in entities if e not in (overlap_info or {})]
+        for key, d in _multihop_edges(conn, cfg, direct_seeds).items():
+            c = candidates.get(key) or _ensure(_row_from(d))
+            c["multihop_score"] = max(c.get("multihop_score", 0.0), d["path_score"])
+            c["hop"] = d["hop"]
+```
+
+Scoring loop — multi-hop-only candidates get a discounted score and an honest
+reason code so `why_retrieved` stays truthful:
+
+```python
+        elif c.get("multihop_score", 0.0) > 0:    # fallback path, reached only via chain
+            score = c["multihop_score"] * recency_weight
+            why.append(f"fallback:multihop:{c['hop']}hop")
+```
+
+### Config knobs (matching the existing `graph_*` style)
+
+```python
+    graph_multihop_enabled: bool = False
+    """Source 4 of _graph_lookup: query-time BFS from matched entities across
+    ALL predicates (vs. offline inference.py, which only chains depends_on).
+    Off by default — flip after the recall probe clears the LME guard."""
+    graph_multihop_max_hops: int = 3        # BrainDB's depth; 2 is the cheap first step
+    graph_multihop_decay: float = 0.5       # per-hop multiplier (<1) so longer chains lose
+    graph_multihop_min_score: float = 0.05  # prune frontier paths below this (bounds fan-out)
+```
+
+### Risks
+- **Fan-out / latency.** A hub like `uv` explodes the frontier;
+  `graph_multihop_min_score` + a per-hop frontier-width cap bound it. The query
+  path must stay LLM-free and fast — measure p95 `augment()` latency.
+- **No double-counting derived edges.** Offline `depends_on` closure already
+  exists; dedup Source 4 against `candidates` from Sources 1/3 on `(s,p,o)`.
+- **Decay vs. Laplace confidence.** Fresh edges start at 0.5, so a 3-hop chain
+  is `~0.5³ × decay³ ≈ 0.002` — correctly invisible vs 1-hop. Verify
+  `min_score` doesn't prune everything; the probe set tells you.
+
+### Validation — bridging-edge recall@k (primary), LME guard (non-regression)
+
+End-to-end LME/BEAM accuracy is too noisy to attribute a multi-hop change to
+([project_lme_variance_band]: strict LME swings ~4 q/category, per-category
+deltas under ~±5pp are noise). A retrieval-recall probe is far more sensitive
+and tests the mechanism directly.
+
+**Primary metric — bridging-edge recall@k.** Adapt `benchmarks/gold_rank_probe.py`:
+build a probe set of questions needing a 2-/3-hop chain, label the *bridging
+edge* (the hop-2/hop-3 `(s,p,o)` 1-hop retrieval misses), and measure whether it
+appears in `graph_facts[:graph_top_k]`.
+
+1. **Build the probe set (~60–100 items), two sources:**
+   - **Synthetic, controlled** — seed a DB with known chains
+     (`atta —part_of→ medflow —deploys_to→ fly.io`), ask the bridging question,
+     assert recall. Ground truth + deterministic decay/min_score tests. Lives in
+     `tests/` as real pytest (mirrors the P4 box-gate style).
+   - **Mined from LME/BEAM** — filter multi-session-reasoning items to those
+     needing a cross-predicate hop; hand-label the bridge. Use
+     `benchmarks/longmemeval_adapter.py` / `benchmarks/beam_adapter.py`.
+
+2. **A/B protocol** (same DB, `graph_multihop_enabled` off → on):
+   - **bridging-edge recall@8** (primary) — must rise on multi-hop items.
+   - **recall@8 on a 1-hop control set** — must NOT drop (multi-hop must not
+     crowd out direct hits; the additive invariant as a metric).
+   - **p50/p95 `augment()` latency** — cost gate; budget e.g. p95 < 1.5×
+     baseline before any LME run.
+
+3. **Then** run the full LME guard (canonical 70.0% full-dream
+   [project_lme_canonical_fulldream], MS floor 51.9) as **non-regression only**,
+   not a tuning signal. Tune `decay`/`min_score`/`max_hops` against the recall
+   probe; LME just confirms nothing broke.
+
+**Sweep:** `max_hops ∈ {2,3}`, `decay ∈ {0.4,0.5,0.6}`,
+`min_score ∈ {0.02,0.05,0.1}`, scored recall@8 vs p95 latency — pick the Pareto
+knee. `max_hops=2` is the likely first ship (cheapest, most of the gain).
+
+### STATUS 2026-07-25 — steps 1–2 BUILT (probe + feature), default OFF
+
+- **Feature** landed in `hymem/query/augment.py`: `_multihop_edges` (read-only
+  BFS) + Source 4 wiring (direct seeds only, dedups Sources 1/3 on `(s,p,o)`) +
+  a discounted-scoring branch emitting `fallback:multihop:{n}hop`. Four config
+  knobs in `hymem/config.py` (`graph_multihop_{enabled=False,max_hops=2,
+  decay=0.5,min_score=0.05}`). **Two sketch bugs fixed** (probe-before-code paid
+  off): the BFS `range(1, max_hops)` was one round short — with `max_hops=2` it
+  never reached the worked example's own bridge — corrected to `range(1,
+  max_hops+1)` emitting from round 2; and the seed's 1-hop edges were re-emitted
+  as hop-2 (only the `entity_match` dedup masked it) — now an explicit
+  seed-incident filter drops them. Compounding verified exactly: hop-2 = conf²·
+  decay² = 1/9, hop-3 = conf³·decay³ = 1/27 (fresh 3-hop chains sit ~min_score).
+- **Probe — synthetic half**: `tests/test_multihop.py` (10 pytest, all green in
+  the 720-test suite). Encodes G-A1 as assertions: bridge recall 0→present on
+  flip, 1-hop control non-regression (same score, no multihop chip), decay/
+  min_score/depth/dedup determinism.
+- **Probe — mined half**: `benchmarks/multihop_probe.py` (+ `_example.json`
+  schema/demo). LLM/embedding-free `gold_rank_probe.py`-style harness; consumes
+  a labeled probe JSON (fresh-seed OR `--store <built.sqlite>` read-only), runs
+  the off→on recall@k A/B per set + p50/p95 `_graph_lookup` latency, prints the
+  G-A1 advisory (multihop rose / control held / p95<1.5× with a sub-1ms noise
+  floor). Sweep points drive via `--max-hops/--decay/--min-score`; `--json` for
+  the sweep loop.
+- **Miner**: `benchmarks/multihop_miner.py` — pre-fills the labeled probe set so
+  Phase A is a verify pass, not authoring. Reuses `_multihop_edges` (so a
+  proposed bridge is exactly what Source 4 fetches) + `match_known_entities`,
+  ranks candidate edges by gold-answer token overlap, and auto-sorts each MR/TR
+  question into multihop (a hop≥2 bridge explains the answer) / control (a direct
+  1-hop edge does) / dropped. Emits probe-compatible items + `_`-hints
+  (`_gold/_hop/_answer_overlap/_alt_bridges`). Gold-for-labeling is legitimate
+  (ground truth), not read at retrieval time. **Two modes:**
+  (1) **`--store`** — mine an existing dreamed store, LLM-free, seconds.
+  (2) **`--lme-data`** — per-question: rebuild + **dream each question's own
+  haystack to completion** (loops `dream()` until `not budget_exhausted`), then
+  mine it. Sidesteps the `dream_budget=50`-per-cycle under-dream that made a
+  combined LME store yield a false-empty graph (37 edges / 4 subjects → false 0%
+  G-A1); faithful to LME's isolated per-question retrieval. Emits a self-contained
+  fresh-seed `edges` block (probe needs no `--store`); prints per-question dream
+  health (avg edges/store) to catch a non-extracting dream LLM. Dreams via
+  `--dream-model` (default v4-flash, thinking-disabled; `stub` = plumbing test).
+  Both modes share `_mine_question`. End-to-end verified: store→probe PASS,
+  per-question plumbing + self-contained edges→probe PASS.
+- **Guard flag**: `longmemeval_adapter.py --graph-multihop` (+
+  `--graph-multihop-max-hops/--decay/--min-score`) wires the swept knobs into the
+  adapter config and records them in run metadata — makes G-A2 runnable.
+
+### STATUS 2026-07-26 — box G-A1 on LME FAILED → real cause = hub-dilution → hub guard added, G-A1 PASSES locally
+
+The box ran the per-question miner on 40 MR/TR questions (dreams **healthy** —
+200+ edges / 30+ subjects each; the `dream_budget` loop worked), then G-A1 on the
+self-contained slice: **0/4 bridges, FAIL**. The box's stated cause ("BFS is
+subject→object only, object-only seeds have no outgoing edges") is **wrong** —
+`_multihop_edges` traverses `((s,o),(o,s))` (augment.py:1709), so it is already
+bidirectional and an object-only seed *does* reach `user`. The **real** cause:
+
+- **Hub dilution.** Every LME "bridge" runs through the `user` super-hub
+  (`road_trip ← user → driving_trip`). A leaf seed reaches `user` in 1 hop; hop 2
+  expands `user`, which is incident to *hundreds* of edges (worse in the merged
+  slice, which unions 40 questions' `user` edges). All emit as ~equal-weight
+  hop-2 candidates; `graph_top_k=8` truncates; the true bridge is buried. **Not
+  "can't reach" — "reaches everything and keeps 8."**
+- **The deeper truth:** a path through a super-hub is not a bridge — it holds for
+  *every pair* of things the user mentioned. **LME's personal-memory star has ~0
+  genuine (non-hub) intermediate-entity bridges** (40 questions → 4, all
+  hub-mediated). LME **cannot validate Track A** regardless of dream quality; this
+  confirms the standing prediction empirically. Hub paths are also net-negative in
+  production (flood query-irrelevant `user` edges).
+
+**Fix — hub guard (degree-cap):** new knob `graph_multihop_hub_degree_max=32`
+(config.py) + `_active_degrees` helper. A node whose active degree exceeds the cap
+is **reached but never expanded** — edges INTO it can still emit, but the BFS never
+fans OUT through it. Genuine intermediates (`medflow`, degree 2) stay far below the
+cap so real chains still bridge; the `user` hub (degree hundreds) is inert. `≤0`
+disables. **Deliberately does NOT rescue the 4 LME items** (they aren't bridges) —
+mechanism > score, no tuning toward them.
+
+- **pytest** (`tests/test_multihop.py`, now 14, all green in the 724-suite): guard
+  blocks fan-out through a degree-40 hub; guard-off floods ~39 siblings (proves the
+  guard is what suppresses it); low-degree intermediate still bridges with a hub in
+  the same store; end-to-end leaf-seed of a star yields **no** `fallback:multihop`
+  fact (ON == OFF on a star → inert, not harmful).
+- **Local G-A1 substrate**: `benchmarks/multihop_genuine_bridges.json` — 5 genuine
+  low-degree chains + 4 controls, needs **no box, no LME**. `multihop_probe.py`
+  reads **G-A1 PASS**: multihop 0→100%, control 100→100%, latency sub-floor. This
+  is the canonical mechanism gate; LME/BEAM slices only measure *substrate
+  richness*, which for personal-memory graphs is ~0.
+
+- **PENDING (box, now optional/Hermes-scoped)**: the mechanism gate is CLOSED
+  locally. The remaining reads are substrate-dependent and belong on a **Hermes
+  production graph** (which has genuine intermediate entities), not LME: mine that
+  graph → G-A1 on real bridges → sweep → G-A2 non-regression (vs 68.4%). Ship
+  default stays `False`; on LME the feature is provably inert with the guard on.
+
+---
+
+## Idea B — `always_on` Rules as a first-class node type
+
+### Motivation
+
+HyMem's "always loaded" layer is scattered across the MEMORY.md / USER.md
+auto-sections (`augment.py:322`), `profile_entries`, and the closed-vocabulary
+`user_profile` slots. None is a clean standing imperative ("always run tests
+before pushing", "never suggest Docker") — they're facts/preferences, not rules,
+and they compete for the capped `insights_max_entries=12` / `profile_max_entries=16`
+budgets. BrainDB's `always_on` rule node is a dedicated abstraction injected into
+every context call. This is a cleaner home for the imperative subset.
+
+### Sketch — schema (migration v22)
+
+```sql
+CREATE TABLE IF NOT EXISTS rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL DEFAULT 'always_on'
+        CHECK (scope IN ('always_on','contextual')),
+    -- contextual rules inject only when a trigger entity matches;
+    -- always_on inject every augment() call (BrainDB semantics)
+    trigger_entities TEXT NOT NULL DEFAULT '[]',   -- JSON, for scope='contextual'
+    source TEXT NOT NULL DEFAULT 'user',           -- user | agent_inferred
+    pos_evidence INTEGER NOT NULL DEFAULT 1,
+    neg_evidence INTEGER NOT NULL DEFAULT 0,
+    valid_at TIMESTAMP,                            -- bi-temporal, like knowledge_graph / user_profile
+    invalid_at TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','retracted')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_rules_active ON rules(scope, status, invalid_at);
+```
+
+### Sketch — augment + extraction
+
+```python
+# augment.py, AugmentedContext
+    rules: list[Rule] = field(default_factory=list)
+
+# augment(), after matched entities computed (~line 531)
+    if cfg.rules_enabled:
+        ctx.rules = _load_rules(conn, ctx.matched_entities, cap=cfg.rules_context_cap)
+```
+
+- `always_on` rules load unconditionally (the whole point); `contextual` rules
+  load iff their trigger overlaps `ctx.matched_entities`.
+- **Extraction:** route a sub-slice of existing `behavioral_markers`
+  (`correction`/`rejection` that are imperative + durable) during Phase-2
+  consolidation — no new LLM call, preserving one-call-per-chunk discipline.
+- **Direct API:** `hy.add_rule(text, scope=...)` + an MCP tool, since rules are
+  often *told*, not inferred. Follow the `HyMem.ask()` / `hymem_ask` pattern
+  (landed 2026-07-02: `hymem/query/ask.py` + `server.py`) for the API-plus-tool
+  pairing.
+- **Supersession** reuses `bitemporal.py` interval-closing — a contradicting
+  rule closes the prior's `invalid_at` rather than overwriting.
+
+### Honcho surface
+Rules ride along in `GET .../context` and `peers/{pid}/card`, ahead of MEMORY.md
+— matching how BrainDB's `always_on` injects into every context call.
+
+### Constraint (from §0)
+Do **not** add rules to `_anchor_facts` (`aggregate.py:530`). That block hashes
+into the RAPTOR root digest cache id; coupling rule edits to digest regeneration
+is undesired. Rules stay a parallel augment tier.
+
+### Validation — compliance gate, NOT a benchmark number
+
+Rules are behavioral imperatives; LME/BEAM have no questions testing "did the
+agent obey a standing instruction." Forcing it onto those suites measures noise.
+Mirror the P4 profile-tier box gate ([project_p4_profile_tier], ~95% pass):
+
+1. **Synthetic compliance harness.** Fixed (rule, probe-message,
+   expected-behavior) triples — e.g. rule "never suggest Docker" + a probe that
+   tempts it. Run rules-injected vs not; LLM-judge (Claude) scores *adherence*
+   (rule present in context + response respects it). A pass/fail box gate, not a
+   leaderboard.
+2. **Mechanical pytest (no LLM):** `always_on` rules appear in every
+   `augment()` ctx regardless of query; `contextual` rules appear iff trigger
+   matched; a contradicting rule closes the prior `invalid_at` (reuse bitemporal
+   tests); retracted rules never surface.
+3. **Cost watch.** Rules add fixed token cost to every call — log it; "every
+   context call" is the hot path.
+
+### STATUS 2026-07-26 — core mechanism BUILT (probe-first), default OFF
+
+The mechanical compliance gate and the tier it depends on are landed; the
+LLM-adherence half stays a box gate.
+
+- **Schema**: migration `023_rules.sql` + the `rules` table in `schema.sql`;
+  `EXPECTED_SCHEMA_VERSION` 22 → **23**. (The §0 note above is stale — it was
+  written when head was 21 and called this "v22"; head had already moved to 22,
+  so the rules table is **v23**.) Bi-temporal (`valid_at`/`invalid_at` +
+  `status`), `text UNIQUE`, `scope` and `source` CHECK-constrained.
+- **Feature** `hymem/rules.py`: `Rule` + `load_rules` (always_on unconditional;
+  contextual gated on `trigger_entities`∩`matched_entities`, canonicalized both
+  sides; always_on-first, capped; degrades to `[]` pre-v23) + `add_rule`
+  (redaction-scrubbed persist; `text`-UPSERT reinforces `pos_evidence` and
+  revives a retracted row; `supersedes` closes a prior interval) + `retract_rule`.
+- **Wiring**: `AugmentedContext.rules` + a `load_rules` call in `augment()`
+  right after `matched_entities` resolves, gated by `cfg.rules_enabled`
+  (default **False**) + `cfg.rules_context_cap=16`. Purely additive (own SELECT,
+  no tier's budget touched). **NOT** in `_anchor_facts` (§0 honoured).
+- **API**: `HyMem.add_rule(text, scope=, trigger_entities=, source=,
+  supersedes=)` / `HyMem.retract_rule(id)` — the *told-not-inferred* direct path,
+  mirroring `HyMem.ask()`.
+- **Render wiring** (added 2026-07-27): `render_context` in `hymem/query/ask.py`
+  emits a `=== STANDING RULES (always follow) ===` section FIRST (never shed by
+  tail-truncation), and `_system_prompt(has_rules)` appends `ASK_RULES_DIRECTIVE`
+  (obey-not-quote) to `ASK_PROMPT_V1` ONLY when rules are present — so the
+  versioned base prompt is byte-identical for every current (no-rules) consumer.
+  Without this the answerer never saw the rules; it is what makes adherence
+  measurable. Covered by 3 more pytests (render-first, directive-iff-rules,
+  ask() end-to-end).
+- **Gate — mechanical (`tests/test_rules.py`, 12 green in the 736-suite)**:
+  always_on injects on every query; default-OFF stays empty; contextual fires
+  iff trigger overlaps; always_on ranks before contextual; supersession +
+  retraction interval-close and stop surfacing; re-assert reinforces without
+  duplicating; pre-v23 degrades; rules render first + directive composes. E2E
+  smoke: fresh store → v23, rule surfaces on an unrelated query.
+- **Gate — LLM adherence (BOX-TESTABLE NOW)**: `benchmarks/rules_compliance.py`
+  + `benchmarks/rules_compliance_runbook.md`. Self-contained (6 rule/tempting-probe
+  triples, no LME/BEAM, no dream). Runs `ask()` ON vs OFF per triple, LLM-judges
+  compliance, and gates on THREE checks: (1) ON adherence ≥ `--threshold` (0.8),
+  (2) **ON > OFF** (the rule caused it, not the base model), (3) rule present in
+  every ON / no OFF context (mechanical invariant). Stub-mode plumbing verified;
+  needs a box run with a real answerer + an INDEPENDENT judge.
+- **GATE CLEARED 2026-07-27 → default FLIPPED ON.** Box ran
+  `benchmarks/rules_compliance.py` with answerer `deepseek-v4-flash` + an
+  INDEPENDENT judge `openai/gpt-oss-120b` (OpenRouter), threshold 0.8 — PASS on
+  all three checks (ON≥0.8, ON>OFF, rule-present invariant). `rules_enabled`
+  default `False`→`True` in `hymem/config.py` (docstring updated); the
+  `test_default_off_no_rules_tier` assertion was repurposed to the new default-ON
+  behaviour + a `test_rules_tier_can_be_disabled` opt-out test (local suite 737
+  green; box 651). The tier is INERT until a host calls `add_rule()` (empty
+  `rules` table → empty tier), so ON-by-default adds no cost on stores without rules.
+### STATUS 2026-07-27 — extraction routing + surfaces BUILT; 3-gate scorecard
+
+Idea B is now backed by three data-driven gates (see
+`benchmarks/rules_compliance_runbook.md`): **adherence** (CLEARED, above),
+**extraction precision**, **overhead**.
+
+- **Extraction routing (write side)**: `rules.route_markers_to_rules` +
+  `rule_scope_for_marker`, wired into runner Phase-2 (gated `cfg.rules_extraction_enabled`,
+  default **OFF**), reusing already-extracted markers → NO new LLM call. Policy:
+  `style` routes on kind; `rejection`/`correction` require an imperative cue
+  (`_DIRECTIVE_RE`); `preference` never routes. `DreamReport.rules_extracted`
+  reports the count. Emits `source='agent_inferred'` rules; idempotent via
+  add_rule's text-UPSERT.
+- **Extraction PRECISION gate** (`benchmarks/rule_extraction_probe.py`,
+  deterministic, runs anywhere): scores `rule_scope_for_marker` on a hand-labeled
+  marker set. **Data-driven tuning loop paid off**: first run **85% (FAIL)** — the
+  3 FPs were rejection *one-offs* ("rejected the Tuesday meeting"); tightened the
+  policy to require the directive cue for rejection too (past-tense forms
+  excluded) → **100% precision / 100% recall (PASS)**. Precision is gated
+  (default ≥0.90); a false rule pollutes every call. Box must re-validate on REAL
+  dream markers (`--labels markers.json`) before flipping the write-side default.
+- **OVERHEAD gate** (`benchmarks/rules_overhead.py`, deterministic): ON/empty
+  adds **0 rendered chars** (proves the ON-by-default read side is free until
+  `add_rule()`); ON/full (16 rules) = 1138 chars / **0.034ms p95** overhead. PASS.
+- **Surfaces**: `HyMem.add_rule/rules/retract_rule`; MCP `hymem_add_rule` +
+  `hymem_list_rules` (`server.py`); Honcho — active rules lead the peer card +
+  peer/session context ahead of MEMORY.md (`honcho/app.py::_rules_block`).
+- **Gates — mechanical (`tests/test_rules.py`, 21 green; full suite 746)**: adds
+  classifier + end-to-end dream-routing (routes imperative markers, skips
+  one-offs, respects the write-side gate) + `list_rules` + MCP tools + Honcho
+  card/context surfacing + inert-when-empty.
+- **PENDING**: (1) box re-validate extraction precision on real dream markers →
+  flip `rules_extraction_enabled` ON. (2) optionally sweep the adherence probe
+  with a larger/adversarial probe set for the competitive writeup.
+
+### STATUS 2026-07-27 — lexical extraction FAILED on real markers → LLM-durability-tag extractor + A/B experiment engine prototyped
+
+The write-side precision gate ran on **real** dream markers and **failed at 8.3%**
+(1 TP / 11 FP / 37 FN). Two rounds of lexical tightening confirmed a ~14% ceiling:
+`rejects?`/`refuses?` fired on 100% of rejection markers (kind-restatement leak;
+removed, FP 73→11 + present-tense one-offs added to `rule_extraction_probe.py` as
+local regression guards), and the residual FPs are one-off *corrections* carrying
+incidental modals ("X was Dutch **instead** of English", "**should** be automatic").
+**Standing-vs-one-off is semantic, not lexical** — the gate correctly blocks the
+flip; further regex trimming is a dead end. Decision: `rules_extraction_enabled`
+**stays OFF**; auto-extraction is **R&D**, not a launch blocker. Shippable value =
+read side (ON, adherence-cleared) + told-path surfaces (`add_rule` via API/MCP/Honcho).
+
+**Prototype (option b + a):**
+- `hymem/rules_extract.py` — batched **LLM durability tagger** (`judge_durability_batch`,
+  ONE call per dream; asks standing-rule-vs-one-off; returns standing/confidence/
+  **canonical rule** which collapses paraphrases so `add_rule`'s UPSERT `pos_evidence`
+  becomes a cross-session recurrence counter). `route_decisions` dispatches
+  `cfg.rules_extraction_mode` ∈ `lexical`|`llm`|`llm_fastpath`, gated on
+  `rules_extraction_confidence_min`; every failure degrades to "don't mint".
+- Wired live: `route_markers_to_rules(conn, cfg, llm=)` ← runner passes `llm`.
+  Config `rules_extraction_mode` (default `lexical`) + `rules_extraction_confidence_min`.
+- **Experiment engine** `benchmarks/rule_extraction_experiment.py` — scores every
+  arm (mode × τ-sweep × promotion{immediate/and/recurrence/or_highconf} × N) in one
+  judgment pass; `--sim` fake-judge offline, real `--answer-model` on box; precision
+  gated 0.90, prints best arm at max recall. Spec + decision rules =
+  `benchmarks/rules_extraction_ab.md` (E1 instrument, E2 τ-frontier, E3 repetition,
+  E4 independent-judge, E5 cost, E6 LME non-regression).
+- **Offline `--sim` findings** (synthetic, NOT real numbers — mechanics only):
+  llm 100% vs lexical 70%; **`llm_fastpath` DOMINATED (77%) — the lexical shortcut
+  re-imports the FP leak**; repetition gating is a **robustness** lever (restores
+  precision a noisy judge loses, at a recall cost), so build schema v24
+  (`status='provisional'`) ONLY if E3 on real markers earns it.
+- Tests: `tests/test_rules_extract.py` (13); full suite 759 passed.
+
+### STATUS 2026-07-28 — write-side auto-injection CLOSED; candidate-SUGGESTION shipped
+
+The box ran the experiment on real markers across the full pipeline. Findings, in
+order:
+
+1. **Instrument confirmed, gate not cleared.** The LLM tagger is **7×** lexical on
+   precision (59% vs 8% on the rule-enriched set) at ~95% recall — but 59% is short
+   of 0.90, and drops to ~45% on the natural-base-rate 614-marker set (a base-rate
+   effect, the *more* honest number).
+2. **A kind-filter LEAK, fixed.** The full run first read **5.8%** because
+   `route_decisions`/`judge_corpus` sent EVERY kind to the tagger — 1,768
+   `preference` markers flooded it. The `_RULE_KINDS` gate lived only in the lexical
+   classifier; the LLM path bypassed it. Fixed with `rules.is_rule_eligible_kind`,
+   a single eligibility gate BOTH paths call BEFORE the tagger (durability ≠
+   eligibility; a durable preference still belongs in the profile tier).
+3. **Adjudication was inconclusive, not confirmatory.** An independent blind judge
+   (gpt-oss-120b) to check whether the tagger's "FPs" were mislabels scored **50% on
+   its controls** — chance — tripping the distrust guard. So "0/25 overturned" is
+   not evidence; the labels stayed suspect.
+4. **The labels WERE the problem (`--by-kind`).** Per-kind at τ=0.90 the tagger is
+   `rejection` **69%**/99%, `style` "0%", `correction` ~0%. All 90 gold rules were
+   labeled `rejection`; `style`/`correction` had ZERO — impossible. Eyeballing
+   settled it: the `style` markers ("be concise", "class-level skills", "active
+   updates") ARE durable directives *mislabeled* not-rule (and already live in the
+   profile as preferences → auto-minting them = duplication); `correction` markers
+   are genuinely one-off. Corrected precision ~73%. The FPs are **not concentrated
+   in a kind** — no `_RULE_KINDS` lever helps.
+5. **Repetition-gating has no validation corpus.** The policy layer clears 0.90 only
+   at ~3–5% recall (nothing recurs) on LME (star topology), MSC (preference-shaped),
+   AND real Honcho data. Only Honcho could show recurring imperatives, and it shows
+   them sparse — suggesting the sparsity is intrinsic (rules are said once, expected
+   to hold).
+
+**Decision: auto-*injection* is closed as a dead-end on available data.** The tagger
+is a strong high-recall *detector*, so the answer is **candidate SUGGESTION** —
+`HyMem.suggest_rules()` + MCP `hymem_suggest_rules` (read-only; ranked, de-duped
+`RuleCandidate`s with marker/session counts + `already_active`; the human confirms
+via `add_rule`, which also makes the profile-vs-rules tier-placement call). Built +
+tested 2026-07-28 (`tests/test_rules.py`, full suite 775). `rules_extraction_enabled`
+stays OFF. Repetition-gating / schema v24 is NOT built — WATCH ITEM: as the Honcho
+store grows, re-check imperative recurrence (`msc_adapter.py --probe-mode recurrence`
+→ `rule_extraction_experiment.py --policy-from-canonical`); sparse → close v24
+permanently, dense → the E3 path reopens. Full scorecard:
+`benchmarks/rules_compliance_runbook.md`; experiment design: `rules_extraction_ab.md`.
+
+---
+
+## Plan C — Episode granularity in dreaming
+
+*(added 2026-07-02 — the "point 5" carry-over from the competitive/architecture
+review)*
+
+### Motivation
+
+- **BEAM floor post-mortem** (benchmarks/beam_investigation_notes.md): EO/SUM
+  failures traced to episodes too ABSTRACT ("developed budget tracker with
+  Flask, added auth") to decompose into the rubric's event sequence. The one EO
+  question that flipped did so exactly when detailed episodes led the context —
+  mechanism verified, magnitude unmeasurable at sample=3. Episode granularity is
+  a CORE dreaming concern, not an adapter knob.
+- **Digest coverage gap**: 65/91 sessions covered on the prod store (~42%
+  episode-recall gap upstream) — the digest tree can only fuse what episodes
+  carry.
+- **Rate-distortion framing** ("Remember the Decision, Not the Description",
+  arXiv 2605.10870): store *decisions and outcomes* at retrieval granularity.
+  The `episodes.outcome` field already exists; the failure is granularity, not
+  schema.
+- **Retention decoupling** (`episode_retention_days = 0`, landed 2026-07-02):
+  episodes are now permanent, so each one should carry more retrievable signal —
+  and `HyMem.ask()` consumes them directly in its evidence block.
+
+### Sketch
+
+- Prompt-side change to the per-session digest call
+  (`hymem/dreaming/digest.py`; bounded by `dream_digest_max_chars` 12000 /
+  `dream_digest_max_tokens` 3072): decompose into event-grained episodes — one
+  episode per decision/change/outcome, concrete values (names, numbers, dates,
+  versions) in the summary, target roughly 3–8 per substantive session instead
+  of 1–2 blobs. Keep the outcome discipline (outcome REQUIRED when the session
+  reached one).
+- New `dream_max_episodes_per_session` config cap (mirror
+  `profile_max_items_per_session = 16`) so a runaway response is truncated
+  before persistence.
+- **Version the prompt + re-extraction guard.** Mirror the
+  `PROFILE_PROMPT_VERSION` / fusion-salt lesson: a granularity change must
+  invalidate prior extractions or old blob episodes silently persist (UPSERT
+  refreshes only matching message ranges). Reuse the per-session skip-guard
+  pattern (`sessions.profile_prompt_version`, schema v19) with an episodes
+  prompt version so unchanged sessions cost zero tail calls.
+
+### Validation — box gate + probes, explicitly NOT BEAM EO
+
+The variance-band discipline applies twice over: BEAM EO at sample=3 has a
+±12.5pp/category noise floor (measured, via the CR control), so the aggregate
+cannot see this change. Gates, in order:
+
+1. **Mechanical pytest** (StubLLMClient): multi-episode persistence per
+   session, cap enforcement, stable-id UPSERT semantics on re-dream, prompt
+   version guard.
+2. **Qualitative box gate** (mirror the P4 profile gate, pass ≥ 0.9): hand-score
+   ~20 sessions' episodes on (a) traceability — every episode grounded in actual
+   turns, no invented outcomes; (b) granularity — decision-level with concrete
+   values; (c) session coverage. `HyMem.ask()` doubles as a cheap spot-check
+   harness here.
+3. **`benchmarks/episode_coverage_probe.py`** before/after — coverage should
+   rise from the ~42% gap.
+4. **LME full guard as NON-REGRESSION only** (canonical 70.0 full-dream, MS
+   floor 51.9). Not a tuning signal.
+5. **Cost watch**: more episodes ⇒ more `vec_episodes` embeddings + a larger
+   clustering input each dream. Blocking (`aggregation_blocking_top_k = 24`)
+   bounds the pair tests; measure dream wall-clock and fusion-call counts
+   before/after.
+
+### Sequencing constraint (hard)
+
+Run AFTER the RAPTOR Stage 3c flip decision. The flip gate is a quiescent-dream
+node-reuse watch (~90%+ hold, no spikes) following the Option B snapshot-ceiling
+fix (commit 8b36501). A granularity change rewrites episode membership
+wholesale — under the watch it is indistinguishable from the spurious-rebuild
+failure mode it exists to rule out. Land the flip (or the no-flip verdict)
+first, then granularity, then re-verify reuse once on the new episode set.
+
+---
+
+## Recommended sequencing
+
+1. **Idea A at `max_hops=2`** first — measurable, attacks a concrete retrieval
+   gap, clean go/no-go from the recall probe. Build the synthetic multi-hop
+   probe as pytest **before** touching `_graph_lookup` (the variance-band
+   discipline requires a gate before tuning).
+2. **Idea B** second — lower implementation risk (purely additive context), but
+   the payoff is behavioral and only validatable via the compliance gate, so it
+   won't move headline numbers and shouldn't be judged by them.
+3. **Plan C** independently of A/B but strictly after the RAPTOR flip decision
+   (see its sequencing constraint) — A/B don't touch episodes, so they can
+   proceed while the reuse watch runs.

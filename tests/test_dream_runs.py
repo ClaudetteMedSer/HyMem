@@ -44,6 +44,109 @@ def test_dream_persists_run_report(hy):
     assert row["markers_extracted"] == report.markers_extracted
 
 
+def test_dream_persists_digest_counters(hy):
+    """Schema v25: episode creation and digest failures land in dream_runs.
+
+    The 2026-07-30 starvation bug (long-lived sessions never re-digested, so no
+    episode was created for six days) was invisible here — every run reported
+    success with a rising chunks_seen. `episodes_created` makes the stall a run
+    of zeros in the same row, and `digest_failures` counts the calls the runner
+    logs-and-continues past."""
+    import json
+
+    _seed_session(hy)
+    episode = {
+        "title": "Dropped Docker for local dev",
+        "summary": "Switched local development from Docker to uv and system Python.",
+        "outcome": "resolved",
+        "key_entities": ["uv", "docker"],
+        "chunk_ids": [],
+    }
+    hy.set_llm(StubLLMClient(
+        fixtures={"Return the JSON object now": json.dumps(
+            {"episodes": [episode], "summary": "", "procedures": []}
+        )},
+        default="[]",
+    ))
+
+    report = hy.dream()
+    row = hy.conn.execute(
+        "SELECT digest_failures, episodes_created FROM dream_runs "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert report.episodes_created == 1
+    assert row["episodes_created"] == 1
+    assert report.digest_failures == 0
+    assert row["digest_failures"] == 0
+
+
+def test_dream_counts_unparseable_digest_as_failure(hy):
+    """An unparseable digest reply is a failure, not an empty session: the
+    counter must fire so a broken tail is visible without reading the log."""
+    _seed_session(hy)
+    hy.set_llm(StubLLMClient(
+        fixtures={"Return the JSON object now": "definitely not json"},
+        default="[]",
+    ))
+
+    report = hy.dream()
+    row = hy.conn.execute(
+        "SELECT digest_failures, episodes_created FROM dream_runs "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert report.digest_failures == 1
+    assert row["digest_failures"] == 1
+    assert row["episodes_created"] == 0
+
+
+def test_dream_persists_aggregation_counters(hy, monkeypatch):
+    # The RAPTOR flip criteria watch the built/reused split per cycle
+    # (benchmarks/raptor_digest_plan.md Stage 3c). build_aggregation_nodes
+    # computes it; the runner must land it in dream_runs (the log.info() it also
+    # emits is dropped on a server without basicConfig). Stub the builder so the
+    # assertion is on the wiring, not the clustering machinery.
+    import dataclasses
+
+    from hymem.api import HyMem
+    from hymem.dreaming import runner as runner_mod
+    from hymem.dreaming.aggregate import AggregationResult
+
+    monkeypatch.setattr(
+        runner_mod, "build_aggregation_nodes",
+        lambda *a, **kw: AggregationResult(
+            nodes=3, reused=2, fusion_failures=1, input_episodes=41,
+            blocking="exact:no_vec_extension",
+        ),
+    )
+
+    enabled = HyMem(
+        dataclasses.replace(hy.config, aggregation_nodes_enabled=True),
+        llm=hy._llm, embedding_client=hy._embed,
+    )
+    try:
+        _seed_session(enabled)
+        report = enabled.dream()
+        assert report.aggregation_nodes_built == 3
+        assert report.aggregation_nodes_reused == 2
+        assert report.aggregation_fusion_failures == 1
+        assert report.aggregation_input_episodes == 41
+        assert report.aggregation_blocking == "exact:no_vec_extension"
+
+        row = enabled.conn.execute(
+            "SELECT aggregation_nodes_built, aggregation_nodes_reused, "
+            "       aggregation_fusion_failures, aggregation_input_episodes, "
+            "       aggregation_blocking "
+            "FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row["aggregation_nodes_built"] == 3
+        assert row["aggregation_nodes_reused"] == 2
+        assert row["aggregation_fusion_failures"] == 1
+        assert row["aggregation_input_episodes"] == 41
+        assert row["aggregation_blocking"] == "exact:no_vec_extension"
+    finally:
+        enabled.close()
+
+
 def test_dream_run_skipped_records_lock_skip(hy):
     _seed_session(hy)
     hy.conn.execute(
@@ -182,6 +285,7 @@ def test_recent_dream_runs_returns_dicts(hy):
         "id", "started_at", "ended_at",
         "sessions_processed", "chunks_seen", "chunks_processed",
         "chunks_embedded", "triples_extracted", "markers_extracted",
+        "aggregation_nodes_built", "aggregation_nodes_reused",
         "skipped_locked", "error",
     }
     assert expected_keys.issubset(rows[0].keys())

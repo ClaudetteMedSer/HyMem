@@ -35,7 +35,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- (same skip mechanics as digested_prompt_version, but decoupled so a
     -- profile-prompt bump alone re-extracts). Migration 019 adds this for
     -- existing DBs (ALTER lives there only).
-    profile_prompt_version TEXT
+    profile_prompt_version TEXT,
+    -- Highest message id covered by a successful digest. The digest reads only
+    -- chunks ABOVE this watermark, so a long-lived session's tail keeps getting
+    -- digested instead of the head being re-read forever (the truncation was
+    -- `combined[:max_chars]` over the whole session), and new traffic re-opens
+    -- the digest even when no chunk was freshly extracted. NULL = no coverage
+    -- recorded, so the next dream digests from the start of the session.
+    -- Migration 024 adds this for existing DBs (ALTER lives there only).
+    digested_message_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -213,7 +221,8 @@ CREATE TABLE IF NOT EXISTS knowledge_graph (
         'uses','depends_on','prefers','rejects','avoids',
         'replaces','conflicts_with','deploys_to','part_of','equivalent_to',
         'implements','contains','configured_with','requires_version',
-        'runs_on','connects_to','generates','tested_by'
+        'runs_on','connects_to','generates','tested_by',
+        'owns','located_in','participates_in','has_attribute'
     )),
     object_canonical TEXT NOT NULL,
     pos_evidence INTEGER NOT NULL DEFAULT 0,
@@ -503,7 +512,44 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     edges_embedded INTEGER NOT NULL DEFAULT 0,
     triples_extracted INTEGER NOT NULL DEFAULT 0,
     markers_extracted INTEGER NOT NULL DEFAULT 0,
+    aggregation_nodes_built INTEGER NOT NULL DEFAULT 0,
+    aggregation_nodes_reused INTEGER NOT NULL DEFAULT 0,
+    aggregation_fusion_failures INTEGER NOT NULL DEFAULT 0,
+    aggregation_input_episodes INTEGER NOT NULL DEFAULT 0,
+    aggregation_blocking TEXT NOT NULL DEFAULT '',
+    -- v25 digest attribution: a per-session digest that raises or returns an
+    -- unparseable payload is logged and skipped (one bad session must not abort
+    -- a dream), and episode creation can stall silently while chunks keep
+    -- arriving — the 2026-07-30 starvation bug. These make both visible without
+    -- a join against episodes.
+    digest_failures INTEGER NOT NULL DEFAULT 0,
+    episodes_created INTEGER NOT NULL DEFAULT 0,
     skipped_locked INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dream_runs_started ON dream_runs(started_at);
+
+-- v23: `always_on` Rules as a first-class node type (Idea B). Standing
+-- behavioral imperatives ("always run the tests before pushing") injected into
+-- every augment() context via ctx.rules; scope='contextual' rules fire only on
+-- trigger_entities overlap with matched_entities. Bi-temporal like
+-- knowledge_graph / user_profile (a contradicting rule closes invalid_at rather
+-- than overwriting); text UNIQUE so re-assert reinforces. See hymem/rules.py.
+-- Constraint (additional_planning.md §0): NOT fed into the RAPTOR digest anchor.
+CREATE TABLE IF NOT EXISTS rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL DEFAULT 'always_on'
+        CHECK (scope IN ('always_on', 'contextual')),
+    trigger_entities TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'user'
+        CHECK (source IN ('user', 'agent_inferred')),
+    pos_evidence INTEGER NOT NULL DEFAULT 1,
+    neg_evidence INTEGER NOT NULL DEFAULT 0,
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'retracted')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_rules_active ON rules(scope, status, invalid_at);

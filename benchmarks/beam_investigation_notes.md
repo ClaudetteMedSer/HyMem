@@ -293,14 +293,130 @@ reorder. See *Open levers*.
       resolves updates correctly **when both values reach it** — the blend broke
       that by rearranging which turns reach the answerer. **Turn-level recency is
       the wrong axis.** Reverted; tombstone comment left in `search()`.
-- [ ] **Populate `valid_at`/`invalid_at` (schema v15) from BEAM** — the box run
-      proved this is the **dominant** KU failure mode, not a residual. The fix is
-      fact-validity recency: extract update semantics during dreaming ("updated to
-      X" / "changed to X" asserts new validity; "per the X" / "originally X" is a
-      reference, not a re-assertion), set `valid_at`/`invalid_at`, and at retrieval
-      prefer the fact with the latest `valid_at` (suppress invalidated values).
-      Core bi-temporal path, **LME-validated** — not an adapter reorder, not
-      BEAM-hand-fit. This is now the primary KU lever.
+- [~] **Fact-validity recency via schema-v15 `valid_at`/`invalid_at`** — the
+      dominant KU failure mode (not a residual). LME-driven, core, not BEAM-hand-fit.
+      Progress (all local + deterministic; LME A/B pending on the box):
+      - **Step 0 (done):** repro test `tests/test_ku_update_supersession_repro.py`
+        pins the gap — a single update emits only positive evidence, so the old
+        edge stays active. Settled the routing: the real extraction prompt is
+        tech-stack-framed and unreliable on value updates; even when it emits a
+        `replaces`/`-1`, nothing acts on it (read-only at query time; one negative
+        can't trip phase3). The detector + correctness discriminator already exist
+        in `query/conflicts.py` (`_competing_objects`, functional predicates) but
+        are read-only.
+      - **Step 1 (landed, flag default OFF):** `hymem/dreaming/value_supersession.py`
+        — a dream-cycle consumer that retracts the older-`valid_at` edge among
+        competing **typed-value** objects (numeric/%/count via
+        `kg_evidence.value_numeric`, `value_unit` as compatibility key), closing
+        `invalid_at` at the winner's `valid_at`. Gated by
+        `cfg.value_supersession_enabled`. Typed-value scoping keeps multi-valued
+        facts safe. Test flips green with the flag on; full suite green.
+      - **v1 box result (2026-06-13): DID NOT FIRE.** Full LME-S 500q treatment =
+        70.6% (KU 87.2%) but `bitemporal.value_superseded count=0` across all 500
+        dream cycles (vs thousands of `valid_at_stamped` — stamping runs fine, the
+        supersede query returns empty). Root cause confirmed by sampling 10 of 500
+        per-question DBs: 207 kg_evidence rows, **1** with `value_numeric` populated
+        (a lone `$120` on a `prefers` edge, no competing pair). DeepSeek captures the
+        number in `object_canonical` but doesn't tag `value_numeric` → v1's
+        `HAVING has_numeric=1` matched nothing. Discriminator-too-narrow, NOT
+        lever-fails, exactly as pre-checked.
+      - **v2 (uncommitted, flag still OFF):** discriminator now PARSES
+        `object_canonical` (`_classify_object` → `("num",unit)`/`("date",None)`/`None`;
+        free text never competes). Adds DATE objects (april_1→april_5) and UNTAGGED
+        numerics (count 5→7) — the LME-KU value classes. `value_numeric` kept as a
+        fast-path only. Per-supersession INFO log `bitemporal.supersede subj=.. pred=..
+        old=.. new=..` = free collateral audit. Suite 668 green.
+      - **A/B protocol (v2):** `longmemeval_adapter.py --value-supersession`,
+        full-dream, `--sample 500`, 3 paired repeats vs canonical 70.0. **Cheapest
+        gate first:** `grep "bitemporal.supersede"` in the treatment dream log —
+        `count>0` AND a clean audit (all updates, no `prefers`/multi-valued rows)
+        before spending on scored interpretation. Then OVERALL (G4 guard, hold ~70
+        ±1.5pp) + knowledge-update strict (target, >±5pp to clear noise) + collateral
+        watch on multi-session / single-session-preference / knowledge-update_abs.
+      - **Then:** if a clean numeric multi-value shows in the audit, add a
+        single-valued-predicate gate; decide date/version representation; default flip.
+      - **v2 box result (2026-06-14): correct, but LME-S can't exercise it.** Count
+        still 0, for a STRUCTURAL reason: across 100 DBs the parser found 37 groups —
+        ~31 same-object reinforcement, 2 competing-but-SAME-`valid_at`, **0 cross-session
+        updates**. LME-S embeds value changes intra-session (one `valid_at`), so the
+        tie-breaker correctly skips. Critically, the one near-fire — `sahara_yoga_studio
+        contains 5_class_package / 10_class_package` (two studios, identical pattern) —
+        is a MULTI-VALUED `contains` (a studio offers both tiers), i.e. a would-be FALSE
+        POSITIVE saved only by the shared `valid_at`. ⇒ do NOT lower the tie-breaker
+        (the box's own suggestion) — same `valid_at` = no temporal basis = must not
+        supersede. The scored A/B was SKIPPED (confirmed no-op; paying to verify
+        70.0==70.0 is the waste to avoid).
+      - **Mechanism VALIDATED separately (green):** `test_value_supersession_across_sessions`
+        — two SEPARATE sessions, distinct world dates (Jan 20 → Mar 35); flag ON retracts
+        the older, `invalid_at`=newer `valid_at`, stale gone from retrieval; flag OFF
+        no-op. Proves classify→group→compare end-to-end for a dataset (BEAM) that DOES
+        drift cross-session. Suite 670 green. **v2 lands DORMANT (flag OFF), no LME claim.**
+      - **v3 + v3.1 + GUARD CLEARED → DEFAULT FLIPPED ON (2026-07-02).** v3 adds a
+        VERSION class (`("ver", prefix_key)`: dotted numeric cores, alpha prefix =
+        compatibility key, canonicalized `2_3_1`/`python_3_12` shapes recognised;
+        `sprint_3`/`endpoint_v2`/`node_20` excluded — no dotted core). v3.1 (external
+        bug report, confirmed): the string parse is now AUTHORITATIVE over the
+        `has_numeric` fast-path — a free-text object with tagged `value_numeric` (a
+        year in a possession name) no longer enters the numeric pool; `ev_unit`
+        survives only as fill-only unit refinement for bare numbers; the v3 ver-wins
+        special case is subsumed by class-first ordering. **Guard A/B (500q, same
+        codebase, v3.1): OVERALL 70.8→71.6 (+0.8pp), KU 80.8→83.3 (+2.5pp), 3 firings
+        across 500 questions — all legit `has_attribute` updates, ZERO false
+        positives.** Causal footprint ≤3 questions ⇒ every larger per-category delta
+        (SS-P +13.3pp) is provably mostly run noise; **LME sizing is CLOSED
+        (structurally underpowered)** — note it fired at all only because the v9
+        personal-predicate extension lifted extraction coverage. Default flipped ON as
+        a correctness call (digest anchor / profile / ask() / conflicts() hygiene);
+        the `bitemporal.supersede` INFO audit line is the production tripwire; the
+        adapter now pins the flag explicitly both ways (`--no-value-supersession` =
+        historical flag-off control arm matching the pre-flip canonical 70.0).
+- [ ] **[MEM]-consumption lever (the real KU lever; BEAM not LME-S).** KU zeros were
+      8/8 [MEM] (raw turns), but the graph never re-ranks/annotates [MEM] with its
+      validity knowledge; [MEM] dates are MENTION-time (why the Borda blend failed).
+      Asset: post-supersession graph = validity oracle (active=current@valid_at,
+      retracted=stale@invalid_at) + provenance kg_evidence→chunks→messages links
+      edges↔turns. Principle: **additive annotation, never reorder** (Borda broke 4
+      working cases by pulling turns up). Layers: **L1** date the [FACT] tier with
+      `valid_at` (closes the "graph dating deferred" TODO, beam_adapter.py:566 — the
+      winner already shows alone post-supersession, dating lets it out-authority a
+      stale dated [MEM]); **L2** annotate a [MEM] whose source edge is retracted
+      (`[MEM .. — superseded by ..]`, needs msg-id on each hit); **L3 (opt)** validity
+      boost keyed on `valid_at` not mention-time, gated + measured alone. **Coverage
+      gate first (cheap probe):** for the KU zeros, did the gold value mint a graph
+      edge at all? If mostly NO, the bottleneck is EXTRACTION coverage, not ranking,
+      and the lever's ceiling is low until that's fixed. Cheapest path: probe + ship L1.
+      - **COVERAGE PROBE RESULT (2026-06-14): bottleneck IS extraction, lever DEFERRED.**
+        `ku_probe.py --dream` (new `_gold_edges` table scan, S-scale): **10/72 KU gold
+        values minted as edges (14%)**; **KU zeros = 10/10 NO** (after matcher
+        hardening; box's raw run showed 2 false YES from substring coincidence —
+        `ford`→`ford_mustang_shelby`, `tennis`→`nike_..._tennis_shoes` — now fixed:
+        whole-token + numeric/≥2-token/single-exact "pin" rule). All 10 YES are
+        `active` (when extraction fires it gets the CURRENT value right; 0 stale-only).
+        ⇒ the gold value lives ONLY in raw turns, never the graph — confirms the 8/8
+        [MEM] finding. [MEM]-consumption L1–L3 has a LOW CEILING; do NOT build it yet.
+        value_supersession stays dormant. The missed values are PERSONAL attributes /
+        possessions / preferences (Ford F-150 truck, tennis schedule) — consistent
+        with the settled "extraction prompt is tech-stack-framed" finding. **Real KU
+        lever is now UPSTREAM: extraction coverage of personal-life value facts.**
+      - **v9 EXTRACTION EXTENSION LANDED (2026-06-14, uncommitted).** Chose "full
+        extend" (predicates + de-tech the prompt). Added 4 predicates to
+        ALLOWED_PREDICATES + both prompt templates: `owns`, `located_in`,
+        `participates_in`, `has_attribute` (personal-fact examples + broadened
+        entity-types/"concrete named things"; routing substring "structured technical
+        relationships" PRESERVED — de-tech is additive: "...and personal-life facts").
+        `prompt_version` v8→v9. Routing keywords added (owns/lives in/plays/age...);
+        dropped "have" (too generic). The locked predicate CHECK forced a
+        knowledge_graph table-rebuild migration **021** (EXPECTED_SCHEMA_VERSION 20→21;
+        CHECK expanded, NOT dropped; rebuild preserves edge ids + kg_evidence FK +
+        indexes, verified by `test_v21_rebuilds_predicate_check_preserving_data_and_fk`).
+        Tests: `test_personal_predicates.py`. Suite 676 green.
+      - **NEXT (box): re-run the coverage probe to measure the lift.**
+        `python ku_probe.py --dream --n 78` — does `>>> COVERAGE GATE` move off 10/72
+        (14%)? Cross-ref the KU zeros: do their gold values now mint edges? If coverage
+        rises → the [MEM]-consumption lever (L1 [FACT] dating + L2 stale-[MEM] annot.)
+        becomes worth building. If still flat → the prompt change isn't enough on
+        DeepSeek; reconsider. Watch BEAM/LME OVERALL for extraction-noise regression
+        from the broadened scope (G4 guard).
 - [ ] *(superseded)* turn-recency reorder and the block-tag sub-check — both moot;
       mention-order is the wrong axis (see the reverted blend above).
 - [ ] **Per-block sessions:** split each conversation's ~3 time-anchored blocks
@@ -332,3 +448,103 @@ reorder. See *Open levers*.
   (`answer`/`ideal`/`rubric`/`scores`) so runs can be re-judged and diffed.
 - **BEAM measures per-conversation memory.** Its conversations are independent
   personas; it cannot validly reward cross-conversation recall. Use LME for that.
+
+---
+
+## Answer-side ceiling: KU / CR / EO (2026-06)
+
+After exhausting the retrieval/assembly levers, three BEAM floors closed for the
+**same reason** — the answerer fails on context that is *already present*, not a
+retrieval or assembly gap. Recorded so we don't re-mine them.
+
+- **KU closed ~45%.** Graph coverage dead (values genuinely absent from the KG —
+  DeepSeek mints predicate + head noun but drops the value/quantifier, 1/207
+  `value_numeric`); a procedural KU prompt **regressed 45→20** (DeepSeek executes
+  the simple "use the latest value" clause better than an explicit procedure);
+  ranking/budget headroom zero (bucket split A=2 / **B=0** / C=70 — the
+  value-bearing turn is in context for 70/72 and the model mis-picks).
+  Synthesis-bound, same verdict as LME KU.
+- **CR ~52%, answer-side.** Both contradiction sides are always in context; the
+  model answers the surface question instead of flagging the planted negation.
+  Mid-pack, not a floor — not worth procedural-prompt risk.
+- **EO assembly fix LANDED, then EO closed ~10.7%.** The fix: lead the EO context
+  with the date-sorted raw-turn timeline and demote the undated RAPTOR episode
+  nodes below it (`memories = dated + episodes + other`, was `episodes + dated +
+  other`) — the model orders by *presentation order*, so leading with undated
+  summaries sabotaged the chronological sort. A/B = **+1.9pp (8.8→10.7%)**, 8/11
+  changed favoring it; **keep it**. But a composition probe then showed zero vs
+  non-zero EO contexts are statistically identical on every axis (unique dates
+  4.2 vs 4.3, etc.), and the one regression (Conv 19) had *varied* dates and still
+  failed — so the **event-date-extraction hypothesis is falsified**; EO is
+  answer-side too. Both models fail EO ⇒ task ceiling, not answerer-fixable.
+
+### Answerer-swap A/B — DeepSeek vs Gemini 2.5 Flash (CONFOUNDED)
+
+A `--answer-model provider:model` knob (env `BEAM_ANSWER_MODEL`) swaps the
+**answerer only** — extraction + dream stay DeepSeek, and the **judge stays
+DeepSeek** so scoring is held constant. Adapter-only; HyMem ships no backend.
+(`ANSWER_PROVIDERS` registry + `resolve_answer_provider`; `LLMClient` gained a
+`base_url` arg.)
+
+Result: KU 30.0→7.5 (−22.5), CR 51.9→63.1 (**+11.2, 11 conv wins**), EO
+10.3→12.4 (+2.1 = noise), OVERALL 50.6→42.7 (−7.9); IE **−28.8**, MR **−23.4**.
+
+- **Floors move on a pure answerer swap ⇒ answer-side diagnosis CONFIRMED.**
+- **But the run is confounded — do not build per-ability routing off it.** IE is
+  the most retrieval-trivial ability; a strong model does not lose 29pp at basic
+  extraction. Broad simultaneous IE+MR+KU collapse is the signature of a
+  systematic artifact, not cognition. Two confounds to rule out first: (1) **API
+  errors** — `LLMClient.chat` returns `[LLM_ERROR]` after 3 retries, scoring 0 on
+  *every* ability (grep the predictions / check call counts; ≥~10% ⇒ re-run with
+  longer backoff); (2) **prompts + judge are DeepSeek-tuned** — we held both fixed
+  while swapping the answerer, so we measured "Gemini on DeepSeek-shaped prompts,
+  DeepSeek-judged" (pull IE/KU zero transcripts: correct-but-mis-shaped/abstained
+  → artifact; genuinely-wrong → real).
+- **Survives regardless:** CR +11pp is robust (Gemini reasons contradictions
+  better); EO failing under *both* models double-confirms it as a task ceiling.
+- **Decision:** do **not** globally swap (net −7.9pp on this ability mix).
+  Per-ability model routing (Gemini→CR, DeepSeek→KU) is a candidate but **gated**
+  on the two confound checks above. Deferred for now.
+
+### Five-way answerer comparison (2026-06-16, 100K, DeepSeek judge)
+
+Added Granite 4.1 8B, Nemotron 30B, Command-R. OVERALL: DeepSeek 50.6 / Gemini
+42.7 / **Granite 51.6** / Nemotron 32.8 / Cmd-R 38.6. This **supersedes the
+earlier "grounded vs reasoning" hypothesis** — the real structure is a single
+**eagerness-to-answer** tradeoff axis.
+
+- **Two anti-correlated ability clusters.** *Extraction/utilization* (IE, KU, MR,
+  IF, PF) rewards producing the answer that's in context; *discrimination* (CR,
+  ABS) rewards *withholding* it (flag the contradiction; refuse when unsupported).
+  Models line up on how eager they are to answer:
+  - **Granite & Command-R (eager):** top the extraction cluster, bottom the
+    discrimination cluster. Command-R is the most eager → worst CR (**10.0%**, the
+    real CR floor) *and* worst ABS (55%) — one mechanism, two abilities.
+  - **Gemini (cautious):** mirror image — best CR (63.1) + best ABS (95), tanks
+    IE/KU/MR. The hedging that lost it the extraction cluster is what wins it
+    discrimination.
+  - **DeepSeek (balanced middle):** best CR among the competent extractors, strong
+    ABS, no cluster collapse → best all-rounder.
+- **Real, not noise.** Within each model CR and ABS move *together* and *opposite*
+  to IE/KU. A measurement/parse artifact would not selectively hit the two
+  withholding-abilities while sparing extraction ⇒ Command-R's CR=10 is a real
+  maximally-eager model that never withholds, not a glitch.
+- **EO confirmed STRUCTURAL.** Five architectures, none above 12.4% (Nemotron
+  0.5). Decisive evidence EO is not answer-side — the dated-first assembly fix is
+  the correct lever; stop testing answerers against EO.
+- **KU is answer-side elastic** (Granite 51.2 / Cmd-R 42.5 both beat DeepSeek 30)
+  — unlike EO. CR is an answer-side ceiling but DeepSeek already sits near its top.
+- **No single model dominates.** Granite edges overall only because this benchmark
+  weights extraction (5 abilities) over discrimination (2); weight CR/ABS more and
+  DeepSeek/Gemini win. The data-indicated config is a **2-bucket route** (eager
+  grounded → extraction abilities; cautious → CR/ABS) — e.g. Granite + Gemini
+  combines KU 51.2 + CR 63.1 + ABS 95 + IF 65, beating every single model. **This
+  is the deferred routing item; NOT built (architecture frozen per user).**
+- **One single model can only beat the tradeoff by going up a capability tier**
+  (GPT-4o / Claude / Qwen2.5-72B-class) calibrated enough to do both — at the cost
+  of the small/local/cheap appeal. No free 8B does both.
+- **Gating probe before trusting Gemini for the discrimination bucket:** are
+  Gemini's IE/KU zeros actually *refusals*? Grep its predictions for "I don't have
+  enough information"-type phrases. If yes, Gemini's whole profile reduces to one
+  over-refusal calibration knob (and its CR/ABS "wins" are that refusal landing
+  favorably) — a prompt tweak might recalibrate it rather than routing to it.

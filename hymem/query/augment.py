@@ -18,6 +18,7 @@ from hymem.query.entities import GraphCount, count_relations, match_known_entiti
 from hymem.query.intent import detect_ability_signal
 from hymem.query.predicate_routing import route_predicates
 from hymem.query.rerank import rerank as run_rerank
+from hymem.rules import Rule, load_rules
 from hymem.session import Message, recent_messages
 
 log = logging.getLogger("hymem.query.augment")
@@ -236,6 +237,17 @@ class AugmentedContext:
     extracted profile facts, when `cfg.profile_extraction_enabled` is False, or
     on a pre-v18 store. Capped at `cfg.profile_context_cap`, identity slots
     first; values are already redaction-scrubbed at persist time."""
+    rules: list[Rule] = field(default_factory=list)
+    """ACTIVE `always_on` Rules (schema v23) — standing behavioral imperatives
+    ("always run the tests before pushing", "never suggest Docker") loaded into
+    EVERY call when `cfg.rules_enabled` is set. `always_on` rules load
+    unconditionally; `contextual` rules load only when a `trigger_entities`
+    member overlaps `matched_entities`. ADDITIVE like the profile/aggregation
+    tiers: a standalone SELECT (`hymem.rules.load_rules`) that never consumes a
+    slot from any retrieval tier. Capped at `cfg.rules_context_cap`, `always_on`
+    first. Empty when `rules_enabled` is False or on a pre-v23 store. Values are
+    redaction-scrubbed at persist time. Deliberately NOT in the RAPTOR digest
+    anchor (additional_planning.md §0)."""
     digest: Digest | None = None
     """The standing whole-store root digest (see `HyMem.digest()`), populated
     only when `cfg.augment_include_digest` is True — the Stage-5 convenience
@@ -529,6 +541,14 @@ def augment(
         if e not in combined:
             combined.append(e)
     ctx.matched_entities = combined
+
+    # Idea B `always_on` Rules tier — loaded here (after matched_entities is
+    # resolved) so `contextual` rules can gate on entity overlap; `always_on`
+    # rules inject unconditionally. Its own SELECT, so purely additive — no
+    # other tier's budget is touched. Degrades to [] on a pre-v23 store.
+    if cfg.rules_enabled:
+        ctx.rules = load_rules(conn, ctx.matched_entities, cap=cfg.rules_context_cap)
+
     routed = route_predicates(user_message)
     ctx.graph_facts = _graph_lookup(
         conn, cfg, user_message, ctx.matched_entities, expansion_info, routed,
@@ -1483,6 +1503,8 @@ def _graph_lookup(
                 "entity_types": set(),
                 "overlap_tokens": set(),
                 "direct_anchor": False,
+                "multihop_score": 0.0,
+                "hop": 1,
             }
             candidates[key] = c
         return c
@@ -1546,6 +1568,18 @@ def _graph_lookup(
         for r in rows:
             _ensure(r)
 
+    # Source 4 — multi-hop expansion from DIRECTLY-anchored entities only.
+    # Chaining a fuzzy (token-overlap) link N times produces garbage, so seeds
+    # exclude overlap-only anchors. Additive: dedups against Sources 1/3 on
+    # (s, p, o) via `_ensure`, so a bridged edge that is also a direct/routed hit
+    # keeps its stronger native score and multi-hop never double-counts.
+    if cfg.graph_multihop_enabled:
+        direct_seeds = [e for e in entities if e not in overlap_info]
+        for d in _multihop_edges(conn, cfg, direct_seeds).values():
+            c = _ensure(d["row"])
+            c["multihop_score"] = max(c["multihop_score"], d["path_score"])
+            c["hop"] = d["hop"]
+
     # Recency-only seeding: if the fallback path has no candidates at all
     # (no entity match, no semantic hit), pull a small set of recent active
     # edges so the graph_facts list isn't empty when something could be shown.
@@ -1559,9 +1593,22 @@ def _graph_lookup(
         recency_weight = math.exp(-c["days_since"] / cfg.graph_recency_half_life_days)
         semantic_score = c["semantic_score"]
         in_routed = c["p"] in routed
+        # A candidate reached ONLY via multi-hop chaining (not a direct entity
+        # anchor, semantic hit, or routed predicate) scores by its compounding
+        # path_score — always below a 1-hop hit by construction (decay < 1), so
+        # the additive invariant holds: bridged edges add, never displace.
+        multihop_only = (
+            c["multihop_score"] > 0.0
+            and not c["entity_match"]
+            and not c["semantic_retrieved"]
+            and not in_routed
+        )
 
         why: list[str] = []
-        if fallback:
+        if multihop_only:
+            score = c["multihop_score"] * recency_weight
+            why.append(f"fallback:multihop:{c['hop']}hop")
+        elif fallback:
             if c["entity_match"]:
                 overlap_only = not c["direct_anchor"]
                 if overlap_only:
@@ -1624,6 +1671,121 @@ def _graph_lookup(
 
     results.sort(key=lambda f: f.score, reverse=True)
     return results[: cfg.graph_top_k]
+
+
+# Hard safety bound on BFS frontier width per hop. Not a tuning knob — a hub
+# node (e.g. `uv`) could otherwise explode the frontier and blow the query
+# latency budget; `graph_multihop_min_score` is the primary bound, this is the
+# backstop. Keep only the highest-scoring frontier nodes into the next hop.
+_MULTIHOP_FRONTIER_CAP = 256
+
+
+def _multihop_edges(
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+    seeds: list[str],
+) -> dict[tuple[str, str, str], dict]:
+    """Read-only BFS outward from seed entities up to `cfg.graph_multihop_max_hops`
+    edges, returning the bridging edges that 1-hop retrieval (Source 1) misses.
+
+    Each returned edge carries a compounding `path_score` = product over the chain
+    of (smoothed_confidence × `graph_multihop_decay`), so a longer chain is strictly
+    weaker than a shorter one. Only edges at hop >= 2 are returned: the first BFS
+    round traverses the seeds' own 1-hop edges, which Source 1 already retrieves —
+    re-emitting them would double-count. (The Idea-A sketch's `range(1, max_hops)`
+    stopped one round short and mislabeled those 1-hop edges as hop-2; the loop
+    below runs `max_hops` rounds and emits from round 2 on, so `max_hops=2` reaches
+    the true 2-hop bridge — verified by tests/test_multihop.py.)
+
+    Returns `{(s, p, o): {"row": sqlite3.Row, "path_score": float, "hop": int}}`.
+    """
+    if cfg.graph_multihop_max_hops < 2 or not seeds:
+        return {}
+
+    seeds_set = set(seeds)
+    reached: dict[str, float] = {s: 1.0 for s in seeds}  # node -> best path score
+    out: dict[tuple[str, str, str], dict] = {}
+    frontier = list(seeds)
+
+    for hop in range(1, cfg.graph_multihop_max_hops + 1):
+        if not frontier:
+            break
+        ph = ",".join("?" * len(frontier))
+        rows = conn.execute(
+            _EDGE_SELECT
+            + f"""
+            WHERE status = 'active'
+              AND (subject_canonical IN ({ph}) OR object_canonical IN ({ph}))
+            """,
+            frontier + frontier,
+        ).fetchall()
+
+        next_scores: dict[str, float] = {}
+        for r in rows:
+            conf = (r["pos"] + 1.0) / (r["pos"] + r["neg"] + 2.0)
+            # Never emit a seed-incident edge: it is 1-hop from a seed and Source 1
+            # already has it (emitting would double-count / mislabel it as a bridge).
+            seed_incident = r["s"] in seeds_set or r["o"] in seeds_set
+            for near, far in ((r["s"], r["o"]), (r["o"], r["s"])):
+                if near not in reached:
+                    continue
+                path_score = reached[near] * conf * cfg.graph_multihop_decay
+                if path_score < cfg.graph_multihop_min_score:
+                    continue
+                if hop >= 2 and not seed_incident:  # emit true bridges only
+                    key = (r["s"], r["p"], r["o"])
+                    prev = out.get(key)
+                    if prev is None or path_score > prev["path_score"]:
+                        out[key] = {"row": r, "path_score": path_score, "hop": hop}
+                if far not in reached or path_score > reached[far]:
+                    reached[far] = path_score
+                    if path_score > next_scores.get(far, 0.0):
+                        next_scores[far] = path_score
+        # Advance the strongest frontier nodes into the next hop — but apply the
+        # hub guard first. A super-hub (degree > graph_multihop_hub_degree_max) is
+        # REACHED (it stays in `reached`, so an edge INTO it can still emit) but is
+        # never EXPANDED: fanning out from it would make every one of its leaves a
+        # 2-hop "bridge" of every other leaf (`road_trip ← user → driving_trip`),
+        # flooding graph_top_k with hub-mediated non-bridges and diluting the true
+        # bridge out of recall. A genuine intermediate (degree ~2) is far below the
+        # cap, so real chains still bridge. `<= 0` disables the guard.
+        candidates = sorted(next_scores, key=next_scores.get, reverse=True)
+        if cfg.graph_multihop_hub_degree_max > 0 and candidates:
+            probe = candidates[: _MULTIHOP_FRONTIER_CAP * 2]
+            degrees = _active_degrees(conn, probe)
+            candidates = [
+                n
+                for n in probe
+                if degrees.get(n, 0) <= cfg.graph_multihop_hub_degree_max
+            ]
+        frontier = candidates[:_MULTIHOP_FRONTIER_CAP]
+    return out
+
+
+def _active_degrees(
+    conn: sqlite3.Connection, nodes: list[str]
+) -> dict[str, int]:
+    """Active degree (count of active edges where the node is subject OR object)
+    for each node, in a single query — the hub guard's fan-out test in
+    `_multihop_edges`. A node absent from the result has degree 0. (A self-loop
+    edge, subject==object, is counted twice; those are effectively absent in this
+    graph, so degree == incident-edge count in practice.)"""
+    if not nodes:
+        return {}
+    ph = ",".join("?" * len(nodes))
+    rows = conn.execute(
+        f"""
+        SELECT node, COUNT(*) AS deg FROM (
+            SELECT subject_canonical AS node FROM knowledge_graph
+             WHERE status = 'active' AND subject_canonical IN ({ph})
+            UNION ALL
+            SELECT object_canonical AS node FROM knowledge_graph
+             WHERE status = 'active' AND object_canonical IN ({ph})
+        ) GROUP BY node
+        """,
+        nodes + nodes,
+    ).fetchall()
+    return {r["node"]: r["deg"] for r in rows}
 
 
 def _recency_edges(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:

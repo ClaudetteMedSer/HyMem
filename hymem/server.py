@@ -1,14 +1,18 @@
 """MCP server for HyMem.
 
-Exposes eight tools to the Hermes Agent platform:
-  hymem_capture  — log a full conversation at once + optionally dream (preferred)
-  hymem_log      — log one conversational turn (fallback for turn-by-turn use)
-  hymem_dream    — run a dreaming cycle (extract, consolidate, decay)
-  hymem_augment  — retrieve graph facts + FTS context for a user message
-  hymem_profile  — return USER.md (behavioral profile) + MEMORY.md (project insights)
-  hymem_digest   — return the standing whole-store memory digest (RAPTOR root)
-  hymem_alias    — register a surface-form alias for an entity
-  hymem_retract  — retract a wrongly extracted knowledge graph edge
+Exposes eleven tools to the Hermes Agent platform:
+  hymem_capture    — log a full conversation at once + optionally dream (preferred)
+  hymem_log        — log one conversational turn (fallback for turn-by-turn use)
+  hymem_dream      — run a dreaming cycle (extract, consolidate, decay)
+  hymem_augment    — retrieve graph facts + FTS context for a user message
+  hymem_ask        — ask the memory a question, get one LLM-reasoned answer
+  hymem_profile    — return USER.md (behavioral profile) + MEMORY.md (project insights)
+  hymem_digest     — return the standing whole-store memory digest (RAPTOR root)
+  hymem_alias      — register a surface-form alias for an entity
+  hymem_retract    — retract a wrongly extracted knowledge graph edge
+  hymem_add_rule   — record a standing behavioral rule (always_on / contextual)
+  hymem_list_rules — list the active standing rules
+  hymem_suggest_rules — propose inferred standing rules to review (no auto-add)
 
 Run via the installed entry point:
     hymem-server
@@ -22,12 +26,21 @@ hymem/contrib/openai_client.py for the full list).
 Key variables:
     HYMEM_LLM_API_KEY        API key for the extraction LLM (or DEEPSEEK_API_KEY)
     HYMEM_LLM_BASE_URL       Base URL (default: https://api.deepseek.com)
-    HYMEM_LLM_MODEL          Model name (default: deepseek-chat)
+    HYMEM_LLM_MODEL          Model name (default: deepseek-v4-flash)
     HYMEM_EMBEDDING_API_KEY  API key for embeddings (falls back to LLM key)
     HYMEM_EMBEDDING_BASE_URL Embedding endpoint (default: https://api.deepseek.com)
     HYMEM_EMBEDDING_MODEL    Embedding model (default: deepseek-embedding)
     HYMEM_ROOT               Directory for hymem.sqlite, MEMORY.md, USER.md
                              (default: ~/.hermes)
+    HYMEM_AGGREGATION_NODES_ENABLED
+                             Turn on the RAPTOR aggregation/digest layer at dream
+                             time (default: off). Set true to gather steady-state
+                             nodes/reused cost data before flipping the shipped
+                             default (raptor_digest_plan.md 3c).
+    HYMEM_AGGREGATION_DIGEST_ENABLED
+                             Override the digest sub-switch independently (default:
+                             on whenever aggregation is enabled). Set false to
+                             measure level-0 node-build cost in isolation.
 
 If the embedding client cannot be constructed (e.g. API key absent), the server
 logs a warning and falls back to FTS-only retrieval — no other functionality
@@ -36,6 +49,8 @@ is affected.
 from __future__ import annotations
 
 import json
+import logging
+import os
 
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
 # Re-exported here under the historical names used by tests and tool helpers.
@@ -137,6 +152,10 @@ def _do_augment(message: str) -> str:
     return "\n\n".join(parts) if parts else ""
 
 
+def _do_ask(question: str) -> str:
+    return _get_hy().ask(question).answer
+
+
 def _do_profile() -> str:
     hy = _get_hy()
     cfg = hy.config
@@ -169,6 +188,44 @@ def _do_alias(surface: str, canonical: str) -> str:
 def _do_retract(subject: str, predicate: str, object: str) -> str:
     ok = _get_hy().retract_edge(subject, predicate, object)
     return "retracted" if ok else "no matching active edge found"
+
+
+def _do_add_rule(text: str, scope: str = "always_on", trigger_entities: str = "") -> str:
+    triggers = [t.strip() for t in trigger_entities.split(",") if t.strip()] or None
+    try:
+        rid = _get_hy().add_rule(text, scope=scope, trigger_entities=triggers, source="user")
+    except ValueError as e:
+        return f"error: {e}"
+    return f"rule #{rid} added (scope={scope})"
+
+
+def _do_list_rules() -> str:
+    active = _get_hy().rules()
+    if not active:
+        return "No standing rules set."
+    lines = []
+    for r in active:
+        tag = (r.scope if r.scope == "always_on"
+               else f"contextual({', '.join(r.trigger_entities)})")
+        lines.append(f"#{r.id} [{tag}] {r.text}")
+    return "\n".join(lines)
+
+
+def _do_suggest_rules(limit: int = 10) -> str:
+    try:
+        cands = _get_hy().suggest_rules(limit=limit)
+    except RuntimeError as e:
+        return f"error: {e}"
+    if not cands:
+        return ("No rule candidates (no recent markers cleared the durability "
+                "tagger). Suggestions read UNCONSOLIDATED markers — call after "
+                "logging a session and before dreaming.")
+    lines = ["Candidate standing rules — NOT added yet; adopt with hymem_add_rule:"]
+    for c in cands:
+        prov = f"{c.marker_count} marker(s)/{c.session_count} session(s), conf {c.confidence:.2f}"
+        dup = "  [already active — would reinforce]" if c.already_active else ""
+        lines.append(f"- {c.text}  ({prov}; kinds={','.join(c.kinds)}){dup}")
+    return "\n".join(lines)
 
 
 # ── MCP tool registration ─────────────────────────────────────────────────────
@@ -227,6 +284,21 @@ def hymem_augment(message: str) -> str:
     return _do_augment(message)
 
 
+def hymem_ask(question: str) -> str:
+    """Ask the memory store a question and get one reasoned answer.
+
+    The dialectic counterpart to hymem_augment: instead of returning raw
+    retrieval context for YOU to interpret, this runs the same retrieval and
+    makes a single LLM call that synthesizes a grounded answer — quoting
+    concrete values and dates, stating both sides of a contradiction (most
+    recent statement wins), hedging low-confidence facts, and saying plainly
+    when the memory does not contain the answer. Use it for direct questions
+    about the user or past sessions ("what database does the user prefer?");
+    use hymem_augment when you want the raw evidence tiers instead.
+    """
+    return _do_ask(question)
+
+
 def hymem_profile() -> str:
     """Return the user's behavioral profile and project insights.
 
@@ -275,16 +347,68 @@ def hymem_retract(subject: str, predicate: str, object: str) -> str:
     return _do_retract(subject, predicate, object)
 
 
+def hymem_add_rule(text: str, scope: str = "always_on", trigger_entities: str = "") -> str:
+    """Record a STANDING RULE — a behavioral instruction to always follow.
+
+    Rules are imperatives about HOW to behave ("always run the tests before
+    pushing", "never suggest Docker"), distinct from facts. An `always_on` rule
+    (default) is injected into every future context call; a `contextual` rule
+    fires only when one of its trigger entities is in play.
+
+    Use this when the user TELLS you a standing preference or prohibition — not
+    for one-off facts (those are logged as messages and extracted at dream time).
+
+    Arguments:
+        text             — the rule, phrased as a directive.
+        scope            — "always_on" (default) or "contextual".
+        trigger_entities — for scope="contextual" only: a comma-separated list
+                           of entities that activate the rule (e.g. "redis,cache").
+    """
+    return _do_add_rule(text, scope, trigger_entities)
+
+
+def hymem_list_rules() -> str:
+    """List all active standing rules (with ids), so you can see what behavioral
+    rules are in force before answering. Each line is `#id [scope] text`."""
+    return _do_list_rules()
+
+
+def hymem_suggest_rules(limit: int = 10) -> str:
+    """Propose standing rules inferred from RECENT behavior, to review and confirm
+    — this does NOT add anything. Auto-adding inferred rules is deliberately off:
+    a rule injects into every future call, so a human/agent confirms first.
+
+    Each candidate shows its corroboration — how many markers over how many
+    distinct sessions support it (more sessions = more durable) — its confidence,
+    and its source kinds; ones matching an active rule are flagged. To adopt one,
+    call `hymem_add_rule` with its text; skip the rest. Reads unconsolidated
+    markers, so call it after logging a session and before dreaming."""
+    return _do_suggest_rules(limit)
+
+
 def main() -> None:
+    # Configure logging at the application entry point (never on import — that
+    # would clobber a host's handlers). Without this, the dream runner's
+    # log.info() lines — including "aggregate.built nodes=/reused=" and the
+    # aggregate.build_failure exception — are silently dropped, leaving the
+    # server with no operational visibility. Level is env-tunable.
+    logging.basicConfig(
+        level=os.environ.get("HYMEM_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     mcp_instance = _get_mcp()
     mcp_instance.tool()(hymem_capture)
     mcp_instance.tool()(hymem_log)
     mcp_instance.tool()(hymem_dream)
     mcp_instance.tool()(hymem_augment)
+    mcp_instance.tool()(hymem_ask)
     mcp_instance.tool()(hymem_profile)
     mcp_instance.tool()(hymem_digest)
     mcp_instance.tool()(hymem_alias)
     mcp_instance.tool()(hymem_retract)
+    mcp_instance.tool()(hymem_add_rule)
+    mcp_instance.tool()(hymem_list_rules)
+    mcp_instance.tool()(hymem_suggest_rules)
     mcp_instance.run()
 
 

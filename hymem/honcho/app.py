@@ -36,6 +36,7 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("pip install 'hymem[server]'") from exc
 
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
+from hymem import rules as rules_mod
 from hymem.bootstrap import get_instance as _get_hy, set_instance as set_hy
 from hymem.core import db as core_db
 from hymem.dreaming.scheduler import DreamScheduler
@@ -408,10 +409,10 @@ def get_context(
         cfg.memory_md_path.read_text(encoding="utf-8")
         if cfg.memory_md_path.exists() else ""
     )
-    user_text = (
-        cfg.user_md_path.read_text(encoding="utf-8")
-        if cfg.user_md_path.exists() else ""
-    )
+    # Standing rules ride ahead of MEMORY.md in the returned summary.
+    rules_block = _rules_block()
+    if rules_block:
+        memory_text = rules_block + ("\n\n" + memory_text if memory_text.strip() else "")
 
     session_row = hy.conn.execute(
         "SELECT summary FROM sessions WHERE id = ?", (session_id,)
@@ -444,7 +445,7 @@ def get_context(
     return {
         "summary": summary_obj,
         "messages": messages,
-        "peer_representation": user_text,
+        "peer_representation": _peer_representation(),
         "peers": [{"id": role} for role in peer_roles],
     }
 
@@ -512,10 +513,26 @@ def search_peer_messages(
     return _augment_messages(body.query, body.limit, "", workspace_id)
 
 
+def _rules_block() -> str:
+    """The STANDING RULES tier rendered for the Honcho representation/context —
+    always_on + contextual imperatives the agent must follow, ahead of MEMORY.md
+    (BrainDB's always_on injects into every context call). Empty when the tier is
+    disabled or no rules exist; degrades to '' on a pre-v23 store."""
+    hy = _get_hy()
+    if not hy.config.rules_enabled:
+        return ""
+    active = rules_mod.list_rules(hy.conn)
+    if not active:
+        return ""
+    return "=== STANDING RULES (always follow) ===\n" + "\n".join(
+        f"- {r.text}" for r in active
+    )
+
+
 def _peer_representation() -> str:
-    """The user-representation text the peer card/context endpoints return:
-    the standing root digest (when the aggregation layer has built one) above
-    USER.md. The digest is HyMem's analogue of Honcho's dialectic user model —
+    """The user-representation text the peer card/context and session context
+    endpoints return: the standing root digest (when the aggregation layer has
+    built one) above USER.md. The digest is HyMem's analogue of Honcho's dialectic user model —
     a whole-store "what do you know about me?" narrative — so it belongs on
     exactly the endpoints the SDK reads a user representation from. Rendered
     via Digest.as_context_block(), whose footer carries coverage + generated_at
@@ -524,6 +541,9 @@ def _peer_representation() -> str:
     hy = _get_hy()
     cfg = hy.config
     parts: list[str] = []
+    rules_block = _rules_block()          # standing rules lead — always-follow tier
+    if rules_block:
+        parts.append(rules_block)
     digest = hy.digest()
     if digest is not None:
         parts.append(digest.as_context_block())
@@ -604,6 +624,17 @@ def get_peer_context(
             summary_obj = adapters.summary_obj(memory_text, "memory")
 
     return {
+        # honcho-ai's PeerContextResponse requires peer_id/target_id and
+        # declares the representation field as `representation` with no alias
+        # (SessionContext, by contrast, maps `peer_representation` correctly).
+        # Without all three the SDK either raises a ValidationError or silently
+        # drops the value — either way SDK consumers (e.g. the Hermes harness
+        # prefetch path) got an empty representation from this route. Send the
+        # required ids plus both representation names so the digest arrives
+        # without a client-side patch.
+        "peer_id": peer_id,
+        "target_id": target or peer_id,
+        "representation": peer_representation,
         "summary": summary_obj,
         "messages": messages,
         "peer_representation": peer_representation,

@@ -1,0 +1,35 @@
+{
+  "description": "Track A example probe — hand-built 2-hop chains + 1-hop controls. Reproduces the tests/test_multihop.py chains at probe scale so multihop_probe.py runs end-to-end and documents the labeled-JSON schema. Replace `edges`/`items` with the mined LME/BEAM slice (hand-labeled bridging edges) for the real G-A1 read.",
+  "edges": [
+    {"subject": "atta", "predicate": "part_of", "object": "medflow"},
+    {"subject": "medflow", "predicate": "deploys_to", "object": "fly.io"},
+    {"subject": "atta", "predicate": "owns", "object": "laptop"},
+    {"subject": "bob", "predicate": "part_of", "object": "acme"},
+    {"subject": "acme", "predicate": "located_in", "object": "berlin"},
+    {"subject": "carol", "predicate": "uses", "object": "postgres"},
+    {"subject": "carol", "predicate": "part_of", "object": "dataco"},
+    {"subject": "dataco", "predicate": "runs_on", "object": "aws"},
+    {"subject": "unrelated", "predicate": "connects_to", "object": "k8s"}
+  ],
+  "items": [
+    {"id": "mh-atta", "set": "multihop", "route": false,
+     "question": "where is the project atta works on deployed?",
+     "seeds": ["atta"], "bridge": ["medflow", "deploys_to", "fly.io"]},
+    {"id": "mh-bob", "set": "multihop", "route": false,
+     "question": "where is bob's team located?",
+     "seeds": ["bob"], "bridge": ["acme", "located_in", "berlin"]},
+    {"id": "mh-carol", "set": "multihop", "route": false,
+     "question": "what does carol's project run on?",
+     "seeds": ["carol"], "bridge": ["dataco", "runs_on", "aws"]},
+
+    {"id": "ctl-atta", "set": "control", "route": false,
+     "question": "what does atta own?",
+     "seeds": ["atta"], "bridge": ["atta", "owns", "laptop"]},
+    {"id": "ctl-bob", "set": "control", "route": false,
+     "question": "what is bob part of?",
+     "seeds": ["bob"], "bridge": ["bob", "part_of", "acme"]},
+    {"id": "ctl-carol", "set": "control", "route": false,
+     "question": "what does carol use?",
+     "seeds": ["carol"], "bridge": ["carol", "uses", "postgres"]}
+  ]
+}

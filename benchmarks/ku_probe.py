@@ -31,6 +31,7 @@ Usage (on the Hermes box, from benchmarks/):
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 import tempfile
@@ -68,6 +69,144 @@ def _answer_in(text: str, answer: str) -> bool:
 def _date10(created_at: str) -> str:
     """Leading YYYY-MM-DD of an ISO created_at, or '' if absent/short."""
     return created_at[:10] if created_at and len(created_at) >= 10 else ""
+
+
+def _gold_value_tokens(answer: str) -> list[str]:
+    """Discriminating tokens of the gold value: any token carrying a digit (a
+    number/size/version) or an alpha word >3 chars (a brand/name). Short
+    stopwords are dropped so the edge match isn't swamped."""
+    out = []
+    for t in re.split(r"[^a-z0-9]+", (answer or "").lower()):
+        if t and (any(c.isdigit() for c in t) or len(t) > 3):
+            out.append(t)
+    return out
+
+
+# ── Spoiler (a)/(b) auto-classifier ──────────────────────────────────────────
+# A "spoiler" is a turn dated AFTER the newest answer-bearing turn — it out-dates
+# the new value and can mislead a naive latest-date-wins clause. Two fates with
+# OPPOSITE fixes: (a) STALE-VALUE re-assertion (a later turn restates an OLD value
+# for the same attribute — unfixable from raw turns, recency is genuinely wrong)
+# vs (b) TANGENTIAL mention (the turn touches the topic but carries no value — a
+# value-aware clause skips it, recoverable). Because spoilers by construction never
+# contain the gold value (a turn that did would BE answer-bearing and move the
+# anchor), any value of the SAME SHAPE as the gold sitting in a spoiler is a
+# COMPETING (stale) value ⇒ (a). No same-shape value ⇒ (b).
+_MONEY = re.compile(r"[$€£]\s?\d|\bdollars?\b|\busd\b", re.I)
+_DURATION = re.compile(r"\b\d{1,2}:\d{2}\b|\b\d+\s*(?:hours?|hrs?|minutes?|mins?|seconds?|secs?)\b", re.I)
+_NUMWORD = re.compile(r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|once|twice)\b", re.I)
+_NUM = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+_MONTH = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", re.I)
+
+
+def _value_shape(text: str) -> str | None:
+    """Coarse shape of a value in `text`: money|time|date|num|None. Ordered
+    most-specific-first so '$400' reads as money, '25:50' as time, not num."""
+    text = text or ""
+    if _MONEY.search(text):
+        return "money"
+    if _DURATION.search(text):
+        return "time"
+    if _MONTH.search(text):
+        return "date"
+    if _NUMWORD.search(text) or _NUM.search(text):
+        return "num"
+    return None
+
+
+def _classify_spoiler(spoiler_text: str, answer: str) -> str:
+    """'a' (stale-value), 'b' (tangential), or '?' (gold has no value shape —
+    a location/boolean/venue — so a shape match can't decide it; eyeball)."""
+    gshape = _value_shape(answer)
+    if gshape is None:
+        return "?"
+    return "a" if _value_shape(spoiler_text) == gshape else "b"
+
+
+def _spoiler_verdict(spoilers, answer: str) -> tuple[str, list[str]]:
+    """Roll a question's spoiler turns into one verdict: 'a' if ANY spoiler
+    carries a competing same-shape value (the recency clause CAN'T win), 'b' if
+    all are tangential (a value-aware clause recovers it), '?' if shapeless gold.
+    Returns (verdict, per_spoiler_tags)."""
+    tags = [_classify_spoiler(_norm(getattr(h, "text", "")), answer) for h in spoilers]
+    if not tags:
+        return "b", tags
+    if "?" in tags and not any(t == "a" for t in tags):
+        return "?", tags
+    return ("a" if "a" in tags else "b"), tags
+
+
+def _gold_edges(conn, answer: str) -> list[tuple]:
+    """COVERAGE PROBE: does the gold value exist as a knowledge_graph EDGE at
+    all — minted by extraction, regardless of whether retrieval surfaced it?
+
+    This is the extraction-vs-ranking fork for the [MEM]-consumption lever. The
+    `graph_facts` tier shows only RETRIEVED edges (top-k, relevance-filtered); a
+    direct table scan tells us instead whether the value ever entered the graph.
+    Matching is WHOLE-TOKEN (no substring), and a hit only counts as coverage
+    when it PINS the value rather than sharing a common word: a numeric/size
+    token matches, OR >=2 gold tokens match, OR the gold value is a single token
+    that matches exactly. This rejects token-coincidence false positives — gold
+    "Ford F-150" {ford,150} hitting "ford_mustang_shelby" (only "ford", no
+    numeric) — that a bare substring/any-token match produced. Returns
+    (row, matched_tokens) per qualifying edge.
+
+    The haystack folds in the kg_evidence value fields (surface_object,
+    value_text, value_numeric, value_unit) per edge, JOINed in: a knowledge-update
+    VALUE frequently lands in the evidence row rather than object_canonical, and an
+    object-only scan is blind to it. NOTE the residual word/digit gap — gold "four"
+    won't token-match value_numeric "4.0"; the dump (--dream NO rows) is the ground
+    truth when the matcher can't bridge that."""
+    toks = _gold_value_tokens(answer)
+    if not toks:
+        return []
+    rows = conn.execute(
+        "SELECT kg.subject_canonical AS s, kg.predicate AS p, kg.object_canonical AS o, "
+        "       kg.status AS st, kg.valid_at AS v, kg.invalid_at AS iv, "
+        "       GROUP_CONCAT(COALESCE(e.surface_object,''), ' ') AS so, "
+        "       GROUP_CONCAT(COALESCE(e.value_text,''), ' ')    AS vt, "
+        "       GROUP_CONCAT(COALESCE(e.value_numeric,''), ' ') AS vn, "
+        "       GROUP_CONCAT(COALESCE(e.value_unit,''), ' ')    AS vu "
+        "FROM knowledge_graph kg "
+        "LEFT JOIN kg_evidence e ON e.edge_id = kg.id "
+        "GROUP BY kg.id"
+    ).fetchall()
+    out = []
+    for row in rows:
+        hay = f"{row['s']} {row['o']} {row['so'] or ''} {row['vt'] or ''} {row['vn'] or ''} {row['vu'] or ''}"
+        hay_toks = set(re.split(r"[^a-z0-9]+", hay.lower()))
+        matched = [t for t in toks if t in hay_toks]
+        if not matched:
+            continue
+        numeric_hit = any(any(c.isdigit() for c in t) for t in matched)
+        strong = numeric_hit or len(matched) >= 2 or (len(toks) == 1 and len(matched) == 1)
+        if strong:
+            out.append((row, matched))
+    return out
+
+
+def _all_edges_with_values(conn) -> list:
+    """GROUND TRUTH for a NO row: every edge in this question's graph with its
+    kg_evidence value fields, so a human/LLM can eyeball where the gold value
+    actually is. Three fates the fuzzy matcher can't distinguish but the eye can:
+      (1) value sits in object_canonical/surface/value_* under different PHRASING
+          (gold "four" vs "4_korean_restaurants") -> matcher gap, value IS present
+          -> the [MEM]-consumption lever's prerequisite is met after all;
+      (2) value is genuinely ABSENT from every field -> extraction still missed it
+          -> L1-L3 have a low ceiling, redirect upstream (box's claim is wrong);
+      (3) value in a free-text object the predicate didn't structure.
+    Per-question DBs are small (one question's sessions), so we dump all edges."""
+    return conn.execute(
+        "SELECT kg.subject_canonical AS s, kg.predicate AS p, kg.object_canonical AS o, "
+        "       kg.status AS st, kg.valid_at AS v, "
+        "       GROUP_CONCAT(COALESCE(e.surface_object,''), '|') AS so, "
+        "       GROUP_CONCAT(COALESCE(e.value_text,''), '|')     AS vt, "
+        "       GROUP_CONCAT(COALESCE(e.value_numeric,''), '|')  AS vn, "
+        "       GROUP_CONCAT(COALESCE(e.value_unit,''), '|')     AS vu "
+        "FROM knowledge_graph kg "
+        "LEFT JOIN kg_evidence e ON e.edge_id = kg.id "
+        "GROUP BY kg.id ORDER BY kg.subject_canonical, kg.predicate"
+    ).fetchall()
 
 
 def probe_question(adapter: HyMemAdapter, q: dict, top_k: int) -> dict:
@@ -339,18 +478,44 @@ def print_report(r: dict, top_k: int, show_graph: bool) -> None:
     # The decisive eyeball: turns that out-date the new value. Classify each
     # (a) STALE-VALUE re-assertion (unfixable) vs (b) TANGENTIAL mention (fixable).
     if r["answer_present"] and not r["answer_on_latest"] and r["spoilers"]:
+        answer = str(r["q"].get("answer", ""))
+        verdict, tags = _spoiler_verdict(r["spoilers"], answer)
+        label = {"a": "(a) STALE-VALUE — unfixable from raw turns",
+                 "b": "(b) TANGENTIAL — value-aware clause recovers",
+                 "?": "(?) shapeless gold — EYEBALL"}[verdict]
         print(f"  --- SPOILERS: turns dated AFTER the new value ({r['ans_latest_date']}) "
-              f"— classify (a) stale-value vs (b) tangential ---")
-        for h in r["spoilers"]:
+              f"— auto-verdict {label} ---")
+        for h, tag in zip(r["spoilers"], tags):
             d = _date10(getattr(h, "created_at", ""))
             role = getattr(h, "role", "?")
             text = _norm(getattr(h, "text", ""))[:160]
-            print(f"    [{d}] ({role:>9}) {text}")
+            print(f"    [{tag}] [{d}] ({role:>9}) {text}")
     if show_graph and r["graph_facts"]:
         print(f"  --- graph_facts (UNDATED tier — conflict check) ---")
         for f in r["graph_facts"][:12]:
             print(f"    [FACT conf={getattr(f, 'confidence', 0):.2f}] "
                   f"{getattr(f, 'subject', '')} {getattr(f, 'predicate', '')} {getattr(f, 'object', '')}")
+    if show_graph:
+        ge = r.get("gold_edges") or []
+        print(f"  GOLD VALUE as graph edge   : {'YES' if ge else 'NO'}  "
+              f"({len(ge)} matching edge(s); table scan, not retrieval) "
+              f"[coverage: was the value extracted at all?]")
+        for row, matched in ge[:8]:
+            print(f"    [{row['st']:>9} v={(row['v'] or '')[:10] or '----------'}] "
+                  f"{row['s']} {row['p']} {row['o']}  «match {','.join(matched)}»")
+        if not ge:
+            ae = r.get("all_edges") or []
+            print(f"  --- GROUND-TRUTH edge dump ({len(ae)} edge(s); is the gold value "
+                  f"present-but-unmatched, or absent?) ---")
+            if not ae:
+                print(f"    (no edges minted at all for this question)")
+            for row in ae[:30]:
+                vals = "  ".join(
+                    f"{lbl}={row[k]}" for lbl, k in
+                    (("so", "so"), ("vt", "vt"), ("vn", "vn"), ("vu", "vu"))
+                    if (row[k] or "").strip("| "))
+                print(f"    [{row['st']:>9}] {row['s']} {row['p']} {row['o']}"
+                      + (f"   {{{vals}}}" if vals else ""))
 
 
 def run_ranking(ku: list[dict], args) -> None:
@@ -540,6 +705,14 @@ def main() -> None:
                 adapter.dream_and_wait()
                 ctx = adapter.hy.augment(q["question"], ability=r["ability"])
                 r["graph_facts"] = list(getattr(ctx, "graph_facts", None) or [])
+                # COVERAGE GATE: did the gold value mint an edge at all (vs only
+                # living in raw turns)? Direct table scan, not retrieval-filtered.
+                r["gold_edges"] = _gold_edges(adapter.hy.conn, str(q.get("answer", "")))
+                # On a NO, dump the whole graph+evidence so we can SEE whether the
+                # value is present-but-unmatched (matcher gap) or genuinely absent
+                # (extraction miss) — the fork that decides if L1/L2 is worth it.
+                if not r["gold_edges"]:
+                    r["all_edges"] = _all_edges_with_values(adapter.hy.conn)
             reports.append(r)
             print_report(r, args.top_k, args.dream)
         except Exception as e:
@@ -574,14 +747,42 @@ def main() -> None:
           f"(naive latest-date-wins — pessimistic floor)")
     print(f"  present-but-NOT-latest (spoiled)  : {len(present_not_latest)}/{n}  "
           f"across {spoiler_turns} spoiler turns to classify above")
+    if args.dream:
+        edge_present = sum(1 for r in reports if r.get("gold_edges"))
+        print()
+        print(f"  >>> COVERAGE GATE — gold value present as graph edge : {edge_present}/{n}")
+        print(f"      (direct knowledge_graph scan; the [MEM]-consumption lever's prerequisite)")
+        print(f"      LOW  -> bottleneck is EXTRACTION coverage, not [MEM] ranking; L1-L3 have a")
+        print(f"              low ceiling until extraction captures the value. Redirect upstream.")
+        print(f"      HIGH -> value IS in the graph; L1 ([FACT] dating) + L2 (stale-[MEM] annot.)")
+        print(f"              can consume it. CROSS-REF the per-question YES/NO against the KU zeros.")
+    # ── Spoiler (a)/(b) auto-tally: the KU headroom question ─────────────────
+    # Each present-but-not-latest question gets one verdict (any same-shape
+    # competing value among its spoilers = (a) stale; all tangential = (b)).
+    # Shapeless-gold questions land in (?) for manual eyeball.
+    verdicts = {"a": [], "b": [], "?": []}
+    for r in present_not_latest:
+        v, _ = _spoiler_verdict(r["spoilers"], str(r["q"].get("answer", "")))
+        verdicts[v].append(r["q"].get("question_id", "?"))
+    a, b, u = len(verdicts["a"]), len(verdicts["b"]), len(verdicts["?"])
+    pnl = len(present_not_latest)
     print()
-    print("  CEILING of a VALUE-AWARE clause = (on-latest + tangential-spoiled)/n.")
-    print("  Read the SPOILER blocks above and count, per spoiled question:")
-    print("    (a) STALE-VALUE re-assertion  -> unfixable from raw turns (recency is genuinely wrong)")
-    print("    (b) TANGENTIAL topic mention  -> a value-aware clause skips it (recoverable)")
-    print("  If (b) dominates -> ceiling is high, a value-aware clause + dating is worth one run.")
-    print("  If (a) shows up often -> raw-turn recency can't separate it; consider the graph")
-    print("  (value-bearing edges, --dream) or stop — KU's big lift is already banked under permissive.")
+    print(f"  >>> SPOILER SPLIT (of the {pnl} present-but-not-latest) — auto-classified:")
+    print(f"        (a) STALE-VALUE  : {a:>3}  unfixable from raw turns (recency genuinely wrong)")
+    print(f"        (b) TANGENTIAL   : {b:>3}  a value-aware clause recovers these")
+    print(f"        (?) shapeless    : {u:>3}  location/boolean/venue gold — EYEBALL these")
+    # Optimistic recoverable ceiling treats (?) as recoverable; pessimistic as not.
+    ceil_lo = (ans_latest + b)
+    ceil_hi = (ans_latest + b + u)
+    print(f"      VALUE-AWARE CLAUSE CEILING ≈ (on-latest {ans_latest} + recoverable) / {n}")
+    print(f"        = {ceil_lo}/{n} ({100*ceil_lo//n}%) pessimistic  ..  "
+          f"{ceil_hi}/{n} ({100*ceil_hi//n}%) optimistic (counts (?) as recoverable)")
+    print(f"      READ: if (b) dominates → recency-clause headroom, worth one tuning run.")
+    print(f"            if (a) dominates → raw-turn recency can't separate it → KU is")
+    print(f"            synthesis-bound (the LME KU verdict); stop spending on KU retrieval.")
+    print(f"      Spot-check the (?) and a few (a) SPOILER blocks above to trust the split.")
+    if verdicts["?"]:
+        print(f"      (?) question_ids: {', '.join(verdicts['?'][:20])}")
 
 
 if __name__ == "__main__":

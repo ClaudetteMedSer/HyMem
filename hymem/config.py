@@ -138,9 +138,11 @@ class HyMemConfig:
     store the probe (benchmarks/cluster_size_probe.py, 2026-06-12) found ONE
     component of 348 episodes spanning 61 sessions — fusing that yields a mush
     summary. Components larger than the cap are split deterministically into
-    recency-ordered windows of at most this many episodes (full windows aligned
-    to the newest end; an undersized oldest window is dropped by the normal
-    min-members/min-sessions policy). 0 translates to None (uncapped) at the
+    recency-ordered windows of at most this many episodes (full windows
+    anchored at the OLDEST end so between-dream arrivals only re-fuse the
+    newest tail window — see cluster_episodes — and the undersized newest
+    window is dropped by the normal min-members/min-sessions policy). 0
+    translates to None (uncapped) at the
     `cluster_episodes` call sites — matching the `aggregation_digest_anchor_facts`
     "0 disables" house style."""
 
@@ -263,6 +265,54 @@ class HyMemConfig:
     the cap keeps the tier from bloating host prompts. Identity slots sort
     first, so they always survive the cut. `HyMem.profile()` is uncapped."""
 
+    rules_enabled: bool = True
+    """Idea B: load the `always_on` Rules tier (`hymem/rules.py`) into
+    `ctx.rules` on every `augment()` call — standing behavioral imperatives
+    ("always run the tests before pushing", "never suggest Docker") that are
+    rules, not facts/preferences. `always_on` rules inject unconditionally;
+    `contextual` rules inject only on a `trigger_entities`/`matched_entities`
+    overlap. Purely additive (own SELECT, never a retrieval competitor). ON by
+    default since the box adherence gate cleared 2026-07-27 (answerer
+    deepseek-v4-flash, INDEPENDENT judge gpt-oss-120b, threshold 0.8, ON>OFF —
+    `benchmarks/rules_compliance.py`). Inert until rules exist: an empty `rules`
+    table (or a pre-v23 store) yields an empty tier, so the default adds no cost
+    until a host calls `add_rule()`."""
+    rules_context_cap: int = 16
+    """Max ACTIVE rules `augment()` returns in `ctx.rules` — `always_on` first,
+    then triggered `contextual`, stable by insertion order. Bounds the fixed
+    per-call token cost the rules tier adds to every context."""
+    rules_extraction_enabled: bool = False
+    """Idea B write-side: during Phase-2 consolidation, route the imperative,
+    durable sub-slice of `behavioral_markers` (rejection/style, and imperative-
+    shaped corrections) into the `rules` table as `source='agent_inferred'`
+    rules — so a standing instruction the user *stated in passing* ("stop
+    suggesting Docker") becomes an always_on rule without a `add_rule()` call
+    and WITHOUT a new LLM call (it reuses markers the dream already extracted).
+    Off by default: an auto-rule injects into EVERY context, so a false positive
+    is costly — flip only after the extraction precision probe clears on real
+    dream markers (`benchmarks/rule_extraction_probe.py`; precision is the gated
+    metric, not recall). Independent of `rules_enabled` (read side)."""
+    rules_extraction_mode: str = "lexical"
+    """Idea B write-side routing instrument (`hymem/rules_extract.py`), active only
+    when `rules_extraction_enabled`. `lexical` = the deterministic classifier
+    (`rule_scope_for_marker`, ~14% precision on real markers — the baseline arm).
+    `llm` = an LLM durability tag decides (route iff standing AND confidence ≥
+    `rules_extraction_confidence_min`); ONE batched call per dream, and it returns
+    a canonical rule form that collapses paraphrases. `llm_fastpath` = trust a
+    lexical imperative modal as standing (no call) and send only the ambiguous
+    rest to the LLM. Arms are compared head-to-head by
+    `benchmarks/rule_extraction_experiment.py`; the winning arm is what flips the
+    write-side default. `lexical` keeps the current behaviour with no LLM cost."""
+    rules_extraction_confidence_min: float = 0.75
+    """Min LLM standing-confidence to mint a rule in `llm`/`llm_fastpath` mode.
+    Higher = more precise, fewer rules. Swept by the extraction experiment to the
+    point where precision clears 0.90 at max recall; the sweep result sets this."""
+    rules_extraction_batch_size: int = 20
+    """Markers per durability call in `llm`/`llm_fastpath` mode. A real judge is
+    accurate on a small batch but collapses to all-non-standing on a large one
+    (deepseek-v4-flash: 100% at 10, 0% at 111), so a dream's markers are judged in
+    sub-batches of this size. Lower if a weaker judge still collapses."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 
@@ -297,6 +347,35 @@ class HyMemConfig:
     graph_token_overlap_max_per_entity: int = 5
     """Max token-overlap expansions allowed per matched canonical."""
 
+    graph_multihop_enabled: bool = False
+    """Source 4 of `_graph_lookup`: query-time read-only BFS from directly-anchored
+    entities across ALL predicates (vs. offline `inference.py`, which only chains
+    `depends_on`). Bridges edges 1-hop retrieval misses — e.g.
+    `atta —part_of→ medflow —deploys_to→ fly.io` from the seed `atta`. Additive
+    (never filters; multi-hop-only candidates are discounted below any direct hit).
+    Off by default — flip only after the bridging-edge recall probe clears the LME
+    guard (Track A / `additional_planning.md` Idea A; tests/test_multihop.py)."""
+    graph_multihop_max_hops: int = 2
+    """Max chain length (edges from a seed) explored by Source 4. `2` reaches the
+    bridge two edges out (the cheap first step, most of the gain); `3` goes deeper.
+    < 2 disables the traversal entirely."""
+    graph_multihop_decay: float = 0.5
+    """Per-hop score multiplier (< 1) so a longer chain is strictly weaker than a
+    shorter one — BrainDB's compounding edge-weight model. A fresh 2-hop chain
+    scores ~conf²·decay² ≈ 0.5²·0.5² so it never outranks a 1-hop direct hit."""
+    graph_multihop_min_score: float = 0.05
+    """Prune frontier paths whose compounding score falls below this — bounds
+    fan-out from hub nodes and keeps the query path LLM-free and fast."""
+    graph_multihop_hub_degree_max: int = 32
+    """Hub guard: a node whose active degree (edges where it is subject OR object)
+    exceeds this is REACHED but never EXPANDED — the BFS will not fan out through
+    it. In a personal-memory star every leaf is 2 hops from every other leaf via
+    the `user` hub (degree = all facts about the user), so expanding hubs emits a
+    flood of hub-mediated non-bridges (`road_trip ← user → driving_trip`) that
+    dilute the true bridge out of `graph_top_k`. A genuine intermediate entity
+    (`medflow`, degree ~2) stays well below this, so real chains still bridge. Set
+    ≤ 0 to disable the guard (raw traversal). Only active when multi-hop is on."""
+
     decay_window_days: int = 30
     decay_factor: float = 0.9
     retract_threshold: float = 0.15
@@ -319,6 +398,26 @@ class HyMemConfig:
     under many negatives). Keep small; raising shields more edges from
     retraction."""
 
+    value_supersession_enabled: bool = True
+    """Schema v15 bi-temporal consumer. When True, the dream cycle closes the
+    validity interval of an OLDER value-edge the moment a NEWER one supersedes it:
+    among active, non-derived edges sharing subject + predicate but differing on a
+    *typed-value* object (a number / percentage / count, a DATE, or a VERSION —
+    classified from the object string; `kg_evidence.value_numeric`/`value_unit`
+    only refine a bare number's missing unit), the edge with the earlier
+    `valid_at` is retracted and its `invalid_at` set to the newer edge's
+    `valid_at`. This is single-assertion supersession — one authoritative update
+    suffices — distinct from the evidence-accumulation retract rule above which
+    needs repeated negatives. Typed-value scoping means multi-valued facts (a
+    project using many tools) are never collapsed. Default ON since the LME
+    guard cleared (2026-07-02, 500q A/B: score-neutral +0.8pp overall, zero
+    false positives across all firings — a footprint the benchmark cannot size,
+    so the flip is a correctness call: a superseded edge left active is wrong
+    context for the digest anchor, profile, ask() and conflicts()). Every firing
+    logs `bitemporal.supersede ...` at INFO — a `prefers`/multi-valued row there
+    is the rollback signal. Set False to disable.
+    See `hymem/dreaming/value_supersession.py`."""
+
     reinforce_window_days: int = 30
     """Window for soft positive reinforcement from co-mention. Symmetric to
     decay_window_days."""
@@ -326,7 +425,7 @@ class HyMemConfig:
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    prompt_version: str = "v8"
+    prompt_version: str = "v9"
 
     dream_budget: int = 50
     """Maximum number of chunks to process per dreaming cycle."""
@@ -350,7 +449,15 @@ class HyMemConfig:
 
     retention_days: int = 90
     """Chunks newer than this are always kept regardless of graph references.
-    Also the age window for pruning old episodes and stale procedures."""
+    Also the age window for pruning stale procedures. Episodes are governed by
+    episode_retention_days instead."""
+
+    episode_retention_days: int = 0
+    """Age window for pruning old episodes; 0 (the default) keeps them forever.
+    Episodes are the leaves of the aggregation/digest tree, which full-rebuilds
+    from live episodes each dream — deleting them makes the digest forget, so
+    this is decoupled from retention_days. Set to a positive number of days to
+    restore age-based pruning."""
 
     message_retention_days: int = 90
     """Raw messages of a session are pruned once the session is older than this
@@ -409,6 +516,16 @@ class HyMemConfig:
     the pool exceeds `message_fts_top_k`. Set False to restore the raw-BM25
     behaviour (no extra rerank cost). No effect on the MR aggregate path, which
     counts rather than ranks."""
+
+    ask_max_context_chars: int = 8000
+    """Char budget for the rendered memory-context block `HyMem.ask()` sends to
+    the synthesis LLM. The block is assembled most-authoritative-first (profile
+    → graph facts → dated raw turns → ... → recent turns) and truncated from
+    the tail, so tightening the budget sheds the softest evidence first.
+    0 disables the cap."""
+
+    ask_max_tokens: int = 1024
+    """max_tokens for the single synthesis completion behind `HyMem.ask()`."""
 
     hedge_confidence_threshold: float = 0.75
     """Below this Laplace-smoothed confidence, a GraphFact is flagged

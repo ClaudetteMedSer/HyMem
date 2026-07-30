@@ -107,6 +107,15 @@ Write a comprehensive, specific summary of everything in the context that is rel
 Summarize whatever relevant material is present even if it looks incomplete; only say "I don't have enough information to answer this question" if the context contains nothing relevant at all.
 Do not add information that is not in the context."""
 
+# NB (2026-06-14): a dedicated procedural KU prompt was A/B'd and REGRESSED KU hard
+# (45%→20%, IE/ABS/OVERALL flat — additive design held, the regression was all KU).
+# DeepSeek executes the simple shared RECENCY_CONFLICT_CLAUSE ("use the latest value")
+# BETTER than an explicit "decide what's asked → find direct statements → check
+# recency → ignore different-kind mentions" procedure: the extra reasoning steps make
+# it abstain/mispick. So KU intentionally falls through to ANSWERING_SYSTEM_PROMPT —
+# do NOT re-add a procedural KU prompt. The spoiler-split headroom is real but it's
+# retrieval/selection-side, not promptable on this model.
+
 # Abilities not listed here fall through to ANSWERING_SYSTEM_PROMPT.
 ANSWERING_PROMPTS = {
     "PF": ANSWERING_PREFERENCE_PROMPT,
@@ -152,10 +161,10 @@ PUBLISHED_SOTA = {
 # ── LLM Client ────────────────────────────────────────────────────────────
 
 class LLMClient:
-    def __init__(self, model: str, api_key: str):
+    def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL):
         self.model = model
         self.api_key = api_key
-        self.base_url = DEEPSEEK_BASE_URL.rstrip("/")
+        self.base_url = base_url.rstrip("/")
         self.call_count = 0
 
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
@@ -184,6 +193,45 @@ class LLMClient:
         data = resp.json()
         self.call_count += 1
         return data["choices"][0]["message"].get("content", "")
+
+
+# ── Answer-model provider registry ────────────────────────────────────────
+# The BEAM ANSWERER is swappable to isolate the answer-side ceiling (KU/CR/EO
+# all fail on context that is already present, 2026-06) from extraction/assembly.
+# ONLY the answerer changes here: extraction + dream stay on DeepSeek
+# (HyMemAdapter, untouched), and the JUDGE stays DeepSeek always — swapping the
+# grader would move scores without moving capability, breaking the A/B. Each
+# provider exposes an OpenAI-compatible /chat/completions endpoint, so the same
+# LLMClient payload works. Spec form is "provider:model"
+# (e.g. "gemini:gemini-2.5-flash"); a bare model name ("deepseek-chat") stays on
+# DeepSeek for back-compat with the old --answer-model.
+ANSWER_PROVIDERS = {
+    "deepseek": ("https://api.deepseek.com", ("HYMEM_LLM_API_KEY", "DEEPSEEK_API_KEY")),
+    "gemini":   ("https://generativelanguage.googleapis.com/v1beta/openai", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
+    "openai":   ("https://api.openai.com/v1", ("OPENAI_API_KEY",)),
+}
+
+
+def resolve_answer_provider(spec: str, deepseek_key: str):
+    """Map an answer-model spec to (model, base_url, api_key, provider).
+
+    'provider:model' selects a provider and pulls its key from the first set
+    env var in that provider's tuple; a bare model name stays on DeepSeek and
+    reuses the already-resolved DeepSeek key. Exits if a non-DeepSeek provider
+    is selected without its key set."""
+    if ":" in spec and spec.split(":", 1)[0] in ANSWER_PROVIDERS:
+        provider, model = spec.split(":", 1)
+    else:
+        provider, model = "deepseek", spec
+    base_url, key_envs = ANSWER_PROVIDERS[provider]
+    if provider == "deepseek":
+        api_key = deepseek_key
+    else:
+        api_key = next((os.environ[e] for e in key_envs if os.environ.get(e)), "")
+        if not api_key:
+            print(f"ERROR: answer provider '{provider}' needs one of {key_envs} set.", flush=True)
+            sys.exit(1)
+    return model, base_url, api_key, provider
 
 
 # ── BEAM Dataset Loader ───────────────────────────────────────────────
@@ -269,6 +317,7 @@ def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
                     all_questions.append({
                         "ability": ability,
                         "ability_short": ABILITY_MAP.get(ability, ability[:3].upper()),
+                        "question_id": q.get("question_id") or q.get("id") or "",
                         "question": q.get("question", ""),
                         "ideal_answer": q.get("ideal_response", q.get("ideal_answer", "")),
                         "rubric": q.get("rubric", []),
@@ -516,7 +565,42 @@ class HyMemAdapter:
         return memories, total_matches
 
 
-def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str, total_matches: int = 0) -> str:
+# Opt-in transcript logging for localizing a category's floor (retrieval vs
+# answer-side). Set BEAM_CONTEXT_LOG=/path/to/file.txt to append, per question,
+# the EXACT assembled context the model saw (presented order, [MEM date]/[FACT]
+# tags intact) + the prediction. Zero cost when the env var is unset; wrapped so
+# a logging error can never break a benchmark run. Optionally narrow with
+# BEAM_CONTEXT_LOG_ABILITIES=CR,EO to only dump those abilities.
+def _log_context(question_id: str, ability: str, system_prompt: str,
+                 question: str, context: str, prediction: str) -> None:
+    path = os.environ.get("BEAM_CONTEXT_LOG")
+    if not path:
+        return
+    only = os.environ.get("BEAM_CONTEXT_LOG_ABILITIES", "")
+    if only and ability not in {a.strip() for a in only.split(",") if a.strip()}:
+        return
+    try:
+        sys_line = (system_prompt or "").strip().splitlines()[0] if system_prompt else ""
+        block = (
+            "\n================ CONTEXT LOG ================\n"
+            f"QID: {question_id or '(none)'}\n"
+            f"ABILITY: {ability}\n"
+            f"SYSTEM_PROMPT[0]: {sys_line}\n"
+            f"QUESTION: {question}\n"
+            f"---- CONTEXT ({len(context)} chars, presented order) ----\n"
+            f"{context}\n"
+            "---- PREDICTION ----\n"
+            f"{prediction}\n"
+            "============================================\n"
+        )
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(block)
+    except Exception as e:
+        print(f"      [context-log skipped: {type(e).__name__}: {e}]", flush=True)
+
+
+def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str,
+                    total_matches: int = 0, question_id: str = "") -> str:
     """Ask LLM to answer based on retrieved memories."""
     # Build context from memories
     parts = []
@@ -539,9 +623,15 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     # only ordering signal the answer model gets, and it cannot sort shuffled
     # snippets itself (every EO question failed that way).
     if ability == "EO":
-        # Episodes (the coverage overview search() loaded for EO) lead, so the
-        # char budget can't truncate them; then the dated raw-turn timeline;
-        # then any other undated tiers.
+        # The answer model orders events by PRESENTATION ORDER, not by reading the
+        # [MEM] dates (confirmed: 14/20 EO failures followed context order). So
+        # presentation order MUST be chronological. Earlier this block led with the
+        # UNDATED RAPTOR episode/aggregation nodes (for coverage) — but leading with
+        # undated summaries put non-timeline entries at the front and the model
+        # ordered by them, sabotaging the very signal we sorted. Lead with the
+        # date-sorted raw-turn timeline so following presentation order IS correct;
+        # demote the undated episodes BELOW it (kept for coverage, not truncated out
+        # by EO's doubled budget) and any other undated tiers last.
         episodes = [m for m in memories if m["type"] == "episode"]
         dated = sorted(
             (m for m in memories if m["type"] != "episode" and m.get("created_at")),
@@ -549,7 +639,7 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         )
         other = [m for m in memories
                  if m["type"] != "episode" and not m.get("created_at")]
-        memories = episodes + dated + other
+        memories = dated + episodes + other
     elif ability == "TR":
         dated = sorted(
             (m for m in memories if m.get("created_at")),
@@ -582,7 +672,9 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         {"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
-    return llm.chat(messages, temperature=0.0, max_tokens=1024)
+    prediction = llm.chat(messages, temperature=0.0, max_tokens=1024)
+    _log_context(question_id, ability, system_prompt, question, context, prediction)
+    return prediction
 
 
 def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_answer: str) -> dict:
@@ -650,7 +742,8 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
         print()
 
         # Answer
-        answer = answer_question(llm, memories, question, ability, total_matches)
+        answer = answer_question(llm, memories, question, ability, total_matches,
+                                 question_id=q.get("question_id", ""))
 
         # Judge
         judge_result = judge_answer(judge_llm, question, q["ideal_answer"], q["rubric"], answer)
@@ -730,7 +823,9 @@ def main():
     parser.add_argument("--scales", default=DEFAULT_SCALE)
     parser.add_argument("--sample", type=int, default=DEFAULT_SAMPLE)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
-    parser.add_argument("--answer-model", default=ANSWER_MODEL)
+    parser.add_argument("--answer-model", default=os.environ.get("BEAM_ANSWER_MODEL", ANSWER_MODEL),
+                        help="Answerer spec 'provider:model' (e.g. gemini:gemini-2.5-flash) "
+                             "or a bare DeepSeek model. Env: BEAM_ANSWER_MODEL.")
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
     parser.add_argument("--api-key", default="")
     parser.add_argument("--keep-db", action="store_true")
@@ -761,8 +856,9 @@ def main():
     print(f"  Scales: {scales}")
     print(f"  Max conversations: {max_conv or 'all'}")
     print(f"  Top-K: {top_k}")
-    print(f"  Answer model: {args.answer_model}")
-    print(f"  Judge model: {args.judge_model}")
+    ans_model, ans_base, ans_key, ans_provider = resolve_answer_provider(args.answer_model, DEEPSEEK_API_KEY)
+    print(f"  Answer model: {ans_model} (provider={ans_provider}, base={ans_base})")
+    print(f"  Judge model: {args.judge_model} (provider=deepseek)")
 
     # Temp DB
     tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-beam-"))
@@ -774,7 +870,7 @@ def main():
     hy.open()
 
     # LLM clients
-    answer_llm = LLMClient(args.answer_model, DEEPSEEK_API_KEY)
+    answer_llm = LLMClient(ans_model, ans_key, base_url=ans_base)
     judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY)
 
     # Load data

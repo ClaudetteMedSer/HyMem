@@ -97,6 +97,19 @@ def test_hymem_augment_returns_empty_when_no_context(hy):
     assert result == ""
 
 
+def test_hymem_ask_returns_synthesized_answer(hy, stub_llm):
+    sid = "ask-tool"
+    hy.open_session(sid)
+    hy.log_message(sid, "user", "My favorite database is duckdb.")
+    # Key the fixture on the retrieved fact: it only matches once the rendered
+    # memory context (carrying the logged turn) reaches the synthesis prompt.
+    stub_llm.fixtures["duckdb"] = "Your favorite database is duckdb."
+
+    srv.set_hy(hy)
+    result = srv._do_ask("what database do I like?")
+    assert result == "Your favorite database is duckdb."
+
+
 def test_hymem_profile_returns_user_and_memory_md(hy):
     hy.config.user_md_path.write_text("# Behavioral Profile\nPrefers terse code.", encoding="utf-8")
     hy.config.memory_md_path.write_text("# Project Insights\nUses uv for tooling.", encoding="utf-8")
@@ -179,3 +192,18 @@ def test_hymem_retract_succeeds_for_existing_edge(hy):
     srv.set_hy(hy)
     result = srv._do_retract("med_flow", "depends_on", "redis")
     assert result == "retracted"
+
+
+def test_hymem_add_and_list_rules(hy):
+    srv.set_hy(hy)
+    assert srv._do_add_rule("never suggest docker").startswith("rule #")
+    srv._do_add_rule("prefer pytest", "contextual", "pytest, tests")
+    listed = srv._do_list_rules()
+    assert "never suggest docker" in listed
+    assert "[always_on]" in listed
+    assert "contextual(" in listed and "pytest" in listed
+
+
+def test_hymem_add_rule_rejects_empty(hy):
+    srv.set_hy(hy)
+    assert srv._do_add_rule("   ").startswith("error")

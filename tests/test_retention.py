@@ -127,6 +127,9 @@ def test_prune_bookkeeping_keeps_newest(hy, cfg):
 
 
 def test_prune_episodes_and_procedures(hy, cfg):
+    # Default episode_retention_days=0: episodes are kept forever (they're the
+    # leaves of the digest tree), while stale procedures still age out on
+    # retention_days.
     conn = hy.conn
     _session(conn, "s", days_ago=0, summary=None)
     conn.execute(
@@ -152,11 +155,38 @@ def test_prune_episodes_and_procedures(hy, cfg):
 
     pruned = prune_episodes_and_procedures(conn, cfg)
 
-    assert pruned == 2  # e_old + p_stale_old
+    assert pruned == 1  # p_stale_old only; episodes never age out by default
     eps = {r["id"] for r in conn.execute("SELECT id FROM episodes").fetchall()}
-    assert eps == {"e_new"}
+    assert eps == {"e_old", "e_new"}
     procs = {r["id"] for r in conn.execute("SELECT id FROM procedures").fetchall()}
     assert procs == {"p_active_old", "p_stale_new"}
+
+
+def test_prune_episodes_opt_in_retention(hy, cfg):
+    # episode_retention_days > 0 restores age-based episode pruning, on its own
+    # cutoff (30 here) rather than retention_days (90): e_mid at -40 days goes
+    # too, proving the decoupling.
+    conn = hy.conn
+    opt_in = dataclasses.replace(cfg, episode_retention_days=30)
+    _session(conn, "s", days_ago=0, summary=None)
+    conn.execute(
+        "INSERT INTO episodes(id, session_id, title, summary, created_at) "
+        "VALUES ('e_old', 's', 'Old', 'old summary', datetime('now', '-200 days'))"
+    )
+    conn.execute(
+        "INSERT INTO episodes(id, session_id, title, summary, created_at) "
+        "VALUES ('e_mid', 's', 'Mid', 'mid summary', datetime('now', '-40 days'))"
+    )
+    conn.execute(
+        "INSERT INTO episodes(id, session_id, title, summary, created_at) "
+        "VALUES ('e_new', 's', 'New', 'new summary', datetime('now', '-1 days'))"
+    )
+
+    pruned = prune_episodes_and_procedures(conn, opt_in)
+
+    assert pruned == 2  # e_old + e_mid
+    eps = {r["id"] for r in conn.execute("SELECT id FROM episodes").fetchall()}
+    assert eps == {"e_new"}
     # FTS shadow stays in sync via the existing delete trigger.
     fts = conn.execute(
         "SELECT COUNT(*) AS c FROM episodes_fts WHERE episodes_fts MATCH 'old'"

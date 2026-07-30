@@ -271,7 +271,18 @@ BOTH-arms alternative is union-find order-dependent). Recency signal is
 clock; session_id is lexicographic, NOT chronological on the prod store); full
 windows align to the most-recent end so the one possibly-undersized window
 holds the OLDEST episodes — downstream min-members/min-sessions filtering then
-drops the least recent slice, never the newest. Applied at BOTH call sites
+drops the least recent slice, never the newest.
+**REVERSED 2026-07-05 (dream runs 685-693): windows now anchor at the OLDEST
+end.** Newest-end alignment shifted every window boundary whenever an episode
+joined the mega-component between dreams, re-keying all ~24 windows plus the
+rollup chain above them — reuse collapsed to ~30% on every episode-adding
+dream (the constant ~13 reused nodes were the small clusters outside the
+component). The 678/680 rowid ceiling (8b36501) couldn't catch this: it guards
+mid-build arrivals, not between-dream ones. Oldest-anchored windows confine an
+append to the still-filling newest tail window; the undersized-newest slice a
+min-size filter drops stays retrievable as episodes and enters the digest as
+leftover leaves. No salt bump (blocking precedent: member-set hashes re-key
+naturally). Applied at BOTH call sites
 (level-0 `select_clusters` and the rollup loop — a frontier mega-component
 would otherwise fuse from a truncation of itself). Salt bumped
 `cluster.v2 → cluster.v3` (membership semantics changed); `rollup.v2`/`root.v4`
@@ -331,6 +342,49 @@ stays TR-gated; enabling the layer is primarily for the digest.
 *Status 2026-06-12: criteria 1 and 2 MET (Stage 0 closed; guard built and
 verified ≤15 on the box). Steady-state reuse already looks right (34/34 on the
 no-change pass) — what remains is the week-scale cost observation, then flip.*
+
+**INSTRUMENTATION LANDED (2026-06-13, this branch).** The `nodes=/reused=`
+signal this criterion watches was only reaching a `log.info()` at
+`aggregate.py:711`, and the MCP server runs without `logging.basicConfig`, so
+production dropped it silently — we had the flat-34 circumstantial evidence but
+not the exact reused count. Fixed at the source instead of the log:
+`build_aggregation_nodes` now returns `AggregationResult(nodes, reused)`, and
+the runner persists BOTH into `dream_runs` per cycle (`aggregation_nodes_built`,
+`aggregation_nodes_reused` — schema v20, migration 020). `built` was likewise
+computed-then-dropped before this; both gaps closed. So the week-scale dataset
+now accrues durably as a queryable column rather than a scraped log line —
+captured forward from deploy (the June 11-12 runs stay unrecoverable: full-
+replace keeps no prior-membership baseline to diff, so no post-hoc DB
+reconstruction was possible). Secondary: added `logging.basicConfig` (env-tuned
+via `HYMEM_LOG_LEVEL`, default INFO) to the `hymem-server` entry point, which
+also closes the parallel blind spot where the `aggregate.build_failure`
+exception was being dropped. 663 tests green.
+
+**ENABLE PATH LANDED (2026-06-17, this branch).** The June-13 columns were
+accruing `0/0` every cycle because the layer was never actually ON in prod:
+`build_from_env` threaded only `root` into `HyMemConfig`, so the server always
+ran the `aggregation_nodes_enabled = False` default — there was no env var to
+flip it. (The flat-34 "steady-state reuse" was the June-12 one-shot demo
+script's nodes, not a production signal — production had never built any.) Three
+fixes so the week-scale data can actually start:
+- `HYMEM_AGGREGATION_NODES_ENABLED` (+ `HYMEM_AGGREGATION_DIGEST_ENABLED` to
+  isolate level-0 node-build cost from digest-rollup cost) are now resolved in
+  `resolve_env`/`build_from_env` via an overrides dict — an *unset* var stays
+  `None` and the dataclass default wins, so the shipped default stays off until
+  the flip, and a future default change stays authoritative.
+- A startup `log.info` confirms when the layer is enabled (and the effective
+  digest state), so a deploy can verify the flag took.
+- Re-added the counts to the `dream.end` log line (`agg_nodes=/agg_reused=`) —
+  they were persisted to `dream_runs` but absent from the log, so the grep-able
+  signal this criterion describes did not exist.
+*Status: criteria 1 and 2 still MET. Criterion 3 (week-scale cost) is now
+actually collectable — the clock starts at the next server deploy with
+`HYMEM_AGGREGATION_NODES_ENABLED=true`. Read it right: the first dream reports
+~all-built / ~zero-reused (full-replace wipes the stale demo nodes, whose
+member-set hashes no longer match the grown store); reuse climbs toward
+near-full on runs 2..N — that ratio is the flip signal. The flip itself stays
+the one-line config-default change, now backed by data rather than the demo
+pass.*
 
 ---
 

@@ -1,0 +1,22 @@
+-- v25: per-session digest attribution on dream_runs (2026-07-30).
+--
+-- The episode-starvation bug that migration 024 fixes went unnoticed for six
+-- days because NOTHING in dream_runs reported on the digest. `chunks_seen` grew
+-- monotonically (781 -> 906), `triples_extracted` stayed healthy, every run
+-- reported success — and zero episodes were created the whole time. Diagnosing
+-- it needed a join against the episodes table that nobody had reason to run.
+--
+-- Two counters make the same failure a one-line read, mirroring what
+-- aggregation_fusion_failures did for the fusion path in v22:
+--
+--   digest_failures  — per-session digest calls that raised or came back
+--     unparseable this run. The runner logs and continues (a bad session must
+--     not abort a dream), so without this the whole class is invisible.
+--   episodes_created — episodes written by this dream's digests. A pipeline
+--     that has stopped producing episodes while chunks keep arriving is then
+--     visible as a run of zeros next to a rising chunks_seen.
+--
+-- Forward-only and idempotent: duplicate-column errors are tolerated by the
+-- migration runner against schema.sql databases that already carry these.
+ALTER TABLE dream_runs ADD COLUMN digest_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE dream_runs ADD COLUMN episodes_created INTEGER NOT NULL DEFAULT 0;

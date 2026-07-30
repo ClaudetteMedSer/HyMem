@@ -263,6 +263,30 @@ def test_peer_context_representation_includes_digest(client, hy_with_embed):
     rep = r.json()["peer_representation"]
     assert "Works on HyMem and Hermes." in rep
     assert "prefers uv" in rep
+    # honcho-ai's PeerContextResponse expects `representation` (it has no
+    # alias for `peer_representation`), so the route sends both names.
+    assert r.json()["representation"] == rep
+
+
+def test_session_context_representation_includes_digest(client, hy_with_embed):
+    # The session-scoped context endpoint carries the same digest + USER.md
+    # representation as the peer routes, so harnesses that auto-inject from
+    # session context get the standing digest without an explicit call.
+    hy_with_embed.config.user_md_path.write_text(
+        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
+    )
+    _seed_root_digest(hy_with_embed)
+    sid = "s-ctx-digest"
+    hy_with_embed.open_session(sid)
+    hy_with_embed.log_message(sid, "user", "hello")
+    hy_with_embed.close_session(sid)
+
+    r = client.get(f"/v3/workspaces/hermes/sessions/{sid}/context")
+    assert r.status_code == 200
+    rep = r.json()["peer_representation"]
+    assert "Works on HyMem and Hermes." in rep
+    assert "prefers uv" in rep
+    assert rep.index("Works on HyMem and Hermes.") < rep.index("prefers uv")
 
 
 def test_peer_representation_plain_user_md_without_digest(client, hy_with_embed):
@@ -683,3 +707,30 @@ def test_every_supported_sdk_route_is_registered():
 
     missing = [(m, p) for m, p in supported if not _full_match(m, p)]
     assert not missing, f"SDK routes not registered (path+method): {missing}"
+
+
+def test_context_summary_leads_with_rules(client, hy_with_embed):
+    """A standing rule rides in the session context summary, ahead of MEMORY.md."""
+    hy_with_embed.add_rule("never suggest docker")
+    client.post(
+        "/v3/workspaces/hermes/sessions/s-rules/messages",
+        json={"messages": [{"content": "hi", "peer_id": "user-1"}]},
+    )
+    r = client.get("/v3/workspaces/hermes/sessions/s-rules/context")
+    assert r.status_code == 200
+    summary = r.json()["summary"]
+    assert summary and "STANDING RULES" in summary["content"]
+    assert "never suggest docker" in summary["content"]
+
+
+def test_peer_card_leads_with_rules(client, hy_with_embed):
+    """The peer card representation leads with rules, ahead of the USER.md profile."""
+    hy_with_embed.config.user_md_path.write_text(
+        "# Profile\n\n- prefers uv\n", encoding="utf-8"
+    )
+    hy_with_embed.add_rule("always run tests before pushing")
+    r = client.get("/v3/workspaces/hermes/peers/user-1/card")
+    assert r.status_code == 200
+    content = r.json()["content"]
+    assert "STANDING RULES" in content and "always run tests before pushing" in content
+    assert content.index("STANDING RULES") < content.index("prefers uv")

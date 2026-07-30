@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from hymem import portability
 from hymem import redaction
+from hymem import rules as rules_mod
 from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
@@ -29,6 +30,7 @@ from hymem.dreaming.runner import DreamReport, run_dreaming
 from hymem.dreaming.user_profile import ProfileEntry, load_profile
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
+from hymem.query.ask import Answer, ask as query_ask
 from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
 from hymem.query.conflicts import Conflict, find_conflicts
 from hymem.query.entities import (
@@ -78,12 +80,17 @@ def _ensure_embedding_server(timeout: float = 45.0) -> bool:
     if not base_url:
         return True
 
-    host = (urlsplit(base_url).hostname or "").lower()
+    parts = urlsplit(base_url)
+    host = (parts.hostname or "").lower()
     if host not in _LOCAL_HOSTS:
         # Remote provider: not ours to manage. Skip rather than fail.
         return True
 
-    health_url = base_url.rstrip("/") + "/health"
+    # Health lives at the server root, not under the OpenAI-style path segment
+    # base_url carries for /v1/embeddings (e.g. .../v1). Build it from the origin
+    # only — appending to base_url would probe /v1/health, which 404s, falsely
+    # reporting a healthy server as down (spurious restart + full-timeout stall).
+    health_url = f"{parts.scheme}://{parts.netloc}/health"
     if _embedding_health_ok(health_url):
         return True  # already up — nothing to do
 
@@ -278,6 +285,89 @@ class HyMem:
                 for role, content, created_at in prepared
             ]
 
+    def add_rule(
+        self,
+        text: str,
+        *,
+        scope: str = "always_on",
+        trigger_entities: list[str] | None = None,
+        source: str = "user",
+        supersedes: int | None = None,
+    ) -> int:
+        """Add (or reinforce) a standing behavioral rule; return its id.
+
+        Rules are the imperative subset of "always loaded" context ("always run
+        the tests before pushing", "never suggest Docker") — a first-class node
+        type (schema v23) injected into every `augment()` call via `ctx.rules`
+        when `cfg.rules_enabled` is set. `scope='always_on'` (default) injects
+        unconditionally; `scope='contextual'` injects only when a
+        `trigger_entities` member overlaps the call's matched entities.
+
+        Rules are often *told*, not inferred, so this mirrors the `HyMem.ask()`
+        direct-API pattern. `supersedes` closes a prior rule's validity interval
+        (bi-temporal — a contradicting instruction supersedes rather than
+        overwrites). Re-asserting identical text reinforces instead of
+        duplicating. Text is redaction-scrubbed at persist time.
+        """
+        with core_db.transaction(self.conn):
+            return rules_mod.add_rule(
+                self.conn,
+                text,
+                scope=scope,
+                trigger_entities=trigger_entities,
+                source=source,
+                supersedes=supersedes,
+            )
+
+    def retract_rule(self, rule_id: int) -> None:
+        """Retire a rule by closing its validity interval (`status='retracted'`
+        + `invalid_at`); it stops surfacing in `ctx.rules` but stays in the table
+        as auditable history. Idempotent."""
+        with core_db.transaction(self.conn):
+            rules_mod.retract_rule(self.conn, rule_id)
+
+    def rules(self) -> list[rules_mod.Rule]:
+        """Every ACTIVE rule (always_on + contextual), the whole rulebook — the
+        read-side counterpart to `add_rule`, mirroring `profile()`. Unlike the
+        per-call `ctx.rules` (trigger-gated, capped) this is the full set, for a
+        host that wants to show or audit what standing rules exist. Read-only."""
+        return rules_mod.list_rules(self.read_conn)
+
+    def suggest_rules(
+        self,
+        *,
+        limit: int | None = None,
+        mode: str = "llm",
+        confidence_min: float | None = None,
+    ) -> list[rules_mod.RuleCandidate]:
+        """Propose standing rules the durability tagger infers from recent
+        (unconsolidated) behavioral markers, ranked and de-duplicated — for a
+        human or agent to confirm via `add_rule`. **Read-only: nothing is
+        persisted.**
+
+        This is the candidate-suggestion counterpart to the (default-OFF)
+        write-side auto-extraction. Auto-*injecting* inferred rules didn't clear
+        the precision gate on real markers — the tagger reliably FINDS standing
+        directives (high recall) but over-fires on one-offs — so instead of
+        silently minting rules, this surfaces candidates and lets the confirming
+        human/agent be the precision gate. Each `RuleCandidate` shows its
+        corroboration (markers over distinct sessions), confidence, source kinds,
+        the raw supporting statements, and whether it's `already_active`.
+
+        Typical flow: log a session → `suggest_rules()` to review → `add_rule()`
+        the good ones → `dream()`. Requires an LLMClient (the tagger), like
+        `ask()`/`dream()`; returns `[]` when no marker clears the tagger.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "HyMem.suggest_rules requires an LLMClient (the durability tagger). "
+                "Pass one to the constructor or call set_llm() before suggesting."
+            )
+        return rules_mod.suggest_rules_from_markers(
+            self.read_conn, self.config, self._llm,
+            limit=limit, mode=mode, confidence_min=confidence_min,
+        )
+
     # ---- query-time --------------------------------------------------
 
     def augment(
@@ -315,6 +405,50 @@ class HyMem:
             session_id=session_id,
             ability=ability,
         )
+
+    def ask(
+        self,
+        question: str,
+        *,
+        session_id: str | None = None,
+        ability: str | None = None,
+        include_digest: bool = False,
+    ) -> Answer:
+        """The dialectic/synthesis endpoint: one call, a reasoned answer,
+        grounded in the retrieval tiers.
+
+        Where `augment()` returns raw tiers for the HOST to assemble into its
+        own prompt, `ask()` closes the loop inside HyMem: it runs the same
+        retrieval (`session_id`/`ability` pass straight through), renders the
+        tiers into a compact most-authoritative-first context block (capped at
+        `cfg.ask_max_context_chars`), and makes ONE completion against the
+        host-provided LLM under `ASK_PROMPT_V1` — answer only from the
+        context, quote concrete values/dates, state contradictions with their
+        dates (most recent value-bearing statement wins), soften
+        low-confidence facts, and say plainly when the memory doesn't contain
+        the answer. The returned `Answer` keeps the full `AugmentedContext`
+        for provenance/drill-down plus the rendered block size actually sent.
+
+        `include_digest=True` additionally loads the standing whole-store
+        digest (see `digest()`) into the context, so a global "what do you
+        know about me?" can draw on it; off by default because per-query
+        retrieval usually answers better without dream-time standing context.
+
+        Hosts that want the raw tiers (Hermes) keep using `augment()` — this
+        endpoint exists for one-call consumers (the MCP `hymem_ask` tool,
+        Honcho-style dialectic chat). Requires an LLMClient, like `dream()`.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "HyMem.ask requires an LLMClient. Pass one to the constructor "
+                "or call set_llm() before asking."
+            )
+        ctx = self.augment(question, session_id=session_id, ability=ability)
+        # `ctx.digest` may already be populated when cfg.augment_include_digest
+        # is on; only load it here when the caller asked and augment didn't.
+        if include_digest and ctx.digest is None:
+            ctx.digest = load_digest(self.read_conn)
+        return query_ask(self.config, self._llm, question, ctx)
 
     def digest(self) -> Digest | None:
         """The standing whole-store summary — the root of the RAPTOR
