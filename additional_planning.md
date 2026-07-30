@@ -2,7 +2,9 @@
 
 Two ideas borrowed from [BrainDB](https://github.com/dimknaf/braindb), adapted to
 HyMem's embedded, edge-typed architecture, plus the episode-granularity plan
-(added 2026-07-02, see [Plan C](#plan-c--episode-granularity-in-dreaming)):
+(added 2026-07-02, see [Plan C](#plan-c--episode-granularity-in-dreaming)),
+plus the narrative-facts campaign (added 2026-07-30, see
+[Campaign E](#campaign-e--the-narrative-facts-roadmap-added-2026-07-30)):
 
 - **Idea A** — query-time multi-hop graph traversal with compounding edge weights.
 - **Idea B** — `always_on` Rules as a first-class node type.
@@ -562,6 +564,15 @@ permanently, dense → the E3 path reopens. Full scorecard:
 *(added 2026-07-02 — the "point 5" carry-over from the competitive/architecture
 review)*
 
+> **SUBSUMED 2026-07-30 by Campaign E, Step 4 (E1 build, below).** The
+> decision-grained granularity goal is realized as a NEW artifact class
+> (`narrative_facts`, append-only/immutable) rather than an episode-prompt
+> rewrite — which dodges this plan's sequencing constraint entirely (episode
+> membership is untouched, so the RAPTOR flip-watch is undisturbed). This plan
+> stays as the record of the granularity motivation (BEAM EO/SUM post-mortem,
+> rate-distortion framing); do not run the episode-prompt version while
+> Campaign E is active.
+
 ### Motivation
 
 - **BEAM floor post-mortem** (benchmarks/beam_investigation_notes.md): EO/SUM
@@ -646,3 +657,402 @@ first, then granularity, then re-verify reuse once on the new episode set.
 3. **Plan C** independently of A/B but strictly after the RAPTOR flip decision
    (see its sequencing constraint) — A/B don't touch episodes, so they can
    proceed while the reuse watch runs.
+
+---
+
+## Campaign E — the narrative-facts roadmap (added 2026-07-30)
+
+*Origin: the 2026-07-30 competitive review (HyMem vs Hindsight/Honcho), integrated
+with its own critique the same day. Supersedes nothing above; Plan C is subsumed
+by Step 4 (E1 build) as noted there. Same standing contract as every plan in this
+file: front-run gate before any build, additive-only, mechanism > score, nothing
+reads oracle labels, per-category LME deltas under ~±5pp are noise.*
+
+### E0. Evidence base and the six review constraints
+
+**The finding.** Four instruments, three corpora, independent investigations all
+terminate at the same wall: LME MS banks ~20 synthesis misses, LoCoMo ~137 of
+its answerable-miss bucket, MSC 24/35, BEAM KU/CR/EO answer-side. P0 measured
+the reader at ~20% of the gap to Hindsight (72.6 vs judge-matched 68.4). The
+residual is **evidence packaging**: readers fuse pre-fused facts fine but fail
+to fuse ~45 raw turn fragments. HyMem's store is structurally richer than
+Hindsight's (bi-temporal KG, supersession, locked vocabulary, procedures, rules);
+what it lacks is the middle-granularity unit — self-contained, dated,
+entity-tagged **narrative facts** — between the atomic triple and the abstract
+episode. Hindsight's paper (arXiv 2512.12818) is the template + existence proof
+for that unit, **not** evidence: zero ablations, borrowed baselines under a
+different judge, blank token budgets, LoCoMo adversarial omitted, and their
+benchmark answer step is single-shot (the agentic reflect loop is a product
+feature, not what produced their numbers). E1's case stands on HyMem's own
+probes alone.
+
+**The six constraints the 2026-07-30 review imposed (all adopted):**
+
+1. **Mechanism criterion is the gate.** "MS ≥ +5pp on one LME A/B" is inside the
+   churn floor (100% reader-side; judge churn measured <1.5% → majority-of-3
+   judging buys nothing). Offline mechanism results decide build/no-build;
+   LME A/Bs are **non-regression only**; scored confirmation lives on LoCoMo
+   n=800 (±1.6pp) + MSC.
+2. **Facts are per-range IMMUTABLE, append-only, version-tagged.** A closed
+   range's facts never change → no re-fusion, no resample, no poison-cascade:
+   the entire aggregation reuse bug class (the third flip-watch failed on the
+   deepseek outage streak; watch still red) is sidestepped by construction.
+   The ONE mutable field is `invalid_at` (closing it is itself append-only).
+3. **E2 (per-entity observations) does NOT get that exemption** — it is
+   synthetic over a mutable set, i.e. the aggregation-node pattern under watch.
+   E2 is gated on the flip-watch turning green.
+4. **E3 (cross-encoder rerank) is two changes, not one.** Backend flip
+   (LLM → CE) and model swap (mxbai English → bge-m3 multilingual) are measured
+   separately; adoption is ONE deliberate rebaseline after E1's scored runs.
+5. **E4 needs a relative-date resolver first.** `dreaming/dates.py` is
+   explicit-date-only by design ("resolving them requires an anchor date");
+   "what did we decide last week" fails at the mention layer otherwise.
+6. **Hindsight's numbers are demoted to corroboration.** Argue every item from
+   HyMem's own evidence.
+
+**Churn floors (read every delta against these):** LME per-category ±~5pp /
+~4 questions; LoCoMo ±1.6pp @ n=800 (±3.2 @ n=200); MSC ~±4pp @ n=100;
+sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples).
+
+---
+
+### Step 1 — E1 front-run probe (`benchmarks/fact_probe.py`)
+
+**Idea.** Extract narrative facts with a draft prompt from the haystacks of the
+~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and
+measure the two things the build can't measure later: (a) does a fact tier
+deliver the question's gold inside ≤5 dense items (vs ~45 raw slots), (b) is
+the extraction faithful (≥0.9 hand-score — every value/name/date traceable to
+a turn, the profile.v2 gate pattern). Probe extraction is append-only by
+construction, so its artifacts are reusable as test fixtures in Step 4.
+
+**Architecture.**
+- Selection: the instrumented emb-ON floor-audit run JSON (2026-06-07) in
+  `~/.hermes/benchmarks/`; the readside plan §2.1 selection rule (MS non-`_abs`,
+  `correct=false`, `recall_ceiling=true`, no `"none"` in `gold_turn_tiers`,
+  gold survived into the sent context) + equal random `correct=true` MS control.
+- Per qid: rebuild the per-question temp DB (the `--inspect-floor` pattern,
+  `_inspect_floor_questions` in `longmemeval_adapter.py`), ingest haystack,
+  run **one fact-extraction call per session** (draft `FACTS_PROMPT_V1`: input
+  = session turns char-capped; output JSON list of 2–8 facts, each
+  `{text, date ISO|null, entities[]}`; rules: self-contained without the source
+  turn, values/names/dates verbatim, one fact per exchange/decision/outcome,
+  no invention, skip smalltalk), store into a temp FTS5 table, retrieve top-5
+  with the question.
+- Gold check: **containment** (port `_gold_in_pool` from
+  `longmemeval_adapter.py`: one string contains the other or a shared 40-char
+  prefix) against the ≤5 returned facts. Per question: gold covered? facts
+  extracted total? Same for control.
+- Faithfulness: dump all extracted facts to JSON; hand-score a 20-session
+  sample.
+- `--sim` stub mode (canned extraction) verifying selection → rebuild → FTS →
+  gold-check plumbing offline, mirroring `multihop_probe.py`'s plumbing tests.
+
+**Pre-registered gate G-F1 (decides build/no-build; score-free).**
+BUILD iff: gold-in-≤5-facts on **≥60%** of banked misses AND faithfulness
+**≥0.9** AND median facts/session ≤ 8 AND control shows no systematic
+over-extraction (>12/session). One prompt iteration (`FACTS_PROMPT_V2`) allowed
+on a visible prompt defect; a second failure banks E1 dead — record and stop.
+
+**Tests:** probe-only; the `--sim` plumbing test + a fixture asserting the
+selection rule reproduces the banked n on the 2026-06-07 JSON.
+
+---
+
+### Step 2 (parallel, day one) — E5 anaphora resolver (`hymem/query/coref.py`)
+
+**Idea.** P3, the real-life lever LME is blind to: follow-up queries carry
+pronouns/ellipsis ("what did she say about that?", "en de prijs?") and every
+retrieval tier misses simultaneously. Resolve against the session's recent
+turns BEFORE retrieval. Zero LME delta by construction; production value only —
+it is the campaign's hedge: it ships value even if G-F1 kills E1.
+
+**Architecture.**
+- New `hymem/query/coref.py`:
+  `rewrite_query(query, recent_turns, *, cfg, llm=None) -> QueryRewrite` with
+  `QueryRewrite{rewritten: str, changed: bool, rule: str, resolved: dict}`.
+- **Stage 1, heuristic (stdlib, EN+NL):** fire on (a) pronoun-dominant queries
+  (standalone it/that/she/he/they/dit/dat/ze/hij with no known-entity match),
+  (b) ellipsis follow-ups (≤4 content tokens, no entity match), (c)
+  demonstratives ("that project", "die tool"). Resolve referents from the last
+  `cfg.coref_max_turns` recent turns: entities via `match_known_entities` over
+  those turns first, else salient noun tokens of the last user turn.
+- **APPEND, never replace:** `rewritten = original + " (context: <referents>)"`.
+  Retrieval keeps the original tokens AND gains the resolved ones — the
+  additive invariant applied at the query level.
+- **Stage 2, optional LLM fallback** (`cfg.coref_llm_enabled`, default False):
+  one tiny "rewrite as a standalone question" call when the heuristic fires at
+  low confidence; `LLMClient` Protocol only.
+- Wiring: in `augment()` right after ability detection, before ALL retrieval
+  tiers; only when `session_id` is passed (needs `recent_turns`); every tier
+  consumes `rewritten`. `ctx.coref` records the rewrite for observability
+  (same contract as `detected_rule`).
+- Config: `coref_enabled: bool = True` (heuristic is cheap and safe),
+  `coref_max_turns: int = 6`, `coref_llm_enabled: bool = False`.
+
+**Gate:** a hand-built 30-item eval set (EN+NL pronoun/ellipsis follow-ups with
+known referents) — heuristic resolution ≥80% with zero rewrites on
+self-contained queries (the no-harm control). No LME run.
+
+**Tests (`tests/test_coref.py`):** pronoun query + recent turns → rewritten
+contains referent; self-contained query → byte-identical; no `session_id` →
+inert; entity-matched query unchanged; Dutch pronouns; append-not-replace
+(original tokens preserved verbatim); LLM fallback gating (stub call counts);
+`coref_enabled=False` → inert; `ctx.coref` observability fields.
+
+---
+
+### Step 3 (parallel, offline) — E3 reranker measurements (`benchmarks/rerank_ab.py`)
+
+**Idea.** Two SEPARATE measurements, both offline, neither touching a frozen
+baseline: **M1** cross-encoder backend vs LLM backend (shipping model
+`mixedbread-ai/mxbai-rerank-base-v1`); **M2** model swap mxbai →
+`bge-reranker-v2-m3` (the Dutch/multilingual constraint). Adoption is deferred
+to Step 6; this step only produces the decision data.
+
+**Architecture.**
+- New probe (or `gold_rank_probe.py` extension): for a fixed question set (LME
+  MS slice for M1 + a Dutch hand-set for M2), pull the production candidate
+  pool (BM25+vec fused, `rerank_top_k` wide), rerank with each backend in turn.
+- Measure: gold-rank distribution (median, ≤15 share), pairwise rank
+  correlation, p50/p95 rerank latency (CE local vs LLM round-trip), LLM tokens
+  spent per query.
+- **M1 gate (pre-registered):** CE parity = median gold rank within 1 position
+  of LLM rerank AND ≤15 share within 2pp AND latency ≥10× better. **M2 gate:**
+  bge ≥ mxbai on the Dutch set with English median-rank regression ≤1 position.
+- `--sim` mode with a deterministic fake reranker for plumbing.
+
+**Tests:** probe plumbing + rank-correlation/latency math unit tests; no core
+changes.
+
+---
+
+### Step 4 — E1 build: the narrative-facts artifact (gated on G-F1)
+
+**Idea.** Dream-time extraction of self-contained narrative facts, stored
+immutably (append-only, version-tagged), served as an additive retrieval tier
+and as the lead evidence block in `ask()`. Subsumes Plan C's granularity goal
+as a NEW artifact class — episode membership is untouched, so the Plan C
+sequencing constraint (RAPTOR flip-watch) does not apply. Unblocks E6.
+
+**Schema (migration `026_narrative_facts.sql`; `EXPECTED_SCHEMA_VERSION` 25→26;
+table also added to the `schema.sql` fresh-DB baseline — indexes/ALTERs only in
+the migration per the documented gotcha):**
+
+```sql
+CREATE TABLE IF NOT EXISTS narrative_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    start_message_id INTEGER NOT NULL,
+    end_message_id INTEGER NOT NULL,
+    text TEXT NOT NULL,                    -- self-contained narrative; IMMUTABLE
+    fact_date TEXT,                        -- ISO or NULL (explicit dates; relatives = E4)
+    entities TEXT NOT NULL DEFAULT '[]',   -- JSON array of canonical names
+    prompt_version TEXT NOT NULL,          -- 'facts.v1' provenance tag
+    valid_at TEXT,                         -- bi-temporal, mirrors knowledge_graph
+    invalid_at TEXT,                       -- the ONLY mutable field (E6 closes it)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (session_id, start_message_id, text)
+);
+-- + narrative_facts_fts (FTS5 over text, triggers, mirroring episodes_fts)
+-- + narrative_fact_embeddings JSON cache (content-addressed like edge_embeddings)
+-- + vec_facts vec0 table when sqlite-vec is present
+-- + sessions.facts_message_id INTEGER  (facts watermark, mirrors v24 digested_message_id)
+-- + dream_runs: facts_extracted INTEGER, fact_failures INTEGER (mirrors v25)
+```
+
+**Extraction — new `hymem/dreaming/facts.py`:**
+- `extract_facts(conn, session_id, llm, cfg, *, since_message_id)` reads the
+  session's undigested tail (chunks starting above the facts watermark — the
+  v24 watermark pattern, own column so facts and digest advance independently),
+  makes ONE LLM call per session tail (`FACTS_PROMPT_V1` + user template in
+  `extraction/prompts/__init__.py`, versioned module constant
+  `FACTS_PROMPT_VERSION` like `PROFILE_PROMPT_VERSION`), returns validated
+  items. Validation mirrors `validate_episode_items`: non-empty text ≤600
+  chars, date ISO-or-null, entities through `canonicalize.normalize`, cap
+  `cfg.dream_max_facts_per_session` (default 8, truncate).
+- Persist **append-only**: `INSERT OR IGNORE` keyed on the UNIQUE constraint;
+  no UPDATE path for `text`/`entities`; `invalid_at` starts NULL. Watermark
+  advances only on successful parse; parse failure → `DreamReport.fact_failures
+  += 1`, watermark held, retried next dream (the v25 `digest_failures`/
+  `parse_failed` contract).
+- **Prompt bumps extract FORWARD ONLY**: new ranges are tagged with the new
+  `FACTS_PROMPT_VERSION`; covered ranges are never re-extracted. (Review
+  constraint 2 — this is what makes E1 safe while the flip-watch is red.)
+- Idempotency: re-dream of a quiescent store = 0 extraction calls (watermark at
+  tail) + 0 new rows (UNIQUE key).
+- Embeddings: batch-embed fact texts OUTSIDE the write lock (the phase1
+  lock-free pattern); content-addressed `embedding_cache` reuse is free.
+- `DreamReport.facts_extracted` / `fact_failures` persisted to `dream_runs`.
+
+**Retrieval — additive tier in `query/augment.py`:**
+- `FactHit` dataclass `{fact_id, text, fact_date, entities, session_id, score,
+  why_retrieved}`; `ctx.facts: list[FactHit]` with the standard additive-tier
+  docstring (own SELECT/FTS, never consumes another tier's budget, degrades to
+  [] on a pre-v26 store).
+- `_fact_search()`: FTS5 over `narrative_facts_fts` (same `_FTS_SAFE` +
+  `_fold_diacritics` query path as the other six FTS sites) + optional vec KNN
+  + RRF; `WHERE invalid_at IS NULL` (superseded facts leave the tier but stay
+  in the DB for audit); cap `cfg.facts_top_k` (default 8, 0 disables).
+  `facts_enabled` (default True) is the master switch;
+  `facts_extraction_enabled` (default True) gates the write side separately.
+- Wired after `_fts_search`/`_vector_search`, before graph lookup; v1 does NOT
+  feed entity matching (minimal diff).
+- `ask.py render_context`: new section `=== FACTS (verified past events) ===`
+  placed after KNOWN FACTS and ABOVE CONVERSATION EVIDENCE — facts lead, raw
+  turns stay below as verification backup (the Acme lesson: a summary is never
+  the only copy). Line form `- [2023-11-30] text` (`undated` fallback),
+  snippet-capped; tail-truncation sheds it before STANDING RULES/USER PROFILE.
+- Surfaces at landing: `HyMem.augment()`/`ask()` + the `hymem_augment` MCP
+  rendering. Honcho `/search` response shaping is a documented follow-up, not
+  part of this step.
+
+**Risks:** extraction quality on deepseek (G-F1 faithfulness gate is the
+mitigation); growth on long-lived sessions (watermark + caps); version mixing
+at retrieval (harmless — additive evidence, duplicates impossible by
+append-only + UNIQUE).
+
+**Tests (`tests/test_facts.py`, StubLLMClient + stub embeddings, mirroring
+`test_digest.py`):**
+1. extraction→persist round-trip (rows, canonical entities, watermark advanced
+   to covered `end_message_id`);
+2. append-only: new messages arrive, re-dream → old rows byte-identical, new
+   rows only for the new range;
+3. idempotent re-dream: 0 new rows, 0 extraction calls (stub call count),
+   watermark stable;
+4. forward-only versioning: bump `FACTS_PROMPT_VERSION` → new range under new
+   tag, covered ranges untouched;
+5. parse failure → `fact_failures` +1, watermark held, retry succeeds;
+6. UNIQUE dedup on re-submitted range;
+7. tier surfaces matching facts; non-matching query → empty; `invalid_at` set →
+   never surfaces, row retained;
+8. **additive invariant:** with facts present, `message_hits`/`fts_hits`/
+   `episodes`/`graph_facts` are byte-identical to the `facts_enabled=False`
+   control;
+9. pre-v26 store → tier degrades to [], extraction skipped, no crash;
+10. `render_context`: FACTS above CONVERSATION EVIDENCE, below KNOWN FACTS;
+    date rendering; snippet cap; truncation order (rules/profile survive, facts
+    shed first among evidence);
+11. `ask()` end-to-end sees the facts block;
+12. both config flags off → no extraction, empty tier;
+13. migration 026 on a pre-v26 DB: table + watermark + dream_runs columns
+    created, existing data untouched, version-guard error path intact.
+
+---
+
+### Step 5 — scored confirmation (box; protocol, not a build)
+
+- **LoCoMo, n=800, `--fresh` (core changed → stores rebuilt), seed 0, canonical
+  3×/24k.** Pre-registered reads, in order: (a) mechanism — facts rendered in
+  contexts? gold-in-facts rate on the miss set (the instrument must move before
+  the score is read); (b) multi-hop + temporal READ TOGETHER (cat-1 is ~113/800
+  → ±4pp alone); (c) all-800 net vs the ±1.6pp churn floor — a lever moving
+  both populations is gated on all 800 (the Step-3 lesson).
+- **MSC recall run**, same protocol, treated as secondary (band ±4pp @ n=100).
+- **LME full-500 seed-0 `--auto-ability` full-dream: NON-REGRESSION ONLY**
+  (hold 70.0 ± band; MS floor 51.9; per-category <±5pp = noise). Do not tune
+  against it.
+- All runs: config recorded in metadata (adapter contract), paired reads via
+  `locomo_flip.py` / `compare_recall.py`.
+
+---
+
+### Step 6 — E3 adoption (one deliberate rebaseline; after Step 5)
+
+If M1+M2 passed (Step 3): flip `rerank_model` default `"llm"`→`"cross-encoder"`
+and (if M2 passed) `rerank_cross_encoder_model` → `bge-reranker-v2-m3` in ONE
+commit — the single deliberate rebaseline the review priced. LME/LoCoMo
+non-regression rides Step 5's runs where the config diff is orthogonal, else
+one shared confirmation run. Update the frozen-baseline table
+(`longmemeval_roadmap.md` §1) with the new numbers. Suite green; adjust any
+test pinning the old default.
+
+---
+
+### Step 7 — E2 per-entity observations (GATED on flip-watch green)
+
+**Idea.** Hindsight's observation network: per-entity preference-neutral
+summaries ("MedFlow: what it is, status, key decisions"), regenerated at dream
+time only when the entity's evidence set changed. THE entity-centric query
+shape ("where do we stand on X?") in real life.
+
+**Architecture.**
+- Migration `027_entity_observations.sql`:
+  `entity_observations(canonical TEXT PRIMARY KEY, summary TEXT, source_hash
+  TEXT, updated_at)` + FTS shadow. `source_hash` = member-set hash of inputs →
+  reuse cache (unchanged entities cost zero calls on re-dream).
+- `hymem/dreaming/observations.py`: per dream, entities whose evidence
+  (episodes + facts + active edges mentioning them) changed since `source_hash`
+  AND degree ≥ `observations_min_evidence` get ONE regeneration call
+  (`OBSERVE_PROMPT_V1`, evidence-bound clauses reused from root.v4), cap
+  `observations_max_per_dream` (default 20, most-recently-mentioned first).
+- Augment tier `ctx.observations`, gated `observations_enabled` (default False
+  until gated) AND `matched_entities` non-empty — the natural gate, no router.
+  Additive SELECT (`canonical IN matched_entities`); rendered in `ask()` below
+  USER PROFILE.
+- **Constraint (mirrors the rules §0 constraint): NOT in `_anchor_facts`** —
+  the digest cache must not couple to observation churn.
+
+**Gate:** flip-watch green (prerequisite) + qualitative hand-read of 20
+entities on the prod store + mechanical tests. **Tests:** regenerate-on-change
+only; reuse-cache hit on quiescent re-dream; empty `matched_entities` → empty
+tier; additive-invariant control; cap enforcement; pre-v27 degradation;
+not-in-anchor assertion.
+
+---
+
+### Step 8 — E4, E6, E7 (production track, independent)
+
+**E4 temporal-range boost.** (a) New `hymem/query/reldates.py`: stdlib-only
+relative-date resolver, EN+NL (yesterday, N days/weeks/months ago, last
+week/month/year, "twee weken geleden", "vorige week", "between X and Y"),
+anchored to a `now` argument (harness passes `question_date`, production
+wall-clock); returns `[start, end]` or None. ~150 lines + a pattern-matrix
+test file. (b) augment wiring: when a range resolves, items whose dates fall in
+range get a score boost ×`cfg.temporal_boost` (default 1.5) on the
+message/facts/temporal tiers with a `in_range:YYYY-MM-DD..YYYY-MM-DD` why-code.
+**Boost, never filter** — out-of-range item sets stay identical (additive
+invariant test). **Tests:** resolver matrix EN+NL with fixed anchor; boost-only
+semantics; no-range query → byte-identical path; why codes; TR chronology
+unchanged.
+
+**E6 supersession over facts** (after Step 4). Extend the
+`value_supersession.py` classify→group→compare pipeline to `narrative_facts`:
+typed-value classification over fact text+entities, group by (entity, attribute
+cue), compare `fact_date`; a newer contradicting fact closes the older fact's
+`invalid_at` (the one mutable field). Conservative: cross-session with distinct
+dates only (the LME same-date lesson); multi-valued never fires; audit line
+`facts.supersede subj=.. old=.. new=..`; `facts_supersession_enabled` default
+False → flip after a clean audit, mirroring the v3.1 guard. **Tests:**
+cross-session numeric update closes old fact (tier stops surfacing, row
+retained); same-date never fires; multi-valued never fires; flag-off no-op;
+audit emitted.
+
+**E7 usage-signal feedback** (long game). `ask()` post-pass: stdlib
+token-overlap between the answer text and rendered items →
+`retrieval_feedback(item_kind, item_id, used, query_hash)` (migration 028);
+dream-time aggregation → bounded ranking prior ×[0.8..1.2] on the relevant
+tier. Invisible to benchmarks; compounds in deployment. **Tests:** overlap
+detector fixtures; boost bounds; cold-store no-op; zero writes when `ask()` is
+unused.
+
+---
+
+### Campaign sequencing and run budget
+
+| # | Item | Depends on | LLM cost | Gate |
+|---|------|-----------|----------|------|
+| 1 | E1 probe (`fact_probe.py`) | — | ~40 extraction calls | **G-F1** (mechanism + faithfulness, score-free) |
+| 2 | E5 anaphora | — (parallel day one) | none (heuristic) | 30-item eval ≥80%, zero no-harm |
+| 3 | E3 measurements M1+M2 | — (parallel, offline) | none | M1/M2 pre-registered parity |
+| 4 | E1 build (migration 026, facts.py, tier, render) | G-F1 pass | probe artifacts reused | 13 pytests; additive-invariant test |
+| 5 | Scored confirmation (LoCoMo n=800 + MSC + LME guard) | Step 4 | 2–3 box runs | triad net vs churn floors; LME non-regression only |
+| 6 | E3 adoption (one rebaseline) | Steps 3+5 | ≤1 shared run | offline parity held; baselines re-frozen |
+| 7 | E2 observations | **flip-watch green** | capped per dream | qualitative + mechanical |
+| 8 | E4 / E6 / E7 | E4: none; E6: Step 4; E7: none | small | per-item gates above |
+
+Hard rules carried into this campaign: never suppress-filter on a routed
+signal (boost ≠ filter); additive tiers never touch another tier's budget; any
+material prompt change bumps its version constant AND extracts forward-only
+(facts) or re-gates (profile precedent); judge posture frozen; LME A/Bs are
+non-regression confirmations, never tuning signals.
