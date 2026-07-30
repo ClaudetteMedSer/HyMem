@@ -1,0 +1,303 @@
+{
+  "description": "E5 anaphora/ellipsis eval set (Campaign E, Step 2 gate). 30 follow-up items with a known referent + 12 self-contained no-harm controls. EN + NL, Latin-script (project scope). Items with an `edges` block are seeded into a temp store so the CANONICAL-entity resolution path is exercised; items without one exercise the salient-token fallback (a fresh session with no graph yet — exactly when follow-ups are most likely). `expect` lists acceptable referents: an item counts as RESOLVED when the rewrite fired AND at least one of them appears in the rewritten query. Controls must produce NO rewrite. Written 2026-07-30 as a hand-built set; nothing here reads any benchmark's gold labels.",
+  "items": [
+    {
+      "id": "en-pron-01",
+      "kind": "pronoun",
+      "turns": [["user", "I finally migrated the billing service to postgres"]],
+      "query": "what did we decide about it?",
+      "expect": ["postgres", "billing", "migrated"],
+      "edges": [["billing", "depends_on", "postgres"]]
+    },
+    {
+      "id": "en-pron-02",
+      "kind": "pronoun",
+      "turns": [
+        ["user", "sarah reviewed the medflow rollout plan"],
+        ["assistant", "She left three comments on the staging step."]
+      ],
+      "query": "what did she say about that?",
+      "expect": ["medflow", "staging", "comments"],
+      "edges": [["medflow", "deploys_to", "fly.io"]]
+    },
+    {
+      "id": "en-pron-03",
+      "kind": "pronoun",
+      "turns": [["user", "we switched the analytics pipeline over to duckdb"]],
+      "query": "is it faster?",
+      "expect": ["duckdb", "analytics", "pipeline"]
+    },
+    {
+      "id": "en-pron-04",
+      "kind": "pronoun",
+      "turns": [["user", "the invoice generator broke again on the tax rounding"]],
+      "query": "did they fix it?",
+      "expect": ["invoice", "generator", "rounding"]
+    },
+    {
+      "id": "en-pron-05",
+      "kind": "pronoun",
+      "turns": [["user", "I ordered the standing desk from a shop in utrecht"]],
+      "query": "when does it arrive?",
+      "expect": ["standing", "desk", "utrecht"]
+    },
+    {
+      "id": "en-pron-06",
+      "kind": "pronoun",
+      "turns": [
+        ["user", "my sister moved to lisbon for a research job"],
+        ["assistant", "That sounds like a big change."]
+      ],
+      "query": "how is she settling in?",
+      "expect": ["lisbon", "research", "sister"]
+    },
+    {
+      "id": "en-pron-07",
+      "kind": "pronoun",
+      "turns": [["user", "we agreed to postpone the kubernetes migration"]],
+      "query": "why did they postpone it?",
+      "expect": ["kubernetes", "migration", "postpone"]
+    },
+    {
+      "id": "en-pron-08",
+      "kind": "pronoun",
+      "turns": [["user", "the redis cache keeps evicting the session keys"]],
+      "query": "what caused that?",
+      "expect": ["redis", "evicting", "session"],
+      "edges": [["redis", "part_of", "medflow"]]
+    },
+    {
+      "id": "en-ell-01",
+      "kind": "ellipsis",
+      "turns": [["user", "I booked the amsterdam flight for the conference"]],
+      "query": "the price?",
+      "expect": ["amsterdam", "conference", "flight"]
+    },
+    {
+      "id": "en-ell-02",
+      "kind": "ellipsis",
+      "turns": [["user", "we shipped the onboarding rewrite to production"]],
+      "query": "and the rollback plan?",
+      "expect": ["onboarding", "rewrite", "production"]
+    },
+    {
+      "id": "en-ell-03",
+      "kind": "ellipsis",
+      "turns": [["user", "the terraform state got corrupted during the apply"]],
+      "query": "any updates?",
+      "expect": ["terraform", "corrupted", "state"],
+      "edges": [["terraform", "configured_with", "fly.io"]]
+    },
+    {
+      "id": "en-ell-04",
+      "kind": "ellipsis",
+      "turns": [["user", "I started the sourdough starter on saturday"]],
+      "query": "and the temperature?",
+      "expect": ["sourdough", "starter", "saturday"]
+    },
+    {
+      "id": "en-ell-05",
+      "kind": "ellipsis",
+      "turns": [
+        ["user", "we interviewed two candidates for the platform role"],
+        ["assistant", "Both had strong systems backgrounds."]
+      ],
+      "query": "any feedback?",
+      "expect": ["candidates", "platform", "systems", "backgrounds"]
+    },
+    {
+      "id": "en-ell-06",
+      "kind": "ellipsis",
+      "turns": [["user", "the grafana dashboards lost their alert rules"]],
+      "query": "what about the alerts?",
+      "expect": ["grafana", "dashboards", "rules"]
+    },
+    {
+      "id": "en-dem-01",
+      "kind": "demonstrative",
+      "turns": [["user", "we kicked off the medflow rollout with the pilot clinic"]],
+      "query": "how is that project going?",
+      "expect": ["medflow", "rollout", "clinic"],
+      "edges": [["medflow", "deploys_to", "fly.io"]]
+    },
+    {
+      "id": "en-dem-02",
+      "kind": "demonstrative",
+      "turns": [["user", "I have been using ruff for the linting"]],
+      "query": "does that tool support notebooks?",
+      "expect": ["ruff", "linting"]
+    },
+    {
+      "id": "en-dem-03",
+      "kind": "demonstrative",
+      "turns": [["user", "the postgres connection pool was raised to forty"]],
+      "query": "did that change help?",
+      "expect": ["postgres", "connection", "raised"],
+      "edges": [["postgres", "runs_on", "fly.io"]]
+    },
+    {
+      "id": "en-dem-04",
+      "kind": "demonstrative",
+      "turns": [["user", "we ran the pricing experiment for three weeks"]],
+      "query": "what came out of that experiment?",
+      "expect": ["pricing", "experiment", "weeks"]
+    },
+    {
+      "id": "en-dem-05",
+      "kind": "demonstrative",
+      "turns": [["user", "I moved my notes into obsidian with a daily template"]],
+      "query": "is this setup working?",
+      "expect": ["obsidian", "template", "daily", "notes"]
+    },
+    {
+      "id": "nl-pron-01",
+      "kind": "pronoun",
+      "turns": [["user", "ik heb de medflow migratie naar vrijdag verzet"]],
+      "query": "wat zei hij daarover?",
+      "expect": ["medflow", "migratie", "verzet"],
+      "edges": [["medflow", "deploys_to", "fly.io"]]
+    },
+    {
+      "id": "nl-pron-02",
+      "kind": "pronoun",
+      "turns": [["user", "we gebruiken duckdb voor de analyses"]],
+      "query": "is het sneller?",
+      "expect": ["duckdb", "analyses", "gebruiken"]
+    },
+    {
+      "id": "nl-pron-03",
+      "kind": "pronoun",
+      "turns": [["user", "mijn zus is naar lissabon verhuisd voor haar promotie"]],
+      "query": "hoe gaat het met haar?",
+      "expect": ["lissabon", "verhuisd", "promotie"]
+    },
+    {
+      "id": "nl-pron-04",
+      "kind": "pronoun",
+      "turns": [["user", "de facturatie module rekent de btw verkeerd af"]],
+      "query": "hebben ze dat opgelost?",
+      "expect": ["facturatie", "module", "verkeerd"]
+    },
+    {
+      "id": "nl-pron-05",
+      "kind": "pronoun",
+      "turns": [["user", "ik heb het bureaublad bij een winkel in utrecht besteld"]],
+      "query": "wanneer komt het?",
+      "expect": ["bureaublad", "besteld", "utrecht", "winkel"]
+    },
+    {
+      "id": "nl-pron-06",
+      "kind": "pronoun",
+      "turns": [["user", "de redis cache gooit de sessiesleutels eruit"]],
+      "query": "wat veroorzaakte dat?",
+      "expect": ["redis", "sessiesleutels", "cache"],
+      "edges": [["redis", "part_of", "medflow"]]
+    },
+    {
+      "id": "nl-ell-01",
+      "kind": "ellipsis",
+      "turns": [["user", "ik heb de vlucht naar amsterdam geboekt"]],
+      "query": "en de prijs?",
+      "expect": ["amsterdam", "geboekt", "vlucht"]
+    },
+    {
+      "id": "nl-ell-02",
+      "kind": "ellipsis",
+      "turns": [["user", "we hebben de onboarding herschreven en uitgerold"]],
+      "query": "en het terugdraaien?",
+      "expect": ["onboarding", "herschreven", "uitgerold"]
+    },
+    {
+      "id": "nl-ell-03",
+      "kind": "ellipsis",
+      "turns": [["user", "de terraform state is beschadigd tijdens de apply"]],
+      "query": "al nieuws?",
+      "expect": ["terraform", "beschadigd", "state"],
+      "edges": [["terraform", "configured_with", "fly.io"]]
+    },
+    {
+      "id": "nl-ell-04",
+      "kind": "ellipsis",
+      "turns": [["user", "de grafana dashboards missen hun alertregels"]],
+      "query": "en de alerts?",
+      "expect": ["grafana", "dashboards", "alertregels"]
+    },
+    {
+      "id": "nl-dem-01",
+      "kind": "demonstrative",
+      "turns": [["user", "ik gebruik ruff voor de linting van het project"]],
+      "query": "werkt die tool goed?",
+      "expect": ["ruff", "linting"]
+    },
+    {
+      "id": "nl-dem-02",
+      "kind": "demonstrative",
+      "turns": [["user", "de postgres pool is naar veertig verhoogd"]],
+      "query": "heeft die wijziging geholpen?",
+      "expect": ["postgres", "verhoogd", "veertig"],
+      "edges": [["postgres", "runs_on", "fly.io"]]
+    }
+  ],
+  "controls": [
+    {
+      "id": "ctl-en-01",
+      "turns": [["user", "the medflow migration is scheduled for friday"]],
+      "query": "what did we set the postgres connection pool to?"
+    },
+    {
+      "id": "ctl-en-02",
+      "turns": [["user", "I ordered a standing desk"]],
+      "query": "how many project cards did I add to the sprint board?"
+    },
+    {
+      "id": "ctl-en-03",
+      "turns": [["user", "sarah reviewed the rollout plan"]],
+      "query": "how long between the first deploy and the rollback?"
+    },
+    {
+      "id": "ctl-en-04",
+      "turns": [["user", "we switched to duckdb"]],
+      "query": "summarize what we agreed about the pricing experiment"
+    },
+    {
+      "id": "ctl-en-05",
+      "turns": [["user", "the invoice generator broke"]],
+      "query": "which linter am I using for the python project?"
+    },
+    {
+      "id": "ctl-en-06",
+      "turns": [["user", "I booked the amsterdam flight"]],
+      "query": "what were the three options for the analytics warehouse?"
+    },
+    {
+      "id": "ctl-en-07",
+      "turns": [["user", "we ran the pricing experiment"]],
+      "query": "remind me which shop sold the standing desk in utrecht"
+    },
+    {
+      "id": "ctl-nl-01",
+      "turns": [["user", "de migratie is naar vrijdag verzet"]],
+      "query": "welke linter gebruik ik voor het python project?"
+    },
+    {
+      "id": "ctl-nl-02",
+      "turns": [["user", "ik heb de vlucht geboekt"]],
+      "query": "hoeveel kaarten heb ik aan het sprintbord toegevoegd?"
+    },
+    {
+      "id": "ctl-nl-03",
+      "turns": [["user", "we gebruiken duckdb"]],
+      "query": "wat hebben we afgesproken over het prijsexperiment?"
+    },
+    {
+      "id": "ctl-nl-04",
+      "turns": [["user", "de facturatie module rekent verkeerd"]],
+      "query": "hoe lang duurde de migratie van de billing service?"
+    },
+    {
+      "id": "ctl-nl-05",
+      "turns": [["user", "mijn zus is verhuisd"]],
+      "query": "in welke winkel in utrecht heb ik het bureaublad gekocht?"
+    }
+  ]
+}

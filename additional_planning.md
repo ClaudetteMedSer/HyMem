@@ -718,6 +718,34 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 
 ### Step 1 — E1 front-run probe (`benchmarks/fact_probe.py`)
 
+> **BUILT 2026-07-30, UNRUN** (no LLM spend yet, and no banked source run on this
+> box — `~/.hermes/benchmarks/` is empty here, so the gate must be executed on the
+> Hermes box). `benchmarks/fact_probe.py` + `tests/test_fact_probe.py` (25 tests);
+> `--sim` end-to-end verified. Two deviations from the sketch below, both
+> deliberate and documented in the module docstring:
+> 1. **No per-question store rebuild.** The `--inspect-floor` pattern exists to
+>    reproduce a RETRIEVAL state; this probe exercises no HyMem tier (it indexes
+>    into its own FTS5 table, the shape migration 026 will create) so a rebuild +
+>    dream per question would cost hundreds of calls and measure nothing extra.
+>    The production query path (`_FTS_SAFE`, `_fold_diacritics`) IS imported, so
+>    the tokenization under test is the real one. Consequence: the selection
+>    rule's "gold survived into the sent context" clause is inherited from the
+>    source run's instrumentation rather than re-verified live, so the recovered
+>    set can be slightly WIDER than the banked 20 — the probe prints the recovered
+>    n for reconciliation.
+> 2. **Cost is `questions × sessions`, not ~40 calls.** Extraction is one call per
+>    session (as specified) and an LME haystack carries tens of sessions per
+>    question; the plan's ~40-call budget corresponds to one call per QUESTION.
+>    `--cost` prints the call count and exits; `--max-sessions` caps sessions per
+>    question (label-free — keeps the most recent). **Pick the budget before
+>    running.**
+>
+> `FACTS_PROMPT_V1` lives in the probe, NOT in `extraction/prompts/` — a front-run
+> gate must not land a core change before it clears. Step 4 moves the text
+> verbatim behind `FACTS_PROMPT_VERSION`. The gate reports **INCOMPLETE** (never
+> PASS) until `--faithfulness` supplies the hand-score, so three-of-four can't
+> read as a pass.
+
 **Idea.** Extract narrative facts with a draft prompt from the haystacks of the
 ~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and
 measure the two things the build can't measure later: (a) does a fact tier
@@ -761,6 +789,31 @@ selection rule reproduces the banked n on the 2026-06-07 JSON.
 
 ### Step 2 (parallel, day one) — E5 anaphora resolver (`hymem/query/coref.py`)
 
+> **BUILT + GATE PASSED 2026-07-30.** `hymem/query/coref.py`, wired in `augment()`
+> before every tier, `ctx.coref` provenance, three config flags
+> (`coref_enabled=True`, `coref_max_turns=6`, `coref_llm_enabled=False`).
+> Tests: `tests/test_coref.py` (27) + `tests/test_coref_eval.py` (5); suite 856.
+> **Gate (`benchmarks/coref_eval.py`, set `benchmarks/coref_eval_set.json`):
+> resolution 31/31 = 100% (graph path 10/10, salient-token path 21/21; pronoun
+> 14/14, ellipsis 10/10, demonstrative 7/7), no-harm control 0/12 rewrites →
+> PASS.** No LME run, by design.
+>
+> Two notes on how the gate was reached, so the number is readable:
+> - `rewrite_query` takes an optional `conn` (not in the plan's signature) because
+>   `match_known_entities` — the plan's own resolution rule — is a graph lookup.
+>   Without a store it falls back to salient tokens; both paths are gated
+>   separately and both clear.
+> - The FIRST gate run scored 100% resolution but **2/12 control false fires**, both
+>   real precision defects: the content-token ceilings were too generous and the
+>   stopword table was missing interlocutor words ("we"/"ik"), which inflated the
+>   count on ordinary questions. Fixed by tightening the ceilings to the observed
+>   distribution (pronoun 3, demonstrative 3, ellipsis 2 + a 5-token total ceiling
+>   — "wat hebben we afgesproken over het prijsexperiment?" has only 2 content
+>   tokens yet is a complete question) and extending the stopwords. Resolution
+>   stayed 30+/30+, i.e. **no recall was traded for the precision**. The eval set
+>   is now a standing regression test (`test_coref_eval.py`), so a future loosening
+>   that re-introduces a false fire fails the suite.
+
 **Idea.** P3, the real-life lever LME is blind to: follow-up queries carry
 pronouns/ellipsis ("what did she say about that?", "en de prijs?") and every
 retrieval tier misses simultaneously. Resolve against the session's recent
@@ -803,6 +856,30 @@ inert; entity-matched query unchanged; Dutch pronouns; append-not-replace
 ---
 
 ### Step 3 (parallel, offline) — E3 reranker measurements (`benchmarks/rerank_ab.py`)
+
+> **BUILT 2026-07-30, UNRUN** (M1 needs an API key for the LLM arm; both
+> measurements need `sentence-transformers` + the two CE models, unavailable on
+> this box). `benchmarks/rerank_ab.py` + `tests/test_rerank_ab.py` (17 tests);
+> `--sim` end-to-end verified, and the hand-set is validated as an instrument by
+> the suite (every gold verbatim in its corpus AND reachable inside the BM25 pool —
+> a hand-set whose gold is unreachable measures retrieval, not rerank).
+>
+> - **M2 needed a Dutch set that did not exist**, so `benchmarks/rerank_handset.json`
+>   was written: two blocks (`nl`, `en`), each one shared ~40-turn corpus + 15
+>   questions whose gold is a verbatim turn, with on-topic distractors sharing the
+>   question's vocabulary. One corpus per block (not per question) is what makes
+>   ranking competitive. The `en` block doubles as M1's default source and as M2's
+>   English regression control; `--dataset` runs M1 on an LME MS slice instead.
+> - **Hard guard:** `cross_encoder_rerank` degrades to returning the pool UNCHANGED
+>   when sentence-transformers/the model is missing, which would post a plausible
+>   parity result for a reranker that never ran. The script refuses to run in that
+>   state (exit 2) rather than reporting it.
+> - Pool caveat, stated in the docstring: the candidate pool is a wide BM25 sweep
+>   of the raw-message tier (no dream → no chunks; no embedding server → no vec),
+>   so ABSOLUTE ranks carry the `gold_rank_probe.py` bias. The comparison is still
+>   sound because both arms are handed the identical pool object — read the output
+>   as "how well does backend X order this pool", never as a production rank.
+> - Nothing flips: adoption stays Step 6.
 
 **Idea.** Two SEPARATE measurements, both offline, neither touching a frozen
 baseline: **M1** cross-encoder backend vs LLM backend (shipping model
@@ -1042,9 +1119,9 @@ unused.
 
 | # | Item | Depends on | LLM cost | Gate |
 |---|------|-----------|----------|------|
-| 1 | E1 probe (`fact_probe.py`) | — | ~40 extraction calls | **G-F1** (mechanism + faithfulness, score-free) |
-| 2 | E5 anaphora | — (parallel day one) | none (heuristic) | 30-item eval ≥80%, zero no-harm |
-| 3 | E3 measurements M1+M2 | — (parallel, offline) | none | M1/M2 pre-registered parity |
+| 1 | E1 probe (`fact_probe.py`) — **BUILT, UNRUN** | — | `questions × sessions` (`--cost` first) | **G-F1** (mechanism + faithfulness, score-free) |
+| 2 | E5 anaphora — **BUILT, GATE PASSED** | — (parallel day one) | none (heuristic) | 31-item eval **100%**, no-harm **0/12** ✓ |
+| 3 | E3 measurements M1+M2 — **BUILT, UNRUN** | — (parallel, offline) | M1 LLM arm only | M1/M2 pre-registered parity |
 | 4 | E1 build (migration 026, facts.py, tier, render) | G-F1 pass | probe artifacts reused | 13 pytests; additive-invariant test |
 | 5 | Scored confirmation (LoCoMo n=800 + MSC + LME guard) | Step 4 | 2–3 box runs | triad net vs churn floors; LME non-regression only |
 | 6 | E3 adoption (one rebaseline) | Steps 3+5 | ≤1 shared run | offline parity held; baselines re-frozen |

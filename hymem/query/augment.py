@@ -14,6 +14,7 @@ from hymem.dreaming.aggregate import Digest, load_digest
 from hymem.dreaming.user_profile import ProfileEntry, load_profile
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
+from hymem.query.coref import QueryRewrite, rewrite_query
 from hymem.query.entities import GraphCount, count_relations, match_known_entities
 from hymem.query.intent import detect_ability_signal
 from hymem.query.predicate_routing import route_predicates
@@ -274,6 +275,15 @@ class AugmentedContext:
     without the caller passing `ability="MR"`. An *explicit* host hint always
     wins and leaves this None, so host-supplied and inferred shaping stay
     distinguishable."""
+    coref: QueryRewrite | None = None
+    """E5 provenance: the anaphora/ellipsis rewrite applied to the query before
+    ANY retrieval tier ran (`hymem/query/coref.py`), or None when no rewrite was
+    attempted (no `session_id`, or `cfg.coref_enabled` is False). Populated even
+    when nothing changed — `coref.changed` is False and `coref.rule` names the
+    abstain reason ("self_contained", "no_turns", "no_referent"), so "why did
+    this follow-up retrieve nothing?" is answerable from the result object alone.
+    Same observability contract as `detected_rule`. The rewrite only ever APPENDS
+    resolved referents, so every tier still saw all of the original tokens."""
     detected_rule: str | None = None
     """WHICH router rule produced `detected_ability` (e.g. "tr_recency",
     "mr_count"), or the abstain reason ("none"/"empty"/"non_str") when nothing was
@@ -342,6 +352,35 @@ def augment(
     if session_id is not None and cfg.working_memory_turns > 0:
         ctx.recent_turns = recent_messages(conn, session_id, cfg.working_memory_turns)
 
+    # E5 anaphora/ellipsis resolution — the ONLY place the query text is
+    # rewritten, and it happens BEFORE every retrieval tier so all of them
+    # benefit from one fix (a pronoun-only follow-up defeats BM25, vectors,
+    # entity matching and predicate routing simultaneously). The rewrite APPENDS
+    # the resolved referents and never replaces, so each tier below still sees
+    # every original token — the additive invariant at the query level.
+    #
+    # Ability detection deliberately ran on the ORIGINAL text above: the router's
+    # patterns are about question SHAPE ("how many", "how long between"), which a
+    # referent clause cannot change but could confuse.
+    #
+    # Needs a session to have any antecedent, so it is inert when the host passes
+    # no `session_id`. `ctx.recent_turns` is reused when the working-memory window
+    # already covers `coref_max_turns` (the default 10 ≥ 6), so the common path
+    # adds no second SELECT.
+    query = user_message
+    if cfg.coref_enabled and session_id is not None and cfg.coref_max_turns > 0:
+        coref_turns = (
+            ctx.recent_turns[-cfg.coref_max_turns:]
+            if len(ctx.recent_turns) >= cfg.coref_max_turns
+            else recent_messages(conn, session_id, cfg.coref_max_turns)
+        )
+        ctx.coref = rewrite_query(
+            user_message, coref_turns, cfg=cfg, conn=conn, llm=llm
+        )
+        if ctx.coref.changed:
+            query = ctx.coref.rewritten
+            log.debug("coref.applied rule=%s query=%r", ctx.coref.rule, query)
+
     # P4 typed user-profile tier: always-relevant identity facts, loaded by its
     # own SELECT so it is purely ADDITIVE — no other tier's top-k budget is
     # touched (mirrors how the TR/aggregation tiers layer on). load_profile
@@ -359,13 +398,13 @@ def augment(
     # has room to reorder beyond the top-fts_top_k window; the final result
     # is still trimmed to fts_top_k after rerank.
     candidate_k = max(cfg.fts_top_k, cfg.rerank_top_k)
-    fts = _fts_search(conn, user_message, top_k=candidate_k)
+    fts = _fts_search(conn, query, top_k=candidate_k)
     vec: list[FtsHit] = []
     if embedding_client is not None:
         vec = _vector_search(
             conn,
             embedding_client,
-            user_message,
+            query,
             top_k=candidate_k,
             max_scan=cfg.embedding_max_scan,
         )
@@ -379,7 +418,7 @@ def augment(
     if rerank_enabled and should_rerank(fts, vec, ctx.fts_hits, cfg.rerank_ambiguity_threshold):
         log.debug("rerank.triggered model=%s", cfg.rerank_model)
         ctx.fts_hits = run_rerank(
-            user_message,
+            query,
             list(ctx.fts_hits[: cfg.rerank_top_k]),
             top_k=cfg.fts_top_k,
             model=cfg.rerank_model,
@@ -411,7 +450,7 @@ def augment(
             if (rerank_enabled and cfg.rerank_message_hits)
             else cfg.message_fts_top_k
         )
-        msg_hits = _message_fts_search(conn, user_message, top_k=msg_candidate_k)
+        msg_hits = _message_fts_search(conn, query, top_k=msg_candidate_k)
         # Only pay the rerank call when it can actually change the surviving set
         # (pool deeper than the cut). A pool at/below the cut would only reorder
         # turns the host already sees, not lift a new one in — not worth a call.
@@ -422,7 +461,7 @@ def augment(
         ):
             log.debug("rerank.message.triggered model=%s", cfg.rerank_model)
             msg_hits = run_rerank(
-                user_message,
+                query,
                 list(msg_hits),
                 top_k=cfg.message_fts_top_k,
                 model=cfg.rerank_model,
@@ -457,9 +496,9 @@ def augment(
             ctx.total_message_matches,
             ctx.enumeration_turns,
         ) = _message_fts_aggregate(
-            conn, user_message, cap=cfg.message_fts_aggregate_cap
+            conn, query, cap=cfg.message_fts_aggregate_cap
         )
-        ctx.graph_count = _maybe_graph_count(conn, user_message)
+        ctx.graph_count = _maybe_graph_count(conn, query)
     else:
         if cfg.message_fts_top_k > 0:
             ctx.message_hits = _relevance_message_hits()
@@ -474,9 +513,9 @@ def augment(
                 ctx.total_message_matches,
                 ctx.enumeration_turns,
             ) = _message_fts_aggregate(
-                conn, user_message, cap=cfg.message_fts_aggregate_cap
+                conn, query, cap=cfg.message_fts_aggregate_cap
             )
-            ctx.graph_count = _maybe_graph_count(conn, user_message)
+            ctx.graph_count = _maybe_graph_count(conn, query)
 
     # ability="TR" (temporal reasoning) builds a date-ordered event list so the
     # host LLM reads a chronology instead of finding dates in noise. It merges
@@ -485,11 +524,11 @@ def augment(
     # other tiers above (graph/fts/messages) still run unchanged.
     if ability == "TR":
         ctx.temporal_events = _temporal_events(
-            conn, user_message, ctx.message_hits, ctx.fts_hits, top_k=cfg.fts_top_k
+            conn, query, ctx.message_hits, ctx.fts_hits, top_k=cfg.fts_top_k
         )
 
     ctx.episodes = _episode_search(
-        conn, user_message,
+        conn, query,
         top_k=cfg.fts_top_k,
         embedding_client=embedding_client,
     )
@@ -502,7 +541,7 @@ def augment(
     # synthesis view on top.
     if cfg.aggregation_nodes_enabled and _aggregation_tier_fires(cfg, ability):
         ctx.aggregation_nodes = _aggregation_search(
-            conn, user_message,
+            conn, query,
             top_k=cfg.aggregation_top_k,
             embedding_client=embedding_client,
             max_scan=cfg.embedding_max_scan,
@@ -512,9 +551,9 @@ def augment(
     # procedures — ordered step-by-step workflows — are the natural fit for
     # "what steps did I take to implement X?" The host still decides ordering.
     proc_top_k = cfg.procedure_top_k_if if ability == "IF" else cfg.fts_top_k
-    ctx.procedures = _procedure_search(conn, user_message, top_k=proc_top_k)
+    ctx.procedures = _procedure_search(conn, query, top_k=proc_top_k)
 
-    matched = match_known_entities(conn, user_message)
+    matched = match_known_entities(conn, query)
     type_expanded, expansion_info = _expand_entities_by_type(conn, matched)
     # Free-text type/property expansion: the user may ask "what build tools
     # do we use?" without naming any specific entity. Map type/property
@@ -522,7 +561,7 @@ def augment(
     # property; merge into the entity set so Source 1 of the graph lookup
     # picks them up.
     query_type_expanded, query_type_info = _expand_entities_from_query(
-        conn, user_message
+        conn, query
     )
     overlap_expanded, overlap_info = _expand_entities_by_token_overlap(
         conn, matched,
@@ -549,9 +588,9 @@ def augment(
     if cfg.rules_enabled:
         ctx.rules = load_rules(conn, ctx.matched_entities, cap=cfg.rules_context_cap)
 
-    routed = route_predicates(user_message)
+    routed = route_predicates(query)
     ctx.graph_facts = _graph_lookup(
-        conn, cfg, user_message, ctx.matched_entities, expansion_info, routed,
+        conn, cfg, query, ctx.matched_entities, expansion_info, routed,
         overlap_info=overlap_info,
         embedding_client=embedding_client,
     )

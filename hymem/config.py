@@ -313,6 +313,31 @@ class HyMemConfig:
     (deepseek-v4-flash: 100% at 10, 0% at 111), so a dream's markers are judged in
     sub-batches of this size. Lower if a weaker judge still collapses."""
 
+    coref_enabled: bool = True
+    """Campaign E / E5: resolve anaphora + ellipsis in the query BEFORE any
+    retrieval tier runs (`hymem/query/coref.py`). A follow-up like "what did she
+    say about that?" or "en de prijs?" defeats every tier at once — BM25 has only
+    stopwords, the vector points nowhere, no entity matches — because the referent
+    is in the previous turn, not the query. The rewrite APPENDS the resolved
+    referents (`query + " (context: medflow)"`) and never replaces, so retrieval
+    keeps every original token and can only gain signal. ON by default: the
+    default path is stdlib-only (no LLM call), it needs a `session_id` to have any
+    recent turns to resolve against, and it fires only when a trigger matches AND
+    a referent resolves — a self-contained query is returned byte-identical."""
+    coref_max_turns: int = 6
+    """Recent turns of the active session searched for the referent. Small on
+    purpose: the antecedent of "that" is nearly always the thing just discussed,
+    and a wide window pulls in stale entities that only dilute the appended
+    clause."""
+    coref_llm_enabled: bool = False
+    """Optional Stage-2 fallback: when the heuristic fires but the graph knows no
+    entity in the recent-turn window, spend ONE tiny `LLMClient` call to rewrite
+    the follow-up as a standalone question. Off by default — the salient-token
+    fallback covers the same cases for free, and this puts an LLM call on the
+    query path (latency + cost on every under-specified follow-up). Only the
+    TERMS the model introduces are used, and they are still appended, so even a
+    hallucinated rewrite cannot remove a token the original query matched on."""
+
     graph_top_k_per_entity: int = 3
     embedding_max_scan: int = 5000
 
