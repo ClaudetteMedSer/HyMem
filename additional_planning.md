@@ -564,14 +564,28 @@ permanently, dense → the E3 path reopens. Full scorecard:
 *(added 2026-07-02 — the "point 5" carry-over from the competitive/architecture
 review)*
 
-> **SUBSUMED 2026-07-30 by Campaign E, Step 4 (E1 build, below).** The
-> decision-grained granularity goal is realized as a NEW artifact class
-> (`narrative_facts`, append-only/immutable) rather than an episode-prompt
-> rewrite — which dodges this plan's sequencing constraint entirely (episode
-> membership is untouched, so the RAPTOR flip-watch is undisturbed). This plan
-> stays as the record of the granularity motivation (BEAM EO/SUM post-mortem,
-> rate-distortion framing); do not run the episode-prompt version while
-> Campaign E is active.
+> **~~SUBSUMED 2026-07-30 by Campaign E, Step 4 (E1 build, below).~~
+> UN-SUBSUMED same day — E1 was banked dead by G-F1 (see Campaign E, Step 1).**
+> The `narrative_facts` artifact class that was to have absorbed this plan's
+> decision-grained granularity goal does not exist and will not be built:
+> extraction faithfulness measured 0.55–0.76 against a required 0.90, twice,
+> across a deliberate prompt revision.
+>
+> **Read that as evidence about THIS plan too, not just about E1.** Plan C is
+> also a generative rewrite — it asks a model to re-cut episodes at decision
+> granularity — and G-F1 is the only measurement the repo has of what that model
+> does when asked to produce self-contained items from session turns. It invented
+> biographical detail at roughly 1 claim per 3–4 items, reproduced the same
+> inventions under a differently-worded prompt, and confabulated over the
+> char-cap truncation boundary. Plan C's version is *harder*, not easier: it
+> rewrites the artifact retrieval already depends on, where E1 only added a new
+> one. **Do not run the episode-prompt version without first clearing
+> `benchmarks/fact_probe.py`'s faithfulness bar** (stratified sample,
+> correct-answer control, ≥0.90) on episode rewrites specifically. The
+> granularity motivation below (BEAM EO/SUM post-mortem, rate-distortion
+> framing) still stands — the *diagnosis* was never in question, only the
+> generative remedy. Both remaining sequencing constraints are unchanged: this
+> plan touches episode membership, so it stays gated on the RAPTOR flip-watch.
 
 ### Motivation
 
@@ -718,6 +732,9 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 
 ### Step 1 — E1 front-run probe (`benchmarks/fact_probe.py`)
 
+> **BUILT + RUN 2026-07-30 → G-F1 FAILED, E1 BANKED DEAD** (verdict at the end of
+> this block; the probe itself is retained as the repo's faithfulness instrument).
+>
 > **BUILT 2026-07-30, UNRUN** (no LLM spend yet, and no banked source run on this
 > box — `~/.hermes/benchmarks/` is empty here, so the gate must be executed on the
 > Hermes box). `benchmarks/fact_probe.py` + `tests/test_fact_probe.py` (25 tests);
@@ -821,6 +838,64 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 > **G-F1 is now one decision, not a scoring question: spend the single allowed
 > iteration (~500 calls, re-extraction — a rescore cannot recover this) or bank
 > E1 dead. A second failure banks it dead by the pre-registered rule.**
+>
+> ---
+>
+> ## **G-F1 VERDICT 2026-07-30: FAIL. E1 IS BANKED DEAD.**
+>
+> The single allowed `FACTS_PROMPT_V2` iteration was spent and hand-scored:
+> **21–29 of 38 facts pass strict (55–76%) on the same 10 gold-bearing sessions.
+> The generous end of the range is still 14pp below the required 0.90.** By the
+> pre-registered rule (`one prompt iteration allowed on a visible prompt defect;
+> a second failure banks E1 dead — record and stop`), **E1 is closed. Step 4 is
+> cancelled. No third prompt.**
+>
+> **V2 did what it was justified to do, and that is exactly why the verdict is
+> clean.** Both visible defects are gone from the failure set: no quota-floor
+> padding, no session-date stamping, facts materially more concise (38 facts vs
+> ~45 for the same sessions). The improvement from ~0.6 (dates excused) to
+> ~0.55–0.76 is inside hand-score noise at n=38, i.e. **not a real move.** The
+> two worst V1 sessions reproduce their hallucinations verbatim under V2:
+> `answer_35c5419d_3` (GPA 3.6 / Dean's list / sister at Stanford, 1/4) and
+> `answer_f56e6152_1` (goats Billy & Nanny, cheese/yogurt, leash training,
+> chicken feed, 2/6). **Identical inventions from a differently-worded prompt on
+> the same source is the signature of a model-side failure mode, not a prompt
+> defect** — which is precisely what the one-iteration rule exists to discriminate,
+> and it discriminated. There is no third visible defect to fix.
+>
+> **Secondary failure mode found, and it is not prompt-fixable either:**
+> sessions 3 and 10 (`answer_85a77c48_2` facts 7–8, `answer_a21f3697_2`
+> "Foundations of Yoga" / MWF 7am / phone reminders) fail in the **truncated
+> tail** — the char-cap drops turns, and the model confabulates over the cut
+> rather than stopping. Raising the cap trades directly against extraction cost,
+> which is the ~500-calls-per-10-questions number that made this probe expensive
+> in the first place.
+>
+> **What the verdict does and does not say.** It kills E1 *as specified* — a
+> generative narrative-fact artifact written into the store by an extraction
+> pass. It does NOT invalidate the density half of the thesis: provenance
+> reachability read 90% on misses, and the middle-granularity retrieval unit may
+> still be worth having. But it cannot be *generated*, because at 0.55–0.76
+> faithfulness a fact tier writes ~1 invented biographical claim per 3–4 facts
+> into permanent memory, where supersession (E6) would then defend it and the
+> reader would cite it with confidence. **A retrieval tier that fabricates
+> beats no tier only if you never read it.** Note also that the 90% provenance
+> was measured on facts that include invented content — BM25 will happily match
+> a fabricated fact into the top-5 — so it is provenance-correct, not
+> quality-correct, and does not survive as an independent finding.
+>
+> **Campaign E survives on its hedge, as designed.** E5 shipped and passed
+> (31/31, 0/12 no-harm). E3 (M1/M2) is unaffected — it reranks what retrieval
+> already found and generates nothing. E2/E4/E6/E7 were all specified over the
+> facts artifact; **E6 (supersession over facts) dies with E1**, E2/E4/E7 need
+> re-specification over episodes/observations before any of them can be costed.
+>
+> **Retained assets:** `benchmarks/fact_probe.py` + tests stay in-tree. It is the
+> only instrument in the repo that measures *extraction faithfulness* against
+> source turns with a stratified sample and a correct-answer control, and any
+> future generative-write proposal (E2 observations included) must clear the same
+> bar before it writes to the store. The V1/V2 dumps are the fixture. Cost of the
+> whole G-F1 decision: ~1,000 extraction calls, one dead build avoided.
 
 **Idea.** Extract narrative facts with a draft prompt from the haystacks of the
 ~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and
@@ -980,7 +1055,16 @@ changes.
 
 ---
 
-### Step 4 — E1 build: the narrative-facts artifact (gated on G-F1)
+### Step 4 — E1 build: the narrative-facts artifact ~~(gated on G-F1)~~ CANCELLED
+
+> **CANCELLED 2026-07-30 — G-F1 FAILED TWICE. Do not build this.** Faithfulness
+> 0.55–0.76 vs a required 0.90, with the same inventions reproducing across the
+> one allowed prompt revision. Full verdict and its reasoning: Step 1 above.
+> The spec below is kept verbatim as the record of what was gated and why the
+> gate was worth running — **it is not a backlog item.** Reviving any part of it
+> requires a NEW faithfulness result, not a re-reading of this one. E6
+> (supersession over facts) is cancelled with it; E2/E4/E7 must be re-specified
+> over an artifact that exists.
 
 **Idea.** Dream-time extraction of self-contained narrative facts, stored
 immutably (append-only, version-tagged), served as an additive retrieval tier
@@ -1156,7 +1240,68 @@ not-in-anchor assertion.
 
 ### Step 8 — E4, E6, E7 (production track, independent)
 
-**E4 temporal-range boost.** (a) New `hymem/query/reldates.py`: stdlib-only
+**E4 temporal-range boost.**
+
+> **FRONT-RUN RUN 2026-07-30 → G-E4a FAILS 2 of 3 on LoCoMo. DO NOT BUILD (b)
+> AS SPECIFIED.** Instrument: `benchmarks/reldate_probe.py` (+ 34 tests), which
+> carries a prototype resolver so the gate runs before `reldates.py` exists —
+> the `fact_probe.py`/`FACTS_PROMPT_V1` pattern. No LLM, no embeddings, no
+> store; seconds to run. Pre-registered G-E4a = fire rate ≥5% AND range
+> precision ≥90% AND zero control fires.
+>
+> | population | n | fired | rate | vague-only | precision | control |
+> |---|---|---|---|---|---|---|
+> | locomo-questions (gating) | 1986 | 24 | **1.2%** | 61 (3.1%) | **20.8%** | **0 ✓** |
+> | locomo-turns (non-gating) | 5882 | 375 | 6.4% | 217 (3.7%) | — | 0 |
+>
+> **Criterion 1 — fire rate 1.2% vs 5%.** This is the Track A verdict again: a
+> correct boost that no query triggers is dead code with a config flag. Note
+> `vague_only` (61) **outnumbers** resolvable (24) 2.5:1 — most temporal intent
+> in the corpus is "recently"/"a while back"/"the other day", which carries no
+> arithmetic. **No resolver improvement reaches that bucket**, so the ceiling
+> here is ~3% even with a perfect parser, i.e. the criterion cannot be met by
+> building harder.
+>
+> **Criterion 2 — precision 20.8%, and the WHY is the real finding.** The
+> arithmetic is right and the axis is wrong. Misses are **one-directional: gold
+> AFTER the range 15, BEFORE 4** (3 of those 4 are future `next month/year`
+> windows). Worked example: *"Where did Caroline move from 4 years ago?"*
+> resolves to 2020 — correctly — and the gold turn is dated **2023-06-09**,
+> because that is when she *said* it. **A range boost matches an item's SPEECH
+> time; a relative expression in a question is about EVENT time.** Every
+> `n_units_ago` miss is that mismatch. It is a bi-temporal gap, not a resolver
+> bug, and no amount of resolver work closes it. (A resolver *accuracy* problem
+> would scatter misses on both sides — which is precisely why the probe measures
+> the direction rather than arguing it.)
+>
+> **Criterion 3 — control PASSES 0/1901.** The one criterion E4 would have to
+> get right to be safe, it gets right. Two false-fire classes were found and
+> fixed during the run, both mine, both now regression-tested: `"the last week
+> **of** August 2023"` is an ABSOLUTE construction that was resolving to a
+> window a year off, and a stated in-text anchor (`"…as mentioned on November 6,
+> 2023"`) was being ignored so the *anchor's* error was reported as the
+> *resolver's* imprecision — the same instrument-defect class that made the G-F1
+> date reading unusable.
+>
+> **What survives, and it is not a rescue.** Content-side fires at **6.4%** —
+> above the gate — while the query side does not. Relative dates are abundant
+> *inside stored turns* ("I moved here last week") and rare in questions. That
+> is a different feature: **normalizing relative mentions at INGEST**, where the
+> anchor is known exactly (the turn's own timestamp) and the resolved date is
+> EVENT time, which is the axis the misses show is needed. It also lands on an
+> artifact HyMem already has — bi-temporal `valid_at` (Phase 1, landed) — rather
+> than on `messages.created_at`. **This is a candidate, not a decision:** it
+> must clear its own front-run (what share of resolved mentions get a `valid_at`
+> that retrieval can use?) before it costs anything.
+>
+> **Status: (a) `hymem/query/reldates.py` NOT written; (b) augment wiring NOT
+> written.** One cheap confirmation is outstanding before E4 is formally banked:
+> `python reldate_probe.py --dataset <lme_s>.json` on the box (free, no LLM).
+> LME questions carry an explicit `question_date`, so it is the fairer test of
+> criterion 1 — but criterion 2's axis mismatch is architectural and will
+> reproduce.
+
+(a) New `hymem/query/reldates.py`: stdlib-only
 relative-date resolver, EN+NL (yesterday, N days/weeks/months ago, last
 week/month/year, "twee weken geleden", "vorige week", "between X and Y"),
 anchored to a `now` argument (harness passes `question_date`, production
@@ -1168,6 +1313,13 @@ message/facts/temporal tiers with a `in_range:YYYY-MM-DD..YYYY-MM-DD` why-code.
 invariant test). **Tests:** resolver matrix EN+NL with fixed anchor; boost-only
 semantics; no-range query → byte-identical path; why codes; TR chronology
 unchanged.
+
+**~~E6 supersession over facts~~ — CANCELLED 2026-07-30 with E1** (its target
+artifact does not exist). Worth keeping the reason visible: supersession is the
+mechanism that would have *defended* a fabricated fact — closing the older,
+correct row in favour of a newer invented one — so at 0.55–0.76 faithfulness E6
+was not merely unbuildable, it was the amplifier. Spec retained below only as
+the record of the intended design.
 
 **E6 supersession over facts** (after Step 4). Extend the
 `value_supersession.py` classify→group→compare pipeline to `narrative_facts`:
@@ -1195,14 +1347,29 @@ unused.
 
 | # | Item | Depends on | LLM cost | Gate |
 |---|------|-----------|----------|------|
-| 1 | E1 probe (`fact_probe.py`) — **BUILT, UNRUN** | — | `questions × sessions` (`--cost` first) | **G-F1** (mechanism + faithfulness, score-free) |
-| 2 | E5 anaphora — **BUILT, GATE PASSED** | — (parallel day one) | none (heuristic) | 31-item eval **100%**, no-harm **0/12** ✓ |
+| 1 | E1 probe (`fact_probe.py`) — **RUN, VERDICT IN** | — | ~1,000 calls (v1 + v2) | **G-F1 FAILED** — faithfulness 0.55–0.76 vs 0.90, twice ✗ |
+| 2 | E5 anaphora — **BUILT, GATE PASSED, SHIPPED** | — (parallel day one) | none (heuristic) | 31-item eval **100%**, no-harm **0/12** ✓ |
 | 3 | E3 measurements M1+M2 — **BUILT, UNRUN** | — (parallel, offline) | M1 LLM arm only | M1/M2 pre-registered parity |
-| 4 | E1 build (migration 026, facts.py, tier, render) | G-F1 pass | probe artifacts reused | 13 pytests; additive-invariant test |
-| 5 | Scored confirmation (LoCoMo n=800 + MSC + LME guard) | Step 4 | 2–3 box runs | triad net vs churn floors; LME non-regression only |
-| 6 | E3 adoption (one rebaseline) | Steps 3+5 | ≤1 shared run | offline parity held; baselines re-frozen |
-| 7 | E2 observations | **flip-watch green** | capped per dream | qualitative + mechanical |
-| 8 | E4 / E6 / E7 | E4: none; E6: Step 4; E7: none | small | per-item gates above |
+| ~~4~~ | ~~E1 build~~ — **CANCELLED** (G-F1) | — | — | — |
+| ~~5~~ | ~~Scored confirmation~~ — **CANCELLED** (nothing to confirm) | — | — | — |
+| 6 | E3 adoption (one rebaseline) | Step 3 only (Step 5 gone) | ≤1 shared run | offline parity held; baselines re-frozen |
+| 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a new faithfulness result** | capped per dream | must clear `fact_probe.py`'s bar first |
+| 8 | E4 — **G-E4a FAILED 2/3, not built** (E7 open; **E6 cancelled with E1**) | E7: none | none spent (probe is LLM-free) | E4 fire rate 1.2% vs 5%, precision 20.8% vs 90% ✗ |
+
+**Post-G-F1 campaign state.** Campaign E's generative half is closed; its
+retrieval half is what remains. Live work: **E3** (M1 needs an API key, M2
+blocked on the torch OOM) is now the only unblocked scored item, and it is
+independent of everything E1 touched — it reorders a pool retrieval already
+built and writes nothing. ~~**E4** (temporal-range boost) was specified over facts' `fact_date` but is
+re-specifiable over episode/message dates, which already exist and are not
+model-generated; that is the cheapest surviving item.~~ **E4 front-run RAN
+2026-07-30 and FAILED G-E4a** (see Step 8): message/episode dates are SPEECH
+time and the queries ask about EVENT time, so re-specifying it over them was
+the wrong move — measured, not guessed, at zero LLM cost.
+**E7** is artifact-agnostic (it scores whatever the tier returned). **E2** is
+the one to be careful with: per-entity observations are generative writes, so it
+inherits G-F1's finding directly and must clear the same bar before it costs
+anything.
 
 Hard rules carried into this campaign: never suppress-filter on a routed
 signal (boost ≠ filter); additive tiers never touch another tier's budget; any
