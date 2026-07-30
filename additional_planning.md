@@ -677,10 +677,32 @@ first, then granularity, then re-verify reuse once on the new episode set.
 ## Campaign E — the narrative-facts roadmap (added 2026-07-30)
 
 *Origin: the 2026-07-30 competitive review (HyMem vs Hindsight/Honcho), integrated
-with its own critique the same day. Supersedes nothing above; Plan C is subsumed
-by Step 4 (E1 build) as noted there. Same standing contract as every plan in this
+with its own critique the same day. Supersedes nothing above; Plan C was briefly
+subsumed by Step 4 (E1 build) and UN-subsumed the same day when G-F1 cancelled it.
+Same standing contract as every plan in this
 file: front-run gate before any build, additive-only, mechanism > score, nothing
 reads oracle labels, per-category LME deltas under ~±5pp are noise.*
+
+### Scoreboard — state as of 2026-07-30 (read this first; the per-step blocks below are the chronological record)
+
+| Item | State | Verdict in one line |
+|---|---|---|
+| **E1 narrative facts** | **DEAD (G-F1 failed twice)** | Faithfulness 0.55–0.76 vs required 0.90; identical inventions reproduced under the one allowed prompt revision → model-side failure, banked by the pre-registered rule. `fact_probe.py` retained as the repo's faithfulness instrument; revival needs a NEW faithfulness result (e.g. a changed dream model), never a re-read of this one. |
+| **E5 anaphora** | **SHIPPED ✓** | `hymem/query/coref.py`, on by default; 31/31 resolution, 0/12 no-harm. The hedge that paid. |
+| **E3 rerank A/B (M1+M2)** | **BUILT, UNRUN — the only live scored item** | Blocked on environment only: M1 needs an API key for the LLM arm; M2 needs sentence-transformers (torch OOM on box). Adoption stays Step 6. |
+| **E6 supersession over facts** | **CANCELLED with E1** | Target artifact doesn't exist; at E1's faithfulness it was the amplifier of fabrication, not a feature. |
+| **E4 temporal boost (query-side)** | **NOT BUILT — closed by decomposition** | LME gate technically PASSED (8.8% / 90.9% / 0) but the same two rules (`calendar_last`, `n_units_ago`) fail in BOTH corpora on the speech-time/event-time axis; revision budget spent. Carry-forward = ingest-side `valid_at` normalization, which needs its own front-run **with a selectivity criterion** (free, dataset-side). |
+| **E2 per-entity observations** | **DORMANT (double-blocked)** | Needs flip-watch green (currently red AND untestable — box store quiescent since ~Jul 12) AND a new faithfulness result clearing `fact_probe.py`'s bar. Not schedulable as pending work. |
+| **E7 usage feedback** | **OPEN, ungated** | Artifact-agnostic long game; no front-run designed yet. |
+
+**Uncommitted as of this note:** the E4 re-run verdict block (Step 8), the
+per-rule-precision + small-n-caveat instrument additions in
+`benchmarks/reldate_probe.py`, and their tests. Suite 936 green.
+
+**Next actions, in order:** (1) commit the E4 verdict + instrument work;
+(2) run the free selectivity measurement for the ingest-side E4 candidate;
+(3) unblock E3's environment (API key + torch) and run M1/M2, then decide
+Step 6 adoption.
 
 ### E0. Evidence base and the six review constraints
 
@@ -1177,7 +1199,11 @@ append-only + UNIQUE).
 
 ---
 
-### Step 5 — scored confirmation (box; protocol, not a build)
+### Step 5 — scored confirmation (box; protocol, not a build) — CANCELLED
+
+> **CANCELLED 2026-07-30 with Step 4 — nothing to confirm.** The protocol below
+> is retained because Step 6 (E3 adoption) reuses its run discipline for the one
+> shared confirmation run it now carries itself.
 
 - **LoCoMo, n=800, `--fresh` (core changed → stores rebuilt), seed 0, canonical
   3×/24k.** Pre-registered reads, in order: (a) mechanism — facts rendered in
@@ -1199,8 +1225,8 @@ append-only + UNIQUE).
 If M1+M2 passed (Step 3): flip `rerank_model` default `"llm"`→`"cross-encoder"`
 and (if M2 passed) `rerank_cross_encoder_model` → `bge-reranker-v2-m3` in ONE
 commit — the single deliberate rebaseline the review priced. LME/LoCoMo
-non-regression rides Step 5's runs where the config diff is orthogonal, else
-one shared confirmation run. Update the frozen-baseline table
+non-regression is one shared confirmation run (Step 5 is cancelled, so there
+are no runs to ride). Update the frozen-baseline table
 (`longmemeval_roadmap.md` §1) with the new numbers. Suite green; adjust any
 test pinning the old default.
 
@@ -1404,6 +1430,67 @@ not-in-anchor assertion.
 > query-side boost is banked and the ingest-side candidate (relative mentions →
 > bi-temporal `valid_at`) is what carries forward. If precision clears 90%, E4
 > is a genuine PASS on LME and the LoCoMo failure is corpus mix.
+>
+> ---
+>
+> **RE-RUN 2026-07-30 → G-E4a reads PASS on LME (fire 8.8% ✓, precision 90.9%
+> ✓ n=44, control 0 ✓) and still FAILS on LoCoMo (1.1% / 23.8%). Per the
+> reading fixed in advance, the threshold crossing is NOT the verdict — the
+> decomposition is, and it says the resolver is FINISHED while the ceiling is
+> ARCHITECTURAL. Still not built.**
+>
+> All 4 surviving LME misses are **gold AFTER the range — one-directional**,
+> the axis signature. Every balanced (resolver-error) miss the previous run
+> showed is gone; revision 1 consumed exactly the fixable half. What remains is
+> the speech-time/event-time gap, in the corpus that was supposed to be the
+> favourable one.
+>
+> **The cross-corpus confirmation is the finding, not the LME number.** n=4
+> one-directional is p=0.125 on its own — a prior, not a result (the probe now
+> says so; see the small-n caveat). But the misses concentrate on the same two
+> rules in both corpora:
+>
+> | rule | LoCoMo precision | LME misses |
+> |---|---|---|
+> | `calendar_last` ("last month") | 33% (3/9) | 3 of 4 |
+> | `n_units_ago` ("a few months ago") | **0% (0/9)** | 1 of 4 |
+> | everything else | 100% (2/2) | 0 |
+>
+> Two corpora, opposite verdicts, **the same two constructions failing** — and
+> they are the two most common resolvable expressions. That is not corpus mix.
+> Mechanism prediction it implies, checkable free from the existing JSON:
+> **precision should decay with lookback distance**, because the further back
+> the window, the more room between when a thing happened and when it was
+> mentioned. `calendar_last` and `n_units_ago` are the long-lookback rules;
+> `within_last_n` and `since_*` are the short ones and are the ones at 100%.
+>
+> **The gate measured the wrong quantity, and this is the honest gap.** Range
+> precision = "the window contains the gold date." It says nothing about how
+> many NON-gold items the window also contains. A month-wide window over a
+> corpus of session dates may cover 10–20% of the store, in which case a ×1.5
+> boost has no discriminative power at any precision. **Selectivity — the share
+> of the corpus inside a fired range — is the quantity that decides whether the
+> boost helps retrieval at all, and G-E4a never measured it.** It is free to
+> measure (dataset-side, no store, no LLM) and it is decision-blocking for ANY
+> range boost, including the ingest-side successor.
+>
+> **Disposition: E4's query-side boost over `created_at` is NOT built.** Not
+> "banked dead" in E1's sense — the pre-registered gate was satisfied and the
+> revision budget was spent honestly. It fails a different test: the two rules
+> that carry the feature are the two that miss, and the miss is on the axis
+> that a query-side boost cannot reach. **The carry-forward is the ingest-side
+> candidate** (relative mentions inside turns → bi-temporal `valid_at`, where
+> the anchor is the turn's own timestamp and the output is EVENT time), which
+> content-side fire rates have pointed at since the first run: 5.2% on LoCoMo
+> turns, above the gate, against 1.1% on its questions. It needs its own
+> front-run, and that front-run must carry a selectivity criterion.
+>
+> **Instrument additions this run (REPORTING only — no resolver change, so no
+> revision budget spent):** per-rule precision with a "broken dominant rule"
+> warning (an aggregate can clear 90% while the most common construction is
+> wrong and rare rules carry the mean), and a small-n caveat on the
+> one-directional warning (4/0 arises by chance 12% of the time; 6/0 is the
+> p<0.05 point). Suite 936.
 
 (a) New `hymem/query/reldates.py`: stdlib-only
 relative-date resolver, EN+NL (yesterday, N days/weeks/months ago, last
@@ -1458,7 +1545,7 @@ unused.
 | ~~5~~ | ~~Scored confirmation~~ — **CANCELLED** (nothing to confirm) | — | — | — |
 | 6 | E3 adoption (one rebaseline) | Step 3 only (Step 5 gone) | ≤1 shared run | offline parity held; baselines re-frozen |
 | 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a new faithfulness result** | capped per dream | must clear `fact_probe.py`'s bar first |
-| 8 | E4 — **G-E4a FAILS on both corpora, not built**; one pre-registered resolver revision remains (E7 open; **E6 cancelled with E1**) | hand-read of the 9 LME misses (free) | none spent (probe is LLM-free) | LoCoMo 1.2%/20.8% ✗ (axis); LME 9.4% ✓ / **80.9%** ✗ (resolver, balanced misses) |
+| 8 | E4 — revision spent, **query-side NOT built**; carry-forward is the ingest-side `valid_at` candidate, which needs its own front-run incl. selectivity (E7 open; **E6 cancelled with E1**) | selectivity measurement (free) | none spent (probe is LLM-free) | LoCoMo 1.1%/23.8% ✗; LME 8.8% ✓ / 90.9% ✓ = gate PASS, **but all 4 misses one-directional and the same 2 rules fail in both corpora** |
 
 **Post-G-F1 campaign state.** Campaign E's generative half is closed; its
 retrieval half is what remains. Live work: **E3** (M1 needs an API key, M2

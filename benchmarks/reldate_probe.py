@@ -617,6 +617,17 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
 
     n = len(rows) or 1
     scored = hits + misses
+    # Per-rule precision. An aggregate can pass while the SINGLE most common
+    # construction is broken and rarely-firing rules carry the average — and a
+    # boost that is wrong on the expression people actually use is worse than
+    # no boost, however good the mean looks.
+    by_rule: dict[str, dict[str, int]] = {}
+    for rec in fired:
+        slot = by_rule.setdefault(rec["rule"], {"fired": 0, "scored": 0, "hits": 0})
+        slot["fired"] += 1
+        if "gold_covered" in rec:
+            slot["scored"] += 1
+            slot["hits"] += bool(rec["gold_covered"])
     return {
         "name": name, "gating": gating, "n": len(rows),
         "fired": len(fired), "fire_rate": 100.0 * len(fired) / n,
@@ -632,6 +643,7 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
         # gold" from "the loader dropped it", which look identical downstream.
         "rows_with_gold": sum(1 for r in rows if r.get("gold_dates")),
         "by_category": by_cat,
+        "by_rule": dict(sorted(by_rule.items(), key=lambda kv: -kv[1]["fired"])),
         "precision_n": scored,
         "precision": (100.0 * hits / scored) if scored else None,
         "rules": dict(sorted(rules.items(), key=lambda kv: -kv[1])),
@@ -705,6 +717,24 @@ def report(pops: list[dict], summary: dict, *, verbose: bool,
             print(f"\n  {p['name']} rules: {top}")
             print(f"  {p['name']} anchors: {p['reanchored']} re-anchored to a "
                   f"date stated in the text")
+            scored_rules = [(k, v) for k, v in (p.get("by_rule") or {}).items()
+                            if v["scored"]]
+            if scored_rules:
+                line = "  ".join(
+                    f"{k}={100.0 * v['hits'] / v['scored']:.0f}% ({v['hits']}/"
+                    f"{v['scored']})" for k, v in scored_rules)
+                print(f"  {p['name']} precision by rule: {line}")
+                worst = min(scored_rules, key=lambda kv: kv[1]["hits"] / kv[1]["scored"])
+                w_name, w = worst
+                w_prec = w["hits"] / w["scored"]
+                share = w["scored"] / max(p["precision_n"], 1)
+                # An aggregate pass carried by rules that rarely fire is not a
+                # pass for the boost anyone would actually hit.
+                if w_prec < 0.75 and share >= 0.2:
+                    print(f"    ⚠ '{w_name}' is {share:.0%} of the scored fires "
+                          f"at {w_prec:.0%} precision. The aggregate is an\n"
+                          f"      average over a broken dominant rule — read the "
+                          f"per-rule row, not the headline.")
             cats = {k: v for k, v in (p.get("by_category") or {}).items()
                     if v["n"] >= 10 and k != "?"}
             if len(cats) > 1:
@@ -739,6 +769,15 @@ def report(pops: list[dict], summary: dict, *, verbose: bool,
                           "      arithmetic, wrong axis — that is a bi-temporal "
                           "gap, not a resolver bug, and no amount of\n"
                           "      resolver work closes it.")
+                    # A lopsided split on a handful of misses is a coin flip.
+                    # Six one-sided misses is p<0.05; four is p=0.125, which
+                    # is a prior worth carrying, not a finding.
+                    if after + before < 6:
+                        print(f"      (n={after + before} misses — suggestive, "
+                              f"not decisive on its own: a {after}/{before} "
+                              f"split\n       arises by chance about "
+                              f"{2 ** -(after + before) * 2:.0%} of the time. "
+                              f"Read it against the other corpora.)")
                 elif after + before:
                     # Said explicitly, because the ABSENCE of the warning above
                     # is not self-interpreting: a reader who has seen a

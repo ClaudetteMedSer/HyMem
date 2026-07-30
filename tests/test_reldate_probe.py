@@ -159,6 +159,33 @@ def test_miss_direction_separates_axis_mismatch_from_resolver_error():
     assert res["miss_sides"] == {"after": 2}
 
 
+def test_per_rule_precision_exposes_an_average_over_a_broken_rule():
+    """An aggregate can clear 90% while the single most common construction is
+    wrong, with rarely-firing rules carrying the mean. A boost that misses on the
+    expression people actually use is worse than no boost, so the split is
+    reported rather than left inside the average."""
+    rows = [
+        # "last month" — arithmetically right, gold sits after the window.
+        {"id": "a", "text": "what did I finish last month?",
+         "anchor": "2024-05-30", "gold_dates": ["2024-05-20"]},
+        {"id": "b", "text": "how many hours last month?",
+         "anchor": "2024-05-30", "gold_dates": ["2024-05-22"]},
+        # a different rule, correct.
+        {"id": "c", "text": "what did I buy three weeks ago?",
+         "anchor": "2024-05-30", "gold_dates": ["2024-05-09"]},
+    ]
+    by_rule = measure(rows, name="t", gating=True)["by_rule"]
+    assert by_rule["calendar_last"] == {"fired": 2, "scored": 2, "hits": 0}
+    assert by_rule["n_units_ago"]["hits"] == 1
+
+
+def test_per_rule_precision_skips_rules_with_no_scorable_gold():
+    rows = [{"id": "a", "text": "what did I finish last month?",
+             "anchor": "2024-05-30", "gold_dates": []}]
+    by_rule = measure(rows, name="t", gating=True)["by_rule"]
+    assert by_rule["calendar_last"] == {"fired": 1, "scored": 0, "hits": 0}
+
+
 def test_future_windows_are_counted_but_never_fired():
     """Superseded by revision 1: a forward-facing window used to be a fire (and
     therefore always a precision miss). It is now its own category."""
