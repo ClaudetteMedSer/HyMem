@@ -25,8 +25,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 from reldate_probe import (  # noqa: E402
     effective_anchor,
     has_temporal_language,
+    load_lme,
     load_locomo,
     measure,
+    normalize_date,
     parse_locomo_date,
     resolve_range,
     summarize,
@@ -195,7 +197,9 @@ def test_precision_below_the_discrimination_floor_is_unread_not_failed():
     delta."""
     s = summarize([_pop(precision_n=3, precision=33.0)])
     assert s["precision_read"] is False
-    assert s["gate"]["precision_ok"] is True
+    # Not FAIL — the number is noise at n=3 and a probe must not kill a build on
+    # noise. Not PASS either: unread is unmeasured.
+    assert s["verdict"] == "INCOMPLETE"
 
 
 def test_non_gating_populations_never_enter_the_verdict():
@@ -236,3 +240,82 @@ def test_load_locomo_anchors_questions_to_the_last_session(tmp_path):
     # Turns are anchored to their OWN session — a turn's "last week" is relative
     # to when it was said, not to the end of the conversation.
     assert [t["anchor"] for t in turns] == ["2023-05-08", "2023-07-03"]
+
+
+# ── verdict states: an unmeasured criterion is not a satisfied one ──────────────
+def test_unmeasured_precision_is_incomplete_not_pass():
+    """The defect this guards: with no dated gold, `precision is None` used to
+    satisfy criterion 2, so a 2-of-3 run printed PASS. `fact_probe.py` reports
+    INCOMPLETE in the same situation and this probe now agrees."""
+    s = summarize([_pop(precision_n=0, precision=None)])
+    assert s["verdict"] == "INCOMPLETE"
+    assert s["pass"] is False
+    assert s["gate"]["precision_ok"] is False
+
+
+def test_a_failing_measured_criterion_outranks_incomplete():
+    """FAIL beats INCOMPLETE: a run that misses the fire-rate floor is decided,
+    whether or not precision was measurable."""
+    s = summarize([_pop(fired=1, fire_rate=1.0, precision_n=0, precision=None)])
+    assert s["verdict"] == "FAIL"
+
+
+def test_all_three_measured_and_holding_is_a_real_pass():
+    assert summarize([_pop()])["verdict"] == "PASS"
+
+
+def test_rows_with_gold_separates_a_loader_failure_from_a_bare_corpus():
+    """Zero rows carrying gold looks identical to 'no fired question had gold'
+    downstream, but one is a bug and the other is a corpus property."""
+    rows = [{"id": "a", "text": "what did we do last week?",
+             "anchor": "2024-03-15", "gold_dates": []}]
+    assert measure(rows, name="t", gating=True)["rows_with_gold"] == 0
+    rows[0]["gold_dates"] = ["2024-03-06"]
+    assert measure(rows, name="t", gating=True)["rows_with_gold"] == 1
+
+
+# ── LME loading: the format that silently voided criterion 2 ────────────────────
+@pytest.mark.parametrize("raw,want", [
+    ("2023/05/20 (Sat) 02:21", "2023-05-20"),   # LongMemEval's actual stamp
+    ("2023-05-20", "2023-05-20"),
+    ("2023/5/6", "2023-05-06"),
+    ("6 November, 2023", "2023-11-06"),
+    ("", ""),
+    ("not a date", ""),
+    ("2023/13/45", ""),
+])
+def test_normalize_date_accepts_the_slash_format(raw, want):
+    """`str(raw)[:10]` + an ISO match drops EVERY LongMemEval date, which
+    reports criterion 2 as a confident 'n/a' instead of failing loudly."""
+    assert normalize_date(raw) == want
+
+
+def test_load_lme_attaches_gold_dates_from_slash_stamps(tmp_path):
+    data = [{
+        "question_id": "q1", "question": "what did we decide last week?",
+        "question_date": "2023/05/20 (Sat) 02:21",
+        "question_type": "temporal-reasoning",
+        "haystack_session_ids": ["s1", "s2"],
+        "haystack_dates": ["2023/05/10 (Wed) 09:00", "2023/05/18 (Thu) 11:00"],
+        "answer_session_ids": ["s2"],
+    }]
+    path = tmp_path / "lme.json"
+    path.write_text(__import__("json").dumps(data))
+    rows = load_lme(path)
+    assert rows[0]["anchor"] == "2023-05-20"
+    assert rows[0]["gold_dates"] == ["2023-05-18"]  # gold session only
+
+
+def test_by_category_tracks_fires_per_category():
+    """A fire rate carried by one annotator-designed category is a property of
+    the benchmark, not of how people ask — a different claim from 'queries carry
+    relative dates'."""
+    rows = [
+        {"id": "1", "text": "what did we do last week?", "anchor": "2024-03-15",
+         "gold_dates": [], "category": "temporal-reasoning"},
+        {"id": "2", "text": "what is her address?", "anchor": "2024-03-15",
+         "gold_dates": [], "category": "single-session-user"},
+    ]
+    cats = measure(rows, name="t", gating=True)["by_category"]
+    assert cats["temporal-reasoning"] == {"n": 1, "fired": 1}
+    assert cats["single-session-user"] == {"n": 1, "fired": 0}

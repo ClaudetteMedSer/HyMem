@@ -1294,12 +1294,44 @@ not-in-anchor assertion.
 > must clear its own front-run (what share of resolved mentions get a `valid_at`
 > that retrieval can use?) before it costs anything.
 >
+> **LME arm RUN 2026-07-30 → fire rate 9.4% ✓, control 0 ✓, precision
+> UNMEASURED. Verdict = INCOMPLETE, not PASS.** Criterion 1 genuinely clears on
+> LME, and the corpus difference is real: LME ships an explicit `question_date`
+> per question, so relative expressions have a usable anchor that LoCoMo's
+> annotator-written questions mostly lack. **9.4% is the resolvable rate as
+> reported** — `fired` already excludes vague-only rows, so subtracting
+> `vague_only` (3.8%) from it double-counts.
+>
+> Two instrument defects the LME run exposed, both fixed + regression-tested:
+> - **The probe printed PASS on 2 of 3 criteria.** `precision is None` was
+>   written as satisfying criterion 2 — an UNMEASURED criterion counted as a met
+>   one. `fact_probe.py` reports INCOMPLETE in exactly this situation and this
+>   probe now agrees: three states (FAIL > INCOMPLETE > PASS), and a failing
+>   *measured* criterion still outranks INCOMPLETE.
+> - **"No gold in LME" is a LOADER bug, not a corpus property.** LongMemEval
+>   stamps read `2023/05/20 (Sat) 02:21`; `load_lme` sliced `[:10]` and demanded
+>   ISO, so every `haystack_dates` entry failed and every gold list came back
+>   empty — the criterion most likely to fail reported as "n/a". `normalize_date`
+>   now accepts slash/dot/prose forms, and the report distinguishes "zero rows
+>   carry gold AT ALL" (loader failure, loud) from "no fired question had gold"
+>   (corpus property). **LME does have dated gold; re-run to measure criterion 2.**
+>
+> Also added: **fire rate by question category**, because a rate carried by one
+> annotator-designed category ("temporal-reasoning") is a property of the
+> benchmark's mix, not of how people ask. The warning requires the top category
+> to carry ≥60% of fires AND be ≥2× over-represented, so it does not trip on the
+> largest category simply being largest (LoCoMo's category 4 is 42% of questions
+> and 62% of fires — size, not concentration).
+>
 > **Status: (a) `hymem/query/reldates.py` NOT written; (b) augment wiring NOT
-> written.** One cheap confirmation is outstanding before E4 is formally banked:
-> `python reldate_probe.py --dataset <lme_s>.json` on the box (free, no LLM).
-> LME questions carry an explicit `question_date`, so it is the fairer test of
-> criterion 1 — but criterion 2's axis mismatch is architectural and will
-> reproduce.
+> written.** The build now hangs on ONE free re-run:
+> `python reldate_probe.py --dataset <lme_s>.json` with the fixed loader.
+> Criterion 2 is the one LoCoMo failed at 20.8% on a **corpus-independent**
+> mechanism, and LME's `haystack_dates` are session dates — SPEECH time, the
+> same axis — so the prior is that it fails there too. If it does, E4's
+> query-side boost is banked and the ingest-side candidate (relative mentions →
+> bi-temporal `valid_at`) is what carries forward. If precision clears 90%, E4
+> is a genuine PASS on LME and the LoCoMo failure is corpus mix.
 
 (a) New `hymem/query/reldates.py`: stdlib-only
 relative-date resolver, EN+NL (yesterday, N days/weeks/months ago, last
@@ -1354,7 +1386,7 @@ unused.
 | ~~5~~ | ~~Scored confirmation~~ — **CANCELLED** (nothing to confirm) | — | — | — |
 | 6 | E3 adoption (one rebaseline) | Step 3 only (Step 5 gone) | ≤1 shared run | offline parity held; baselines re-frozen |
 | 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a new faithfulness result** | capped per dream | must clear `fact_probe.py`'s bar first |
-| 8 | E4 — **G-E4a FAILED 2/3, not built** (E7 open; **E6 cancelled with E1**) | E7: none | none spent (probe is LLM-free) | E4 fire rate 1.2% vs 5%, precision 20.8% vs 90% ✗ |
+| 8 | E4 — **G-E4a: FAIL on LoCoMo, INCOMPLETE on LME**, not built (E7 open; **E6 cancelled with E1**) | one free re-run with the fixed loader | none spent (probe is LLM-free) | LoCoMo 1.2%/20.8% ✗; LME fire 9.4% ✓, precision unmeasured |
 
 **Post-G-F1 campaign state.** Campaign E's generative half is closed; its
 retrieval half is what remains. Live work: **E3** (M1 needs an API key, M2

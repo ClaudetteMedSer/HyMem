@@ -420,6 +420,23 @@ def load_locomo(path: Path) -> tuple[list[dict], list[dict]]:
     return questions, turns
 
 
+def normalize_date(raw: object) -> str:
+    """LongMemEval stamps read `2023/05/20 (Sat) 02:21` — slash-separated, with
+    a weekday and a time. Slicing the first 10 chars and demanding ISO drops
+    EVERY date silently, which turns the precision criterion into a confident
+    'n/a' rather than a loud failure. Returns '' when nothing parses."""
+    s = str(raw or "").strip()
+    m = re.match(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)),
+                        int(m.group(3))).isoformat()
+        except ValueError:
+            return ""
+    d = _prose_to_date(_PROSE_DATE.search(s)) if _PROSE_DATE.search(s) else None
+    return d.isoformat() if d else ""
+
+
 def load_lme(path: Path) -> list[dict]:
     """LME questions with `question_date` as anchor and the gold sessions' dates
     (via `answer_session_ids` → the `haystack_session_ids`/`haystack_dates`
@@ -430,14 +447,13 @@ def load_lme(path: Path) -> list[dict]:
     rows: list[dict] = []
     for q in data:
         text = str(q.get("question", "")).strip()
-        anchor = str(q.get("question_date") or "")[:10]
-        if not text or not _ISO.match(anchor):
+        anchor = normalize_date(q.get("question_date"))
+        if not text or not anchor:
             continue
         sids = [str(s) for s in (q.get("haystack_session_ids") or [])]
-        dates = [str(d)[:10] for d in (q.get("haystack_dates") or [])]
+        dates = [normalize_date(d) for d in (q.get("haystack_dates") or [])]
         gold_ids = {str(s) for s in (q.get("answer_session_ids") or [])}
-        gold = sorted({d for s, d in zip(sids, dates)
-                       if s in gold_ids and _ISO.match(d)})
+        gold = sorted({d for s, d in zip(sids, dates) if s in gold_ids and d})
         rows.append({"id": str(q.get("question_id", len(rows))), "text": text,
                      "anchor": anchor, "gold_dates": gold,
                      "category": q.get("question_type")})
@@ -455,11 +471,20 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
     n_reanchored = n_future = 0
     rules: dict[str, int] = {}
     sides: dict[str, int] = {}
+    # Fire rate by question category. A rate carried entirely by one
+    # annotator-designed category ("temporal-reasoning") is a property of the
+    # benchmark's category mix, not of how people ask questions — and E4 would
+    # then be a one-category feature, which is a different claim.
+    by_cat: dict[str, dict] = {}
 
     for row in rows:
         anchor, overridden = effective_anchor(row["text"],
                                               date.fromisoformat(row["anchor"]))
         hit = resolve_range(row["text"], anchor)
+        cat = str(row.get("category") or "?")
+        slot = by_cat.setdefault(cat, {"n": 0, "fired": 0})
+        slot["n"] += 1
+        slot["fired"] += hit is not None
         vague = vague_markers(row["text"])
         if hit is None:
             if vague:
@@ -516,6 +541,10 @@ def measure(rows: list[dict], *, name: str, gating: bool) -> dict:
         "n_control": n_control, "control_fires": len(control_fires),
         "reanchored": n_reanchored, "future_ranges": n_future,
         "miss_sides": sides,
+        # How many rows carry gold AT ALL — separates "this corpus has no dated
+        # gold" from "the loader dropped it", which look identical downstream.
+        "rows_with_gold": sum(1 for r in rows if r.get("gold_dates")),
+        "by_category": by_cat,
         "precision_n": scored,
         "precision": (100.0 * hits / scored) if scored else None,
         "rules": dict(sorted(rules.items(), key=lambda kv: -kv[1])),
@@ -538,20 +567,30 @@ def summarize(pops: list[dict]) -> dict:
     # handful of scored questions the number is noise either way, and a probe
     # that fails a build on noise is worse than one that says "cannot tell".
     precision_read = pn >= _MIN_N_FOR_PRECISION
+    # An UNMEASURED criterion is not a satisfied one. A corpus with no dated
+    # gold cannot say whether the resolved ranges are right, and 2-of-3 is not
+    # a pass — `fact_probe.py` reports INCOMPLETE for exactly this reason and
+    # this probe reporting PASS instead was a defect, not a difference.
+    n_with_gold = sum(1 for p in gating for _ in range(p["precision_n"]))
     gate = {
         "fire_rate_ok": fire_rate >= _MIN_FIRE_RATE,
-        "precision_ok": (precision is None or not precision_read
-                         or precision >= _MIN_PRECISION),
+        "precision_ok": (precision is not None and precision_read
+                         and precision >= _MIN_PRECISION),
         "no_harm_ok": ctl <= _MAX_CONTROL_FIRES,
     }
+    measured = {k: v for k, v in gate.items() if k != "precision_ok"}
+    unmeasured = precision is None or not precision_read
+    verdict = ("FAIL" if not all(measured.values())
+               else "INCOMPLETE" if unmeasured
+               else "PASS" if gate["precision_ok"] else "FAIL")
     return {
         "n_gating": n, "fired": fired, "fire_rate": 100.0 * fire_rate,
         "vague_only": sum(p["vague_only"] for p in gating),
-        "precision_n": pn,
+        "precision_n": pn, "n_with_gold": n_with_gold,
         "precision": (100.0 * precision) if precision is not None else None,
         "precision_read": precision_read,
         "control_fires": ctl,
-        "gate": gate, "pass": all(gate.values()),
+        "gate": gate, "verdict": verdict, "pass": verdict == "PASS",
         "populations": [{k: v for k, v in p.items()
                          if not k.startswith("rows_")} for p in pops],
     }
@@ -577,6 +616,27 @@ def report(pops: list[dict], summary: dict, *, verbose: bool) -> bool:
             print(f"  {p['name']} anchors: {p['reanchored']} re-anchored to a "
                   f"date stated in the text; {p['future_ranges']} future "
                   f"windows (can never match stored past events)")
+            cats = {k: v for k, v in (p.get("by_category") or {}).items()
+                    if v["n"] >= 10 and k != "?"}
+            if len(cats) > 1:
+                ranked = sorted(cats.items(),
+                                key=lambda kv: -kv[1]["fired"] / kv[1]["n"])
+                head = "  ".join(f"{k}={100.0 * v['fired'] / v['n']:.1f}%"
+                                 for k, v in ranked[:5])
+                print(f"  {p['name']} by category: {head}")
+                top_name, top = ranked[0]
+                fire_share = top["fired"] / p["fired"] if p["fired"] else 0.0
+                size_share = top["n"] / p["n"] if p["n"] else 0.0
+                # Concentration means the category punches ABOVE its weight —
+                # the largest category naturally carries the most fires without
+                # that meaning anything. Requiring both a majority of fires and
+                # a 2× over-representation keeps this from firing on size alone.
+                if fire_share >= 0.6 and fire_share >= 2 * size_share:
+                    print(f"    ⚠ '{top_name}' is {size_share:.0%} of the "
+                          f"questions but {fire_share:.0%} of the fires. The "
+                          f"rate is\n      the benchmark's category mix, not "
+                          f"how people ask — E4 would be a one-category "
+                          f"feature.")
             sides = p.get("miss_sides") or {}
             if sides:
                 after, before = sides.get("after", 0), sides.get("before", 0)
@@ -619,7 +679,25 @@ def report(pops: list[dict], summary: dict, *, verbose: bool) -> bool:
           f"vague-only={s['vague_only']}  precision={prec} "
           f"(n={s['precision_n']})  control fires={s['control_fires']}")
 
-    if s["precision_n"] and not s["precision_read"]:
+    if not s["precision_n"]:
+        # A silent "n/a" is how a gate gets reported as passed on two criteria.
+        # The usual cause is not "this corpus has no gold" but gold plumbing
+        # that failed to attach — an unparsed date format drops every gold and
+        # returns exactly this confident constant.
+        gold_rows = sum(p.get("rows_with_gold", 0) for p in pops if p["gating"])
+        print(f"  ⚠ precision UNMEASURED — no fired question carried a dated "
+              f"gold session ({gold_rows} of {s['n_gating']} questions in the "
+              f"gating populations have gold dates AT ALL).")
+        if not gold_rows:
+            print("    ↳ ZERO questions have gold dates: this is a LOADER "
+                  "failure, not a corpus property. Check the date format in\n"
+                  "      `haystack_dates`/`answer_session_ids` — LongMemEval "
+                  "ships `2023/05/20 (Sat) 02:21`, not ISO.")
+        print("    ↳ criterion 2 is the one LoCoMo FAILED at 20.8% on a "
+              "mechanism (speech-time vs event-time) that is corpus-\n"
+              "      independent. Leaving it unmeasured here is not neutral: "
+              "it is the criterion most likely to fail.")
+    elif not s["precision_read"]:
         print(f"  ⚠ precision UNREAD: {s['precision_n']} scored questions is "
               f"below the {_MIN_N_FOR_PRECISION}-question floor — reported, "
               f"not gated.")
@@ -642,15 +720,21 @@ def report(pops: list[dict], summary: dict, *, verbose: bool) -> bool:
          f"fire rate ≥ {_MIN_FIRE_RATE:.0%} ({s['fire_rate']:.1f}%)"),
         (s["gate"]["precision_ok"],
          f"range precision ≥ {_MIN_PRECISION:.0%} ({prec}"
-         + ("" if s["precision_read"] else ", unread") + ")"),
+         + ("" if s["precision_n"] and s["precision_read"]
+            else ", unmeasured" if not s["precision_n"] else ", unread") + ")"),
         (s["gate"]["no_harm_ok"],
          f"control fires ≤ {_MAX_CONTROL_FIRES} ({s['control_fires']})"),
     ]
-    print(f"\n── G-E4a: {'PASS' if s['pass'] else 'FAIL'} ──")
+    print(f"\n── G-E4a: {s['verdict']} ──")
     for ok, label in checks:
-        print(f"  [{'✓' if ok else '✗'}] {label}")
+        mark = "✓" if ok else ("?" if label.endswith("unmeasured)") else "✗")
+        print(f"  [{mark}] {label}")
     print("  (fire rate is the Track A criterion: a correct boost no query "
           "triggers\n   is dead code with a config flag.)")
+    if s["verdict"] == "INCOMPLETE":
+        print("  INCOMPLETE is not a pass: 2 of 3 criteria hold and the third "
+              "was not measured.\n   Supply a corpus with dated gold, or read "
+              "this as the fire-rate criterion alone.")
     return s["pass"]
 
 
