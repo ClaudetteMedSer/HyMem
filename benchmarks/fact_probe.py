@@ -55,9 +55,19 @@ the probe prints the recovered n so the reconciliation is visible.
 Extraction is ONE call per session, and an LME haystack carries tens of sessions
 per question — so the honest cost is `questions × sessions`, not the ~40 calls
 the plan's budget line implies (that figure corresponds to one call per
-QUESTION). `--max-sessions` caps sessions per question (label-free: it keeps the
-most recent ones), `--cost` prints the call count and exits, and every run prints
-what it actually spent.
+QUESTION). `--cost` prints the call count and exits, and every run prints what it
+actually spent.
+
+**Cut questions, not sessions.** Two knobs bound the spend and they are NOT
+equivalent. `--max-questions` shrinks n: the gate is a FRACTION (≥60%), so a
+smaller set still reads it honestly, just with a wider band. `--max-sessions`
+caps sessions per question and is DANGEROUS as a budget lever: it is label-free
+(it keeps the most recent sessions, never consulting which one holds gold), so
+when it drops the gold session the question scores a guaranteed miss and G-F1
+fails for a BUDGET reason wearing a mechanism reason's clothes. The probe prints
+a warning whenever the cap could have cut a gold-bearing session. Use
+`--max-questions` for the budget; reserve `--max-sessions` for a deliberate
+"does a recent-only window suffice?" experiment.
 
 ── Usage (from benchmarks/) ────────────────────────────────────────────────────
   # plumbing, offline, no LLM, no dataset needed beyond the source run:
@@ -398,16 +408,27 @@ def run_question(
     dates = q_data.get("haystack_dates", []) or []
 
     order = list(range(len(sessions)))
+    gold_cut = False
     if max_sessions and len(order) > max_sessions:
         # Keep the most RECENT sessions. Label-free by construction — recency is
         # a property of the haystack, not of which session holds the answer.
         order = order[-max_sessions:]
+        # ...which is exactly why the cap must be AUDITED after the fact: a
+        # dropped gold session makes this question an automatic miss, and a gate
+        # failure caused by the budget must never be read as a mechanism result.
+        # Checked here (never used to choose sessions) purely so the report can
+        # say how many rows were decided by the cap rather than by extraction.
+        gold_texts, _ = _extract_gold_turns(q_data)
+        if gold_texts:
+            kept = "\n".join(render_session(sessions[i]) for i in order)
+            gold_cut = not _gold_in_pool(gold_texts, [kept])
 
     conn = open_fact_index()
     out = {"question_id": qid, "question": question, "sessions_processed": 0,
            "calls": 0, "parse_failures": 0, "facts_total": 0,
            "facts_per_session": [], "retrieved": [], "gold_in_facts": False,
-           "gold_turns": 0, "error": None, "dump": []}
+           "gold_turns": 0, "gold_cut_by_session_cap": gold_cut,
+           "error": None, "dump": []}
     try:
         for idx in order:
             messages = sessions[idx]
@@ -485,6 +506,11 @@ def summarize(miss_rows: list[dict], ctrl_rows: list[dict],
         "mean_facts_per_question": (sum(r["facts_total"] for r in ok_miss) / n),
         "parse_failures": sum(r["parse_failures"] for r in miss_rows + ctrl_rows),
         "calls": sum(r["calls"] for r in miss_rows + ctrl_rows),
+        # Rows whose gold session `--max-sessions` threw away: guaranteed misses
+        # that say nothing about extraction. Non-zero ⇒ the density number is a
+        # floor, not a measurement.
+        "gold_cut_by_session_cap": sum(
+            1 for r in ok_miss if r.get("gold_cut_by_session_cap")),
         "faithfulness": faithfulness,
         "gate": gate,
         # A missing hand-score is INCOMPLETE, never PASS: three of four criteria
@@ -518,6 +544,11 @@ def report(s: dict, diag: dict, miss_rows: list[dict], verbose: bool) -> bool:
     print(f"  facts/question mean:  {s['mean_facts_per_question']:.1f}")
     print(f"  extraction calls: {s['calls']}   parse failures: {s['parse_failures']}"
           + (f"   row errors: {s['errors']}" if s["errors"] else ""))
+    if s.get("gold_cut_by_session_cap"):
+        print(f"  ⚠ {s['gold_cut_by_session_cap']}/{s['n_misses']} misses had "
+              f"their GOLD SESSION cut by --max-sessions — those are forced "
+              f"misses. The density number below is a FLOOR, not a measurement; "
+              f"re-run without the session cap before reading G-F1.")
     print("  faithfulness: "
           + (f"{s['faithfulness']:.2f} (hand-scored)" if s["faithfulness"] is not None
              else "NOT SCORED — hand-read the dump, then re-run with --faithfulness"))
@@ -569,9 +600,14 @@ def main() -> None:
     ap.add_argument("--category", default="multi-session",
                     help="question_type to select (default: the MS synthesis bank)")
     ap.add_argument("--seed", type=int, default=0, help="control-sample seed")
+    ap.add_argument("--max-questions", type=int, default=0,
+                    help="cap questions per arm (0 = all) — THE budget knob. The "
+                         "gate is a fraction, so a smaller n still reads it")
     ap.add_argument("--max-sessions", type=int, default=0,
                     help="cap sessions extracted per question (0 = all); keeps "
-                         "the most recent — label-free")
+                         "the most recent — label-free, but a poor budget lever: "
+                         "dropping the gold session forces a miss (see --cost "
+                         "output and the gold_cut_by_session_cap counter)")
     ap.add_argument("--top-k", type=int, default=_FACT_TOP_K,
                     help=f"facts returned per question (default {_FACT_TOP_K}; "
                          f"the density claim is about this number)")
@@ -617,6 +653,14 @@ def main() -> None:
         print(f"⚠ {len(missing)} selected qid(s) absent from {args.dataset.name} — "
               f"is this the dataset the source run scored? {missing[:5]}")
 
+    if args.max_questions:
+        # Truncate BEFORE the control is paired down, and take the head of each
+        # list rather than a fresh sample: the selection order is already
+        # deterministic, so a re-run at the same --max-questions hits the same
+        # questions and two budgets nest (n=10 ⊂ n=20).
+        miss_ids = miss_ids[: args.max_questions]
+        ctrl_ids = ctrl_ids[: args.max_questions]
+
     def _sessions_for(qid: str) -> int:
         n = len(by_id[qid].get("haystack_sessions", []) or [])
         return min(n, args.max_sessions) if args.max_sessions else n
@@ -627,11 +671,21 @@ def main() -> None:
           f"{total_calls} extraction calls"
           + ("  (--sim: zero LLM calls)" if args.sim else
              f"  @ {args.model}")
+          + (f"   [--max-questions {args.max_questions}]" if args.max_questions else "")
           + (f"   [--max-sessions {args.max_sessions}]" if args.max_sessions else ""),
           flush=True)
+    if args.max_sessions:
+        sess = [len(by_id[q].get("haystack_sessions", []) or [])
+                for q in miss_ids]
+        capped = sum(1 for n in sess if n > args.max_sessions)
+        print(f"  ⚠ --max-sessions truncates {capped}/{len(miss_ids)} miss "
+              f"haystacks. Every question whose gold session falls outside the "
+              f"window is a GUARANTEED miss — a G-F1 failure would then be a "
+              f"budget artifact. Prefer --max-questions to bound spend; the run "
+              f"reports `gold_cut_by_session_cap` so this is auditable.")
     if args.cost:
-        print("  --cost: nothing spent. Re-run without it (consider "
-              "--max-sessions) to execute.")
+        print("  --cost: nothing spent. Re-run without it (bound spend with "
+              "--max-questions, not --max-sessions) to execute.")
         return
 
     llm = None

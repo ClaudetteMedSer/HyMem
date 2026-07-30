@@ -296,3 +296,35 @@ def test_errored_rows_are_excluded_from_the_rate() -> None:
     assert s["n_misses"] == 4
     assert s["gold_in_facts_rate"] == 100.0
     assert s["errors"] == 1
+
+
+def test_session_cap_flags_a_cut_gold_session() -> None:
+    """`--max-sessions` is label-free, so it can throw away the gold session and
+    force a miss. That must be REPORTED, not silently folded into the density
+    number — a budget artifact read as a mechanism result is how a gate lies."""
+    q = _q_data()
+    # Reverse so the gold session is the OLDEST — a recency cap of 1 drops it.
+    q["haystack_sessions"] = list(reversed(q["haystack_sessions"]))
+    q["haystack_session_ids"] = list(reversed(q["haystack_session_ids"]))
+    q["haystack_dates"] = list(reversed(q["haystack_dates"]))
+
+    cut = run_question(q, llm=None, sim=True, max_sessions=1)
+    assert cut["gold_cut_by_session_cap"] is True
+    assert cut["gold_in_facts"] is False          # forced miss, not a real one
+    s = summarize([cut], [], 0.95)
+    assert s["gold_cut_by_session_cap"] == 1
+
+    # Uncapped, the same question is found — proving the miss was the cap.
+    full = run_question(q, llm=None, sim=True, max_sessions=0)
+    assert full["gold_cut_by_session_cap"] is False
+    assert full["gold_in_facts"] is True
+
+
+def test_max_questions_budgets_are_nested() -> None:
+    """The budget knob must be a prefix, not a fresh sample: n=2 ⊂ n=3, so two
+    runs at different budgets are comparable instead of being different sets."""
+    run = {"per_question": [
+        _row(f"ms-miss-{i}") for i in range(5)
+    ] + [_row(f"ms-hit-{i}", correct=True) for i in range(5)]}
+    misses, _, _ = select_probe_sets(run, seed=0)
+    assert misses[:2] == misses[:3][:2]
