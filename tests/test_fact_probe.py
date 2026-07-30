@@ -25,7 +25,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 from fact_probe import (  # noqa: E402
+    FACTS_PROMPT_V1,
+    FACTS_PROMPTS,
     _MAX_FACT_CHARS,
+    audit_fact_dates,
+    extract_facts,
     build_faithfulness_sample,
     _MAX_FACTS_PER_SESSION,
     gold_session_ids,
@@ -146,8 +150,9 @@ def test_validate_facts_enforces_caps_and_dates() -> None:
     facts = validate_facts(items, session_date="2023-11-30T09:00:00")
     # Cap truncates a runaway response BEFORE it can inflate the density number.
     assert len(facts) == _MAX_FACTS_PER_SESSION
-    # A malformed date is dropped and the session date stands in; the fact is kept.
-    assert all(f["date"] == "2023-11-30" for f in facts)
+    # A malformed date is dropped and NOTHING stands in for it — the fact is kept
+    # but stays undated (see test_validator_never_stamps_the_session_date...).
+    assert all(f["date"] is None for f in facts)
     long_fact = validate_facts([{"text": "x" * 2000}], session_date=None)
     assert len(long_fact[0]["text"]) == _MAX_FACT_CHARS
 
@@ -489,3 +494,89 @@ def test_sample_entries_carry_their_source_turns() -> None:
         assert entry["source_turns"]
         assert entry["facts"]
         assert entry["question_id"] == q["question_id"]
+
+
+# ── Date handling: the validator no longer fabricates (2026-07-30) ──────────
+
+def test_validator_never_stamps_the_session_date_on_an_undated_fact() -> None:
+    """THE regression for the faithfulness hand-read.
+
+    The model returning `date: null` is it doing the right thing on a session
+    that states no date. The validator used to overwrite that null with the
+    SESSION's date, turning "undated" into a confident specific date — which the
+    hand-read then scored as a model hallucination. `fact_date` is explicit dates
+    only; relative references are E4's job."""
+    facts = validate_facts([{"text": "the pool was raised", "date": None}],
+                           session_date="2023-11-30T09:00:00")
+    assert facts[0]["date"] is None
+
+
+def test_malformed_date_is_dropped_not_replaced() -> None:
+    facts = validate_facts([{"text": "a fact", "date": "last friday"}],
+                           session_date="2023-11-30T09:00:00")
+    assert facts[0]["date"] is None
+    assert facts[0]["text"] == "a fact"          # the fact itself survives
+
+
+def test_explicit_iso_date_is_preserved() -> None:
+    facts = validate_facts([{"text": "a fact", "date": "2023-05-22"}],
+                           session_date="2023-11-30T09:00:00")
+    assert facts[0]["date"] == "2023-05-22"
+
+
+def test_date_audit_separates_injected_from_model_supplied() -> None:
+    """Lets a hand-score already performed on a pre-fix dump be re-attributed
+    without re-extracting: only `model_supplied` dates are the model's to answer
+    for."""
+    rows = [{"dump": [
+        {"session_id": "s1", "date": "2023-11-30T00:00:00", "facts": [
+            {"text": "a", "date": "2023-11-30"},   # == session date → injected
+            {"text": "b", "date": "2023-05-22"},   # differs → the model's
+            {"text": "c", "date": None},           # undated
+        ]},
+    ]}]
+    a = audit_fact_dates(rows)
+    assert a["facts"] == 3
+    assert a["dated"] == 2
+    assert a["undated"] == 1
+    assert a["injected_or_coincident"] == 1
+    assert a["model_supplied"] == 1
+    assert a["injected_share"] == 50.0
+
+
+# ── FACTS_PROMPT_V2: the one allowed iteration ─────────────────────────────
+
+def test_v2_prompt_removes_both_visible_defects() -> None:
+    """The two defects the hand-read exposed must be gone from the text itself,
+    not merely intended: the session-date licence and the fact quota."""
+    _tag, system, template = FACTS_PROMPTS["v2"]
+    assert "the session date applies" not in system      # no dating licence
+    assert "2 to 8 facts" not in system                  # no quota floor
+    assert "{date}" not in template                      # model never sees it
+    assert "[]" in system                                # empty is a good answer
+    # v1 is retained verbatim so the v1 run stays reproducible.
+    assert FACTS_PROMPTS["v1"][1] is FACTS_PROMPT_V1
+    assert FACTS_PROMPTS["v1"][0] != FACTS_PROMPTS["v2"][0]
+
+
+def test_extract_facts_routes_to_the_selected_prompt_arm() -> None:
+    class Recorder:
+        def __init__(self):
+            self.systems, self.users = [], []
+
+        def chat(self, messages, temperature=0.1, max_tokens=1024):
+            self.systems.append(messages[0]["content"])
+            self.users.append(messages[1]["content"])
+            return "[]"
+
+    msgs = [{"role": "user", "content": "I raised the pool to 40 " * 5}]
+    for arm, sentinel in (("v1", "the session date applies"),
+                          ("v2", "THE ONLY RULE THAT MATTERS")):
+        rec = Recorder()
+        extract_facts(rec, msgs, session_date="2023-11-30T00:00:00",
+                      prompt_version=arm)
+        assert sentinel in rec.systems[0]
+    # v2's user turn must not carry the session date anywhere.
+    rec = Recorder()
+    extract_facts(rec, msgs, session_date="2023-11-30T00:00:00", prompt_version="v2")
+    assert "2023-11-30" not in rec.users[0]

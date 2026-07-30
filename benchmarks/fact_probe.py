@@ -164,6 +164,51 @@ Rules:
 - An empty array [] is a valid answer for a session that establishes nothing.
 """
 
+# --- V2: the ONE allowed prompt iteration (2026-07-30) ---------------------
+# The gate pre-authorizes a single revision on a VISIBLE prompt defect. The
+# faithfulness hand-read of the v1 run exposed two, both legible in the text
+# above rather than inferred from the scores:
+#
+#   1. **The date clause invited invention.** V1 said a fact's date is the one it
+#      refers to "if the session states one OR THE SESSION DATE APPLIES" — an
+#      open licence to stamp a date on an undated fact. (The probe's validator
+#      then did the same thing independently; that bug is fixed separately at
+#      `validate_facts`. Both had to go.) V2 asks for a date ONLY when the
+#      conversation writes one, and names relative references as things to leave
+#      null — that is E4's job, not the extractor's.
+#   2. **"2 to 8 facts" read as a quota with a floor of 2.** On a thin session
+#      the cheapest way to satisfy a floor is to invent, which matches what the
+#      hand-read found: loyalty programmes, a GPA and Dean's list, named goats, a
+#      named doctor, ride distances — none in the source. V2 removes the floor,
+#      makes zero facts an explicitly good answer, and puts the invention ban
+#      before the coverage instruction rather than after it.
+#
+# V1 is retained verbatim above: a re-run must be able to reproduce the v1
+# numbers, and the two prompts are the arms of that comparison.
+FACTS_PROMPT_VERSION_V2 = "facts.v2"
+
+FACTS_PROMPT_V2 = """You extract NARRATIVE FACTS from one conversation session.
+
+A narrative fact is a single, self-contained statement of something that happened, was decided, was preferred, or was true — written so it can be read and understood WITHOUT the conversation around it.
+
+THE ONLY RULE THAT MATTERS: every name, number, date, price, quantity and claim you write must ALREADY BE PRESENT in the turns below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal fact is correct; a rich fact containing one invented detail is a failure.
+
+Output a strict JSON array. Each item has exactly:
+- text (string): the fact, one sentence, self-contained. Name the people, things and values explicitly instead of using "he", "it", "that", "the project" — but only names that appear in the turns.
+- date (string or null): use YYYY-MM-DD ONLY when the conversation itself writes that date. If the turns say "recently", "last week", "a few days ago", or say nothing about when — use null. Never derive a date from the session date. Never guess.
+- entities (array of strings): the concrete people, products, places, tools or organizations the fact is about, exactly as written in the turns.
+
+Rules:
+- VERBATIM VALUES. Names, numbers, dates, versions, prices and quantities exactly as the turns state them. Never round, convert, or normalize.
+- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields [] — that is a GOOD answer, not a failure, and [] is always available to you.
+- Never extract the assistant's suggestions, recommendations, or hypotheticals as facts about the user. "You could try X" is not "the user uses X".
+- One fact per exchange, decision, event or outcome — not one per turn. Combine a question and its answer into the single fact they establish.
+- Self-contained means resolvable alone: "Atta moved the MedFlow deploy to fly.io" — not "he moved it there".
+- Keep the fact in the language of the conversation.
+
+Before writing each fact, check: can I point at the exact words in the turns that state every value in it? If not, drop it.
+"""
+
 FACTS_USER_TEMPLATE_V1 = """Session date: {date}
 
 Conversation:
@@ -172,6 +217,25 @@ Conversation:
 \"\"\"
 
 Return the JSON array of narrative facts now."""
+
+# V2 deliberately does NOT show the session date. V1 handed it to the model and
+# then asked it not to use it; the surest way to stop a date being copied is for
+# the model never to see it. Explicit dates written in the turns are still right
+# there in {text}.
+FACTS_USER_TEMPLATE_V2 = """Conversation:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON array of narrative facts now."""
+
+# Prompt arms, selected by `--prompt-version`. v1 is kept so the v1 run stays
+# reproducible — the two are the arms of the iteration comparison, not a
+# replacement.
+FACTS_PROMPTS = {
+    "v1": (FACTS_PROMPT_VERSION_DRAFT, FACTS_PROMPT_V1, FACTS_USER_TEMPLATE_V1),
+    "v2": (FACTS_PROMPT_VERSION_V2, FACTS_PROMPT_V2, FACTS_USER_TEMPLATE_V2),
+}
 
 # Validation bounds, mirroring `validate_episode_items` / `validate_profile_items`
 # so the probe rejects exactly what the build's validator will reject. A gate run
@@ -333,8 +397,14 @@ def validate_facts(raw: object, *, session_date: str | None) -> list[dict]:
             # A malformed date is dropped, the fact is kept: the date is
             # metadata, the text is the evidence.
             date = ""
-        if not date and session_date:
-            date = session_date[:10]
+        # NO session-date fallback. Stamping the session's date onto a fact the
+        # model deliberately left null FABRICATES a date — it converts "no
+        # explicit date" into a confident specific one, contradicting both this
+        # probe's own prompt ("never guess one") and the E1 schema, where
+        # `fact_date` is EXPLICIT dates only and relative references are E4's job
+        # (the relative-date resolver). The 2026-07-30 faithfulness hand-read
+        # scored those injected dates as model hallucinations; they were this
+        # validator's. An undated fact stays undated.
         ents = item.get("entities")
         entities = [str(e).strip() for e in ents if str(e).strip()] if isinstance(ents, list) else []
         out.append({"text": text[:_MAX_FACT_CHARS], "date": date or None,
@@ -345,17 +415,20 @@ def validate_facts(raw: object, *, session_date: str | None) -> list[dict]:
 
 
 def extract_facts(
-    llm: LLMClient, messages: list[dict], *, session_date: str | None
+    llm: LLMClient, messages: list[dict], *, session_date: str | None,
+    prompt_version: str = "v1",
 ) -> tuple[list[dict], bool]:
     """ONE extraction call for one session. Returns (facts, parse_failed)."""
     text = render_session(messages)
     if not text.strip():
         return [], False
+    _tag, system, template = FACTS_PROMPTS[prompt_version]
+    user = (template.format(text=text) if "{date}" not in template
+            else template.format(date=(session_date or "unknown")[:10], text=text))
     raw = llm.chat(
         [
-            {"role": "system", "content": FACTS_PROMPT_V1},
-            {"role": "user", "content": FACTS_USER_TEMPLATE_V1.format(
-                date=(session_date or "unknown")[:10], text=text)},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         temperature=0.0,
         max_tokens=1200,
@@ -460,7 +533,7 @@ def search_facts(
 
 def run_question(
     q_data: dict, *, llm: LLMClient | None, sim: bool, max_sessions: int,
-    top_k: int = _FACT_TOP_K,
+    top_k: int = _FACT_TOP_K, prompt_version: str = "v1",
 ) -> dict:
     """Extract facts over one question's haystack, index them, retrieve top-k,
     and report whether the gold turn is reachable inside those k facts."""
@@ -506,7 +579,9 @@ def run_question(
                 failed = False
             else:
                 assert llm is not None
-                facts, failed = extract_facts(llm, messages, session_date=session_date)
+                facts, failed = extract_facts(llm, messages,
+                                              session_date=session_date,
+                                              prompt_version=prompt_version)
                 out["calls"] += 1
             out["parse_failures"] += int(failed)
             out["sessions_processed"] += 1
@@ -605,6 +680,41 @@ def build_faithfulness_sample(
     out = take_gold + take_filler
     rng.shuffle(out)  # so the hand-reader is not primed by ordering
     return out
+
+
+def audit_fact_dates(rows: list[dict]) -> dict:
+    """Split dated facts into MODEL-supplied vs validator-INJECTED.
+
+    Runs on an already-written dump, so it costs nothing and can attribute a
+    faithfulness hand-read retroactively. A fact whose date equals its session's
+    date is (almost certainly) one the pre-fix validator stamped when the model
+    returned null; a fact whose date differs is one the model actually produced,
+    and only THOSE are the model's to answer for.
+
+    The equality test cannot separate an injected date from a model date that
+    genuinely coincides with the session date, so `injected_or_coincident` is an
+    upper bound on the injection — which is the right direction: it bounds how
+    much of an observed "date hallucination" rate can be blamed on the model.
+    """
+    total = dated = injected = model_supplied = 0
+    for r in rows:
+        for d in r.get("dump", []) or []:
+            session_date = (d.get("date") or "")[:10]
+            for f in d.get("facts", []) or []:
+                total += 1
+                fd = f.get("date")
+                if not fd:
+                    continue
+                dated += 1
+                if session_date and fd[:10] == session_date:
+                    injected += 1
+                else:
+                    model_supplied += 1
+    return {
+        "facts": total, "dated": dated, "undated": total - dated,
+        "injected_or_coincident": injected, "model_supplied": model_supplied,
+        "injected_share": (100.0 * injected / dated) if dated else 0.0,
+    }
 
 
 def _print_sample_note(path: Path, sample: list[dict]) -> None:
@@ -718,6 +828,7 @@ def summarize(miss_rows: list[dict], ctrl_rows: list[dict],
         # floor, not a measurement.
         "gold_cut_by_session_cap": sum(
             1 for r in ok_miss if r.get("gold_cut_by_session_cap")),
+        "date_audit": audit_fact_dates(miss_rows + ctrl_rows),
         "faithfulness": faithfulness,
         "gate": gate,
         # A missing hand-score is INCOMPLETE, never PASS: three of four criteria
@@ -796,6 +907,17 @@ def report(s: dict, diag: dict, miss_rows: list[dict], verbose: bool) -> bool:
               f"their GOLD SESSION cut by --max-sessions — those are forced "
               f"misses. The density number below is a FLOOR, not a measurement; "
               f"re-run without the session cap before reading G-F1.")
+    da = s.get("date_audit") or {}
+    if da.get("dated"):
+        print(f"  dates: {da['dated']}/{da['facts']} facts dated  "
+              f"({da['model_supplied']} model-supplied, "
+              f"{da['injected_or_coincident']} equal to their session date = "
+              f"{da['injected_share']:.0f}%)")
+        if da["injected_share"] >= 50.0:
+            print("    ⚠ most dated facts carry EXACTLY their session's date. On a "
+                  "dump written before 2026-07-30 that is the VALIDATOR's "
+                  "session-date fallback, not the model — score dates only on the "
+                  "`model_supplied` slice, or re-extract now that it is removed.")
     print("  faithfulness: "
           + (f"{s['faithfulness']:.2f} (hand-scored)" if s["faithfulness"] is not None
              else "NOT SCORED — hand-read the dump, then re-run with --faithfulness"))
@@ -863,6 +985,11 @@ def main() -> None:
                          "containment number is an upper bound, not evidence")
     ap.add_argument("--api-key", default="", help="reader/extractor API key")
     ap.add_argument("--model", default="deepseek-v4-flash", help="extraction model")
+    ap.add_argument("--prompt-version", default="v1", choices=sorted(FACTS_PROMPTS),
+                    help="extraction prompt arm. v1 = the original; v2 = the ONE "
+                         "allowed iteration (no date invention, no fact quota). "
+                         "Spending v2 uses up the gate's single revision — a "
+                         "second failure banks E1 dead")
     ap.add_argument("--extra-body", default="",
                     help='JSON merged into every request, e.g. '
                          '\'{"thinking":{"type":"disabled"}}\' for v4-flash')
@@ -986,7 +1113,8 @@ def main() -> None:
 
     def _one(kind: str, qid: str) -> dict:
         r = run_question(by_id[qid], llm=llm, sim=args.sim,
-                         max_sessions=args.max_sessions, top_k=args.top_k)
+                         max_sessions=args.max_sessions, top_k=args.top_k,
+                         prompt_version=args.prompt_version)
         r["_kind"] = kind
         return r
 
@@ -1014,7 +1142,7 @@ def main() -> None:
         sample = build_faithfulness_sample(
             results, by_id, size=args.faithfulness_sample, seed=args.seed)
         args.out.write_text(json.dumps({
-            "prompt_version": FACTS_PROMPT_VERSION_DRAFT,
+            "prompt_version": FACTS_PROMPTS[args.prompt_version][0],
             "sim": args.sim,
             "model": None if args.sim else args.model,
             "summary": s,

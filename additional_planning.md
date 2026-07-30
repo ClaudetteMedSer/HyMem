@@ -791,8 +791,36 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 >    reserves half the budget for gold-bearing sessions, tags every entry with
 >    `stratum`, and refuses (loudly) when no gold-bearing session made the sample.
 >
-> **G-F1 remains INCOMPLETE**: re-dump with `--rescore … --out`, hand-score the
-> STRATIFIED sample, then supply `--faithfulness`.
+> **Faithfulness hand-read (stratified, 10 gold-bearing sessions, ~45 facts):
+> ~22–40% strict pass — FAILS the ≥0.90 criterion at both ends of the range.**
+> Two distinct causes, and only one is the model's:
+> - **Dates: the probe's own bug.** `validate_facts` stamped the SESSION date
+>   onto any fact the model returned as `null` — converting a correctly-undated
+>   fact into a confident specific date, contradicting both the prompt ("never
+>   guess one") and the E1 schema (`fact_date` = explicit dates only; relative
+>   references are E4's job). The hand-read scored those as model hallucinations;
+>   they were the validator's. **Fallback removed**; `audit_fact_dates` splits
+>   dated facts into `model_supplied` vs `injected_or_coincident` so a hand-score
+>   already done on a pre-fix dump can be re-attributed at zero cost. Dates must
+>   NOT be scored on the v1 dump — the run cannot attribute them.
+> - **Content invention: the model's, and it alone sinks the gate.** Loyalty
+>   programme, GPA 3.6 + Dean's list + sister at Stanford, named goats, Dr.
+>   Johnson, 10K/20K ride, brand recommendations — none in source. Excusing dates
+>   entirely still lands ~0.6, far below 0.90.
+>
+> **This is the pre-authorized `FACTS_PROMPT_V2` case: two VISIBLE prompt defects
+> (not score-fitting).** (1) v1's date clause licensed invention — "if the session
+> states one *or the session date applies*"; (2) "2 to 8 facts for a substantive
+> session" read as a quota with a FLOOR of 2, and the cheapest way to satisfy a
+> floor on a thin session is to invent — which matches the observed failures.
+> V2 (`--prompt-version v2`): invention ban stated first and as the only rule that
+> matters, explicit dates only, no quota, `[]` named as a good answer, assistant
+> suggestions explicitly not user facts, and the session date is no longer shown
+> to the model at all. v1 retained verbatim so the two are comparable arms.
+>
+> **G-F1 is now one decision, not a scoring question: spend the single allowed
+> iteration (~500 calls, re-extraction — a rescore cannot recover this) or bank
+> E1 dead. A second failure banks it dead by the pre-registered rule.**
 
 **Idea.** Extract narrative facts with a draft prompt from the haystacks of the
 ~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and
