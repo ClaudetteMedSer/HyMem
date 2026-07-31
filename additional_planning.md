@@ -696,7 +696,7 @@ reads oracle labels, per-category LME deltas under ~±5pp are noise.*
 | **E5 anaphora** | **SHIPPED ✓** | `hymem/query/coref.py`, on by default; 31/31 resolution, 0/12 no-harm. The hedge that paid. |
 | **E3 rerank A/B (M1+M2)** | **RUN 2026-07-30/31 — VERDICT IN, NOTHING FLIPPED** | **M1 FAIL on latency arithmetic** (CE is 10.7× *slower* than the API on CPU vs a required ≥10× faster; ~9.5ms/candidate is unreachable — mxbai 108× off, bge 37× off) and its quality row is **unmeasured**, not parity (it ran on the vacuous handset). **M2 = parity, not a bge win** (NL R@1 +4/20 at p≥0.125, EN −2/15; fails the pre-registered effect size once rescaled to n=20). bge's real edge is latency (3–4× on CPU, language-flat). **Decision: keep both defaults as they are** — Step 6 closes unexercised. |
 | **E6 supersession over facts** | **SUSPENDED with E1** | Revives automatically iff G-F1b → Step 4 land. At v4-flash's faithfulness it was the amplifier of fabrication, not a feature — which is exactly why it must never precede a faithfulness pass. |
-| **E4 temporal boost (query-side)** | **NOT BUILT — closed by decomposition** | LME gate technically PASSED (8.8% / 90.9% / 0) but the same two rules (`calendar_last`, `n_units_ago`) fail in BOTH corpora on the speech-time/event-time axis; revision budget spent. Carry-forward = ingest-side `valid_at` normalization, which needs its own front-run **with a selectivity criterion** (free, dataset-side). |
+| **E4 temporal boost (query-side)** | **NOT BUILT — closed by decomposition, then by selectivity arithmetic** | LME gate technically PASSED (8.8% / 90.9% / 0) but the same rules fail across corpora on the speech-time/event-time axis, and selective fire rate lands under criterion 1 on both. **Carry-forward `G-E4b` (ingest-side `valid_at`) PRE-REGISTERED 2026-07-31 — and its Step 0 pre-check closes the query-range consumer for free: ceiling ≈0.22% of queries (LME), ~20× under the bar.** The only live path is Fork B (an existing `valid_at` reader — supersession / recency-dating), which is a different feature and must be argued on its own terms. |
 | **E2 per-entity observations** | **DORMANT (double-blocked)** | Needs flip-watch green (currently red AND untestable — box store quiescent since ~Jul 12) AND a new faithfulness result clearing `fact_probe.py`'s bar. Not schedulable as pending work. |
 | **E7 usage feedback** | **OPEN, ungated** | Artifact-agnostic long game; no front-run designed yet. |
 
@@ -1746,6 +1746,83 @@ invariant test). **Tests:** resolver matrix EN+NL with fixed anchor; boost-only
 semantics; no-range query → byte-identical path; why codes; TR chronology
 unchanged.
 
+#### G-E4b — ingest-side `valid_at`: front-run PRE-REGISTRATION (written 2026-07-31, before any measurement)
+
+*Nothing built, nothing run. This registers the criteria BEFORE the numbers, per
+the standing contract. Zero LLM cost: `reldate_probe.py` already carries the
+resolver, both loaders, `corpus_dates` and the narrow/wide/empty split, so C1 and
+C4 are countable from existing JSON and only C2 needs hand-scoring.*
+
+**STEP 0 — the free arithmetic pre-check, and it must run FIRST.** The
+carry-forward names the consumer as *"where a QUERY range can reach them."* That
+consumer has already been measured, and it is nearly dead: selective query fire
+rate **0.3% LoCoMo / 3.4% LME**. For an ingest-written `valid_at` to change a
+query's result you need BOTH (i) that query to fire a *selective* range and (ii)
+the target item to be one that gained a `valid_at` from a resolved relative
+mention (content-side fire 5.2% LoCoMo turns / 6.4% raw). Treating them as
+independent and counting every co-occurrence as a win — both generous —
+
+> **ceiling on the share of queries this can affect = 3.4% × 6.4% ≈ 0.22% (LME);
+> 0.3% × 5.2% ≈ 0.02% (LoCoMo).**
+
+**That is one to two orders of magnitude below criterion 1's 5% bar, so Fork A
+below closes on arithmetic — before a probe is written, not after.** This is
+E4's query side closing a second time by the same mechanism, and the reason it
+was worth computing rather than assuming: *a correct feature that nothing
+triggers is dead code with a config flag* (the Track A verdict, third
+occurrence).
+
+**The fork this forces, to be resolved before any criterion is measured:**
+
+- **Fork A — consumer is query ranges: CLOSED by the pre-check above.** Record
+  and stop. Do not build a probe to rediscover a multiplication.
+- **Fork B — consumer is an existing `valid_at` reader.** `valid_at` is not
+  only for range queries, and the shipped readers do not need one: typed-value
+  **`value_supersession`** (orders versions by date), the **recency-dating
+  clause over `message_hits`** (the largest shipped dating lever: +5.4pp overall
+  / +11.5pp KU strict), and bi-temporal invalidation. **If the ingest write has
+  value it is here, not in range retrieval.** Name exactly ONE consumer before
+  measuring anything — E3's lesson, applied prospectively: confirm the path
+  under test is reachable from the config the gate runs, or the gate returns a
+  confident constant.
+
+**Pre-registered prediction, recorded so neither outcome can be rationalized
+afterwards: Fork A closes; if this proceeds at all it proceeds as Fork B.** And
+Fork B is a *different feature* from the one E4 carried forward — it must be
+argued on its own terms, not inherited on E4's momentum.
+
+**Criteria, applicable only once Fork B names a live consumer:**
+
+- **C1 — INCREMENTAL coverage, not raw fire rate. ≥5%.** `dreaming/dates.py`
+  already extracts explicit dates, so the measurable is the share of turns
+  gaining a `valid_at` they do **not** already have. The raw 5.2%/6.4%
+  double-counts every relative mention sitting beside an explicit date in the
+  same turn, and would read as a green light for work already done.
+- **C2 — CORRECTNESS ≥95%, deliberately HIGHER than the query side's 90%**,
+  on a hand-labelled sample of ≥50 resolved mentions stratified by rule. The
+  asymmetry is structural: a query-side boost is transient and self-correcting,
+  an **ingest write is permanent and supersession will defend it** — E1's
+  finding generalized (a store write that fabricates beats no write only if you
+  never read it). One class of error does disappear here (the anchor is the
+  turn's own timestamp, exactly known, so G-E4a's anchor-error class is gone),
+  but **`calendar_last` is 33%/50% precise across both corpora and that is a
+  resolver defect which travels to ingest unchanged.** Per-rule reporting is
+  mandatory; a rule under bar is **excluded from writing**, never averaged away
+  by the rules at 100%.
+- **C3 — ABSTENTION / no-harm, zero tolerance.** Unresolvable or ambiguous →
+  write NOTHING; an undated turn stays undated. This is the `validate_facts`
+  lesson restated (stamping the session date onto null-dated facts manufactured
+  confident wrong data). Control population: turns with no relative mention must
+  receive zero writes.
+- **C4 — REACHABILITY (replaces selectivity).** Share of new `valid_at` writes
+  that measurably change the named consumer's output. Measured, not assumed —
+  this criterion exists because three separate E3 measurements read as PASS
+  while being incapable of failing.
+
+**Revision budget: one**, on a visible defect class only, same rule as
+G-F1/G-E4a — threshold tuning is not a visible defect. A second failure banks
+the ingest side.
+
 **~~E6 supersession over facts~~ — CANCELLED 2026-07-30 with E1; SUSPENDED the
 same day when `G-F1b` opened** (revives automatically iff G-F1b → Step 4 land).
 Worth keeping the reason visible: supersession is the
@@ -1789,7 +1866,7 @@ unused.
 | 5 | Scored confirmation — **SUSPENDED with Step 4** | Step 4 | box runs | reinstated as written iff Step 4 builds |
 | 6 | E3 adoption — **CLOSED UNEXERCISED**; nothing flipped, rebaseline unspent | Step 3 only (Step 5 suspended) | **0 (not spent)** | precondition unmet: M1 ✗, M2 parity — revisit only if M1 is re-run and passes on GPU |
 | 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a faithfulness result (a G-F1b PASS supplies it)** | capped per dream | must clear `fact_probe.py`'s bar first |
-| 8 | E4 — **query-side CLOSED on arithmetic**, not built; carry-forward is the ingest-side `valid_at` candidate, needing a *coverage* front-run vs the query range distribution (E7 open; **E6 suspended with E1** — revives iff G-F1b → Step 4 land) | ingest-side coverage front-run (free) | none spent (probe is LLM-free) | raw gate: LoCoMo 1.1%/23.8% ✗, LME 8.8%/90.9% ✓ — **but SELECTIVE fire rate 0.3% / ~3.4%, both under criterion 1**; every precise rule non-selective, both tails dead |
+| 8 | E4 — **query-side CLOSED on arithmetic**, not built; carry-forward **`G-E4b` now PRE-REGISTERED (2026-07-31)**, Fork A (query-range consumer) closed by its free Step 0 pre-check, Fork B (existing `valid_at` reader) unstarted (E7 open; **E6 suspended with E1** — revives iff G-F1b → Step 4 land) | Fork B must name ONE live consumer before anything is measured | none spent (probe is LLM-free) | raw gate: LoCoMo 1.1%/23.8% ✗, LME 8.8%/90.9% ✓ — **but SELECTIVE fire rate 0.3% / ~3.4%, both under criterion 1**; **G-E4b Step 0 ceiling ≈0.22% (LME) / 0.02% (LoCoMo) of queries ⇒ Fork A dead**; C1 ≥5% incremental, **C2 ≥95%** (higher than query side: ingest writes are permanent), C3 zero-tolerance abstention, C4 reachability |
 
 **Post-G-F1 campaign state (amended 2026-07-30 when `G-F1b` opened).**
 Campaign E's generative half is **SUSPENDED, not closed**: G-F1's verdict is
