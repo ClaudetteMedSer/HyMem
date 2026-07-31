@@ -694,23 +694,22 @@ reads oracle labels, per-category LME deltas under ~±5pp are noise.*
 |---|---|---|
 | **E1 narrative facts** | **SUSPENDED — `G-F1b` revival gate is the campaign's next LLM spend** | G-F1 failed twice ON deepseek-v4-flash (faithfulness 0.55–0.76 vs 0.90; identical inventions under the one allowed prompt revision → model-side). Judged the largest lever vs Hindsight (E0 thesis), so one new-dreamer arm is authorized: gate `G-F1b`, protocol at the end of Step 1. No third prompt, no model ladder; a G-F1b FAIL = dead for real. |
 | **E5 anaphora** | **SHIPPED ✓** | `hymem/query/coref.py`, on by default; 31/31 resolution, 0/12 no-harm. The hedge that paid. |
-| **E3 rerank A/B (M1+M2)** | **BUILT, UNRUN — the only live scored item** | Blocked on environment only: M1 needs an API key for the LLM arm; M2 needs sentence-transformers (torch OOM on box). Adoption stays Step 6. |
+| **E3 rerank A/B (M1+M2)** | **RUN 2026-07-30/31 — VERDICT IN, NOTHING FLIPPED** | **M1 FAIL on latency arithmetic** (CE is 10.7× *slower* than the API on CPU vs a required ≥10× faster; ~9.5ms/candidate is unreachable — mxbai 108× off, bge 37× off) and its quality row is **unmeasured**, not parity (it ran on the vacuous handset). **M2 = parity, not a bge win** (NL R@1 +4/20 at p≥0.125, EN −2/15; fails the pre-registered effect size once rescaled to n=20). bge's real edge is latency (3–4× on CPU, language-flat). **Decision: keep both defaults as they are** — Step 6 closes unexercised. |
 | **E6 supersession over facts** | **SUSPENDED with E1** | Revives automatically iff G-F1b → Step 4 land. At v4-flash's faithfulness it was the amplifier of fabrication, not a feature — which is exactly why it must never precede a faithfulness pass. |
 | **E4 temporal boost (query-side)** | **NOT BUILT — closed by decomposition** | LME gate technically PASSED (8.8% / 90.9% / 0) but the same two rules (`calendar_last`, `n_units_ago`) fail in BOTH corpora on the speech-time/event-time axis; revision budget spent. Carry-forward = ingest-side `valid_at` normalization, which needs its own front-run **with a selectivity criterion** (free, dataset-side). |
 | **E2 per-entity observations** | **DORMANT (double-blocked)** | Needs flip-watch green (currently red AND untestable — box store quiescent since ~Jul 12) AND a new faithfulness result clearing `fact_probe.py`'s bar. Not schedulable as pending work. |
 | **E7 usage feedback** | **OPEN, ungated** | Artifact-agnostic long game; no front-run designed yet. |
 
-**Uncommitted as of this note:** the E4 re-run verdict block (Step 8), the
-per-rule-precision + small-n-caveat instrument additions in
-`benchmarks/reldate_probe.py`, and their tests. Suite 936 green.
+**Uncommitted as of this note:** this file only (the E3 verdict). All instrument
+work is in HEAD — the E4 re-run verdict + `reldate_probe.py` per-rule-precision
+and small-n-caveat additions, and E3's `rerank_ab.py` overlap fix + handset v3.
 
 **Next actions, in order:** (1) commit the E4 verdict + instrument work + the
 G-F1b protocol; (2) run the free selectivity measurement for the ingest-side
 E4 candidate (in progress); (3) pre-register the G-F1b candidate model and run
-the gate on the box (~500 calls + hand-score); (4) unblock E3 — CPU-only torch
-wheels (`--index-url https://download.pytorch.org/whl/cpu`) unblock BOTH M1 and
-M2 (M1 is CE-vs-LLM, so it needs the cross-encoder too; only its LLM arm needs
-an API key) — run M1/M2, then decide Step 6 adoption.
+the gate on the box (~500 calls + hand-score). ~~(4) unblock E3~~ **E3 is DONE —
+run, verdict in, nothing flipped (Step 3 status block below).** With E3 closed,
+**G-F1b is the only live scored item in the campaign.**
 
 ### E0. Evidence base and the six review constraints
 
@@ -1081,9 +1080,9 @@ inert; entity-matched query unchanged; Dutch pronouns; append-not-replace
 
 ### Step 3 (parallel, offline) — E3 reranker measurements (`benchmarks/rerank_ab.py`)
 
-> **BUILT 2026-07-30, UNRUN** (M1 needs an API key for the LLM arm; both
-> measurements need `sentence-transformers` + the two CE models, unavailable on
-> this box). `benchmarks/rerank_ab.py` + `tests/test_rerank_ab.py` (17 tests);
+> **BUILT 2026-07-30 — RUN 2026-07-30/31, VERDICT IN, NOTHING FLIPPED. Read the
+> STATUS block at the end of this step first; the spec below is the original
+> pre-registration, kept verbatim.** `benchmarks/rerank_ab.py` + `tests/test_rerank_ab.py` (17 tests);
 > `--sim` end-to-end verified, and the hand-set is validated as an instrument by
 > the suite (every gold verbatim in its corpus AND reachable inside the BM25 pool —
 > a hand-set whose gold is unreachable measures retrieval, not rerank).
@@ -1125,6 +1124,130 @@ to Step 6; this step only produces the decision data.
 
 **Tests:** probe plumbing + rank-correlation/latency math unit tests; no core
 changes.
+
+#### STATUS 2026-07-30/31 — BOTH MEASUREMENTS RUN; M1 FAIL, M2 PARITY; **no default changed**
+
+**Decision (user, 2026-07-31): keep the shipping config exactly as it is** —
+`rerank_model="llm"` and `rerank_cross_encoder_model="mixedbread-ai/mxbai-rerank-base-v1"`.
+Step 6 closes unexercised. Neither measurement produced a reason to move that
+survives its own pre-registered criterion.
+
+**M1 (CE backend vs LLM) — FAIL, and the quality row is UNMEASURED.**
+
+| arm | p50 | p95 | gold rank (median/mean) |
+|---|---|---|---|
+| CE `mxbai-rerank-base-v1` (CPU) | 29.7s | 41.0s | 1.0 / 1.0 |
+| LLM `deepseek-v4-flash` | 2.9s | 3.8s | 1.0 / 1.1 |
+
+Gate required latency **≥10× better**; observed **0.09× (10.7× worse)**. This
+closes on arithmetic, not on model choice: beating a 3.8s p95 by 10× means
+≤0.38s for 40 candidates ≈ **9.5ms/candidate**. mxbai is 108× off that, bge 37×
+off. **No cross-encoder reaches it on CPU, so trying more models is pointless** —
+the avenue closes without further runs.
+
+**Do not record M1 as "quality parity".** Both arms scored 1.0/1.0 because they
+ran on the *original* handset, where BM25 alone already put gold at rank 1 on all
+30 questions (below). Every rank cell was at ceiling, so the quality criterion
+could not fail. M1 was never re-run on handset v3. The honest record is
+**FAIL on latency, quality untested.** The CE's non-latency case (no API
+dependency, no token cost, offline operation) was never in this gate's criteria
+and is untouched by the failure.
+
+*The re-run condition, for the record:* GPU hardware plausibly closes the 9.5ms
+budget, but that is a **hypothesis — no CE was ever benchmarked on a GPU here**.
+Reviving M1 means re-running the gate as written on that hardware, not inheriting
+this verdict with the sign flipped.
+
+**M2 (mxbai → bge-reranker-v2-m3) — PARITY, not a bge win.** Run on handset v3.
+
+| | mxbai R@1 | bge R@1 | Δ | mean gold rank |
+|---|---|---|---|---|
+| NL (n=20) | 11/20 | 15/20 | **+4** | 2.25 → 1.25 |
+| EN (n=15) | 12/15 | 10/15 | **−2** | 1.57 → 1.60 |
+
+Found: NL 20/20 both; EN 14/15 → 15/15. Across the 11 hard items (BM25 gold rank
+≥10) **mxbai wins overall**: bge takes nl-08 and nl-18, mxbai takes nl-06, en-04,
+en-06. Three reasons this is parity and not a result:
+
+1. **The effect size was pre-registered in items at n=15** (4 items = 26.7pp).
+   At n=20 the same effect is **5.3 items**; observed 4 → fails as written.
+   Changing the denominator without rescaling the criterion silently loosens it.
+2. **McNemar:** the most favourable discordant split consistent with 11 vs 15
+   (bge 4, mxbai 0) gives **p = 0.125**; a 5–1 split gives p ≈ 0.22. Same
+   "prior, not a result" territory as E4's 4/0 one-directional misses.
+3. **The five items added between the n=15 and n=20 runs netted Δ=0.** Models are
+   deterministic, so the first 15 are unchanged; under a real ~27pp effect five
+   items should have widened the gap by ~1.3. The resolution test came back
+   negative.
+
+M2 was specified as **non-inferiority**, so parity is a legitimate and available
+conclusion — bge is not worse. What it does not license is banking "+4 on Dutch
+R@1" as a justification.
+
+**bge's one real, measured advantage is latency: 3–4× faster than mxbai on CPU**
+(NL p50 48.3s→11.4s, p95 59.6s→13.9s; EN p50 26.6s→11.3s), with a visible
+mechanism — **mxbai's English-first tokenizer costs 1.82× on Dutch while bge is
+language-flat at 1.01×**. That argues for bge *within* the CE path. It was still
+not adopted, because (a) the CE path is dormant (`rerank_model` defaults to
+`"llm"`; `augment.py` routes to the CE only on `cfg.rerank_model ==
+"cross-encoder"`), so the flip would change nothing for anyone on the default
+config, and (b) it **triples the opt-in download, ~0.7 GB → ~2.3 GB**, against
+the hardening initiative's pip-install-ease goal. A dormant setting is not worth
+a footprint regression on an unmeasured quality row. *If the CE backend is ever
+adopted (i.e. M1 re-run and passing on GPU), revisit bge in the same commit — on
+latency + parity, not on the Dutch R@1 number.*
+
+**Why no LME non-regression guard was run.** It would have been **vacuous by
+construction**: LME runs the default config, the CE path never executes, so the
+run returns "no change" whatever the CE model id says. That is a confident
+constant, not a measurement — the same failure class as the ceiling handset and
+the degenerate ≤15 criterion below. A meaningful guard would need
+`rerank_model="cross-encoder"` in both arms, i.e. a scored run of the backend M1
+just closed. **Generalize: before spending a run on a non-regression guard, check
+that the code path under test is actually reachable from the config the guard
+runs.**
+
+**Three instrument defects, all found mid-flight; two fixed, one open.**
+
+1. **The vacuous handset (fixed).** BM25 alone put gold at **median rank 1.0 on
+   all 30 original questions** — every rank measurement in the first M1 and M2
+   runs was measuring nothing, because the rerankers had no work to do. Caught
+   from the ceiling signature (all 8 rank cells identical at 1.0) *before* the
+   baseline confirmed it. The handset's distractors were never the problem;
+   **question-to-gold vocabulary overlap** was. Rewritten as v3 (30→35 questions;
+   NL targets compounds `verbindingspool`/`connection pool`, separable verbs,
+   register shifts, synonyms; EN matched for difficulty), and gated as an
+   *instrument* on a BM25 front-run independent of both arms: **median gold rank
+   ≥4, zero items at rank 1, all gold reachable in the pool.** Achieved NL 4.0 /
+   EN 5.0, 0 at rank 1, 15/15 found both. **Lesson: gate the measuring device on
+   a baseline arm before running the arms under test** — the same discipline
+   G-E4a needed and the reason the first two E3 runs were thrown away.
+2. **The `id()` overlap bug (fixed).** `run_arm()` keyed its overlap dict on
+   `id(h)`, the Python object address. Both `cross_encoder_rerank` and
+   `llm_rerank` return `replace(hit, ...)` — new objects, new addresses — so
+   every ranked hit mapped to `-1` and overlap read as zero. Caught from the
+   arithmetic: two arms each drawing 15 from the same 40 share ~5.6 by chance, so
+   an observed <3 is **below chance**, which two rerankers scoring the same
+   documents cannot produce. **Below-chance overlap is an anti-correlation
+   signature, i.e. a bug, never "the arms disagree."** Fixed to `h.message_id`
+   (stable across the copy) + 2 regression tests, one of which asserts the old
+   keying *fails*, so the bug cannot silently return. Suite 19 green.
+   **Blast radius is benchmark-local — the product does not share the defect:**
+   `augment.py` keys on domain IDs throughout (`r["id"]`, `hit.chunk_id`,
+   `hit.episode_id`), as does `dreaming/aggregate.py`. Verified, not assumed.
+3. **The degenerate ≤15 criterion (OPEN — fix before any E3 re-run).** With
+   `--pool 40 --top-k 15`, "≤15 share" is arithmetically identical to "Found":
+   every returned item has rank ≤15 by construction. The M1 gate's second clause
+   therefore carried no information in either run. **top-k must be < pool for the
+   share metric to mean anything** — set `--top-k 5` (or widen the pool) before
+   the criterion is read again.
+
+**Carry-forward.** The single reusable finding here is not about rerankers: it is
+that **three separate measurements in this step — the ceiling handset, the
+degenerate ≤15 share, and the proposed LME guard — were each incapable of
+failing.** A gate that cannot fail returns a confident constant and reads as a
+pass. Check reachability and headroom on the instrument before spending anything
+on the arms. See [[project-diagnostic-controls]].
 
 ---
 
@@ -1274,6 +1397,15 @@ append-only + UNIQUE).
 ---
 
 ### Step 6 — E3 adoption (one deliberate rebaseline; after Step 5)
+
+> **CLOSED UNEXERCISED 2026-07-31 — no rebaseline spent, no default changed.**
+> The precondition ("if M1+M2 passed") was not met: M1 FAILED on latency
+> arithmetic and M2 read as parity rather than a win (Step 3 STATUS). Both
+> defaults stand: `rerank_model="llm"`, `rerank_cross_encoder_model=mxbai`.
+> The one deliberate rebaseline the review priced is therefore **unspent and
+> still available** for a future item. Reinstate this step only if M1 is re-run
+> and passes on GPU hardware — and if it does, carry the bge swap into that same
+> commit on latency+parity grounds.
 
 If M1+M2 passed (Step 3): flip `rerank_model` default `"llm"`→`"cross-encoder"`
 and (if M2 passed) `rerank_cross_encoder_model` → `bge-reranker-v2-m3` in ONE
@@ -1652,10 +1784,10 @@ unused.
 | 1 | E1 probe (`fact_probe.py`) — **RUN, VERDICT IN** | — | ~1,000 calls (v1 + v2) | **G-F1 FAILED on v4-flash** — faithfulness 0.55–0.76 vs 0.90, twice ✗ |
 | 1b | **`G-F1b` revival gate — NEXT LLM SPEND** (one new-dreamer arm; protocol in Step 1) | ONE pre-registered candidate model (natural: gpt-oss-120b) | ~500 calls + hand-score | same criteria as G-F1 (faithfulness ≥0.90 strict); 0.85–0.95 at n≈40 → expand sample; **FAIL = E1 dead for real** |
 | 2 | E5 anaphora — **BUILT, GATE PASSED, SHIPPED** | — (parallel day one) | none (heuristic) | 31-item eval **100%**, no-harm **0/12** ✓ |
-| 3 | E3 measurements M1+M2 — **BUILT, UNRUN** | — (parallel, offline) | M1 LLM arm only | M1/M2 pre-registered parity |
+| 3 | E3 measurements M1+M2 — **RUN, VERDICT IN** | — (parallel, offline) | M1 LLM arm only | **M1 ✗ latency (0.09× vs ≥10×; quality untested — ceiling handset); M2 = parity, not a win (NL +4/20 at p≥0.125, fails the effect size rescaled to n=20; EN −2/15)** |
 | 4 | E1 build — **SUSPENDED** (spec retained verbatim) | **G-F1b PASS** | build only | builds iff G-F1b ✓ |
 | 5 | Scored confirmation — **SUSPENDED with Step 4** | Step 4 | box runs | reinstated as written iff Step 4 builds |
-| 6 | E3 adoption (one rebaseline) | Step 3 only (Step 5 suspended) | ≤1 shared run | offline parity held; baselines re-frozen |
+| 6 | E3 adoption — **CLOSED UNEXERCISED**; nothing flipped, rebaseline unspent | Step 3 only (Step 5 suspended) | **0 (not spent)** | precondition unmet: M1 ✗, M2 parity — revisit only if M1 is re-run and passes on GPU |
 | 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a faithfulness result (a G-F1b PASS supplies it)** | capped per dream | must clear `fact_probe.py`'s bar first |
 | 8 | E4 — **query-side CLOSED on arithmetic**, not built; carry-forward is the ingest-side `valid_at` candidate, needing a *coverage* front-run vs the query range distribution (E7 open; **E6 suspended with E1** — revives iff G-F1b → Step 4 land) | ingest-side coverage front-run (free) | none spent (probe is LLM-free) | raw gate: LoCoMo 1.1%/23.8% ✗, LME 8.8%/90.9% ✓ — **but SELECTIVE fire rate 0.3% / ~3.4%, both under criterion 1**; every precise rule non-selective, both tails dead |
 
@@ -1667,10 +1799,13 @@ available lever against Hindsight (the E0 thesis — no other campaign item
 addresses the middle-granularity gap). **G-F1b is the campaign's next LLM
 spend**; a PASS re-activates Steps 4→5 and supplies E2's faithfulness
 prerequisite; a FAIL banks E1 dead on a second model class — record and stop.
-Alongside it: **E3** (M1 needs an API key, M2
+~~Alongside it: **E3** (M1 needs an API key, M2
 blocked on the torch OOM) is now the only unblocked scored item, and it is
 independent of everything E1 touched — it reorders a pool retrieval already
-built and writes nothing. ~~**E4** (temporal-range boost) was specified over facts' `fact_date` but is
+built and writes nothing.~~ **E3 RAN 2026-07-30/31 and is CLOSED with no config
+change** (M1 ✗ on CPU latency arithmetic; M2 parity — Step 3 STATUS), so
+**G-F1b is now the campaign's only live scored item**, not merely its next LLM
+spend. ~~**E4** (temporal-range boost) was specified over facts' `fact_date` but is
 re-specifiable over episode/message dates, which already exist and are not
 model-generated; that is the cheapest surviving item.~~ **E4 front-run RAN
 2026-07-30 and FAILED G-E4a** (see Step 8): message/episode dates are SPEECH
