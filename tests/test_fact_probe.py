@@ -298,6 +298,25 @@ def test_missing_hand_score_is_incomplete_not_pass() -> None:
     assert s["gate"]["density_ok"] and not s["gate"]["faithfulness_ok"]
 
 
+def test_parse_failure_ceiling_is_incomplete_never_fail() -> None:
+    """Pre-registered 2026-07-31: parse_failures/calls > 2% makes the run
+    UNREADABLE — truncation biases the four criteria in opposite directions
+    (criterion 1 harder, criteria 3/4 easier), so a truncation-heavy run is
+    indistinguishable from an honest FAIL without this counter. The ceiling
+    must override even a run where all four criteria pass."""
+    rows = [dict(r, parse_failures=1, calls=3) for r in _rows(10, 7, 5)]
+    ctrl = [dict(r, parse_failures=0, calls=3) for r in _rows(10, 10, 6)]
+    s = summarize(rows, ctrl, 0.95)
+    assert all(s["gate"][k] for k in ("density_ok", "facts_per_session_ok",
+                                      "control_ok", "faithfulness_ok"))
+    assert s["verdict"].startswith("INCOMPLETE")
+    assert "ceiling" in s["verdict"]
+    # And it must override a FAIL-shaped run too: never read as FAIL.
+    s2 = summarize([dict(r, parse_failures=2, calls=3) for r in _rows(10, 4, 5)],
+                   ctrl, 0.80)
+    assert s2["verdict"].startswith("INCOMPLETE")
+
+
 def test_errored_rows_are_excluded_from_the_rate() -> None:
     rows = _rows(4, 4, 5) + [{"error": "boom", "gold_session_in_facts": False,
                               "answer_in_facts": False, "answer_checkable": True,

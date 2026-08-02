@@ -123,6 +123,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from longmemeval_adapter import (  # noqa: E402
+    DEEPSEEK_BASE_URL,
     LLMClient,
     _extract_gold_turns,
     _gold_in_pool,
@@ -251,6 +252,13 @@ _MIN_GOLD_IN_FACTS = 0.60
 _MIN_FAITHFULNESS = 0.90
 _MAX_MEDIAN_FACTS = 8
 _MAX_CONTROL_MEDIAN_FACTS = 12
+# Pre-registered 2026-07-31 (G-F1b, before the run): parse_failures / calls
+# ceiling. A truncated session yields ZERO facts, biasing the four criteria in
+# OPPOSITE directions — criterion 1 (gold reachable) gets harder, criteria 3/4
+# (median facts upper bounds) get easier — so a truncation-heavy run looks like
+# a sparse, clean, honest FAIL. Above this rate the verdict is INCOMPLETE
+# (re-run at a higher --max-tokens), never FAIL.
+_MAX_PARSE_FAILURE_RATE = 0.02
 
 # How many facts the tier is allowed to return per question — the density claim.
 _FACT_TOP_K = 5
@@ -416,7 +424,7 @@ def validate_facts(raw: object, *, session_date: str | None) -> list[dict]:
 
 def extract_facts(
     llm: LLMClient, messages: list[dict], *, session_date: str | None,
-    prompt_version: str = "v1",
+    prompt_version: str = "v1", max_tokens: int = 1200,
 ) -> tuple[list[dict], bool]:
     """ONE extraction call for one session. Returns (facts, parse_failed)."""
     text = render_session(messages)
@@ -431,9 +439,12 @@ def extract_facts(
             {"role": "user", "content": user},
         ],
         temperature=0.0,
-        max_tokens=1200,
+        max_tokens=max_tokens,
     )
-    if raw.startswith("[LLM_ERROR"):
+    if not raw or raw.startswith("[LLM_ERROR"):
+        # None = a 200 with content=null (reasoning models burn the token cap on
+        # chain-of-thought and never emit an answer — provider-dependent, not a
+        # crash). Counted as a parse failure so the row stays auditable.
         return [], True
     facts = validate_facts(raw, session_date=session_date)
     return facts, (not facts and "[" not in raw)
@@ -534,6 +545,7 @@ def search_facts(
 def run_question(
     q_data: dict, *, llm: LLMClient | None, sim: bool, max_sessions: int,
     top_k: int = _FACT_TOP_K, prompt_version: str = "v1",
+    max_tokens: int = 1200,
 ) -> dict:
     """Extract facts over one question's haystack, index them, retrieve top-k,
     and report whether the gold turn is reachable inside those k facts."""
@@ -581,8 +593,15 @@ def run_question(
                 assert llm is not None
                 facts, failed = extract_facts(llm, messages,
                                               session_date=session_date,
-                                              prompt_version=prompt_version)
+                                              prompt_version=prompt_version,
+                                              max_tokens=max_tokens)
                 out["calls"] += 1
+                if failed:
+                    # Best-effort reason capture (racy under --workers > 1, where
+                    # the shared client's last_error can be overwritten by a
+                    # sibling thread — diagnostic only, never gating).
+                    out.setdefault("parse_failure_reasons", []).append(
+                        getattr(llm, "last_error", None) or "unknown")
             out["parse_failures"] += int(failed)
             out["sessions_processed"] += 1
             out["facts_per_session"].append(len(facts))
@@ -819,13 +838,35 @@ def summarize(miss_rows: list[dict], ctrl_rows: list[dict],
     median_miss = _median(per_sess_miss)
     median_ctrl = _median(per_sess_ctrl)
 
+    parse_failures = sum(r["parse_failures"] for r in miss_rows + ctrl_rows)
+    calls = sum(r["calls"] for r in miss_rows + ctrl_rows)
+    parse_failure_rate = (parse_failures / calls) if calls else 0.0
+
     gate = {
         "density_ok": (covered / n) >= _MIN_GOLD_IN_FACTS,
         "facts_per_session_ok": median_miss <= _MAX_MEDIAN_FACTS,
         "control_ok": median_ctrl <= _MAX_CONTROL_MEDIAN_FACTS,
         "faithfulness_ok": (faithfulness is not None
                             and faithfulness >= _MIN_FAITHFULNESS),
+        # Pre-registered: above the ceiling the four criteria are biased in
+        # OPPOSITE directions by truncation, so the run cannot read at all.
+        "parse_failures_ok": parse_failure_rate <= _MAX_PARSE_FAILURE_RATE,
     }
+    if not gate["parse_failures_ok"]:
+        verdict = (
+            f"INCOMPLETE (parse-failure ceiling: {parse_failures}/{calls} = "
+            f"{parse_failure_rate:.1%} > {_MAX_PARSE_FAILURE_RATE:.0%} — truncation "
+            f"biases criteria in opposite directions; re-run at a higher "
+            f"--max-tokens, never read as FAIL)")
+    elif all(gate.values()):
+        verdict = "PASS"
+    elif (all(v for k, v in gate.items() if k not in ("faithfulness_ok",))
+          and faithfulness is None):
+        # A missing hand-score is INCOMPLETE, never PASS: three of four criteria
+        # is not the gate.
+        verdict = "INCOMPLETE (faithfulness hand-score not supplied)"
+    else:
+        verdict = "FAIL"
     return {
         "n_misses": len(ok_miss), "n_control": len(ok_ctrl),
         "errors": len(miss_rows) - len(ok_miss) + len(ctrl_rows) - len(ok_ctrl),
@@ -837,8 +878,9 @@ def summarize(miss_rows: list[dict], ctrl_rows: list[dict],
         "median_facts_per_session": median_miss,
         "median_facts_per_session_control": median_ctrl,
         "mean_facts_per_question": (sum(r["facts_total"] for r in ok_miss) / n),
-        "parse_failures": sum(r["parse_failures"] for r in miss_rows + ctrl_rows),
-        "calls": sum(r["calls"] for r in miss_rows + ctrl_rows),
+        "parse_failures": parse_failures,
+        "parse_failure_rate": parse_failure_rate,
+        "calls": calls,
         # Rows whose gold session `--max-sessions` threw away: guaranteed misses
         # that say nothing about extraction. Non-zero ⇒ the density number is a
         # floor, not a measurement.
@@ -847,13 +889,7 @@ def summarize(miss_rows: list[dict], ctrl_rows: list[dict],
         "date_audit": audit_fact_dates(miss_rows + ctrl_rows),
         "faithfulness": faithfulness,
         "gate": gate,
-        # A missing hand-score is INCOMPLETE, never PASS: three of four criteria
-        # is not the gate.
-        "verdict": ("PASS" if all(gate.values())
-                    else "INCOMPLETE (faithfulness hand-score not supplied)"
-                    if all(v for k, v in gate.items() if k != "faithfulness_ok")
-                    and faithfulness is None
-                    else "FAIL"),
+        "verdict": verdict,
     }
 
 
@@ -918,6 +954,13 @@ def report(s: dict, diag: dict, miss_rows: list[dict], verbose: bool) -> bool:
     print(f"  facts/question mean:  {s['mean_facts_per_question']:.1f}")
     print(f"  extraction calls: {s['calls']}   parse failures: {s['parse_failures']}"
           + (f"   row errors: {s['errors']}" if s["errors"] else ""))
+    if s.get("parse_failure_rate", 0.0) > _MAX_PARSE_FAILURE_RATE:
+        print(f"  ⚠ PARSE-FAILURE CEILING EXCEEDED: "
+              f"{s['parse_failures']}/{s['calls']} = "
+              f"{s['parse_failure_rate']:.1%} > {_MAX_PARSE_FAILURE_RATE:.0%} "
+              f"(pre-registered 2026-07-31). Truncation biases the criteria in "
+              f"opposite directions — this run is UNREADABLE, not a FAIL. "
+              f"Re-run at a higher --max-tokens.")
     if s.get("gold_cut_by_session_cap"):
         print(f"  ⚠ {s['gold_cut_by_session_cap']}/{s['n_misses']} misses had "
               f"their GOLD SESSION cut by --max-sessions — those are forced "
@@ -1001,6 +1044,9 @@ def main() -> None:
                          "containment number is an upper bound, not evidence")
     ap.add_argument("--api-key", default="", help="reader/extractor API key")
     ap.add_argument("--model", default="deepseek-v4-flash", help="extraction model")
+    ap.add_argument("--base-url", default=DEEPSEEK_BASE_URL,
+                    help="OpenAI-compatible endpoint for --model (default: DeepSeek; "
+                         "point at OpenRouter etc. when --model is a hosted model)")
     ap.add_argument("--prompt-version", default="v1", choices=sorted(FACTS_PROMPTS),
                     help="extraction prompt arm. v1 = the original; v2 = the ONE "
                          "allowed iteration (no date invention, no fact quota). "
@@ -1010,6 +1056,11 @@ def main() -> None:
                     help='JSON merged into every request, e.g. '
                          '\'{"thinking":{"type":"disabled"}}\' for v4-flash')
     ap.add_argument("--workers", type=int, default=1, help="parallel questions")
+    ap.add_argument("--max-tokens", type=int, default=1200,
+                    help="output cap per extraction call (default 1200, tuned for "
+                         "v4-flash). Reasoning models (e.g. gpt-oss-120b) burn this "
+                         "on chain-of-thought and return content=null when it is too "
+                         "small — 4096 was verified to complete on a 12k-char session")
     ap.add_argument("--faithfulness", type=float, default=None,
                     help="hand-scored faithfulness (0..1) from a previous run's dump")
     ap.add_argument("--faithfulness-sample", type=int, default=20,
@@ -1123,14 +1174,16 @@ def main() -> None:
             print("ERROR: --api-key is required without --sim.")
             sys.exit(2)
         extra = json.loads(args.extra_body) if args.extra_body else None
-        llm = LLMClient(args.model, args.api_key, extra_body=extra)
+        llm = LLMClient(args.model, args.api_key, base_url=args.base_url,
+                        extra_body=extra)
 
     tasks = [("miss", q) for q in miss_ids] + [("ctrl", q) for q in ctrl_ids]
 
     def _one(kind: str, qid: str) -> dict:
         r = run_question(by_id[qid], llm=llm, sim=args.sim,
                          max_sessions=args.max_sessions, top_k=args.top_k,
-                         prompt_version=args.prompt_version)
+                         prompt_version=args.prompt_version,
+                         max_tokens=args.max_tokens)
         r["_kind"] = kind
         return r
 

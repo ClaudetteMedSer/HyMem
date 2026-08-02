@@ -968,6 +968,105 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 >    faithfulness result E2/Plan C are gated on (the flip-watch still blocks E2
 >    independently). **FAIL** banks E1 dead on a second model class — record and
 >    stop; at that point the finding is about the task, not the model.
+> ### G-F1b — the one allowed revival read (added 2026-07-31, PRE-REGISTERED)
+>
+> **What this is.** E1's bank-death rule allows revival only on a NEW faithfulness
+> result (never a re-read of the 0.55–0.76 one). G-F1b is that read: `fact_probe.py`
+> re-run on the same instrumented emb-ON 2026-06-07 source run
+> (`longmemeval-v2-hymem-20260607T164031Z-seed0.json` + `longmemeval_s_cleaned.json`,
+> pair verified 500/500 gold-turn counts) with extraction model `openai/gpt-oss-120b`
+> @ OpenRouter, prompt arm v2, `--max-tokens 4096`. Same four criteria, same
+> thresholds — the mechanism is unchanged, only the extractor differs.
+>
+> **Pre-registered readings, BEFORE the numbers exist (2026-07-31):**
+> 1. **Parse-failure ceiling (in code, `_MAX_PARSE_FAILURE_RATE = 0.02`):** if
+>    `parse_failures/calls > 2%`, verdict is **INCOMPLETE** (re-run at a higher
+>    `--max-tokens`), never FAIL. Rationale: truncation biases the four criteria in
+>    opposite directions — criterion 1 (gold reachable) gets harder, criteria 3/4
+>    (median upper bounds) get easier — so a truncation-heavy run is
+>    indistinguishable from an honest FAIL without this counter. Pinned by
+>    `test_parse_failure_ceiling_is_incomplete_never_fail`.
+> 2. **Reasoning asymmetry — constrains what a PASS means.** The v4-flash arm ran
+>    with thinking disabled; gpt-oss-120b CANNOT disable reasoning (OpenRouter
+>    400: "Reasoning is mandatory for this endpoint"). A PASS means "this
+>    extractor, WITH mandatory reasoning, clears 0.90" — it does NOT license the
+>    inference "gpt-oss-120b is more faithful than v4-flash" (confounded with
+>    reasoning on/off). Any dreamer-swap argument is a separate migration event
+>    with its own price, per the deepseek precedent.
+> 3. **Budget is ~2× the priced figure, deliberately accepted.** 1002 extraction
+>    calls at `--max-questions 10` (the plan's ~500 assumed one call per question;
+>    the honest count is `questions × sessions` ≈ 50/question), plus 4096-cap
+>    reasoning output ≈ 3.4× v4-flash's per-call spend → total ≈ 6–7× the priced
+>    cost. Criteria are fractions so the gate reads fine at this n; faithfulness
+>    (the underpowered criterion) widens if the budget is cut to
+>    `--max-questions 6` (601 calls).
+>
+> **Instrument patches this read required (all default-preserving, suite green):**
+> `--base-url` (probe hardcoded DeepSeek), `--max-tokens` (1200 default; gpt-oss-120b
+> burned it on CoT and returned `content=null` — verified 4096 completes), and a
+> null-content guard (`raw is None` → counted parse failure, not a row crash).
+> The 2026-07-30 V1/V2 dumps are NOT on this box, so the v4-flash parse-failure
+> rate cannot be re-derived here; if it was non-zero, the 0.55–0.76 carries the
+> same truncation asterisk.
+>
+> **SMOKE SERIES 2026-07-31 (n=1 question per arm, 98 calls each) — config ladder:**
+>
+> | config | parse failures | ceiling | gold production | notes |
+> |---|---|---|---|---|
+> | 1200 (probe default) | crashed on `content=null` | — | — | CoT ate the whole budget; `raw.startswith` on None |
+> | 4096, run 1 | 6/98 = 6.1% | EXCEEDED | 2/4 (50%) | no retry on 200-null-content → one flap = one failure; both `_2` gold sessions 0 facts |
+> | 4096, run 2 (retry fix) | 2/98 = 2.04% | EXCEEDED (0.04pp) | 2/4 (50%, different pair) | gold production run-to-run non-deterministic → stochastic CoT budget exhaustion, not session properties |
+> | 8192 (retry fix) | **0/98 = 0%** | **CLEARED** | **4/4 (100%)** | median facts/session 8.0 — exactly at the criterion-3 cap; over-extraction is now the live risk of this config |
+>
+> **Decisions banked:** full run at `--max-tokens 8192`, `--workers 4`. The
+> 4096-vs-8192 gap is the difference between a ~50% gold-production rate and
+> 100% — the faithfulness sample (which can only fill from gold sessions that
+> produced facts) is the binding constraint, and 8192 is the config that fills it.
+> The `--rescore --faithfulness-sample 40` expansion stays free if the hand-score
+> lands 0.85–0.95. n=6 vs n=10: n=6 yields ~28 gold sessions (≥20, the 40-sample
+> requirement) at the observed 100% production; n=10's 400 extra calls buy no
+> additional evidence on the criterion that failed twice.
+>
+> **Criterion 3 is non-discriminating at the 8192 config (recorded 2026-08-01,
+> before the run).** Smoke density over ~98 sessions read median 8.0 miss / 8.0
+> control — the criterion's threshold (≤8) sits at the measured expected value,
+> so its outcome is decided by sampling, not by extraction quality. Mechanism:
+> density is jointly set by the prompt's "2 to 8 facts" instruction and the
+> token cap; raising 4096→8192 (required for parse integrity, 0/98 vs 6.1%/2.04%)
+> mechanically raised mean output 207→322. The 4096 densities were partly a
+> truncation artifact; 8.0 is the honest number. Accordingly: a run that fails
+> only criterion 3 at median 9, with criteria 1, 2 and 4 passing, is recorded as
+> a PASS on the scored question plus a separate store-cost note — 8–9 is a 12%
+> write-volume difference, not a project-deciding quantity. A median ≥11 is a
+> genuine over-extraction FAIL and is read as one. The cap is not lowered to
+> move this number in either case.
+>
+> **G-F1b VERDICT 2026-08-01: PASS — faithfulness 123/123 (1.00) on the healed
+> sample. E1 is UN-BANKED; Step 4 reopens as specced.** The 2026-07-31 run's
+> hand-score surfaced an INSTRUMENT BUG, not a model failure: the dump recorded
+> `render_session(messages)[:4000]` while the extractor saw the full 12,000-char
+> input (the `[:4000]` truncation had been in `fact_probe.py` since its first
+> commit, 9c172d8 — before both v4-flash hand-reads). Fixed upstream (961a5f5:
+> dump stores the exact extractor input; `build_faithfulness_sample` re-renders
+> from the dataset, so `--rescore` heals existing dumps). All 123 facts re-scored
+> against the full inputs: the 50 previously-unresolvable facts are verbatim in
+> chars 4000–12000 — including the pre-flagged "inventions" (Anglo American
+> Diavik = the source's own claim, preserved faithfully; "neutral theme" = a
+> genuine later change of mind, supersession-correct; the Yamaha FZ6R
+> $3,500/Jan-20/Craigslist, page-250 Nightingale, MWF-7am yoga, black Lenovo bag
+> — all verbatim). Criterion 5 reads clean: two true mid-word 12k cuts, zero
+> facts reference content past the boundary; the sessions-3/10 confabulation
+> mode does not reproduce on gpt-oss-120b — the cap-vs-cost trade is mooted.
+> Two disclosed quibbles (E09 pronoun, E15 one-word completion) dock nothing —
+> even at 0.99 the verdict is identical. Per pre-registered step 6: **PASS
+> reopens Step 4 as specced, E6 revives behind it, and the faithfulness result
+> E2/Plan C are gated on is supplied** (the flip-watch still blocks E2
+> independently). Wholesale-vs-scoped migration decision is now live, priced
+> separately per protocol step 1. **Open item:** the same `[:4000]` trap would
+> have flipped this 1.00 into an apparent 0.59 — squarely inside G-F1's
+> 0.55–0.76 — so if the v1/v2 dumps survive anywhere, the same free rescore
+> settles whether v4-flash actually invented the GPA-3.6/Stanford and
+> Billy-&-Nanny content. Not on this box (confirmed); recorded open.
 
 **Idea.** Extract narrative facts with a draft prompt from the haystacks of the
 ~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and

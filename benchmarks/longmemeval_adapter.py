@@ -294,6 +294,7 @@ class LLMClient:
         self.extra_body = dict(extra_body) if extra_body else {}
         self.call_count = 0
         self.total_tokens = 0
+        self.last_error: str | None = None
         # Guards the two counters so they aggregate correctly when many worker
         # threads share this client (--workers > 1).
         self._lock = threading.Lock()
@@ -310,10 +311,17 @@ class LLMClient:
                 last_error = str(e)
                 if "429" in last_error or "rate" in last_error.lower():
                     time.sleep(15 * (attempt + 1))
+                elif "null content" in last_error and "finish=length" in last_error:
+                    # Deterministic truncation: the reasoning model burned the
+                    # output budget and emitted no answer. Retrying with the SAME
+                    # cap re-spends the call for the same result — fail fast and
+                    # let the caller's parse-failure ceiling catch the aggregate.
+                    break
                 elif attempt < 2:
                     time.sleep(3)
                 else:
                     break
+        self.last_error = last_error
         return f"[LLM_ERROR: {last_error[:100]}]"
 
     def _call(self, messages: list, temperature: float, max_tokens: int) -> tuple[str, dict]:
@@ -336,8 +344,17 @@ class LLMClient:
         data = resp.json()
         with self._lock:
             self.call_count += 1
+        content = data["choices"][0]["message"].get("content")
+        if content is None:
+            # A 200 with content=null. Transient provider behavior should be
+            # retried like a 429; a null from finish_reason=length is
+            # deterministic truncation (chat() fails that one fast). Either
+            # way, returning None used to crash callers (`None.startswith`) —
+            # raising makes the failure explicit and countable.
+            raise RuntimeError(
+                f"null content (finish={data['choices'][0].get('finish_reason')})")
         return (
-            data["choices"][0]["message"].get("content", ""),
+            content,
             data.get("usage", {}),
         )
 
