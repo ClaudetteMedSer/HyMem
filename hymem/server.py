@@ -141,6 +141,13 @@ def _do_augment(message: str) -> str:
         ]
         parts.append("**Structured knowledge (knowledge graph):**\n" + "\n".join(lines))
 
+    if ctx.facts:
+        lines = [
+            f"- [{f.fact_date or 'undated'}] {f.text[:300]}"
+            for f in ctx.facts
+        ]
+        parts.append("**Narrative facts (dream-verified events):**\n" + "\n".join(lines))
+
     if ctx.fts_hits:
         snippets = [f"[{h.session_id}] {h.text[:300]}" for h in ctx.fts_hits]
         parts.append("**Relevant past context (keyword search):**\n" + "\n".join(snippets))

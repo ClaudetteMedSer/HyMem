@@ -75,6 +75,30 @@ def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+# Minimum normalized answer length for the containment check below to carry
+# any signal. LME answers are often a bare value ("40", "ruff"), and a 2-char
+# string appears inside some longer text by chance — which would report as a
+# hit. Mirrors `_MIN_ANSWER_CHARS` in benchmarks/fact_probe.py, where the same
+# trap was found and named.
+_MIN_ANSWER_CHARS = 4
+
+
+def _answer_in_texts(answer: str, texts: list[str]) -> bool | None:
+    """Does the gold ANSWER string appear in any of `texts`?
+
+    Deliberately NOT `_gold_in_pool`: that one matches gold TURNS (long
+    strings) and accepts a match in EITHER direction, which is right for turns
+    and wrong for a short answer — "40" is inside a thousand sentences.
+    Containment is one-directional here, and an answer too short to be
+    distinctive returns None ("unmeasurable") rather than a fabricated
+    True/False, so a short-answer category can't silently report signal.
+    """
+    a = _norm_text(answer)
+    if len(a) < _MIN_ANSWER_CHARS:
+        return None
+    return any(a in _norm_text(t) for t in texts if t and t.strip())
+
+
 def _extract_gold_turns(q_data: dict) -> tuple[list[str], str]:
     """Return (gold_turn_contents, mode).
 
@@ -447,7 +471,9 @@ class HyMemAdapter:
                  graph_multihop_decay: float | None = None,
                  graph_multihop_min_score: float | None = None,
                  rules_enabled: bool | None = None,
-                 rules_extraction: bool | None = None):
+                 rules_extraction: bool | None = None,
+                 facts_enabled: bool | None = None,
+                 facts_extraction: bool | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -463,6 +489,8 @@ class HyMemAdapter:
         self.graph_multihop_min_score = graph_multihop_min_score
         self.rules_enabled = rules_enabled
         self.rules_extraction = rules_extraction
+        self.facts_enabled = facts_enabled
+        self.facts_extraction = facts_extraction
         self.hy = None
 
     def open(self):
@@ -522,6 +550,16 @@ class HyMemAdapter:
             overrides["rules_enabled"] = self.rules_enabled
         if self.rules_extraction is not None:
             overrides["rules_extraction_enabled"] = self.rules_extraction
+        # Campaign E / E1 narrative facts (schema v26). BOTH sides ship ON, so
+        # the control arm is the explicit OFF: `--no-facts` clears the READ side
+        # (the tier renders nothing) and `--no-facts-extraction` additionally
+        # stops the dream from spending a call per session tail. Read-side-off
+        # against the SAME store is the paired A/B — the write side needs a
+        # `--fresh` rebuild to change, so don't mix the two in one comparison.
+        if self.facts_enabled is not None:
+            overrides["facts_enabled"] = self.facts_enabled
+        if self.facts_extraction is not None:
+            overrides["facts_extraction_enabled"] = self.facts_extraction
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,
@@ -605,20 +643,21 @@ class HyMemAdapter:
         """Search HyMem for the given query.
 
         Returns (memories, total_matches, graph_count, temporal_events,
-        aggregation_nodes, pool) where `pool` is the FULL pre-truncation
-        candidate text by tier ({"message": [...], "fts": [...]}) — used for
-        recall-ceiling analysis, so a category's misses can be split into
-        retrieval loss vs ranking loss. `aggregation_nodes` (RAPTOR tier,
-        TR-gated by default) is returned SEPARATELY from `memories` on purpose:
-        the G4 A/B showed that letting nodes compete for memories[:top_k] slots
-        crowds gold message hits out of the answer pool (KU −9.0pp). They render
-        as their own bracketed context block instead.
+        aggregation_nodes, narrative_facts, pool) where `pool` is the FULL
+        pre-truncation candidate text by tier ({"message": [...], "fts": [...]})
+        — used for recall-ceiling analysis, so a category's misses can be split
+        into retrieval loss vs ranking loss. `aggregation_nodes` (RAPTOR tier,
+        TR-gated by default) and `narrative_facts` (E1 tier, schema v26) are
+        returned SEPARATELY from `memories` on purpose: the G4 A/B showed that
+        letting a summary tier compete for memories[:top_k] slots crowds gold
+        message hits out of the answer pool (KU −9.0pp). Both render as their
+        own bracketed context block instead.
         """
         try:
             result = self.hy.augment(query, ability=ability)
         except Exception as e:
             print(f"    [DEBUG] augment error: {e}", flush=True)
-            return [], 0, None, [], [], {"message": [], "fts": []}
+            return [], 0, None, [], [], [], {"message": [], "fts": []}
 
         # Collect all sources
         graph_facts = []
@@ -676,6 +715,18 @@ class HyMemAdapter:
             if content.strip():
                 aggregation_nodes.append(content)
 
+        # E1 narrative facts (schema v26). Like aggregation_nodes: collected
+        # here but kept OUT of the `memories` pool so the tier can never take a
+        # memories[:top_k] slot or spend context budget ahead of the raw turns.
+        # Dates ride along — a dated fact is the whole point of the tier for
+        # the recency-sensitive abilities.
+        narrative_facts = []
+        for nf in (getattr(result, "facts", None) or []):
+            text = getattr(nf, "text", "")[:600]
+            if text.strip():
+                date = getattr(nf, "fact_date", None) or ""
+                narrative_facts.append(f"[{date}] {text}" if date else text)
+
         episode_hits = []
         for ep in (getattr(result, "episodes", None) or []):
             title = getattr(ep, "title", "")
@@ -729,7 +780,8 @@ class HyMemAdapter:
         }
         return (memories[:top_k], getattr(result, 'total_message_matches', 0),
                 getattr(result, 'graph_count', None),
-                getattr(result, 'temporal_events', []), aggregation_nodes, pool)
+                getattr(result, 'temporal_events', []), aggregation_nodes,
+                narrative_facts, pool)
 
 
 # ── Answer & Judge ──────────────────────────────────────────────────
@@ -843,7 +895,8 @@ def _render_answer_context(memories: list[dict], ability: str | None,
                            total_matches: int, graph_count,
                            temporal_events: list | None,
                            aggregation_nodes: list | None,
-                           distilled: list[str] | None = None) -> str:
+                           distilled: list[str] | None = None,
+                           narrative_facts: list[str] | None = None) -> str:
     """Build the CONTEXT block the answerer sees from the retrieved tiers.
 
     Extracted from answer_question so (a) the distillation dry-run can re-render
@@ -896,6 +949,20 @@ def _render_answer_context(memories: list[dict], ability: str | None,
             parts.append(f"  {node}\n")
         parts.append("[END SUMMARIES]\n\n")
 
+    # E1 narrative facts: dream-extracted self-contained statements, rendered as
+    # their own block for the same reason as the summaries above — never a
+    # memories[:top_k] slot, never budget ahead of the raw turns. The
+    # verify-against-source framing is deliberate and matches the tier's own
+    # contract in ask(): facts LEAD the evidence but the raw turns stay below as
+    # the check (the Acme lesson — a summary is never the only copy).
+    if narrative_facts:
+        parts.append("[NARRATIVE FACTS — self-contained statements extracted "
+                     "from past sessions; a leading date is when the fact "
+                     "happened. Verify details against the memories below:]\n")
+        for nf in narrative_facts:
+            parts.append(f"  • {nf}\n")
+        parts.append("[END NARRATIVE FACTS]\n\n")
+
     # Distilled evidence (P1): question-conditioned facts extracted per-turn,
     # rendered ABOVE the raw memories as their own non-competing block. Additive
     # — the raw turns stay below, unchanged. Verify-against-source framing so the
@@ -931,7 +998,8 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
                     aggregation_nodes: list | None = None,
                     question_date: str = "", permissive_default: bool = False,
                     distilled: list[str] | None = None,
-                    extra_system: str | None = None) -> str:
+                    extra_system: str | None = None,
+                    narrative_facts: list[str] | None = None) -> str:
     """Ask LLM to answer based on retrieved memories.
 
     Uses ability-aware prompts and expanded context for multi-session
@@ -952,7 +1020,8 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     # see identical char caps and insertion order.
     context = _render_answer_context(
         memories, ability, total_matches, graph_count,
-        temporal_events, aggregation_nodes, distilled=distilled)
+        temporal_events, aggregation_nodes, distilled=distilled,
+        narrative_facts=narrative_facts)
 
     # The default (unknown-ability) prompt. When --permissive-default is set this
     # is the permissive preference-style prompt (D4 fix) instead of the strict
@@ -1139,7 +1208,8 @@ def evaluate_question(
         hy.dream_and_wait()
 
     # Search
-    memories, total_matches, graph_count, temporal_events, aggregation_nodes, pool = hy.search(
+    (memories, total_matches, graph_count, temporal_events, aggregation_nodes,
+     narrative_facts, pool) = hy.search(
         question, ability=ability, top_k=top_k * 3, graph_facts_first=graph_facts_first)
     src = "question_date" if q_data.get("question_date") else ("haystack_max" if session_dates else "none")
 
@@ -1166,7 +1236,7 @@ def evaluate_question(
                    else f"{recall_ceiling}[{recall_tier}]")
     used_marker = "←used" if auto_ability else ""
     router_str = f"{oracle_ability or '∅'}/det={detected_ability or '∅'}{used_marker}"
-    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, agg_nodes={len(aggregation_nodes)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str}, ability={router_str})", flush=True)
+    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, agg_nodes={len(aggregation_nodes)}, facts={len(narrative_facts)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str}, ability={router_str})", flush=True)
 
     # P1 distillation (additive, cost-gated, label-free): map an extraction call
     # over the distillable hits, then answer over the kept lines PLUS the raw
@@ -1185,7 +1255,8 @@ def evaluate_question(
                                  graph_count=graph_count, temporal_events=temporal_events,
                                  aggregation_nodes=aggregation_nodes,
                                  question_date=question_date, permissive_default=permissive_default,
-                                 distilled=distilled_lines)
+                                 distilled=distilled_lines,
+                                 narrative_facts=narrative_facts)
 
     # Judge (binary yes/no)
     correct = judge_answer(judge_llm, question_type, question, answer, ai_answer)
@@ -1221,6 +1292,18 @@ def evaluate_question(
         "distill_fired": distill_fired,
         "distill_calls": distill_calls,
         "distill_kept": len(distilled_lines) if distilled_lines else 0,
+        # E1 mechanism instrumentation, for the pre-registered read that must
+        # happen BEFORE the score: `n_facts` is whether the tier fired at all
+        # (a run of zeros means the lever never reached the reader, so the
+        # score is a no-op by construction, not a null result), and
+        # `gold_in_facts` is whether the answer string is actually IN the
+        # facts block — the tier's own hit rate, independent of the answer.
+        # None = the answer is too short to test (see _answer_in_texts).
+        "n_facts": len(narrative_facts),
+        "gold_in_facts": (
+            _answer_in_texts(str(answer), narrative_facts)
+            if narrative_facts else False
+        ),
     }
 
 
@@ -1504,7 +1587,9 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
                           graph_multihop_decay=args.graph_multihop_decay,
                           graph_multihop_min_score=args.graph_multihop_min_score,
                           rules_enabled=args.rules,
-                          rules_extraction=args.rules_extraction)
+                          rules_extraction=args.rules_extraction,
+                          facts_enabled=args.facts,
+                          facts_extraction=args.facts_extraction)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -1629,7 +1714,10 @@ def _inspect_floor_questions(questions: list[dict], args, api_key: str) -> None:
             # Search with the SAME oracle ability the audited run used (MR for
             # multi-session), so the live tiers reproduce the audited floor.
             oracle_ability = QUESTION_TYPE_TO_ABILITY.get(q_data.get("question_type"), None)
-            pool = hy.search(question, ability=oracle_ability, top_k=args.top_k * 3)[5]
+            # `pool` is the LAST element of search()'s tuple — indexed from the
+            # end so adding a tier (narrative_facts made this 7-wide) can't
+            # silently hand the floor audit a different tier's list.
+            pool = hy.search(question, ability=oracle_ability, top_k=args.top_k * 3)[-1]
             tiers = _gold_turn_tiers(gold_turns, pool)
             floor_turns = [g for g, t in zip(gold_turns, tiers) if t == "none"]
             # Deep raw-message-FTS scan to confirm the floor + show what DID rank.
@@ -1726,12 +1814,15 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                           rerank_message_hits=args.rerank_message_hits,
                           aggregation_nodes=args.aggregation_nodes,
                           aggregation_broad=args.aggregation_broad,
-                          value_supersession=args.value_supersession)
+                          value_supersession=args.value_supersession,
+                          facts_enabled=getattr(args, "facts", None),
+                          facts_extraction=getattr(args, "facts_extraction", None))
         hy.open()
         hy.ingest_sessions(sessions, sids, dates)
         if not args.no_dream:
             hy.dream_and_wait()
-        memories, total_matches, graph_count, temporal_events, aggregation_nodes, pool = hy.search(
+        (memories, total_matches, graph_count, temporal_events, aggregation_nodes,
+         narrative_facts, pool) = hy.search(
             question, ability=ability, top_k=args.top_k * 3,
             graph_facts_first=args.graph_facts_first)
 
@@ -1741,7 +1832,8 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
             # char caps) and check the gold turn survived the cut. Gold below the
             # cut = deep-lexical (retrieval-ranking loss, not synthesis) → excluded.
             raw_ctx = _render_answer_context(memories, ability, total_matches, graph_count,
-                                             temporal_events, aggregation_nodes, distilled=None)
+                                             temporal_events, aggregation_nodes, distilled=None,
+                                             narrative_facts=narrative_facts)
             out["gold_in_context"] = bool(gold_turns) and _gold_in_pool(gold_turns, [raw_ctx])
 
         distilled, calls = distill_memories(answer_llm, question, memories,
@@ -1753,7 +1845,8 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                                     aggregation_nodes=aggregation_nodes,
                                     question_date=question_date,
                                     permissive_default=args.permissive_default,
-                                    distilled=distilled)
+                                    distilled=distilled,
+                                    narrative_facts=narrative_facts)
         out["ai_answer"] = ai_answer
         out["correct"] = judge_answer(judge_llm, question_type, question, answer, ai_answer)
     except Exception as e:
@@ -2195,6 +2288,23 @@ def main():
                              "flipping the write-side default — expected FLAT on LME (factual "
                              "recall, not behavior); a regression means auto-rules pollute "
                              "answers, so DON'T flip. Requires a dream pass.")
+    parser.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
+                        help="Campaign E / E1 narrative-facts READ side "
+                             "(cfg.facts_enabled). None = config default (ON). "
+                             "Pass --no-facts for the paired control arm: same store, "
+                             "tier rendered or not. UNLIKE --rules this is NOT inert — "
+                             "the tier renders its own [NARRATIVE FACTS] block above the "
+                             "raw turns, so --facts vs --no-facts on one store is the "
+                             "clean A/B for what the tier is worth. Read `n_facts` in the "
+                             "per-question rows FIRST: all zeros means the tier never "
+                             "fired and the score is a no-op by construction.")
+    parser.add_argument("--facts-extraction", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="E1 WRITE side (cfg.facts_extraction_enabled). None = config "
+                             "default (ON). Costs one extra dream call per session tail. "
+                             "Turning this off changes what is STORED, so it only takes "
+                             "effect on a --fresh rebuild — do not mix it into a "
+                             "read-side A/B against an existing store.")
     parser.add_argument("--value-supersession", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Bi-temporal KU lever (cfg.value_supersession_enabled): the "

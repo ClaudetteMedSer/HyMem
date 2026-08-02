@@ -393,7 +393,8 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
         from longmemeval_adapter import _render_answer_context
         rendered = _render_answer_context(
             memories, ability, info["total_matches"], info["graph_count"],
-            info["temporal_events"], info["aggregation_nodes"])
+            info["temporal_events"], info["aggregation_nodes"],
+            narrative_facts=info["narrative_facts"])
 
     diag = _evidence_diagnostics(q, conv, [m["content"] for m in memories],
                                  info["pool"], rendered=rendered)
@@ -425,6 +426,7 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
             total_matches=info["total_matches"], graph_count=info["graph_count"],
             temporal_events=info["temporal_events"],
             aggregation_nodes=info["aggregation_nodes"],
+            narrative_facts=info["narrative_facts"],
             question_date=question_date,
             permissive_default=(cat == 3),
             extra_system=extra)
@@ -444,7 +446,11 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
            # Rendered lines carry a [MEM …]/[FACT] tag; counting them measures
            # how many retrieved memories survived the char budget.
            "n_rendered": (None if rendered is None
-                          else rendered.count("[MEM") + rendered.count("[FACT"))}
+                          else rendered.count("[MEM") + rendered.count("[FACT")),
+           # E1 mechanism read, to be taken BEFORE the score: a run of zeros
+           # means the tier never reached the reader, so a flat all-800 net is
+           # a no-op by construction, not a null result.
+           "n_facts": len(info["narrative_facts"])}
     if (args.dump_context or args.diag_only) and rendered is not None:
         rec["context"] = rendered
     if args.dump_topk or args.diag_only:
@@ -502,6 +508,8 @@ def evaluate_conversation(conv: dict, args, answer_llm, judge_llm) -> list[dict]
                          hymem_model=args.hymem_model, hymem_base_url=args.hymem_base_url,
                          embeddings=args.embeddings, rules_extraction=args.rules_extraction,
                          graph_multihop=args.graph_multihop,
+                         facts_enabled=args.facts,
+                         facts_extraction=args.facts_extraction,
                          aperture=_aperture(args)).open()
     try:
         if reuse:
@@ -805,6 +813,16 @@ def main() -> None:
     ap.add_argument("--api-key", default="", help="HyMem dream LLM key")
     ap.add_argument("--embeddings", action="store_true")
     ap.add_argument("--rules-extraction", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
+                    help="E1 narrative-facts READ side (cfg.facts_enabled). None = "
+                         "config default (ON); --no-facts is the paired control arm "
+                         "against the same store (pair it with --keep-db/--reuse-db so "
+                         "both arms read identical stores). Gate on the all-800 net vs "
+                         "the churn band, and read n_facts BEFORE the score.")
+    ap.add_argument("--facts-extraction", action=argparse.BooleanOptionalAction, default=None,
+                    help="E1 WRITE side (cfg.facts_extraction_enabled). None = config "
+                         "default (ON). Changes what is STORED — only differs on a "
+                         "rebuild, so never mix it into a read-side A/B.")
     ap.add_argument("--graph-multihop", action="store_true",
                     help="Track-A BFS — cat 1 (multi-hop) is the A/B target")
     ap.add_argument("--no-dream", action="store_true")

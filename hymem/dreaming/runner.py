@@ -27,13 +27,16 @@ from hymem.dreaming.embeddings import (
     fetch_chunk_embeddings,
     fetch_edge_embeddings,
     fetch_episode_embeddings,
+    fetch_fact_embeddings,
     persist_chunk_embeddings,
     persist_edge_embeddings,
     persist_episode_embeddings,
+    persist_fact_embeddings,
     prepare_chunk_embed_batch,
 )
 from hymem.dreaming.digest import extract_session_digest
 from hymem.dreaming.episodes import persist_episodes
+from hymem.dreaming.facts import extract_facts, persist_facts
 from hymem.dreaming.procedures import persist_procedures
 from hymem.dreaming.mentions import index_chunk_mentions
 from hymem.dreaming.temporal import index_chunk_temporal_mentions
@@ -78,6 +81,10 @@ class DreamReport:
     aggregation_blocking: str = ""
     digest_failures: int = 0
     episodes_created: int = 0
+    facts_extracted: int = 0
+    fact_failures: int = 0
+    facts_embedded: int = 0
+    facts_embedded_from_cache: int = 0
     profile_items_extracted: int = 0
     skipped_locked: bool = False
     budget_exhausted: bool = False
@@ -507,6 +514,67 @@ def run_dreaming(
                                 session_id, persisted,
                             )
 
+            # E1 narrative facts: one LLM call over the session's raw
+            # user/assistant tail (schema v26). Its own watermark
+            # (sessions.facts_message_id, the v24 pattern) is the ONLY
+            # skip-guard: unlike digest/profile there is no prompt-version
+            # stamp, because a FACTS_PROMPT_VERSION bump extracts FORWARD ONLY
+            # — covered ranges are never re-extracted, so re-reading them on a
+            # bump would be wrong, not just wasteful. Steady-state re-dreams of
+            # unchanged sessions cost zero calls (watermark at tail). A parse
+            # failure counts into dream_runs.fact_failures and holds the
+            # watermark, so the slice retries next dream. The watermark SELECT
+            # doubles as the pre-v26 guard: on a store without the column the
+            # whole block degrades to a debug log, no crash. LLM call outside
+            # the write transaction, like the digest.
+            if cfg.facts_extraction_enabled:
+                try:
+                    facts_watermark = conn.execute(
+                        "SELECT facts_message_id FROM sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()["facts_message_id"]
+                except sqlite3.OperationalError:
+                    log.debug("facts.skipped_pre_v26 session_id=%s", session_id)
+                else:
+                    facts_caught_up = (
+                        newest_message_id is None
+                        or (facts_watermark is not None
+                            and facts_watermark >= newest_message_id)
+                    )
+                    if not facts_caught_up:
+                        try:
+                            facts = extract_facts(
+                                conn, session_id, llm, cfg,
+                                since_message_id=facts_watermark,
+                            )
+                        except Exception:
+                            report.fact_failures += 1
+                            log.exception(
+                                "facts.extraction_failure session_id=%s", session_id
+                            )
+                        else:
+                            if facts is not None and facts.parse_failed:
+                                report.fact_failures += 1
+                            if facts is not None and not facts.parse_failed:
+                                with core_db.transaction(conn):
+                                    persisted = persist_facts(conn, session_id, facts)
+                                    report.facts_extracted += persisted
+                                    # Advance only over what the LLM actually
+                                    # saw, never backwards — the digest
+                                    # watermark contract.
+                                    if facts.covered_message_id is not None:
+                                        conn.execute(
+                                            "UPDATE sessions SET facts_message_id = "
+                                            "MAX(COALESCE(facts_message_id, -1), ?) "
+                                            "WHERE id = ?",
+                                            (facts.covered_message_id, session_id),
+                                        )
+                                if persisted:
+                                    log.debug(
+                                        "facts session_id=%s rows=%d",
+                                        session_id, persisted,
+                                    )
+
             if chunks_remaining <= 0:
                 report.budget_exhausted = True
                 log.info("dream.budget_exhausted budget=%d", cfg.dream_budget)
@@ -668,6 +736,17 @@ def run_dreaming(
                     )
                 report.episodes_embedded_from_cache = pending_episodes.cache_hits
 
+            # E1 narrative facts: embed batch OUTSIDE the write lock (fetch is
+            # the network call, persist is the transaction) — the phase1
+            # lock-free pattern. fetch returns None on a pre-v26 store.
+            pending_facts = fetch_fact_embeddings(conn, embedding_client)
+            if pending_facts is not None:
+                with core_db.transaction(conn):
+                    report.facts_embedded = persist_fact_embeddings(
+                        conn, pending_facts
+                    )
+                report.facts_embedded_from_cache = pending_facts.cache_hits
+
         # Phase-2 RAPTOR aggregation. Runs last (needs the fresh episode
         # embeddings the clusterer reads) and is a no-op unless the layer is
         # enabled. Manages its own transactions; off by default so it costs
@@ -715,6 +794,8 @@ def run_dreaming(
                 aggregation_blocking = ?,
                 digest_failures = ?,
                 episodes_created = ?,
+                facts_extracted = ?,
+                fact_failures = ?,
                 skipped_locked = 0
             WHERE id = ?
             """,
@@ -733,11 +814,13 @@ def run_dreaming(
                 report.aggregation_blocking,
                 report.digest_failures,
                 report.episodes_created,
+                report.facts_extracted,
+                report.fact_failures,
                 run_id,
             ),
         )
         log.info(
-            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_blocking=%s digest_failures=%d episodes_created=%d budget_exhausted=%s",
+            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_blocking=%s digest_failures=%d episodes_created=%d facts=%d fact_failures=%d budget_exhausted=%s",
             run_id,
             report.sessions_processed,
             report.chunks_processed,
@@ -751,6 +834,10 @@ def run_dreaming(
             report.aggregation_fusion_failures,
             report.aggregation_input_episodes,
             report.aggregation_blocking,
+            report.digest_failures,
+            report.episodes_created,
+            report.facts_extracted,
+            report.fact_failures,
             report.budget_exhausted,
         )
         return report

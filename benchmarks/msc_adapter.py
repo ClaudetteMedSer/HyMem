@@ -225,7 +225,9 @@ class MSCAdapter:
     def __init__(self, db_path: Path, *, api_key: str = "", sim: bool = False,
                  hymem_model: str = _HYMEM_MODEL, hymem_base_url: str = _DEEPSEEK_BASE_URL,
                  embeddings: bool = False, rules_extraction: bool | None = None,
-                 graph_multihop: bool = False, aperture: dict | None = None):
+                 graph_multihop: bool = False, aperture: dict | None = None,
+                 facts_enabled: bool | None = None,
+                 facts_extraction: bool | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.sim = sim
@@ -234,6 +236,8 @@ class MSCAdapter:
         self.embeddings = embeddings
         self.rules_extraction = rules_extraction
         self.graph_multihop = graph_multihop
+        self.facts_enabled = facts_enabled
+        self.facts_extraction = facts_extraction
         # None-valued entries mean "unset" so callers can pass argparse results
         # straight through without reimplementing the defaults.
         self.aperture = {**self.APERTURE,
@@ -247,6 +251,13 @@ class MSCAdapter:
             overrides["rules_extraction_enabled"] = self.rules_extraction
         if self.graph_multihop:
             overrides["graph_multihop_enabled"] = True
+        # E1 narrative facts (schema v26). None = config default (both ON).
+        # --no-facts is the read-side control arm on the same store;
+        # --no-facts-extraction changes what is stored, so it needs a rebuild.
+        if self.facts_enabled is not None:
+            overrides["facts_enabled"] = self.facts_enabled
+        if self.facts_extraction is not None:
+            overrides["facts_extraction_enabled"] = self.facts_extraction
         overrides.update(self.aperture)
         cfg = HyMemConfig(root=self.db_path.parent, **overrides)
         embedding_client = None
@@ -369,11 +380,22 @@ class MSCAdapter:
             if content.strip():
                 aggregation_nodes.append(content)
 
+        # E1 narrative facts — carried in `info`, NOT in `memories`, so the tier
+        # renders as its own block and can never take a raw-turn slot (the same
+        # non-competing contract aggregation_nodes and user_profile follow).
+        narrative_facts = []
+        for nf in getattr(result, "facts", None) or []:
+            text = (getattr(nf, "text", "") or "")[:600]
+            if text.strip():
+                date = getattr(nf, "fact_date", None) or ""
+                narrative_facts.append(f"[{date}] {text}" if date else text)
+
         info = {
             "total_matches": getattr(result, "total_message_matches", 0),
             "graph_count": getattr(result, "graph_count", None),
             "temporal_events": getattr(result, "temporal_events", []) or [],
             "aggregation_nodes": aggregation_nodes,
+            "narrative_facts": narrative_facts,
             "n_profile": len(profile),
             "pool": [m["content"] for m in message_hits + fts_hits + episode_hits],
         }
@@ -451,7 +473,9 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
     adapter = MSCAdapter(tmp / "m.sqlite", api_key=args.api_key, sim=args.sim,
                          hymem_model=args.hymem_model, hymem_base_url=args.hymem_base_url,
                          embeddings=args.embeddings, rules_extraction=args.rules_extraction,
-                         graph_multihop=args.graph_multihop).open()
+                         graph_multihop=args.graph_multihop,
+                         facts_enabled=args.facts,
+                         facts_extraction=args.facts_extraction).open()
     try:
         dream_each = args.dream_per_session and not args.no_dream
         adapter.ingest(ex, dream_each=dream_each)
@@ -482,6 +506,7 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
                                  graph_count=info["graph_count"],
                                  temporal_events=info["temporal_events"],
                                  aggregation_nodes=info["aggregation_nodes"],
+                                 narrative_facts=info["narrative_facts"],
                                  question_date=question_date,
                                  extra_system=MSC_PERSPECTIVE_CLAUSE
                                               + MSC_ANSWERABILITY_CLAUSE)
@@ -494,7 +519,11 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
                "gold_distance": (ex["n_sessions"] - gi) if gi >= 0 else -1,
                "gold_in_context": bool(gold_in_context),
                "gold_in_pool": bool(gold_in_pool),
-               "n_memories": len(memories), "n_profile": info["n_profile"]}
+               "n_memories": len(memories), "n_profile": info["n_profile"],
+               # E1 mechanism read (do this BEFORE the score): all-zero n_facts
+               # means the tier never reached the reader, so a flat score is a
+               # no-op by construction rather than a null result.
+               "n_facts": len(info["narrative_facts"])}
         if args.dump_context:
             # Re-render the IDENTICAL context the answerer saw (same function,
             # same char caps — the LME distillation dry-run trick) so synthesis
@@ -502,7 +531,8 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
             from longmemeval_adapter import _render_answer_context
             rec["context"] = _render_answer_context(
                 memories, None, info["total_matches"], info["graph_count"],
-                info["temporal_events"], info["aggregation_nodes"])
+                info["temporal_events"], info["aggregation_nodes"],
+                narrative_facts=info["narrative_facts"])
         return rec
     finally:
         adapter.close()
@@ -633,6 +663,14 @@ def main() -> None:
     ap.add_argument("--api-key", default="", help="HyMem dream LLM key")
     ap.add_argument("--embeddings", action="store_true")
     ap.add_argument("--rules-extraction", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
+                    help="E1 narrative-facts READ side (cfg.facts_enabled). None = "
+                         "config default (ON); --no-facts is the paired control arm. "
+                         "Check n_facts in the per-question rows before reading the score.")
+    ap.add_argument("--facts-extraction", action=argparse.BooleanOptionalAction, default=None,
+                    help="E1 WRITE side (cfg.facts_extraction_enabled). None = config "
+                         "default (ON). Changes what is STORED, so it only differs on a "
+                         "rebuild — not a read-side A/B knob.")
     ap.add_argument("--graph-multihop", action="store_true")
     ap.add_argument("--no-dream", action="store_true")
     ap.add_argument("--dream-per-session", action="store_true",

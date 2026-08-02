@@ -524,6 +524,51 @@ USER_PROFILE_USER_TEMPLATE = """User turns from one session:
 Return the profile JSON array now."""
 
 
+# Narrative-facts extraction (E1, schema v26). This text is the VERBATIM
+# `FACTS_PROMPT_V2` that cleared the G-F1b extraction-faithfulness gate
+# (2026-08-02, 123/123 strict on the healed full-source sample) — moving it
+# unchanged is what carries the gate's verdict over to production, so any
+# rewording, however small, re-enters the gate: bump FACTS_PROMPT_VERSION in
+# hymem/dreaming/facts.py, flip facts_extraction_enabled off, re-clear
+# benchmarks/fact_probe.py at ≥0.90, then re-enable. The draft arms and the
+# v1→v2 defect analysis stay in fact_probe.py (the instrument), not here.
+# The user-template closer ("Return the JSON array of narrative facts now.")
+# is unique so test stubs keyed on the digest/triple/profile closers never
+# route here.
+
+FACTS_SYSTEM = """You extract NARRATIVE FACTS from one conversation session.
+
+A narrative fact is a single, self-contained statement of something that happened, was decided, was preferred, or was true — written so it can be read and understood WITHOUT the conversation around it.
+
+THE ONLY RULE THAT MATTERS: every name, number, date, price, quantity and claim you write must ALREADY BE PRESENT in the turns below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal fact is correct; a rich fact containing one invented detail is a failure.
+
+Output a strict JSON array. Each item has exactly:
+- text (string): the fact, one sentence, self-contained. Name the people, things and values explicitly instead of using "he", "it", "that", "the project" — but only names that appear in the turns.
+- date (string or null): use YYYY-MM-DD ONLY when the conversation itself writes that date. If the turns say "recently", "last week", "a few days ago", or say nothing about when — use null. Never derive a date from the session date. Never guess.
+- entities (array of strings): the concrete people, products, places, tools or organizations the fact is about, exactly as written in the turns.
+
+Rules:
+- VERBATIM VALUES. Names, numbers, dates, versions, prices and quantities exactly as the turns state them. Never round, convert, or normalize.
+- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields [] — that is a GOOD answer, not a failure, and [] is always available to you.
+- Never extract the assistant's suggestions, recommendations, or hypotheticals as facts about the user. "You could try X" is not "the user uses X".
+- One fact per exchange, decision, event or outcome — not one per turn. Combine a question and its answer into the single fact they establish.
+- Self-contained means resolvable alone: "Atta moved the MedFlow deploy to fly.io" — not "he moved it there".
+- Keep the fact in the language of the conversation.
+
+Before writing each fact, check: can I point at the exact words in the turns that state every value in it? If not, drop it.
+"""
+
+# Deliberately does NOT show the session date (the v1→v2 lesson: the surest way
+# to stop a date being copied is for the model never to see it). Explicit dates
+# written in the turns are still right there in {text}.
+FACTS_USER_TEMPLATE = """Conversation:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON array of narrative facts now."""
+
+
 RERANK_SYSTEM = """You evaluate the relevance of conversation excerpts to a user query.
 
 For each excerpt, rate its relevance on a scale of 1-5:

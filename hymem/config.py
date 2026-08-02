@@ -313,6 +313,43 @@ class HyMemConfig:
     (deepseek-v4-flash: 100% at 10, 0% at 111), so a dream's markers are judged in
     sub-batches of this size. Lower if a weaker judge still collapses."""
 
+    facts_enabled: bool = True
+    """Campaign E / E1 master switch (read side): surface the narrative-facts
+    tier in `ctx.facts` — self-contained one-sentence statements extracted at
+    dream time (schema v26), the middle granularity between a knowledge-graph
+    triple and an episode summary. ADDITIVE like the profile/rules tiers: its
+    own FTS/vec SELECT over `narrative_facts`, never a slot from any other
+    tier's budget, so a populated facts store cannot crowd gold turns out of
+    message/chunk/episode retrieval. Superseded facts (invalid_at set — E6's
+    job) leave the tier but stay in the DB for audit. Degrades to [] on a
+    pre-v26 store. False → the tier is always empty; extraction is governed
+    separately by `facts_extraction_enabled`."""
+
+    facts_extraction_enabled: bool = True
+    """Campaign E / E1 write side: during dreaming, run ONE extra LLM call per
+    session tail extracting narrative facts (`hymem/dreaming/facts.py`),
+    append-only under the `facts.v2` prompt that cleared the G-F1b
+    extraction-faithfulness gate (2026-08-02, 123/123 strict — the gate that
+    kept this tier unbuilt while deepseek-v4-flash scored 0.55-0.76). Coverage
+    follows the v24 watermark pattern with its own column
+    (`sessions.facts_message_id`): steady-state re-dreams of unchanged
+    sessions cost zero calls, a parse failure holds the watermark and retries,
+    and a FACTS_PROMPT_VERSION bump extracts forward only (covered ranges are
+    never re-extracted). Any material prompt change re-enters the
+    `benchmarks/fact_probe.py` gate at ≥0.90 before this stays True."""
+
+    facts_top_k: int = 8
+    """Max FactHits `augment()` returns in `ctx.facts` (0 disables the tier's
+    retrieval without touching extraction). FTS + optional vec KNN, RRF-fused
+    like the episode tier."""
+
+    dream_max_facts_per_session: int = 8
+    """Cap on validated facts accepted from one per-session-tail extraction
+    call; a runaway reply is truncated here before any row is written. 8 is
+    the G-F1b density gate's criterion-3 threshold (median facts/session ≤8,
+    measured median 7.0-8.0), so the cap and the gate agree on what a
+    reasonable session yields."""
+
     coref_enabled: bool = True
     """Campaign E / E5: resolve anaphora + ellipsis in the query BEFORE any
     retrieval tier runs (`hymem/query/coref.py`). A follow-up like "what did she

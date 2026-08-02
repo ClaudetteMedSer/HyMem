@@ -336,20 +336,33 @@ def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
 class HyMemAdapter:
     """Direct HyMem Python API adapter with isolated temp DB."""
 
-    def __init__(self, db_path: Path, api_key: str = ""):
+    def __init__(self, db_path: Path, api_key: str = "",
+                 facts_enabled: bool | None = None,
+                 facts_extraction: bool | None = None):
         self.db_path = db_path
         self.api_key = api_key
+        self.facts_enabled = facts_enabled
+        self.facts_extraction = facts_extraction
         self.hy = None
 
     def open(self):
         from hymem import HyMem, HyMemConfig
         from hymem.contrib.openai_client import OpenAICompatibleClient
 
+        # E1 narrative facts (schema v26). None = config default (both ON);
+        # --no-facts is the read-side control arm, --no-facts-extraction stops
+        # the dream spending a call per session tail (needs a fresh store).
+        overrides = {}
+        if self.facts_enabled is not None:
+            overrides["facts_enabled"] = self.facts_enabled
+        if self.facts_extraction is not None:
+            overrides["facts_extraction_enabled"] = self.facts_extraction
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,  # raw message keyword hits — critical for BEAM
             fts_top_k=10,
             graph_top_k=10,
+            **overrides,
         )
         llm = OpenAICompatibleClient(
             api_key=self.api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
@@ -399,17 +412,36 @@ class HyMemAdapter:
         elapsed = time.time() - start
         print(f"      Dream completed in {elapsed:.0f}s", flush=True)
 
-    def search(self, session_id: str, query: str, ability: str = None, top_k: int = 10) -> tuple[list[dict], int]:
-        """Search HyMem for the given query. Returns (memories, total_message_matches)."""
+    def search(self, session_id: str, query: str, ability: str = None,
+               top_k: int = 10) -> tuple[list[dict], int, list[str]]:
+        """Search HyMem for the given query.
+
+        Returns (memories, total_message_matches, narrative_facts). The E1 facts
+        tier (schema v26) is returned SEPARATELY from `memories` on purpose: it
+        renders as its own block, so it never takes a memories[:top_k] slot, and
+        — the BEAM-specific reason — it stays out of the EO/TR re-sorts in
+        answer_question, which partition `memories` by type and would otherwise
+        file undated facts among the "other" tail they were tuned to demote."""
         TASK_RECALL = {"IF", "MR", "EO", "SUM", "TR"}
 
         try:
             result = self.hy.augment(query, session_id=session_id, ability=ability)
         except Exception as e:
             print(f"    [DEBUG] augment error: {e}", flush=True)
-            return [], 0
+            return [], 0, []
 
         total_matches = getattr(result, "total_message_matches", 0)
+
+        # E1 narrative facts (schema v26) — kept OUT of `memories` (see the
+        # docstring). Dates ride along: BEAM's KU/EO/TR prompts all reason off
+        # [MEM YYYY-MM-DD] stamps, and a fact_date is an EVENT date rather than
+        # the session time_anchor those stamps carry.
+        narrative_facts = []
+        for nf in (getattr(result, "facts", None) or []):
+            text = (getattr(nf, "text", "") or "")[:600]
+            if text.strip():
+                date = getattr(nf, "fact_date", None) or ""
+                narrative_facts.append(f"[{date}] {text}" if date else text)
 
         # Collect all sources into separate lists
         graph_facts = []
@@ -509,7 +541,7 @@ class HyMemAdapter:
                     "confidence": 1.0,
                 }]
                 memories += message_hits + procedure_hits + episode_hits + fts_hits + graph_facts
-                return memories[:min(top_k * 6, 120)], total_matches
+                return memories[:min(top_k * 6, 120)], total_matches, narrative_facts
 
             # Coverage abilities (EO/SUM): the question is "order / summarize
             # EVERYTHING that happened", not "find the turns most similar to the
@@ -529,7 +561,7 @@ class HyMemAdapter:
                 memories = overview + message_hits + procedure_hits + rest
                 # Reserve the overview on top of the normal message budget so
                 # the slice can't eat it.
-                return memories[:len(overview) + top_k], total_matches
+                return memories[:len(overview) + top_k], total_matches, narrative_facts
 
             # Task-recall: messages > procedures > then interleave rest by confidence
             memories = message_hits + procedure_hits
@@ -562,7 +594,7 @@ class HyMemAdapter:
 
         memories = memories[:top_k]
 
-        return memories, total_matches
+        return memories, total_matches, narrative_facts
 
 
 # Opt-in transcript logging for localizing a category's floor (retrieval vs
@@ -600,7 +632,8 @@ def _log_context(question_id: str, ability: str, system_prompt: str,
 
 
 def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str,
-                    total_matches: int = 0, question_id: str = "") -> str:
+                    total_matches: int = 0, question_id: str = "",
+                    narrative_facts: list[str] | None = None) -> str:
     """Ask LLM to answer based on retrieved memories."""
     # Build context from memories
     parts = []
@@ -613,6 +646,18 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
                       f"matching your question (assistant echoes excluded, "
                       f"restatements deduped). Verify this count against the "
                       f"evidence below and return the final number.]\n")
+
+    # E1 narrative facts: their own block above the raw turns, never a
+    # memories[:top_k] slot and never part of the EO/TR re-sort below. Facts
+    # lead, the raw turns stay beneath as the check (the tier's contract in
+    # ask(), and the Acme lesson — a summary is never the only copy).
+    if narrative_facts:
+        parts.append("[NARRATIVE FACTS — self-contained statements extracted "
+                     "from past sessions; a leading date is when the fact "
+                     "happened. Verify details against the memories below:]\n")
+        for nf in narrative_facts:
+            parts.append(f"  • {nf}\n")
+        parts.append("[END NARRATIVE FACTS]\n")
 
     # MR/TR: cross-session data is fractured; EO: full timeline must fit;
     # SUM: coverage-graded — all four get the doubled context budget.
@@ -735,15 +780,19 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
         # dea8d94's rewrite of this loop silently dropped the multiplier; the
         # 10-memory runs that followed scored ~11pp below the 30-memory ones
         # (KU fell from 70-83% to 0-17%), so this width is load-bearing.
-        memories, total_matches = hy.search(session_id, question, ability=ability, top_k=top_k * 3)
+        memories, total_matches, narrative_facts = hy.search(
+            session_id, question, ability=ability, top_k=top_k * 3)
         print(f"      {len(memories)} memories", end="")
         if total_matches > 0:
             print(f" (total matches: {total_matches})", end="")
+        if narrative_facts:
+            print(f" (facts: {len(narrative_facts)})", end="")
         print()
 
         # Answer
         answer = answer_question(llm, memories, question, ability, total_matches,
-                                 question_id=q.get("question_id", ""))
+                                 question_id=q.get("question_id", ""),
+                                 narrative_facts=narrative_facts)
 
         # Judge
         judge_result = judge_answer(judge_llm, question, q["ideal_answer"], q["rubric"], answer)
@@ -828,6 +877,16 @@ def main():
                              "or a bare DeepSeek model. Env: BEAM_ANSWER_MODEL.")
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
     parser.add_argument("--api-key", default="")
+    parser.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
+                        help="E1 narrative-facts READ side (cfg.facts_enabled). None = "
+                             "config default (ON); --no-facts is the paired control arm. "
+                             "The tier renders its own [NARRATIVE FACTS] block above the "
+                             "raw turns and never takes a memory slot.")
+    parser.add_argument("--facts-extraction", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="E1 WRITE side (cfg.facts_extraction_enabled). None = config "
+                             "default (ON). Changes what the dream STORES, so it only "
+                             "differs on a fresh store — not a read-side A/B knob.")
     parser.add_argument("--keep-db", action="store_true")
     args = parser.parse_args()
 
@@ -866,7 +925,9 @@ def main():
     print(f"\nTemp DB: {db_path}\n")
 
     # Initialize HyMem
-    hy = HyMemAdapter(db_path, api_key=DEEPSEEK_API_KEY)
+    hy = HyMemAdapter(db_path, api_key=DEEPSEEK_API_KEY,
+                      facts_enabled=args.facts,
+                      facts_extraction=args.facts_extraction)
     hy.open()
 
     # LLM clients

@@ -14,7 +14,7 @@ from hymem.core.vectors import decode_vector
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 25
+EXPECTED_SCHEMA_VERSION = 26
 
 
 def _load_schema() -> str:
@@ -87,6 +87,12 @@ def _split_sql_statements(script: str) -> list[str]:
     """Split a migration script into individual statements, treating a
     ``CREATE TRIGGER ... BEGIN ... END;`` block as one statement (its internal
     semicolons must not split it). Full-line ``--`` comments are dropped.
+
+    Only FULL-LINE comments are stripped, so a semicolon inside a TRAILING
+    ``--`` comment still terminates the statement and cuts a CREATE TABLE in
+    half ("incomplete input"). Keep migration end-of-line comments
+    semicolon-free; schema.sql has no such constraint (executescript hands the
+    whole file to SQLite, which parses comments properly).
     """
     body = "\n".join(
         line for line in script.splitlines() if not line.strip().startswith("--")
@@ -147,7 +153,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         log.info("migrated schema to v%d (%s)", version, entry.name)
 
 
-_VEC_TABLES = frozenset({"vec_chunks", "vec_edges", "vec_episodes"})
+_VEC_TABLES = frozenset({"vec_chunks", "vec_edges", "vec_episodes", "vec_facts"})
 
 
 def _ensure_vec_table_named(conn: sqlite3.Connection, name: str, dim: int) -> None:
@@ -173,25 +179,25 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
             "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
         ).fetchone()
         if existing_dim and int(existing_dim["value"]) == dim:
-            # Dim unchanged — still ensure vec_edges / vec_episodes exist and
-            # are populated for DBs that embedded chunks before those tables
-            # were introduced.
+            # Dim unchanged — still ensure vec_edges / vec_episodes / vec_facts
+            # exist and are populated for DBs that embedded chunks before those
+            # tables were introduced.
             _ensure_vec_table_named(conn, "vec_edges", dim)
             _backfill_vec_edges(conn, dim)
             _ensure_vec_table_named(conn, "vec_episodes", dim)
             _backfill_vec_episodes(conn, dim)
+            _ensure_vec_table_named(conn, "vec_facts", dim)
+            _backfill_vec_facts(conn, dim)
             return
         if existing_dim:
             conn.execute("DELETE FROM schema_meta WHERE key = 'vec_dim'")
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("DROP TABLE IF EXISTS vec_chunks")
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("DROP TABLE IF EXISTS vec_edges")
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("DROP TABLE IF EXISTS vec_episodes")
+            for stale in ("vec_chunks", "vec_edges", "vec_episodes", "vec_facts"):
+                with contextlib.suppress(sqlite3.OperationalError):
+                    conn.execute(f"DROP TABLE IF EXISTS {stale}")
         _ensure_vec_table_named(conn, "vec_chunks", dim)
         _ensure_vec_table_named(conn, "vec_edges", dim)
         _ensure_vec_table_named(conn, "vec_episodes", dim)
+        _ensure_vec_table_named(conn, "vec_facts", dim)
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('vec_dim', ?)",
             (str(dim),),
@@ -199,6 +205,7 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
         _backfill_vec(conn, dim)
         _backfill_vec_edges(conn, dim)
         _backfill_vec_episodes(conn, dim)
+        _backfill_vec_facts(conn, dim)
     except sqlite3.OperationalError:
         log.info("vec tables unavailable; using Python cosine search")
 
@@ -301,6 +308,34 @@ def _backfill_vec_episodes(conn: sqlite3.Connection, dim: int) -> None:
     log.info("backfilled vec_episodes from %d episode rows", len(rows))
 
 
+def _backfill_vec_facts(conn: sqlite3.Connection, dim: int) -> None:
+    """Populate vec_facts (rowid = narrative_facts.id, an INTEGER PRIMARY KEY,
+    so VACUUM-stable like vec_edges) from the JSON mirror on cold start / dim
+    change. Suppresses its own missing-table error so ensure_vec_table keeps
+    working against a pre-v26 store."""
+    with contextlib.suppress(sqlite3.OperationalError):
+        rows = conn.execute(
+            "SELECT fact_id, vector_json FROM narrative_fact_embeddings"
+        ).fetchall()
+        if not rows:
+            return
+        have = conn.execute("SELECT COUNT(*) AS c FROM vec_facts").fetchone()["c"]
+        if have >= len(rows):
+            return
+        for r in rows:
+            try:
+                vec = decode_vector(r["vector_json"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if len(vec) != dim:
+                vec = list(vec) + [0.0] * (dim - len(vec))
+            conn.execute(
+                "INSERT OR IGNORE INTO vec_facts(rowid, embedding) VALUES (?, ?)",
+                (r["fact_id"], _pack_vector(vec)),
+            )
+        log.info("backfilled vec_facts from %d fact rows", len(rows))
+
+
 def _pack_vector(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
@@ -317,8 +352,10 @@ def _pack_vector(vec: list[float]) -> bytes:
 # to sit there. This was a root cause of the 2026-07-12 RAPTOR reuse
 # instability — candidate blocking clustered on garbage neighborhoods after
 # post-prune VACUUMs — and it quietly degrades plain FTS/vec retrieval too.
-# messages_fts (content_rowid='id', INTEGER PRIMARY KEY) and vec_edges (rowid =
-# knowledge_graph.id, INTEGER PRIMARY KEY) are VACUUM-stable and need nothing.
+# messages_fts (content_rowid='id', INTEGER PRIMARY KEY), vec_edges (rowid =
+# knowledge_graph.id, INTEGER PRIMARY KEY), and narrative_facts_fts/vec_facts
+# (rowid = narrative_facts.id, INTEGER PRIMARY KEY) are VACUUM-stable and need
+# nothing.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ROWID_FTS_TABLES = ("chunks_fts", "episodes_fts", "aggregation_nodes_fts")

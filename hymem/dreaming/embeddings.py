@@ -48,6 +48,22 @@ class PendingEpisodeEmbeddings:
 
 
 @dataclass
+class PendingFactEmbeddings:
+    """One-shot batch for narrative-fact embeddings (schema v26). ``fact_ids``
+    align with ``vectors``/``text_hashes``/``from_cache`` by index. Fact text
+    is immutable, so unlike episodes there is no staleness path — a fact is
+    embedded exactly once."""
+
+    fact_ids: list[int]
+    vectors: list[list[float]]
+    text_hashes: list[str]
+    from_cache: list[bool]
+    dim: int
+    model: str
+    cache_hits: int = 0
+
+
+@dataclass
 class ChunkEmbedRequest:
     """Per-batch state captured on the main thread before a background embed.
 
@@ -480,6 +496,111 @@ def fetch_episode_embeddings(
         model=model,
         cache_hits=sum(from_cache),
     )
+
+
+def fetch_fact_embeddings(
+    conn: sqlite3.Connection, embedder: EmbeddingClient
+) -> PendingFactEmbeddings | None:
+    """Embed every narrative fact without a stored vector, embedding_cache-aware.
+    Runs OUTSIDE the write lock (the phase1 lock-free pattern). Returns None
+    when nothing is pending — including on a pre-v26 store, where the table
+    does not exist."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT f.id, f.text FROM narrative_facts f
+            LEFT JOIN narrative_fact_embeddings e ON e.fact_id = f.id
+            WHERE e.fact_id IS NULL
+            ORDER BY f.id
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        return None
+
+    fact_ids = [int(r["id"]) for r in rows]
+    texts = [r["text"] for r in rows]
+    model = embedder.model
+    text_hashes = [
+        hashlib.sha256(normalize_text(t).encode()).hexdigest() for t in texts
+    ]
+    cached_by_hash = _fetch_cached_vectors(conn, text_hashes, model)
+
+    vectors_out: list[list[float] | None] = [None] * len(texts)
+    from_cache = [False] * len(texts)
+    miss_indices: list[int] = []
+    miss_texts: list[str] = []
+    for i, h in enumerate(text_hashes):
+        cached = cached_by_hash.get(h)
+        if cached is not None:
+            vectors_out[i] = cached
+            from_cache[i] = True
+        else:
+            miss_indices.append(i)
+            miss_texts.append(texts[i])
+
+    if miss_texts:
+        embedded = embedder.embed(miss_texts)
+        if len(embedded) != len(miss_texts):
+            raise RuntimeError(
+                f"embedding client returned {len(embedded)} vectors for "
+                f"{len(miss_texts)} facts"
+            )
+        for idx, vec in zip(miss_indices, embedded):
+            vectors_out[idx] = vec
+
+    return PendingFactEmbeddings(
+        fact_ids=fact_ids,
+        vectors=cast(list[list[float]], vectors_out),
+        text_hashes=text_hashes,
+        from_cache=from_cache,
+        dim=embedder.dim,
+        model=model,
+        cache_hits=sum(from_cache),
+    )
+
+
+def persist_fact_embeddings(
+    conn: sqlite3.Connection, pending: PendingFactEmbeddings
+) -> int:
+    """Insert fact vectors into narrative_fact_embeddings + vec_facts (rowid =
+    narrative_facts.id, an INTEGER PRIMARY KEY, so VACUUM-stable like
+    vec_edges). Cache misses also land in embedding_cache. Caller wraps in
+    core_db.transaction()."""
+    core_db.ensure_vec_table(conn, pending.dim)
+    has_vec = core_db.has_vec_table(conn, table="vec_facts")
+    for fact_id, vec, text_hash, is_cached in zip(
+        pending.fact_ids,
+        pending.vectors,
+        pending.text_hashes,
+        pending.from_cache,
+    ):
+        if not is_cached:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO embedding_cache(text_hash, model, vector_json, dim)
+                VALUES (?, ?, ?, ?)
+                """,
+                (text_hash, pending.model, encode_vector(vec), len(vec)),
+            )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO narrative_fact_embeddings(
+                fact_id, vector_json, model, dim, text_hash
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (fact_id, encode_vector(vec), pending.model, len(vec), text_hash),
+        )
+        if has_vec:
+            # vec0 doesn't support INSERT OR REPLACE on the rowid PK, so delete
+            # any stale row first — same guard as the other vec_* persists.
+            conn.execute("DELETE FROM vec_facts WHERE rowid = ?", (fact_id,))
+            conn.execute(
+                "INSERT INTO vec_facts(rowid, embedding) VALUES (?, ?)",
+                (fact_id, core_db._pack_vector(vec)),
+            )
+    return len(pending.fact_ids)
 
 
 def persist_episode_embeddings(

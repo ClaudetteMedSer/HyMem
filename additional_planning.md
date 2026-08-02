@@ -692,10 +692,10 @@ reads oracle labels, per-category LME deltas under ~±5pp are noise.*
 
 | Item | State | Verdict in one line |
 |---|---|---|
-| **E1 narrative facts** | **SUSPENDED — `G-F1b` revival gate is the campaign's next LLM spend** | G-F1 failed twice ON deepseek-v4-flash (faithfulness 0.55–0.76 vs 0.90; identical inventions under the one allowed prompt revision → model-side). Judged the largest lever vs Hindsight (E0 thesis), so one new-dreamer arm is authorized: gate `G-F1b`, protocol at the end of Step 1. No third prompt, no model ladder; a G-F1b FAIL = dead for real. |
+| **E1 narrative facts** | **BUILT 2026-08-02 (schema v26) — `G-F1b` PASSED, Step 4 landed** | G-F1 failed twice ON deepseek-v4-flash (0.55–0.76 vs 0.90), but the revival gate `G-F1b` cleared decisively on gpt-oss-120b (**123/123 strict**, all five criteria, truncation-tail clean). Step 4 built as specced: `narrative_facts` + FTS/vec, `hymem/dreaming/facts.py` (append-only, own watermark, forward-only prompt versioning), additive `ctx.facts` tier, FACTS block in `ask()`. The gate-passing prompt ships VERBATIM as `FACTS_SYSTEM`/`facts.v2`. Defaults ON; **Step 5 (scored confirmation) is now the open item.** |
 | **E5 anaphora** | **SHIPPED ✓** | `hymem/query/coref.py`, on by default; 31/31 resolution, 0/12 no-harm. The hedge that paid. |
 | **E3 rerank A/B (M1+M2)** | **RUN 2026-07-30/31 — VERDICT IN, NOTHING FLIPPED** | **M1 FAIL on latency arithmetic** (CE is 10.7× *slower* than the API on CPU vs a required ≥10× faster; ~9.5ms/candidate is unreachable — mxbai 108× off, bge 37× off) and its quality row is **unmeasured**, not parity (it ran on the vacuous handset). **M2 = parity, not a bge win** (NL R@1 +4/20 at p≥0.125, EN −2/15; fails the pre-registered effect size once rescaled to n=20). bge's real edge is latency (3–4× on CPU, language-flat). **Decision: keep both defaults as they are** — Step 6 closes unexercised. |
-| **E6 supersession over facts** | **SUSPENDED with E1** | Revives automatically iff G-F1b → Step 4 land. At v4-flash's faithfulness it was the amplifier of fabrication, not a feature — which is exactly why it must never precede a faithfulness pass. |
+| **E6 supersession over facts** | **UNBLOCKED 2026-08-02 (E1 landed) — not built** | Its prerequisites are now met: G-F1b passed and Step 4 shipped `narrative_facts` with `invalid_at` as the one mutable field, which is exactly the column E6 closes. At v4-flash's faithfulness it would have been an amplifier of fabrication — which is why it had to follow a faithfulness pass, not precede one. Sequence it behind Step 5. |
 | **E4 temporal boost (query-side)** | **NOT BUILT — closed by decomposition, then by selectivity arithmetic** | LME gate technically PASSED (8.8% / 90.9% / 0) but the same rules fail across corpora on the speech-time/event-time axis, and selective fire rate lands under criterion 1 on both. **Carry-forward `G-E4b` (ingest-side `valid_at`) PRE-REGISTERED 2026-07-31 — and its Step 0 pre-check closes the query-range consumer for free: ceiling ≈0.22% of queries (LME), ~20× under the bar.** The only live path is Fork B (an existing `valid_at` reader — supersession / recency-dating), which is a different feature and must be argued on its own terms. |
 | **E2 per-entity observations** | **DORMANT (double-blocked)** | Needs flip-watch green (currently red AND untestable — box store quiescent since ~Jul 12) AND a new faithfulness result clearing `fact_probe.py`'s bar. Not schedulable as pending work. |
 | **E7 usage feedback** | **OPEN, ungated** | Artifact-agnostic long game; no front-run designed yet. |
@@ -1350,17 +1350,44 @@ on the arms. See [[project-diagnostic-controls]].
 
 ---
 
-### Step 4 — E1 build: the narrative-facts artifact ~~(gated on G-F1)~~ SUSPENDED, re-gated on G-F1b
+### Step 4 — E1 build: the narrative-facts artifact ~~(gated on G-F1)~~ ~~SUSPENDED, re-gated on G-F1b~~ **BUILT 2026-08-02**
 
-> **CANCELLED 2026-07-30 — G-F1 FAILED TWICE on deepseek-v4-flash. RE-GATED the
-> same day on `G-F1b` (Step 1): SUSPENDED, builds iff G-F1b passes. Do not build
-> before that.** Faithfulness 0.55–0.76 vs a required 0.90, with the same
-> inventions reproducing across the one allowed prompt revision. Full verdict
-> and its reasoning: Step 1 above. The spec below is kept verbatim and becomes
-> the build plan again ONLY on a G-F1b PASS — until then **it is not a backlog
-> item.** E6 (supersession over facts) is suspended with it; E4's verdict is
-> independent (its query-side closed on its own evidence); E2 remains gated on
-> the flip-watch plus a faithfulness result, which a G-F1b PASS would supply.
+> **BUILT 2026-08-02 on the G-F1b PASS** (123/123 strict faithfulness,
+> gpt-oss-120b; the gate that cancelled this step on 2026-07-30 and revived it
+> 2026-08-02). Landed as specced below — **schema v26** (`narrative_facts` +
+> `narrative_facts_fts` + `narrative_fact_embeddings` + `vec_facts`,
+> `sessions.facts_message_id`, `dream_runs.facts_extracted/fact_failures`),
+> `hymem/dreaming/facts.py`, the additive `ctx.facts` tier with RRF fusion,
+> the `=== FACTS (verified past events) ===` block in `ask()` and the MCP
+> `hymem_augment` rendering, 22 tests in `tests/test_facts.py`, full suite
+> green. **Deltas from the spec, all deliberate:**
+>
+> 1. **Extraction reads RAW MESSAGES, not chunks.** The spec said "the
+>    session's undigested tail (chunks above the watermark)". The gate scored
+>    extraction over raw `role: content` turns, and chunks are a different
+>    corpus (salience-floored, assistant prefixes duplicated across chunks,
+>    short turns dropped). Reading chunks would have shipped a pipeline the
+>    gate never measured. Watermark semantics are unchanged — it is a message
+>    id either way.
+> 2. **`FACTS_PROMPT_VERSION` is `facts.v2`, not `facts.v1`** — v2 is the arm
+>    that cleared the gate; v1 (the arm that failed G-F1) never ships.
+> 3. **The watermark is the ONLY facts skip-guard** (no
+>    `facts_prompt_version` session stamp, unlike digest/profile). Forward-only
+>    versioning means a bump must NOT re-read covered ranges, so a
+>    version-keyed guard would be actively wrong.
+> 4. **An oversized single turn is COVERED, not re-read.** Truncation keeps
+>    the head, so no later dream can read more of that turn; holding the
+>    watermark (the digest's behaviour) would re-spend one call per dream
+>    forever and store nothing. The dropped tail is logged
+>    (`facts.oversized_turn`), never silent.
+>
+> **Not done, deliberately:** narrative facts are absent from
+> `portability.py`'s export spec — which already omits `user_profile` (v18),
+> `rules` (v23) and the aggregation layer, so this joins the tracked
+> export-gap phase rather than being fixed inconsistently here. **Step 5
+> (scored confirmation: LoCoMo n=800 `--fresh`, MSC, LME non-regression) is
+> now the open item** — the build is unmeasured on any benchmark. E6 revives
+> behind this step; E2 stays blocked on the flip-watch independently.
 
 **Idea.** Dream-time extraction of self-contained narrative facts, stored
 immutably (append-only, version-tagged), served as an additive retrieval tier
@@ -1473,12 +1500,12 @@ append-only + UNIQUE).
 
 ---
 
-### Step 5 — scored confirmation (box; protocol, not a build) — SUSPENDED with Step 4
+### Step 5 — scored confirmation (box; protocol, not a build) — **LIVE: Step 4 has landed**
 
-> **CANCELLED 2026-07-30 with Step 4; SUSPENDED the same day when `G-F1b`
-> opened — reinstated as written iff Step 4 builds.** Until then, Step 6 (E3
-> adoption) reuses this run discipline for the one shared confirmation run it
-> carries itself.
+> **REINSTATED 2026-08-02** — Step 4 built, so this runs as written below. The
+> facts tier ships defaulted ON and **unmeasured on every benchmark**: nothing
+> here has been scored since the build, and the pre-registered reading order
+> (mechanism BEFORE score) is what keeps a null result readable.
 
 - **LoCoMo, n=800, `--fresh` (core changed → stores rebuilt), seed 0, canonical
   3×/24k.** Pre-registered reads, in order: (a) mechanism — facts rendered in

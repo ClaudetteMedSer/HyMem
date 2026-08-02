@@ -121,13 +121,18 @@ def render_context(ctx: AugmentedContext, *, max_chars: int) -> str:
                               "(low confidence)" per the `hedge_recommended`
                               contract, and a date is included when the fact
                               carries one.
-      4. CONVERSATION EVIDENCE — dated raw turns (`message_hits`), the dominant
+      4. FACTS              — narrative facts (schema v26): self-contained
+                              dream-verified event statements. Lead the
+                              evidence — but the raw turns stay below as the
+                              verification backup (the Acme lesson: a summary
+                              is never the only copy).
+      5. CONVERSATION EVIDENCE — dated raw turns (`message_hits`), the dominant
                               recovery source; MR count signals ride along here.
-      5. TIMELINE           — the TR chronology (`temporal_events`), when built.
-      6. EPISODES           — per-session summaries.
-      7. PAST CONTEXT       — dreamed chunk hits.
-      8. PROCEDURES         — step-by-step workflows, only when present.
-      9. RECENT TURNS       — working memory, last: useful but least curated.
+      6. TIMELINE           — the TR chronology (`temporal_events`), when built.
+      7. EPISODES           — per-session summaries.
+      8. PAST CONTEXT       — dreamed chunk hits.
+      9. PROCEDURES         — step-by-step workflows, only when present.
+     10. RECENT TURNS       — working memory, last: useful but least curated.
 
     Empty tiers are skipped entirely (no empty headers wasting budget). Each
     item is snippet-capped so no single hit can crowd out whole sections.
@@ -174,6 +179,13 @@ def render_context(ctx: AugmentedContext, *, max_chars: int) -> str:
                 line += " (low confidence)"
             lines.append(line)
         parts.append("=== KNOWN FACTS (knowledge graph) ===\n" + "\n".join(lines))
+
+    if ctx.facts:
+        lines = []
+        for nf in ctx.facts:
+            stamp = nf.fact_date if nf.fact_date else "undated"
+            lines.append(f"- [{stamp}] {_snippet(nf.text)}")
+        parts.append("=== FACTS (verified past events) ===\n" + "\n".join(lines))
 
     if ctx.message_hits or ctx.total_message_matches or ctx.graph_count:
         lines = []

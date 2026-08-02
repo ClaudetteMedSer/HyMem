@@ -60,6 +60,28 @@ class EpisodeHit:
 
 
 @dataclass
+class FactHit:
+    """One narrative fact (schema v26, Campaign E / E1) — a self-contained
+    one-sentence statement extracted at dream time, the middle granularity
+    between a knowledge-graph triple and an episode summary. `fact_date` is an
+    explicit ISO date the conversation wrote, or None (undated facts stay
+    undated — never a session-date fallback). `entities` are canonical ids.
+    `session_id` + the stored message range keep every fact traceable to the
+    turns it was extracted from."""
+
+    fact_id: int
+    text: str
+    fact_date: str | None
+    entities: list[str]
+    session_id: str
+    score: float
+    score_kind: str = "bm25"
+    why_retrieved: list[str] = field(default_factory=list)
+    """Short reason chips (e.g. `fact_fts("fly deploy")`,
+    `fact_rrf(fts+vec, 0.0240)`), mirroring the other tiers."""
+
+
+@dataclass
 class AggregationNodeHit:
     """A Phase-2 RAPTOR cross-session aggregation node — one fused summary over a
     cluster of episodes that spanned several sessions. Surfaced as an ADDITIVE
@@ -221,6 +243,14 @@ class AugmentedContext:
     matching turns. `graph_count.counted` names which side was tallied so the host
     can phrase the answer unambiguously."""
     episodes: list[EpisodeHit] = field(default_factory=list)
+    facts: list[FactHit] = field(default_factory=list)
+    """Narrative facts (schema v26) matching the query — FTS + optional vec
+    KNN over `narrative_facts`, RRF-fused like the episode tier. ADDITIVE:
+    its own SELECT, never consumes another tier's budget, so a populated
+    facts store cannot crowd gold turns out of message/chunk/episode
+    retrieval. Superseded facts (`invalid_at` set — E6's write) leave the
+    tier but stay in the DB for audit. Empty when `cfg.facts_enabled` is
+    False, `cfg.facts_top_k` is 0, or on a pre-v26 store."""
     aggregation_nodes: list[AggregationNodeHit] = field(default_factory=list)
     """Phase-2 RAPTOR cross-session cluster summaries (see `AggregationNodeHit`).
     Empty unless `cfg.aggregation_nodes_enabled` is set AND the dream has built
@@ -532,6 +562,18 @@ def augment(
         top_k=cfg.fts_top_k,
         embedding_client=embedding_client,
     )
+
+    # E1 narrative-facts tier (schema v26): FTS + optional vec over the
+    # dreamed fact store, before the graph lookup. Additive — its own SELECT,
+    # never a slot from message/chunk/episode/graph budgets. v1 deliberately
+    # does NOT feed matched_entities (minimal diff); superseded facts
+    # (invalid_at) are filtered in the search itself.
+    if cfg.facts_enabled and cfg.facts_top_k > 0:
+        ctx.facts = _fact_search(
+            conn, query,
+            top_k=cfg.facts_top_k,
+            embedding_client=embedding_client,
+        )
 
     # Phase-2 RAPTOR additive tier: cross-session cluster summaries. Off by
     # default; only runs when the layer is enabled AND the routed ability is in
@@ -2038,6 +2080,135 @@ def _episode_rrf_chips(
     else:
         sources = "vec"
     return [*base, f"episode_rrf({sources}, {score:.4f})"]
+
+
+def _fact_search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    top_k: int,
+    embedding_client: EmbeddingClient | None = None,
+) -> list[FactHit]:
+    """Narrative-fact retrieval (schema v26). Always runs the FTS path; when an
+    embedding client is configured and vec_facts has rows, also runs semantic
+    KNN over fact-text embeddings and RRF-fuses the two ranked lists —
+    mirroring `_episode_search`.
+
+    `invalid_at IS NULL` is the supersession filter: a fact E6 closed leaves
+    the tier but stays in the DB for audit. Degrades to [] on a pre-v26 store
+    (no table) and to FTS-only when there's no embedder or no vec_facts."""
+    from hymem.core import db as core_db
+
+    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    fts_hits: list[FactHit] = []
+    if cleaned:
+        tokens = [t for t in cleaned.split() if len(t) >= 2]
+        if tokens:
+            fts_query = " OR ".join(f'"{t}"' for t in tokens)
+            fact_chip = f'fact_fts("{" ".join(tokens)}")'
+            try:
+                rows = conn.execute(
+                    """SELECT f.id, f.session_id, f.text, f.fact_date, f.entities,
+                              bm25(narrative_facts_fts) AS score
+                       FROM narrative_facts_fts
+                       JOIN narrative_facts f ON f.id = narrative_facts_fts.rowid
+                       WHERE narrative_facts_fts MATCH ? AND f.invalid_at IS NULL
+                       ORDER BY score
+                       LIMIT ?""",
+                    (fts_query, top_k * 2),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            for r in rows:
+                fts_hits.append(_fact_row_hit(r, float(r["score"]), "bm25", [fact_chip]))
+
+    vec_hits: list[FactHit] = []
+    if (
+        embedding_client is not None
+        and core_db._load_vec_extension(conn)
+        and core_db.has_vec_table(conn, table="vec_facts")
+    ):
+        qvec = embedding_client.embed([query])[0]
+        try:
+            hit_rows = core_db.vec_search(conn, qvec, top_k * 2, table="vec_facts")
+        except Exception:
+            hit_rows = []
+        for rowid, distance in hit_rows:
+            try:
+                r = conn.execute(
+                    "SELECT id, session_id, text, fact_date, entities "
+                    "FROM narrative_facts WHERE id = ? AND invalid_at IS NULL",
+                    (rowid,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                break
+            if r is None:
+                continue
+            sim = 1.0 / (1.0 + distance)
+            vec_hits.append(
+                _fact_row_hit(r, float(sim), "vec", [f"fact_vec(sim={sim:.3f})"])
+            )
+
+    if not vec_hits:
+        return fts_hits[:top_k]
+    if not fts_hits:
+        return vec_hits[:top_k]
+    return _rrf_merge_facts(fts_hits, vec_hits, top_k=top_k)
+
+
+def _fact_row_hit(
+    r: sqlite3.Row, score: float, score_kind: str, chips: list[str]
+) -> FactHit:
+    try:
+        entities = json.loads(r["entities"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        entities = []
+    return FactHit(
+        fact_id=int(r["id"]),
+        text=r["text"],
+        fact_date=r["fact_date"],
+        entities=[e for e in entities if isinstance(e, str)],
+        session_id=r["session_id"],
+        score=score,
+        score_kind=score_kind,
+        why_retrieved=chips,
+    )
+
+
+def _rrf_merge_facts(
+    fts: list[FactHit],
+    vec: list[FactHit],
+    *,
+    top_k: int,
+    k: int = 60,
+) -> list[FactHit]:
+    """RRF over two ranked fact lists, keyed on fact_id — the
+    `_rrf_merge_episodes` pattern."""
+    by_id: dict[int, FactHit] = {}
+    scores: dict[int, float] = {}
+    for rank, hit in enumerate(fts, start=1):
+        scores[hit.fact_id] = scores.get(hit.fact_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.fact_id, hit)
+    for rank, hit in enumerate(vec, start=1):
+        scores[hit.fact_id] = scores.get(hit.fact_id, 0.0) + 1.0 / (k + rank)
+        by_id.setdefault(hit.fact_id, hit)
+    fts_ids = {h.fact_id for h in fts}
+    vec_ids = {h.fact_id for h in vec}
+    ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    out: list[FactHit] = []
+    for fid, score in ordered[:top_k]:
+        if fid in fts_ids and fid in vec_ids:
+            sources = "fts+vec"
+        elif fid in fts_ids:
+            sources = "fts"
+        else:
+            sources = "vec"
+        base = by_id[fid]
+        out.append(replace(
+            base, score=score, score_kind="rrf",
+            why_retrieved=[*base.why_retrieved, f"fact_rrf({sources}, {score:.4f})"],
+        ))
+    return out
 
 
 def _aggregation_tier_fires(cfg: HyMemConfig, ability: str | None) -> bool:

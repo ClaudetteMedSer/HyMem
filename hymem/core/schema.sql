@@ -43,7 +43,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- the digest even when no chunk was freshly extracted. NULL = no coverage
     -- recorded, so the next dream digests from the start of the session.
     -- Migration 024 adds this for existing DBs (ALTER lives there only).
-    digested_message_id INTEGER
+    digested_message_id INTEGER,
+    -- Facts watermark (v26): same mechanics as digested_message_id but for the
+    -- narrative-facts extractor, its own column so facts and digest coverage
+    -- advance independently. Migration 026 adds this for existing DBs.
+    facts_message_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -524,6 +528,10 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     -- a join against episodes.
     digest_failures INTEGER NOT NULL DEFAULT 0,
     episodes_created INTEGER NOT NULL DEFAULT 0,
+    -- v26 facts attribution, mirroring the digest counters above: a stalled or
+    -- failing narrative-facts extractor must be a one-line read.
+    facts_extracted INTEGER NOT NULL DEFAULT 0,
+    fact_failures INTEGER NOT NULL DEFAULT 0,
     skipped_locked INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );
@@ -536,6 +544,68 @@ CREATE INDEX IF NOT EXISTS idx_dream_runs_started ON dream_runs(started_at);
 -- knowledge_graph / user_profile (a contradicting rule closes invalid_at rather
 -- than overwriting); text UNIQUE so re-assert reinforces. See hymem/rules.py.
 -- Constraint (additional_planning.md §0): NOT fed into the RAPTOR digest anchor.
+-- v26: narrative facts — the E1 middle-granularity tier. Dream-time extraction
+-- of self-contained narrative statements ("Atta moved the MedFlow deploy to
+-- fly.io"), stored APPEND-ONLY (text is immutable; a prompt bump extracts
+-- forward only under a new prompt_version tag) and served as an additive
+-- retrieval tier plus the lead evidence block in ask(). fact_date holds
+-- EXPLICIT dates the conversation wrote; relative references stay NULL (E4's
+-- job — stamping the session date was a proven invention amplifier).
+-- invalid_at is the ONLY mutable field (E6 supersession closes it); retrieval
+-- filters invalid_at IS NULL, the row stays for audit. Built behind the
+-- G-F1b extraction-faithfulness gate (PASSED 2026-08-02, 123/123 strict);
+-- see hymem/dreaming/facts.py. The index is safe here (table created whole
+-- in this script); migration 026 carries it for existing DBs.
+CREATE TABLE IF NOT EXISTS narrative_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    start_message_id INTEGER NOT NULL,
+    end_message_id INTEGER NOT NULL,
+    text TEXT NOT NULL,                    -- self-contained narrative; IMMUTABLE
+    fact_date TEXT,                        -- ISO or NULL (explicit dates; relatives = E4)
+    entities TEXT NOT NULL DEFAULT '[]',   -- JSON array of canonical names
+    prompt_version TEXT NOT NULL,          -- 'facts.v2' provenance tag
+    valid_at TEXT,                         -- bi-temporal, mirrors knowledge_graph
+    invalid_at TEXT,                       -- the ONLY mutable field (E6 closes it)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (session_id, start_message_id, text)
+);
+CREATE INDEX IF NOT EXISTS idx_narrative_facts_session
+    ON narrative_facts(session_id);
+
+-- content_rowid='id' on an INTEGER PRIMARY KEY (rowid alias): VACUUM-stable
+-- like messages_fts/vec_edges, so no resync_rowid_shadows coverage needed.
+-- The update trigger is drift-proofing only — the sanctioned UPDATE path
+-- (invalid_at) never touches text.
+CREATE VIRTUAL TABLE IF NOT EXISTS narrative_facts_fts USING fts5(
+    text,
+    content='narrative_facts',
+    content_rowid='id',
+    tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS narrative_facts_fts_insert AFTER INSERT ON narrative_facts BEGIN
+    INSERT INTO narrative_facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS narrative_facts_fts_delete AFTER DELETE ON narrative_facts BEGIN
+    INSERT INTO narrative_facts_fts(narrative_facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS narrative_facts_fts_update AFTER UPDATE ON narrative_facts BEGIN
+    INSERT INTO narrative_facts_fts(narrative_facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO narrative_facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+-- JSON mirror for fact vectors (vec_facts is created at runtime by
+-- ensure_vec_table when sqlite-vec is present). Fact text is immutable, so a
+-- row here means "embedded" — no staleness path.
+CREATE TABLE IF NOT EXISTS narrative_fact_embeddings (
+    fact_id INTEGER PRIMARY KEY REFERENCES narrative_facts(id) ON DELETE CASCADE,
+    vector_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT NOT NULL UNIQUE,
