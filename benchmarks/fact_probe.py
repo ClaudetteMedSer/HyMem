@@ -594,8 +594,12 @@ def run_question(
                     "facts": facts,
                     # Source turns travel WITH the facts so the faithfulness
                     # hand-score is a self-contained read (no re-joining the
-                    # dataset to check a value is verbatim).
-                    "source_turns": render_session(messages)[:4000],
+                    # dataset to check a value is verbatim). This must be the
+                    # EXACT extractor input — the G-F1b sample stored a [:4000]
+                    # slice of the 12000-char input, so the hand-read scored
+                    # everything faithfully taken from chars 4000-12000 as
+                    # invention.
+                    "source_turns": render_session(messages),
                 })
 
         retrieved = search_facts(conn, question, top_k=top_k)
@@ -662,8 +666,20 @@ def build_faithfulness_sample(
     for r in rows:
         q_data = by_id.get(r.get("question_id"))
         gold_sids = gold_session_ids(q_data) if q_data else set()
+        sessions = (q_data.get("haystack_sessions", []) or []) if q_data else []
+        sids = (q_data.get("haystack_session_ids",
+                           [str(i) for i in range(len(sessions))])
+                if q_data else [])
+        by_sid = {(sids[i] if i < len(sids) else str(i)): sessions[i]
+                  for i in range(len(sessions))}
         for d in r.get("dump", []) or []:
             entry = {"question_id": r.get("question_id"), **d}
+            # Re-render from the dataset rather than trusting the stored copy:
+            # a dump written before the [:4000] truncation fix carries a sliced
+            # source, and a --rescore pass must heal it, not inherit it.
+            messages = by_sid.get(d.get("session_id"))
+            if messages is not None:
+                entry["source_turns"] = render_session(messages)
             if d.get("session_id") in gold_sids:
                 entry["stratum"] = "gold_bearing"
                 gold.append(entry)
