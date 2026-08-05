@@ -313,7 +313,7 @@ class HyMemConfig:
     (deepseek-v4-flash: 100% at 10, 0% at 111), so a dream's markers are judged in
     sub-batches of this size. Lower if a weaker judge still collapses."""
 
-    facts_enabled: bool = True
+    facts_enabled: bool = False
     """Campaign E / E1 master switch (read side): surface the narrative-facts
     tier in `ctx.facts` — self-contained one-sentence statements extracted at
     dream time (schema v26), the middle granularity between a knowledge-graph

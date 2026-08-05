@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -582,7 +583,12 @@ def _llm_fuse(
         log.exception("aggregate.fusion_failure kind=%s stage=call", kind)
         return None
     try:
-        data = json.loads(raw)
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            # Model wrapped the JSON in markdown fences — strip them before parsing.
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+        data = json.loads(cleaned)
     except json.JSONDecodeError:
         log.warning("aggregate.fusion_failure kind=%s stage=parse raw_len=%d",
                     kind, len(raw))

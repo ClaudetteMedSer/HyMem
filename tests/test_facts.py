@@ -350,7 +350,7 @@ def test_tier_surfaces_matches_skips_non_matches_and_hides_superseded(cfg):
     """The tier returns matching facts, stays empty for an unrelated query, and
     drops a superseded fact (invalid_at set) while KEEPING its row for audit."""
     llm = _facts_llm()
-    hy = HyMem(cfg, llm=llm)
+    hy = HyMem(dataclasses.replace(cfg, facts_enabled=True), llm=llm)  # default OFF post-E1; pin on
     try:
         sid = "s_tier"
         _seed_session(hy, sid, _TURNS)
@@ -387,7 +387,8 @@ def test_facts_are_embedded_once_and_reach_the_vec_arm(cfg, embed_stub):
     them, and a re-dream re-embeds nothing — fact text is immutable, so a
     stored vector can never be stale."""
     llm = _facts_llm()
-    hy = HyMem(cfg, llm=llm, embedding_client=embed_stub)
+    hy = HyMem(dataclasses.replace(cfg, facts_enabled=True), llm=llm,
+               embedding_client=embed_stub)  # default OFF post-E1; pin on
     try:
         sid = "s_embed"
         _seed_session(hy, sid, _TURNS)
@@ -419,7 +420,8 @@ def test_facts_tier_does_not_disturb_any_other_tier(cfg):
     """The control that lets this tier default ON: with facts present, every
     other tier returns exactly what it returns with `facts_enabled=False`."""
     llm = _facts_llm()
-    hy = HyMem(cfg, llm=llm)
+    on_cfg = dataclasses.replace(cfg, facts_enabled=True)  # read-side default is OFF post-E1; pin on for the invariant test
+    hy = HyMem(on_cfg, llm=llm)
     query = "what happened with the MedFlow deploy?"
     try:
         sid = "s_additive"
@@ -552,6 +554,7 @@ def test_truncation_sheds_facts_before_standing_rules():
 
 def test_ask_sends_the_facts_block_to_the_synthesis_call(cfg):
     """The one-call endpoint really carries facts into the prompt."""
+    cfg = dataclasses.replace(cfg, facts_enabled=True)  # read-side default is OFF post-E1; pin on for the render-path test
     llm = _facts_llm()
     hy = HyMem(cfg, llm=llm)
     try:

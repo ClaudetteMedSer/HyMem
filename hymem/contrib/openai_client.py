@@ -60,6 +60,7 @@ class OpenAICompatibleClient:
             ],
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            extra_body={"thinking": {"type": "disabled"}},
         )
         if request.response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
