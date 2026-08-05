@@ -97,10 +97,24 @@ def extract_session_digest(
             )
     combined = "\n\n---\n\n".join(combined_parts)
     if len(combined) > max_chars:
-        # Single oversized chunk: keep the hard cap, and do not claim coverage
-        # of a message range the LLM only partly saw.
+        # ONE chunk longer than the whole cap (the loop always admits the first
+        # part, whatever its size — `used` tracks `len(combined)` exactly, so
+        # this branch can only mean the head chunk overflowed on its own).
+        # Truncate it and still claim coverage: truncation keeps the HEAD, so
+        # no later dream could read more of this chunk than this one just did.
+        # Holding the watermark instead re-sends the identical slice, and
+        # re-spends the call, on EVERY dream forever while storing nothing —
+        # the session's episodes then freeze while its messages keep arriving
+        # (2026-08-05: watermark pinned at 547 against message 2093 for five
+        # days, silently). Losing the tail of one oversized chunk is the lesser
+        # evil, and it is logged rather than silent. Same trade, same reasoning
+        # as facts.oversized_turn in dreaming/facts.py.
         combined = combined[:max_chars]
-        covered = None
+        log.warning(
+            "digest.oversized_chunk session_id=%s message_id=%s chars=%d cap=%d "
+            "(tail not read)",
+            session_id, covered, len(combined_parts[0]), max_chars,
+        )
 
     request = LLMRequest(
         system=SESSION_DIGEST_SYSTEM,

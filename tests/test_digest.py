@@ -345,6 +345,115 @@ def test_since_message_id_selects_only_the_tail(cfg):
         hy.close()
 
 
+# --- an oversized head chunk must not pin the watermark ---------------------
+
+
+def _oversized_turns(cap: int) -> list[tuple[str, str]]:
+    """A session whose FIRST chunk alone overflows `cap`, followed by ordinary
+    tail turns. The loop in extract_session_digest admits the head part without
+    a size check, so this is the only shape that can reach the truncation
+    branch."""
+    filler = "the deploy playbook step repeats here to pad the turn. " * 40
+    turns = [
+        ("assistant", "head-marker: how do we deploy to staging?"),
+        ("user", f"Build the image then apply the manifests. {filler} tail-marker."),
+    ]
+    for i in range(4):
+        turns.append(("assistant", f"question {i}: what runs in step {i}?"))
+        turns.append((
+            "user",
+            f"For step {i} you run the step-{i} playbook end to end; "
+            f"marker-{i} confirms it finished cleanly.",
+        ))
+    assert len(filler) > cap, "the head turn must overflow the cap on its own"
+    return turns
+
+
+def test_oversized_head_chunk_advances_the_watermark(cfg):
+    """A single chunk longer than the whole cap must be truncated AND claim
+    coverage. Holding the watermark here re-sent the identical slice on every
+    dream forever: the session's episodes froze while its messages kept
+    arriving, and the repeated digest upserted onto the same deterministic
+    episode ids, so the store never grew (2026-08-05, watermark 547 vs message
+    2093). Truncation keeps the HEAD, so no later dream could read more of this
+    chunk than this one did — claiming coverage loses nothing a retry recovers.
+    Mirrors facts.oversized_turn in dreaming/facts.py."""
+    import dataclasses
+
+    small = dataclasses.replace(cfg, dream_digest_max_chars=400)
+    llm = _digest_llm(summary="A short but valid session summary about deploys.")
+    hy = HyMem(small, llm=llm)
+    try:
+        sid = "s_oversized"
+        _seed_session(hy, sid, _oversized_turns(400))
+
+        newest = hy.conn.execute(
+            "SELECT MAX(id) AS m FROM messages WHERE session_id = ?", (sid,)
+        ).fetchone()["m"]
+
+        marks: list[int | None] = []
+        for _ in range(10):
+            hy.dream()
+            marks.append(hy.conn.execute(
+                "SELECT digested_message_id FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()["digested_message_id"])
+
+        assert marks[0] is not None, (
+            "the oversized head chunk must claim coverage — reporting None pins "
+            "the watermark and re-sends this slice on every dream forever"
+        )
+        assert marks == sorted(marks), "coverage must never go backwards"
+        assert marks[-1] == newest, "the tail beyond the oversized chunk must be reached"
+
+        calls = [c.user for c in _digest_calls(llm)]
+        assert "head-marker" in calls[0], "the head of the oversized chunk is kept"
+        assert "tail-marker" not in calls[0], "its tail is truncated at the cap"
+        assert any("marker-3" in c for c in calls), "later turns must still be read"
+    finally:
+        hy.close()
+
+
+def test_oversized_head_chunk_is_logged(cfg, caplog):
+    """The truncation drops text, so it must be audible rather than silent —
+    the pre-fix branch reported no coverage with no log at all, which is what
+    made the stall invisible for five days."""
+    import dataclasses
+    import logging
+
+    small = dataclasses.replace(cfg, dream_digest_max_chars=400)
+    llm = _digest_llm(summary="A short but valid session summary about deploys.")
+    hy = HyMem(small, llm=llm)
+    try:
+        sid = "s_oversized_log"
+        _seed_session(hy, sid, _oversized_turns(400))
+        with caplog.at_level(logging.WARNING, logger="hymem.dreaming.digest"):
+            hy.dream()
+        assert "digest.oversized_chunk" in caplog.text
+        assert "cap=400" in caplog.text
+        assert "(tail not read)" in caplog.text
+        # The message id is the coverage now being claimed, not None.
+        assert "message_id=None" not in caplog.text
+    finally:
+        hy.close()
+
+
+def test_normal_session_logs_no_oversized_warning(cfg, caplog):
+    """The warning must stay quiet on ordinary traffic — a truncation notice on
+    every dream would be noise, and noise is how the real one gets missed."""
+    import logging
+
+    llm = _digest_llm(summary="A short but valid session summary about deploys.")
+    hy = HyMem(cfg, llm=llm)
+    try:
+        sid = "s_normal"
+        _seed_session(hy, sid, _TURNS)
+        with caplog.at_level(logging.WARNING, logger="hymem.dreaming.digest"):
+            hy.dream()
+        assert "digest.oversized_chunk" not in caplog.text
+    finally:
+        hy.close()
+
+
 # --- malformed payloads degrade gracefully ---------------------------------
 
 
