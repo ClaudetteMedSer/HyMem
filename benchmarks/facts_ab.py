@@ -48,6 +48,21 @@ def load_rows(path: str) -> list[dict]:
                      f"(keys: {sorted(obj)[:10]})")
 
 
+# The adapters disagree on what the model's answer is called: LoCoMo/MSC write
+# `ai_answer`, LME writes `hypothesis`. Reading only one of them silently dumps
+# a column of nulls -- which is exactly what makes a flip dump unreadable, since
+# WHY a question moved is only visible in the two answers side by side.
+_ANSWER_KEYS = ("ai_answer", "hypothesis", "prediction", "response")
+
+
+def _model_answer(row: dict) -> str | None:
+    for k in _ANSWER_KEYS:
+        v = row.get(k)
+        if v:
+            return v
+    return None
+
+
 def mcnemar(pairs: list[tuple[bool, bool]]) -> dict:
     """Exact-ish McNemar on discordant pairs.
 
@@ -174,8 +189,8 @@ def main() -> None:
                           "question": r.get("question"), "answer": r.get("answer"),
                           "n_facts": r.get("n_facts"),
                           "gold_in_facts": r.get("gold_in_facts"),
-                          "ai_on": r.get("ai_answer"),
-                          "ai_off": off_rows[q].get("ai_answer")})
+                          "ai_on": _model_answer(r),
+                          "ai_off": _model_answer(off_rows[q])})
         Path(args.dump_flips).write_text(json.dumps(flips, indent=2), encoding="utf-8")
         print(f"\n  {len(flips)} discordant fired questions → {args.dump_flips}")
         print("  Hand-read these. A real tier effect has a READABLE mechanism in\n"
