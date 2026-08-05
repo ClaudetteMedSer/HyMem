@@ -34,6 +34,7 @@ from hymem.dreaming.user_profile import (
     PROFILE_PROMPT_VERSION,
     ProfileExtraction,
     build_profile_user_prompt,
+    extract_user_profile,
     load_profile,
     persist_user_profile,
     render_profile_fact,
@@ -715,3 +716,66 @@ def test_migration_019_purges_v1_rows_and_adds_session_stamp(tmp_path: Path):
     # …and unrelated data is untouched.
     assert conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"] == 1
     conn.close()
+
+
+# ── fenced replies (dream 1013) ──────────────────────────────────────────────
+
+
+def test_extract_user_profile_parses_fenced_reply(conn):
+    """The profile call sets response_format="json"; dream 1013 proved that is
+    a request, not a contract. A fenced reply used to drop the whole session's
+    profile with no log at all."""
+    sid = "s_fenced_profile"
+    mid = _msg(conn, sid, "Tegenwoordig werk ik als bedrijfsarts bij MedFlow.")
+    fenced = (
+        "Here is the JSON:\n```json\n"
+        + json.dumps([_item("role", "bedrijfsarts", mid)])
+        + "\n```"
+    )
+    llm = StubLLMClient(fixtures={_NEEDLE: fenced}, default="[]")
+    extraction = extract_user_profile(
+        conn, sid, llm, max_chars=4000, max_items=10
+    )
+    assert extraction is not None
+    assert [(i["slot"], i["value"]) for i in extraction.items] == [
+        ("role", "bedrijfsarts")
+    ]
+
+
+def test_extract_user_profile_refusal_yields_empty_extraction(conn, caplog):
+    """An unparseable reply keeps the documented empty ProfileExtraction —
+    a refusal must never be laundered into profile facts — and now logs."""
+    sid = "s_refusal_profile"
+    _msg(conn, sid, "Tegenwoordig werk ik als bedrijfsarts bij MedFlow.")
+    llm = StubLLMClient(
+        fixtures={_NEEDLE: "I'm sorry, I can't help with that."}, default="[]"
+    )
+    with caplog.at_level("WARNING"):
+        extraction = extract_user_profile(
+            conn, sid, llm, max_chars=4000, max_items=10
+        )
+    assert extraction == ProfileExtraction()
+    assert any(
+        "user_profile.parse_failure" in r.message and sid in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_extract_user_profile_wrong_shape_yields_empty_extraction(conn, caplog):
+    """Valid JSON, wrong shape. validate_profile_items() already returned []
+    for it; without a log that is indistinguishable from "nothing about this
+    user was profile-worthy"."""
+    sid = "s_shape_profile"
+    _msg(conn, sid, "Tegenwoordig werk ik als bedrijfsarts bij MedFlow.")
+    llm = StubLLMClient(
+        fixtures={_NEEDLE: '{"profile": "nothing to report"}'}, default="[]"
+    )
+    with caplog.at_level("WARNING"):
+        extraction = extract_user_profile(
+            conn, sid, llm, max_chars=4000, max_items=10
+        )
+    assert extraction == ProfileExtraction()
+    assert any(
+        "user_profile.shape_failure" in r.message and sid in r.getMessage()
+        for r in caplog.records
+    )

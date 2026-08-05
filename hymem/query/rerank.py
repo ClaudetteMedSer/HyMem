@@ -19,11 +19,11 @@ only sort downstream consumers by ``score`` if they keep the kind tag too.
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import replace
 from typing import Protocol
 
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import RERANK_SYSTEM, RERANK_USER_TEMPLATE
 
@@ -76,16 +76,27 @@ def llm_rerank(
         log.exception("llm_rerank backend failed; returning candidates unreranked")
         return candidates[:top_k]
 
-    try:
-        ratings = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    # Fences/prose around the JSON are tolerated (dream 1013 — json_object mode
+    # is a request, not a contract). `expect="any"` rather than "object"
+    # because the shape check below deliberately accepts a bare array too:
+    # narrowing recovery to objects would drop a fenced array this function is
+    # otherwise happy to rerank. Pure string work, no extra request, so the
+    # deliberately retry-free hot path stays that way.
+    parsed = loads_lenient(raw, expect="any")
+    if parsed is None:
+        log.warning("rerank.parse_failure candidates=%d raw_len=%d",
+                    len(candidates), len(raw) if isinstance(raw, str) else -1)
         return candidates[:top_k]
     # JSON-mode backends (response_format "json_object") are required to emit
     # an object, so the prompt asks for {"ratings": [...]}; models without
     # strict JSON mode may still return the bare array. Accept both.
-    if isinstance(ratings, dict):
-        ratings = ratings.get("ratings")
+    ratings = parsed.get("ratings") if isinstance(parsed, dict) else parsed
     if not isinstance(ratings, list):
+        # Valid JSON of the wrong shape. Silent, this is indistinguishable
+        # downstream from "the model rated nothing relevant" — the candidates
+        # come back in upstream order either way — so it gets its own line.
+        log.warning("rerank.shape_failure candidates=%d type=%s",
+                    len(candidates), type(parsed).__name__)
         return candidates[:top_k]
 
     relevance: dict[int, int] = {}

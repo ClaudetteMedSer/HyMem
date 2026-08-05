@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import json
+import logging
 from dataclasses import dataclass
 
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import (
     ALLOWED_PREDICATES,
     build_triple_system,
     TRIPLE_USER_TEMPLATE,
 )
+
+log = logging.getLogger("hymem.extraction.triples")
 
 
 @dataclass(frozen=True)
@@ -43,7 +46,16 @@ def extract_triples(
         response_format="json",
     )
     raw = client.complete(request)
-    return _parse(raw), extract_entity_types(raw), extract_entity_properties(raw)
+    # Decode ONCE and fan the same list out to the three validators: identical
+    # to calling `_parse`/`extract_entity_types`/`extract_entity_properties` on
+    # `raw` separately (each decoded it itself), minus two duplicate
+    # parse-failure warnings for a single bad reply.
+    items = _as_item_list(raw)
+    return (
+        triples_from_list(items),
+        entity_types_from_list(items),
+        entity_properties_from_list(items),
+    )
 
 
 _VALID_TYPES = frozenset({
@@ -68,12 +80,17 @@ def _as_item_list(raw: str) -> list:
     Returns [] for invalid JSON or any non-array payload. The combined-extraction
     path bypasses this and feeds an already-decoded sub-array into the
     ``*_from_list`` helpers directly.
+
+    The triple prompt asks for a bare JSON array; fences/prose around it are
+    tolerated (dream 1013 — json_object mode is a request, not a contract).
     """
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+    data = loads_lenient(raw, expect="array")
+    if data is None:
+        log.warning("triples.parse_failure raw_len=%d",
+                    len(raw) if isinstance(raw, str) else -1)
         return []
     if not isinstance(data, list):
+        log.warning("triples.shape_failure type=%s", type(data).__name__)
         return []
     return data
 
@@ -159,6 +176,8 @@ def entity_properties_from_list(data: list) -> dict[str, dict[str, str]]:
 
 
 def _parse(raw: str) -> list[Triple]:
+    """Triples only, from a raw LLM reply. `extract_triples` decodes once and
+    fans out instead; this stays for callers that only want the triples."""
     return triples_from_list(_as_item_list(raw))
 
 

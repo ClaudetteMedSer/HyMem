@@ -28,6 +28,7 @@ from hymem.dreaming.aggregate import (
     load_digest,
     _CLUSTER_SALT,
     _content_defined_groups,
+    _llm_fuse,
     _node_id,
     _ROLLUP_SALT,
     _ROOT_SALT,
@@ -1182,6 +1183,31 @@ def test_expand_reports_dangling_members(cfg, conn):
     exp = expand_node(conn, digest.node_id)
     assert exp.missing_member_ids == ["e3"]
     assert len(exp.child_nodes) == 1 and exp.episodes == []
+
+
+@pytest.mark.parametrize("wrapper", [
+    "{body}",
+    "```json\n{body}\n```",
+    "```\n{body}\n```",
+    "```JSON\n{body}\n```",
+    "Here is the JSON:\n```json\n{body}\n```",
+    "```json\n{body}\n```\nHope that helps!",
+])
+def test_fusion_survives_a_fenced_or_chatty_reply(wrapper):
+    # Dream 1013 logged `kind=rollup stage=parse raw_len=4660` on a COMPLETE
+    # rollup the provider had fenced — json_object mode was already set on the
+    # call. A dropped fusion is re-fused on the next dream and costs reuse, so
+    # this is pinned at the _llm_fuse level, not just at the parser: the fix
+    # went missing from HEAD once already.
+    llm = StubLLMClient(default=wrapper.format(body=_NODE_JSON))
+    fused = _llm_fuse("prompt", llm, system="sys", kind="rollup")
+    assert fused == json.loads(_NODE_JSON)
+
+
+def test_fusion_returns_none_on_an_unparseable_reply():
+    # The leniency must not turn a genuine failure into a fabricated node.
+    llm = StubLLMClient(default="I could not summarize these episodes.")
+    assert _llm_fuse("prompt", llm, system="sys", kind="rollup") is None
 
 
 def test_hymem_expand_node_api(cfg):

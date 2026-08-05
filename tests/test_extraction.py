@@ -156,3 +156,112 @@ def test_extract_chunk_matches_separate_parsers():
     assert result.markers == parse_markers(markers_raw)
     assert result.entity_type_hints == extract_entity_types(triples_raw)
     assert result.entity_property_hints == extract_entity_properties(triples_raw)
+
+
+# --- fenced replies (dream 1013) -------------------------------------------
+#
+# Every one of these calls sets response_format="json"; dream 1013 proved that
+# is a request, not a contract. A ```json-fenced reply used to be dropped
+# silently on the ONE-SHOT ingest path, where nothing retries it.
+
+
+_FENCED_TRIPLES = (
+    'Here is the JSON:\n```json\n'
+    '[{"subject": "service", "predicate": "uses", "object": "postgres", '
+    '"polarity": 1, "subject_type": "service"}]\n'
+    '```\nHope that helps!'
+)
+
+_FENCED_MARKERS = (
+    '```JSON\n[{"kind": "preference", "statement": "user prefers uv"}]\n```'
+)
+
+
+def test_triples_parse_fenced_reply():
+    llm = StubLLMClient(default=_FENCED_TRIPLES)
+    triples, types, _props = extract_triples(llm, "x")
+    assert [t.object for t in triples] == ["postgres"]
+    assert types["service"] == "service"
+
+
+def test_triples_refusal_still_yields_empty_tuple(caplog):
+    """Leniency must never fabricate a result out of a refusal, and the drop
+    must now be audible."""
+    llm = StubLLMClient(default="I'm sorry, I can't help with that.")
+    with caplog.at_level("WARNING"):
+        assert extract_triples(llm, "x") == ([], {}, {})
+    # Decoded once, so one warning — not one per validator.
+    assert sum("triples.parse_failure" in r.message for r in caplog.records) == 1
+
+
+def test_markers_parse_fenced_reply():
+    llm = StubLLMClient(default=_FENCED_MARKERS)
+    markers = extract_markers(llm, "x")
+    assert [m.statement for m in markers] == ["user prefers uv"]
+
+
+def test_markers_refusal_still_yields_empty_list(caplog):
+    llm = StubLLMClient(default="I cannot produce that output.")
+    with caplog.at_level("WARNING"):
+        assert extract_markers(llm, "x") == []
+    assert any("markers.parse_failure" in r.message for r in caplog.records)
+
+
+def test_extract_chunk_parses_fenced_reply():
+    payload = {
+        "triples": [{"subject": "service", "predicate": "uses",
+                     "object": "postgres", "polarity": 1}],
+        "markers": [{"kind": "preference", "statement": "user prefers uv"}],
+    }
+    llm = StubLLMClient(default=f"```json\n{json.dumps(payload)}\n```")
+    result = extract_chunk(llm, "x")
+    assert [t.object for t in result.triples] == ["postgres"]
+    assert [m.kind for m in result.markers] == ["preference"]
+
+
+def test_extract_chunk_refusal_still_yields_empty_result(caplog):
+    llm = StubLLMClient(default="Sorry, no JSON for you.")
+    with caplog.at_level("WARNING"):
+        result = extract_chunk(llm, "x")
+    assert result.triples == [] and result.markers == []
+    assert result.entity_type_hints == {} and result.entity_property_hints == {}
+    assert any("chunk_extraction.parse_failure" in r.message for r in caplog.records)
+
+
+# --- wrong SHAPE, as distinct from unparseable ------------------------------
+
+
+def test_markers_wrong_shape_is_empty_and_audible(caplog):
+    """Valid JSON, wrong shape. markers_from_list() already absorbed this into
+    [], which is the behavior we want — but silence made a dropped extraction
+    look identical to "this chunk had no markers", and ingest is one-shot."""
+    llm = StubLLMClient(default=json.dumps({"markers": "none found"}))
+    with caplog.at_level("WARNING"):
+        assert extract_markers(llm, "x") == []
+    assert any("markers.shape_failure" in r.message for r in caplog.records)
+
+
+def test_triples_wrong_shape_is_empty_and_audible(caplog):
+    llm = StubLLMClient(default=json.dumps({"error": "no triples"}))
+    with caplog.at_level("WARNING"):
+        assert extract_triples(llm, "x") == ([], {}, {})
+    assert sum("triples.shape_failure" in r.message for r in caplog.records) == 1
+
+
+def test_extract_chunk_wrong_shape_is_empty_and_audible(caplog):
+    llm = StubLLMClient(default=json.dumps(["not", "an", "object"]))
+    with caplog.at_level("WARNING"):
+        result = extract_chunk(llm, "x")
+    assert result.triples == [] and result.markers == []
+    assert any("chunk_extraction.shape_failure" in r.message for r in caplog.records)
+
+
+def test_extract_chunk_stays_quiet_on_the_stub_empty_array(caplog):
+    """`[]` is StubLLMClient's documented default and a routine "nothing here".
+    Warning on it would fire on every stub-configured call — the no-LLM default
+    this project ships — and drown the real signal."""
+    llm = StubLLMClient(default="[]")
+    with caplog.at_level("WARNING"):
+        result = extract_chunk(llm, "x")
+    assert result.triples == [] and result.markers == []
+    assert not any("shape_failure" in r.message for r in caplog.records)

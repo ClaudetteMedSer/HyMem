@@ -232,3 +232,67 @@ def test_augment_uses_rerank_top_k_as_candidate_pool(hy_with_embed):
     marker_count = sum(1 for line in user.splitlines() if line.startswith("[") and "]" in line)
     assert marker_count > 3
     assert marker_count <= 10
+
+
+# --- fenced replies (dream 1013) -------------------------------------------
+
+
+def test_llm_rerank_parses_fenced_ratings():
+    """The rerank call sets response_format="json"; dream 1013 proved a
+    provider will fence the reply anyway. Recovery here is pure string work —
+    no extra request, so augment()'s retry-free hot path stays retry-free."""
+    candidates = [
+        _Hit(text="completely irrelevant blue elephant trivia"),
+        _Hit(text="how to deploy api to staging via docker"),
+    ]
+    fenced = "```json\n" + json.dumps({"ratings": [
+        {"index": 0, "relevance": 1},
+        {"index": 1, "relevance": 5},
+    ]}) + "\n```"
+    out = llm_rerank("how do I deploy?", candidates, StubLLMClient(default=fenced), top_k=2)
+    assert "deploy" in out[0].text
+    assert out[0].score_kind == "reranked"
+
+
+def test_llm_rerank_refusal_returns_passthrough(caplog):
+    """An unparseable reply keeps the documented passthrough (input order,
+    truncated to top_k, score_kind untouched) — leniency must not invent
+    ratings — and the drop is now audible."""
+    candidates = [_Hit(text="a"), _Hit(text="b"), _Hit(text="c")]
+    llm = StubLLMClient(default="I'm sorry, I can't rate these.")
+    with caplog.at_level("WARNING"):
+        out = llm_rerank("q", candidates, llm, top_k=2)
+    assert [h.text for h in out] == ["a", "b"]
+    assert all(h.score_kind == "rrf" for h in out)
+    assert any("rerank.parse_failure" in r.message for r in caplog.records)
+
+
+def test_llm_rerank_parses_a_fenced_BARE_array():
+    """The prompt asks for {"ratings": [...]} but this function deliberately
+    accepts a bare array too (models without strict JSON mode emit one). The
+    recovery has to cover both, or a shape the reranker is otherwise happy to
+    consume gets dropped purely because the model fenced it."""
+    candidates = [
+        _Hit(text="completely irrelevant blue elephant trivia"),
+        _Hit(text="how to deploy api to staging via docker"),
+    ]
+    fenced = "```json\n" + json.dumps([
+        {"index": 0, "relevance": 1},
+        {"index": 1, "relevance": 5},
+    ]) + "\n```"
+    out = llm_rerank("how do I deploy?", candidates, StubLLMClient(default=fenced), top_k=2)
+    assert "deploy" in out[0].text
+    assert out[0].score_kind == "reranked"
+
+
+def test_llm_rerank_wrong_shape_is_passthrough_and_audible(caplog):
+    """Valid JSON of the wrong shape. Downstream this is indistinguishable
+    from "nothing was rated relevant" — candidates come back in upstream order
+    either way — so it needs its own log line to be diagnosable."""
+    candidates = [_Hit(text="a"), _Hit(text="b")]
+    llm = StubLLMClient(default=json.dumps({"verdict": "all equally good"}))
+    with caplog.at_level("WARNING"):
+        out = llm_rerank("q", candidates, llm, top_k=2)
+    assert [h.text for h in out] == ["a", "b"]
+    assert all(h.score_kind == "rrf" for h in out)
+    assert any("rerank.shape_failure" in r.message for r in caplog.records)

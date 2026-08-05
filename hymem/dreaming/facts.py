@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 
 from hymem.config import HyMemConfig
 from hymem.dreaming.canonicalize import normalize
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import FACTS_SYSTEM, FACTS_USER_TEMPLATE
 
@@ -180,16 +181,9 @@ def validate_fact_items(raw: object, *, max_items: int) -> list[dict] | None:
     the probe (scoring verbatim faithfulness) deliberately did not do.
     """
     if isinstance(raw, str):
-        text = raw.strip()
         # Tolerate a fenced or prose-wrapped array — the same leniency the
-        # dreaming parsers apply, no more.
-        bracket_start, bracket_end = text.find("["), text.rfind("]")
-        if bracket_start == -1 or bracket_end <= bracket_start:
-            return None
-        try:
-            raw = json.loads(text[bracket_start : bracket_end + 1])
-        except json.JSONDecodeError:
-            return None
+        # dreaming parsers apply, no more: one shared helper, so that stays true.
+        raw = loads_lenient(raw, expect="array")
     if not isinstance(raw, list):
         return None
 

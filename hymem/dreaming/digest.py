@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -8,6 +7,7 @@ from dataclasses import dataclass
 from hymem.dreaming.episodes import EpisodesExtraction, validate_episode_items
 from hymem.dreaming.procedures import ProceduresExtraction, validate_procedure_items
 from hymem.dreaming.summary import clean_summary
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import SESSION_DIGEST_SYSTEM, SESSION_DIGEST_USER_TEMPLATE
 
@@ -110,14 +110,25 @@ def extract_session_digest(
     )
     raw = llm.complete(request)
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+    # SESSION_DIGEST_SYSTEM asks for a top-level JSON object; fences/prose
+    # around it are tolerated (dream 1013 — json_object mode is a request, not
+    # a contract).
+    data = loads_lenient(raw, expect="object")
+    if data is None:
+        log.warning("digest.parse_failure session_id=%s raw_len=%d",
+                    session_id, len(raw) if isinstance(raw, str) else -1)
         return _empty()
 
     # A bare array (e.g. a stub LLM's "[]" default) or any non-object payload
     # yields an empty digest rather than crashing.
     if not isinstance(data, dict):
+        # An empty array is that documented stub default and a routine "nothing
+        # here", so it stays quiet. Any OTHER shape is a real reply we dropped;
+        # _empty() holds the watermark, so a persistent one re-sends this slice
+        # every dream and the log is the only way that surfaces.
+        if data != []:
+            log.warning("digest.shape_failure session_id=%s type=%s",
+                        session_id, type(data).__name__)
         return _empty()
 
     episodes = EpisodesExtraction(

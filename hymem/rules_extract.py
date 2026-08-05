@@ -40,6 +40,7 @@ import json
 import logging
 from dataclasses import dataclass, replace
 
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.rules import is_rule_eligible_kind, rule_scope_for_marker
 
@@ -157,11 +158,16 @@ def _parse_batch(raw: str, n: int) -> list[DurabilityJudgment]:
     absent confidence on a crisp verdict defaults high, and the raw statement is
     the fallback rule text downstream."""
     out = [DurabilityJudgment(standing=False, confidence=0.0, rule=None, index=i) for i in range(n)]
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    # DURABILITY_SYSTEM asks for a bare JSON array; fences/prose around it are
+    # tolerated (dream 1013 — json_object mode is a request, not a contract).
+    data = loads_lenient(raw, expect="array")
+    if data is None:
+        log.warning("rules_extract.durability_parse_failure n=%d raw_len=%d",
+                    n, len(raw) if isinstance(raw, str) else -1)
         return out
     if not isinstance(data, list):
+        log.warning("rules_extract.durability_shape_failure n=%d type=%s",
+                    n, type(data).__name__)
         return out
     for pos, item in enumerate(data):
         if not isinstance(item, dict):

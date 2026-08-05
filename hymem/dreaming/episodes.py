@@ -6,6 +6,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import EPISODE_SYSTEM, EPISODE_USER_TEMPLATE
 
@@ -49,9 +50,19 @@ def extract_episodes_for_session(
     )
     raw = llm.complete(request)
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+    # EPISODE_SYSTEM asks for a bare JSON array; fences/prose around it are
+    # tolerated (dream 1013 — json_object mode is a request, not a contract).
+    data = loads_lenient(raw, expect="array")
+    if data is None:
+        log.warning("episodes.parse_failure session_id=%s raw_len=%d",
+                    session_id, len(raw) if isinstance(raw, str) else -1)
+        return EpisodesExtraction()
+    if not isinstance(data, list):
+        # validate_episode_items() returns [] for a non-list, which is the
+        # behavior we want but not the silence — an empty extraction here is
+        # indistinguishable from "the session held no episodes".
+        log.warning("episodes.shape_failure session_id=%s type=%s",
+                    session_id, type(data).__name__)
         return EpisodesExtraction()
 
     return EpisodesExtraction(items=validate_episode_items(data, valid_chunk_ids))

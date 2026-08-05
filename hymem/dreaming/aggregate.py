@@ -38,7 +38,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import sqlite3
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -48,6 +47,7 @@ from hymem.core import db as core_db
 from hymem.core.vectors import decode_vector, encode_vector
 from hymem.dreaming.user_profile import load_profile, render_profile_fact
 from hymem.extraction.embeddings import EmbeddingClient, normalize_text
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import (
     AGGREGATE_SYSTEM,
@@ -582,16 +582,12 @@ def _llm_fuse(
     except Exception:
         log.exception("aggregate.fusion_failure kind=%s stage=call", kind)
         return None
-    try:
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            # Model wrapped the JSON in markdown fences — strip them before parsing.
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-            cleaned = re.sub(r"\s*```\s*$", "", cleaned)
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
+    # Fences/prose around the JSON are tolerated (dream 1013): json_object mode
+    # was already set on this call and the provider fenced it anyway.
+    data = loads_lenient(raw, expect="object")
+    if data is None:
         log.warning("aggregate.fusion_failure kind=%s stage=parse raw_len=%d",
-                    kind, len(raw))
+                    kind, len(raw) if isinstance(raw, str) else -1)
         return None
     if not isinstance(data, dict):
         log.warning("aggregate.fusion_failure kind=%s stage=shape", kind)

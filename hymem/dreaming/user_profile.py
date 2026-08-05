@@ -38,12 +38,12 @@ secrets/PII the LLM lifted from context.
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
 
 from hymem import redaction
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import USER_PROFILE_SYSTEM, USER_PROFILE_USER_TEMPLATE
 
@@ -152,9 +152,19 @@ def extract_user_profile(
     )
     raw = llm.complete(request)
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+    # USER_PROFILE_SYSTEM asks for a bare JSON array; fences/prose around it
+    # are tolerated (dream 1013 — json_object mode is a request, not a
+    # contract).
+    data = loads_lenient(raw, expect="array")
+    if data is None:
+        log.warning("user_profile.parse_failure session_id=%s raw_len=%d",
+                    session_id, len(raw) if isinstance(raw, str) else -1)
+        return ProfileExtraction()
+    if not isinstance(data, list):
+        # validate_profile_items() returns [] for a non-list, which reads as
+        # "nothing profile-worthy in this session" rather than a dropped reply.
+        log.warning("user_profile.shape_failure session_id=%s type=%s",
+                    session_id, type(data).__name__)
         return ProfileExtraction()
     return ProfileExtraction(
         items=validate_profile_items(data, valid_ids, max_items=max_items)

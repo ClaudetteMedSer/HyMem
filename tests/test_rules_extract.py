@@ -265,3 +265,41 @@ def test_route_llm_without_client_is_precision_safe():
 def test_unknown_mode_raises():
     with pytest.raises(ValueError):
         route_decisions([("style", "x")], mode="bogus", llm=None, confidence_min=0.5)
+
+
+# --- fenced replies (dream 1013) -------------------------------------------
+
+
+def test_parse_batch_parses_fenced_reply():
+    """The durability call sets response_format="json"; dream 1013 proved that
+    is a request, not a contract. A fenced batch used to degrade every marker
+    in the slice to non-standing with no log."""
+    raw = "Here is the JSON:\n```json\n" + json.dumps([
+        {"index": 0, "standing": True, "confidence": 0.95, "rule": "Never use MongoDB"},
+        {"index": 1, "standing": False, "confidence": 0.1, "rule": None},
+    ]) + "\n```"
+    out = _parse_batch(raw, 2)
+    assert out[0].standing is True and out[0].rule == "Never use MongoDB"
+    assert out[1].standing is False
+
+
+def test_parse_batch_refusal_keeps_nonrouting_default(caplog):
+    """An unparseable reply must still yield the precision-safe default for
+    every slot — garbage never mints a rule — now with a warning."""
+    with caplog.at_level("WARNING"):
+        out = _parse_batch("I'm sorry, I can't classify these.", 3)
+    assert len(out) == 3
+    assert all(not j.standing and j.confidence == 0.0 and j.rule is None for j in out)
+    assert any("rules_extract.durability_parse_failure" in r.message for r in caplog.records)
+
+
+def test_parse_batch_wrong_shape_keeps_nonrouting_default(caplog):
+    """Valid JSON of the wrong shape degrades every slot in the batch to
+    non-standing, exactly as a refusal does — so it needs to be as visible."""
+    with caplog.at_level("WARNING"):
+        out = _parse_batch(json.dumps({"verdict": "none are standing"}), 3)
+    assert len(out) == 3
+    assert all(not j.standing and j.confidence == 0.0 and j.rule is None for j in out)
+    assert any(
+        "rules_extract.durability_shape_failure" in r.message for r in caplog.records
+    )

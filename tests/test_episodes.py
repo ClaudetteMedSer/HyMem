@@ -433,3 +433,91 @@ def test_episode_semantic_search_surfaces_topic_match(cfg):
         assert top.score_kind in {"rrf", "vec"}
     finally:
         hy.close()
+
+
+# --- fenced replies (dream 1013) -------------------------------------------
+
+
+_EPISODE_TURNS = [
+    ("assistant", "anything"),
+    ("user", "Long enough user turn to clear the salience minimum threshold here."),
+]
+
+
+def _hy_with_chunks(cfg, sid: str) -> HyMem:
+    """HyMem whose `sid` has real chunks, ready for a direct extract call."""
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    _seed_session_with_chunks(hy, sid, _EPISODE_TURNS)
+    hy.dream()
+    return hy
+
+
+def test_extract_episodes_parses_fenced_reply(cfg):
+    """The episode call sets response_format="json"; dream 1013 proved a
+    provider will fence the reply anyway. That used to be a silent, permanent
+    drop — the one-shot ingest path has nothing that retries it."""
+    sid = "s_fenced_ep"
+    hy = _hy_with_chunks(cfg, sid)
+    try:
+        fenced = (
+            "Here is the JSON:\n```json\n"
+            + json.dumps([{
+                "title": "Salience threshold chat",
+                "summary": "The user said something long enough to be chunked.",
+                "outcome": "informational",
+                "chunk_ids": [],
+            }])
+            + "\n```"
+        )
+        hy.set_llm(StubLLMClient(
+            fixtures={"identify distinct episodes": fenced}, default="[]",
+        ))
+        extraction = extract_episodes_for_session(hy.conn, sid, hy._llm)
+        assert extraction is not None
+        assert [i["title"] for i in extraction.items] == ["Salience threshold chat"]
+    finally:
+        hy.close()
+
+
+def test_extract_episodes_refusal_yields_empty_extraction(cfg, caplog):
+    """An unparseable reply keeps the documented empty EpisodesExtraction —
+    leniency must not fabricate episodes out of a refusal — but the drop is
+    now audible instead of silent."""
+    sid = "s_refusal_ep"
+    hy = _hy_with_chunks(cfg, sid)
+    try:
+        hy.set_llm(StubLLMClient(
+            fixtures={"identify distinct episodes": "I'm sorry, I can't help."},
+            default="[]",
+        ))
+        with caplog.at_level("WARNING"):
+            extraction = extract_episodes_for_session(hy.conn, sid, hy._llm)
+        assert extraction == EpisodesExtraction()
+        assert any(
+            "episodes.parse_failure" in r.message and sid in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        hy.close()
+
+
+def test_extract_episodes_wrong_shape_yields_empty_extraction(cfg, caplog):
+    """validate_episode_items() returns [] for a non-list, so the behavior was
+    already right — but an empty extraction reads as "this session held no
+    episodes", which is exactly what a dropped reply must not look like."""
+    sid = "s_shape_ep"
+    hy = _hy_with_chunks(cfg, sid)
+    try:
+        hy.set_llm(StubLLMClient(
+            fixtures={"identify distinct episodes": '{"episodes": "none"}'},
+            default="[]",
+        ))
+        with caplog.at_level("WARNING"):
+            extraction = extract_episodes_for_session(hy.conn, sid, hy._llm)
+        assert extraction == EpisodesExtraction()
+        assert any(
+            "episodes.shape_failure" in r.message and sid in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        hy.close()

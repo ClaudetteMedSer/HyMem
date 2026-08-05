@@ -718,3 +718,32 @@ def test_validator_tolerates_a_fenced_array():
         max_items=8,
     )
     assert items == [{"text": "Atta shipped it.", "date": None, "entities": ["med_flow"]}]
+
+
+_ONE_FACT = '{"text": "Atta shipped it.", "entities": []}'
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (f"[{_ONE_FACT}]", 1),                                    # bare array
+    (f"```json\n[{_ONE_FACT}]\n```", 1),                      # fenced array
+    (f"Here:\n```json\n[{_ONE_FACT}]\n```\nDone.", 1),        # prose + fence
+    ('{"facts": [%s]}' % _ONE_FACT, 1),                       # bare envelope
+    ('```json\n{"facts": [%s]}\n```' % _ONE_FACT, 1),         # fenced envelope
+    ("I could not extract any facts.", None),                 # refusal
+])
+def test_validator_shape_table(raw, expected):
+    # The envelope rows are the point: this call sets response_format="json"
+    # (-> json_object) while FACTS_SYSTEM asks for a bare array, so
+    # {"facts": [...]} is a shape the provider will genuinely emit. Rejecting
+    # it returns None -> parse_failed -> the watermark holds -> the SAME slice
+    # is re-extracted on every subsequent dream: an unbounded paid-for loop
+    # that stores nothing. Bare and fenced must also agree exactly.
+    items = facts_mod.validate_fact_items(raw, max_items=8)
+    assert (None if items is None else len(items)) == expected
+
+
+def test_validator_rejects_an_ambiguous_envelope():
+    # Two lists = no single candidate. A wrong guess would silently store the
+    # wrong half, which is worse than the retry.
+    assert facts_mod.validate_fact_items(
+        '{"facts": [%s], "notes": []}' % _ONE_FACT, max_items=8) is None

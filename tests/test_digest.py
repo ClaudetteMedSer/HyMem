@@ -371,3 +371,121 @@ def test_non_object_digest_payload_yields_empty(cfg):
         assert digest.procedures.items == []
     finally:
         hy.close()
+
+
+def test_digest_parses_fenced_reply(cfg):
+    """Dream 1013 verbatim: a complete, valid payload wrapped in ```json
+    fences from a call that already had json_object mode set. It used to be
+    dropped, taking episodes + summary + procedures with it and stalling the
+    watermark for a formatting quirk."""
+    payload = {
+        "episodes": [{"title": "Deploy chat", "summary": "How to ship to staging.",
+                      "chunk_ids": []}],
+        "summary": "A short but valid session summary about deploys.",
+        "procedures": [{"name": "Deploy to staging",
+                        "steps": [{"order": 1, "action": "build the image"}]}],
+    }
+    fenced = "Here is the JSON:\n```json\n" + json.dumps(payload) + "\n```\nHope that helps!"
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_fenced_digest"
+        _seed_session(hy, sid, _TURNS)
+        hy.dream()  # materialize chunks
+        hy.set_llm(StubLLMClient(
+            fixtures={"Return the JSON object now": fenced}, default="[]",
+        ))
+        digest = extract_session_digest(
+            hy.conn, sid, hy._llm,
+            max_tokens=hy.config.dream_digest_max_tokens,
+            max_chars=hy.config.dream_digest_max_chars,
+        )
+        assert digest is not None
+        assert digest.parse_failed is False
+        assert [i["title"] for i in digest.episodes.items] == ["Deploy chat"]
+        assert [i["name"] for i in digest.procedures.items] == ["Deploy to staging"]
+        assert digest.summary == payload["summary"]
+    finally:
+        hy.close()
+
+
+def test_digest_refusal_sets_parse_failed_and_logs(cfg, caplog):
+    """An unparseable reply must still take the `_empty()` contract —
+    parse_failed=True, covered_message_id=None so the watermark does not
+    advance — and must now say so in the log."""
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_refusal_digest"
+        _seed_session(hy, sid, _TURNS)
+        hy.dream()
+        hy.set_llm(StubLLMClient(
+            fixtures={"Return the JSON object now": "I'm sorry, I can't help with that."},
+            default="[]",
+        ))
+        with caplog.at_level("WARNING"):
+            digest = extract_session_digest(
+                hy.conn, sid, hy._llm,
+                max_tokens=hy.config.dream_digest_max_tokens,
+                max_chars=hy.config.dream_digest_max_chars,
+            )
+        assert digest is not None
+        assert digest.parse_failed is True
+        assert digest.covered_message_id is None
+        assert digest.episodes.items == [] and digest.procedures.items == []
+        assert digest.summary is None
+        assert any(
+            "digest.parse_failure" in r.message and sid in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        hy.close()
+
+
+def test_digest_wrong_shape_holds_the_watermark_and_is_audible(cfg, caplog):
+    """Valid JSON of the wrong shape. _empty() sets parse_failed, which HOLDS
+    the watermark, so a model that persistently returns this re-sends the same
+    slice every dream forever — the log line is the only way that surfaces."""
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_shape_digest"
+        _seed_session(hy, sid, _TURNS)
+        hy.dream()
+        hy.set_llm(StubLLMClient(
+            fixtures={"Return the JSON object now": json.dumps(["not", "an", "object"])},
+            default="[]",
+        ))
+        with caplog.at_level("WARNING"):
+            digest = extract_session_digest(
+                hy.conn, sid, hy._llm,
+                max_tokens=hy.config.dream_digest_max_tokens,
+                max_chars=hy.config.dream_digest_max_chars,
+            )
+        assert digest.parse_failed is True
+        assert digest.covered_message_id is None
+        assert any(
+            "digest.shape_failure" in r.message and sid in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        hy.close()
+
+
+def test_digest_stays_quiet_on_the_stub_empty_array(cfg, caplog):
+    """`[]` is StubLLMClient's documented default and a routine "nothing here".
+    Warning on it would fire on every stub-configured dream — the no-LLM
+    default this project ships — and drown the real signal."""
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    try:
+        sid = "s_stub_digest"
+        _seed_session(hy, sid, _TURNS)
+        hy.dream()
+        hy.set_llm(StubLLMClient(default="[]"))
+        with caplog.at_level("WARNING"):
+            caplog.clear()  # ignore anything the dream above logged
+            extract_session_digest(
+                hy.conn, sid, hy._llm,
+                max_tokens=hy.config.dream_digest_max_tokens,
+                max_chars=hy.config.dream_digest_max_chars,
+            )
+        assert not any("shape_failure" in r.message for r in caplog.records)
+    finally:
+        hy.close()
