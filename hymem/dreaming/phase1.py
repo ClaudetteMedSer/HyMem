@@ -130,6 +130,51 @@ def prepare_dedup_vectors(
     return dict(zip(texts, vectors))
 
 
+def _record_failed_attempt(
+    conn: sqlite3.Connection,
+    chunk: Chunk,
+    *,
+    prompt_version: str,
+    cfg: HyMemConfig | None,
+) -> None:
+    """Count a held failure, and give up once the bound is reached.
+
+    The chunk stays unmarked (and so retried) until `attempts` reaches
+    `chunk_extraction_max_attempts`, at which point it is marked done so it
+    stops consuming a dream_budget slot on every cycle. Giving up is logged at
+    WARNING: it is a real content loss, and the whole point of the held-retry
+    change is that losses must be audible rather than silent. `max_attempts=0`
+    disables the bound and retries forever.
+    """
+    row = conn.execute(
+        "SELECT attempts FROM chunk_extraction_attempts "
+        "WHERE chunk_id = ? AND prompt_version = ?",
+        (chunk.id, prompt_version),
+    ).fetchone()
+    attempts = (row[0] if row else 0) + 1
+    conn.execute(
+        """INSERT INTO chunk_extraction_attempts(chunk_id, prompt_version, attempts,
+                                                 last_failure_at)
+           VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(chunk_id, prompt_version)
+           DO UPDATE SET attempts = excluded.attempts,
+                         last_failure_at = excluded.last_failure_at""",
+        (chunk.id, prompt_version, attempts),
+    )
+
+    max_attempts = cfg.chunk_extraction_max_attempts if cfg is not None else 0
+    if max_attempts and attempts >= max_attempts:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_chunks(chunk_id, prompt_version) VALUES (?, ?)",
+            (chunk.id, prompt_version),
+        )
+        log.warning(
+            "phase1.extraction_abandoned chunk_id=%s attempts=%d "
+            "action=marked_done content_lost=1",
+            chunk.id, attempts,
+        )
+
+
 def persist_chunk_results(
     conn: sqlite3.Connection,
     chunk: Chunk,
@@ -208,9 +253,20 @@ def persist_chunk_results(
             [(chunk.id, e) for e in mentioned],
         )
     for m in extraction.markers:
+        # Write idempotence: re-extracting a chunk re-attaches its markers
+        # without duplicating them, the way UNIQUE(edge_id, chunk_id, polarity)
+        # already protects kg_evidence. Enforced here rather than by a unique
+        # index because deduping an existing store to build that index is not
+        # legacy-safe (see migration 028). Dreams hold a lock, so the
+        # check-then-insert is not racing another writer.
         conn.execute(
-            "INSERT INTO behavioral_markers(kind, statement, chunk_id) VALUES (?, ?, ?)",
-            (m.kind, m.statement, chunk.id),
+            """INSERT INTO behavioral_markers(kind, statement, chunk_id)
+               SELECT ?, ?, ?
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM behavioral_markers
+                   WHERE chunk_id = ? AND kind = ? AND statement = ?
+               )""",
+            (m.kind, m.statement, chunk.id, chunk.id, m.kind, m.statement),
         )
 
     # A FAILED extraction is never marked done. `processed_chunks` is the
@@ -221,9 +277,17 @@ def persist_chunk_results(
     # Holding the mark instead retries on the next dream, which is what the
     # digest (v24 watermark), facts (v26 watermark) and fusion paths all do.
     # A clean parse that yielded nothing IS marked: that is the real floor.
-    if not extraction.failed:
+    if extraction.failed:
+        _record_failed_attempt(conn, chunk, prompt_version=prompt_version, cfg=cfg)
+    else:
         conn.execute(
             "INSERT OR IGNORE INTO processed_chunks(chunk_id, prompt_version) VALUES (?, ?)",
+            (chunk.id, prompt_version),
+        )
+        # Consecutive-failure count, so a chunk that heals starts fresh.
+        conn.execute(
+            "DELETE FROM chunk_extraction_attempts "
+            "WHERE chunk_id = ? AND prompt_version = ?",
             (chunk.id, prompt_version),
         )
     log.debug(

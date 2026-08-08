@@ -183,6 +183,18 @@ CREATE TABLE IF NOT EXISTS processed_chunks (
     PRIMARY KEY (chunk_id, prompt_version)
 );
 
+-- Consecutive failed extraction attempts per chunk (v28). A failed extraction
+-- is HELD (no processed_chunks row) and retried next dream; this bounds that
+-- retry so a permanently-broken chunk cannot consume a dream_budget slot
+-- forever. Cleared on success, so the count is consecutive failures.
+CREATE TABLE IF NOT EXISTS chunk_extraction_attempts (
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    prompt_version TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_failure_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chunk_id, prompt_version)
+);
+
 -- Entity canonicalization. surface forms map to a canonical id.
 CREATE TABLE IF NOT EXISTS entity_aliases (
     alias TEXT PRIMARY KEY,

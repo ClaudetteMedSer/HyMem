@@ -497,6 +497,14 @@ class HyMemConfig:
     non-salience-marked chunks (newest first) per cycle. Guarantees every chunk
     eventually flows through extraction even if it didn't trip the regexes."""
 
+    chunk_extraction_max_attempts: int = 3
+    """Consecutive failed extractions before a chunk is given up on and marked
+    done anyway. A failed extraction is held for retry rather than marked, and
+    the runner spends a budget slot on a chunk BEFORE knowing whether it will
+    fail — so without a bound, a permanently-broken chunk consumes one of
+    `dream_budget`'s slots on every dream forever, starving new chunks. Giving
+    up logs at WARNING with the attempt count; set to 0 to retry indefinitely."""
+
     dream_digest_max_tokens: int = 3072
     """max_tokens for the batched per-session digest call (episodes + summary +
     procedures in one JSON object). Larger than the 1024 LLMRequest default

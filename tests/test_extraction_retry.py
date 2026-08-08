@@ -18,6 +18,7 @@ because that is a real empty and re-reading it forever would burn budget.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from hymem import HyMem
 from hymem.core import db as core_db
@@ -26,6 +27,7 @@ from hymem.dreaming.chunks import Chunk
 from hymem.dreaming.phase1 import ChunkExtraction
 from hymem.extraction.chunk import extract_chunk
 from hymem.extraction.llm import StubLLMClient
+from hymem.extraction.markers import Marker
 
 
 # --- the failed flag itself -------------------------------------------------
@@ -144,6 +146,119 @@ def test_held_chunk_is_re_extracted_on_the_next_dream(cfg):
 
         _persist(hy, chunk, second)
         assert _marked(hy, chunk.id), "a healed chunk is marked done"
+    finally:
+        hy.close()
+
+
+# --- the bound: held retries are finite (v28) -------------------------------
+
+
+def _attempts(hy: HyMem, chunk_id: str) -> int:
+    row = hy.conn.execute(
+        "SELECT attempts FROM chunk_extraction_attempts "
+        "WHERE chunk_id = ? AND prompt_version = ?",
+        (chunk_id, hy.config.prompt_version),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def test_failures_accrue_and_chunk_stays_held_below_the_bound(cfg):
+    hy = HyMem(replace(cfg, chunk_extraction_max_attempts=3))
+    try:
+        chunk = _seed_chunk(hy)
+        for expected in (1, 2):
+            _persist(hy, chunk, ChunkExtraction(triples=[], markers=[], failed=True))
+            assert _attempts(hy, chunk.id) == expected
+            assert not _marked(hy, chunk.id)
+    finally:
+        hy.close()
+
+
+def test_chunk_is_abandoned_at_the_bound(cfg, caplog):
+    """The budget tax has to terminate: the runner spends a slot on a chunk
+    before knowing it will fail, so an unbounded hold starves new chunks."""
+    hy = HyMem(replace(cfg, chunk_extraction_max_attempts=2))
+    try:
+        chunk = _seed_chunk(hy)
+        _persist(hy, chunk, ChunkExtraction(triples=[], markers=[], failed=True))
+        assert not _marked(hy, chunk.id)
+
+        with caplog.at_level("WARNING"):
+            _persist(hy, chunk, ChunkExtraction(triples=[], markers=[], failed=True))
+        assert _marked(hy, chunk.id), "must stop consuming a budget slot"
+        assert any(
+            "phase1.extraction_abandoned" in r.message for r in caplog.records
+        ), "giving up is a real content loss and must be audible"
+    finally:
+        hy.close()
+
+
+def test_success_clears_the_attempt_count(cfg):
+    """Consecutive failures, not lifetime — a chunk that heals starts fresh."""
+    hy = HyMem(replace(cfg, chunk_extraction_max_attempts=3))
+    try:
+        chunk = _seed_chunk(hy)
+        _persist(hy, chunk, ChunkExtraction(triples=[], markers=[], failed=True))
+        assert _attempts(hy, chunk.id) == 1
+        _persist(hy, chunk, ChunkExtraction(triples=[], markers=[], failed=False))
+        assert _attempts(hy, chunk.id) == 0
+        assert _marked(hy, chunk.id)
+    finally:
+        hy.close()
+
+
+def test_zero_max_attempts_retries_forever(cfg):
+    hy = HyMem(replace(cfg, chunk_extraction_max_attempts=0))
+    try:
+        chunk = _seed_chunk(hy)
+        for _ in range(5):
+            _persist(hy, chunk, ChunkExtraction(triples=[], markers=[], failed=True))
+        assert _attempts(hy, chunk.id) == 5
+        assert not _marked(hy, chunk.id)
+    finally:
+        hy.close()
+
+
+# --- marker write idempotence (what makes OR-semantics safe) ----------------
+
+
+def test_re_extracting_a_chunk_does_not_duplicate_its_markers(cfg):
+    """kg_evidence has UNIQUE(edge_id, chunk_id, polarity); markers had no
+    equivalent, and that asymmetry is the only reason a split-merge needed
+    AND-semantics (one good half marks the whole chunk done, silently
+    discarding the failed half). With the write idempotent, re-extracting the
+    good half is free and the content-losing tradeoff is unnecessary."""
+    hy = HyMem(cfg)
+    try:
+        chunk = _seed_chunk(hy)
+        marker = Marker(kind="preference", statement="prefers short answers")
+        for _ in range(3):
+            _persist(hy, chunk, ChunkExtraction(triples=[], markers=[marker]))
+        count = hy.conn.execute(
+            "SELECT COUNT(*) FROM behavioral_markers WHERE chunk_id = ?",
+            (chunk.id,),
+        ).fetchone()[0]
+        assert count == 1
+    finally:
+        hy.close()
+
+
+def test_distinct_markers_on_one_chunk_all_persist(cfg):
+    """The guard keys on (chunk_id, kind, statement) — it must not collapse
+    genuinely different markers that happen to share a chunk."""
+    hy = HyMem(cfg)
+    try:
+        chunk = _seed_chunk(hy)
+        _persist(hy, chunk, ChunkExtraction(triples=[], markers=[
+            Marker(kind="preference", statement="prefers short answers"),
+            Marker(kind="preference", statement="prefers python"),
+            Marker(kind="rejection", statement="prefers short answers"),
+        ]))
+        count = hy.conn.execute(
+            "SELECT COUNT(*) FROM behavioral_markers WHERE chunk_id = ?",
+            (chunk.id,),
+        ).fetchone()[0]
+        assert count == 3
     finally:
         hy.close()
 
