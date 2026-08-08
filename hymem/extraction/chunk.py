@@ -86,6 +86,22 @@ def extract_chunk(
             return ChunkResult(failed=True)
         return ChunkResult()
 
+    # MEASURE-ONLY (pending flip): a dict carrying NEITHER key is never a
+    # compliant reply — the prompt asks for both, and a chunk that genuinely
+    # holds nothing comes back as {"triples": [], "markers": []}, which is the
+    # real empty and stays quiet here. Neither-key is a wrong-schema reply, a
+    # JSON-wrapped refusal, or a bare {} — always a lost extraction, i.e. the
+    # same permanent-hole class parse/shape failures used to be. ONE key is
+    # benign (a model that found triples and omitted an empty markers array)
+    # and must not trip this.
+    #
+    # It is logged rather than flagged because the rate is unmeasured, and
+    # turning on a second unknown-rate retry class while the re-extraction
+    # queue drains would mix its abandonment counts into that verdict. Flip to
+    # `return ChunkResult(failed=True)` once the rate is read off a few dreams.
+    if "triples" not in data and "markers" not in data:
+        log.warning("chunk_extraction.missing_keys keys=%d", len(data))
+
     triples_raw = data.get("triples", [])
     markers_raw = data.get("markers", [])
     return ChunkResult(

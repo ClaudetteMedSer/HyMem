@@ -58,6 +58,42 @@ def test_stub_empty_array_is_not_failed():
     assert extract_chunk(StubLLMClient(default="[]"), "x").failed is False
 
 
+def test_missing_both_keys_is_audible_but_not_yet_failed(caplog):
+    """Candidate third hole class, measure-only. A dict with neither key is
+    never compliant, but the rate is unmeasured — so it is logged now and
+    flipped to failed once the re-extraction queue's verdict is clear."""
+    llm = StubLLMClient(default=json.dumps({"other": 1}))
+    with caplog.at_level("WARNING"):
+        result = extract_chunk(llm, "x")
+    assert result.triples == [] and result.markers == []
+    assert result.failed is False, "flip deferred: see chunk.py"
+    assert any("chunk_extraction.missing_keys" in r.message for r in caplog.records)
+
+
+def test_one_key_present_is_not_flagged(caplog):
+    """A model that found triples and omitted an empty markers array is
+    behaving normally — this must not trip the missing-keys signal."""
+    llm = StubLLMClient(default=json.dumps({
+        "triples": [{"subject": "app", "predicate": "uses", "object": "uv"}],
+    }))
+    with caplog.at_level("WARNING"):
+        result = extract_chunk(llm, "x")
+    assert [t.predicate for t in result.triples] == ["uses"]
+    assert not any(
+        "chunk_extraction.missing_keys" in r.message for r in caplog.records
+    )
+
+
+def test_clean_empty_object_is_not_flagged_missing_keys(caplog):
+    """Both keys present but empty is the real floor, and must stay silent."""
+    llm = StubLLMClient(default=json.dumps({"triples": [], "markers": []}))
+    with caplog.at_level("WARNING"):
+        extract_chunk(llm, "x")
+    assert not any(
+        "chunk_extraction.missing_keys" in r.message for r in caplog.records
+    )
+
+
 # --- the behavior that flag buys: retry vs. permanent hole ------------------
 
 
