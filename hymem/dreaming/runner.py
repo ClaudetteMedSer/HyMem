@@ -180,6 +180,14 @@ def run_dreaming(
         # an earlier chunk in the same cycle. In-memory only; no DB/network I/O.
         in_cycle_edges = phase1.new_in_cycle_pool()
 
+        # Chunks this cycle has already sent to the LLM. The baseline backstop
+        # selects on "no processed_chunks row", which used to exclude a failed
+        # chunk automatically because failures were marked done. Held-for-retry
+        # leaves them unmarked, so without this set the SAME chunk is extracted
+        # twice in one dream — once per tier — doubling its LLM cost and
+        # burning two budget slots and two retry attempts per cycle.
+        attempted_this_cycle: set[str] = set()
+
         # Lease heartbeat (throttled). Refreshes the lock at most once per
         # _LOCK_REFRESH_INTERVAL_SECONDS of wall time. Called per session AND
         # per chunk so a single very heavy session can't let acquired_at age
@@ -267,6 +275,7 @@ def run_dreaming(
                 if already:
                     continue
                 chunks_remaining -= 1
+                attempted_this_cycle.add(chunk.id)
                 try:
                     extraction = phase1.extract_chunk_results(
                         conn, chunk, llm,
@@ -282,13 +291,18 @@ def run_dreaming(
                     # Held, not marked: retried on the next dream. Audible so a
                     # chunk that fails forever is greppable rather than silent
                     # (the stuck-fusion lesson, applied to ingest).
+                    #
+                    # This must NOT skip persist. The attempt bookkeeping that
+                    # bounds the retry lives there, so short-circuiting here
+                    # left the v28 bound unreachable in production while the
+                    # tests — which call persist directly — still passed.
                     report.chunk_extraction_failures += 1
                     log.warning(
                         "phase1.extraction_failed chunk_id=%s tier=salience "
                         "action=held_for_retry", chunk.id,
                     )
-                    continue
-                had_new_chunk_work = True
+                else:
+                    had_new_chunk_work = True
                 # Embed dedup candidates OUTSIDE the write lock; best-effort so
                 # a flaky embedder degrades to "no dedup", never aborts the dream.
                 dedup_vectors = _prepare_dedup_vectors(
@@ -330,8 +344,13 @@ def run_dreaming(
                     for chunk in baseline:
                         if chunks_remaining <= 0:
                             break
+                        if chunk.id in attempted_this_cycle:
+                            # Already sent to the LLM by the salience tier this
+                            # cycle and held for retry — not a second attempt.
+                            continue
                         _heartbeat()
                         chunks_remaining -= 1
+                        attempted_this_cycle.add(chunk.id)
                         try:
                             extraction = phase1.extract_chunk_results(
                                 conn, chunk, llm,
@@ -347,14 +366,15 @@ def run_dreaming(
                         if extraction is None:
                             continue
                         if extraction.failed:
-                            # See the salience-tier call site above.
+                            # See the salience-tier call site above — persist
+                            # still runs, or the retry bound never accrues.
                             report.chunk_extraction_failures += 1
                             log.warning(
                                 "phase1.extraction_failed chunk_id=%s "
                                 "tier=baseline action=held_for_retry", chunk.id,
                             )
-                            continue
-                        had_new_chunk_work = True
+                        else:
+                            had_new_chunk_work = True
                         # Embed dedup candidates OUTSIDE the write lock (see
                         # the salience-tier call site above).
                         dedup_vectors = _prepare_dedup_vectors(

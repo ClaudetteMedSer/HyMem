@@ -299,6 +299,70 @@ def test_distinct_markers_on_one_chunk_all_persist(cfg):
         hy.close()
 
 
+# --- the bound must be reachable from the RUNNER, not just from persist ----
+
+
+def _seed_dreamable_session(hy: HyMem, sid: str = "s_runner") -> str:
+    hy.open_session(sid)
+    hy.log_message(hy_sid := sid, "assistant",
+                   "I'll set up Docker for the local dev environment.")
+    hy.log_message(hy_sid, "user",
+                   "No, we don't use Docker for local dev anymore. We switched "
+                   "to uv and system Python, and I'd rather keep it that way.")
+    hy.close_session(sid)
+    return sid
+
+
+def test_runner_accrues_attempts_and_abandons_at_the_bound(cfg, caplog):
+    """Regression: the bound lived in persist_chunk_results while the runner
+    short-circuited BEFORE persist on extraction.failed, so attempts never
+    accrued in production — every held chunk re-attempted forever, which is the
+    unbounded budget tax v28 exists to stop. The persist-level tests passed the
+    whole time because they call persist directly. This one drives the real
+    dream loop, which is the only path that can catch it.
+    """
+    hy = HyMem(replace(cfg, chunk_extraction_max_attempts=2))
+    try:
+        _seed_dreamable_session(hy)
+        hy.set_llm(StubLLMClient(default="not json at all"))
+
+        hy.dream()
+        rows = hy.conn.execute(
+            "SELECT chunk_id, attempts FROM chunk_extraction_attempts"
+        ).fetchall()
+        assert rows, "a failed extraction must record an attempt via the runner"
+        assert all(r["attempts"] == 1 for r in rows)
+        assert not hy.conn.execute("SELECT 1 FROM processed_chunks").fetchone()
+
+        with caplog.at_level("WARNING"):
+            hy.dream()
+        assert any(
+            "phase1.extraction_abandoned" in r.message for r in caplog.records
+        ), "the bound must fire from the runner path"
+        assert hy.conn.execute("SELECT 1 FROM processed_chunks").fetchone(), \
+            "abandoned chunks must stop consuming a budget slot"
+    finally:
+        hy.close()
+
+
+def test_runner_holds_a_failed_chunk_without_marking_it(cfg):
+    """The other half of the same path: below the bound, nothing is marked and
+    the chunk stays eligible for the next dream."""
+    hy = HyMem(replace(cfg, chunk_extraction_max_attempts=5))
+    try:
+        _seed_dreamable_session(hy)
+        hy.set_llm(StubLLMClient(default="not json at all"))
+        for expected in (1, 2, 3):
+            hy.dream()
+            attempts = hy.conn.execute(
+                "SELECT MAX(attempts) FROM chunk_extraction_attempts"
+            ).fetchone()[0]
+            assert attempts == expected
+            assert not hy.conn.execute("SELECT 1 FROM processed_chunks").fetchone()
+    finally:
+        hy.close()
+
+
 def test_marked_chunk_is_not_re_extracted(cfg):
     """The one-shot gate still works for successful extractions."""
     hy = HyMem(cfg)
