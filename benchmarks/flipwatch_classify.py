@@ -41,6 +41,24 @@ store that gained no episodes is 100% reuse on a frozen tree — membership
 cannot change, so the cache cannot miss, and the criterion both prior watches
 died on goes untested no matter how long the watch runs.
 
+DEFICIT ATTRIBUTION (2026-08-08, schema v29). The banked criterion has always
+had two halves: reuse >= the bar, AND low runs attributable. Until v29 the
+second half was adjudicated from three coarse signals (fusion_failures,
+input_episodes, blocking), because the per-dream decomposition existed only in
+`aggregate.built` stderr — unreadable for honcho-run dreams, whose stderr goes
+to the gateway pipe. Migration 029 puts `aggregation_level0_missed` and
+`aggregation_leaf_changed` on the row itself, so this script now reads them and
+prints, per row, how much of the rebuild the arrival channel accounts for.
+
+That reporting is INSTRUMENT ONLY: no criterion changed, no label was added,
+and no row is excused by its attribution. The amplification constant A in
+`rebuilt ~ A*level0_missed + root_term + leaf_term` rests on a single dream so
+far (~3.3 at #1158) and an earlier estimate was already retracted; a bound set
+from that would discharge every row it is asked to judge, which is a ceiling
+instrument rather than a discriminator. The ratio distribution is printed so
+the bound can be pre-registered from real dispersion, later, as its own
+decision.
+
 Paste the emitted block into `benchmarks/raptor_digest_plan.md` Stage 3c.
 """
 from __future__ import annotations
@@ -66,7 +84,24 @@ MIN_VERDICT_ROWS = 5
 REFUSION_REUSE_MAX = 10.0
 REFUSION_BUILT_FRACTION = 0.8
 
-COLUMNS = (
+# Stamped into every RESULT block. The third watch ran against a classifier
+# that could not read the v29 columns; a run under this build is a FOURTH
+# watch, and the block has to say so rather than look like a continuation.
+CLASSIFIER_VERSION = "v2 (2026-08-08) — deficit attribution surfaced, gate unchanged"
+
+# `aggregation_leaf_changed` is THREE-state and the two non-numeric states are
+# easy to destroy on the way in. NULL means the leaf-set snapshot was
+# unreadable — aggregate.py writes NULL rather than a counterfeit 0, because
+# `level0_missed = 0` together with `leaf_changed = 0` IS the fixed-point
+# signature. -1 means the digest is disabled, so no leaf term exists at all.
+# A `COALESCE(leaf_changed, 0)` anywhere in a reader manufactures that
+# signature on exactly the rows whose evidence is missing, which is the same
+# counterfeit-fixed-point hazard the 029 migration header warns about, moved
+# to the read side. Nothing below defaults either column.
+LEAF_DIGEST_DISABLED = -1
+
+# v22 columns: present on any store the watch can classify at all.
+BASE_COLUMNS = (
     "id, started_at, "
     "aggregation_nodes_built AS built, "
     "aggregation_nodes_reused AS reused, "
@@ -76,6 +111,16 @@ COLUMNS = (
     "skipped_locked, error"
 )
 
+# v29 columns: read when present, NULL-filled when not, so a pre-029 store
+# still classifies exactly as it did before — just with every row unattributed.
+ATTRIBUTION_COLUMNS = ("aggregation_level0_missed", "aggregation_leaf_changed")
+
+
+def _has_attribution(conn: sqlite3.Connection) -> bool:
+    """Does this store carry the v29 deficit-attribution columns?"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(dream_runs)")}
+    return set(ATTRIBUTION_COLUMNS) <= cols
+
 
 def pull(db: Path, since: str) -> list[dict]:
     """Read the watch window read-only (§0.1). Never opens the store rw."""
@@ -83,20 +128,35 @@ def pull(db: Path, since: str) -> list[dict]:
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
+        attributed = _has_attribution(conn)
+        select = BASE_COLUMNS
+        if attributed:
+            select += (
+                ", aggregation_level0_missed AS level0_missed"
+                ", aggregation_leaf_changed AS leaf_changed"
+            )
         rows = conn.execute(
-            f"SELECT {COLUMNS} FROM dream_runs "
+            f"SELECT {select} FROM dream_runs "
             "WHERE started_at >= ? ORDER BY id",
             (since,),
         ).fetchall()
     except sqlite3.OperationalError as exc:
         sys.exit(
             f"error: {exc}\n"
-            "The attribution columns land in migration 022 (schema v22). A store "
-            "without them predates the 2026-07-12 fixes and cannot be classified."
+            "The base attribution columns land in migration 022 (schema v22). A "
+            "store without them predates the 2026-07-12 fixes and cannot be "
+            "classified."
         )
     finally:
         conn.close()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    if not attributed:
+        # Absent columns are indistinguishable from unwritten ones, and both
+        # mean the same thing to the reader: unattributed.
+        for r in out:
+            r["level0_missed"] = None
+            r["leaf_changed"] = None
+    return out
 
 
 def pull_excluded(db: Path, since: str) -> dict:
@@ -204,6 +264,68 @@ def reuse_pct(row: dict) -> float | None:
     return round(100.0 * row["reused"] / row["built"], 1) if row["built"] else None
 
 
+def attribution(row: dict) -> dict:
+    """Normalize the v29 deficit columns for one row. Instrument only.
+
+    Returns `rebuilt` (built - reused), the two raw columns, a printable leaf
+    state, and `ratio` = rebuilt per level-0 miss — the amplification A that
+    `rebuilt ~ A*level0_missed + root_term + leaf_term` predicts. A is NOT
+    thresholded here; see the module docstring.
+
+    `attr_state` is the three-way read the gate's fifth-cause question needs:
+
+      unattributed  level0_missed is NULL — pre-v29 row, or a store without
+                    the columns. Says nothing either way.
+      zero-miss     level0_missed = 0. No arrival landed in a cluster, so the
+                    arrival channel explains NONE of this row's rebuild. On a
+                    row at or above the bar that is the fixed point; on a row
+                    BELOW it, the explanation has to come from somewhere else.
+      attributed    level0_missed > 0 — `ratio` is meaningful.
+    """
+    l0 = row.get("level0_missed")
+    leaf = row.get("leaf_changed")
+    rebuilt = (row["built"] or 0) - (row["reused"] or 0)
+
+    if leaf is None:
+        leaf_str = "—"          # snapshot unreadable; NOT zero
+    elif leaf == LEAF_DIGEST_DISABLED:
+        leaf_str = "off"        # digest disabled; no leaf term exists
+    else:
+        leaf_str = str(leaf)
+
+    if l0 is None:
+        state, ratio = "unattributed", None
+    elif l0 == 0:
+        state, ratio = "zero-miss", None
+    else:
+        state, ratio = "attributed", round(rebuilt / l0, 1)
+
+    return {
+        "rebuilt": rebuilt,
+        "level0_missed": l0,
+        "leaf_changed": leaf,
+        "leaf_str": leaf_str,
+        "ratio": ratio,
+        "attr_state": state,
+    }
+
+
+def attribution_note(rec: dict) -> str:
+    """The per-row attribution sentence appended to a below-bar verdict row —
+    the reason the v29 columns were added, put where the offender is read."""
+    if rec["attr_state"] == "unattributed":
+        return "UNATTRIBUTED (no v29 columns on this row)"
+    if rec["attr_state"] == "zero-miss":
+        return (
+            f"level0_missed=0 leaf={rec['leaf_str']} — {rec['rebuilt']} rebuilt "
+            "with NO arrival to charge them to"
+        )
+    return (
+        f"level0_missed={rec['level0_missed']} leaf={rec['leaf_str']} "
+        f"rebuilt={rec['rebuilt']} ({rec['ratio']}/miss)"
+    )
+
+
 def classify(rows: list[dict], heal_grace: bool = True) -> list[dict]:
     """Label every row per §0.2. Order matters: earlier labels win."""
     agg = [r for r in rows if r["built"] and not r["skipped_locked"] and not r["error"]]
@@ -216,7 +338,10 @@ def classify(rows: list[dict], heal_grace: bool = True) -> list[dict]:
     out = []
     for row in rows:
         pct = reuse_pct(row)
-        rec = dict(row, reuse_pct=pct, note="")
+        # Attribution is attached to every row so the table, the CSV and the
+        # distribution all read the same normalized fields. It feeds no branch
+        # below: labels are decided exactly as they were for the third watch.
+        rec = dict(row, reuse_pct=pct, note="", **attribution(row))
 
         if row["skipped_locked"]:
             rec["label"] = "no-agg"
@@ -273,10 +398,12 @@ def classify(rows: list[dict], heal_grace: bool = True) -> list[dict]:
             rec["label"] = "quiescent"
 
         # A verdict row below the bar fits none of labels 1-4: a fifth cause
-        # exists, and §0.3 makes that an automatic FAIL.
+        # exists, and §0.3 makes that an automatic FAIL. The attribution rider
+        # does not soften that — it says what the arrival channel accounts for,
+        # so the FAIL is routed rather than merely recorded.
         if rec["label"] in ("append", "quiescent") and pct is not None and pct < REUSE_BAR:
             rec["note"] = (rec["note"] + "; " if rec["note"] else "") + (
-                f"{pct}% < {REUSE_BAR:g}% bar"
+                f"{pct}% < {REUSE_BAR:g}% bar; {attribution_note(rec)}"
             )
 
         prev_failed = row["failures"] > 0
@@ -349,10 +476,121 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
             "unclassifiable."
         )
 
+    # The sharpest thing the v29 columns can say, and the reason they exist:
+    # a below-bar verdict row whose arrival channel is empty. Advisory, not a
+    # criterion — it changes no verdict, it tells a FAIL where to go next.
+    orphaned = [r for r in below if r["attr_state"] == "zero-miss"]
+    if orphaned:
+        advisories.append(
+            f"**rebuild with no arrival**: {len(orphaned)} below-bar verdict row(s)"
+            + ids(orphaned)
+            + " — each carries `level0_missed = 0`, so no episode landed in a "
+            "cluster and the arrival channel accounts for NONE of the rebuild. "
+            "The remaining honest "
+            "explanations are the root's conditional facts_hash re-key and leftover "
+            "displacement; if neither fits, this is the fifth cause §0.3 is looking "
+            "for, and these rows are where to open it."
+        )
+    unattributed_below = [r for r in below if r["attr_state"] == "unattributed"]
+    if unattributed_below:
+        advisories.append(
+            f"**unattributed offenders**: {len(unattributed_below)} below-bar verdict "
+            f"row(s){ids(unattributed_below)} predate schema v29 and carry no "
+            "attribution. They can still fail the gate, but they cannot be routed — "
+            "prefer a window whose rows were all written after 029 before reading a "
+            "FAIL as a fusion-path defect."
+        )
+
     if len(verdict_rows) < MIN_VERDICT_ROWS and not (below or blocking or unclassifiable):
         return "INSUFFICIENT", checks, advisories
     passed = not below and not blocking and not unclassifiable and len(failures) <= MAX_FAILURE_ROWS
     return ("PASS" if passed else "FAIL"), checks, advisories
+
+
+def render_attribution(rows: list[dict]) -> list[str]:
+    """The deficit-attribution read: a distribution, not a judgement.
+
+    Only aggregation rows are summarized — a lock-skip or a zero-built row has
+    no deficit to attribute, and folding them in would dilute the very
+    dispersion the future bound has to be set from.
+    """
+    agg = [r for r in rows if r["label"] != "no-agg"]
+    # The ratio distribution is read ONLY off verdict rows. A refusion or a
+    # fusion-failure row also has a level0_missed and therefore also has a
+    # ratio, but its rebuild is charged to a salt bump or to failed fusions —
+    # mixing them in inflates the spread with rebuilds the arrival channel
+    # never caused, and the bound this distribution will eventually set applies
+    # to append/quiescent rows only.
+    verdict = [r for r in agg if r["label"] in ("append", "quiescent")]
+    other = [r for r in agg if r["label"] not in ("append", "quiescent")
+             and r["attr_state"] == "attributed"]
+    attributed = [r for r in verdict if r["attr_state"] == "attributed"]
+    zero_miss = [r for r in verdict if r["attr_state"] == "zero-miss"]
+    unattributed = [r for r in verdict if r["attr_state"] == "unattributed"]
+
+    lines = ["**Deficit attribution (schema v29 columns — instrument only)**", ""]
+    if not agg:
+        return lines + ["- no aggregation rows in the window.", ""]
+    lines += [
+        f"Verdict rows only ({len(verdict)} append + quiescent); excluded rows are "
+        "summarized at the end.",
+        "",
+    ]
+
+    if attributed:
+        ratios = sorted(r["ratio"] for r in attributed)
+        median = ratios[len(ratios) // 2]
+        lines.append(
+            f"- attributed (`level0_missed > 0`): {len(attributed)} row(s) · "
+            f"rebuilt-per-miss min {ratios[0]} · median {median} · max {ratios[-1]}"
+        )
+        lines.append(
+            "  - ratios: " + ", ".join(
+                f"#{r['id']} {r['ratio']}" for r in attributed[:12]
+            ) + (f", +{len(attributed) - 12} more" if len(attributed) > 12 else "")
+        )
+    else:
+        lines.append(
+            "- attributed (`level0_missed > 0`): 0 verdict rows — no dream in this "
+            "window had an arrival land in a cluster, so A is unconstrained by it."
+        )
+
+    orphans = [r for r in zero_miss if r["rebuilt"] > 0]
+    lines.append(
+        f"- zero-miss (`level0_missed = 0`): {len(zero_miss)} row(s), of which "
+        f"{len(orphans)} rebuilt anything"
+        + (f" ({', '.join('#' + str(r['id']) for r in orphans[:8])})" if orphans else "")
+    )
+    lines.append(
+        f"- unattributed (column NULL): {len(unattributed)} row(s) — pre-v29 or a "
+        "store without the columns"
+    )
+    leaf_read = sum(1 for r in verdict
+                    if r["leaf_changed"] not in (None, LEAF_DIGEST_DISABLED))
+    leaf_off = sum(1 for r in verdict if r["leaf_changed"] == LEAF_DIGEST_DISABLED)
+    leaf_null = sum(1 for r in verdict if r["leaf_changed"] is None)
+    lines.append(
+        f"- leaf term: {leaf_read} readable · {leaf_off} digest-disabled · "
+        f"{leaf_null} unreadable (NULL is not zero — see `LEAF_DIGEST_DISABLED`)"
+    )
+    if other:
+        lines.append(
+            f"- excluded from the distribution: {len(other)} attributed non-verdict "
+            "row(s) — " + ", ".join(
+                f"#{r['id']} {r['ratio']}/miss (`{r['label']}`)" for r in other[:8]
+            ) + ". Their rebuild is already charged to a salt bump or to failed "
+            "fusions, so their ratio is not a measurement of A."
+        )
+    lines += [
+        "",
+        "No threshold is applied to any of this. The amplification bound that would "
+        "let a below-bar append row be DISCHARGED as arrival-driven is a separate, "
+        "pre-registered decision, and it needs this distribution first: a bound "
+        "picked from today's single-dream estimate of A would excuse every row it "
+        "was asked to judge.",
+        "",
+    ]
+    return lines
 
 
 def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[str],
@@ -366,7 +604,14 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
         "### RESULT — flip-watch classification (G-FLIP)",
         "",
         f"Window: `started_at >= {since}` · store `{db}` (read-only) · "
-        f"{len(rows)} dream_runs rows · generated by `benchmarks/flipwatch_classify.py`.",
+        f"{len(rows)} dream_runs rows · generated by `benchmarks/flipwatch_classify.py` "
+        f"{CLASSIFIER_VERSION}.",
+        "",
+        "**Classifier amended since the third watch.** It now reads the schema v29 "
+        "deficit-attribution columns and reports them per row and in aggregate. The "
+        "five G-FLIP criteria, the labels and their precedence are unchanged, so a "
+        "verdict here is comparable with the earlier blocks — but a run under this "
+        "build is a FOURTH watch, not a continuation of the third.",
         "",
     ]
 
@@ -396,14 +641,18 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
         )
 
     lines += [
-        "| id | started_at | built | reused | reuse% | fail | input_eps | blocking | label | note |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| id | started_at | built | reused | reuse% | fail | input_eps | blocking "
+        "| l0miss | leaf | rebuilt | /miss | label | note |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         pct = "" if r["reuse_pct"] is None else f"{r['reuse_pct']}"
+        l0 = "—" if r["level0_missed"] is None else str(r["level0_missed"])
+        ratio = "" if r["ratio"] is None else f"{r['ratio']}"
         lines.append(
             f"| {r['id']} | {r['started_at']} | {r['built']} | {r['reused']} | {pct} | "
             f"{r['failures']} | {r['input_eps']} | {r['blocking'] or '—'} | "
+            f"{l0} | {r['leaf_str']} | {r['rebuilt']} | {ratio} | "
             f"`{r['label']}` | {r['note']} |"
         )
 
@@ -411,6 +660,10 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
         "",
         "Labels: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())),
         "",
+    ]
+    lines += render_attribution(rows)
+
+    lines += [
         "**Gate G-FLIP**",
         "",
         *checks,
@@ -452,11 +705,15 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
         ]
     elif verdict == "FAIL":
         lines += [
-            "Do NOT flip. Bank this as a third failed-watch RESULT and route by "
+            "Do NOT flip. Bank this as another failed-watch RESULT and route by "
             "label (§0.3): `blocking-flip` -> env parity (sqlite-vec on both trigger "
             "paths); a `failure` streak -> LLM transport/retry work; an "
             "`unclassifiable` row -> reopen the windowing analysis with that row's "
-            "`input_eps`/`built` delta as the starting evidence. Plan C stays blocked.",
+            "`input_eps`/`built` delta as the starting evidence. A below-bar verdict "
+            "row now carries its own attribution in the note column: `level0_missed "
+            "> 0` points at arrival-driven re-keying (read the ratio against the "
+            "distribution above), `level0_missed = 0` at the root/leftover terms or "
+            "at the fifth cause. Plan C stays blocked.",
         ]
     else:
         lines += [
@@ -511,7 +768,8 @@ def main() -> int:
     if args.csv:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         fields = ["id", "started_at", "built", "reused", "reuse_pct", "failures",
-                  "input_eps", "blocking", "skipped_locked", "error", "label", "note"]
+                  "input_eps", "blocking", "level0_missed", "leaf_changed", "rebuilt",
+                  "ratio", "attr_state", "skipped_locked", "error", "label", "note"]
         with args.csv.open("w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
