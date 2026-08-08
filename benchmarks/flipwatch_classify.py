@@ -59,6 +59,25 @@ instrument rather than a discriminator. The ratio distribution is printed so
 the bound can be pre-registered from real dispersion, later, as its own
 decision.
 
+KEYING INTEGRITY (criterion 6, pre-registered 2026-08-09, schema v31). The five
+original criteria all read the reuse RATE, which cannot distinguish a rebuild
+caused by real membership change from one caused by a broken id. Migration 031
+records a structural forecast per dream: `predicted` counts nodes whose (level,
+member set) is absent from the previous tree, `actual` counts nodes whose id
+missed the fusion cache, and the residual is their difference. A positive
+residual counts nodes that kept their exact members and STILL missed the cache
+-- the salt/hash/rowid-shadow class -- and it reads on one dream.
+
+Criterion 6 is `residual == 0` on every aggregation row, excusing at most one
+confirmed deploy-refusion. It has no tolerance by design: the residual is
+structural, not sampled, so there is no band to absorb and any positive value is
+a defect. It was banked BEFORE the first v31 dream wrote a value, so the
+threshold could not be fitted to what the data turned out to look like.
+
+Scope is deliberately wider than the reuse criterion: a defect on a row ABOVE
+the bar is exactly the case the rate cannot see, and criterion 6 blocks the flip
+there regardless of reuse%. Reuse% gates COST; the residual gates CORRECTNESS.
+
 Paste the emitted block into `benchmarks/raptor_digest_plan.md` Stage 3c.
 """
 from __future__ import annotations
@@ -87,7 +106,7 @@ REFUSION_BUILT_FRACTION = 0.8
 # Stamped into every RESULT block. The third watch ran against a classifier
 # that could not read the v29 columns; a run under this build is a FOURTH
 # watch, and the block has to say so rather than look like a continuation.
-CLASSIFIER_VERSION = ("v3 (2026-08-09) — v29 deficit attribution + v31 structural forecast surfaced, gate unchanged")
+CLASSIFIER_VERSION = ("v4 (2026-08-09) — criterion 6 (keying integrity) added; criteria 1-5 unchanged")
 
 # `aggregation_leaf_changed` is THREE-state and the two non-numeric states are
 # easy to destroy on the way in. NULL means the leaf-set snapshot was
@@ -436,6 +455,38 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
         more = f", +{len(rs) - cap} more" if len(rs) > cap else ""
         return f": {shown}{more}{span}"
 
+    # Criterion 6, pre-registered 2026-08-09 BEFORE the first v31 dream wrote a
+    # value — deliberately, so the threshold could not be fitted to observed data.
+    #
+    # There is no tunable here on purpose. `aggregation_keying_residual` counts
+    # nodes that kept their EXACT member set and still missed the fusion cache;
+    # it is a structural quantity, not a sampled one, so there is no churn band
+    # to absorb and no n to out-sample. A tolerance would be a number chosen to
+    # let rows pass, which is the failure the >= 90% bar's history warns about.
+    # Any positive value is a defect.
+    #
+    # Scope is every aggregation row, not just verdict rows: a keying defect on
+    # a row ABOVE the bar is the case the reuse criterion cannot see, and is the
+    # falsifiable prediction the v31 design makes. One deploy-refusion row is
+    # excused (a confirmed salt bump legitimately re-keys a whole tree) — the
+    # same carve-out label 1 already gets, and a SECOND refusion is labelled
+    # `unclassifiable`, so it stays in scope here.
+    agg_rows = [r for r in rows if r["label"] != "no-agg"]
+    keying_offenders = [
+        r for r in agg_rows
+        if (r["residual"] or 0) > 0 and r["label"] != "deploy-refusion"
+    ]
+    # NULL can neither fail nor satisfy the criterion: pre-v31 rows are
+    # unattributed. The criterion is only MET once every verdict row carries a
+    # populated value, so a partly-NULL window reads pending, never pass.
+    residual_pending = [r for r in verdict_rows if r["residual"] is None]
+    negative_residual = [r for r in agg_rows if (r["residual"] or 0) < 0]
+
+    def keying_mark() -> str:
+        if keying_offenders:
+            return "FAIL"
+        return "PENDING" if residual_pending else "PASS"
+
     checks = [
         f"- [{mark(not below)}] every verdict row (append + quiescent) at reuse >= "
         f"{REUSE_BAR:g}% — {len(verdict_rows) - len(below)}/{len(verdict_rows)}"
@@ -448,6 +499,11 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
         f"{len(unclassifiable)}" + ids(unclassifiable),
         f"- [{mark(len(verdict_rows) >= MIN_VERDICT_ROWS)}] sanity floor: >= "
         f"{MIN_VERDICT_ROWS} verdict rows — {len(verdict_rows)}",
+        f"- [{keying_mark()}] keying integrity: zero rows with "
+        f"aggregation_keying_residual > 0 — found {len(keying_offenders)}"
+        + ids(keying_offenders)
+        + (f"; {len(residual_pending)}/{len(verdict_rows)} verdict row(s) still "
+           "unattributed (pre-v31)" if residual_pending else ""),
     ]
 
     advisories = []
@@ -494,6 +550,15 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
             "displacement; if neither fits, this is the fifth cause §0.3 is looking "
             "for, and these rows are where to open it."
         )
+    if negative_residual:
+        advisories.append(
+            f"**negative keying residual**: {len(negative_residual)} row(s)"
+            + ids(negative_residual)
+            + " served a NEW-membership node from cache — a member-set collision "
+            "across levels. Not a criterion-6 failure (the criterion counts "
+            "unexplained REBUILDS), but it means two levels share a member set, "
+            "which makes the level key load-bearing. Worth a look, not a block."
+        )
     keying = [r for r in rows if r["label"] != "no-agg" and (r["residual"] or 0) > 0]
     if keying:
         advisories.append(
@@ -514,9 +579,12 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
             "FAIL as a fusion-path defect."
         )
 
-    if len(verdict_rows) < MIN_VERDICT_ROWS and not (below or blocking or unclassifiable):
+    hard_fail = bool(below or blocking or unclassifiable or keying_offenders)
+    if not hard_fail and (len(verdict_rows) < MIN_VERDICT_ROWS or residual_pending):
+        # Too few rows, or criterion 6 not yet answerable. Both mean "extend the
+        # watch", never "flip" — an unattributed residual is not a clean one.
         return "INSUFFICIENT", checks, advisories
-    passed = not below and not blocking and not unclassifiable and len(failures) <= MAX_FAILURE_ROWS
+    passed = not hard_fail and len(failures) <= MAX_FAILURE_ROWS
     return ("PASS" if passed else "FAIL"), checks, advisories
 
 
@@ -620,11 +688,12 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
         f"{len(rows)} dream_runs rows · generated by `benchmarks/flipwatch_classify.py` "
         f"{CLASSIFIER_VERSION}.",
         "",
-        "**Classifier amended since the third watch.** It now reads the schema v29 "
-        "deficit-attribution columns and reports them per row and in aggregate. The "
-        "five G-FLIP criteria, the labels and their precedence are unchanged, so a "
-        "verdict here is comparable with the earlier blocks — but a run under this "
-        "build is a FOURTH watch, not a continuation of the third.",
+        "**Classifier amended since the third watch.** It reads the schema v29 "
+        "deficit-attribution and v31 forecast columns, and G-FLIP gained a SIXTH "
+        "criterion (keying integrity), pre-registered 2026-08-09 before any v31 row "
+        "existed. Criteria 1-5, the labels and their precedence are unchanged, so "
+        "those checks stay comparable with the earlier blocks — but the gate is not "
+        "the one the third watch ran, and a run under this build is a FOURTH watch.",
         "",
     ]
 
@@ -724,7 +793,10 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
             "label (§0.3): `blocking-flip` -> env parity (sqlite-vec on both trigger "
             "paths); a `failure` streak -> LLM transport/retry work; an "
             "`unclassifiable` row -> reopen the windowing analysis with that row's "
-            "`input_eps`/`built` delta as the starting evidence. A below-bar verdict "
+            "`input_eps`/`built` delta as the starting evidence; a criterion-6 "
+            "offender -> keying, NOT membership (salt bump, hash instability, "
+            "rowid/vec/FTS shadow desync), and it blocks the flip at any reuse%. "
+            "A below-bar verdict "
             "row now carries its own attribution in the note column: `level0_missed "
             "> 0` points at arrival-driven re-keying (read the ratio against the "
             "distribution above), `level0_missed = 0` at the root/leftover terms or "
@@ -732,8 +804,11 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
         ]
     else:
         lines += [
-            f"Fewer than {MIN_VERDICT_ROWS} verdict rows: extend the watch rather "
-            "than deciding (§0.3 sanity floor).",
+            f"Extend the watch rather than deciding: either fewer than "
+            f"{MIN_VERDICT_ROWS} verdict rows (§0.3 sanity floor) or criterion 6 "
+            "is still PENDING — a verdict row whose keying residual is NULL is "
+            "unattributed, and an unattributed residual is not a clean one. Both "
+            "resolve with dreams, not with a re-read.",
         ]
     return "\n".join(lines) + "\n"
 
