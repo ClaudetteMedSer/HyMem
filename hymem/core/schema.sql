@@ -554,6 +554,13 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     -- NULL rather than being backfilled into counterfeit fixed points.
     aggregation_level0_missed INTEGER,
     aggregation_leaf_changed INTEGER,
+    -- v31 structural rebuild forecast. predicted counts nodes whose (level,
+    -- member set) is absent from the previous tree; residual = actual -
+    -- predicted counts nodes that kept their membership and still missed the
+    -- fusion cache, which is an id-keying defect and reads on ONE dream.
+    aggregation_predicted_rebuild INTEGER,
+    aggregation_keying_residual INTEGER,
+    aggregation_facts_rekey INTEGER,
     -- v25 digest attribution: a per-session digest that raises or returns an
     -- unparseable payload is logged and skipped (one bad session must not abort
     -- a dream), and episode creation can stall silently while chunks keep

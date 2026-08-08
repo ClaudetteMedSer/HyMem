@@ -85,6 +85,9 @@ class DreamReport:
     aggregation_input_episodes: int = 0
     aggregation_level0_missed: int | None = None
     aggregation_leaf_changed: int | None = None
+    aggregation_predicted_rebuild: int | None = None
+    aggregation_keying_residual: int | None = None
+    aggregation_facts_rekey: int | None = None
     aggregation_blocking: str = ""
     digest_failures: int = 0
     episodes_created: int = 0
@@ -815,6 +818,9 @@ def run_dreaming(
                 report.aggregation_blocking = agg.blocking
                 report.aggregation_level0_missed = agg.level0_missed
                 report.aggregation_leaf_changed = agg.leaf_changed
+                report.aggregation_predicted_rebuild = agg.predicted_rebuild
+                report.aggregation_keying_residual = agg.keying_residual
+                report.aggregation_facts_rekey = agg.facts_rekey
             except Exception:
                 log.exception("aggregate.build_failure")
 
@@ -841,6 +847,9 @@ def run_dreaming(
                 aggregation_blocking = ?,
                 aggregation_level0_missed = ?,
                 aggregation_leaf_changed = ?,
+                aggregation_predicted_rebuild = ?,
+                aggregation_keying_residual = ?,
+                aggregation_facts_rekey = ?,
                 digest_failures = ?,
                 episodes_created = ?,
                 facts_extracted = ?,
@@ -863,6 +872,9 @@ def run_dreaming(
                 report.aggregation_blocking,
                 report.aggregation_level0_missed,
                 report.aggregation_leaf_changed,
+                report.aggregation_predicted_rebuild,
+                report.aggregation_keying_residual,
+                report.aggregation_facts_rekey,
                 report.digest_failures,
                 report.episodes_created,
                 report.facts_extracted,
@@ -871,7 +883,7 @@ def run_dreaming(
             ),
         )
         log.info(
-            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d chunk_extraction_failures=%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_level0_missed=%s agg_leaf_changed=%s agg_blocking=%s digest_failures=%d episodes_created=%d facts=%d fact_failures=%d budget_exhausted=%s",
+            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d chunk_extraction_failures=%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_level0_missed=%s agg_leaf_changed=%s agg_predicted=%s agg_keying_residual=%s agg_facts_rekey=%s agg_blocking=%s digest_failures=%d episodes_created=%d facts=%d fact_failures=%d budget_exhausted=%s",
             run_id,
             report.sessions_processed,
             report.chunks_processed,
@@ -887,6 +899,9 @@ def run_dreaming(
             report.aggregation_input_episodes,
             report.aggregation_level0_missed,
             report.aggregation_leaf_changed,
+            report.aggregation_predicted_rebuild,
+            report.aggregation_keying_residual,
+            report.aggregation_facts_rekey,
             report.aggregation_blocking,
             report.digest_failures,
             report.episodes_created,

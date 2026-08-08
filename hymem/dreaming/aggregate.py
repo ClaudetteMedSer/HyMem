@@ -82,6 +82,9 @@ class AggregationResult(NamedTuple):
     blocking: str = "exact"
     level0_missed: int = 0
     leaf_changed: int | None = None
+    predicted_rebuild: int = 0
+    keying_residual: int = 0
+    facts_rekey: int = 0
 
 # Fusion-prompt versions, baked into the node-id salt of the level the prompt
 # serves. Reuse is keyed by node id, so bumping a version when its prompt
@@ -574,6 +577,69 @@ def select_clusters(
 _MAX_FUSION_TITLE_CHARS = 300
 _MAX_FUSION_SUMMARY_CHARS = 2000
 
+class _RebuildForecast(NamedTuple):
+    """Structural account of one dream's rebuild. See `_forecast_rebuild`."""
+    predicted: int
+    actual: int
+    residual: int
+    facts_rekey: int
+
+
+def _forecast_rebuild(
+    rows: list[dict], prev_membership: set[tuple[int, frozenset[str]]]
+) -> _RebuildForecast:
+    """Predict this dream's rebuild from tree structure alone — no constants.
+
+    The amplification model `rebuilt ~ A*level0_missed + root + leaf` was never
+    fittable on this store: `level0_missed` sat at 3 for 11 of 13 dreams
+    (2026-08-09), so the slope had one x-value and the intercept absorbed the
+    leaf term by construction. This replaces the fit rather than waiting for a
+    dispersion that is not coming.
+
+    A node must be rebuilt when its membership is NEW — that is the whole
+    causal story of amplification (a changed child re-keys its parent, and so
+    on to the root), and it is COMPUTABLE per dream instead of estimated
+    across dreams. So:
+
+        predicted = nodes whose (level, member set) is absent from the
+                    previous tree
+        actual    = nodes whose id missed the fusion cache
+        residual  = actual - predicted
+
+    Residual 0 means every rebuild this dream is accounted for by membership
+    change. A POSITIVE residual is the interesting signal and the reason this
+    is not circular: it counts nodes that kept their exact membership and
+    still failed to reuse — same inputs, different id. That is the fifth-cause
+    class §0.3 hunts for (salt bump, hash instability, rowid/shadow desync),
+    and it is visible on a SINGLE dream with no bar to calibrate.
+
+    The root is exempt from the residual because its id keys on the VERIFIED
+    FACTS hash as well as membership, so an unchanged tree over a changed
+    graph re-keys it legitimately. That case is counted separately as
+    `facts_rekey` and folded into `predicted`, which keeps the residual a pure
+    keying-defect detector instead of a channel that fires once per graph edit.
+
+    A negative residual is not an error either: it means a node whose
+    membership is new was nevertheless served from cache, which happens when
+    two levels share a member set. It is reported as-is rather than clamped —
+    a clamp would hide the collision.
+    """
+    predicted = actual = facts_rekey = 0
+    for r in rows:
+        membership_is_new = (r["level"], frozenset(r["member_ids"])) not in prev_membership
+        was_rebuilt = not r.get("reused", False)
+        if was_rebuilt:
+            actual += 1
+        if membership_is_new:
+            predicted += 1
+        elif was_rebuilt and r["is_root"]:
+            # Same members, new id, and the root is the one node whose key
+            # carries something other than membership.
+            facts_rekey += 1
+            predicted += 1
+    return _RebuildForecast(predicted, actual, actual - predicted, facts_rekey)
+
+
 def _leaf_fingerprint(leaf_ids: frozenset[str]) -> str:
     """Order-independent fingerprint of a digest leaf set.
 
@@ -887,10 +953,23 @@ def build_aggregation_nodes(
     # a mostly-stable store rebuilds the whole tree only paying for memberships
     # that actually changed. (The embedding was already cache-keyed; this
     # extends the same discipline to the much more expensive fusion call.)
-    existing: dict[str, dict] = {
-        row["id"]: {"title": row["title"], "summary": row["summary"]}
-        for row in conn.execute("SELECT id, title, summary FROM aggregation_nodes")
-    }
+    existing: dict[str, dict] = {}
+    # (level, member set) of every node in the PREVIOUS tree. The structural
+    # predictor below asks a different question from the fusion cache: the
+    # cache asks "does this id exist", this asks "did a node with this exact
+    # membership exist at this level". The two answers diverge exactly when id
+    # keying is broken — a salt change, an unstable hash, a rowid/shadow
+    # desync — which is the failure class the reuse watch keeps hitting.
+    prev_membership: set[tuple[int, frozenset[str]]] = set()
+    for row in conn.execute(
+        "SELECT id, title, summary, member_episode_ids, level FROM aggregation_nodes"
+    ):
+        existing[row["id"]] = {"title": row["title"], "summary": row["summary"]}
+        try:
+            members = json.loads(row["member_episode_ids"])
+        except (TypeError, ValueError):
+            continue
+        prev_membership.add((row["level"], frozenset(members)))
 
     rows: list[dict] = []
     items: list[dict] = []          # hierarchy frontier: level-0 nodes first
@@ -902,6 +981,7 @@ def build_aggregation_nodes(
         member_ids = [m["id"] for m in members]
         node_id = _node_id(member_ids, salt=_CLUSTER_SALT)
         fused = existing.get(node_id)
+        level0_reused = fused is not None
         if fused is not None:
             reused += 1
         else:
@@ -924,7 +1004,7 @@ def build_aggregation_nodes(
         rows.append({
             "id": node_id, "title": fused["title"], "summary": fused["summary"],
             "member_ids": member_ids, "session_ids": session_ids,
-            "level": 0, "is_root": 0,
+            "level": 0, "is_root": 0, "reused": level0_reused,
         })
         clustered_ids.update(member_ids)
         items.append({
@@ -1019,18 +1099,32 @@ def build_aggregation_nodes(
         with core_db.transaction(conn):
             _persist_node_embeddings(conn, embedding_client)
 
+    forecast = _forecast_rebuild(rows, prev_membership)
     log.info(
         "aggregate.built nodes=%d reused=%d failures=%d blocking=%s "
         "vectorless=%d level0_missed=%d leaf_changed=%d (from %d episodes)",
         len(rows), reused, failures, blocking, vectorless,
         level0_missed, -1 if leaf_changed is None else leaf_changed, len(episodes),
     )
+    log.info(
+        "aggregate.forecast predicted=%d actual=%d residual=%d facts_rekey=%d",
+        forecast.predicted, forecast.actual, forecast.residual, forecast.facts_rekey,
+    )
+    if forecast.residual > 0:
+        # Membership-identical nodes that did not reuse. Nothing in the build
+        # explains this; it is the signature of an id-keying defect.
+        log.warning(
+            "aggregate.keying_residual nodes=%d — %d node(s) kept their exact "
+            "membership and still missed the fusion cache",
+            forecast.residual, forecast.residual,
+        )
     leaf_res: int | None = leaf_changed
     if leaf_res is not None and leaf_res < 0:
         leaf_res = None
     return AggregationResult(
         len(rows), reused, failures, len(episodes), blocking,
         level0_missed, leaf_res,
+        forecast.predicted, forecast.residual, forecast.facts_rekey,
     )
 
 
@@ -1097,6 +1191,7 @@ def _build_digest_levels(
             member_ids = [m["id"] for m in g]
             node_id = _node_id(member_ids, salt=_ROLLUP_SALT)
             fused = existing.get(node_id)
+            rollup_reused = fused is not None
             if fused is not None:
                 reused += 1
             else:
@@ -1120,7 +1215,7 @@ def _build_digest_levels(
             rows.append({
                 "id": node_id, "title": fused["title"], "summary": fused["summary"],
                 "member_ids": member_ids, "session_ids": sorted(session_ids),
-                "level": level, "is_root": 0,
+                "level": level, "is_root": 0, "reused": rollup_reused,
             })
             next_items.append({
                 "id": node_id, "title": fused["title"], "summary": fused["summary"],
@@ -1146,6 +1241,7 @@ def _build_digest_levels(
     facts_hash = hashlib.sha1(facts_block.encode("utf-8")).hexdigest()[:12]
     root_id = _node_id(member_ids, salt=f"{_ROOT_SALT}|{facts_hash}")
     fused = existing.get(root_id)
+    root_reused = fused is not None
     if fused is not None:
         reused += 1
     else:
@@ -1163,7 +1259,7 @@ def _build_digest_levels(
     rows.append({
         "id": root_id, "title": fused["title"], "summary": fused["summary"],
         "member_ids": member_ids, "session_ids": session_ids,
-        "level": level, "is_root": 1,
+        "level": level, "is_root": 1, "reused": root_reused,
     })
     return rows, reused, failures, False
 

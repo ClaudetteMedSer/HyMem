@@ -87,7 +87,7 @@ REFUSION_BUILT_FRACTION = 0.8
 # Stamped into every RESULT block. The third watch ran against a classifier
 # that could not read the v29 columns; a run under this build is a FOURTH
 # watch, and the block has to say so rather than look like a continuation.
-CLASSIFIER_VERSION = "v2 (2026-08-08) — deficit attribution surfaced, gate unchanged"
+CLASSIFIER_VERSION = ("v3 (2026-08-09) — v29 deficit attribution + v31 structural forecast surfaced, gate unchanged")
 
 # `aggregation_leaf_changed` is THREE-state and the two non-numeric states are
 # easy to destroy on the way in. NULL means the leaf-set snapshot was
@@ -111,15 +111,22 @@ BASE_COLUMNS = (
     "skipped_locked, error"
 )
 
-# v29 columns: read when present, NULL-filled when not, so a pre-029 store
-# still classifies exactly as it did before — just with every row unattributed.
-ATTRIBUTION_COLUMNS = ("aggregation_level0_missed", "aggregation_leaf_changed")
+# Optional columns, read when present and NULL-filled when not, so an older
+# store still classifies exactly as it did before — just with those channels
+# unattributed. v29 = deficit attribution, v31 = the structural forecast.
+OPTIONAL_COLUMNS = {
+    "level0_missed": "aggregation_level0_missed",
+    "leaf_changed": "aggregation_leaf_changed",
+    "predicted": "aggregation_predicted_rebuild",
+    "residual": "aggregation_keying_residual",
+    "facts_rekey": "aggregation_facts_rekey",
+}
 
 
-def _has_attribution(conn: sqlite3.Connection) -> bool:
-    """Does this store carry the v29 deficit-attribution columns?"""
+def _present_columns(conn: sqlite3.Connection) -> dict[str, str]:
+    """Which optional columns this store actually has, alias -> column."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(dream_runs)")}
-    return set(ATTRIBUTION_COLUMNS) <= cols
+    return {alias: col for alias, col in OPTIONAL_COLUMNS.items() if col in cols}
 
 
 def pull(db: Path, since: str) -> list[dict]:
@@ -128,13 +135,10 @@ def pull(db: Path, since: str) -> list[dict]:
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        attributed = _has_attribution(conn)
-        select = BASE_COLUMNS
-        if attributed:
-            select += (
-                ", aggregation_level0_missed AS level0_missed"
-                ", aggregation_leaf_changed AS leaf_changed"
-            )
+        present = _present_columns(conn)
+        select = BASE_COLUMNS + "".join(
+            f", {col} AS {alias}" for alias, col in present.items()
+        )
         rows = conn.execute(
             f"SELECT {select} FROM dream_runs "
             "WHERE started_at >= ? ORDER BY id",
@@ -150,12 +154,11 @@ def pull(db: Path, since: str) -> list[dict]:
     finally:
         conn.close()
     out = [dict(r) for r in rows]
-    if not attributed:
-        # Absent columns are indistinguishable from unwritten ones, and both
-        # mean the same thing to the reader: unattributed.
-        for r in out:
-            r["level0_missed"] = None
-            r["leaf_changed"] = None
+    # An absent column is indistinguishable from an unwritten one, and both
+    # mean the same thing to the reader: unattributed.
+    for r in out:
+        for alias in OPTIONAL_COLUMNS:
+            r.setdefault(alias, None)
     return out
 
 
@@ -491,6 +494,16 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
             "displacement; if neither fits, this is the fifth cause §0.3 is looking "
             "for, and these rows are where to open it."
         )
+    keying = [r for r in rows if r["label"] != "no-agg" and (r["residual"] or 0) > 0]
+    if keying:
+        advisories.append(
+            f"**keying residual**: {len(keying)} row(s){ids(keying)} rebuilt nodes "
+            "whose membership was UNCHANGED — same inputs, different id. Nothing in "
+            "the build explains that, so it is the fifth cause §0.3 hunts (salt "
+            "bump, hash instability, rowid/shadow desync), and unlike the reuse bar "
+            "it reads on a single dream. Investigate these before any verdict: a "
+            "row can sit ABOVE the bar and still carry a keying defect."
+        )
     unattributed_below = [r for r in below if r["attr_state"] == "unattributed"]
     if unattributed_below:
         advisories.append(
@@ -642,8 +655,8 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
 
     lines += [
         "| id | started_at | built | reused | reuse% | fail | input_eps | blocking "
-        "| l0miss | leaf | rebuilt | /miss | label | note |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| l0miss | leaf | rebuilt | /miss | pred | resid | label | note |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         pct = "" if r["reuse_pct"] is None else f"{r['reuse_pct']}"
@@ -653,6 +666,8 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
             f"| {r['id']} | {r['started_at']} | {r['built']} | {r['reused']} | {pct} | "
             f"{r['failures']} | {r['input_eps']} | {r['blocking'] or '—'} | "
             f"{l0} | {r['leaf_str']} | {r['rebuilt']} | {ratio} | "
+            f"{'—' if r['predicted'] is None else r['predicted']} | "
+            f"{'—' if r['residual'] is None else r['residual']} | "
             f"`{r['label']}` | {r['note']} |"
         )
 
@@ -769,7 +784,8 @@ def main() -> int:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         fields = ["id", "started_at", "built", "reused", "reuse_pct", "failures",
                   "input_eps", "blocking", "level0_missed", "leaf_changed", "rebuilt",
-                  "ratio", "attr_state", "skipped_locked", "error", "label", "note"]
+                  "ratio", "attr_state", "predicted", "residual", "facts_rekey",
+                  "skipped_locked", "error", "label", "note"]
         with args.csv.open("w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
