@@ -65,6 +65,11 @@ class DreamReport:
     sessions_processed: int = 0
     chunks_seen: int = 0
     chunks_processed: int = 0
+    # Extractions that did not complete this run (unparseable / wrong-shaped
+    # reply). NOT persisted to dream_runs: those chunks are held unmarked and
+    # retried, so a rising count across consecutive dreams is the ingest
+    # analogue of a stuck fusion. In-memory + dream.end only.
+    chunk_extraction_failures: int = 0
     triples_extracted: int = 0
     markers_extracted: int = 0
     rules_extracted: int = 0
@@ -271,6 +276,16 @@ def run_dreaming(
                     continue
                 if extraction is None:
                     continue
+                if extraction.failed:
+                    # Held, not marked: retried on the next dream. Audible so a
+                    # chunk that fails forever is greppable rather than silent
+                    # (the stuck-fusion lesson, applied to ingest).
+                    report.chunk_extraction_failures += 1
+                    log.warning(
+                        "phase1.extraction_failed chunk_id=%s tier=salience "
+                        "action=held_for_retry", chunk.id,
+                    )
+                    continue
                 had_new_chunk_work = True
                 # Embed dedup candidates OUTSIDE the write lock; best-effort so
                 # a flaky embedder degrades to "no dedup", never aborts the dream.
@@ -328,6 +343,14 @@ def run_dreaming(
                             )
                             continue
                         if extraction is None:
+                            continue
+                        if extraction.failed:
+                            # See the salience-tier call site above.
+                            report.chunk_extraction_failures += 1
+                            log.warning(
+                                "phase1.extraction_failed chunk_id=%s "
+                                "tier=baseline action=held_for_retry", chunk.id,
+                            )
                             continue
                         had_new_chunk_work = True
                         # Embed dedup candidates OUTSIDE the write lock (see
@@ -820,11 +843,12 @@ def run_dreaming(
             ),
         )
         log.info(
-            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_blocking=%s digest_failures=%d episodes_created=%d facts=%d fact_failures=%d budget_exhausted=%s",
+            "dream.end run_id=%d sessions=%d chunks_processed=%d/%d chunk_extraction_failures=%d triples=%d markers=%d chunks_from_cache=%d edges_from_cache=%d agg_nodes=%d agg_reused=%d agg_failures=%d agg_input=%d agg_blocking=%s digest_failures=%d episodes_created=%d facts=%d fact_failures=%d budget_exhausted=%s",
             run_id,
             report.sessions_processed,
             report.chunks_processed,
             report.chunks_seen,
+            report.chunk_extraction_failures,
             report.triples_extracted,
             report.markers_extracted,
             report.chunks_embedded_from_cache,

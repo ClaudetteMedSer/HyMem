@@ -21,11 +21,16 @@ log = logging.getLogger("hymem.dreaming.phase1")
 
 @dataclass
 class ChunkExtraction:
-    """Raw phase-1 output: ready to persist, no DB writes performed yet."""
+    """Raw phase-1 output: ready to persist, no DB writes performed yet.
+
+    ``failed`` carries :class:`~hymem.extraction.chunk.ChunkResult.failed`
+    through to the persist step, which refuses to mark a failed chunk done.
+    """
     triples: list[Triple]
     markers: list[Marker]
     entity_type_hints: dict[str, str] = field(default_factory=dict)
     entity_property_hints: dict[str, dict[str, str]] = field(default_factory=dict)
+    failed: bool = False
 
 
 def extract_chunk_results(
@@ -53,6 +58,7 @@ def extract_chunk_results(
         markers=result.markers,
         entity_type_hints=result.entity_type_hints,
         entity_property_hints=result.entity_property_hints,
+        failed=result.failed,
     )
 
 
@@ -207,10 +213,19 @@ def persist_chunk_results(
             (m.kind, m.statement, chunk.id),
         )
 
-    conn.execute(
-        "INSERT OR IGNORE INTO processed_chunks(chunk_id, prompt_version) VALUES (?, ?)",
-        (chunk.id, prompt_version),
-    )
+    # A FAILED extraction is never marked done. `processed_chunks` is the
+    # one-shot gate — a row here means no dream will ever look at this chunk
+    # again under this prompt version — so marking a chunk whose extraction did
+    # not complete converts a transient provider hiccup into a permanent hole,
+    # indistinguishable in the DB from a chunk that genuinely held nothing.
+    # Holding the mark instead retries on the next dream, which is what the
+    # digest (v24 watermark), facts (v26 watermark) and fusion paths all do.
+    # A clean parse that yielded nothing IS marked: that is the real floor.
+    if not extraction.failed:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_chunks(chunk_id, prompt_version) VALUES (?, ?)",
+            (chunk.id, prompt_version),
+        )
     log.debug(
         "phase1.chunk chunk_id=%s triples=%d markers=%d",
         chunk.id,
