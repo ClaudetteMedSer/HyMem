@@ -574,10 +574,40 @@ def select_clusters(
 _MAX_FUSION_TITLE_CHARS = 300
 _MAX_FUSION_SUMMARY_CHARS = 2000
 
-# Per-process memory of the previous dream's digest leaf set — log
-# instrumentation for the leftover-displacement channel (aggregation_digest_
-# max_leaves). Process-local by design: each server keeps its own.
-_LAST_LEAF_SET: frozenset[str] | None = None
+def _leaf_fingerprint(leaf_ids: frozenset[str]) -> str:
+    """Order-independent fingerprint of a digest leaf set.
+
+    Only equality is ever tested, so the id list is not stored — see migration
+    030. Sorted before hashing for the same reason `_node_id` sorts: the
+    selection order must not re-key an unchanged set.
+    """
+    return hashlib.sha1("\x00".join(sorted(leaf_ids)).encode()).hexdigest()
+
+
+def _read_leaf_fingerprint(conn: sqlite3.Connection) -> str | None:
+    """The leaf set the last dream that persisted aggregation actually used.
+    None means no dream ever has — unattributed, NOT an unchanged set."""
+    row = conn.execute(
+        "SELECT fingerprint FROM aggregation_leaf_state WHERE id = 1"
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _write_leaf_fingerprint(conn: sqlite3.Connection, fingerprint: str,
+                            n_leaves: int) -> None:
+    """Advance the watermark. Called INSIDE the node-persist transaction so it
+    commits with the nodes that consumed this leaf set, never ahead of them."""
+    conn.execute(
+        """
+        INSERT INTO aggregation_leaf_state(id, fingerprint, n_leaves, updated_at)
+        VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+            fingerprint = excluded.fingerprint,
+            n_leaves = excluded.n_leaves,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (fingerprint, n_leaves),
+    )
 
 
 def _fusion_max_tokens(prompt: str) -> int:
@@ -906,6 +936,8 @@ def build_aggregation_nodes(
 
     root_failed = False
     leaf_changed = -1               # instrumentation: -1 when digest disabled
+    leaf_fingerprint: str | None = None      # None => nothing to advance
+    leaf_count = 0
     if cfg.aggregation_digest_enabled:
         # Digest leaves = the level-0 nodes plus every episode no cluster
         # absorbed (capped by a churn-stable hash-rank sample), so the root
@@ -913,22 +945,28 @@ def build_aggregation_nodes(
         leftovers = [e for e in episodes if e["id"] not in clustered_ids]
         leftovers = _stable_sample(leftovers, cfg.aggregation_digest_max_leaves)
         # Instrumentation for the leftover-displacement channel: whether the
-        # selected leaf set moved since this process's previous dream (the
-        # tunable aggregation_digest_max_leaves re-keys the root's level-1
-        # parent when a hash-rank crosses the cap line).
-        global _LAST_LEAF_SET
+        # selected leaf set moved since the last dream that PERSISTED
+        # aggregation (the tunable aggregation_digest_max_leaves re-keys the
+        # root's level-1 parent when a hash-rank crosses the cap line).
+        #
+        # The watermark lives in the store (v30), not in a module global. It
+        # used to be process-local, which meant the first dream of every
+        # process wrote NULL — and the box starts a fresh process per dream, so
+        # 175 of 187 rows were unreadable and the channel could not be measured
+        # at all. Reading it from the store makes the comparison survive the
+        # restart; NULL now means "no dream has ever aggregated this store".
         leaf_set = frozenset(e["id"] for e in leftovers)
-        if _LAST_LEAF_SET is None:
-            # First aggregation dream in this process: the previous leaf set
-            # is UNKNOWN (aggregation_nodes was full-replaced; other
-            # processes' state is not ours). Report unattributed (NULL), not
-            # a counterfeit 0 — leaf_changed=0 is part of the fixed-point
+        leaf_fingerprint = _leaf_fingerprint(leaf_set)
+        leaf_count = len(leaf_set)
+        previous_fingerprint = _read_leaf_fingerprint(conn)
+        if previous_fingerprint is None:
+            # No predecessor to compare against. Report unattributed (NULL),
+            # not a counterfeit 0 — leaf_changed=0 is part of the fixed-point
             # signature, and 1162's 8 rebuilds at "leaf_changed=0" were this
             # artifact, not a model violation.
             leaf_changed = None
         else:
-            leaf_changed = int(leaf_set != _LAST_LEAF_SET)
-        _LAST_LEAF_SET = leaf_set
+            leaf_changed = int(leaf_fingerprint != previous_fingerprint)
         items += [{
             "id": e["id"], "title": e["title"] or "", "summary": e["summary"] or "",
             "vector": e["vector"], "entities": e["entities"],
@@ -970,6 +1008,12 @@ def build_aggregation_nodes(
                     r["level"], r["is_root"],
                 ),
             )
+        if leaf_fingerprint is not None:
+            # Same transaction as the nodes above: a dream that dies before
+            # persisting must not leave the watermark pointing at a leaf set no
+            # tree was ever built from, which would report the NEXT dream's
+            # genuine displacement as unchanged.
+            _write_leaf_fingerprint(conn, leaf_fingerprint, leaf_count)
 
     if embedding_client is not None and rows:
         with core_db.transaction(conn):

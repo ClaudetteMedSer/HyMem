@@ -419,6 +419,21 @@ CREATE TABLE IF NOT EXISTS aggregation_node_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Durable leaf-set watermark (schema v30) for the leftover-displacement term
+-- of the deficit model. Replaces a module global that only ever compared
+-- against the previous dream IN THE SAME PROCESS, which on a box that starts a
+-- fresh process per dream made `aggregation_leaf_changed` unreadable on 175 of
+-- 187 rows. Written inside the node-persist transaction, so the watermark
+-- advances only when the dream that consumed the leaf set landed; a store that
+-- has never aggregated has no row, and that reads as NULL (unattributed), not
+-- as an unchanged leaf set.
+CREATE TABLE IF NOT EXISTS aggregation_leaf_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    fingerprint TEXT NOT NULL,
+    n_leaves INTEGER NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Typed user-profile slots (schema v18, Stage 1 / P4). Durable personal facts
 -- the tech-domain knowledge-graph vocabulary can never hold (role, name,
 -- employer, location, ...), extracted from USER turns only during dreaming
