@@ -29,6 +29,21 @@ from typing import Any
 _DELIMS = {"object": ("{", "}"), "array": ("[", "]")}
 
 
+def is_ceiling_cut(raw: str) -> bool:
+    """Structural cut detector: a reply that opens a JSON object and ends
+    with an unclosed brace — the signature of a reply truncated at the token
+    ceiling (finish_reason="length"). Provider-agnostic: computed from the
+    string in hand, no API signal needed. A prose refusal doesn't open with
+    '{' and a complete object parses (so the caller's lenient parse wouldn't
+    have failed) — the brace scan only ever runs on a payload that already
+    failed to parse.
+    """
+    s = raw.lstrip()
+    if not s.startswith("{"):
+        return False
+    return s.count("{") > s.count("}")
+
+
 def loads_lenient(raw: str, *, expect: str = "object") -> Any | None:
     """Parse *raw* as JSON, tolerating markdown fences and surrounding prose.
 

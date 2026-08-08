@@ -41,13 +41,14 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from typing import NamedTuple
+from collections.abc import Callable
 
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
 from hymem.core.vectors import decode_vector, encode_vector
 from hymem.dreaming.user_profile import load_profile, render_profile_fact
 from hymem.extraction.embeddings import EmbeddingClient, normalize_text
-from hymem.extraction.jsonio import loads_lenient
+from hymem.extraction.jsonio import is_ceiling_cut, loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import (
     AGGREGATE_SYSTEM,
@@ -79,6 +80,8 @@ class AggregationResult(NamedTuple):
     fusion_failures: int = 0
     input_episodes: int = 0
     blocking: str = "exact"
+    level0_missed: int = 0
+    leaf_changed: int | None = None
 
 # Fusion-prompt versions, baked into the node-id salt of the level the prompt
 # serves. Reuse is keyed by node id, so bumping a version when its prompt
@@ -563,64 +566,140 @@ def select_clusters(
     return kept
 
 
+# Persist-time bounds (facts.py:211 model): a bloated fusion summary would
+# propagate into every ancestor's render via _items_text and crowd out
+# siblings under aggregation_max_members — cap it where it is visible (at
+# persist time, with a warning) instead of at the token ceiling where it
+# becomes a silent parse failure.
+_MAX_FUSION_TITLE_CHARS = 300
+_MAX_FUSION_SUMMARY_CHARS = 2000
+
+# Per-process memory of the previous dream's digest leaf set — log
+# instrumentation for the leftover-displacement channel (aggregation_digest_
+# max_leaves). Process-local by design: each server keeps its own.
+_LAST_LEAF_SET: frozenset[str] | None = None
+
+
+def _fusion_max_tokens(prompt: str) -> int:
+    """Payload-sized ceiling with headroom (rules_extract.py:223 model: size
+    the ceiling so the reply never truncates). Fusion output scales with the
+    rendered input; the bare 1024 default cut big rollup/root prompts
+    (measured cut band 3769-4619 chars, ~52% of dreams mid-drain). Capped at
+    8192 — the retry ladder (re-roll, then membership-preserving shrink)
+    covers anything beyond.
+    """
+    return min(8192, 2048 + len(prompt) // 2)
+
+
 def _llm_fuse(
-    user_prompt: str, llm: LLMClient, *, system: str, kind: str = "fusion"
+    user_prompt: str, llm: LLMClient, *, system: str, kind: str = "fusion",
+    shrink: Callable[[], str] | None = None,
 ) -> dict | None:
     """One LLM call fusing the prepared `user_prompt` into {title, summary}.
     Returns None when the call fails or yields nothing usable (so no empty
     node is persisted). Every failure path logs at WARNING with `kind`
     (cluster/rollup/root): a failed fusion retries on every subsequent dream
     until it succeeds, and each fail→heal transition costs reuse — silent
-    failures made the 2026-07-12 low-reuse runs unattributable."""
-    request = LLMRequest(
-        system=system,
-        user=user_prompt,
-        response_format="json",
-    )
-    try:
-        raw = llm.complete(request)
-    except Exception:
-        log.exception("aggregate.fusion_failure kind=%s stage=call", kind)
-        return None
-    # Fences/prose around the JSON are tolerated (dream 1013): json_object mode
-    # was already set on this call and the provider fenced it anyway.
-    data = loads_lenient(raw, expect="object")
-    if data is None:
-        log.warning("aggregate.fusion_failure kind=%s stage=parse raw_len=%d",
-                    kind, len(raw) if isinstance(raw, str) else -1)
-        return None
-    if not isinstance(data, dict):
-        log.warning("aggregate.fusion_failure kind=%s stage=shape", kind)
-        return None
-    title = data.get("title", "")
-    summary = data.get("summary", "")
-    if not isinstance(title, str) or not isinstance(summary, str):
-        log.warning("aggregate.fusion_failure kind=%s stage=shape", kind)
-        return None
-    title, summary = title.strip(), summary.strip()
-    if not title or not summary:
-        log.warning("aggregate.fusion_failure kind=%s stage=empty", kind)
-        return None
-    return {"title": title, "summary": summary}
+    failures made the 2026-07-12 low-reuse runs unattributable.
+
+    RETRY LADDER (2026-08-07): the ceiling is payload-sized (see
+    `_fusion_max_tokens`). When the reply still fails to parse and the
+    structural cut detector fires (opens '{', unterminated — same evidence
+    finish_reason="length" would give, computed from the string in hand),
+    the SAME input is re-rolled ONCE. The re-roll is licensed empirically by
+    deepseek-v4-flash output variance at temperature=0.0 (measured 0.3x-4.8x
+    output spread on identical input); it is NOT a Protocol guarantee — a
+    deterministic backend turns it into a wasted call every time. The
+    terminating step, `shrink`, reduces the RENDERED input only (fewer chars
+    per member), never the member set: node_id = sha1(sorted(member_ids)),
+    so a different member set would produce a different node id and re-key
+    every ancestor permanently.
+    """
+    def attempt(prompt: str) -> tuple[dict | None, str | None, str]:
+        request = LLMRequest(
+            system=system, user=prompt, response_format="json",
+            max_tokens=_fusion_max_tokens(prompt),
+        )
+        try:
+            raw = llm.complete(request)
+        except Exception:
+            log.exception("aggregate.fusion_failure kind=%s stage=call", kind)
+            return None, None, "call"
+        data = loads_lenient(raw, expect="object")
+        if data is None:
+            log.warning("aggregate.fusion_failure kind=%s stage=parse raw_len=%d",
+                        kind, len(raw) if isinstance(raw, str) else -1)
+            return None, raw, "parse"
+        if not isinstance(data, dict):
+            log.warning("aggregate.fusion_failure kind=%s stage=shape", kind)
+            return None, raw, "shape"
+        title = data.get("title", "")
+        summary = data.get("summary", "")
+        if not isinstance(title, str) or not isinstance(summary, str):
+            log.warning("aggregate.fusion_failure kind=%s stage=shape", kind)
+            return None, raw, "shape"
+        title, summary = title.strip(), summary.strip()
+        if not title or not summary:
+            log.warning("aggregate.fusion_failure kind=%s stage=empty", kind)
+            return None, raw, "empty"
+        if len(summary) > _MAX_FUSION_SUMMARY_CHARS:
+            log.warning("aggregate.fusion_summary_capped kind=%s chars=%d->%d",
+                        kind, len(summary), _MAX_FUSION_SUMMARY_CHARS)
+            summary = summary[:_MAX_FUSION_SUMMARY_CHARS]
+        if len(title) > _MAX_FUSION_TITLE_CHARS:
+            title = title[:_MAX_FUSION_TITLE_CHARS]
+        return {"title": title, "summary": summary}, raw, "ok"
+
+    fused, raw, stage = attempt(user_prompt)
+    if fused is None and stage == "parse" and raw is not None and is_ceiling_cut(raw):
+        # One re-roll of the SAME input — empirical license, see docstring.
+        fused, raw, stage = attempt(user_prompt)
+    if fused is None and stage == "parse" and shrink is not None:
+        # Terminating step: membership-PRESERVING render shrink.
+        fused, _, _ = attempt(shrink())
+    return fused
 
 
 def _summarize_cluster(
     members: list[dict], cfg: HyMemConfig, llm: LLMClient
 ) -> dict | None:
     """Fuse a level-0 cluster's episodes into {title, summary}."""
-    capped = members[: cfg.aggregation_max_members]
-    text = "\n\n---\n\n".join(
-        f"[{m['session_id']}] {m['title']}\n{m['summary']}" for m in capped
+    def render(scale: float = 1.0) -> str:
+        capped = members[: cfg.aggregation_max_members]
+        if scale >= 1.0:
+            return "\n\n---\n\n".join(
+                f"[{m['session_id']}] {m['title']}\n{m['summary']}" for m in capped
+            )
+        return "\n\n---\n\n".join(
+            f"[{m['session_id']}] {m['title'][:int(len(m['title']) * scale)]}\n"
+            f"{m['summary'][:int(len(m['summary']) * scale)]}" for m in capped
+        )
+    return _llm_fuse(
+        AGGREGATE_USER_TEMPLATE.format(text=render()), llm,
+        system=AGGREGATE_SYSTEM, kind="cluster",
+        shrink=lambda: AGGREGATE_USER_TEMPLATE.format(text=render(0.5)),
     )
-    return _llm_fuse(AGGREGATE_USER_TEMPLATE.format(text=text), llm,
-                     system=AGGREGATE_SYSTEM, kind="cluster")
 
 
-def _items_text(items: list[dict], cfg: HyMemConfig) -> str:
+def _items_text(items: list[dict], cfg: HyMemConfig, *, char_scale: float = 1.0) -> str:
     """Render hierarchy items (level-0 nodes / rollups / pass-through episodes,
-    all carrying title+summary) as one fusion input block."""
+    all carrying title+summary) as one fusion input block.
+
+    `char_scale` shrinks each member's rendered title/summary for the retry
+    ladder's terminating step — the MEMBER SET is untouched, so the node's
+    content-hash id is unchanged and a fused result stays cache-compatible.
+    """
     capped = items[: cfg.aggregation_max_members]
-    return "\n\n---\n\n".join(f"{m['title']}\n{m['summary']}" for m in capped)
+    if char_scale >= 1.0:
+        return "\n\n---\n\n".join(f"{m['title']}\n{m['summary']}" for m in capped)
+    parts = []
+    for m in capped:
+        t = m["title"] or ""
+        s = m["summary"] or ""
+        parts.append(
+            f"{t[:int(len(t) * char_scale)]}\n{s[:int(len(s) * char_scale)]}"
+        )
+    return "\n\n---\n\n".join(parts)
 
 
 def _anchor_facts(conn: sqlite3.Connection, cap: int) -> list[str]:
@@ -788,6 +867,7 @@ def build_aggregation_nodes(
     clustered_ids: set[str] = set()
     reused = 0
     failures = 0
+    level0_missed = 0               # instrumentation: level-0 re-keys this dream
     for members in clusters:
         member_ids = [m["id"] for m in members]
         node_id = _node_id(member_ids, salt=_CLUSTER_SALT)
@@ -795,6 +875,7 @@ def build_aggregation_nodes(
         if fused is not None:
             reused += 1
         else:
+            level0_missed += 1
             fused = _summarize_cluster(members, cfg, llm)
             if fused is None:
                 # CONTAINMENT: the members still count as clustered so they do
@@ -824,12 +905,30 @@ def build_aggregation_nodes(
         })
 
     root_failed = False
+    leaf_changed = -1               # instrumentation: -1 when digest disabled
     if cfg.aggregation_digest_enabled:
         # Digest leaves = the level-0 nodes plus every episode no cluster
         # absorbed (capped by a churn-stable hash-rank sample), so the root
         # covers the WHOLE store — full time span, not just recent threads.
         leftovers = [e for e in episodes if e["id"] not in clustered_ids]
         leftovers = _stable_sample(leftovers, cfg.aggregation_digest_max_leaves)
+        # Instrumentation for the leftover-displacement channel: whether the
+        # selected leaf set moved since this process's previous dream (the
+        # tunable aggregation_digest_max_leaves re-keys the root's level-1
+        # parent when a hash-rank crosses the cap line).
+        global _LAST_LEAF_SET
+        leaf_set = frozenset(e["id"] for e in leftovers)
+        if _LAST_LEAF_SET is None:
+            # First aggregation dream in this process: the previous leaf set
+            # is UNKNOWN (aggregation_nodes was full-replaced; other
+            # processes' state is not ours). Report unattributed (NULL), not
+            # a counterfeit 0 — leaf_changed=0 is part of the fixed-point
+            # signature, and 1162's 8 rebuilds at "leaf_changed=0" were this
+            # artifact, not a model violation.
+            leaf_changed = None
+        else:
+            leaf_changed = int(leaf_set != _LAST_LEAF_SET)
+        _LAST_LEAF_SET = leaf_set
         items += [{
             "id": e["id"], "title": e["title"] or "", "summary": e["summary"] or "",
             "vector": e["vector"], "entities": e["entities"],
@@ -878,10 +977,17 @@ def build_aggregation_nodes(
 
     log.info(
         "aggregate.built nodes=%d reused=%d failures=%d blocking=%s "
-        "vectorless=%d (from %d episodes)",
-        len(rows), reused, failures, blocking, vectorless, len(episodes),
+        "vectorless=%d level0_missed=%d leaf_changed=%d (from %d episodes)",
+        len(rows), reused, failures, blocking, vectorless,
+        level0_missed, -1 if leaf_changed is None else leaf_changed, len(episodes),
     )
-    return AggregationResult(len(rows), reused, failures, len(episodes), blocking)
+    leaf_res: int | None = leaf_changed
+    if leaf_res is not None and leaf_res < 0:
+        leaf_res = None
+    return AggregationResult(
+        len(rows), reused, failures, len(episodes), blocking,
+        level0_missed, leaf_res,
+    )
 
 
 def _build_digest_levels(
@@ -958,6 +1064,8 @@ def _build_digest_levels(
                 fused = _llm_fuse(
                     ROLLUP_USER_TEMPLATE.format(text=_items_text(g, cfg)),
                     llm, system=ROLLUP_SYSTEM, kind="rollup",
+                    shrink=lambda: ROLLUP_USER_TEMPLATE.format(
+                        text=_items_text(g, cfg, char_scale=0.5)),
                 )
                 if fused is None:
                     # CONTAINMENT (see the level-0 twin): the group sits this
@@ -1001,6 +1109,9 @@ def _build_digest_levels(
             DIGEST_USER_TEMPLATE.format(facts=facts_block,
                                         text=_items_text(items, cfg)),
             llm, system=DIGEST_SYSTEM, kind="root",
+            shrink=lambda: DIGEST_USER_TEMPLATE.format(
+                facts=facts_block,
+                text=_items_text(items, cfg, char_scale=0.5)),
         )
     if fused is None:
         return rows, reused, failures + 1, True

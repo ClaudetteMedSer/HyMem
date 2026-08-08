@@ -533,6 +533,12 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     aggregation_fusion_failures INTEGER NOT NULL DEFAULT 0,
     aggregation_input_episodes INTEGER NOT NULL DEFAULT 0,
     aggregation_blocking TEXT NOT NULL DEFAULT '',
+    -- v29 deficit attribution (renumbered from 027): NULL = unattributed, NOT
+    -- a fixed point. The fixed-point signature is level0_missed=0 AND
+    -- leaf_changed=0 alongside a nonzero built count, so pre-v29 rows stay
+    -- NULL rather than being backfilled into counterfeit fixed points.
+    aggregation_level0_missed INTEGER,
+    aggregation_leaf_changed INTEGER,
     -- v25 digest attribution: a per-session digest that raises or returns an
     -- unparseable payload is logged and skipped (one bad session must not abort
     -- a dream), and episode creation can stall silently while chunks keep
