@@ -4,11 +4,14 @@ Two ideas borrowed from [BrainDB](https://github.com/dimknaf/braindb), adapted t
 HyMem's embedded, edge-typed architecture, plus the episode-granularity plan
 (added 2026-07-02, see [Plan C](#plan-c--episode-granularity-in-dreaming)),
 plus the narrative-facts campaign (added 2026-07-30, see
-[Campaign E](#campaign-e--the-narrative-facts-roadmap-added-2026-07-30)):
+[Campaign E](#campaign-e--the-narrative-facts-roadmap-added-2026-07-30)),
+plus the MindCache state-anchor expansion plan (added 2026-08-14, see
+[Plan D](#plan-d--state-anchor-expansion-borrowed-from-mindcache-added-2026-08-14)):
 
 - **Idea A** — query-time multi-hop graph traversal with compounding edge weights.
 - **Idea B** — `always_on` Rules as a first-class node type.
 - **Plan C** — decision-grained episode extraction in dreaming.
+- **Plan D** — query-time state-anchor expansion (borrowed from MindCache).
 
 Ideas A and B have been checked against the current RAPTOR/aggregation
 architecture (see [§0](#0-raptor-interference-check)) and are clear to build.
@@ -2024,3 +2027,50 @@ signal (boost ≠ filter); additive tiers never touch another tier's budget; any
 material prompt change bumps its version constant AND extracts forward-only
 (facts) or re-gates (profile precedent); judge posture frozen; LME A/Bs are
 non-regression confirmations, never tuning signals.
+
+---
+
+## Plan D — state-anchor expansion (borrowed from MindCache, added 2026-08-14)
+
+Reviewed 2026-08-14 against MindCache `collapsed_tree`
+(faisalhussain-devs/MindCache): their decision-anchor retrieval seeds a
+secondary lexical expansion from the currently-ACTIVE decision set, pulling
+supporting rows that share no vector overlap with the query but overlap with
+the current state. Full implementation plan (TDD tasks, exact files, stop
+conditions): [`docs/plans/2026-08-14-state-anchor-expansion.md`](docs/plans/2026-08-14-state-anchor-expansion.md).
+
+**Adaptation to HyMem:** the "current state" is not an LLM status label — it is
+the bitemporal active edge set, the SAME predicate as the digest anchor
+(`aggregate.py:829`, `status='active' AND derived=0 AND invalid_at IS NULL`).
+Seed terms = subject canonical + predicate + object canonical (+ typed values),
+run through existing `_fts_search` / `_vec_search` / `_rrf_merge`. Additive
+only, budget-capped (≤5 rows / ≤400 tokens), never reorders or suppresses
+existing rows. Zero schema change, zero prompt change, zero dream spend.
+
+**RAPTOR interference — CLEAR (mirrors Idea A):** query-time read of active
+edges; writes nothing; `_aggregation_search` writes a different ctx field and
+shares no state; digest anchor read is dream-time and unaffected.
+
+**Sequencing:** independent of Campaign E; probe is LLM-free, runs in parallel
+with G-F1b without touching the dream budget.
+
+**Pre-registered gate (verdict must cite numbers; band arithmetic applies):**
+- C1 mechanism: anchored-only hit rate ≥ 5% of sampled queries (gold row
+  reachable ONLY via expansion).
+- C2 harm: 0 wrong-state pulls (invalidated/superseded edges excluded by
+  construction; unit-tested incl. value_supersession'd edges).
+- C3 cost: 0 LLM calls, ≤1 vector call/query, ≤5 rows/≤400 tokens, +100ms
+  latency budget.
+- C4 non-interference: existing rows never reordered; non-target categories
+  within ±2σ on answerable.
+- Verdicts: PASS → flip `state_anchor_enabled`; FAIL-mechanism → close, no
+  score-chasing; UNMEASURED → extend sample once or keep shadow.
+- MindCache's own evidence for anchors is "Observed in Development" (manual) —
+  the reason this gate exists before any build spend beyond the LLM-free probe.
+
+**Rejected MindCache items (recorded 2026-08-14, do not revisit without new
+evidence):** topic taxonomy (graph already encodes structure), Leiden
+partitioning (overkill at our scale), input denoiser (recall risk — could drop
+exactly the turns benchmarks probe), query-time constitution prompt
+(prompting artifact; authority order already covered by origin/confidence
+mechanics), 600MB lazy cross-encoder (rerank tier already exists).
