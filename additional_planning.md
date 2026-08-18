@@ -6,12 +6,16 @@ HyMem's embedded, edge-typed architecture, plus the episode-granularity plan
 plus the narrative-facts campaign (added 2026-07-30, see
 [Campaign E](#campaign-e--the-narrative-facts-roadmap-added-2026-07-30)),
 plus the MindCache state-anchor expansion plan (added 2026-08-14, see
-[Plan D](#plan-d--state-anchor-expansion-borrowed-from-mindcache-added-2026-08-14)):
+[Plan D](#plan-d--state-anchor-expansion-borrowed-from-mindcache-added-2026-08-14)),
+plus the Grove Memory borrows (added 2026-08-18, see
+[Plan E](#plan-e--grove-borrows-borrowed-from-grove-memory-added-2026-08-18)):
 
 - **Idea A** — query-time multi-hop graph traversal with compounding edge weights.
 - **Idea B** — `always_on` Rules as a first-class node type.
 - **Plan C** — decision-grained episode extraction in dreaming.
 - **Plan D** — query-time state-anchor expansion (borrowed from MindCache).
+- **Plan E** — Grove borrows: labeled wildcard, recovery gauge, trajectory
+  resurfacing, null-model gate (borrowed from Grove Memory).
 
 Ideas A and B have been checked against the current RAPTOR/aggregation
 architecture (see [§0](#0-raptor-interference-check)) and are clear to build.
@@ -2074,3 +2078,154 @@ partitioning (overkill at our scale), input denoiser (recall risk — could drop
 exactly the turns benchmarks probe), query-time constitution prompt
 (prompting artifact; authority order already covered by origin/confidence
 mechanics), 600MB lazy cross-encoder (rerank tier already exists).
+
+---
+
+## Plan E — Grove borrows (borrowed from Grove Memory, added 2026-08-18)
+
+Reviewed 2026-08-18 against Grove Memory ("Living Memory", Phoenix Grove
+Systems, 2026, pgsgrove.com/papers/living-memory): a research-intelligence
+memory with use-weighted retrieval strength (ACT-R family + access-diversity
+weighting), principled exploration (labeled wildcards, UCB-selected), and
+consent-gated schema formation. Evidence caveat: the paper withholds ALL
+numeric parameters (§10) and reports zero quantitative results — "full-scale
+semantic evaluation... in progress"; verified behaviors are qualitative.
+Verdict on their evidence: **UNMEASURED**. We borrow mechanisms as hypotheses
+to gate, never as validated results. Full implementation plan (TDD tasks,
+exact files, stop conditions):
+[`docs/plans/2026-08-18-grove-borrows.md`](docs/plans/2026-08-18-grove-borrows.md).
+
+Four items survived the review; each is a separate, independently gated tier.
+
+### E1 — Labeled wildcard slot in augment (mode-gated exploration)
+
+**Adaptation:** after the RRF merge in `query/augment.py`, when
+`cfg.augment_wildcard_mode != "off"`, reserve exactly ONE result slot for a
+relevant-but-dormant row: drawn from the shortlist tail / dormant band
+(never-or-rarely surfaced, derived=0, low recency), appended AFTER the normal
+rows, stamped `wildcard: true` in the row plus a `wildcards` note in the
+augmented context. Never reorders, never suppresses, never displaces a normal
+hit (paper P3: bounded tilt). Mode-gated: `off` (default, precision) /
+`warm` (synthesis) / `hot` (digest-adjacent) — mirrors the paper's
+mode-dependent temperatures. Selection is NOT random: candidates carry an
+uncertainty bonus proportional to how under-observed they are (UCB-lite;
+without a retrieval log, "under-observed" is approximated by a zero-prior-
+surface counter over recent augment calls).
+
+**RAPTOR interference — CLEAR (mirrors Idea A / Plan D):** query-time,
+read-only, writes nothing; `_aggregation_search` writes a different ctx
+field; digest anchor read is dream-time and unaffected.
+
+**Sequencing:** independent of Campaign E; probe is LLM-free (lexical/vector
+only), runs in parallel with G-F1b without touching the dream budget.
+
+**Pre-registered gate:**
+- C1 mechanism: in ≥5% of warm-mode sampled queries the wildcard row is
+  relevant-but-dormant (gold-reachable only via the wildcard slot; shadow
+  probe against `off` baseline).
+- C2 harm: 0 — wildcard never displaces a normal row (test: normal rows
+  byte-identical vs `off` mode), never reorders, absent in `off`.
+- C3 cost: 0 LLM calls; ≤1 extra FTS/vec tail read; ≤1 row / ≤200 tokens.
+- C4 non-interference: per-category answerable deltas within ±2σ on
+  non-target categories.
+- Verdicts: PASS → flip warm-mode default; FAIL-mechanism → close, no
+  score-chasing; UNMEASURED → extend sample once or keep shadow.
+
+### E2 — Recovery-rate gauge (read-only instrument)
+
+**Adaptation:** count, over the store's bitemporal history, the fraction of
+currently-active facts (`status='active' AND derived=0`) that were previously
+retracted/superseded (`invalid_at` set on an earlier edge with the same
+subject/predicate/object triple) and later re-asserted with fresh evidence.
+Report `recovery_rate` in the dream summary log (runner output), NOT in the
+digest payload — digest content hashes into the RAPTOR root cache id (Idea B
+constraint). Pure SQL + counters; zero behavioral change. facts_ab-style
+instrumentation: measures whether the retraction gate is too aggressive (the
+paper's "system tunes its own doubt" — gauge ONLY, **no auto-tuning**;
+auto-tuning conflicts with pre-registration culture).
+
+**RAPTOR interference — CLEAR:** read-only SQL at dream time; touches no
+aggregation table, no cache id, no augment path.
+
+**Sequencing:** independent; LLM-free; can land any time.
+
+**Pre-registered gate:**
+- C1 mechanism: gauge reports a numeric fraction; unit test over a synthetic
+  supersede→re-assert fixture returns the hand-computed value.
+- C2 harm: 0 — read-only; store unchanged (test asserts no writes).
+- C3 cost: one indexed query per dream.
+- C4 non-interference: digest cache id byte-identical before/after.
+- Verdicts: PASS → keep reporting in the dream log; FAIL-mechanism → fix.
+  NO auto-tuning ever.
+
+### E3 — Trajectory-based resurfacing for retracted facts
+
+**Adaptation:** when dreaming's re-assertion path re-proposes a
+previously-retracted/superseded triple (same subject/predicate/object, fresh
+evidence), attach the prior retraction reason(s) as `retraction_history` on
+the new candidate — the paper's "resurfaces carrying its prior refutations as
+questions". Reuses the EXISTING bitemporal predicate (`invalid_at`, retracted
+status); the old edge stays invalid — never resurrected in place, no ported
+status labels (house rule). Hook: the re-assert path in `dreaming/phase1.py`
+(contradiction handling, ~line 669) and/or the evidence-accumulation retract
+in `query/conflicts.py`.
+
+**RAPTOR interference — CLEAR:** dream-time read of the old edge's retraction
+record + a field on the new candidate; aggregation tables untouched; digest
+anchor predicate unchanged.
+
+**Sequencing:** BEHIND Campaign E — touches the dreaming phase-1 re-assert
+path that Campaign E also modifies; lands after those changes settle, and its
+own probe runs shadow-first.
+
+**Pre-registered gate:**
+- C1 mechanism: ≥80% of re-asserted triples with a prior retraction carry
+  `retraction_history` (unit + fixture test).
+- C2 harm: 0 — no behavioral change when no prior retraction exists; old
+  edges never re-activated (asserted).
+- C3 cost: one indexed lookup per re-assertion; 0 LLM calls (reason text read
+  from the existing record, not regenerated).
+- C4 non-interference: contradiction/supersession counters and digest content
+  unchanged.
+- Verdicts: PASS → keep; FAIL-mechanism → close; UNMEASURED → extend sample.
+
+### E4 — Null-model threshold for the consolidation gate
+
+**Adaptation:** candidate clusters surfaced by `consolidate_insights`
+(`dreaming/runner.py:723`, phase2) must beat a null model: domain-label
+shuffling (episode/domain membership permuted) recomputes the detection
+metric distribution; candidates below the calibrated α (default 0.05, or the
+measured spurious-cluster rate) are not surfaced. Statistical, offline,
+LLM-free. Operationalizes the paper's false-discovery-scaling defense —
+"coincidence grows superlinearly with corpus size" — for the RAPTOR
+aggregation tier's own gate.
+
+**RAPTOR interference — CLEAR with a sequence tie:** the gate SUPPRESSES
+surface candidates only; never adds content, never changes digest content or
+cache ids, never touches augment. But it sits ON the aggregation gate that
+the Stage 3c flip decision governs — sequence E4's probe BEHIND the 3c
+decision (same dependency as Plan C).
+
+**Pre-registered gate:**
+- C1 mechanism: null-model test rejects ≥95% of spurious clusters on a
+  synthetic shuffled fixture; real surfaced clusters survive.
+- C2 harm: 0 — suppression only, additive nowhere.
+- C3 cost: offline shuffle+recompute, bounded runtime budget per dream.
+- C4 non-interference: digest root and cache id byte-identical; surfaced
+  cluster SET is a subset of today's (never a superset).
+- Verdicts: PASS → flip gate on; FAIL-mechanism → close; UNMEASURED → keep
+  shadow.
+
+**Rejected Grove items (recorded 2026-08-18, do not revisit without new
+evidence):** dual-space structural-signature distillation (protocol
+unpublished, quality ceiling unproven at scale — the paper's own limitation;
+would touch frozen judge posture), schema taxonomy/annotator lifecycle
+(changes ingestion encoding; consent-gated promotion machinery unjustified at
+HyMem's scale), full UCB exploration machinery (behavior under skewed query
+distributions uncharacterized — the paper's own limitation; the
+labeled-wildcard discipline is the transferable part, E1), auto-tuning of the
+recovery gauge (conflicts with pre-registered gate culture; gauge-only per
+E2), checkpointed worldview re-derivation/diff (bitemporal store already
+provides audit; full re-derivation cost unjustified), MDL compression gate
+(specified but not operationalized even by the paper; no corpus-encoding
+machinery to apply it to).
