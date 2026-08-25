@@ -1,37 +1,97 @@
-"""Plan D — state-anchor selection and seed terms (`hymem/query/state_anchor.py`).
+"""State-anchor expansion (Plan D, borrowed from MindCache) — Tasks 1-4.
 
-A state anchor seeds a secondary expansion from what is CURRENTLY TRUE, so that
-evidence rows sharing no lexical or vector overlap with the query — but overlap
-with the answer state — become reachable. The selection is the digest anchor's
-predicate (`aggregate.py:826-834`) with ONE deliberate deviation, banked before
-the shadow probe ran: separate caps for profile and edges instead of the shared
-one, and no early return.
+Task 1 pins `select_anchor_edges`: the EXACT `_anchor_facts` predicate
+(`dreaming/aggregate.py:829-830`) — active, non-derived, non-superseded,
+margin-positive edges, ordered by evidence margin, bounded by `cap`.
 
-`test_edges_are_not_starved_by_a_large_profile` is the test that carries that
-deviation: `_anchor_facts` returns profile-only once profile rows fill the shared
-cap, which on the production box means 0 of 8754 active edges. Copying that into
-a SEED source would make the tier inert and close Plan D for the wrong reason.
-`test_the_predicate_matches_the_digest_anchor_row_for_row` is its control — the
-deviation must be the cap and nothing else, or the tier stops anchoring on the
-state the digest considers true.
+Task 2 pins `seed_terms_from_edges`: canonical subject/predicate/object plus
+typed-value sub-terms (the value_supersession v3 classes: versions carry their
+alpha prefix, numbers their unit, dates their year) — the discriminative side
+of each class, so a version bump ("python_3.12" -> "python_3.13") still matches
+evidence rows that spell the prefix.
+
+Task 3 pins `state_anchor_expand`: seed terms -> existing FTS (optional vec)
+-> RRF merge -> top_k, deduped by chunk id (entry key), zero-cost inert with
+no seed terms.
+
+Task 4 pins the shadow probe: on a fixture store where the gold evidence row
+is reachable ONLY from the state anchors (not from the query), the probe
+reports exactly one anchored-only hit and a zero wrong-state rate.
+
+The probe and expansion run read-only; every test asserts the store is not
+mutated.
 """
 from __future__ import annotations
 
-import json
+import sqlite3
+import sys
+from pathlib import Path
 
 import pytest
 
-from hymem import HyMem, StubEmbeddingClient
+from hymem import HyMem
 from hymem.core import db as core_db
-from hymem.dreaming.aggregate import _anchor_facts
 from hymem.extraction.llm import StubLLMClient
-from hymem.query.state_anchor import (
-    expand_over_chunks,
-    expand_over_messages,
-    seed_terms_from_edges,
-    select_anchor_edges,
-    select_anchor_profile,
-)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
+from state_anchor_probe import run_probe  # noqa: E402
+
+
+# ── seeding helpers (the tests/test_recovery_probe.py idiom) ────────────────
+
+def _seed_session(conn, session_id: str = "s1") -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions(id, started_at) VALUES (?, CURRENT_TIMESTAMP)",
+        (session_id,),
+    )
+
+
+def _seed_message(conn, msg_id: int, created_at: str, *, session_id: str = "s1") -> None:
+    conn.execute(
+        "INSERT INTO messages(id, session_id, role, content, created_at) "
+        "VALUES (?, ?, 'user', 'x', ?)",
+        (msg_id, session_id, created_at),
+    )
+
+
+def _seed_chunk(conn, chunk_id: str, start_msg: int, text: str,
+                *, session_id: str = "s1") -> None:
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES (?, ?, ?, ?, 'test', ?)",
+        (chunk_id, session_id, start_msg, start_msg, text),
+    )
+
+
+def _seed_edge(conn, subject: str, predicate: str, obj: str, *,
+               pos: int = 3, neg: int = 0, status: str = "active",
+               derived: int = 0, invalid_at: str | None = None) -> int:
+    cur = conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, first_seen, last_seen, last_reinforced, "
+        "valid_at, invalid_at, status, derived) "
+        "VALUES (?, ?, ?, ?, ?, '2024-01-01 00:00:00', CURRENT_TIMESTAMP, "
+        "CURRENT_TIMESTAMP, '2024-01-01 00:00:00', ?, ?, ?)",
+        (subject, predicate, obj, pos, neg, invalid_at, status, derived),
+    )
+    return cur.lastrowid
+
+
+def _seed_evidence(conn, edge_id: int, chunk_id: str, polarity: int = 1) -> None:
+    conn.execute(
+        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity, extracted_at) "
+        "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+        (edge_id, chunk_id, polarity),
+    )
+
+
+def _count_writes(conn) -> dict[str, int]:
+    """Rows in tables the probe must not touch (snapshot before/after compare
+    of the row counts would be stronger, but a write counter over the probe's
+    own connection is impossible — the probe opens its own read-only conn; on
+    THIS connection we just check the tables' row counts are stable)."""
+    tables = ["sessions", "messages", "chunks", "knowledge_graph", "kg_evidence"]
+    return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
 
 
 @pytest.fixture
@@ -41,268 +101,380 @@ def conn(cfg):
     hy.close()
 
 
-def _edge(conn, subject, predicate, obj, *, pos=3, neg=0, status="active",
-          derived=0, invalid_at=None, last_seen="2024-06-01 00:00:00") -> int:
-    cur = conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
-        "pos_evidence, neg_evidence, first_seen, last_seen, last_reinforced, "
-        "invalid_at, status, derived) "
-        "VALUES (?, ?, ?, ?, ?, '2024-01-01 00:00:00', ?, ?, ?, ?, ?)",
-        (subject, predicate, obj, pos, neg, last_seen, last_seen,
-         invalid_at, status, derived),
-    )
-    return cur.lastrowid
+@pytest.fixture
+def anchor_fixture(conn):
+    """One evidence chunk reachable ONLY from the state anchor.
+
+    - Edge: dev_box installed cuda_12.1 (active, margin-positive).
+    - Evidence chunk for that edge: "We installed CUDA 12.1 and PyTorch 2.2
+      on the dev box in January."
+    - Query: "Which GPU system produces model training output?" — shares no
+      FTS token with the evidence chunk, so the baseline augment() misses it
+      and only the anchor expansion can surface it.
+    - A second, query-reachable chunk: "Model training output is stored on
+      nas01." — a topic row that does NOT contain the answer, so a naive
+      query-match does not accidentally count as the gold row.
+    """
+    with core_db.transaction(conn):
+        _seed_session(conn)
+        _seed_message(conn, 1, "2024-01-01 00:00:00")
+        _seed_message(conn, 2, "2024-01-02 00:00:00")
+        _seed_message(conn, 3, "2024-01-03 00:00:00")
+        _seed_chunk(conn, "c-evidence", 1,
+                    "We installed CUDA 12.1 and PyTorch 2.2 on the dev box in January.")
+        _seed_chunk(conn, "c-distractor", 2, "Model training output is stored on nas01.")
+        _seed_edge(conn, "dev_box", "configured_with", "cuda_12.1", pos=3, neg=0)
+        edge_id = conn.execute(
+            "SELECT id FROM knowledge_graph WHERE subject_canonical='dev_box'"
+        ).fetchone()[0]
+        _seed_evidence(conn, edge_id, "c-evidence")
+    return conn
 
 
-def _profile(conn, slot, value, slot_key=None) -> None:
+# ── Task 1: select_anchor_edges ─────────────────────────────────────────────
+
+def test_select_anchor_edges_exact_predicate(conn):
+    """status='active' AND derived=0 AND invalid_at IS NULL AND pos>neg."""
+    with core_db.transaction(conn):
+        _seed_edge(conn, "a", "uses", "postgres", pos=3, neg=0)          # in
+        _seed_edge(conn, "b", "uses", "postgres", pos=3, neg=0, derived=1)  # out
+        _seed_edge(conn, "c", "uses", "postgres", pos=3, neg=0,
+                   invalid_at="2024-03-01")                             # out
+        _seed_edge(conn, "d", "uses", "postgres", pos=3, neg=0, status="retracted")  # out
+        _seed_edge(conn, "e", "uses", "postgres", pos=1, neg=4)         # out (margin)
+
+    from hymem.query.state_anchor import select_anchor_edges
+
+    rows = select_anchor_edges(conn, cap=20)
+    assert [r["subject_canonical"] for r in rows] == ["a"]
+
+
+def test_select_anchor_edges_cap_respected(conn):
+    """The top-`cap` by (pos-neg DESC, last_seen DESC, id) — copy the ORDER BY."""
+    with core_db.transaction(conn):
+        for i, pos in enumerate([2, 9, 5, 1, 7]):
+            _seed_edge(conn, f"svc{i}", "uses", "postgres", pos=pos, neg=0)
+
+    from hymem.query.state_anchor import select_anchor_edges
+
+    rows = select_anchor_edges(conn, cap=3)
+    assert [r["subject_canonical"] for r in rows] == ["svc1", "svc4", "svc2"]
+
+
+def test_select_anchor_edges_zero_cap(conn):
+    with core_db.transaction(conn):
+        _seed_edge(conn, "a", "uses", "postgres", pos=3, neg=0)
+
+    from hymem.query.state_anchor import select_anchor_edges
+
+    assert select_anchor_edges(conn, cap=0) == []
+
+
+# ── Task 2: seed_terms_from_edges ──────────────────────────────────────────
+
+def test_seed_terms_canonical_fields():
+    from hymem.query.state_anchor import seed_terms_from_edges
+
+    edges = [{"subject_canonical": "app", "predicate": "uses", "object_canonical": "postgres"}]
+    assert seed_terms_from_edges(edges) == ["app", "uses", "postgres"]
+
+
+def test_seed_terms_typed_values():
+    from hymem.query.state_anchor import seed_terms_from_edges
+
+    edges = [
+        {"subject_canonical": "dev_box", "predicate": "installed",
+         "object_canonical": "python_3.12"},   # version with alpha prefix
+        {"subject_canonical": "coverage", "predicate": "target",
+         "object_canonical": "65_percent"},    # number with unit
+        {"subject_canonical": "release", "predicate": "on",
+         "object_canonical": "2024-03-01"},    # ISO date
+        {"subject_canonical": "team", "predicate": "uses",
+         "object_canonical": "postgres"},      # free text: object only
+    ]
+    terms = seed_terms_from_edges(edges)
+    assert "python_3.12" in terms and "python" in terms   # vers: prefix key
+    assert "65_percent" in terms and "percent" in terms   # num: unit
+    assert "2024-03-01" in terms and "2024" in terms      # date: year
+    assert "dev_box" in terms and "installed" in terms
+    assert "team" in terms and "postgres" in terms
+
+
+def test_seed_terms_empty_edge_no_terms():
+    from hymem.query.state_anchor import seed_terms_from_edges
+
+    assert seed_terms_from_edges([{}]) == []
+    assert seed_terms_from_edges([]) == []
+    assert seed_terms_from_edges(
+        [{"subject_canonical": None, "predicate": "", "object_canonical": "  "}]
+    ) == []
+
+
+def test_seed_terms_dedup_stable_order():
+    from hymem.query.state_anchor import seed_terms_from_edges
+
+    edges = [
+        {"subject_canonical": "app", "predicate": "uses", "object_canonical": "postgres"},
+        {"subject_canonical": "app", "predicate": "uses", "object_canonical": "postgres"},
+        {"subject_canonical": "app", "predicate": "runs", "object_canonical": "linux"},
+    ]
+    assert seed_terms_from_edges(edges) == ["app", "uses", "postgres", "runs", "linux"]
+
+
+# ── Task 1 (correction): profile leg ───────────────────────────────────────
+
+def _seed_profile(conn, slot: str, value: str, *, slot_key: str | None = None,
+                  invalid_at: str | None = None, confidence: float = 1.0) -> None:
     conn.execute(
-        "INSERT INTO user_profile(slot, slot_key, value, confidence) VALUES (?,?,?,1.0)",
-        (slot, slot_key, value),
+        "INSERT INTO user_profile(slot, slot_key, value, confidence, valid_at, invalid_at) "
+        "VALUES (?, ?, ?, ?, '2024-01-01 00:00:00', ?)",
+        (slot, slot_key, value, confidence, invalid_at),
     )
 
 
-# ── selection: the digest predicate, verbatim ───────────────────────────────
-
-def test_only_active_non_derived_valid_margin_positive_edges_are_selected(conn):
+def _seed_squeeze(conn) -> None:
+    """3 profile rows + 6 edges — enough for a cap of 4 to starve the edges."""
     with core_db.transaction(conn):
-        _edge(conn, "app", "uses", "postgres")                       # keep
-        _edge(conn, "app", "uses", "mysql", status="retracted")      # dropped
-        _edge(conn, "app", "uses", "redis", derived=1)               # dropped
-        _edge(conn, "app", "uses", "mongo", pos=1, neg=4)            # dropped: margin
-        _edge(conn, "app", "uses", "kafka",
-              invalid_at="2024-03-01 00:00:00")                      # dropped: superseded
-
-    edges = select_anchor_edges(conn, edge_cap=20)
-
-    assert [e["o"] for e in edges] == ["postgres"]
+        for val in ["running", "pottery", "reading"]:
+            _seed_profile(conn, "recurring_activity", val, slot_key="melanie")
+        for i in range(6):
+            _seed_edge(conn, f"m{i}", "uses", "postgres", pos=3, neg=0)
 
 
-def test_edges_are_ordered_by_evidence_margin_then_recency(conn):
-    """The digest anchor's ORDER BY, verbatim. Ordering is load-bearing: the cap
-    turns it into a selection, so a different order seeds a different tier."""
-    with core_db.transaction(conn):
-        _edge(conn, "a", "uses", "weak", pos=2, neg=1)
-        _edge(conn, "a", "uses", "strong", pos=9, neg=0)
-        _edge(conn, "a", "uses", "recent", pos=2, neg=1,
-              last_seen="2025-01-01 00:00:00")
+def test_shared_cap_reproduces_the_digest_squeeze(conn):
+    """`shared_cap=` is the digest accounting: profile FIRST, edges the rest.
 
-    edges = select_anchor_edges(conn, edge_cap=20)
+    Kept reproducible ON PURPOSE — this is the leg measured on the box
+    2026-08-25 (1.35% anchored-only). It is NOT the default: see the carrier
+    below.
+    """
+    from hymem.query.state_anchor import select_state_anchor
 
-    assert [e["o"] for e in edges] == ["strong", "recent", "weak"]
-
-
-def test_the_predicate_matches_the_digest_anchor_row_for_row(conn):
-    """The control for the cap deviation. With a cap large enough that
-    `_anchor_facts` never truncates, the selector must return exactly the edges
-    the digest considers true — same filter, same order. If this drifts, the
-    tier is anchoring on a different state than the digest does."""
-    with core_db.transaction(conn):
-        _edge(conn, "app", "uses", "postgres", pos=9)
-        _edge(conn, "app", "deploys_to", "fly", pos=4)
-        _edge(conn, "app", "uses", "mysql", status="retracted")
-        _edge(conn, "app", "uses", "mongo", pos=1, neg=4)
-
-    rendered = [f"{e['s']} {e['p']} {e['o']}" for e in select_anchor_edges(conn, edge_cap=50)]
-
-    assert rendered == _anchor_facts(conn, 50)
+    _seed_squeeze(conn)
+    profiles, edges = select_state_anchor(conn, shared_cap=4)
+    assert len(profiles) == 3
+    assert len(edges) == 1
+    assert edges[0]["subject_canonical"] == "m0"
 
 
 def test_edges_are_not_starved_by_a_large_profile(conn):
-    """THE deviation. `_anchor_facts` gives profile rows the whole cap and
-    returns early (`aggregate.py:823-824`) — on the box, 22 profile rows against
-    cap=20 leaves 0 of 8754 edges. That is right for a prompt block and fatal for
-    a seed source, so the selector budgets the two independently."""
-    with core_db.transaction(conn):
-        for i in range(25):
-            _profile(conn, "relationship", f"person{i}", slot_key=f"k{i}")
-        _edge(conn, "app", "uses", "postgres")
+    """CARRIER for the banked Plan D deviation (correction 5, 2026-08-25).
 
-    assert _anchor_facts(conn, 20) and "postgres" not in " ".join(_anchor_facts(conn, 20))
-    assert [e["o"] for e in select_anchor_edges(conn, edge_cap=20)] == ["postgres"]
+    The default must give each source its OWN cap. Its control is
+    `test_shared_cap_reproduces_the_digest_squeeze` above: without that pair,
+    a single implementation could satisfy either rule and nothing would say
+    which one shipped.
+
+    Why this is load-bearing rather than a preference: under the shared cap the
+    box's 22 profile rows leave an edge budget of ZERO against 8754 active
+    edges, so the tier is inert, C1 reads near zero, and Plan D closes
+    FAIL-mechanism because of the digest's prompt-block budget rather than
+    because state anchors do not work.
+    """
+    from hymem.query.state_anchor import select_state_anchor
+
+    _seed_squeeze(conn)
+    profiles, edges = select_state_anchor(conn, edge_cap=4, profile_cap=4)
+    assert len(profiles) == 3
+    assert len(edges) == 4, "profile rows consumed the edge budget — shared cap leaked back in"
 
 
 def test_each_cap_is_respected_independently(conn):
+    from hymem.query.state_anchor import select_state_anchor
+
+    _seed_squeeze(conn)
+    profiles, edges = select_state_anchor(conn, edge_cap=2, profile_cap=1)
+    assert len(profiles) == 1
+    assert len(edges) == 2
+    # and a zero cap disables exactly one source, never both
+    profiles, edges = select_state_anchor(conn, edge_cap=0, profile_cap=3)
+    assert len(profiles) == 3 and edges == []
+
+
+def test_the_predicate_matches_the_digest_anchor_row_for_row(conn):
+    """CONTROL on the copied predicate: the selector must agree with
+    `_anchor_facts`' EDGE leg exactly. If the digest's clause ever changes,
+    this fails and the copy is re-decided deliberately rather than drifting."""
+    from hymem.dreaming.aggregate import _anchor_facts
+    from hymem.query.state_anchor import select_anchor_edges
+
     with core_db.transaction(conn):
-        for i in range(5):
-            _profile(conn, "relationship", f"person{i}", slot_key=f"k{i}")
-        for i in range(5):
-            _edge(conn, f"app{i}", "uses", "postgres")
+        _seed_edge(conn, "a", "uses", "postgres", pos=5, neg=0)
+        _seed_edge(conn, "b", "uses", "redis", pos=2, neg=4)          # margin <= 0
+        _seed_edge(conn, "c", "uses", "kafka", pos=3, neg=0, derived=1)
+        _seed_edge(conn, "d", "uses", "mysql", pos=3, neg=0,
+                   invalid_at="2024-02-01 00:00:00")
+        _seed_edge(conn, "e", "uses", "sqlite", pos=4, neg=1)
 
-    assert len(select_anchor_edges(conn, edge_cap=2)) == 2
-    assert len(select_anchor_profile(conn, profile_cap=3)) == 3
+    rendered = [f"{r['subject_canonical']} {r['predicate']} {r['object_canonical']}"
+                for r in select_anchor_edges(conn, cap=50)]
+    # No profile rows seeded here, so the digest block IS the edge leg, in order.
+    assert rendered == _anchor_facts(conn, 50)
+    assert rendered == ["a uses postgres", "e uses sqlite"], (
+        "the copied predicate drifted: margin<=0 / derived / invalid_at rows leaked "
+        "in, or the evidence-margin ordering changed"
+    )
 
 
-def test_profile_is_a_separate_seed_source_with_its_own_budget(conn):
-    """Profile rows carry the identity facts the 22-predicate graph vocabulary
-    can never mint (the P4 Stage-0 finding), so they are seeded too — but as
-    their OWN source, so the probe can attribute a hit to edges vs profile
-    instead of reporting one undifferentiated number."""
+def test_select_anchor_profile_rows_excludes_invalidated(conn):
+    from hymem.query.state_anchor import select_anchor_profile_rows
+
     with core_db.transaction(conn):
-        _profile(conn, "employer", "acme_health")
-        _edge(conn, "app", "uses", "postgres")
+        _seed_profile(conn, "recurring_activity", "running")
+        _seed_profile(conn, "recurring_activity", "swimming",
+                      invalid_at="2024-02-01")
+        _seed_profile(conn, "location", "lommel")
 
-    terms = seed_terms_from_edges(select_anchor_edges(conn, edge_cap=20),
-                                  select_anchor_profile(conn, profile_cap=20))
-
-    assert "acme_health" in terms
-    assert "postgres" in terms
+    rows = select_anchor_profile_rows(conn, cap=20)
+    vals = {r.value for r in rows}
+    assert vals == {"running", "lommel"}
 
 
-def test_a_zero_cap_disables_the_source(conn):
-    """House convention: 0 disables, so the tier can be turned off per-source
-    without a flag."""
+def test_seed_terms_from_profile_values_first():
+    from hymem.query.state_anchor import seed_terms_from_profile
+    from hymem.dreaming.user_profile import ProfileEntry
+
+    entries = [
+        ProfileEntry(
+            slot="recurring_activity", slot_key="melanie",
+            value="running pottery", confidence=1.0,
+            evidence_message_id=None, valid_at="2024-01-01 00:00:00",
+        ),
+    ]
+    terms = seed_terms_from_profile(entries)
+    # value + value words + slot_key are the searchable vocabulary
+    for t in ["running", "pottery", "melanie"]:
+        assert t in terms
+    # slot words (not the underscore-joined token) also present
+    assert "recurring" in terms
+    assert "activity" in terms
+
+
+def test_seed_terms_from_profile_empty(conn):
+    from hymem.query.state_anchor import seed_terms_from_profile
+
+    assert seed_terms_from_profile([]) == []
+
+
+# ── Task 3: state_anchor_expand ────────────────────────────────────────────
+
+def test_expand_surfaces_evidence_from_seed_terms(anchor_fixture):
+    """The evidence chunk is FTS-reachable from the anchor; the distractor is
+    reachable from the query instead — Task 4's scenario, measured here at the
+    expansion-core level."""
+    from hymem.query.state_anchor import (
+        select_anchor_edges,
+        seed_terms_from_edges,
+        state_anchor_expand,
+    )
+
+    conn = anchor_fixture
+    edges = select_anchor_edges(conn, cap=20)
+    terms = seed_terms_from_edges(edges)
+    hits = state_anchor_expand(conn, terms, top_k=5)
+
+    ids = [h["chunk_id"] for h in hits]
+    assert "c-evidence" in ids
+    # the query-reachable distractor shares no anchor term ("nas01" etc.)
+    assert "c-distractor" not in ids
+
+
+def test_expand_limits_top_k_and_dedups(conn):
     with core_db.transaction(conn):
-        _edge(conn, "app", "uses", "postgres")
+        _seed_session(conn)
+        _seed_message(conn, 1, "2024-01-01 00:00:00")
+        for i in range(8):
+            _seed_chunk(conn, f"c{i}", 1, f"CUDA 12.1 notes number {i}")
 
-    assert select_anchor_edges(conn, edge_cap=0) == []
+    from hymem.query.state_anchor import state_anchor_expand
+
+    hits = state_anchor_expand(conn, ["cuda_12.1", "cuda_12.1", "cuda"], top_k=5)
+    ids = [h["chunk_id"] for h in hits]
+    assert len(ids) == 5
+    assert len(set(ids)) == 5
 
 
-def test_a_pre_migration_store_degrades_to_empty(conn):
-    """Same contract as every other retrieval helper: a missing table returns []
-    rather than raising, so an old store degrades instead of breaking augment."""
+def test_expand_inert_without_seed_terms(conn):
+    from hymem.query.state_anchor import state_anchor_expand
+
+    assert state_anchor_expand(conn, [], top_k=5) == []
+    assert state_anchor_expand(conn, ["  ", None], top_k=5) == []
+
+
+# ── Task 4: probe ──────────────────────────────────────────────────────────
+
+def test_probe_reports_the_anchored_only_hit(anchor_fixture, tmp_path):
+    """THE smoke test: the gold row is reachable ONLY via anchor expansion.
+    The probe must count it as one anchored-only hit, zero wrong-state pulls,
+    zero vec calls (FTS-only default) and must not mutate the store."""
+    from datetime import datetime
+
+    from hymem import HyMemConfig
+
+    queries = [{
+        "question": "Which GPU system produces model training output?",
+        "gold_chunk_ids": ["c-evidence"],
+        "category": "single-session-user",
+    }]
+    qpath = tmp_path / "queries.json"
+    qpath.write_text(__import__("json").dumps(queries))
+
+    store = tmp_path / "store.sqlite"
+    # copy the fixture store to a temp path so the probe opens it read-only
+    src = anchor_fixture
+    src.execute("VACUUM INTO ?", (str(store),))
+
+    before = _count_writes(src)
+
+    cfg = HyMemConfig(root=tmp_path)
+    summary = run_probe(store, qpath, cfg=cfg)
+
+    assert summary["n_queries"] == 1
+    assert summary["hit_rate"] == 1.0
+    assert summary["wrong_state_rate"] == 0.0
+    assert summary["vec_calls"] == 0
+    assert summary["llm_calls"] == 0
+    assert summary["max_added_rows"] <= 5
+    assert summary["max_added_tokens"] <= 400
+
+    # store not mutated (row counts stable on the original connection)
+    assert _count_writes(src) == before
+
+
+# ── the SECOND corpus (D3/D5: probed separately, at most one ships) ─────────
+
+def test_message_expansion_uses_the_raw_turn_corpus(anchor_fixture):
+    """`expand_over_messages` reaches raw turns, not chunks.
+
+    The chunk arm and the message arm are different corpora with incomparable
+    BM25 scores, and the plan ships AT MOST ONE. Without this test the message
+    arm has no coverage at all and could return chunk rows unnoticed.
+    """
+    from hymem.query.state_anchor import (
+        expand_over_messages,
+        select_anchor_edges,
+        seed_terms_from_edges,
+    )
+
+    conn = anchor_fixture
     with core_db.transaction(conn):
-        conn.execute("DROP TABLE knowledge_graph")
-
-    assert select_anchor_edges(conn, edge_cap=20) == []
-
-
-# ── seed terms ──────────────────────────────────────────────────────────────
-
-def test_seed_terms_carry_subject_predicate_and_object(conn):
-    with core_db.transaction(conn):
-        _edge(conn, "hymem_api", "deploys_to", "fly_io")
-
-    terms = seed_terms_from_edges(select_anchor_edges(conn, edge_cap=20))
-
-    assert set(terms) == {"hymem_api", "deploys_to", "fly_io"}
-
-
-def test_seed_terms_are_deduped_across_edges(conn):
-    """Anchor sets are subject-heavy — the same subject recurs across predicates.
-    Without dedup the FTS query degenerates into one term repeated N times."""
-    with core_db.transaction(conn):
-        _edge(conn, "app", "uses", "postgres")
-        _edge(conn, "app", "uses", "redis")
-
-    terms = seed_terms_from_edges(select_anchor_edges(conn, edge_cap=20))
-
-    assert sorted(terms) == ["app", "postgres", "redis", "uses"]
-
-
-def test_no_edges_means_no_terms_and_therefore_no_cost(conn):
-    """C3 is a cost gate: an empty anchor set must short-circuit before any
-    search runs, not issue an empty FTS query."""
-    assert seed_terms_from_edges([]) == []
-
-
-# ── expansion core ──────────────────────────────────────────────────────────
-# Two corpora, probed separately and shipped at most one (the D5 rule): raw
-# messages are BM25-only — `_VEC_TABLES` (core/db.py:156) has no `vec_messages`
-# — while chunks carry both arms. Which one pays is a measurement, not a guess.
-
-def _session_with_turns(hy, sid, turns):
-    hy.open_session(sid)
-    for role, text in turns:
-        hy.log_message(sid, role, text)
-    hy.close_session(sid)
-
-
-def _chunk(hy, chunk_id, text, sid="s0"):
-    """A chunk row plus its FTS shadow — what persist_chunks writes."""
-    hy.open_session(sid)
-    mid = hy.log_message(sid, "user", text)
-    hy.close_session(sid)
-    with core_db.transaction(hy.conn):
-        hy.conn.execute(
-            "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
-            "salience_reason, text) VALUES (?, ?, ?, ?, 'test', ?)",
-            (chunk_id, sid, mid, mid, text),
+        # Insert the content directly: `messages_fts` has INSERT and DELETE
+        # triggers but NO UPDATE trigger (schema.sql:79-85), so seeding a row
+        # and then UPDATE-ing its content leaves the FTS index holding the old
+        # text and this test would read as a dead message arm.
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, created_at) "
+            "VALUES (4, 's1', 'user', ?, '2024-01-04 00:00:00')",
+            ("The dev box is configured with cuda and pytorch.",),
         )
-        hy.conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) "
-            "SELECT rowid, text FROM chunks WHERE id = ?", (chunk_id,)
-        )
+
+    terms = seed_terms_from_edges(select_anchor_edges(conn, cap=20))
+    hits = expand_over_messages(conn, terms, top_k=5)
+    assert hits, "the raw-turn arm surfaced nothing from the anchor seed"
+    assert all("message_id" in h for h in hits), "message arm returned chunk-shaped rows"
 
 
-def test_chunk_expansion_reaches_a_row_the_query_never_could(hy):
-    """The mechanism, stated as a test: the query says "what do we run on", the
-    evidence says "pinned 15.4 after the vacuum incident", and the only bridge
-    is the anchor term `postgres`. If this fails the tier has no mechanism."""
-    _chunk(hy, "c1", "we pinned postgres 15.4 after the vacuum incident")
+def test_message_expansion_is_inert_without_seed_terms(anchor_fixture):
+    from hymem.query.state_anchor import expand_over_messages
 
-    hits = expand_over_chunks(hy.conn, ["postgres"], top_k=5)
-
-    assert [h.chunk_id for h in hits] == ["c1"]
-
-
-def test_message_expansion_uses_the_raw_turn_corpus(hy):
-    _session_with_turns(hy, "s1", [
-        ("user", "we pinned postgres 15.4 after the vacuum incident"),
-    ])
-
-    hits = expand_over_messages(hy.conn, ["postgres"], top_k=5)
-
-    assert len(hits) == 1
-    assert "vacuum incident" in hits[0].text
-
-
-def test_no_seed_terms_costs_zero_queries(hy):
-    """C3 is a cost gate, so this counts STATEMENTS, not results.
-
-    Asserting on the return value alone would measure nothing: both helpers give
-    [] on an empty seed set whether or not they short-circuit, because an empty
-    FTS query matches nothing. This is a CONTRACT test, not a control for one
-    line — the zero-SQL guarantee is currently provided twice (here, and again
-    by the `_fts_search` / `_message_fts_search` token guards), and it must
-    survive either one being refactored away."""
-    executed: list[str] = []
-    hy.conn.set_trace_callback(executed.append)
-    try:
-        assert expand_over_chunks(hy.conn, [], top_k=5) == []
-        assert expand_over_messages(hy.conn, [], top_k=5) == []
-    finally:
-        hy.conn.set_trace_callback(None)
-
-    assert executed == []
-
-
-def test_expansion_respects_top_k(hy):
-    _session_with_turns(hy, "s1", [
-        ("user", f"postgres note number {i}") for i in range(8)
-    ])
-
-    assert len(expand_over_messages(hy.conn, ["postgres"], top_k=3)) == 3
-
-
-def test_chunk_expansion_costs_exactly_one_embedding_call(hy):
-    """C3: <=1 vector call per query. Seeds are joined into ONE query string, so
-    the whole anchor set embeds once however many edges it holds.
-
-    The assertion is `== 1`, not `<= 1`, deliberately. `_python_cosine_search`
-    returns before embedding when no chunk_embeddings rows exist, so a store
-    without persisted vectors makes this test pass with ZERO calls while
-    exercising nothing — the vacuous-pass trap. Persisting one vector first is
-    what makes the count a measurement."""
-    embedder = StubEmbeddingClient()
-    _chunk(hy, "c1", "postgres notes")
-    with core_db.transaction(hy.conn):
-        hy.conn.execute(
-            "INSERT INTO chunk_embeddings(chunk_id, vector_json, model, dim) "
-            "VALUES ('c1', ?, ?, ?)",
-            (json.dumps(embedder.embed(["postgres notes"])[0]),
-             embedder.model, embedder.dim),
-        )
-    embedder.calls.clear()
-
-    hits = expand_over_chunks(hy.conn, ["postgres", "uses", "app", "redis", "kafka"],
-                              top_k=5, embedding_client=embedder)
-
-    assert len(embedder.calls) == 1, "the vector arm did not run — test is vacuous"
-    assert [h.chunk_id for h in hits] == ["c1"]
-
-
-def test_expansion_degrades_on_a_pre_migration_store(hy):
-    with core_db.transaction(hy.conn):
-        hy.conn.execute("DROP TABLE messages_fts")
-
-    assert expand_over_messages(hy.conn, ["postgres"], top_k=5) == []
+    assert expand_over_messages(anchor_fixture, [], top_k=5) == []
