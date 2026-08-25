@@ -769,6 +769,164 @@ def pct(a: int, b: int) -> float:
     return 100.0 * a / b if b else 0.0
 
 
+# R3's bars, banked with the rest of the gate in the module docstring.
+R3_SHUFFLE_MARGIN_PP = 2.0    # v2 may fire at most this much more on mismatched pairs
+R3_DISCRIM_RATIO = 3.0        # v2's true-pair rate must beat its own shuffled rate by this
+
+
+def _recite_pairs(records: list[dict]) -> list[tuple[dict, str, str]]:
+    """(record, answer, gold) for every record carrying both texts.
+
+    `--out` records keep `_answer`/`_gold` (`rec_with_answer` sets them and
+    nothing strips them before the write), which is what makes this whole
+    verification free: no row is re-judged, only re-scored."""
+    out = []
+    for r in records:
+        a, g = str(r.get("_answer") or ""), str(r.get("_gold") or "")
+        if a and g:
+            out.append((r, a, g))
+    return out
+
+
+def _shuffled_control(pairs: list[tuple[dict, str, str]]) -> list[tuple[str, str]]:
+    """Each answer re-paired with the NEXT row's gold. Deterministic.
+
+    Pairs whose rotated gold happens to equal their own are dropped: a duplicate
+    gold would smuggle a true pair into the control arm and inflate the floor
+    the discriminability ratio is measured against."""
+    n = len(pairs)
+    if n < 2:
+        return []
+    return [(a, pairs[(i + 1) % n][2])
+            for i, (_r, a, g) in enumerate(pairs)
+            if pairs[(i + 1) % n][2].strip().lower() != g.strip().lower()]
+
+
+def _ceiling_under(pairs: list[tuple[dict, str, str]], rule) -> tuple[int, int, float]:
+    """(numerator, denominator, pct) for `c3_ceiling_non_abs` under `rule`.
+
+    Denominator is judged non-`_abs` rows, numerator is the refusals among them
+    that recite — the same split `free_precheck` computes and `build_report`
+    divides by. Recomputed here rather than imported so the two rules can be
+    reported side by side from one banked file."""
+    den = [(r, a, g) for r, a, g in pairs if not r.get("is_abs")]
+    num = sum(1 for r, a, g in den if r.get("answer_refusal") and rule(a, g))
+    return num, len(den), pct(num, len(den))
+
+
+def verify_recitation(records: list[dict]) -> dict:
+    """Re-score every STORED (answer, gold) pair under frozen v1 and under v2.
+
+    Free: the judge calls were already paid for, and this touches no judge at
+    all — only the instrument's own recitation rule.
+
+    THE VACUITY SPLIT IS THE POINT, exactly as in `verify_parse`. A row whose
+    gold appears VERBATIM in the answer is decided by the fast path both rules
+    share, so no token-rule change can move it. Reporting "N rows, M changed"
+    without saying how many rows the token rule was even consulted on would be a
+    certificate signed by an instrument that never met the surface it certifies.
+    `token_rule_consulted` is that denominator.
+
+    Three arms, mapping to the banked gate:
+
+      newly_flagged / no_longer_flagged -> R2. The two rules are NOT nested:
+        v2 is looser on prose and gloss but STRICTER on numerals (it requires
+        the short ones v1 deleted), so it can un-flag a row v1 flagged. Both
+        directions are reported and both are hand-checkable.
+      shuffled control                  -> R3, free, no hand-check needed.
+      ceiling_v1 / ceiling_v2           -> R4, reported not barred.
+    """
+    pairs = _recite_pairs(records)
+    verbatim = [p for p in pairs
+                if p[2].strip().lower() and p[2].strip().lower() in p[1].lower()]
+    consulted = len(pairs) - len(verbatim)
+
+    newly, lost = [], []
+    for r, a, g in pairs:
+        v1, v2 = recites_gold_v1(a, g), recites_gold_v2(a, g)
+        if v2 and not v1:
+            newly.append(r)
+        elif v1 and not v2:
+            lost.append(r)
+
+    ctrl = _shuffled_control(pairs)
+    ctrl_v1 = pct(sum(1 for a, g in ctrl if recites_gold_v1(a, g)), len(ctrl))
+    ctrl_v2 = pct(sum(1 for a, g in ctrl if recites_gold_v2(a, g)), len(ctrl))
+    true_v2 = pct(sum(1 for _r, a, g in pairs if recites_gold_v2(a, g)), len(pairs))
+
+    n1, d1, c1 = _ceiling_under(pairs, recites_gold_v1)
+    n2, d2, c2 = _ceiling_under(pairs, recites_gold_v2)
+
+    r3_margin_ok = ctrl_v2 <= ctrl_v1 + R3_SHUFFLE_MARGIN_PP
+    r3_ratio_ok = ctrl_v2 == 0.0 or true_v2 >= R3_DISCRIM_RATIO * ctrl_v2
+    r3_pass = bool(ctrl) and r3_margin_ok and r3_ratio_ok
+
+    if consulted == 0:
+        verdict = ("VACUOUS — every stored pair is decided by the verbatim fast "
+                   "path both rules share. The token rule was consulted on ZERO "
+                   "rows, so 0 changes here cannot fail to be 0. This file "
+                   "cannot answer R2 or R3.")
+    elif not ctrl:
+        verdict = ("R3 UNMEASURED — the shuffled control is empty (fewer than "
+                   "two distinct golds), so discriminability is untested. Do "
+                   "not read the change counts as a PASS.")
+    elif not r3_pass:
+        verdict = (f"R3 FAIL — v2 fires on {ctrl_v2:.2f}% of MISMATCHED pairs "
+                   f"(v1 {ctrl_v1:.2f}%, margin {R3_SHUFFLE_MARGIN_PP}pp; true-pair "
+                   f"{true_v2:.2f}%, ratio bar {R3_DISCRIM_RATIO}x). The rule is "
+                   "measuring text volume, not recitation. Close and keep v1.")
+    else:
+        verdict = (f"R3 PASS — v2 fires on {ctrl_v2:.2f}% of mismatched pairs vs "
+                   f"{true_v2:.2f}% of true pairs. R2 IS STILL OPEN: hand-check "
+                   f"the {len(newly)} newly-flagged row(s) before flipping the "
+                   "alias. R3 clearing does not license the flip on its own.")
+
+    return {
+        "n": len(pairs),
+        "verbatim_decided": len(verbatim),
+        "token_rule_consulted": consulted,
+        "newly_flagged": len(newly),
+        "newly_flagged_ids": [r.get("id") for r in newly],
+        "no_longer_flagged": len(lost),
+        "no_longer_flagged_ids": [r.get("id") for r in lost],
+        "control_n": len(ctrl),
+        "control_rate_v1": ctrl_v1,
+        "control_rate_v2": ctrl_v2,
+        "true_pair_rate_v2": true_v2,
+        "r3_pass": r3_pass,
+        "ceiling_v1": {"num": n1, "den": d1, "pct": c1},
+        "ceiling_v2": {"num": n2, "den": d2, "pct": c2},
+        "verdict": verdict,
+    }
+
+
+def write_recitation_sample(records: list[dict], out: str,
+                            k: int = HANDCHECK_K) -> Path | None:
+    """R2's hand-check arm: the rows v2 flags and v1 did not, plus the reverse.
+
+    Written to a file because R2 is the arm that cannot be automated — a token
+    rule cannot tell you whether a refusal genuinely recited the gold. Labelled
+    by direction so the two are scored separately: they are different errors
+    (`newly` = a wrongly-licensed spend, `lost` = a numeral v1 never checked)."""
+    rows = []
+    for r, a, g in _recite_pairs(records):
+        v1, v2 = recites_gold_v1(a, g), recites_gold_v2(a, g)
+        if v1 == v2:
+            continue
+        rows.append({"id": r.get("id"), "direction": "newly" if v2 else "lost",
+                     "is_abs": r.get("is_abs"), "verdict": r.get("verdict"),
+                     "answer_refusal": r.get("answer_refusal"),
+                     "_gold": g, "_answer": a})
+    if not rows:
+        return None
+    newly = [r for r in rows if r["direction"] == "newly"][:k]
+    lost = [r for r in rows if r["direction"] == "lost"][:k]
+    path = Path(out).with_suffix(".recitation.json")
+    path.write_text(json.dumps({"newly": newly, "lost": lost}, indent=2),
+                    encoding="utf-8")
+    return path
+
+
 # Licence codes, in the order the branches must be evaluated.
 LICENCE_NO_REFUSALS = "NO_REFUSALS"
 LICENCE_NO_DENOMINATOR = "NO_DENOMINATOR"
@@ -983,6 +1141,11 @@ def main(argv=None, client=None) -> int:
                          "frozen legacy rule and the live one, and count the "
                          "verdicts that change. Zero = the parse fix moved no "
                          "canonical number on that corpus.")
+    ap.add_argument("--verify-recitation", metavar="AUDIT.json",
+                    help="FREE. Re-score the stored (answer, gold) pairs under "
+                         "frozen recites_gold_v1 and v2, with the vacuity split "
+                         "and the shuffled-gold control (R3). Writes the "
+                         "newly/no-longer-flagged rows for R2's hand-check.")
     ap.add_argument("--bench", choices=("locomo", "lme", "msc"), default="locomo")
     ap.add_argument("--limit", type=int, default=None,
                     help="deterministic content-addressed sample size")
@@ -1004,6 +1167,32 @@ def main(argv=None, client=None) -> int:
     if args.handcheck:
         fp, fn = args.handcheck.split(",")
         handcheck = (int(fp), int(fn))
+
+    if args.verify_recitation:
+        saved = json.loads(Path(args.verify_recitation).read_text(encoding="utf-8"))
+        res = verify_recitation(saved["records"])
+        print(f"\n  RECITATION v1 -> v2 — {args.verify_recitation} (FREE, no LLM)")
+        print(f"    stored pairs: {res['n']}")
+        print(f"    decided by the verbatim fast path (immune): "
+              f"{res['verbatim_decided']}")
+        print(f"    token rule actually consulted on: "
+              f"{res['token_rule_consulted']}")
+        print(f"    NEWLY flagged by v2: {res['newly_flagged']}  "
+              f"(R2 hand-check arm)")
+        print(f"    NO LONGER flagged by v2: {res['no_longer_flagged']}  "
+              f"(v2 is stricter on numerals)")
+        print(f"    R3 control — v1 {res['control_rate_v1']:.2f}% / v2 "
+              f"{res['control_rate_v2']:.2f}% on {res['control_n']} MISMATCHED "
+              f"pairs; v2 true-pair {res['true_pair_rate_v2']:.2f}%")
+        print(f"    R4 licence — ceiling v1 {res['ceiling_v1']['num']}/"
+              f"{res['ceiling_v1']['den']} = {res['ceiling_v1']['pct']:.2f}%  ->  "
+              f"v2 {res['ceiling_v2']['num']}/{res['ceiling_v2']['den']} = "
+              f"{res['ceiling_v2']['pct']:.2f}%")
+        sample = write_recitation_sample(saved["records"], args.verify_recitation)
+        if sample:
+            print(f"    R2 hand-check sample -> {sample}")
+        print(f"\n    {res['verdict']}\n")
+        return 0
 
     if args.verify_parse:
         saved = json.loads(Path(args.verify_parse).read_text(encoding="utf-8"))

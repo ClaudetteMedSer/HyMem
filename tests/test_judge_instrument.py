@@ -702,6 +702,290 @@ def test_gold_recitation_check_is_strict_in_the_safe_direction():
     assert JA.recites_gold(refusal, "") is False
 
 
+# ── recites_gold v1 -> v2: the pre-registered token-rule gate (R1-R4) ────
+#
+# The 2026-08-25 audit hand-read all 10 rows of C3's numerator: zero genuine
+# judge errors, and 5 of 10 were v1 FALSE NEGATIVES. These fixtures reconstruct
+# the recorded MECHANISMS; the original rows live in judge_audit.json on the
+# box, and whether v2 recovers all five of THEM is what --verify-recitation
+# measures. A fixture pass is not that measurement, and must not be reported as
+# one.
+
+# (label, answer, gold) — every one of these is a v1 False that v2 must recover.
+#
+# NOTE THE DIRECTION. The banked note records two v1 defects in one breath, and
+# they point OPPOSITE WAYS: discarding the numerals makes v1 more PERMISSIVE
+# (it fires without the number), while mandating the gloss makes it more
+# RESTRICTIVE. Only the second can produce a false negative, so only the second
+# belongs here. v1's numeral blindness is a precision defect and is pinned by
+# `test_v2_holds_numerals_at_zero_tolerance` and the not-nested test instead.
+_R1_FIXTURES = [
+    ("numerals deleted by len(t) > 2, and the gloss made mandatory",
+     "I can't determine that from the context, though it mentions 22 days "
+     "and 21 days.",
+     "22 days (21 days is also acceptable)"),
+    ("the same widening written as a trailing clause, not a parenthetical",
+     "I'm not able to say. The notes put the gap at 22 days.",
+     "22 days, 21 days is also acceptable"),
+    ("one prose word missed in an otherwise complete recitation",
+     "I'm not able to say, but the context mentions she started the "
+     "medication in March.",
+     "she started taking the medication in March"),
+]
+
+
+@pytest.mark.parametrize("label,answer,gold", _R1_FIXTURES,
+                         ids=[f[0][:40] for f in _R1_FIXTURES])
+def test_R1_v2_recovers_each_recorded_false_negative_mechanism(label, answer, gold):
+    """R1 recall. Each fixture must be a v1 False AND a v2 True.
+
+    Asserting BOTH halves is what makes this a recall test rather than a
+    tautology: a fixture v1 already passes proves nothing about the change."""
+    assert JA.recites_gold_v1(answer, gold) is False, \
+        f"fixture does not reproduce the defect ({label}) — v1 already passes it"
+    assert JA.recites_gold_v2(answer, gold) is True, \
+        f"v2 fails to recover the recorded mechanism: {label}"
+
+
+def test_R1_is_NOT_the_gate_and_the_docstring_says_so():
+    """The banked gate must keep saying R1 alone cannot license the flip.
+
+    R1 re-finds the rows the rule was written from. If a later edit quietly
+    promotes it to the pass criterion, the gate stops being a gate — this is
+    the same post-hoc-bar-moving the C3 ledger refuses by name."""
+    doc = JA.__doc__
+    assert "R1 ALONE CANNOT BE THE GATE" in doc
+    assert "R2 and R3 are the gate" in doc
+
+
+def test_v2_holds_numerals_at_zero_tolerance():
+    """The asymmetry that pays for v2's prose slack.
+
+    v2 is LOOSER than v1 on gloss and on one missing prose word, so it must be
+    STRICTER somewhere or it is simply a loosening. Numerals are that
+    somewhere: a wrong or absent number is not a recitation, and it is the
+    numerals v1 was deleting in the first place."""
+    gold = "the meeting ran 45 minutes"
+    assert JA.recites_gold_v2("I don't know; the meeting ran 45 minutes.", gold) is True
+    # Same prose, wrong number: v2 refuses where a pure loosening would not.
+    assert JA.recites_gold_v2("I don't know; the meeting ran 40 minutes.", gold) is False
+    # And the number missing entirely.
+    assert JA.recites_gold_v2("I don't know; the meeting ran a while.", gold) is False
+
+
+def test_the_two_recitation_rules_are_NOT_nested():
+    """Both directions of change are real, which is why both are hand-checked.
+
+    v2 flags rows v1 missed (numerals, gloss) AND un-flags rows v1 caught,
+    because v1's `len(t) > 2` filter deleted the very token v2 now requires.
+    A verifier reporting only `newly_flagged` would under-report the change."""
+    newly_gold, newly_ans = ("22 days (21 days is also acceptable)",
+                             "I can't say — the context mentions 22 days.")
+    lost_gold, lost_ans = ("5 kilometres apart",
+                           "I don't have that; the notes say the towns are "
+                           "kilometres apart.")
+    assert (JA.recites_gold_v1(newly_ans, newly_gold),
+            JA.recites_gold_v2(newly_ans, newly_gold)) == (False, True)
+    assert (JA.recites_gold_v1(lost_ans, lost_gold),
+            JA.recites_gold_v2(lost_ans, lost_gold)) == (True, False)
+
+
+def test_v2_keeps_every_guarantee_v1_had_in_the_safe_direction():
+    """The pinned v1 behaviours that must survive the loosening."""
+    refusal = ("I can't tell which is her personal best, though the context "
+               "mentions 3:42.")
+    assert JA.recites_gold_v2(refusal, "3:42") is True       # verbatim fast path
+    assert JA.recites_gold_v2(refusal, "2:58") is False      # mismatched gold
+    assert JA.recites_gold_v2("", "3:42") is False
+    assert JA.recites_gold_v2(refusal, "") is False
+
+
+def test_a_gold_that_is_entirely_gloss_does_not_match_everything():
+    """The degenerate case the gloss-stripper has to refuse.
+
+    Stripping the gloss from a gold that is ONLY gloss leaves no content
+    tokens. Returning True there would make the rule fire on every answer —
+    a ceiling instrument, not a check."""
+    assert JA._gold_primary_clause("(also acceptable)").strip() == "(also acceptable)"
+    assert JA.recites_gold_v2("nothing relevant here at all", "(also acceptable)") is False
+
+
+def test_the_shipping_alias_is_still_v1_until_the_gate_runs():
+    """STATUS: UNRUN. The alias is the flip, and it has not happened.
+
+    Flipping it before --verify-recitation returns a PASS would restate the C3
+    footnote and the spend licence on an unmeasured rule — the licence being
+    the part that can wrongly authorise money."""
+    assert JA.recites_gold is JA.recites_gold_v1
+    assert "STATUS: UNRUN" in JA.__doc__
+
+
+def test_recites_gold_v1_stays_frozen_at_the_pre_fix_behaviour():
+    """Exists solely to FAIL on a well-meant tidy-up, like `shipping_verdict`.
+
+    v1 produced C3 10/470, the 5-of-10 decomposition and the 16/470 = 3.40%
+    ceiling that licensed the 2026-08-25 spend. Re-syncing it to v2 would make
+    --verify-recitation's before/after diff a constant zero BY CONSTRUCTION."""
+    # The exact defect v1 must keep exhibiting: numerals below the length filter.
+    assert JA.recites_gold_v1(
+        "I can't say — the context mentions 22 days.",
+        "22 days (21 days is also acceptable)") is False
+    assert JA.recites_gold_v1 is not JA.recites_gold_v2
+
+
+# ── --verify-recitation: the free before/after check, and its vacuity split ──
+
+def _rrec(rid, gold, answer, *, is_abs=False, refusal=True, verdict=True):
+    return {"id": rid, "is_abs": is_abs, "answer_refusal": refusal,
+            "verdict": verdict, "_gold": gold, "_answer": answer}
+
+
+def test_verify_recitation_counts_both_directions_of_change():
+    recs = [
+        _rrec("n1", "22 days (21 days is also acceptable)",
+              "I can't say — the context mentions 22 days."),
+        _rrec("l1", "5 kilometres apart",
+              "I don't have that; the notes say the towns are kilometres apart."),
+    ]
+    res = JA.verify_recitation(recs)
+    assert res["newly_flagged"] == 1 and res["newly_flagged_ids"] == ["n1"]
+    assert res["no_longer_flagged"] == 1 and res["no_longer_flagged_ids"] == ["l1"]
+
+
+def test_a_verbatim_only_corpus_is_reported_as_VACUOUS():
+    """The E3 trap, reappearing inside the verification of a fix for it.
+
+    A row whose gold appears verbatim in the answer is decided by the fast path
+    BOTH rules share, so no token-rule change can move it. On such a corpus
+    `newly_flagged == 0` cannot fail to be 0, and reporting that as "the change
+    is inert" would be a certificate signed by an instrument that never met the
+    surface it certifies. Mirrors
+    `test_a_zero_flip_result_on_a_compliant_corpus_is_reported_as_VACUOUS`."""
+    recs = [_rrec("v1", "3:42", "I can't tell, though the context mentions 3:42."),
+            _rrec("v2", "blue", "I don't know; she did mention blue.")]
+    res = JA.verify_recitation(recs)
+    assert res["newly_flagged"] == 0 and res["no_longer_flagged"] == 0
+    assert res["token_rule_consulted"] == 0
+    assert res["verbatim_decided"] == 2
+    assert "VACUOUS" in res["verdict"]
+
+
+def test_the_vacuity_split_clears_when_the_token_rule_is_actually_consulted():
+    """The other half of the guard: it must be able to NOT trip."""
+    recs = [_rrec("v1", "3:42", "I can't tell, though the context mentions 3:42."),
+            _rrec("t1", "22 days (21 days is also acceptable)",
+                  "I can't say — the context mentions 22 days.")]
+    res = JA.verify_recitation(recs)
+    assert res["token_rule_consulted"] == 1
+    assert "VACUOUS" not in res["verdict"]
+
+
+def test_R3_control_pairs_each_answer_with_a_DIFFERENT_gold():
+    """R3's negative control, and the reason it is not a formality.
+
+    A loose similarity check on this exact shape false-positived at 55% against
+    an 11% correct-answer control earlier in this project and the number was
+    retracted. If v2 fires as often on mismatched pairs as on true ones it is
+    measuring text volume; the shuffled arm is what says so for free."""
+    recs = [_rrec("a", "22 days", "I can't say — the context mentions 22 days."),
+            _rrec("b", "blue", "I don't know; she did mention blue."),
+            _rrec("c", "17 March", "No idea, though 17 March comes up.")]
+    res = JA.verify_recitation(recs)
+    assert res["control_n"] == 3
+    assert res["control_rate_v2"] == 0.0
+    assert res["true_pair_rate_v2"] == 100.0
+    assert res["r3_pass"] is True
+
+
+def test_R3_FAILS_a_rule_that_fires_on_mismatched_pairs():
+    """The guard asserted to TRIP, not only to clear.
+
+    Every gold's tokens appear in every answer here, so a recitation rule
+    cannot distinguish true pairs from shuffled ones — it fires at the same
+    rate on both. R3 must call that out rather than report a healthy
+    `newly_flagged` count."""
+    # Every gold's tokens appear in every answer, but no gold appears
+    # VERBATIM — otherwise the vacuity branch fires before R3 is reached.
+    shared = ("I can't say; the notes mention a shade of blue, a shade of "
+              "green and a shade of red.")
+    recs = [_rrec("a", "blue shade", shared),
+            _rrec("b", "green shade", shared),
+            _rrec("c", "red shade", shared)]
+    res = JA.verify_recitation(recs)
+    assert res["control_rate_v2"] > 0.0
+    assert res["r3_pass"] is False
+    assert "R3 FAIL" in res["verdict"]
+
+
+def test_R3_control_drops_pairs_whose_shuffled_gold_equals_their_own():
+    """A duplicate gold would smuggle a TRUE pair into the control arm and
+    inflate the floor the discriminability ratio is measured against."""
+    # Non-verbatim on purpose: a verbatim pair would trip the VACUOUS branch
+    # first and this guard would never be reached.
+    recs = [_rrec("a", "22 elapsed days", "I can't say; 22 days elapsed."),
+            _rrec("b", "22 elapsed days", "No idea; 22 days had elapsed.")]
+    res = JA.verify_recitation(recs)
+    assert res["control_n"] == 0
+    assert "R3 UNMEASURED" in res["verdict"]
+
+
+def test_R4_ceiling_is_reported_under_BOTH_rules_on_the_same_denominator():
+    """R4. The licence numerator is `recites_gold`, so a token-rule change
+    changes the spend arithmetic and not merely the C3 footnote. Both ceilings
+    are printed side by side, over the non-`_abs` denominator `build_report`
+    divides by — an `_abs` row that refuses AND recites is the INTENDED
+    behaviour, never the defect."""
+    recs = [
+        _rrec("n1", "22 days (21 days is also acceptable)",
+              "I can't say — the context mentions 22 days."),
+        _rrec("a1", "17 March", "I don't know, the context mentions 17 March.",
+              is_abs=True),
+        _rrec("c1", "blue", "Her favourite colour is blue.", refusal=False),
+    ]
+    res = JA.verify_recitation(recs)
+    assert res["ceiling_v1"]["den"] == res["ceiling_v2"]["den"] == 2  # _abs excluded
+    assert res["ceiling_v1"]["num"] == 0
+    assert res["ceiling_v2"]["num"] == 1
+
+
+def test_R2_hand_check_sample_labels_the_two_directions_separately(tmp_path):
+    """R2 is the arm that cannot be automated — a token rule cannot tell you
+    whether a refusal genuinely recited the gold. The two directions are
+    different errors and are scored separately: `newly` risks a wrongly
+    LICENSED spend, `lost` is a numeral v1 never checked."""
+    recs = [
+        _rrec("n1", "22 days (21 days is also acceptable)",
+              "I can't say — the context mentions 22 days."),
+        _rrec("l1", "5 kilometres apart",
+              "I don't have that; the notes say the towns are kilometres apart."),
+    ]
+    path = JA.write_recitation_sample(recs, str(tmp_path / "aud.json"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert [r["id"] for r in payload["newly"]] == ["n1"]
+    assert [r["id"] for r in payload["lost"]] == ["l1"]
+    assert payload["newly"][0]["_gold"] and payload["newly"][0]["_answer"]
+
+
+def test_recitation_sample_writes_nothing_when_the_rules_agree(tmp_path):
+    recs = [_rrec("v1", "3:42", "I can't tell, though the context mentions 3:42.")]
+    assert JA.write_recitation_sample(recs, str(tmp_path / "aud.json")) is None
+
+
+def test_verify_recitation_cli_path_is_reachable_and_free(tmp_path, capsys):
+    """The CLI branch, exercised. An unreachable code path reads as PASS."""
+    aud = tmp_path / "aud.json"
+    aud.write_text(json.dumps({"records": [
+        _rrec("n1", "22 days (21 days is also acceptable)",
+              "I can't say — the context mentions 22 days."),
+        _rrec("b", "blue", "I don't know; she did mention blue."),
+    ]}), encoding="utf-8")
+    assert JA.main(["--verify-recitation", str(aud)]) == 0
+    out = capsys.readouterr().out
+    assert "RECITATION v1 -> v2" in out and "FREE, no LLM" in out
+    assert "token rule actually consulted on: 1" in out
+    assert "R3 control" in out and "R4 licence" in out
+
+
 # -- Degeneracy guards. Each is asserted to TRIP and, separately, to CLEAR, so
 # -- none of them can be a guard that is always on (vacuously safe) or always
 # -- off (vacuously absent).
