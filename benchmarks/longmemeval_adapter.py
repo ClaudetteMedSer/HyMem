@@ -1193,10 +1193,12 @@ def parse_judge_verdict(raw: str) -> bool:
       1. An `[LLM_ERROR: ...]` sentinel is never a verdict. It already scored
          `False` by luck (no "yes" substring); it now scores `False` by
          construction, so an outage message that happens to contain the word
-         cannot be read as the judge saying the answer was correct. This does
-         NOT make the outage visible to the caller — `judge_answer` returns a
-         bare bool and has no channel for that; surfacing it is a separate
-         change that touches five call sites across three adapters.
+         cannot be read as the judge saying the answer was correct. Visibility
+         is no longer this function's problem: `judge_scored` (D3, 2026-08-26)
+         reports the sentinel as `correct=None` — UNSCORED, not wrong — and
+         every call site across the three adapters goes through it. This rule
+         stays because the two are independent: a sentinel must fail closed
+         even where a caller ignores the channel.
       2. A negated affirmative scores `False`.
       3. Otherwise the FIRST of `\byes\b` / `\bno\b` wins; no verdict token at
          all scores `False`, the same fail-closed direction as the empty reply.
@@ -1455,9 +1457,11 @@ def evaluate_question(
                                  distilled=distilled_lines,
                                  narrative_facts=narrative_facts)
 
-    # Judge (binary yes/no)
-    correct = judge_answer(judge_llm, question_type, question, answer, ai_answer)
-    print(f"    Correct: {correct} | Answer: {ai_answer[:120]}...", flush=True)
+    # Judge (binary yes/no, or None when the JUDGE itself errored — D3)
+    correct, judge_raw = judge_scored(judge_llm, question_type, question,
+                                      answer, ai_answer)
+    print(f"    Correct: {correct if correct is not None else 'UNSCORED (judge error)'}"
+          f" | Answer: {ai_answer[:120]}...", flush=True)
 
     return {
         "question_id": question_id,
@@ -1469,6 +1473,11 @@ def evaluate_question(
         "answer": str(answer),
         "hypothesis": ai_answer,
         "correct": correct,
+        # The judge's own reply, kept for the same reason the strings above are
+        # un-clipped: a discarded reply is why judge_audit had to re-judge 500
+        # rows to measure a rate that had already been produced once. ~10 tokens.
+        "judge_raw": judge_raw,
+        "judge_error": correct is None,
         "num_sessions": stats["sessions"],
         "num_messages": stats["messages"],
         "num_memories": len(memories),
@@ -1505,7 +1514,11 @@ def evaluate_question(
 
 
 def compute_scores(results: list[dict]) -> dict:
-    """Compute accuracy by question type."""
+    """Compute accuracy by question type, over SCORED rows only."""
+    # UNSCORED rows (correct is None — the judge errored, D3) are dropped HERE,
+    # once, rather than guarded at each summation below. They are reported by
+    # `judge_error_note`, never counted wrong.
+    results = scored(results)
     by_type = defaultdict(list)
     for r in results:
         qtype = r["question_type"]
@@ -1542,6 +1555,10 @@ def compute_abstention_scores(results: list[dict]) -> dict:
     against strict with the abstention cost made explicit. If overall goes up while
     ABSTENTION drops, the gain is partly a hallucination trade, not a clean win.
     """
+    # UNSCORED rows (correct is None — the judge errored, D3) are dropped HERE,
+    # once, rather than guarded at each summation below. They are reported by
+    # `judge_error_note`, never counted wrong.
+    results = scored(results)
     answerable: list[bool] = []
     abstention: list[bool] = []
     by_cat: dict[str, dict[str, list[bool]]] = defaultdict(
@@ -1597,6 +1614,10 @@ def compute_recall_diagnostics(results: list[dict]) -> dict:
     The miss split is the actionable signal: retrieval-dominant → embeddings/
     chunking; ranking-dominant → rerank/budget/packing.
     """
+    # UNSCORED rows (correct is None — the judge errored, D3) are dropped HERE,
+    # once, rather than guarded at each summation below. They are reported by
+    # `judge_error_note`, never counted wrong.
+    results = scored(results)
     by_type: dict[str, list[dict]] = defaultdict(list)
     for r in results:
         by_type[r["question_type"].replace("_abs", "")].append(r)
@@ -2000,7 +2021,12 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
     out = {"question_id": q_data.get("question_id"), "question": question,
            "gold_answer": str(answer), "ability": ability, "gold_in_context": None,
            "distill_calls": 0, "distill_kept": 0, "distilled": [], "ai_answer": "",
-           "correct": False, "error": None}
+           "correct": False, "error": None,
+           # Defaults so the record carries the D3 channel even when the judge
+           # branch below is never reached (an exception before judging leaves
+           # `correct` False guarded by `error`, which is reader-side and out of
+           # D3's scope — D3 is about the JUDGE failing, not the reader).
+           "judge_raw": "", "judge_error": False}
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-distill-"))
     hy = None
@@ -2045,7 +2071,11 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                                     distilled=distilled,
                                     narrative_facts=narrative_facts)
         out["ai_answer"] = ai_answer
-        out["correct"] = judge_answer(judge_llm, question_type, question, answer, ai_answer)
+        _correct, _judge_raw = judge_scored(judge_llm, question_type, question,
+                                            answer, ai_answer)
+        out["correct"] = _correct
+        out["judge_raw"] = _judge_raw
+        out["judge_error"] = _correct is None
     except Exception as e:
         out["error"] = str(e)
     finally:
@@ -2242,13 +2272,22 @@ def _rejudge_run(args, api_key: str) -> None:
 
     def _rj(r: dict) -> dict:
         hyp = str(r.get("hypothesis", ""))
+        judge_raw = ""
         if not hyp or is_llm_error(hyp) or r.get("error"):
             new, judged = bool(r.get("correct")), False   # nothing judgeable → keep prior
         else:
-            new = judge_answer(judge_llm, r.get("question_type", ""),
-                               r.get("question", ""), str(r.get("answer", "")), hyp)
-            judged = True
+            verdict, judge_raw = judge_scored(
+                judge_llm, r.get("question_type", ""), r.get("question", ""),
+                str(r.get("answer", "")), hyp)
+            # A JUDGE error keeps the prior verdict and leaves `_rejudged` False,
+            # reusing the answer-side rule one line up rather than inventing a
+            # second one. Overwriting with None would drop the row out of the
+            # flip denominator AND destroy the baseline it is being compared to.
+            new, judged = (bool(r.get("correct")), False) if verdict is None \
+                else (verdict, True)
         out = dict(r)
+        out["judge_raw"] = judge_raw
+        out["judge_error"] = bool(judge_raw) and is_llm_error(judge_raw)
         out["correct_original"] = r.get("correct")
         out["correct"] = new
         out["_rejudged"] = judged
@@ -2685,11 +2724,16 @@ def main():
 
     def _progress(done: int):
         elapsed = time.time() - start_time
-        acc = sum(1 for r in all_results if r.get("correct")) / max(1, len(all_results))
+        acc = accuracy(all_results)
+        n_err = len(judge_error_rows(all_results))
         suffix = f" (×{args.workers} workers)" if args.workers > 1 else ""
+        # An outage should be visible WHILE the run burns reader calls, not only
+        # in the post-mortem — that is the whole point of D3. Silent when zero:
+        # the run summary states the denominator instead.
+        err = f" | ⚠ UNSCORED (judge error): {n_err}" if n_err else ""
         print(f"  ── Progress: {done}/{total} | Acc: {acc*100:.1f}% | "
-              f"Elapsed: {elapsed:.0f}s | Avg: {elapsed/max(1, done):.0f}s/q{suffix}",
-              flush=True)
+              f"Elapsed: {elapsed:.0f}s | Avg: {elapsed/max(1, done):.0f}s/q"
+              f"{suffix}{err}", flush=True)
 
     if args.workers > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2733,7 +2777,12 @@ def main():
               f"{n_calls} extraction calls (included in Answer calls above)")
     print(f"  Avg time/question: {elapsed/len(questions):.0f}s")
 
-    # Report
+    # Report. The judge-error line comes FIRST and is unconditional: a score
+    # printed without it cannot be read, because the reader cannot tell an
+    # accuracy over n rows from an accuracy over n-k. When k is 0 the line
+    # states the denominator instead, so "0 errors" is never a claim made by an
+    # instrument that had nothing to measure.
+    print(f"\n  {judge_error_note(all_results)}")
     scores = compute_scores(all_results)
     print_report(scores, {
         "answer_model": args.answer_model,

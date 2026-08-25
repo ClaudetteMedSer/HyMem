@@ -493,13 +493,14 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
         gold_in_context = _lex_match(ex["answer"], joined, tau=0.6)
         gold_in_pool = gold_in_context or _lex_match(
             ex["answer"], " ".join(info["pool"]), tau=0.6)
+        judge_raw = ""        # only the judge branch below can set this
         if args.sim:
             # Offline: no answer/judge LLM. Test the thing --sim CAN test — did
             # retrieval surface the gold answer?
             ai = memories[0]["content"] if memories else ""
             correct = gold_in_context
         else:
-            from longmemeval_adapter import answer_question, judge_answer
+            from longmemeval_adapter import answer_question, judge_scored
             question_date = ex["session_dates"][-1] if ex["session_dates"] else ""
             ai = answer_question(answer_llm, memories, ex["question"],
                                  total_matches=info["total_matches"],
@@ -510,10 +511,15 @@ def run_recall(ex: dict, args, answer_llm, judge_llm) -> dict:
                                  question_date=question_date,
                                  extra_system=MSC_PERSPECTIVE_CLAUSE
                                               + MSC_ANSWERABILITY_CLAUSE)
-            correct = judge_answer(judge_llm, "single-session-user",
-                                   ex["question"], ex["answer"], ai)
+            correct, judge_raw = judge_scored(judge_llm, "single-session-user",
+                                              ex["question"], ex["answer"], ai)
         gi = _gold_session_index(ex)
-        rec = {"id": ex["id"], "question_type": "recall", "correct": bool(correct),
+        rec = {"id": ex["id"], "question_type": "recall",
+               # NOT bool(): that coerced a judge outage into a wrong answer,
+               # which is the deflation D3 names. None = UNSCORED.
+               "correct": (None if correct is None else bool(correct)),
+               "judge_raw": judge_raw,
+               "judge_error": bool(judge_raw) and correct is None,
                "question": ex["question"], "answer": ex["answer"], "ai_answer": ai,
                "n_sessions": ex["n_sessions"], "gold_session": gi,
                "gold_distance": (ex["n_sessions"] - gi) if gi >= 0 else -1,
@@ -562,7 +568,13 @@ def run_recurrence_dump(ex: dict, args) -> list[dict]:
 # ── reporting ───────────────────────────────────────────────────────────────
 
 def _print_recall_report(results: list[dict]) -> None:
-    from longmemeval_adapter import compute_scores
+    from longmemeval_adapter import compute_scores, judge_error_note
+    # UNSCORED rows (the judge errored — D3) are dropped ONCE, here, so the
+    # distance table and the miss decomposition below cannot silently count an
+    # outage as a reader failure. MSC has no --diag-only branch, so every
+    # correct=None reaching this function is a judge error.
+    print(f"\n  {judge_error_note(results)}")
+    results = [r for r in results if r.get("correct") is not None]
     scores = compute_scores(results)
     ov = scores["OVERALL"]
     print(f"\n=== MSC recall — n={ov['count']} ===")

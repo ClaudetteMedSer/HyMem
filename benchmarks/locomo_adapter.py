@@ -406,6 +406,7 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
     if args.answerable_clause and cat != 5:
         extra += LOCOMO_ANSWERABLE_CLAUSE
 
+    judge_raw = ""            # only the judge branch below can set this
     if args.diag_only:
         # Retrieval + render only — no reader, no judge. `correct` stays None
         # because this pass CANNOT produce accuracy; locomo_audit.py joins the
@@ -418,7 +419,7 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
         # (on cat-5 it reports whether the trap-source turn surfaces).
         ai, correct = (memories[0]["content"] if memories else ""), diag["gold_in_context"]
     else:
-        from longmemeval_adapter import answer_question, judge_answer
+        from longmemeval_adapter import answer_question, judge_scored
         question_date = conv["session_dates"][-1] if conv["session_dates"] else ""
         ai = answer_question(
             answer_llm, memories, q["question"],
@@ -432,12 +433,18 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
             extra_system=extra)
         gold_for_judge = _gold_for_judge(cat, q["answer"] or "",
                                          q["adversarial_answer"])
-        correct = judge_answer(judge_llm, q["judge_type"], q["question"],
-                               gold_for_judge, ai)
+        correct, judge_raw = judge_scored(judge_llm, q["judge_type"],
+                                          q["question"], gold_for_judge, ai)
 
     rec = {"id": q["qa_id"], "conv_id": conv["id"], "question_type": q["qtype"],
            "category": cat,
            "correct": (None if correct is None else bool(correct)),
+           "judge_raw": judge_raw,
+           # A judge error, NOT the --diag-only/--sim `correct=None`: those two
+           # never call a judge, so their None means "no verdict exists" rather
+           # than "the judge failed". Conflating them would report a run that
+           # deliberately measured nothing as an outage.
+           "judge_error": bool(judge_raw) and correct is None,
            "question": q["question"],
            "answer": q["answer"] if cat != 5 else f"[unanswerable; trap: {q['adversarial_answer']}]",
            "ai_answer": ai, "n_sessions": conv["n_sessions"],
@@ -533,8 +540,12 @@ def evaluate_conversation(conv: dict, args, answer_llm, judge_llm) -> list[dict]
                   f"{surf*100:.1f}% (tau=0.6, no reader)"
                   f" ({conv['n_sessions']} sessions)", flush=True)
         else:
-            acc = sum(r["correct"] for r in results) / len(results) if results else 0.0
-            print(f"  [{conv['id']}] done — {len(results)} q, {acc*100:.1f}%"
+            _scored = [r for r in results if r.get("correct") is not None]
+            acc = sum(r["correct"] for r in _scored) / len(_scored) if _scored else 0.0
+            _unscored = len(results) - len(_scored)
+            print(f"  [{conv['id']}] done — {len(results)} q"
+                  + (f" ({_unscored} UNSCORED — judge error)" if _unscored else "")
+                  + f", {acc*100:.1f}%"
                   f" ({conv['n_sessions']} sessions)", flush=True)
         return results
     finally:
@@ -553,6 +564,7 @@ def _compute_scores_local(results: list[dict]) -> dict:
     """Fallback mirror of longmemeval_adapter.compute_scores (accuracy by
     question_type, _abs folded into the base type) so --sim runs with zero API
     deps — importing the LME module pulls in `requests` at module level."""
+    results = [r for r in results if r.get("correct") is not None]
     by_type: dict[str, list[bool]] = defaultdict(list)
     for r in results:
         by_type[r["question_type"].replace("_abs", "")].append(r["correct"])
@@ -567,10 +579,23 @@ def _compute_scores_local(results: list[dict]) -> dict:
 def _print_report(results: list[dict], args) -> None:
     try:
         from longmemeval_adapter import (compute_scores, compute_abstention_scores,
-                                         print_abstention_scores)
+                                         judge_error_note, print_abstention_scores)
     except ImportError:  # offline --sim without the LME module's HTTP deps
         compute_scores = _compute_scores_local
         compute_abstention_scores = print_abstention_scores = None
+        judge_error_note = None
+    # UNSCORED rows (the judge errored — D3) are dropped ONCE, here, rather than
+    # guarded at each summation below. `--diag-only` never reaches this branch,
+    # so the only correct=None seen here is a judge error.
+    #
+    # The note is silent on the offline `--sim` path, which is correct rather
+    # than a gap: that path takes the ImportError fallback above precisely
+    # because it makes no LLM calls at all, so there is no judge that could
+    # have failed. It is the one place where "no judge errors" needs no
+    # denominator.
+    if judge_error_note:
+        print(f"\n  {judge_error_note(results)}")
+    results = [r for r in results if r.get("correct") is not None]
     scores = compute_scores(results)
     ov = scores.pop("OVERALL")
     print(f"\n=== LoCoMo — n={ov['count']} ===")
@@ -683,7 +708,7 @@ _TRAP_RE = re.compile(r"^\[unanswerable; trap: (.*)\]$", re.S)
 
 def _rejudge_file(args, judge_llm) -> None:
     """Re-judge a stored `--out` file, writing a flip-compatible copy."""
-    from longmemeval_adapter import judge_answer
+    from longmemeval_adapter import is_llm_error, judge_scored
 
     rows = json.loads(Path(args.rejudge).read_text(encoding="utf-8"))
     if not isinstance(rows, list) or not rows:
@@ -697,17 +722,26 @@ def _rejudge_file(args, judge_llm) -> None:
 
     def _rj(r: dict) -> dict:
         cat, ai = r["category"], str(r.get("ai_answer") or "")
-        if not ai or ai.startswith("[LLM_ERROR"):
+        judge_raw = ""
+        if not ai or is_llm_error(ai):
             new, judged = bool(r.get("correct")), False   # nothing judgeable
         else:
             gold = r.get("answer")
             if cat == 5:
                 m = _TRAP_RE.match(str(gold))
                 gold = _gold_for_judge(5, None, m.group(1) if m else "")
-            new = judge_answer(judge_llm, CATEGORY_JUDGE[cat], r["question"],
-                               gold if gold is not None else "", ai)
-            judged = True
+            verdict, judge_raw = judge_scored(
+                judge_llm, CATEGORY_JUDGE[cat], r["question"],
+                gold if gold is not None else "", ai)
+            # A JUDGE error keeps the prior verdict and leaves `_rejudged`
+            # False, reusing the answer-side rule three lines up rather than
+            # inventing a second one. Overwriting would drop the row out of the
+            # flip denominator AND destroy the baseline it is compared to.
+            new, judged = (bool(r.get("correct")), False) if verdict is None \
+                else (verdict, True)
         return {**r, "correct": new, "correct_original": r.get("correct"),
+                "judge_raw": judge_raw,
+                "judge_error": bool(judge_raw) and is_llm_error(judge_raw),
                 "_rejudged": judged}
 
     out_rows: list[dict] = [None] * len(rows)

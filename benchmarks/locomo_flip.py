@@ -80,6 +80,19 @@ def main() -> None:
             sys.exit(f"No category-{args.category} questions in common.")
 
     only_a, only_b = len(a_rows) - len(shared), len(b_rows) - len(shared)
+    # A row the JUDGE never scored (`correct is None`, D3) is dropped from BOTH
+    # arms or from neither. Dropping it from one would make the comparison
+    # unpaired on exactly the rows an outage touched — the C4 arm-asymmetry void
+    # condition, arriving through the back door. Reported, never silent.
+    unscored = [i for i in shared
+                if a_rows[i].get("correct") is None
+                or b_rows[i].get("correct") is None]
+    if unscored:
+        shared = [i for i in shared if i not in set(unscored)]
+        if not shared:
+            sys.exit(f"Every shared question is UNSCORED in one arm or the "
+                     f"other ({len(unscored)}) — the judge failed, so there is "
+                     f"nothing to compare. Re-judge before reading this gate.")
     a_acc = sum(a_rows[i]["correct"] for i in shared) / len(shared)
     b_acc = sum(b_rows[i]["correct"] for i in shared) / len(shared)
 
@@ -88,6 +101,9 @@ def main() -> None:
     print(f"  B  {args.new}")
     if only_a or only_b:
         print(f"  [note] {only_a} ids only in A, {only_b} only in B — ignored")
+    if unscored:
+        print(f"  [note] {len(unscored)} shared id(s) UNSCORED in one arm "
+              f"(judge error) — dropped from BOTH arms, not counted wrong")
     if not (a_staged and b_staged):
         stale = args.base if not a_staged else args.new
         print(f"  [note] {stale} predates the four-surface diagnostic: its budget\n"

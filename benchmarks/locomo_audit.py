@@ -74,7 +74,12 @@ def main() -> None:
         ev_map[conv["id"]] = conv["evidence_map"]
 
     def _pop(want_correct: bool) -> list[dict]:
-        return [r for r in rows if bool(r["correct"]) is want_correct
+        # `correct is None` means the JUDGE never scored the row (D3), not that
+        # the reader was wrong. Without this an outage would be handed to the
+        # synthesis-bucket hand-check as a reader failure — a confident finding
+        # produced by a timeout.
+        return [r for r in rows if r.get("correct") is not None
+                and bool(r["correct"]) is want_correct
                 and r["category"] != 5 and r.get("gold_in_context")]
 
     misses = _pop(False)

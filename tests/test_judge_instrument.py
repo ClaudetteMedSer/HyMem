@@ -329,62 +329,74 @@ def test_DEFECT_truncated_reply_is_scored_as_a_verdict(reply, expected):
     assert _judge(reply) is expected
 
 
-def test_DEFECT_judge_side_llm_error_is_still_invisible_to_the_caller():
-    """HALF-FIXED on 2026-08-25, and the unfixed half is the half that matters.
+def test_FIXED_a_judge_outage_is_now_distinguishable_from_a_genuine_no():
+    """D3, CLOSED 2026-08-26. Was `test_DEFECT_..._still_invisible_to_the_caller`.
 
-    Containment rode along with the parse fix: the sentinel is now rejected
-    explicitly, so an outage message that happens to contain the word "yes"
-    (`[LLM_ERROR: unexpected token 'yes']`) can no longer be read as the judge
-    saying the answer was CORRECT. That was a two-line, provably-inert change —
-    the 2026-08-25 run recorded 0 judge-side sentinels.
+    Two halves, landed a day apart and for different reasons.
 
-    VISIBILITY was not fixed and is still pinned as a defect. `judge_answer`
-    returns a bare bool and has no channel for "the judge never answered", so a
-    sentinel is still indistinguishable from a genuine "no" at the call site.
-    Giving it one means deciding what five call sites across three adapters do
-    mid-run during an outage — not a two-line change, and NOT inert: it changes
-    behaviour in exactly the situation nobody can rehearse.
+    CONTAINMENT (2026-08-25, rode along with the parse fix): the sentinel is
+    rejected explicitly, so an outage message that happens to contain the word
+    "yes" (`[LLM_ERROR: unexpected token 'yes']`) cannot be read as the judge
+    saying the answer was CORRECT. Provably inert — 0 judge-side sentinels over
+    500 recorded replies.
 
-    The two re-judge paths (`_rejudge_run`, `_rejudge_file`) DO test for this
-    sentinel — but only on the ANSWER (`hypothesis` / `ai_answer`). Neither
-    inspects the judge's reply, and `judge_answer` has already discarded it.
-    A judge-side outage streak therefore still deflates the score of the arm
-    it hit.
+    VISIBILITY (2026-08-26): `judge_scored` returns `correct=None` for a
+    sentinel — UNSCORED, not wrong — and every call site across the three
+    adapters routes through it. `judge_answer` keeps its bare bool and its
+    fail-closed `False`, unchanged, because it is the certified function; the
+    channel is a sibling, not a modification.
 
-    The two re-judge paths (`_rejudge_run`, `_rejudge_file`) DO test for this
-    sentinel — but only on the ANSWER (`hypothesis` / `ai_answer`). Neither
-    inspects the judge's reply, and `judge_answer` has already discarded it.
-    A judge-side outage streak therefore deflates the score of the arm it hit."""
-    error_verdict = _judge("[LLM_ERROR: Connection reset by peer]")
-    genuine_no = _judge("no")
-    assert error_verdict is False
-    assert error_verdict == genuine_no, (
-        "an outage sentinel and a genuine 'no' are indistinguishable at the "
-        "call site — that indistinguishability IS the remaining defect"
+    The old defect asserted `error_verdict == genuine_no`. THAT EQUALITY IS
+    WHAT MOVED: at the scoring boundary they are now different values."""
+    outage = "[LLM_ERROR: Connection reset by peer]"
+
+    # The certified function is untouched: still a bool, still fail-closed.
+    assert _judge(outage) is False
+    assert _judge(outage) == _judge("no")
+
+    # The channel the call sites actually use tells them apart.
+    from longmemeval_adapter import judge_scored
+    err_verdict, err_raw = judge_scored(StubJudgeClient(outage),
+                                        "single-session-user", "q", "a", "r")
+    no_verdict, no_raw = judge_scored(StubJudgeClient("no"),
+                                      "single-session-user", "q", "a", "r")
+    assert err_verdict is None and no_verdict is False
+    assert err_verdict != no_verdict, (
+        "an outage and a genuine 'no' are indistinguishable again — that "
+        "indistinguishability WAS the defect"
     )
-    # The half that WAS fixed: rejected by construction, not by luck.
+    assert err_raw == outage and no_raw == "no"
+
+    # The half that was fixed first: rejected by construction, not by luck.
     assert _judge("[LLM_ERROR: unexpected token 'yes' in response]") is False
     assert JA.shipping_verdict("[LLM_ERROR: unexpected token 'yes' in response]") \
         is True, "the legacy rule scored this sentinel CORRECT — that is the " \
                  "hazard the explicit check removed"
 
 
-def test_DEFECT_raw_reply_is_discarded():
-    """The reason `benchmarks/judge_audit.py` has to exist.
+def test_FIXED_the_raw_reply_survives_into_the_caller():
+    """Was `test_DEFECT_raw_reply_is_discarded`, the reason judge_audit exists.
 
-    `judge_answer` returns a bare bool, so the rate of non-compliant replies is
-    not merely unmeasured — it is unmeasurABLE from any stored run.
+    `judge_answer` discarded `raw`, so the rate of non-compliant replies was not
+    merely unmeasured but unmeasurABLE from any stored run — judge_audit had to
+    re-judge 500 rows to measure something that had already been produced once
+    and thrown away. `judge_answer_raw` returns it, the adapters persist it as
+    `judge_raw`, and the next audit is free.
 
-    The three replies here are deliberately all COMPLIANT affirmatives that
-    differ only in formatting. That isolates the claim: this test is about the
-    return type erasing `raw`, not about the substring rule (which the DEFECT
-    tests above own). Mixing a defective reply in here would make this test fail
-    for two different reasons and blur the negative control."""
+    The three replies are deliberately all COMPLIANT affirmatives differing only
+    in formatting: that isolates the claim to the RETURN CHANNEL. Under the old
+    bare-bool return all three collapsed to one value; now each survives
+    verbatim while the verdict stays identical."""
+    from longmemeval_adapter import judge_answer_raw
+
     replies = ["yes", "Yes.", "  YES  \n"]
     assert len(set(replies)) == 3
-    verdicts = [_judge(r) for r in replies]
-    assert verdicts == [True, True, True]
-    assert len(set(verdicts)) == 1, "raw reply survived into the return value"
+    got = [judge_answer_raw(StubJudgeClient(r), "single-session-user",
+                            "q", "a", "r") for r in replies]
+    assert [v for v, _raw in got] == [True, True, True]
+    assert [raw for _v, raw in got] == replies, "raw reply is still discarded"
+    # And the bool-returning wrapper still erases it, unchanged.
+    assert len({_judge(r) for r in replies}) == 1
 
 
 def test_judge_call_shape_is_the_comparability_contract():
@@ -500,6 +512,15 @@ def test_unknown_question_type_raises():
 # walk that finds nothing at all otherwise reads as a clean pass (this codebase
 # has already shipped one import test with exactly that hole).
 
+# The adapters call `judge_scored` since the 2026-08-26 D3 fix. That is still
+# the SAME judge: judge_scored -> judge_answer_raw -> parse_judge_verdict, and
+# `judge_answer` is now `judge_answer_raw(...)[0]`. What changed is the channel
+# (a sentinel returns None = UNSCORED instead of False), not the decision rule.
+# Both names are accepted so the premise survives the rename; the delegation
+# chain that makes them equivalent is asserted separately below.
+_JUDGE_ENTRYPOINTS = ("judge_answer", "judge_scored")
+
+
 def _import_sources(path: Path, name: str) -> list[ast.ImportFrom]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     return [n for n in ast.walk(tree)
@@ -511,11 +532,36 @@ def _import_sources(path: Path, name: str) -> list[ast.ImportFrom]:
 @pytest.mark.parametrize("adapter", ["locomo_adapter.py", "msc_adapter.py"])
 def test_locomo_and_msc_import_the_lme_judge(adapter):
     """One function, three canonical baselines."""
-    hits = _import_sources(_BENCH / adapter, "judge_answer")
+    hits = [h for name in _JUDGE_ENTRYPOINTS
+            for h in _import_sources(_BENCH / adapter, name)]
     assert len(hits) >= 1, (
-        f"{adapter} no longer imports judge_answer from longmemeval_adapter — "
+        f"{adapter} no longer imports the LME judge entry point — "
         "the single-judge premise of this audit has changed"
     )
+
+
+def test_the_judge_entry_points_all_reduce_to_one_decision_rule():
+    """What keeps the blast-radius premise true across the D3 rename.
+
+    Three names now exist, and they must remain ONE rule: `judge_scored` and
+    `judge_answer` both delegate to `judge_answer_raw`, which parses with
+    `parse_judge_verdict`. If a call site were ever given its own parse, the
+    single-judge premise — and with it C1 = 0.00% covering all three
+    benchmarks — would quietly stop holding."""
+    from longmemeval_adapter import judge_answer_raw, judge_scored
+
+    client = StubJudgeClient("yes")
+    assert judge_answer(client, "single-session-user", "q", "a", "r") is True
+    assert judge_answer_raw(StubJudgeClient("yes"),
+                            "single-session-user", "q", "a", "r") == (True, "yes")
+    assert judge_scored(StubJudgeClient("no"),
+                        "single-session-user", "q", "a", "r") == (False, "no")
+    # The channel, and the only behavioural difference between the two.
+    verdict, raw = judge_scored(StubJudgeClient("[LLM_ERROR: reset by peer]"),
+                                "single-session-user", "q", "a", "r")
+    assert verdict is None and raw.startswith("[LLM_ERROR")
+    assert judge_answer(StubJudgeClient("[LLM_ERROR: reset by peer]"),
+                        "single-session-user", "q", "a", "r") is False
 
 
 def test_beam_is_NOT_in_the_blast_radius():
@@ -529,14 +575,14 @@ def test_beam_is_NOT_in_the_blast_radius():
 
 
 def _judge_call_type_args(path: Path) -> list[str | None]:
-    """The 2nd positional arg (`question_type`) of every `judge_answer(...)` call,
-    as a literal where it is one and None where it is computed."""
+    """The 2nd positional arg (`question_type`) of every judge call, as a
+    literal where it is one and None where it is computed."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     out: list[str | None] = []
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id == "judge_answer"
+                and node.func.id in _JUDGE_ENTRYPOINTS
                 and len(node.args) >= 2):
             arg = node.args[1]
             out.append(arg.value if isinstance(arg, ast.Constant) else None)
@@ -548,7 +594,7 @@ def test_msc_routes_every_question_through_the_containment_criterion():
     at its only judge call site, so no MSC row ever reaches the correct-looking
     `_abs` branch. The ~84.0% baseline is 100% containment-judged."""
     args = _judge_call_type_args(_BENCH / "msc_adapter.py")
-    assert args, "no judge_answer call found in msc_adapter.py"
+    assert args, "no judge call found in msc_adapter.py"
     assert set(args) == {"single-session-user"}
 
 
@@ -1631,3 +1677,254 @@ def test_verify_parse_cli_path_is_reachable_and_free(tmp_path, capsys):
     assert "stored replies: 3" in out
     assert "verdicts that CHANGE: 1" in out
     assert "NOT A NO-OP" in out
+
+
+# ── D3: an outage is UNSCORED, never wrong (the policy, and its inertness) ──
+
+def _row(qtype="single-session-user", correct=True, **kw):
+    r = {"question_id": kw.pop("qid", "q"), "question_type": qtype,
+         "correct": correct}
+    r.update(kw)
+    return r
+
+
+def test_an_unscored_row_leaves_the_accuracy_denominator():
+    """The D3 policy, stated as arithmetic.
+
+    Three rows, two right, one the judge never answered. Accuracy is 2/2, not
+    2/3. The `expected_if_counted_wrong` line is a NEGATIVE CONTROL: it is the
+    number the old behaviour produced, and asserting the two differ is what
+    stops this test passing vacuously on a fixture where exclusion and
+    deflation happen to agree."""
+    from longmemeval_adapter import accuracy, scored
+
+    rows = [_row(qid="a"), _row(qid="b"),
+            _row(qid="c", correct=None, judge_error=True)]
+    assert len(scored(rows)) == 2
+    assert accuracy(rows) == 1.0
+    expected_if_counted_wrong = 2 / 3
+    assert accuracy(rows) != expected_if_counted_wrong
+
+
+def test_the_accuracy_helper_does_not_TypeError_on_an_unscored_row():
+    """The shape that made this ~15 edits rather than 6.
+
+    `sum(r["correct"] for r in rows) / len(rows)` — repeated across the three
+    adapters — raises the moment one row is unscored. The helper exists so that
+    is ONE decision rather than fifteen slightly different guards, and this
+    test asserts both halves: the raw shape still raises, and the helper does
+    not."""
+    from longmemeval_adapter import accuracy
+
+    rows = [_row(qid="a"), _row(qid="c", correct=None, judge_error=True)]
+    with pytest.raises(TypeError):
+        sum(r["correct"] for r in rows) / len(rows)
+    assert accuracy(rows) == 1.0
+
+
+def test_compute_scores_is_INERT_on_a_run_with_no_judge_errors():
+    """The inertness claim, asserted rather than assumed.
+
+    The 2026-08-25 audit recorded 0 judge-side sentinels over 500 replies, so
+    on a clean run the filter is the identity and every canonical number is
+    untouched. LoCoMo 68.2 / LME 68.4 / MSC ~84.0 are NOT re-baselined by this
+    change — but "no rows were dropped" has to be a test, not a paragraph."""
+    from longmemeval_adapter import compute_scores, scored
+
+    rows = [_row(qid="a"), _row(qid="b", correct=False),
+            _row(qid="c", qtype="temporal-reasoning")]
+    assert scored(rows) == rows            # identity: nothing dropped
+    scores = compute_scores(rows)
+    assert scores["OVERALL"] == {"accuracy": 2 / 3, "count": 3}
+    assert scores["single-session-user"]["count"] == 2
+
+
+def test_an_unscored_row_changes_only_the_denominator_it_leaves():
+    """Adding an outage row must not move any OTHER row's number.
+
+    The failure this guards against is a filter applied in one summary and not
+    another, so a category table and the overall line disagree about which run
+    they describe."""
+    from longmemeval_adapter import compute_scores
+
+    clean = [_row(qid="a"), _row(qid="b", correct=False)]
+    with_outage = clean + [_row(qid="c", correct=None, judge_error=True)]
+    assert compute_scores(clean) == compute_scores(with_outage)
+
+
+def test_judge_error_note_states_the_denominator_when_the_count_is_zero():
+    """"0 judge errors" over a run that made no judge calls is not reassurance.
+
+    Same reason `--verify-parse` reports `rows_that_could_flip`: a count with no
+    denominator is a certificate signed by an instrument that never met the
+    surface it certifies. The zero branch names what could have errored; the
+    non-zero branch names the surviving denominator so an accuracy over n-k is
+    never mistaken for one over n."""
+    from longmemeval_adapter import judge_error_note
+
+    clean = judge_error_note([_row(qid="a"), _row(qid="b")])
+    assert "0 of 2" in clean and "could have errored" in clean
+
+    dirty = judge_error_note([_row(qid="a"),
+                              _row(qid="c", correct=None, judge_error=True)])
+    assert "UNSCORED" in dirty and "NOT counted wrong" in dirty
+    assert "1-row accuracy denominator" in dirty
+
+
+def test_diag_only_rows_are_unscored_but_are_NOT_judge_errors():
+    """The two reasons for `correct=None` must not be conflated.
+
+    `--diag-only` writes `correct=None` because no reader and no judge ever
+    ran; the existing branch already refuses to print 0.0% for it, on the
+    grounds that a run which measured nothing must not look like a run that
+    scored zero. A judge outage is the OTHER None, and only it is a defect.
+    `judge_error` is the field that separates them — without it, a diagnostics
+    pass would be reported as a 100% outage."""
+    from longmemeval_adapter import accuracy, judge_error_rows, scored
+
+    diag = [_row(qid="d1", correct=None), _row(qid="d2", correct=None)]
+    assert scored(diag) == [] and accuracy(diag) == 0.0
+    assert judge_error_rows(diag) == []          # unscored, but no judge failed
+    assert "0 of 2" in __import__(
+        "longmemeval_adapter").judge_error_note(diag)
+
+
+@pytest.mark.parametrize("adapter,fn", [
+    ("locomo_adapter.py", "evaluate_qa"),
+    ("msc_adapter.py", None),
+])
+def test_every_adapter_record_carries_the_judge_error_field(adapter, fn):
+    """Asserted from the SOURCE, because the alternative is running three
+    benchmarks. A record without `judge_error` cannot be filtered downstream,
+    and the filter is the whole fix."""
+    src = (_BENCH / adapter).read_text(encoding="utf-8")
+    assert '"judge_error"' in src, f"{adapter} records no judge_error field"
+    assert '"judge_raw"' in src, f"{adapter} persists no judge_raw field"
+
+
+def test_msc_no_longer_coerces_a_judge_error_into_a_wrong_answer():
+    """MSC's record built `"correct": bool(correct)`, which turned an outage
+    into a wrong answer at the point of writing — the deflation D3 names, in
+    one call. LoCoMo's record already admitted None; MSC's did not."""
+    src = (_BENCH / "msc_adapter.py").read_text(encoding="utf-8")
+    assert '"correct": bool(correct)' not in src
+    assert '"correct": (None if correct is None else bool(correct))' in src
+
+
+def test_every_record_that_stores_a_verdict_carries_the_outage_channel():
+    """Asserted from the SOURCE across all three adapters, via ast.
+
+    The rule: a dict that records `correct` ALONGSIDE the question it scored (or
+    alongside a prior verdict) must also carry `judge_raw` and `judge_error`. A
+    record missing them cannot be filtered downstream, and the filter is the
+    whole fix — a substring check on the file would pass while one of two record
+    builders in the same module had lost the field.
+
+    Deliberately excluded, and why: the exception records (`correct: False` next
+    to `error`) are READER-side failures, which D3 does not cover, and the
+    `{**r, "correct": ...}` re-score in the drift report is a projection of an
+    existing record, not a new one.
+
+    The count assertion is not decoration: an ast walk that matches nothing
+    otherwise reads as a clean pass, and this file has already shipped one
+    import test with exactly that hole."""
+    found = 0
+    for adapter in ("longmemeval_adapter.py", "locomo_adapter.py",
+                    "msc_adapter.py"):
+        tree = ast.parse((_BENCH / adapter).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {k.value for k in node.keys
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+            if "correct" not in keys:
+                continue
+            if not ({"question", "correct_original"} & keys):
+                continue
+            found += 1
+            assert "judge_raw" in keys, (
+                f"{adapter}:{node.lineno} records a verdict without judge_raw")
+            assert "judge_error" in keys, (
+                f"{adapter}:{node.lineno} records a verdict without judge_error")
+    assert found >= 4, (
+        f"only {found} verdict-recording dicts found across the three adapters "
+        "— the ast matcher has drifted and this test is certifying nothing")
+
+
+def test_recall_diagnostics_does_not_count_an_unscored_row_as_a_MISS():
+    """The miss decomposition is the actionable signal — it decides whether the
+    next lever is retrieval, ranking or the reader. An unscored row entering the
+    miss bucket would be attributed to whichever of those its `recall_ceiling`
+    happens to say, so a judge outage would arrive dressed as a retrieval
+    finding. That is the diagnostic-controls lesson exactly: a broken device
+    returns a confident constant."""
+    from longmemeval_adapter import compute_recall_diagnostics
+
+    clean = [_row(qid="a", recall_ceiling=True, recall_tier="fts"),
+             _row(qid="b", correct=False, recall_ceiling=False,
+                  recall_tier="none")]
+    with_outage = clean + [_row(qid="c", correct=None, judge_error=True,
+                                recall_ceiling=False, recall_tier="none")]
+    d_clean = compute_recall_diagnostics(clean)
+    d_outage = compute_recall_diagnostics(with_outage)
+    assert d_clean == d_outage, (
+        "an unscored row moved the miss decomposition — a judge outage would "
+        "be reported as a retrieval loss"
+    )
+
+
+def test_abstention_scores_do_not_count_an_unscored_row_as_a_FAILED_abstention():
+    """The abstention split is where an outage would do the most damage.
+
+    `compute_abstention_scores` coerces with `bool(r.get("correct"))`, so an
+    unscored row lands as a FALSE in whichever arm it belongs to. On the
+    abstention arm that reads as "the reader answered a question it should have
+    refused" — a hallucination finding manufactured by a judge timeout. The
+    answerable/abstention trade-off is exactly the comparison this benchmark
+    exists to make, so a defect that biases only one arm does not cancel."""
+    from longmemeval_adapter import compute_abstention_scores
+
+    clean = [_row(qid="a"),
+             _row(qid="x", qtype="single-session-user_abs"),
+             _row(qid="y", qtype="single-session-user_abs")]
+    with_outage = clean + [_row(qid="z", qtype="single-session-user_abs",
+                                correct=None, judge_error=True)]
+    assert compute_abstention_scores(clean)["abstention"] == {
+        "accuracy": 1.0, "count": 2}
+    assert compute_abstention_scores(clean) == compute_abstention_scores(with_outage), (
+        "an unscored row moved the abstention rate — a judge outage would be "
+        "reported as a hallucination"
+    )
+
+
+def test_the_run_file_instruments_also_refuse_to_score_an_unscored_row():
+    """The adapters are not the only consumers of these records.
+
+    `locomo_flip.py` and `locomo_audit.py` read the same `--out` files and are
+    the LoCoMo gate instruments. Before this change `locomo_flip` would
+    TypeError on a run containing one unscored row, and `locomo_audit` would
+    hand it to the synthesis-bucket hand-check as a reader failure. Asserted
+    from source, because both are argv-driven scripts.
+
+    The flip case is the sharper one: an unscored row must be dropped from BOTH
+    arms or from neither. Dropping it from one leaves the comparison unpaired on
+    exactly the rows an outage touched, which is the C4 arm-asymmetry void
+    condition arriving through the back door."""
+    flip = (_BENCH / "locomo_flip.py").read_text(encoding="utf-8")
+    assert 'a_rows[i].get("correct") is None' in flip
+    assert 'or b_rows[i].get("correct") is None' in flip
+    assert "dropped from BOTH arms" in flip
+
+    audit = (_BENCH / "locomo_audit.py").read_text(encoding="utf-8")
+    assert 'r.get("correct") is not None' in audit
+
+
+def test_facts_ab_already_dropped_unpaired_rows_and_still_does():
+    """A pre-existing guard, pinned rather than rewritten.
+
+    `facts_ab.py` already skipped a pair where either arm had no verdict
+    ("abstention/unjudged: no verdict to pair"), which is exactly the D3 rule
+    reached independently. It needs no change — but it does need a test, or a
+    later tidy-up removes it on the grounds that `correct` is always a bool."""
+    src = (_BENCH / "facts_ab.py").read_text(encoding="utf-8")
+    assert "if a is None or b is None:" in src
