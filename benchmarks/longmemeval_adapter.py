@@ -299,6 +299,19 @@ QUESTION_TYPE_TO_ABILITY = {
     "single-session-preference_abs": "ABS",
 }
 
+# ── LLM outage sentinel ─────────────────────────────────────────────
+#
+# `LLMClient.chat` returns this marker string instead of raising once retries are
+# exhausted, so an outage travels through the pipeline as DATA. Five sites spelt
+# the prefix out by hand; they now share one predicate, because the D3 fix turns
+# it from a cosmetic detail into a decision about whether a row is scored.
+LLM_ERROR_PREFIX = "[LLM_ERROR"
+
+
+def is_llm_error(text: str | None) -> bool:
+    return bool(text) and str(text).startswith(LLM_ERROR_PREFIX)
+
+
 # ── LLM Client ──────────────────────────────────────────────────────
 
 class LLMClient:
@@ -856,7 +869,7 @@ def _distill_hit(llm: LLMClient, question: str, excerpt: str,
         temperature=0.0, max_tokens=256,
     )
     stripped = (resp or "").strip()
-    if not stripped or stripped.upper() == "NONE" or stripped.startswith("[LLM_ERROR"):
+    if not stripped or stripped.upper() == "NONE" or is_llm_error(stripped):
         return []
     lines = []
     for ln in stripped.splitlines():
@@ -1216,7 +1229,12 @@ def parse_judge_verdict(raw: str) -> bool:
     own evidence.
     """
     text = raw or ""
-    if text.startswith("[LLM_ERROR"):
+    # Shares the CONSTANT but deliberately does not call `is_llm_error`: that
+    # predicate adds a truthiness test and a str() coercion, and this function is
+    # certified byte-for-byte by the 2026-08-25 run (C1 = 0.00%). Widening a
+    # certified decision rule, even harmlessly, costs the "identical to what was
+    # measured" claim. Every other site does route through the predicate.
+    if text.startswith(LLM_ERROR_PREFIX):
         return False
     low = text.lower()
     if _NEGATED_YES.search(low):
@@ -1227,13 +1245,103 @@ def parse_judge_verdict(raw: str) -> bool:
     return bool(y)
 
 
-def judge_answer(llm: LLMClient, question_type: str, question: str, answer: str, ai_answer: str) -> bool:
-    """Judge whether the answer is correct (binary yes/no per LongMemEval protocol)."""
+def judge_answer_raw(llm: LLMClient, question_type: str, question: str,
+                     answer: str, ai_answer: str) -> tuple[bool, str]:
+    """`judge_answer`, plus the reply it used to throw away. D3.
+
+    The bare-bool return is why an outage was invisible: a judge that never
+    answered and a judge that said "no" are the same value at the call site, so
+    an outage streak silently DEFLATES the score of the arm it hits. It is also
+    why `benchmarks/judge_audit.py` had to re-judge 500 rows to measure a rate
+    that was already produced once and discarded.
+
+    `judge_answer` now delegates here and drops the raw, so it is byte-identical
+    in behaviour and signature. That is deliberate and load-bearing: rule 3 of
+    `parse_judge_verdict` is IDENTICAL to `judge_audit.reference_verdict`, banked
+    before the 2026-08-25 run, and that identity is the whole warrant for
+    C1 = 0.00% certifying this function rather than something merely like it.
+    Neither function's logic is touched here — only the channel around them."""
     prompt = get_judge_prompt(question_type, question, answer, ai_answer)
     messages = [{"role": "user", "content": prompt}]
     raw = llm.chat(messages, temperature=0.0, max_tokens=10)
-    return parse_judge_verdict(raw)
+    return parse_judge_verdict(raw), raw
 
+
+def judge_answer(llm: LLMClient, question_type: str, question: str, answer: str, ai_answer: str) -> bool:
+    """Judge whether the answer is correct (binary yes/no per LongMemEval protocol)."""
+    return judge_answer_raw(llm, question_type, question, answer, ai_answer)[0]
+
+
+def judge_scored(llm: LLMClient, question_type: str, question: str,
+                 answer: str, ai_answer: str) -> tuple[bool | None, str]:
+    """(correct, raw) where `correct` is None iff the JUDGE itself errored.
+
+    The one place the D3 policy is written down, so five call sites across three
+    adapters cannot each decide it differently:
+
+      * a judge sentinel yields `correct = None` — the row is UNSCORED, not
+        wrong. It drops out of the accuracy denominator (`accuracy` below) and
+        is counted separately.
+      * `correct = False` keeps meaning the judge read the answer and rejected
+        it, which is what every canonical number was scored under.
+
+    PROVABLY INERT WHERE IT MATTERS: the 2026-08-25 audit recorded 0 judge-side
+    sentinels over 500 replies, so on a clean run this returns exactly what
+    `judge_answer` returned and no canonical number moves. That is the same
+    inert-window argument that licensed landing the parse fix rather than
+    deferring it to the next judge migration — and the insurance is only free
+    once, because at the next verbose judge the decision rule and the data would
+    change in the same step with no way to separate them."""
+    verdict, raw = judge_answer_raw(llm, question_type, question, answer, ai_answer)
+    return (None if is_llm_error(raw) else verdict), raw
+
+
+# ── Scoring over rows that may be UNSCORED ──────────────────────────
+
+def is_scored(row: dict) -> bool:
+    """A row carries a verdict. `correct is None` means no verdict exists —
+    either the judge errored (`judge_error`) or no reader ran at all
+    (`--diag-only`). Both are excluded from accuracy; only the first is a
+    defect, and `judge_error` is what tells them apart."""
+    return row.get("correct") is not None
+
+
+def scored(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if is_scored(r)]
+
+
+def accuracy(rows: list[dict]) -> float:
+    """Accuracy over SCORED rows only.
+
+    Exists because `sum(r["correct"] for r in rows) / len(rows)` — the shape
+    repeated at roughly fifteen sites across the three adapters — TypeErrors the
+    moment one row is unscored, and because the fix for that must be ONE
+    decision rather than fifteen slightly different guards. Returns 0.0 for an
+    empty set; callers that must distinguish "scored zero" from "measured
+    nothing" check `len(scored(rows))` and say so, exactly as the `--diag-only`
+    branch already refuses to print 0.0% for a run that measured nothing."""
+    s = scored(rows)
+    return sum(1 for r in s if r["correct"]) / len(s) if s else 0.0
+
+
+def judge_error_rows(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if r.get("judge_error")]
+
+
+def judge_error_note(rows: list[dict]) -> str:
+    """One line for a run summary, with the vacuity split built in.
+
+    "0 judge errors" over a run that made no judge calls is not reassurance,
+    it is an instrument that never met the surface it certifies — the same
+    reason `--verify-parse` reports `rows_that_could_flip`. So the denominator
+    is stated whenever the count is zero."""
+    errs, judged = judge_error_rows(rows), scored(rows)
+    if errs:
+        return (f"⚠ {len(errs)} row(s) UNSCORED — the judge returned an "
+                f"[LLM_ERROR] sentinel. They are excluded from the "
+                f"{len(judged)}-row accuracy denominator, NOT counted wrong. "
+                f"ids: {[r.get('id') or r.get('question_id') for r in errs][:10]}")
+    return f"judge errors: 0 of {len(rows)} row(s) that could have errored"
 
 # ── Evaluation ──────────────────────────────────────────────────────
 
@@ -2134,7 +2242,7 @@ def _rejudge_run(args, api_key: str) -> None:
 
     def _rj(r: dict) -> dict:
         hyp = str(r.get("hypothesis", ""))
-        if not hyp or hyp.startswith("[LLM_ERROR") or r.get("error"):
+        if not hyp or is_llm_error(hyp) or r.get("error"):
             new, judged = bool(r.get("correct")), False   # nothing judgeable → keep prior
         else:
             new = judge_answer(judge_llm, r.get("question_type", ""),
