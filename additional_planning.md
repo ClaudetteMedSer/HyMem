@@ -2320,6 +2320,49 @@ aggregation table, no cache id, no augment path.
 - Verdicts: PASS → keep reporting in the dream log; FAIL-mechanism → fix.
   NO auto-tuning ever.
 
+#### STATUS 2026-08-25 — Stage 0 RAN on two stores; **Grove E2 Stage 1 CLOSED, FAIL-mechanism**
+
+Instrument: `benchmarks/recovery_probe.py` (read-only, LLM-free, `mode=ro`,
+`PRAGMA data_version` guard). Artifacts:
+`~/.hermes/benchmarks/recovery_probe_{box,locomo26}_20260825.json`.
+
+| Leg | cap split | `anchor_delta` | recovered | verdict |
+|---|---|---|---|---|
+| Box `~/.hermes/hymem.sqlite` | 20 profile + **0 edge** | 0 | 2 of 8722 active (6 retracted, 0 unstamped) | **VACUOUS** |
+| LoCoMo conv-26 (fresh) | 16 profile + 4 edge | 0 (both arms byte-identical) | 0 of 55 | **INERT-EMPTY** |
+
+**The close rests on the recovery POPULATION, not on a measured-inert clause.**
+There is no `evidence_backed` row anywhere: the box's 2 recovered edges are both
+`no_negative_evidence` (pos>0, neg=0, no evidence trail — backfill or
+cascade-deleted evidence, not quotable), and LoCoMo has 0 of 0. An in-dream gauge
+would instrument an empty set on both stores, which is the unreachable-code-path
+trap. **Plan D may copy the `_anchor_facts` predicate verbatim** — the coupling
+recorded in the Plan D section is resolved in the "clause is inert" direction.
+
+**Instrument amended mid-read (recorded because the amendment came AFTER seeing a
+number).** The box leg exposed a degenerate criterion in the probe's own verdict
+function: it returned the pre-registered `INERT` reading whenever
+`anchor_delta == 0`, without checking the delta *could* have been non-zero. With
+20 profile rows against `cap=20` the edge budget is 0 and the diff is 0 by
+arithmetic, so the probe was reporting a result on a store that had measured
+nothing. Two verdicts added, each with a binding negative control:
+**`VACUOUS`** (`edge_budget <= 0` — cannot answer) and **`INERT-EMPTY`**
+(`recovered == 0` — nothing to bar, a correct close for that store that does not
+generalise to one where retractions fire). The strong `INERT` now requires a
+non-empty recovered population that the clause still fails to bar. **Neither leg
+produced a strong INERT**, and the honest scope caveat is the one already banked:
+LoCoMo conv-26 is a one-conversation single-dream store where no retraction ever
+fired, and the box could not measure the delta at production cap.
+
+**Collateral finding, separate issue — the box digest anchor contains ZERO graph
+edges.** `_anchor_facts` gives profile rows the whole cap first and returns early
+when `remaining <= 0` (`aggregate.py:820-823`). The box has 20 active profile rows
+against `aggregation_digest_anchor_facts = 20`, so **none of its 8722 active
+edges reach the VERIFIED FACTS block**, and the graph has been silently squeezed
+out of the root digest as the profile grew. LoCoMo conv-26 shows the same shape
+in miniature (4 edge slots for 55 edges). This is unrelated to `invalid_at` and
+needs its own pre-registered gate — see the Plan D + Grove E2 plan.
+
 ### E3 — Trajectory-based resurfacing for retracted facts
 
 **Adaptation:** when dreaming's re-assertion path re-proposes a

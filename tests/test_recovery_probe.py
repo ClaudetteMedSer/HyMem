@@ -327,14 +327,34 @@ def test_the_probe_writes_nothing(cfg, tmp_path):
 # produces an inconvenient value.
 
 def _report(**kw) -> dict:
-    base = {"anchor_delta": 0, "cap": 20,
-            "buckets": dict.fromkeys(BUCKETS, 0)}
+    base = {"anchor_delta": 0, "cap": 20, "profile_rows": 0, "edge_budget": 20,
+            "recovered": 0, "buckets": dict.fromkeys(BUCKETS, 0)}
     base.update(kw)
     return base
 
 
-def test_zero_delta_reads_inert_and_closes_stage_1():
-    verdict, _ = _verdict(_report(anchor_delta=0))
+def test_a_zero_edge_budget_reads_vacuous_not_inert():
+    """The trap the box store walked into on 2026-08-25: 20 profile rows against
+    cap=20 leave no edge budget, so the diff is 0 for ARITHMETIC reasons. Reading
+    that as the pre-registered "the clause is inert" would close Grove E2 on a
+    store that never measured anything — a degenerate criterion reading as a
+    result, which is the exact failure this probe exists to avoid."""
+    verdict, reason = _verdict(_report(anchor_delta=0, profile_rows=20,
+                                       edge_budget=0, recovered=2))
+    assert verdict == "VACUOUS"
+    assert "by construction" in reason
+
+
+def test_zero_delta_with_no_recovered_population_reads_inert_empty():
+    """Distinguishes "the clause bars nothing" from "there was nothing to bar".
+    Both close the gate, but only the former generalises to a store where
+    retractions fire, and the verdict must not let a reader conflate them."""
+    verdict, _ = _verdict(_report(anchor_delta=0, edge_budget=4, recovered=0))
+    assert verdict == "INERT-EMPTY"
+
+
+def test_zero_delta_over_a_real_population_reads_inert_and_closes_stage_1():
+    verdict, _ = _verdict(_report(anchor_delta=0, edge_budget=4, recovered=3))
     assert verdict == "INERT"
 
 
@@ -344,14 +364,14 @@ def test_a_delta_with_no_evidence_backed_row_is_unattributed_not_sized():
     evidence. Quoting a recovery rate here would report value oscillation and
     migration backfill as 'the retraction gate is too aggressive'."""
     verdict, _ = _verdict(
-        _report(anchor_delta=4,
+        _report(anchor_delta=4, recovered=4,
                 buckets={**dict.fromkeys(BUCKETS, 0), "value_oscillation": 4}))
     assert verdict == "UNATTRIBUTED"
 
 
 def test_a_delta_with_evidence_backing_is_sized_and_demands_hand_verification():
     verdict, reason = _verdict(
-        _report(anchor_delta=4,
+        _report(anchor_delta=4, recovered=4,
                 buckets={**dict.fromkeys(BUCKETS, 0), "evidence_backed": 2}))
     assert verdict == "SIZED"
     assert "hand-verify" in reason

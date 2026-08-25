@@ -238,12 +238,34 @@ def measure_recovery(conn: sqlite3.Connection, *, cap: int = 20) -> dict:
 
 
 def _verdict(report: dict) -> tuple[str, str]:
-    """Apply the pre-registered reading. Returns (verdict, one-line reason)."""
+    """Apply the pre-registered reading. Returns (verdict, one-line reason).
+
+    The first branch is a DEGENERACY guard, not part of the pre-registration:
+    `_anchor_facts` gives profile rows the whole cap first, so a store with
+    >= cap active profile rows leaves NO edge budget, and the diff is then 0
+    for arithmetic reasons rather than because the clause is inert. Measured on
+    the box 2026-08-25: 20 profile rows against cap=20 -> edge budget 0. Without
+    this branch the probe prints the pre-registered "INERT" reading on a store
+    that cannot answer the question -- the degenerate-criterion trap, one level
+    up from the one this probe was built to avoid.
+    """
+    if report["edge_budget"] <= 0:
+        return ("VACUOUS",
+                f"{report['profile_rows']} profile rows consume the whole "
+                f"cap={report['cap']}, so the edge budget is 0 and the diff is 0 "
+                "by construction -- this store cannot answer the question. NOT "
+                "evidence of anything; re-run with a larger --cap or on a store "
+                "with a smaller profile")
+    if report["anchor_delta"] == 0 and report["recovered"] == 0:
+        return ("INERT-EMPTY",
+                "no recovered edges exist at all, so the clause has nothing to "
+                "bar. A correct close for THIS store, but it says nothing about "
+                "a store where retractions actually fire")
     if report["anchor_delta"] == 0:
         return ("INERT",
-                "the invalid_at clause costs the digest nothing on this store; "
-                "Grove E2 Stage 1 closes FAIL-mechanism, Plan D may copy the "
-                "predicate verbatim")
+                f"{report['recovered']} recovered edges exist and the invalid_at "
+                "clause still costs the digest nothing; Grove E2 Stage 1 closes "
+                "FAIL-mechanism, Plan D may copy the predicate verbatim")
     if report["buckets"]["evidence_backed"] == 0:
         return ("UNATTRIBUTED",
                 "the clause excludes facts, but no closure is backed by "
@@ -260,7 +282,9 @@ def _render(report: dict, *, path: str) -> str:
         "",
         f"  store             {path}",
         f"  cap               {report['cap']} "
-        f"({report['profile_rows']} profile + {report['edge_budget']} edge budget)",
+        f"({report['profile_rows']} profile + {report['edge_budget']} edge budget)"
+        + ("   !! profile rows consume the entire cap: the digest anchor "
+           "contains ZERO graph edges" if report["edge_budget"] <= 0 else ""),
         "",
         "  ── mechanism (read this first) ──",
         f"  anchor with       {report['anchor_with_clause']} facts",
