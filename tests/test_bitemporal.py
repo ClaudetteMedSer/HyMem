@@ -169,6 +169,111 @@ def test_stamp_invalidation_empty_is_noop(hy):
     bitemporal.stamp_invalidation(hy.conn, [])  # must not raise
 
 
+# --- invalid_at: re-opened on re-assertion ----------------------------------
+#
+# A positive polarity mention of a retracted/closed edge flips status back to
+# 'active'. The validity interval must reopen too — invalid_at clears,
+# mirroring rules.py's re-assert contract (status='active', invalid_at=NULL).
+# Without the clear the resurrected edge keeps its close date and stays
+# invisible to every reader that filters on `invalid_at IS NULL`
+# (state_anchor.py, aggregate.py), in the one state where it should be most
+# trusted: asserted, contradicted, then re-asserted.
+
+
+def test_positive_reassert_clears_invalid_at(hy):
+    """Re-asserting a retracted edge reopens the validity interval: status
+    flips to active AND the stale invalid_at clears."""
+    conn = hy.conn
+    _seed_session(conn)
+    _seed_message(conn, 10, "2024-03-15 09:00:00")
+    _seed_chunk(conn, "c1", 10)
+    eid = _seed_edge(conn, "med_flow", "uses", "redis", status="retracted")
+    conn.execute(
+        "UPDATE knowledge_graph SET invalid_at = '2024-05-01 00:00:00' WHERE id = ?",
+        (eid,),
+    )
+
+    from hymem.dreaming import phase1
+    from hymem.extraction.triples import Triple
+    phase1._upsert_triple(conn, "c1", Triple("med_flow", "uses", "redis", 1))
+
+    row = _edge(conn, eid)
+    assert row["status"] == "active"
+    assert row["invalid_at"] is None
+
+
+def test_positive_reassert_self_heals_active_with_stale_invalid_at(hy):
+    """The already-corrupted state (status='active' BUT invalid_at still set,
+    as produced by the never-cleared bug) must heal on the next positive
+    mention — the clear must not be gated on status='retracted', or rows that
+    died in this state never come back."""
+    conn = hy.conn
+    _seed_session(conn)
+    _seed_message(conn, 10, "2024-03-15 09:00:00")
+    _seed_chunk(conn, "c1", 10)
+    eid = _seed_edge(conn, "med_flow", "uses", "redis", status="active")
+    conn.execute(
+        "UPDATE knowledge_graph SET invalid_at = '2024-05-01 00:00:00' WHERE id = ?",
+        (eid,),
+    )
+
+    from hymem.dreaming import phase1
+    from hymem.extraction.triples import Triple
+    phase1._upsert_triple(conn, "c1", Triple("med_flow", "uses", "redis", 1))
+
+    row = _edge(conn, eid)
+    assert row["status"] == "active"
+    assert row["invalid_at"] is None
+
+
+def test_negative_reassert_does_not_clear_invalid_at(hy):
+    """A negative mention on a closed edge must NOT resurrect it or clear the
+    close date — only positive re-assertion reopens the interval."""
+    conn = hy.conn
+    _seed_session(conn)
+    _seed_message(conn, 10, "2024-03-15 09:00:00")
+    _seed_chunk(conn, "c1", 10)
+    eid = _seed_edge(conn, "med_flow", "uses", "redis", status="retracted")
+    conn.execute(
+        "UPDATE knowledge_graph SET invalid_at = '2024-05-01 00:00:00' WHERE id = ?",
+        (eid,),
+    )
+
+    from hymem.dreaming import phase1
+    from hymem.extraction.triples import Triple
+    phase1._upsert_triple(conn, "c1", Triple("med_flow", "uses", "redis", -1))
+
+    row = _edge(conn, eid)
+    assert row["status"] == "retracted"
+    assert row["invalid_at"] == "2024-05-01 00:00:00"
+
+
+def test_reinforce_heals_active_with_stale_invalid_at(hy):
+    """phase3.reinforce bumps positive evidence on active rows; a row that is
+    active-with-stale-invalid_at must be healed there too, not re-bumped into
+    guaranteed invisibility. (Box evidence: edge 1872 was re-reinforced at
+    18:12:59 while corrupted.)"""
+    conn = hy.conn
+    _seed_session(conn)
+    _seed_message(conn, 10, "2024-03-15 09:00:00")
+    _seed_chunk(conn, "c1", 10)
+    eid = _seed_edge(conn, "med_flow", "uses", "redis", status="active")
+    conn.execute(
+        "UPDATE knowledge_graph SET invalid_at = '2024-05-01 00:00:00' WHERE id = ?",
+        (eid,),
+    )
+    conn.execute(
+        "INSERT INTO entity_mentions(chunk_id, entity_canonical) VALUES (?, ?), (?, ?)",
+        ("c1", "med_flow", "c1", "redis"),
+    )
+
+    from hymem.dreaming import phase3
+    phase3.reinforce(conn, hy.config)
+
+    row = _edge(conn, eid)
+    assert row["invalid_at"] is None
+
+
 # --- end-to-end through the public retraction API --------------------------
 
 

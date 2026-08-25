@@ -653,13 +653,24 @@ def _upsert_triple(
 
     if triple.polarity == 1:
         # pos_weight is the speaker weight for this chunk (>= 1).
+        # Re-asserting a retracted edge reopens its validity interval: the
+        # status flip to 'active' is useless without also clearing invalid_at,
+        # since every reader that consumes active edges filters on
+        # `invalid_at IS NULL` (state_anchor.py, aggregate.py). Without the
+        # clear, an asserted → contradicted → re-asserted edge stays invisible
+        # in the exact state where it should be most trusted. The clear is
+        # unconditional (not gated on status='retracted') so a row that
+        # already died in the corrupted state (active + stale invalid_at)
+        # self-heals on its next positive mention. Mirrors the rules table's
+        # re-assert contract (rules.py: status='active', invalid_at=NULL).
         conn.execute(
             """
             UPDATE knowledge_graph
             SET pos_evidence = pos_evidence + ?,
                 last_seen = CURRENT_TIMESTAMP,
                 last_reinforced = CURRENT_TIMESTAMP,
-                status = CASE WHEN status = 'retracted' THEN 'active' ELSE status END
+                status = CASE WHEN status = 'retracted' THEN 'active' ELSE status END,
+                invalid_at = NULL
             WHERE id = ?
             """,
             (pos_weight, edge_id),

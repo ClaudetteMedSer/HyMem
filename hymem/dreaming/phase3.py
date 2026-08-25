@@ -190,7 +190,8 @@ def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         conn.execute(
             "UPDATE knowledge_graph "
             "SET pos_evidence = pos_evidence + ?, "
-            "    last_reinforced = CURRENT_TIMESTAMP "
+            "    last_reinforced = CURRENT_TIMESTAMP, "
+            "    invalid_at = NULL "
             "WHERE id = ?",
             (weight, edge_id),
         )
