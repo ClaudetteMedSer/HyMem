@@ -58,8 +58,14 @@ from hymem.dreaming.value_supersession import _ISO_DATE, _classify_object
 # The EXACT anchor predicate — copy of dreaming/aggregate.py:825-835. If the
 # digest anchor ever changes, this module must change with it (the probe's
 # whole point is measuring the CURRENT state anchor).
+#
+# `id` is projected in ADDITION to the digest's three columns. The digest only
+# renders text; the probe must trace a seed edge back to the chunks it was
+# extracted from, to exclude provenance-circular "recoveries" (D4). The filter,
+# the ordering and the cap are untouched, which is what the parity control
+# pins.
 _ANCHOR_SQL = """
-    SELECT subject_canonical, predicate, object_canonical
+    SELECT id, subject_canonical, predicate, object_canonical
     FROM knowledge_graph
     WHERE status = 'active' AND derived = 0 AND invalid_at IS NULL
       AND pos_evidence > neg_evidence

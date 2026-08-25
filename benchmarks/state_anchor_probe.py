@@ -79,6 +79,32 @@ def _gold_absent(gold: set[str], store_keys: set[str]) -> set[str]:
     return gold - store_keys
 
 
+def _provenance_chunk_ids(conn: sqlite3.Connection, edges) -> set[str]:
+    """Chunks the SEED EDGES were themselves extracted from.
+
+    Retrieving one of these is tautological: the anchor term came out of that
+    chunk, so matching it back proves nothing about reachability. The plan
+    requires these excluded and COUNTED separately — without the exclusion,
+    reachability can approach 100% and mean nothing (D4).
+    """
+    ids = [e["id"] for e in edges if _has_id(e)]
+    if not ids:
+        return set()
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT DISTINCT chunk_id FROM kg_evidence WHERE edge_id IN ({marks})",
+        ids,
+    ).fetchall()
+    return {r[0] for r in rows if r[0]}
+
+
+def _has_id(edge) -> bool:
+    try:
+        return edge["id"] is not None
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
 def run_probe(
     store_path: str,
     queries_path: str,
@@ -121,6 +147,9 @@ def run_probe(
     vec_calls = 0
     hit_queries = 0
     wrong_queries = 0
+    headroom_queries = 0
+    headroom_hits = 0
+    circular_queries = 0
 
     for q in queries:
         question = q["question"]
@@ -172,12 +201,25 @@ def run_probe(
 
         anchor_keys = seen_keys
         fired = bool(anchor_keys)
-        anchored_only = sorted(gold & anchor_keys - baseline_keys)
+
+        # HEADROOM (pre-registered, D4): the gold this query's baseline already
+        # has. Without it a low hit rate is unreadable — saturation and a dead
+        # mechanism produce the same number (the LME 99.8% precedent). When
+        # `gold_missing` is empty there is nothing left for ANY tier to reach,
+        # so the query cannot contribute to C1 and is not evidence against it.
+        gold_covered_baseline = sorted(gold & baseline_keys)
+        gold_missing = sorted(gold - baseline_keys)
+
+        # CIRCULARITY (pre-registered, D4): drop gold that is merely the seed
+        # edge's own provenance.
+        circular = set(_provenance_chunk_ids(conn, edges))
+        circular_keys = sorted((gold & anchor_keys - baseline_keys) & circular)
+        anchored_only = sorted(gold & anchor_keys - baseline_keys - circular)
         anchored_only_edge = sorted(
-            gold & {h["chunk_id"] for h in edge_hits} - baseline_keys
+            gold & {h["chunk_id"] for h in edge_hits} - baseline_keys - circular
         )
         anchored_only_profile = sorted(
-            gold & {h["chunk_id"] for h in profile_hits} - baseline_keys
+            gold & {h["chunk_id"] for h in profile_hits} - baseline_keys - circular
         )
         wrong_state_keys = sorted(anchor_keys & wrong_state)
         added = [h for h in anchor_hits_merged if h["chunk_id"] not in baseline_keys]
@@ -185,6 +227,12 @@ def run_probe(
 
         if anchored_only:
             hit_queries += 1
+        if gold_missing:
+            headroom_queries += 1
+            if anchored_only:
+                headroom_hits += 1
+        if circular_keys:
+            circular_queries += 1
         if wrong_state_keys:
             wrong_queries += 1
         llm_calls += 0
@@ -197,6 +245,9 @@ def run_probe(
             "anchored_only_keys": anchored_only,
             "anchored_only_edge_keys": anchored_only_edge,
             "anchored_only_profile_keys": anchored_only_profile,
+            "gold_covered_baseline_keys": gold_covered_baseline,
+            "gold_missing_baseline_keys": gold_missing,
+            "circular_keys": circular_keys,
             "wrong_state_keys": wrong_state_keys,
             "added_rows": len(added),
             "added_tokens": added_tokens,
@@ -230,6 +281,14 @@ def run_probe(
     summary = {
         "n_queries": n,
         "hit_rate": (hit_queries / n) if n else 0.0,
+        # --- headroom: read these BEFORE hit_rate ---
+        "headroom_queries": headroom_queries,
+        "headroom_rate": (headroom_queries / n) if n else 0.0,
+        "hit_rate_within_headroom": (
+            (headroom_hits / headroom_queries) if headroom_queries else 0.0
+        ),
+        "c1_ceiling": (headroom_queries / n) if n else 0.0,
+        "circular_queries": circular_queries,
         "hit_rate_edge_source": (edge_hits_q / n) if n else 0.0,
         "hit_rate_profile_source": (profile_hits_q / n) if n else 0.0,
         "wrong_state_rate": (wrong_queries / n) if n else 0.0,

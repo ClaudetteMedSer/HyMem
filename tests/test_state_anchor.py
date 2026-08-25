@@ -114,6 +114,10 @@ def anchor_fixture(conn):
     - A second, query-reachable chunk: "Model training output is stored on
       nas01." — a topic row that does NOT contain the answer, so a naive
       query-match does not accidentally count as the gold row.
+    - "c-gold": shares the anchor vocabulary but is NOT the seed edge's
+      evidence chunk. This is the only row that can demonstrate reachability.
+      "c-evidence" cannot: the seed terms were EXTRACTED from it, so matching
+      it back is provenance-circular and the probe must exclude it (D4).
     """
     with core_db.transaction(conn):
         _seed_session(conn)
@@ -123,6 +127,10 @@ def anchor_fixture(conn):
         _seed_chunk(conn, "c-evidence", 1,
                     "We installed CUDA 12.1 and PyTorch 2.2 on the dev box in January.")
         _seed_chunk(conn, "c-distractor", 2, "Model training output is stored on nas01.")
+        # A GENUINELY anchored row: it shares the anchor's vocabulary but is
+        # NOT the seed edge's provenance, so reaching it is not tautological.
+        _seed_chunk(conn, "c-gold", 3,
+                    "The cuda toolkit on dev_box was upgraded again in March.")
         _seed_edge(conn, "dev_box", "configured_with", "cuda_12.1", pos=3, neg=0)
         edge_id = conn.execute(
             "SELECT id FROM knowledge_graph WHERE subject_canonical='dev_box'"
@@ -413,7 +421,9 @@ def test_probe_reports_the_anchored_only_hit(anchor_fixture, tmp_path):
 
     queries = [{
         "question": "Which GPU system produces model training output?",
-        "gold_chunk_ids": ["c-evidence"],
+        # BOTH golds: the genuine one and the circular one. The probe must
+        # credit the first and exclude-but-count the second.
+        "gold_chunk_ids": ["c-gold", "c-evidence"],
         "category": "single-session-user",
     }]
     qpath = tmp_path / "queries.json"
@@ -431,6 +441,11 @@ def test_probe_reports_the_anchored_only_hit(anchor_fixture, tmp_path):
 
     assert summary["n_queries"] == 1
     assert summary["hit_rate"] == 1.0
+    assert summary["circular_queries"] == 1, (
+        "the provenance-circular gold was credited as a reach"
+    )
+    assert summary["headroom_queries"] == 1
+    assert summary["c1_ceiling"] == 1.0
     assert summary["wrong_state_rate"] == 0.0
     assert summary["vec_calls"] == 0
     assert summary["llm_calls"] == 0
@@ -478,3 +493,60 @@ def test_message_expansion_is_inert_without_seed_terms(anchor_fixture):
     from hymem.query.state_anchor import expand_over_messages
 
     assert expand_over_messages(anchor_fixture, [], top_k=5) == []
+
+
+def test_a_provenance_circular_gold_does_not_score(anchor_fixture, tmp_path):
+    """CONTROL for the circularity exclusion (D4).
+
+    When the ONLY gold row is the chunk the seed edge was extracted from, the
+    anchor reaches it by tautology and the probe must score ZERO. Without this
+    the box's original fixture read hit_rate 1.0 on a circular hit, and any
+    store where edges are dense in gold chunks would report reachability
+    approaching 100% while proving nothing.
+    """
+    import json
+
+    from hymem import HyMemConfig
+
+    queries = [{
+        "question": "Which GPU system produces model training output?",
+        "gold_chunk_ids": ["c-evidence"],
+        "category": "single-session-user",
+    }]
+    qpath = tmp_path / "queries.json"
+    qpath.write_text(json.dumps(queries))
+    store = tmp_path / "store.sqlite"
+    anchor_fixture.execute("VACUUM INTO ?", (str(store),))
+
+    summary = run_probe(store, qpath, cfg=HyMemConfig(root=tmp_path))
+    assert summary["hit_rate"] == 0.0, "a tautological reach was scored as a hit"
+    assert summary["circular_queries"] == 1
+
+
+def test_a_saturated_baseline_reports_zero_headroom(anchor_fixture, tmp_path):
+    """CONTROL for the headroom denominator (D4).
+
+    When the baseline already holds the gold, no tier can add reach: the query
+    must not count toward the C1 denominator. Without this, a saturated store
+    drives hit_rate toward 0 and the verdict reads FAIL-mechanism when the real
+    reading is "the instrument had no room" (the LME 99.8% precedent).
+    """
+    import json
+
+    from hymem import HyMemConfig
+
+    queries = [{
+        "question": "Model training output stored nas01",   # matches the distractor
+        "gold_chunk_ids": ["c-distractor"],
+        "category": "single-session-user",
+    }]
+    qpath = tmp_path / "queries.json"
+    qpath.write_text(json.dumps(queries))
+    store = tmp_path / "store.sqlite"
+    anchor_fixture.execute("VACUUM INTO ?", (str(store),))
+
+    summary = run_probe(store, qpath, cfg=HyMemConfig(root=tmp_path))
+    assert summary["headroom_queries"] == 0, (
+        "a query whose gold the baseline already had was counted as headroom"
+    )
+    assert summary["c1_ceiling"] == 0.0
