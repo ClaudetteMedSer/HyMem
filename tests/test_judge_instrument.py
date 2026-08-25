@@ -1034,6 +1034,49 @@ def test_no_abs_row_reaches_either_handcheck_arm(tmp_path):
     assert not any(r["is_abs"] for r in w["classified_committed_CONTROL"])
 
 
+def _lme_row(*, qtype="single-session-user", answer="yes",
+             gold="g", ident="r0"):
+    return {"id": ident, "question_type": qtype, "question": "q",
+            "answer": gold, "hypothesis": answer}
+
+
+def test_pre_spend_writer_selects_the_same_arms_as_the_paid_writer(tmp_path):
+    """write_handcheck_sample_pre must reconstruct exactly what rejudge_row
+    would have put in the records, so the free-path writer and the paid-path
+    writer pick the same rows. It delegates selection to write_handcheck_sample
+    itself; this test pins the record construction it feeds in, including the
+    _abs population rule — the drift class that shipped the 6-slot bug."""
+    rows = ([_lme_row(qtype="single-session-user_abs",
+                      answer="I don't have enough information", ident=f"a{i}")
+             for i in range(4)]
+            + [_lme_row(answer="I don't have enough information", ident=f"f{i}")
+               for i in range(6)]
+            + [_lme_row(answer="yes", ident=f"c{i}") for i in range(6)])
+    # Paid-equivalent records: the same classifiers, applied by rejudge_row.
+    paid_recs = []
+    for r in rows:
+        qtype, _q, gold, answer = JA.judge_inputs(r, "lme")
+        cls = JA.classify_refusal(answer)
+        paid_recs.append({"id": r["id"], "question_type": qtype,
+                          "is_abs": "_abs" in qtype,
+                          "answer_refusal": cls["refusal"],
+                          "answer_canonical": cls["canonical"],
+                          "answer_loose_only": cls["loose_only"],
+                          "recites_gold": JA.recites_gold(answer, gold),
+                          "_answer": answer, "_gold": gold})
+
+    free = JA.write_handcheck_sample_pre(rows, "lme", str(tmp_path / "f.json"), k=3)
+    paid = JA.write_handcheck_sample(paid_recs, str(tmp_path / "p.json"), k=3)
+    fw, pw = json.loads(free.read_text()), json.loads(paid.read_text())
+
+    for arm in ("classified_refusal", "classified_committed_CONTROL"):
+        assert [r["id"] for r in fw[arm]] == [r["id"] for r in pw[arm]] == \
+            [r["id"] for r in fw[arm]]
+    # The population rule holds on the free side too.
+    assert [r["id"] for r in fw["classified_refusal"]] == ["f0", "f1", "f2"]
+    assert len(fw["classified_committed_CONTROL"]) == 3
+
+
 def test_the_handcheck_arms_are_still_capped_at_HANDCHECK_K(tmp_path):
     """Negative control for the population fix: restricting to non-_abs must not
     disturb the cap. If the fix had been written as a filter applied AFTER the

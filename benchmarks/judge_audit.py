@@ -782,6 +782,10 @@ def main(argv=None, client=None) -> int:
               f"{pre['judgeable_non_abs']})   bar = {C3_MATERIAL:.1f}%")
         _code, _msg = c3_spend_licence(pre)
         print(f"    {_msg}")
+        hc_path = write_handcheck_sample_pre(rows, args.bench, args.out)
+        if hc_path:
+            print(f"    hand-check sample (pre-spend, delegated to the paid "
+                  f"sampler's selection) → {hc_path}")
         print(f"\n    a --spend pass would cost {len(to_judge)} judge calls "
               f"(1 per judgeable row, max_tokens=10).")
         print("    add --spend to run it.\n")
@@ -811,6 +815,40 @@ def main(argv=None, client=None) -> int:
     print(f"  full records → {args.out}")
     print(f"  hand-check sample → {Path(args.out).with_suffix('.handcheck.json')}")
     return 0
+
+
+def write_handcheck_sample_pre(rows: list[dict], bench: str, out: str,
+                               k: int = HANDCHECK_K) -> Path | None:
+    """PRE-SPEND twin of write_handcheck_sample: same arm selection, no judge.
+
+    Builds rec-shaped records from the run file alone (same classifiers the
+    paid path applies), then delegates arm selection to write_handcheck_sample
+    OUTRIGHT — one selection implementation, so a future fix to the paid
+    sampler cannot leave a stale copy behind in the free path. Rows that are
+    not judgeable are skipped, mirroring `to_judge`. Returns None when there is
+    nothing to sample (no refusals).
+    """
+    recs = []
+    for r in rows:
+        qtype, _q, gold, answer = judge_inputs(r, bench)
+        if not judgeable(answer):
+            continue
+        cls = classify_refusal(answer)
+        recs.append({
+            "id": r.get("id") or r.get("qa_id") or r.get("question_id"),
+            "question_type": qtype,
+            "question": r.get("question", ""),
+            "is_abs": "_abs" in qtype,
+            "answer_refusal": cls["refusal"],
+            "answer_canonical": cls["canonical"],
+            "answer_loose_only": cls["loose_only"],
+            "recites_gold": recites_gold(answer, gold),
+            "_answer": answer,
+            "_gold": gold,
+        })
+    if not any(r["answer_refusal"] for r in recs):
+        return None
+    return write_handcheck_sample(recs, out, k)
 
 
 def write_handcheck_sample(recs: list[dict], out: str,
