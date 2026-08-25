@@ -652,8 +652,13 @@ def build_report(recs: list[dict], precheck: dict, handcheck: tuple[int, int] | 
         "n_refusals_non_abs": len(refusals),
         "buckets": dict(buckets),
         "llm_error_replies": buckets.get("llm_error", 0),
+        # n_flag/n_ctrl are exported so the sampler's arm sizes can be pinned
+        # against the divisors they are supposed to match. Left as locals, the
+        # only way to assert that parity was to restate the definition in the
+        # test — which is exactly the duplication that let the two drift apart.
         "handcheck": ({"fp": handcheck[0], "fn": handcheck[1],
-                       "fp_rate": fp_rate, "fn_rate": fn_rate}
+                       "fp_rate": fp_rate, "fn_rate": fn_rate,
+                       "n_flag": n_flag, "n_ctrl": n_ctrl}
                       if handcheck is not None else None),
         "blocked": blocked,
         "verdict": verdict,
@@ -813,9 +818,29 @@ def write_handcheck_sample(recs: list[dict], out: str,
     """G4's correct-answer control. Writes BOTH refusal-classified and
     committed-classified rows, labelled, so the hand-check can measure false
     POSITIVES and false NEGATIVES. A sample of only flagged rows would be a
-    confirmation pass and could not produce an FN count."""
-    flagged = [r for r in recs if r["answer_refusal"]][:k]
-    control = [r for r in recs if not r["answer_refusal"]][:k]
+    confirmation pass and could not produce an FN count.
+
+    BOTH arms draw from non-`_abs` rows only, because that is the population
+    `build_report` divides by (`n_flag`/`n_ctrl` at :617-618 are sized off
+    `non_abs`). Drawing from all rows while dividing by the non-`_abs` count
+    spends divisor slots on rows the criterion never counts, and understates
+    the FP rate by exactly that fraction — measured at 6 of 25 slots on the
+    2026-08-25 LME run, where the reader refused 28 of 30 abstention questions.
+    The correction `c3_adj = c3 * (1 - fp_rate)` is applied to a non-`_abs`
+    quantity, so its FP rate has to be measured on non-`_abs` rows.
+
+    Consequence to keep in view: the refusal classifier is then never
+    hand-validated on `_abs` rows. Nothing bands on that today — C3 is the only
+    consumer and it excludes them — but a future criterion that reads abstention
+    behaviour would need its own sample rather than this one.
+
+    The `[:k]` slice is take-first, not `stable_sample`. Deliberate: the arm
+    sizes must equal `n_flag`/`n_ctrl` exactly, and re-sampling a file an
+    operator has already hand-scored would silently invalidate their work.
+    """
+    non_abs = [r for r in recs if not r["is_abs"]]
+    flagged = [r for r in non_abs if r["answer_refusal"]][:k]
+    control = [r for r in non_abs if not r["answer_refusal"]][:k]
     dest = Path(out).with_suffix(".handcheck.json")
     dest.write_text(json.dumps(
         {"instructions":

@@ -989,3 +989,65 @@ def test_the_licence_keys_on_the_banked_bar_not_a_hard_coded_literal():
         assert JA.c3_spend_licence(pre)[0] == JA.LICENCE_REACHABLE
     finally:
         JA.C3_MATERIAL = old
+
+
+# ── Hand-check sample / divisor parity ──────────────────────────────────
+
+def _hc_rec(*, is_abs: bool, refusal: bool) -> dict:
+    r = _rec(answer_refusal=refusal, verdict=False)
+    r["is_abs"] = is_abs
+    return r
+
+
+def test_handcheck_arm_sizes_equal_the_divisors_they_are_scored_against(tmp_path):
+    """The FP rate is `fp / n_flag`, and `n_flag` is sized off NON-_abs refusals
+    (`build_report`) while the sampler drew from ALL rows. Every _abs row in the
+    written arm therefore consumed a divisor slot for a row the criterion never
+    counts, understating the FP rate by that fraction — silently, as a clean
+    number. Pin the two populations together so they cannot drift again."""
+    recs = ([_hc_rec(is_abs=True, refusal=True) for _ in range(20)]
+            + [_hc_rec(is_abs=False, refusal=True) for _ in range(8)]
+            + [_hc_rec(is_abs=False, refusal=False) for _ in range(9)])
+
+    dest = JA.write_handcheck_sample(recs, str(tmp_path / "a.json"))
+    written = json.loads(dest.read_text())
+    rep = JA.build_report(recs, _pre(), handcheck=(0, 0))
+
+    assert len(written["classified_refusal"]) == rep["handcheck"]["n_flag"] == 8
+    assert len(written["classified_committed_CONTROL"]) == rep["handcheck"]["n_ctrl"] == 9
+
+
+def test_no_abs_row_reaches_either_handcheck_arm(tmp_path):
+    """Direct statement of the population rule. The parity test above would also
+    pass if BOTH sides wrongly included _abs rows; this one pins the side that
+    has to be non-_abs on its own."""
+    recs = ([_hc_rec(is_abs=True, refusal=True) for _ in range(5)]
+            + [_hc_rec(is_abs=True, refusal=False) for _ in range(5)]
+            + [_hc_rec(is_abs=False, refusal=True) for _ in range(3)]
+            + [_hc_rec(is_abs=False, refusal=False) for _ in range(3)])
+
+    dest = JA.write_handcheck_sample(recs, str(tmp_path / "b.json"))
+    w = json.loads(dest.read_text())
+    assert len(w["classified_refusal"]) == 3
+    assert len(w["classified_committed_CONTROL"]) == 3
+    assert not any(r["is_abs"] for r in w["classified_refusal"])
+    assert not any(r["is_abs"] for r in w["classified_committed_CONTROL"])
+
+
+def test_the_handcheck_arms_are_still_capped_at_HANDCHECK_K(tmp_path):
+    """Negative control for the population fix: restricting to non-_abs must not
+    disturb the cap. If the fix had been written as a filter applied AFTER the
+    `[:k]` slice, arms would silently come back short of K on an _abs-heavy run
+    and every rate would be divided by the wrong number in the other direction."""
+    n = JA.HANDCHECK_K + 10
+    # _abs rows FIRST. With them last, `[:k]` never reaches one and a
+    # filter-after-slice bug is invisible — the fixture, not the code, would be
+    # deciding the result.
+    recs = ([_hc_rec(is_abs=True, refusal=True) for _ in range(n)]
+            + [_hc_rec(is_abs=True, refusal=False) for _ in range(n)]
+            + [_hc_rec(is_abs=False, refusal=True) for _ in range(n)]
+            + [_hc_rec(is_abs=False, refusal=False) for _ in range(n)])
+
+    w = json.loads(JA.write_handcheck_sample(recs, str(tmp_path / "c.json")).read_text())
+    assert len(w["classified_refusal"]) == JA.HANDCHECK_K
+    assert len(w["classified_committed_CONTROL"]) == JA.HANDCHECK_K
