@@ -273,10 +273,29 @@ D2 CLOSED BY FIX, 2026-08-25. `judge_answer` now calls
     `shipping_verdict` is now the FROZEN pre-fix rule and must never be
     re-synced. Two shapes deliberately unchanged and pinned by test: "yes and no"
     (a criterion question, D1) and a truncated fragment carrying a bare "yes"
-    (needs reply structure, and `max_tokens=10` is the frozen contract). D3
-    half-fixed: the sentinel can no longer score CORRECT, but it is still
-    indistinguishable from a genuine "no" at the call site — surfacing it needs
-    a channel `judge_answer`'s bool return does not have.
+    (needs reply structure, and `max_tokens=10` is the frozen contract).
+
+D3 CLOSED BY FIX, 2026-08-26. The visibility half. `judge_scored` returns
+    `correct=None` for a sentinel — UNSCORED, not wrong — and all six call sites
+    across the three adapters route through it; the ~15 accuracy summations drop
+    unscored rows once per reporting entry point, and `judge_error_note` reports
+    the count WITH its denominator (a zero over a run that made no judge calls
+    is not reassurance). `judge_answer` keeps its bare bool and its fail-closed
+    False, unchanged: it is the certified function, so the channel is a sibling
+    (`judge_answer_raw`) rather than a modification, and rule 3's identity with
+    `reference_verdict` survives intact.
+
+    Landed in the same inert window as D2 and on the same argument — 0
+    judge-side sentinels over 500 replies means the filter is the identity on a
+    clean run, and a test asserts that rather than claiming it. No canonical
+    number moves.
+
+    The adapters now persist `judge_raw` (~10 tokens/row). THIS MODULE'S REASON
+    TO EXIST NARROWS ACCORDINGLY: `--run --spend` re-judges because `raw` was
+    discarded, and on any run made after 2026-08-26 it no longer is. A future
+    audit of such a run should re-score the STORED replies (the `--verify-*`
+    shape) rather than pay for new ones. C4 stays blocked on the old pair, but
+    is unblocked for the next one.
 
 C4. NOT RUN — blocked, recorded not dropped. No scored LoCoMo run pair exists
     on this box; the only conv-26 artifact is a --diag-only dump (correct=null,

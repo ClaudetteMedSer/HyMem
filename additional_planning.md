@@ -2874,3 +2874,141 @@ that is ever non-trivial, and build it against observed cases.
 | **Grove E3** | Pre-registered, unbuilt; its "behind Campaign E" sequencing tie is released now that Campaign E is closed as a scored campaign. |
 | **Grove E4** | Pre-registered, unbuilt; still tied to the Stage 3c flip decision (same dependency as Plan C), NOT to Campaign E. |
 | **`main`** | 209 commits behind `Beam-optimisation`, which now holds Campaign E, narrative facts, schema v19→v26 and this audit under a name that no longer describes it. |
+
+---
+
+## D3 closed + the `recites_gold` gate built (added 2026-08-26)
+
+Both threads the 2026-08-25 audit left open as *cheap and well-evidenced*. Both
+are LLM-free. Neither moves a canonical number, and one of them is asserted to
+move none rather than claimed to.
+
+**Machine note, load-bearing for what follows.** The dev machine is not the box.
+`~/.hermes` does not exist there, and no `judge_audit.json` or scored LME run
+file is present — those live on `Afrodite.MedSerPBAS`. So Part A's CODE is
+built and tested; Part A's VERDICT is unrun and can only run where the banked
+replies are. This is the same shape that blocks C4, and it is stated rather than
+worked around.
+
+### Part A — the `recites_gold` token rule (built, gated, UNRUN)
+
+The pre-registration (`5884adf`) recorded that the C3 numerator's 5 false
+negatives came from the instrument's token rule, not the judge, and said to gate
+any loosening on its own. That is now built.
+
+**v1 is frozen under its own name** with the same never-re-sync contract as
+`shipping_verdict` — it produced C3 10/470, the 5-of-10 decomposition, and the
+16/470 = 3.40% ceiling that licensed the 2026-08-25 spend. **v2** keeps the
+verbatim fast path, strips the widening gloss from gold, keeps numerals as
+content, and allows `RECITE_ALPHA_COVERAGE` slack on prose.
+**`recites_gold` still aliases v1.** The alias IS the flip, and it has not
+happened.
+
+> **The safe direction reverses, which is the whole reason this is separate.**
+> The banked note argues v1's under-count "can only wrongly REFUSE a spend,
+> never wrongly license one". Loosening inverts that: `free_precheck`'s ceiling
+> numerator is this function, so v2 can wrongly LICENSE one. v2 therefore holds
+> numerals at ZERO tolerance and buys slack only on prose — and R2/R3, arms v1
+> never needed, are the gate.
+
+Bars, banked before v2 scored a row: **R1** recall on fixtures, **R2** precision
+by hand-check of newly-flagged rows (FP ≤ 1), **R3** a free shuffled-gold
+negative control (v2's mismatched-pair rate ≤ v1's + 2pp AND true-pair ≥ 3× its
+own shuffled rate), **R4** the licence restated under both rules, reported not
+barred. **R1 alone is explicitly not the gate** — it re-finds the rows the rule
+was written from.
+
+`--verify-recitation` is the free instrument, and it carries the vacuity split
+for the same reason `--verify-parse` does: a row whose gold appears VERBATIM in
+the answer is decided by the fast path BOTH rules share, so on such a corpus
+"0 changes" cannot fail to be 0. `token_rule_consulted` is the denominator that
+makes the number readable. Both directions of change are reported, because the
+rules are **not nested** — v2 is looser on gloss and prose but stricter on
+numerals, so it un-flags rows v1 flagged.
+
+> **A fixture the tests rejected, worth keeping.** The first R1 arm included a
+> "short numeral" row. It does not belong there: the banked note records two v1
+> defects in one breath and they point OPPOSITE ways — discarding numerals makes
+> v1 more PERMISSIVE, mandating the gloss makes it more RESTRICTIVE. Only the
+> second can produce a false negative. Reading "two defects" as "two defects in
+> the same direction" is the kind of error that survives a docstring and dies to
+> a fixture that has to assert BOTH `v1 is False` and `v2 is True`.
+
+**What A5 must do on the box:** run `--verify-recitation judge_audit.json`, hand
+-check the `.recitation.json` sample it writes, and record R1–R4 with numbers.
+PASS flips one line; FAIL keeps v1 and closes. Do not re-tune the rule to make
+it pass.
+
+### Part B — D3, the judge-outage channel (CLOSED)
+
+`judge_answer` returned a bare bool, so a judge that never answered and a judge
+that said "no" were the same value at the call site. An outage streak deflated
+the arm it hit, silently, across all three canonical numbers — on a stack that
+has already lived through one provider hard-deprecation and one outage streak.
+
+**The channel is a sibling, not a modification.** `judge_answer_raw` returns
+`(verdict, raw)`; `judge_answer` is now `judge_answer_raw(...)[0]`,
+byte-identical. That matters: rule 3 of `parse_judge_verdict` is IDENTICAL to
+`judge_audit.reference_verdict`, banked pre-run, and that identity is the entire
+warrant for C1 = 0.00% certifying *this* function rather than something merely
+like it. `judge_scored` holds the policy in one place so six call sites across
+three adapters cannot each decide it differently.
+
+**The denominators were the actual work** — this is what "not two lines" meant.
+`sum(r["correct"] for r in rows) / len(rows)` appears at ~15 sites and TypeErrors
+on the first unscored row. Unscored rows are dropped ONCE per reporting entry
+point rather than guarded fifteen times.
+
+> **Where an unscored row does the most damage, if it is coerced.** In the
+> abstention arm it reads as "the reader answered a question it should have
+> refused" — a hallucination finding manufactured by a timeout. In the recall
+> diagnostics it lands in the miss decomposition and is attributed to whatever
+> its `recall_ceiling` says — a retrieval finding, manufactured the same way.
+> Both are the diagnostic-controls lesson: a broken device returns a confident
+> constant.
+
+**Scope extended, deliberately, to the run-file instruments.** `locomo_flip.py`
+would have TypeError'd; it now drops an unscored row from BOTH arms or neither,
+because dropping it from one leaves the comparison unpaired on exactly the rows
+an outage touched — **the C4 arm-asymmetry void condition arriving through the
+back door**. `locomo_audit.py` no longer hands one to the synthesis-bucket
+hand-check as a reader failure. `facts_ab.py` had already reached the same rule
+independently ("abstention/unjudged: no verdict to pair") and is now pinned so a
+tidy-up cannot remove it on the grounds that `correct` is always a bool.
+
+**Inertness is asserted, not assumed.** 0 judge sentinels over 500 replies means
+the filter is the identity on a clean run, and a test says so. Nothing is
+re-baselined.
+
+**`judge_raw` is now persisted** on every verdict-recording row (~10 tokens).
+This narrows `judge_audit.py`'s own reason to exist: `--run --spend` re-judges
+because `raw` was discarded, and on any run made after today it is not. Future
+audits of such runs should re-score STORED replies. C4 stays blocked on the old
+pair; it is unblocked for the next one.
+
+#### The negative-control probe lied, and that is the finding
+
+All ten new D3 guards were reverted one at a time. Three read UNGUARDED. **Two
+were real test gaps** (the abstention filter and LoCoMo's `judge_error` field —
+the latter because a substring check on the file passed while one of two record
+builders in the same module had lost it; replaced by an ast invariant that every
+dict recording a verdict alongside its question carries the channel). **The
+third was the probe itself**: stale `.pyc` bytecode meant pytest re-ran the
+unbroken module. `PYTHONDONTWRITEBYTECODE=1` fixed it and the guard turned out
+to be guarded all along.
+
+> A negative-control device returning a confident wrong constant is precisely
+> the failure mode negative controls exist to catch. Any future reversion probe
+> in this repo runs with bytecode caching off, and reports which guards it broke
+> rather than only which tests failed.
+
+### Open after 2026-08-26
+
+| Item | State |
+|---|---|
+| **D1 / C3** | Unchanged: WATCH-at-bar, band NOT resolved. |
+| **`recites_gold` gate** | **BUILT, bars banked, UNRUN.** Needs `judge_audit.json` on Afrodite. Free. |
+| **C4 arm asymmetry** | Still blocked on the old pair; **unblocked for the next one** now that `judge_raw` is persisted. |
+| **D3 visibility** | **CLOSED.** |
+| **E6, Grove E3/E4, digest staleness** | Unchanged. Note Grove E3's measured population is ~2 rows on the box and 0 on conv-26, and nothing consumes `retraction_history` — the shape that closed Grove E2 FAIL-mechanism. |
+| **`main`** | Now 214 commits behind `Beam-optimisation` and 4 ahead: a real merge, not a fast-forward. |
