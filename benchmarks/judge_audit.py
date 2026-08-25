@@ -217,6 +217,23 @@ C3 2.13% raw (10/470) -> hand-check corrected 1.87% (FP 3/25=12%, FN 0/25)
     credits. => C3's size is D1 by design, not judge error; the instrument's
     recitation token rule, not the judge, is the mis-calibrated piece.
 
+D2 CLOSED BY FIX, 2026-08-25. `judge_answer` now calls
+    `longmemeval_adapter.parse_judge_verdict`: word-boundary tokens, first
+    verdict wins, negated affirmatives and the `[LLM_ERROR: ...]` sentinel score
+    False. Landed in the INERT window this run established — C2 0.00%, C1b 0
+    negated-yes, 0 judge-side sentinels — so it moved no canonical number and
+    LoCoMo/LME/MSC are NOT re-baselined. `--verify-parse <this file>` re-scores
+    the stored replies under the frozen legacy rule and the live one and must
+    report 0 flips; it also reports how many replies COULD have flipped, because
+    on an all-compliant corpus 0 flips is vacuous rather than reassuring.
+    `shipping_verdict` is now the FROZEN pre-fix rule and must never be
+    re-synced. Two shapes deliberately unchanged and pinned by test: "yes and no"
+    (a criterion question, D1) and a truncated fragment carrying a bare "yes"
+    (needs reply structure, and `max_tokens=10` is the frozen contract). D3
+    half-fixed: the sentinel can no longer score CORRECT, but it is still
+    indistinguishable from a genuine "no" at the call site — surfacing it needs
+    a channel `judge_answer`'s bool return does not have.
+
 C4. NOT RUN — blocked, recorded not dropped. No scored LoCoMo run pair exists
     on this box; the only conv-26 artifact is a --diag-only dump (correct=null,
     empty ai_answer, no reader calls by construction), which would have audited
@@ -270,10 +287,27 @@ def normalise_reply(raw: str) -> str:
 
 
 def shipping_verdict(raw: str) -> bool:
-    """EXACTLY what `judge_answer` does. Duplicated rather than imported so the
-    audit still reports correctly if `judge_answer` is later fixed — at which
-    point the disagreement column becomes the before/after diff."""
+    """The LEGACY rule, FROZEN. Until 2026-08-25 this was `judge_answer` verbatim;
+    it is what produced LoCoMo 68.2%, LME 68.4% and MSC ~84.0%.
+
+    The duplication was written so the audit would still report correctly once
+    `judge_answer` was fixed — "at which point the disagreement column becomes
+    the before/after diff". That has now happened, so DO NOT re-sync this to the
+    live parse: it is the historical baseline every canonical number was scored
+    under, and re-syncing would make the diff a constant zero by construction.
+    `landed_verdict` reads the live rule; `--verify-parse` diffs the two."""
     return "yes" in (raw or "").lower()
+
+
+def landed_verdict(raw: str) -> bool:
+    """The rule `judge_answer` runs TODAY, imported rather than restated.
+
+    Imported precisely because restating it is what let the legacy copy above
+    drift into a second source of truth. Lazily, because the audit's free paths
+    must not pull in the adapter (and its `requests` import) to count rows."""
+    from longmemeval_adapter import parse_judge_verdict
+
+    return parse_judge_verdict(raw)
 
 
 def reference_verdict(raw: str) -> bool:
@@ -546,6 +580,48 @@ def free_precheck(rows: list[dict], bench: str) -> dict:
             "c3_ceiling_non_abs": pct(recite_non_abs, judged_non_abs)}
 
 
+def verify_parse(records: list[dict]) -> dict:
+    """Re-score every STORED raw judge reply under the legacy rule and under the
+    rule `judge_answer` runs today, and count where they differ.
+
+    This is the whole post-hoc verification of the 2026-08-25 parse fix, and it
+    is free: the replies were already paid for. A flip here is a row whose
+    recorded verdict would change, i.e. a canonical number that moves. Zero
+    flips means the fix is a no-op ON THIS CORPUS — the strongest claim the
+    evidence supports, and NOT a claim that the rules agree in general (they
+    demonstrably do not; that disagreement is the entire point of landing it).
+
+    Reported per bucket as well as in total: an all-compliant corpus can only
+    ever produce zero flips, so the bucket table is what distinguishes "the fix
+    is inert" from "there was nothing here that could have flipped". C2 = 0.00%
+    means this run is the SECOND case, and the verdict text must say so.
+    """
+    flips = [r for r in records
+             if shipping_verdict(r.get("raw", "")) != landed_verdict(r.get("raw", ""))]
+    buckets = Counter(r.get("bucket", "?") for r in records)
+    could_flip = sum(n for b, n in buckets.items()
+                     if b not in ("compliant_yes", "compliant_no", "empty"))
+    return {
+        "n": len(records),
+        "flips": len(flips),
+        "flip_ids": [r.get("id") for r in flips],
+        "rows_that_could_flip": could_flip,
+        "buckets": dict(buckets),
+        "verdict": (
+            "NO-OP CONFIRMED — but VACUOUSLY: every stored reply is a bare "
+            "yes/no, so no reply existed that either rule could score "
+            "differently. The fix is inert here because the corpus is "
+            "compliant, not because the rules agree."
+            if len(flips) == 0 and could_flip == 0 else
+            f"NO-OP CONFIRMED on {could_flip} non-compliant replies that COULD "
+            "have flipped and did not."
+            if len(flips) == 0 else
+            f"NOT A NO-OP — {len(flips)} stored verdict(s) change. The affected "
+            "benchmark number moves and must be re-baselined, not silently "
+            "re-scored."),
+    }
+
+
 def pct(a: int, b: int) -> float:
     return 100.0 * a / b if b else 0.0
 
@@ -759,6 +835,11 @@ def main(argv=None, client=None) -> int:
     ap.add_argument("--pair", nargs=2, metavar=("A.json", "B.json"),
                     help="C4 arm-asymmetry pre-check — FREE, no LLM calls")
     ap.add_argument("--report", help="re-print a saved audit JSON (free)")
+    ap.add_argument("--verify-parse", metavar="AUDIT.json",
+                    help="FREE. Re-score the stored raw judge replies under the "
+                         "frozen legacy rule and the live one, and count the "
+                         "verdicts that change. Zero = the parse fix moved no "
+                         "canonical number on that corpus.")
     ap.add_argument("--bench", choices=("locomo", "lme", "msc"), default="locomo")
     ap.add_argument("--limit", type=int, default=None,
                     help="deterministic content-addressed sample size")
@@ -780,6 +861,18 @@ def main(argv=None, client=None) -> int:
     if args.handcheck:
         fp, fn = args.handcheck.split(",")
         handcheck = (int(fp), int(fn))
+
+    if args.verify_parse:
+        saved = json.loads(Path(args.verify_parse).read_text(encoding="utf-8"))
+        res = verify_parse(saved["records"])
+        print(f"\n  PARSE BEFORE/AFTER — {args.verify_parse} (FREE, no LLM)")
+        print(f"    stored replies: {res['n']}")
+        print(f"    verdicts that CHANGE: {res['flips']}")
+        print(f"    replies that COULD have changed (non-compliant): "
+              f"{res['rows_that_could_flip']}")
+        print(f"    reply buckets: {res['buckets']}")
+        print(f"\n    {res['verdict']}\n")
+        return 0
 
     if args.report:
         saved = json.loads(Path(args.report).read_text(encoding="utf-8"))

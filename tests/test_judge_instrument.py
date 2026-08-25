@@ -8,7 +8,11 @@ import `judge_answer` from `longmemeval_adapter`. One function therefore scores
 LoCoMo (68.2%), LME (68.4%) and MSC (~84.0%). It is two lines::
 
     raw = llm.chat(messages, temperature=0.0, max_tokens=10)
-    return "yes" in raw.lower()
+    return parse_judge_verdict(raw)
+
+Until 2026-08-25 the second line was `return "yes" in raw.lower()`, and most of
+this file was written to pin that. See "The 2026-08-25 parse fix" below for what
+changed and what deliberately did not.
 
 (BEAM is NOT in the blast radius: `beam_adapter.py:725` defines its own
 rubric-scoring `judge_answer` returning a dict. Pinned below so a future reader
@@ -26,14 +30,16 @@ shape. No live client is ever constructed.
 
 What is pinned, in one paragraph
 --------------------------------
-1. The DECISION RULE is `"yes" in raw.lower()` — an unanchored substring test.
-   It is correct on compliant replies and on the empty reply, and wrong on
-   "yes and no", "not yes", and — the amplifier nobody expected — any reply
-   containing "yes" INSIDE another word ("yesterday", "eyes"). "yesterday" is
-   not a hypothetical: temporal-reasoning is a scored category on both LME and
-   LoCoMo, and the judge's own reasoning about it is exactly where that word
-   appears. The "no" half of the reply is never consulted, so every conflict
-   resolves to correct.
+1. The DECISION RULE is `parse_judge_verdict`: word-boundary `\byes\b` /
+   `\bno\b`, first verdict token wins, negated affirmatives and the
+   `[LLM_ERROR: ...]` sentinel score `False`, no verdict token scores `False`.
+   It replaced `"yes" in raw.lower()` — an unanchored substring test that was
+   correct on compliant replies and on the empty reply, and wrong on "not yes"
+   and on any reply containing "yes" INSIDE another word ("yesterday", "eyes").
+   "yesterday" was not a hypothetical: temporal-reasoning is a scored category
+   on both LME and LoCoMo, and the judge\'s own reasoning about it is exactly
+   where that word appears. The old rule never consulted the "no" half of a
+   reply, so every conflict resolved to correct.
 2. The CRITERION for the 5 non-abstention branches is CONTAINMENT ("answer yes
    if the response contains the correct answer"). The `_abs` branch asks a
    different question ("does the model correctly identify the question as
@@ -44,11 +50,33 @@ What is pinned, in one paragraph
    Whether a real judge exploits that latitude is an LLM-behaviour question this
    offline file cannot answer; `benchmarks/judge_audit.py` is the instrument
    that measures it, and its thresholds are pre-registered in its docstring.
-3. A judge-side `[LLM_ERROR: ...]` sentinel is scored, silently, as "wrong
-   answer" — indistinguishable from a genuine "no". No caller checks it; the
-   two re-judge paths check only the ANSWER for that sentinel.
+3. A judge-side `[LLM_ERROR: ...]` sentinel is scored as "wrong answer" —
+   now BY CONSTRUCTION rather than by luck, but still indistinguishable from a
+   genuine "no" at the call site. No caller checks it; the two re-judge paths
+   check only the ANSWER for that sentinel. Containment was fixed; VISIBILITY
+   was not, and that half is still pinned as a defect below.
 4. `judge_answer` returns a bool and DISCARDS `raw`. That is precisely why
-   points 1 and 3 have never been counted on any real run.
+   points 1 and 3 went uncounted until `benchmarks/judge_audit.py` recorded
+   `raw` on the 2026-08-25 LME run.
+
+The 2026-08-25 parse fix
+------------------------
+The audit\'s spend pass recorded all 500 raw judge replies and measured C2
+non-compliance = 0.00%: every reply was a bare yes/no. That made the anchored
+rule a PROVEN no-op on the only corpus of real judge replies in existence, so it
+was landed in that window rather than at the next judge migration — when the
+rule and the data would otherwise change in the same step. `judge_audit.py
+--verify-parse` is the standing check, and it must report zero flips.
+
+Two shapes were deliberately NOT changed, and both are pinned so the choice
+cannot be quietly revisited:
+
+  * "yes and no" still scores correct (first token wins). Resolving a hedging
+    judge to `False` decides what it MEANT — a criterion question (D1, open at
+    WATCH), not a parse question.
+  * A truncated fragment carrying the bare word ("...whether a yes would be")
+    still scores correct. Separating it needs the reply\'s structure, and
+    `max_tokens=10` is part of the frozen comparability contract.
 """
 
 from __future__ import annotations
@@ -102,7 +130,15 @@ _install_offline_requests_shim()
 from longmemeval_adapter import (  # noqa: E402
     get_judge_prompt,
     judge_answer,
+    parse_judge_verdict,
 )
+
+# The audit instrument. Imported at the top rather than beside its own section
+# because the decision-rule tests join against it: several of them assert that
+# the FROZEN legacy rule still disagrees with the landed one, which is what
+# stops `shipping_verdict` being re-synced and the before/after diff going
+# vacuous. Only stdlib is pulled in at its import time.
+import judge_audit as JA  # noqa: E402
 
 # Every question_type the judge prompt knows. Sourced from the branches of
 # `get_judge_prompt`; the `_abs` variants are the abstention route.
@@ -163,7 +199,7 @@ def test_stub_reply_actually_reaches_judge_answer():
         "verdict did not depend on the canned reply — every test here is vacuous"
 
 
-# ── 1. The decision rule: `"yes" in raw.lower()` ────────────────────────
+# ── 1. The decision rule: `parse_judge_verdict` (was `"yes" in raw.lower()`) ─
 
 @pytest.mark.parametrize("reply", ["yes", "Yes", "YES", "Yes.", "yes\n",
                                    "  \n\t yes", "**Yes**", '"yes"', "- Yes"])
@@ -178,9 +214,10 @@ def test_compliant_affirmatives_score_correct(reply):
                                    "  no", "**No**",
                                    "No, the response does not contain it."])
 def test_compliant_negatives_score_incorrect(reply):
-    """CORRECT, pinned as correct. Note the last case: a verbose "no" survives
-    only because it happens to contain no "yes" anywhere. It is correct by luck,
-    not by construction — see the DEFECT tests below for the same shape losing."""
+    """CORRECT, pinned as correct. Note the last case: under the LEGACY rule a
+    verbose "no" survived only because it happened to contain no "yes" anywhere.
+    Since 2026-08-25 it is correct by construction — the same shape carrying a
+    "yesterday" now also scores no, which is the fix directly below."""
     assert _judge(reply) is False
 
 
@@ -190,18 +227,48 @@ def test_empty_reply_scores_incorrect():
     assert _judge("") is False
 
 
-def test_DEFECT_ambiguous_yes_and_no_scores_correct():
-    """The judge explicitly declining to commit is scored as a correct answer."""
+def test_UNFIXED_ambiguous_yes_and_no_still_scores_correct():
+    """DELIBERATELY UNCHANGED by the 2026-08-25 parse fix, and pinned so the
+    choice cannot be quietly revisited.
+
+    A judge that answers "yes and no" has declined to commit, and first-token-wins
+    credits the answer. Scoring it `False` is a defensible reading of the judge
+    instruction ("Answer yes or no only"), but it decides what a non-committal
+    judge MEANT — a CRITERION question, which is D1, still open at WATCH. The
+    parse fix was landed on the strength of being a proven no-op on the recorded
+    corpus; folding an unmeasured criterion decision into it would have spent
+    exactly the property that made it safe to land."""
     assert _judge("yes and no") is True
     assert _judge("Yes and no — it depends.") is True
 
 
-def test_DEFECT_negated_yes_scores_correct():
-    """A NEGATED affirmative scores correct. The rule reads the token, never the
-    polarity, so the judge's meaning is inverted."""
-    assert _judge("not yes") is True
-    assert _judge("NOT YES") is True
-    assert _judge("The correct answer here is not yes.") is True
+def test_FIXED_negated_yes_scores_incorrect():
+    """WAS a defect: the legacy rule read the token and never the polarity, so a
+    NEGATED affirmative inverted the judge's meaning and scored CORRECT."""
+    assert _judge("not yes") is False
+    assert _judge("NOT YES") is False
+    assert _judge("The correct answer here is not yes.") is False
+    assert _judge("that is never a yes") is False
+
+
+def test_the_negation_rule_does_not_fire_on_a_judge_that_said_yes():
+    """The negation rule is the one part of the fix that can create a NEW
+    misscore, in the opposite direction, so it is bounded and controlled here.
+
+    `judge_audit._NEGATED_YES` is deliberately looser (`[^.]{0,20}?` between the
+    negation and the token) because it is a COUNTER: over-matching inflates a
+    bucket already reported as a lower bound, which is conservative. A DECISION
+    rule cannot be loose — over-matching silently marks a correct answer wrong —
+    so the landed regex requires the negation to sit ADJACENT to the token.
+
+    This test is the join proving the two really differ. If someone re-syncs the
+    decision rule to the audit's regex "for consistency", it fails."""
+    hedged_yes = "it is not incorrect, yes"
+    assert _judge(hedged_yes) is True, \
+        "the negation rule flipped a reply whose verdict was yes"
+    assert JA._NEGATED_YES.search(hedged_yes), \
+        "the audit's counter no longer over-matches — the asymmetry this test " \
+        "documents is gone and the tightening is no longer motivated"
 
 
 @pytest.mark.parametrize("reply", [
@@ -209,29 +276,33 @@ def test_DEFECT_negated_yes_scores_correct():
     "No — the response only mentions what she did yesterday.",
     "no, the model just describes eyes",
 ])
-def test_DEFECT_substring_rule_has_no_word_boundary(reply):
-    """The highest-exposure defect, and the one that is NOT hypothetical.
+def test_FIXED_substring_rule_now_has_a_word_boundary(reply):
+    """The highest-exposure defect, and the one that was NOT hypothetical.
 
-    `"yes" in raw.lower()` is unanchored, so "yesterday" and "eyes" fire it. Each
-    reply here is an unambiguous NO from the judge and each scores CORRECT.
+    `"yes" in raw.lower()` was unanchored, so "yesterday" and "eyes" fired it.
+    Each reply here is an unambiguous NO from the judge and each scored CORRECT.
 
-    Why this is not a curiosity: temporal-reasoning is a scored category on both
+    Why this was not a curiosity: temporal-reasoning is a scored category on both
     LME (`temporal-reasoning`) and LoCoMo (`category 2`), and its judge prompt
     invites day-arithmetic reasoning ("do not penalize off-by-one errors for the
     number of days"). "yesterday" is the single likeliest word in a
-    non-compliant temporal judge reply, and it is a false CORRECT every time.
-    A word-boundary match (`\\byes\\b`) would reject all three.
+    non-compliant temporal judge reply, and it was a false CORRECT every time.
     """
-    assert _judge(reply) is True
+    assert _judge(reply) is False
+    assert JA.shipping_verdict(reply) is True, \
+        "the frozen legacy rule no longer scores this correct — the baseline " \
+        "copy has been re-synced and the before/after diff is now vacuous"
 
 
-def test_DEFECT_the_no_half_of_a_reply_is_never_consulted():
-    """There is no "no" test at all, so no conflict can ever be detected and
-    every conflict resolves to CORRECT regardless of order. `raw.strip()` alone —
-    reading only the FIRST token — would score both of these as the judge meant."""
-    assert _judge("no\n\nyes") is True
+def test_FIXED_the_no_half_of_a_reply_is_now_consulted():
+    """The legacy rule had no "no" test at all, so no conflict could be detected
+    and every conflict resolved to CORRECT regardless of order. The first
+    word-boundary verdict token now wins, which scores all three as the judge
+    meant — including the ORDER-DEPENDENT pair, which is what proves the rule
+    reads position and is not just returning `False` on anything ambiguous."""
+    assert _judge("no\n\nyes") is False
     assert _judge("yes\n\nno") is True
-    assert _judge("No. Well, actually, yes.") is True
+    assert _judge("No. Well, actually, yes.") is False
 
 
 @pytest.mark.parametrize("reply,expected", [
@@ -241,9 +312,15 @@ def test_DEFECT_the_no_half_of_a_reply_is_never_consulted():
     ("The question is whether a yes would be", True),
 ])
 def test_DEFECT_truncated_reply_is_scored_as_a_verdict(reply, expected):
-    """`max_tokens=10` truncates any non-compliant reply mid-sentence, and the
+    """DELIBERATELY UNFIXED by the 2026-08-25 parse fix, and pinned as a defect.
+
+    `max_tokens=10` truncates any non-compliant reply mid-sentence, and the
     fragment is then scored AS IF it were a verdict — silently, in whichever
-    direction the fragment happens to fall.
+    direction the fragment happens to fall. Word-boundary matching does not help
+    here: the second case carries a real, bare "yes" that simply is not the
+    verdict. Separating it needs the reply's STRUCTURE, and `max_tokens=10` is
+    itself part of the frozen comparability contract, so the fix is a
+    re-baseline rather than a parse change.
 
     This is the failure mode the deepseek-v4-flash migration already hit from
     the other side (a reasoning preamble corrupting the yes/no parse, worked
@@ -252,11 +329,27 @@ def test_DEFECT_truncated_reply_is_scored_as_a_verdict(reply, expected):
     assert _judge(reply) is expected
 
 
-def test_DEFECT_judge_side_llm_error_is_scored_as_a_wrong_answer():
-    """`LLMClient.chat` returns `f"[LLM_ERROR: {...}]"` after exhausting its
-    retries (longmemeval_adapter.py:349). `judge_answer` scores that sentinel
-    exactly like a genuine "no": the question is recorded WRONG and the outage
-    is invisible in the per-question row.
+def test_DEFECT_judge_side_llm_error_is_still_invisible_to_the_caller():
+    """HALF-FIXED on 2026-08-25, and the unfixed half is the half that matters.
+
+    Containment rode along with the parse fix: the sentinel is now rejected
+    explicitly, so an outage message that happens to contain the word "yes"
+    (`[LLM_ERROR: unexpected token 'yes']`) can no longer be read as the judge
+    saying the answer was CORRECT. That was a two-line, provably-inert change —
+    the 2026-08-25 run recorded 0 judge-side sentinels.
+
+    VISIBILITY was not fixed and is still pinned as a defect. `judge_answer`
+    returns a bare bool and has no channel for "the judge never answered", so a
+    sentinel is still indistinguishable from a genuine "no" at the call site.
+    Giving it one means deciding what five call sites across three adapters do
+    mid-run during an outage — not a two-line change, and NOT inert: it changes
+    behaviour in exactly the situation nobody can rehearse.
+
+    The two re-judge paths (`_rejudge_run`, `_rejudge_file`) DO test for this
+    sentinel — but only on the ANSWER (`hypothesis` / `ai_answer`). Neither
+    inspects the judge's reply, and `judge_answer` has already discarded it.
+    A judge-side outage streak therefore still deflates the score of the arm
+    it hit.
 
     The two re-judge paths (`_rejudge_run`, `_rejudge_file`) DO test for this
     sentinel — but only on the ANSWER (`hypothesis` / `ai_answer`). Neither
@@ -267,8 +360,13 @@ def test_DEFECT_judge_side_llm_error_is_scored_as_a_wrong_answer():
     assert error_verdict is False
     assert error_verdict == genuine_no, (
         "an outage sentinel and a genuine 'no' are indistinguishable at the "
-        "call site — that indistinguishability IS the defect"
+        "call site — that indistinguishability IS the remaining defect"
     )
+    # The half that WAS fixed: rejected by construction, not by luck.
+    assert _judge("[LLM_ERROR: unexpected token 'yes' in response]") is False
+    assert JA.shipping_verdict("[LLM_ERROR: unexpected token 'yes' in response]") \
+        is True, "the legacy rule scored this sentinel CORRECT — that is the " \
+                 "hazard the explicit check removed"
 
 
 def test_DEFECT_raw_reply_is_discarded():
@@ -478,8 +576,6 @@ def test_locomo_category_to_judge_type_mapping_is_pinned():
 # exists specifically to prove the spend path is REACHABLE — an unreachable code
 # path also reads as PASS.
 
-import judge_audit as JA  # noqa: E402
-
 
 @pytest.mark.parametrize("raw,bucket,ship,ref", [
     ("yes", "compliant_yes", True, True),
@@ -508,14 +604,51 @@ def test_reply_classifier_buckets_and_rules(raw, bucket, ship, ref):
     assert c["disagrees"] is (ship != ref)
 
 
-@pytest.mark.parametrize("raw", ["yes", "No.", "", "[LLM_ERROR: boom]",
-                                 "yes and no", "not yes", "no\n\nyes",
-                                 "the model just describes eyes",
-                                 "Let me analyse the model response against"])
-def test_audit_shipping_rule_matches_judge_answer_exactly(raw):
+_ALL_SHAPES = ["yes", "No.", "", "[LLM_ERROR: boom]",
+               "yes and no", "not yes", "no\n\nyes",
+               "the model just describes eyes",
+               "Let me analyse the model response against"]
+
+
+@pytest.mark.parametrize("raw", _ALL_SHAPES)
+def test_audit_landed_rule_matches_judge_answer_exactly(raw):
     """Cross-check against the REAL function rather than against a restatement
-    of it. This is the join that stops the audit drifting from its subject."""
-    assert JA.shipping_verdict(raw) is _judge(raw)
+    of it. This is the join that stops the audit drifting from its subject.
+
+    It moved from `shipping_verdict` to `landed_verdict` on 2026-08-25: the
+    audit now carries TWO rules, and only one of them is supposed to track
+    production."""
+    assert JA.landed_verdict(raw) is _judge(raw)
+
+
+@pytest.mark.parametrize("raw,legacy", [
+    ("yes", True), ("No.", False), ("", False),
+    # Every shape the legacy rule got wrong. If any of these stops reading True
+    # the frozen baseline has been re-synced to the live parse.
+    ("[LLM_ERROR: boom yes]", True), ("not yes", True), ("no\n\nyes", True),
+    ("the model just describes eyes", True),
+    ("The model refers to yesterday, so no.", True),
+])
+def test_the_legacy_rule_stays_frozen_at_the_pre_fix_behaviour(raw, legacy):
+    """`shipping_verdict` is the historical baseline: it is what actually scored
+    LoCoMo 68.2%, LME 68.4% and MSC ~84.0%, and `--verify-parse` diffs the live
+    rule against it over stored replies.
+
+    Re-syncing it to `parse_judge_verdict` "so the audit matches production"
+    would make that diff a constant zero BY CONSTRUCTION — a ceiling instrument
+    reporting a clean no-op it can no longer fail to report. This test is the
+    only thing standing between a well-meant tidy-up and a silent re-baseline."""
+    assert JA.shipping_verdict(raw) is legacy
+
+
+def test_the_two_audit_rules_actually_differ():
+    """Anti-vacuity for the pair above: if legacy and landed agreed everywhere,
+    both tests would pass on a single rule and `--verify-parse` would be
+    measuring nothing."""
+    differ = [r for r in _ALL_SHAPES
+              if JA.shipping_verdict(r) is not JA.landed_verdict(r)]
+    assert differ, "legacy and landed rules agree on every shape — one of them " \
+                   "has been re-synced to the other"
 
 
 def test_reference_rule_disagrees_on_exactly_the_defect_shapes():
@@ -1094,3 +1227,123 @@ def test_the_handcheck_arms_are_still_capped_at_HANDCHECK_K(tmp_path):
     w = json.loads(JA.write_handcheck_sample(recs, str(tmp_path / "c.json")).read_text())
     assert len(w["classified_refusal"]) == JA.HANDCHECK_K
     assert len(w["classified_committed_CONTROL"]) == JA.HANDCHECK_K
+
+
+# ── The parse fix itself: the rule, and the free before/after check ─────
+# `parse_judge_verdict` is tested directly here, without a client, because it is
+# the piece the audit imports and the piece a future judge migration will meet
+# first. Section 1 tests it through `judge_answer`; this section tests it as the
+# pure function it was extracted to be.
+
+@pytest.mark.parametrize("raw,expected", [
+    ("yes", True), ("Yes.", True), ("**YES**", True), ('"yes"', True),
+    ("no", False), ("No.", False), ("", False), (None, False),
+    # word boundary
+    ("no, she mentioned yesterday", False), ("the model describes eyes", False),
+    # first verdict token wins, in BOTH directions
+    ("yes then no", True), ("no then yes", False),
+    # negation
+    ("not yes", False), ("never a yes", False), ("isn't yes", False),
+    # sentinel, including one carrying the word
+    ("[LLM_ERROR: boom]", False), ("[LLM_ERROR: got 'yes' unexpectedly]", False),
+    # no verdict token at all fails closed, same direction as the empty reply
+    ("Let me think about this", False),
+])
+def test_parse_judge_verdict_rules(raw, expected):
+    assert parse_judge_verdict(raw) is expected
+
+
+def test_parse_judge_verdict_is_what_judge_answer_runs():
+    """The extraction is only worth having if production actually calls it. A
+    copy-pasted second implementation would pass every test above while
+    `judge_answer` kept the old rule."""
+    assert _judge("no, she mentioned yesterday") is parse_judge_verdict(
+        "no, she mentioned yesterday")
+    assert _judge("not yes") is parse_judge_verdict("not yes")
+
+
+def _vrec(raw, bucket="compliant_yes", rid="r"):
+    return {"raw": raw, "bucket": bucket, "id": rid}
+
+
+def test_verify_parse_reports_zero_flips_on_a_compliant_corpus():
+    """The 2026-08-25 LME shape: 500 bare yes/no replies, C2 = 0.00%."""
+    res = JA.verify_parse([_vrec("yes"), _vrec("no", "compliant_no")] * 10)
+    assert res["flips"] == 0
+    assert res["rows_that_could_flip"] == 0
+
+
+def test_a_zero_flip_result_on_a_compliant_corpus_is_reported_as_VACUOUS():
+    """THE E3 TRAP, in its exact shape. "0 flips" on an all-compliant corpus and
+    "0 flips" on a corpus full of non-compliant replies are the same number and
+    opposite evidence: the first cannot fail, the second is a real no-op.
+
+    If the verdict text ever collapses them, `--verify-parse` becomes a ceiling
+    instrument certifying a fix it never had the data to test."""
+    vacuous = JA.verify_parse([_vrec("yes"), _vrec("no", "compliant_no")])
+    real = JA.verify_parse([_vrec("yes and no", "both_tokens"),
+                            _vrec("Yes, clearly.", "verbose_yes")])
+    assert vacuous["flips"] == real["flips"] == 0
+    assert vacuous["rows_that_could_flip"] == 0
+    assert real["rows_that_could_flip"] == 2
+    assert "VACUOUSLY" in vacuous["verdict"]
+    assert "VACUOUSLY" not in real["verdict"]
+
+
+def test_verify_parse_catches_a_verdict_that_actually_changes():
+    """Anti-vacuity: a checker that cannot report a flip proves nothing by
+    reporting none. "yesterday" is the shape the fix exists for."""
+    recs = [_vrec("no, she mentioned yesterday", "yes_substring_only", "flip"),
+            _vrec("yes", "compliant_yes", "same")]
+    res = JA.verify_parse(recs)
+    assert res["flips"] == 1
+    assert res["flip_ids"] == ["flip"]
+    assert "NOT A NO-OP" in res["verdict"]
+
+
+def test_verify_parse_rescores_raw_and_ignores_the_recorded_verdict():
+    """The check has to RE-SCORE the stored reply under the frozen legacy rule,
+    not read back the `verdict` the run happened to record.
+
+    The two agree on every well-formed record, which is why the naive version is
+    easy to write and impossible to catch with a realistic fixture. So the
+    fixture here is deliberately CORRUPT: `verdict` is set to the value the
+    legacy rule does NOT produce for this reply. A checker that re-scores sees a
+    flip; a checker that trusts the field sees none.
+
+    (An earlier draft of this test set `verdict` to the value the legacy rule
+    DOES produce. It passed under both implementations — a test named for a
+    defect that could not detect it.)"""
+    raw = "no, she mentioned yesterday"
+    assert JA.shipping_verdict(raw) is True and JA.landed_verdict(raw) is False
+
+    rec = _vrec(raw, "yes_substring_only", "x")
+    rec["verdict"] = False          # corrupt: NOT what the legacy rule scores
+    assert JA.verify_parse([rec])["flips"] == 1, \
+        "verify_parse trusted the recorded verdict instead of re-scoring `raw`"
+
+
+def test_verify_parse_cli_path_is_reachable_and_free(tmp_path, capsys):
+    """The same degeneracy trap as the spend path: a `--verify-parse` branch
+    nobody can reach would let every unit test above pass while the standing
+    check could never actually be run on the box.
+
+    Drives `main()` through the real branch on a saved-audit-shaped file, with a
+    client injected that must never be touched."""
+    saved = {"precheck": {}, "report": {},
+             "records": [_vrec("yes", "compliant_yes", "a"),
+                         _vrec("no", "compliant_no", "b"),
+                         _vrec("no, she mentioned yesterday",
+                               "yes_substring_only", "c")]}
+    f = tmp_path / "audit.json"
+    f.write_text(json.dumps(saved), encoding="utf-8")
+
+    client = StubJudgeClient("yes")
+    rc = JA.main(["--verify-parse", str(f)], client=client)
+    assert rc == 0
+    assert client.calls == [], "the verification path made an LLM call"
+
+    out = capsys.readouterr().out
+    assert "stored replies: 3" in out
+    assert "verdicts that CHANGE: 1" in out
+    assert "NOT A NO-OP" in out

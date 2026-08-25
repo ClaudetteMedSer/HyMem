@@ -1138,12 +1138,95 @@ def get_judge_prompt(question_type: str, question: str, answer: str, response: s
     raise NotImplementedError(f"Unknown question type: {question_type}")
 
 
+# ── Judge verdict parsing ───────────────────────────────────────────
+# Landed 2026-08-25 to replace `"yes" in raw.lower()`, an UNANCHORED substring
+# test that scored "yesterday" and "eyes" as CORRECT, never consulted the "no"
+# half of a reply, and inverted a negated affirmative.
+#
+# WHY THE CHANGE IS SAFE TO LAND WITHOUT RE-BASELINING. `benchmarks/judge_audit.py`
+# recorded all 500 raw judge replies of the 2026-08-25 LME run (the first run to
+# record `raw` at all) and measured C2 non-compliance = 0.00%: every reply was a
+# bare yes/no. On that evidence the rules below are a PROVEN no-op over the only
+# corpus of real judge replies in existence — verify it with
+# `judge_audit.py --verify-parse <spend.json>`, which must print 0 flips.
+#
+# That is the entire argument for landing it NOW. deepseek-chat's deprecation
+# already forced one judge migration (1.6pp of judge harshness); the next verbose
+# judge would otherwise change the decision rule and the data in the same step,
+# with no way to separate the two. Anchoring while it is provably inert buys the
+# insurance at zero cost, and the cost is only zero once.
+_YES_WORD = re.compile(r"\byes\b")
+_NO_WORD = re.compile(r"\bno\b")
+# A NEGATED affirmative ("not yes", "never a yes"), which the substring rule
+# scored CORRECT because it reads the token and never the polarity.
+#
+# DELIBERATELY TIGHTER than `judge_audit._NEGATED_YES`, and the asymmetry is the
+# point: the audit's regex is a COUNTER, where over-matching inflates a bucket
+# that is already reported as a lower bound and is therefore conservative. This
+# is a DECISION rule, where over-matching silently marks a correct answer wrong.
+# The audit's `[^.]{0,20}?` window would fire on "it is not incorrect, yes" —
+# a judge saying yes — so the negation here must sit adjacent to the token.
+_NEGATED_YES = re.compile(r"\b(?:not|never|isn'?t|wasn'?t|aren'?t|ain'?t)\s+"
+                          r"(?:really\s+|quite\s+|exactly\s+|an?\s+)?yes\b")
+
+
+def parse_judge_verdict(raw: str) -> bool:
+    """Score one raw judge reply. First word-boundary verdict token wins.
+
+    Extracted from `judge_answer` as a pure function so it can be tested without
+    a client and diffed against the frozen legacy rule over stored replies.
+
+    Three rules, in order:
+      1. An `[LLM_ERROR: ...]` sentinel is never a verdict. It already scored
+         `False` by luck (no "yes" substring); it now scores `False` by
+         construction, so an outage message that happens to contain the word
+         cannot be read as the judge saying the answer was correct. This does
+         NOT make the outage visible to the caller — `judge_answer` returns a
+         bare bool and has no channel for that; surfacing it is a separate
+         change that touches five call sites across three adapters.
+      2. A negated affirmative scores `False`.
+      3. Otherwise the FIRST of `\byes\b` / `\bno\b` wins; no verdict token at
+         all scores `False`, the same fail-closed direction as the empty reply.
+
+    Known and deliberately unfixed, both pinned by tests so neither can drift:
+
+      * A truncated non-verdict that contains the bare word ("The question is
+        whether a yes would be") still scores `True`. Separating that needs the
+        reply's structure, not its tokens, and `max_tokens=10` is itself part of
+        the frozen comparability contract.
+      * "yes and no" still scores `True` — first token wins, exactly as the
+        legacy rule did. Resolving a hedging judge to `False` would be a
+        defensible reading of "Answer yes or no only", but it decides what a
+        non-committal judge MEANT, which is a criterion question (D1, still open
+        at WATCH) and not a parse question. This function fixes the parse only;
+        mixing an unmeasured criterion change into a provably-inert parse change
+        is precisely the coupling the inert window exists to avoid.
+
+    Rule 3 IS `judge_audit.reference_verdict`, banked before the 2026-08-25 run,
+    which is why that run's C1 = 0.00% certifies this function rather than
+    something merely like it. Rules 1 and 2 are additive to it and were measured
+    separately on the same run: 0 judge-side sentinels, and C1b = 0 negated-yes
+    replies. All three are therefore inert on the recorded corpus, each on its
+    own evidence.
+    """
+    text = raw or ""
+    if text.startswith("[LLM_ERROR"):
+        return False
+    low = text.lower()
+    if _NEGATED_YES.search(low):
+        return False
+    y, n = _YES_WORD.search(low), _NO_WORD.search(low)
+    if y and n:
+        return y.start() < n.start()
+    return bool(y)
+
+
 def judge_answer(llm: LLMClient, question_type: str, question: str, answer: str, ai_answer: str) -> bool:
     """Judge whether the answer is correct (binary yes/no per LongMemEval protocol)."""
     prompt = get_judge_prompt(question_type, question, answer, ai_answer)
     messages = [{"role": "user", "content": prompt}]
     raw = llm.chat(messages, temperature=0.0, max_tokens=10)
-    return "yes" in raw.lower()
+    return parse_judge_verdict(raw)
 
 
 # ── Evaluation ──────────────────────────────────────────────────────
