@@ -1,0 +1,373 @@
+"""State-anchor expansion (Plan D, borrowed from MindCache) — Tasks 1-4.
+
+Task 1 pins `select_anchor_edges`: the EXACT `_anchor_facts` predicate
+(`dreaming/aggregate.py:829-830`) — active, non-derived, non-superseded,
+margin-positive edges, ordered by evidence margin, bounded by `cap`.
+
+Task 2 pins `seed_terms_from_edges`: canonical subject/predicate/object plus
+typed-value sub-terms (the value_supersession v3 classes: versions carry their
+alpha prefix, numbers their unit, dates their year) — the discriminative side
+of each class, so a version bump ("python_3.12" -> "python_3.13") still matches
+evidence rows that spell the prefix.
+
+Task 3 pins `state_anchor_expand`: seed terms -> existing FTS (optional vec)
+-> RRF merge -> top_k, deduped by chunk id (entry key), zero-cost inert with
+no seed terms.
+
+Task 4 pins the shadow probe: on a fixture store where the gold evidence row
+is reachable ONLY from the state anchors (not from the query), the probe
+reports exactly one anchored-only hit and a zero wrong-state rate.
+
+The probe and expansion run read-only; every test asserts the store is not
+mutated.
+"""
+from __future__ import annotations
+
+import sqlite3
+import sys
+from pathlib import Path
+
+import pytest
+
+from hymem import HyMem
+from hymem.core import db as core_db
+from hymem.extraction.llm import StubLLMClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
+from state_anchor_probe import run_probe  # noqa: E402
+
+
+# ── seeding helpers (the tests/test_recovery_probe.py idiom) ────────────────
+
+def _seed_session(conn, session_id: str = "s1") -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions(id, started_at) VALUES (?, CURRENT_TIMESTAMP)",
+        (session_id,),
+    )
+
+
+def _seed_message(conn, msg_id: int, created_at: str, *, session_id: str = "s1") -> None:
+    conn.execute(
+        "INSERT INTO messages(id, session_id, role, content, created_at) "
+        "VALUES (?, ?, 'user', 'x', ?)",
+        (msg_id, session_id, created_at),
+    )
+
+
+def _seed_chunk(conn, chunk_id: str, start_msg: int, text: str,
+                *, session_id: str = "s1") -> None:
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES (?, ?, ?, ?, 'test', ?)",
+        (chunk_id, session_id, start_msg, start_msg, text),
+    )
+
+
+def _seed_edge(conn, subject: str, predicate: str, obj: str, *,
+               pos: int = 3, neg: int = 0, status: str = "active",
+               derived: int = 0, invalid_at: str | None = None) -> int:
+    cur = conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, first_seen, last_seen, last_reinforced, "
+        "valid_at, invalid_at, status, derived) "
+        "VALUES (?, ?, ?, ?, ?, '2024-01-01 00:00:00', CURRENT_TIMESTAMP, "
+        "CURRENT_TIMESTAMP, '2024-01-01 00:00:00', ?, ?, ?)",
+        (subject, predicate, obj, pos, neg, invalid_at, status, derived),
+    )
+    return cur.lastrowid
+
+
+def _seed_evidence(conn, edge_id: int, chunk_id: str, polarity: int = 1) -> None:
+    conn.execute(
+        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity, extracted_at) "
+        "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+        (edge_id, chunk_id, polarity),
+    )
+
+
+def _count_writes(conn) -> dict[str, int]:
+    """Rows in tables the probe must not touch (snapshot before/after compare
+    of the row counts would be stronger, but a write counter over the probe's
+    own connection is impossible — the probe opens its own read-only conn; on
+    THIS connection we just check the tables' row counts are stable)."""
+    tables = ["sessions", "messages", "chunks", "knowledge_graph", "kg_evidence"]
+    return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
+
+
+@pytest.fixture
+def conn(cfg):
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    yield hy.conn
+    hy.close()
+
+
+@pytest.fixture
+def anchor_fixture(conn):
+    """One evidence chunk reachable ONLY from the state anchor.
+
+    - Edge: dev_box installed cuda_12.1 (active, margin-positive).
+    - Evidence chunk for that edge: "We installed CUDA 12.1 and PyTorch 2.2
+      on the dev box in January."
+    - Query: "Which GPU system produces model training output?" — shares no
+      FTS token with the evidence chunk, so the baseline augment() misses it
+      and only the anchor expansion can surface it.
+    - A second, query-reachable chunk: "Model training output is stored on
+      nas01." — a topic row that does NOT contain the answer, so a naive
+      query-match does not accidentally count as the gold row.
+    """
+    with core_db.transaction(conn):
+        _seed_session(conn)
+        _seed_message(conn, 1, "2024-01-01 00:00:00")
+        _seed_message(conn, 2, "2024-01-02 00:00:00")
+        _seed_message(conn, 3, "2024-01-03 00:00:00")
+        _seed_chunk(conn, "c-evidence", 1,
+                    "We installed CUDA 12.1 and PyTorch 2.2 on the dev box in January.")
+        _seed_chunk(conn, "c-distractor", 2, "Model training output is stored on nas01.")
+        _seed_edge(conn, "dev_box", "configured_with", "cuda_12.1", pos=3, neg=0)
+        edge_id = conn.execute(
+            "SELECT id FROM knowledge_graph WHERE subject_canonical='dev_box'"
+        ).fetchone()[0]
+        _seed_evidence(conn, edge_id, "c-evidence")
+    return conn
+
+
+# ── Task 1: select_anchor_edges ─────────────────────────────────────────────
+
+def test_select_anchor_edges_exact_predicate(conn):
+    """status='active' AND derived=0 AND invalid_at IS NULL AND pos>neg."""
+    with core_db.transaction(conn):
+        _seed_edge(conn, "a", "uses", "postgres", pos=3, neg=0)          # in
+        _seed_edge(conn, "b", "uses", "postgres", pos=3, neg=0, derived=1)  # out
+        _seed_edge(conn, "c", "uses", "postgres", pos=3, neg=0,
+                   invalid_at="2024-03-01")                             # out
+        _seed_edge(conn, "d", "uses", "postgres", pos=3, neg=0, status="retracted")  # out
+        _seed_edge(conn, "e", "uses", "postgres", pos=1, neg=4)         # out (margin)
+
+    from hymem.query.state_anchor import select_anchor_edges
+
+    rows = select_anchor_edges(conn, cap=20)
+    assert [r["subject_canonical"] for r in rows] == ["a"]
+
+
+def test_select_anchor_edges_cap_respected(conn):
+    """The top-`cap` by (pos-neg DESC, last_seen DESC, id) — copy the ORDER BY."""
+    with core_db.transaction(conn):
+        for i, pos in enumerate([2, 9, 5, 1, 7]):
+            _seed_edge(conn, f"svc{i}", "uses", "postgres", pos=pos, neg=0)
+
+    from hymem.query.state_anchor import select_anchor_edges
+
+    rows = select_anchor_edges(conn, cap=3)
+    assert [r["subject_canonical"] for r in rows] == ["svc1", "svc4", "svc2"]
+
+
+def test_select_anchor_edges_zero_cap(conn):
+    with core_db.transaction(conn):
+        _seed_edge(conn, "a", "uses", "postgres", pos=3, neg=0)
+
+    from hymem.query.state_anchor import select_anchor_edges
+
+    assert select_anchor_edges(conn, cap=0) == []
+
+
+# ── Task 2: seed_terms_from_edges ──────────────────────────────────────────
+
+def test_seed_terms_canonical_fields():
+    from hymem.query.state_anchor import seed_terms_from_edges
+
+    edges = [{"subject_canonical": "app", "predicate": "uses", "object_canonical": "postgres"}]
+    assert seed_terms_from_edges(edges) == ["app", "uses", "postgres"]
+
+
+def test_seed_terms_typed_values():
+    from hymem.query.state_anchor import seed_terms_from_edges
+
+    edges = [
+        {"subject_canonical": "dev_box", "predicate": "installed",
+         "object_canonical": "python_3.12"},   # version with alpha prefix
+        {"subject_canonical": "coverage", "predicate": "target",
+         "object_canonical": "65_percent"},    # number with unit
+        {"subject_canonical": "release", "predicate": "on",
+         "object_canonical": "2024-03-01"},    # ISO date
+        {"subject_canonical": "team", "predicate": "uses",
+         "object_canonical": "postgres"},      # free text: object only
+    ]
+    terms = seed_terms_from_edges(edges)
+    assert "python_3.12" in terms and "python" in terms   # vers: prefix key
+    assert "65_percent" in terms and "percent" in terms   # num: unit
+    assert "2024-03-01" in terms and "2024" in terms      # date: year
+    assert "dev_box" in terms and "installed" in terms
+    assert "team" in terms and "postgres" in terms
+
+
+def test_seed_terms_empty_edge_no_terms():
+    from hymem.query.state_anchor import seed_terms_from_edges
+
+    assert seed_terms_from_edges([{}]) == []
+    assert seed_terms_from_edges([]) == []
+    assert seed_terms_from_edges(
+        [{"subject_canonical": None, "predicate": "", "object_canonical": "  "}]
+    ) == []
+
+
+def test_seed_terms_dedup_stable_order():
+    from hymem.query.state_anchor import seed_terms_from_edges
+
+    edges = [
+        {"subject_canonical": "app", "predicate": "uses", "object_canonical": "postgres"},
+        {"subject_canonical": "app", "predicate": "uses", "object_canonical": "postgres"},
+        {"subject_canonical": "app", "predicate": "runs", "object_canonical": "linux"},
+    ]
+    assert seed_terms_from_edges(edges) == ["app", "uses", "postgres", "runs", "linux"]
+
+
+# ── Task 1 (correction): profile leg ───────────────────────────────────────
+
+def _seed_profile(conn, slot: str, value: str, *, slot_key: str | None = None,
+                  invalid_at: str | None = None, confidence: float = 1.0) -> None:
+    conn.execute(
+        "INSERT INTO user_profile(slot, slot_key, value, confidence, valid_at, invalid_at) "
+        "VALUES (?, ?, ?, ?, '2024-01-01 00:00:00', ?)",
+        (slot, slot_key, value, confidence, invalid_at),
+    )
+
+
+def test_select_state_anchor_profile_consumes_cap(conn):
+    """The digest accounting: profile rows FIRST (cap), edges fill the rest."""
+    from hymem.query.state_anchor import select_state_anchor
+
+    with core_db.transaction(conn):
+        for val in ["running", "pottery", "reading"]:
+            _seed_profile(conn, "recurring_activity", val, slot_key="melanie")
+        for i in range(6):
+            _seed_edge(conn, f"m{i}", "uses", "postgres", pos=3, neg=0)
+
+    profiles, edges = select_state_anchor(conn, cap=4)
+    assert len(profiles) == 3
+    assert len(edges) == 1
+    assert edges[0]["subject_canonical"] == "m0"
+
+
+def test_select_anchor_profile_rows_excludes_invalidated(conn):
+    from hymem.query.state_anchor import select_anchor_profile_rows
+
+    with core_db.transaction(conn):
+        _seed_profile(conn, "recurring_activity", "running")
+        _seed_profile(conn, "recurring_activity", "swimming",
+                      invalid_at="2024-02-01")
+        _seed_profile(conn, "location", "lommel")
+
+    rows = select_anchor_profile_rows(conn, cap=20)
+    vals = {r.value for r in rows}
+    assert vals == {"running", "lommel"}
+
+
+def test_seed_terms_from_profile_values_first():
+    from hymem.query.state_anchor import seed_terms_from_profile
+    from hymem.dreaming.user_profile import ProfileEntry
+
+    entries = [
+        ProfileEntry(
+            slot="recurring_activity", slot_key="melanie",
+            value="running pottery", confidence=1.0,
+            evidence_message_id=None, valid_at="2024-01-01 00:00:00",
+        ),
+    ]
+    terms = seed_terms_from_profile(entries)
+    # value + value words + slot_key are the searchable vocabulary
+    for t in ["running", "pottery", "melanie"]:
+        assert t in terms
+    # slot words (not the underscore-joined token) also present
+    assert "recurring" in terms
+    assert "activity" in terms
+
+
+def test_seed_terms_from_profile_empty(conn):
+    from hymem.query.state_anchor import seed_terms_from_profile
+
+    assert seed_terms_from_profile([]) == []
+
+
+# ── Task 3: state_anchor_expand ────────────────────────────────────────────
+
+def test_expand_surfaces_evidence_from_seed_terms(anchor_fixture):
+    """The evidence chunk is FTS-reachable from the anchor; the distractor is
+    reachable from the query instead — Task 4's scenario, measured here at the
+    expansion-core level."""
+    from hymem.query.state_anchor import (
+        select_anchor_edges,
+        seed_terms_from_edges,
+        state_anchor_expand,
+    )
+
+    conn = anchor_fixture
+    edges = select_anchor_edges(conn, cap=20)
+    terms = seed_terms_from_edges(edges)
+    hits = state_anchor_expand(conn, terms, top_k=5)
+
+    ids = [h["chunk_id"] for h in hits]
+    assert "c-evidence" in ids
+    # the query-reachable distractor shares no anchor term ("nas01" etc.)
+    assert "c-distractor" not in ids
+
+
+def test_expand_limits_top_k_and_dedups(conn):
+    with core_db.transaction(conn):
+        _seed_session(conn)
+        _seed_message(conn, 1, "2024-01-01 00:00:00")
+        for i in range(8):
+            _seed_chunk(conn, f"c{i}", 1, f"CUDA 12.1 notes number {i}")
+
+    from hymem.query.state_anchor import state_anchor_expand
+
+    hits = state_anchor_expand(conn, ["cuda_12.1", "cuda_12.1", "cuda"], top_k=5)
+    ids = [h["chunk_id"] for h in hits]
+    assert len(ids) == 5
+    assert len(set(ids)) == 5
+
+
+def test_expand_inert_without_seed_terms(conn):
+    from hymem.query.state_anchor import state_anchor_expand
+
+    assert state_anchor_expand(conn, [], top_k=5) == []
+    assert state_anchor_expand(conn, ["  ", None], top_k=5) == []
+
+
+# ── Task 4: probe ──────────────────────────────────────────────────────────
+
+def test_probe_reports_the_anchored_only_hit(anchor_fixture, tmp_path):
+    """THE smoke test: the gold row is reachable ONLY via anchor expansion.
+    The probe must count it as one anchored-only hit, zero wrong-state pulls,
+    zero vec calls (FTS-only default) and must not mutate the store."""
+    from datetime import datetime
+
+    from hymem import HyMemConfig
+
+    queries = [{
+        "question": "Which GPU system produces model training output?",
+        "gold_chunk_ids": ["c-evidence"],
+        "category": "single-session-user",
+    }]
+    qpath = tmp_path / "queries.json"
+    qpath.write_text(__import__("json").dumps(queries))
+
+    store = tmp_path / "store.sqlite"
+    # copy the fixture store to a temp path so the probe opens it read-only
+    src = anchor_fixture
+    src.execute("VACUUM INTO ?", (str(store),))
+
+    before = _count_writes(src)
+
+    cfg = HyMemConfig(root=tmp_path)
+    summary = run_probe(store, qpath, cfg=cfg)
+
+    assert summary["n_queries"] == 1
+    assert summary["hit_rate"] == 1.0
+    assert summary["wrong_state_rate"] == 0.0
+    assert summary["vec_calls"] == 0
+    assert summary["llm_calls"] == 0
+    assert summary["max_added_rows"] <= 5
+    assert summary["max_added_tokens"] <= 400
+
+    # store not mutated (row counts stable on the original connection)
+    assert _count_writes(src) == before
