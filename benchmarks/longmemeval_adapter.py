@@ -1202,6 +1202,12 @@ def parse_judge_verdict(raw: str) -> bool:
         mixing an unmeasured criterion change into a provably-inert parse change
         is precisely the coupling the inert window exists to avoid.
 
+        And the pin protects more than that choice. `reference_verdict`, banked
+        pre-run, scores "yes and no" True on first-token-wins. Flipping it here
+        would break rule 3's IDENTITY with that reference — and that identity is
+        the entire warrant for the paragraph below. C1 = 0.00% would stop
+        certifying this function and start certifying something merely like it.
+
     Rule 3 IS `judge_audit.reference_verdict`, banked before the 2026-08-25 run,
     which is why that run's C1 = 0.00% certifies this function rather than
     something merely like it. Rules 1 and 2 are additive to it and were measured
