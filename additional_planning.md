@@ -2617,3 +2617,260 @@ E2), checkpointed worldview re-derivation/diff (bitemporal store already
 provides audit; full re-derivation cost unjustified), MDL compression gate
 (specified but not operationalized even by the paper; no corpus-encoding
 machinery to apply it to).
+
+---
+
+## Judge instrument audit + the `invalid_at` lifecycle (added 2026-08-25)
+
+Two threads ran on 2026-08-25 after Plan D, Grove E1/E2 and the digest-squeeze
+gate all closed. They are recorded together because the second was found while
+choosing what should follow the first, and the first is the reason the second
+was fixed rather than deferred a second time.
+
+Neither thread changed a canonical number. That is the point of both.
+
+### Part 1 — the judge instrument (D1-D4)
+
+**Why it was audited at all.** `longmemeval_adapter.judge_answer` is the single
+function behind LoCoMo 68.2%, LME 68.4% and MSC ~84.0% — `locomo_adapter.py:421`
+and `msc_adapter.py:502` both import it. (BEAM is NOT in the blast radius:
+`beam_adapter.py:725` defines its own rubric judge returning a dict.) Until this
+run it was two lines, and it **discarded `raw`**, so its defect rates were not
+merely unmeasured but unmeasurABLE from any stored run. Recording `raw` is the
+whole reason `benchmarks/judge_audit.py` exists. All four criteria were
+pre-registered in that module's docstring before its first LLM call; the
+docstring is the authoritative ledger and this section is the summary.
+
+**The run.** LME, 500 rows, 500 judgeable, 30 `_abs`, 112 non-`_abs` refusals,
+0 judge-side `LLM_ERROR`, v4-flash at temp 0.0 / `max_tokens=10`.
+
+| # | criterion | bar | measured | band |
+|---|---|---|---|---|
+| C1 | misscore (shipping vs reference rule disagree) | ≥1.0% MATERIAL | **0.00%** (0), C1b 0 | IMMATERIAL — *as a lower bound* |
+| C2 | non-compliant replies (indicator only) | no bar | **0.00%** (0) | every reply a bare yes/no |
+| C3 | refusal scored CORRECT (non-`_abs`) | ≥2.0% MATERIAL | **2.13%** raw → **1.87%** corrected | **WATCH-at-bar** |
+| C4 | arm refusal-rate asymmetry | ≥1.0pp | **NOT RUN** | blocked |
+
+**C3 is recorded as WATCH-at-bar, NOT as "below material".** Raw 10/470 has a
+Wilson 95% CI of **1.16–3.87%**; the hand-check FP rate 3/25 has **4.17–29.96%**.
+The 2.0% bar sits inside both. Breakeven FP for MATERIAL is exactly **6.00% =
+1.5 of 25**, so **one hand-scored row moves the verdict**:
+
+| FPs / 25 | corrected C3 | band |
+|---|---|---|
+| 0 | 2.128% | MATERIAL |
+| 1 | 2.043% | MATERIAL |
+| 2 | 1.957% | WATCH |
+| 3 | 1.872% | WATCH |
+
+> **The verdict was flipped by a defect in the instrument, not by the data.**
+> `write_handcheck_sample` drew both arms from ALL rows while `build_report`
+> divided by non-`_abs` only — 6 of 25 slots spent on rows the criterion never
+> counts, on a run where the reader refused 28 of 30 abstention questions. The
+> pre-fix sample gave FP 1/19 = 5.26% → **2.016% = MATERIAL**. Redrawing from
+> the population the rate is divided by gave 3/25 = 12% → **1.872% = WATCH**.
+> Divisor/population parity is not bookkeeping; it decided this verdict.
+
+**C3's numerator decomposed (hand-read, all 10 rows).** Every one is the
+containment criterion doing exactly what its prompt says — **zero genuine judge
+errors**, so no judge-prompt change was warranted on this evidence. 5 pass the
+strict recitation test. The other **5 are `recites_gold` FALSE NEGATIVES**, and
+the mechanism is worse than "strictness biases down": the `len(t) > 2` filter
+**discards the numerals** — the entire payload of a temporal-reasoning gold —
+while **mandating the trailing "also acceptable" gloss**. One row states both
+"22 days" and "21 days" verbatim and still fails; one fails on the single word
+"taking"; the preference row is a paraphrase the rubric's "recalls and utilizes
+personal information" clause credits.
+
+> **`recites_gold` token rule — PRE-REGISTERED AS ITS OWN GATE, not folded in.**
+> It also sizes `free_precheck`'s spend-licence ceiling. With the five FNs
+> counted, the 2026-08-25 ceiling numerator is **≥21/470 = ≥4.47%**, not 16/470
+> = 3.40%. Direction is **conservative for the licence** — an under-count can
+> only wrongly REFUSE a spend, never wrongly license one — and this spend was
+> REACHABLE under either count. Any loosening changes the licence arithmetic as
+> well as the C3 footnote. Gate it separately. **UNRUN.**
+
+#### D2 — CLOSED BY FIX, in its only inert window
+
+`judge_answer` now calls `longmemeval_adapter.parse_judge_verdict`: word-boundary
+`\byes\b`/`\bno\b`, first verdict token wins, negated affirmatives and the
+`[LLM_ERROR: ...]` sentinel score False, no verdict token fails closed.
+
+**Landed on the strength of being a PROVEN no-op**, not on the strength of being
+right: C2 = 0.00% over 500 recorded replies, C1b = 0 negated-yes, 0 sentinels.
+Each of the three rules is inert on the corpus on its own evidence.
+`judge_audit.py --verify-parse` re-scored all 500 stored replies under the frozen
+legacy rule and the live one: **0 verdicts change, 0 could have changed**
+(349 compliant-yes / 151 compliant-no). No canonical number moved; LoCoMo, LME
+and MSC are **not** re-baselined.
+
+> **Why now and not at the next migration.** deepseek-chat's hard-deprecation
+> already forced one judge migration and cost 1.6pp of judge harshness. At the
+> next verbose judge, the decision rule and the data would change in the same
+> step with no way to separate them. The insurance is only free once.
+
+**Deliberately NOT changed, both pinned by test:**
+
+- **"yes and no" still scores True.** Not merely "criterion, not parse": rule 3
+  IS `judge_audit.reference_verdict`, banked pre-run, and that identity is the
+  **only warrant that C1 = 0.00% certifies this function** rather than something
+  merely like it. `reference_verdict("yes and no")` → True. Flipping it breaks
+  the certification chain. Resolving a hedging judge is D1 territory.
+- **A truncated fragment carrying a bare "yes"** ("...whether a yes would be")
+  still scores True. Needs the reply's structure, and `max_tokens=10` is part of
+  the frozen comparability contract.
+- **Residual, legacy-identical, no regression:** stacked modifiers
+  ("never really a yes") pass the tightened negation regex. Unfixed family
+  member, not drift. No measured pressure to widen a decision rule.
+
+**D3 — HALF-fixed, deliberately.** Containment rode along (provably inert, 0
+sentinels): a sentinel can no longer score CORRECT, which closes the
+`[LLM_ERROR: unexpected token 'yes']` hole the legacy rule scored True.
+**Visibility did not**: `judge_answer` returns a bare bool with no channel for
+"the judge never answered", and giving it one decides what five call sites across
+three adapters do **mid-outage** — not two lines, and not inert. Stays pinned as
+a defect.
+
+**C4 — blocked, recorded not dropped.** No scored LoCoMo run pair exists on the
+box; the only conv-26 artifact is a `--diag-only` dump (`correct=null`, empty
+`ai_answer`, no reader calls by construction) which would have audited nothing.
+Recovering the pair is 1,600 reader calls — not proportionate.
+
+#### Instrument lessons that generalise beyond this audit
+
+1. **A "we verified it changed nothing" claim needs the denominator of things
+   that COULD have changed.** `--verify-parse` reports flips AND
+   `rows_that_could_flip`, because on an all-compliant corpus 0 flips *cannot
+   fail* to be 0. Without the split it is a certificate signed by an instrument
+   that never met the surface it certifies — the E3 trap reappearing inside the
+   verification of a fix for it. Pinned by
+   `test_a_zero_flip_result_on_a_compliant_corpus_is_reported_as_VACUOUS`.
+2. **A baseline copy must be frozen, and the freeze needs a test.**
+   `judge_audit.shipping_verdict` is now the pre-fix rule that actually produced
+   the three canonical numbers. Re-syncing it to production "for consistency"
+   would make the before/after diff a constant zero **by construction**. One
+   test exists solely to fail on a well-meant tidy-up.
+3. **A counter and a decision rule need different tightness.** The audit's
+   `_NEGATED_YES` over-matches on purpose (inflating a lower-bound bucket is
+   conservative); the landed rule cannot (over-matching marks correct answers
+   wrong). The join test asserts **both** halves so a re-sync fails loudly.
+4. **Negative controls by reversion, one guard at a time.** Seven guards, each
+   reverted individually; each failed exactly its own test. **This is how a
+   vacuous test of mine was caught**: `test_verify_parse_reads_raw_not_the_
+   recorded_verdict` used a fixture that passed under *both* the correct
+   implementation and the bug it was named for. Rewritten with a deliberately
+   corrupt fixture. A guard whose test cannot fail is unguarded.
+
+**Commits:** `5acb05b` (C3 `_abs` cross-tab + `c3_spend_licence`) → `2ec2ed8`
+(hand-check population parity) → `9408b76` (free-path writer delegates) →
+`454d393` (post-run ledger) → `4369fe2` (the parse fix) → `5884adf`
+(`recites_gold` gate pre-registered) → `a025151` (certification-chain note).
+
+### Part 2 — `knowledge_graph.invalid_at` was never cleared on re-assert
+
+Found while sizing what should follow the audit. Previously flagged in the
+digest-squeeze plan as a sibling defect deferred on a deploy-cost claim that was
+itself retracted as overstated by a large factor.
+
+**The defect.** `phase1._upsert_triple` resurrected a retracted edge with
+`status = CASE WHEN status='retracted' THEN 'active' ELSE status END` — and
+`invalid_at` appeared **nowhere in `phase1.py`**. Across all of `hymem/`, the
+only site that ever cleared an `invalid_at` was `rules.py:407`, for the `rules`
+table; `knowledge_graph.invalid_at` had **no clearing path at all**
+(`bitemporal.py` has `stamp_validity` / `stamp_invalidation` and no inverse).
+
+**Two live readers consume exactly the violated conjunction:**
+`query/state_anchor.py:70` and `dreaming/aggregate.py:829`, both
+`status='active' AND derived=0 AND invalid_at IS NULL`. So an
+asserted → contradicted → **re-asserted** edge was permanently invisible to
+retrieval and to the digest's VERIFIED FACTS — in the one state where its
+evidence is strongest.
+
+**Second writer with the same hole:** `phase3.reinforce` cannot resurrect (its
+SELECT filters retracted out) but bumps positive evidence on already-corrupted
+active rows — reinforcing guaranteed invisibility.
+
+**Sizing (free, counts only, before any fix).** Box: **2 rows**, both
+`derived=0`, i.e. exactly the population both readers consume; conv-26: 0
+(latent there). Not hypothetical and not historical: edge 1872 carried
+`last_reinforced = 2026-08-25 18:12:59` — phase3 was bumping it into invisibility
+**that evening**. Both rows are `user rejects <X>` — explicit user rejections of
+system behaviour, suppressed since 2026-05-29.
+
+> **Claim corrected in passing:** the "growing since the 2026-07-02 supersession
+> flip" framing is NOT evidenced by this store — both stamps predate it. The
+> supported claim is narrower and sufficient: nothing ever cleared the field, so
+> the population is **monotonic**.
+
+**The fix (`8c6925c`, TDD, 3 RED → GREEN).** `invalid_at = NULL` in phase1's
+positive branch and in `phase3.reinforce`, mirroring `rules.py`'s re-assert
+contract. **Unconditional, not gated on `status='retracted'`**, so a row that
+already died corrupted self-heals on its next positive mention — pinned so it
+cannot be "safely" re-gated later. Negative polarity untouched (a negative
+mention must not resurrect a closed edge), pinned. 4 tests in
+`tests/test_bitemporal.py`.
+
+**Live-store repair, 2 → 0.** Authorised on three checks, in this order:
+(1) **the invariant holds by construction** — all three `invalid_at` writers
+(`api.py:805-816`, `phase3.py:127-133`, `value_supersession.py:233-240`) set
+`status='retracted'` in the same breath, so `active AND invalid_at IS NOT NULL`
+is unreachable through any correct path and every matching row is corruption;
+(2) **the one reading that would make the UPDATE destructive is unrepresentable
+here** — a general bi-temporal model can hold an active fact with a closed
+world-time interval ("lived in Berlin 2019–2021"), but in this schema
+`invalid_at` is only ever stamped *as part of* a retraction; (3) **it clears a
+cache, not a fact** — `stamp_invalidation` re-derives the date from `kg_evidence`,
+which the UPDATE never touched. Backup via `.backup`, **not `VACUUM INTO`**
+(VACUUM renumbers rowids, and rowid drift against the vec/FTS shadows is one of
+the four causes behind the RAPTOR reuse failure). Anchor-eligible count
+8896 → 8898, effective immediately rather than on next mention.
+
+**Unstated benefit, worth keeping findable.** `value_supersession.py:237` is
+`COALESCE(invalid_at, ?)` — write-once. Before this fix, a
+resurrected-then-re-superseded edge kept its **first** close date, so the
+interval claimed "invalid since T1" while the edge had actually been valid again
+between T1 and T2. Clearing on re-assert means the COALESCE now sees NULL and
+stamps a fresh, correct date. The fix repaired the interval semantics for
+oscillating edges, one layer below the visibility bug it was written for.
+
+**Watch note landed (`910df08`, `config.py:463`).** A positive re-mention now
+clears `invalid_at` and reactivates the old value, so both values are active
+until the next dream's supersession re-retracts the loser by `valid_at`.
+`bitemporal.supersede` can therefore legitimately fire **twice on the same
+pair**. The rollback signal for that watch is *a `prefers`/multi-valued row* —
+**NOT** a double firing. Do not roll the feature back on a double firing: that is
+the guard converging, not failing.
+
+#### A both-active probe was proposed and REFUSED — on the same trap
+
+Post-dream both-active would be **0 by construction**: `supersede_competing_
+values` runs at `runner.py:715`, *after* phase1 persist (283-387) and
+`phase3.reinforce` (699), so a re-mention is resolved inside the same pass that
+created it. A probe sampling after a completed dream **cannot report non-zero** —
+a ceiling instrument, the exact shape the vacuity split above exists to prevent.
+
+It is degenerate from the other side too: `value_supersession.py:195-196` skips
+every object `_classify_object` cannot parse, so free text never competes. A
+naive "count same subj/pred active pairs" would return a large **permanent**
+population that is not a defect in any sense. To be correct the probe would have
+to reuse supersession's own grouping — at which point it *is* supersession, run
+immediately after itself, returning 0.
+
+**The signal that would actually matter is RE-RETRACTION** — the same edge
+superseded across more than one dream — and it needs no new code: the
+`bitemporal.supersede` audit line already carries `subj`/`pred`/`old`, so
+repeated triples across dream runs are the count. Build an instrument only if
+that is ever non-trivial, and build it against observed cases.
+
+### What stays open after 2026-08-25
+
+| Item | State |
+|---|---|
+| **D1 / C3** | **WATCH-at-bar, band NOT resolved.** Pre-registration says record, do not re-baseline on it alone. Reviving needs a new gate; note the numerator is containment-by-design with 0 judge errors, so a judge-prompt fix has no measured defect to fix. |
+| **`recites_gold` token rule** | Pre-registered `5884adf`, **UNRUN**, free. Changes the licence arithmetic, not just the C3 footnote. |
+| **C4 arm asymmetry** | Blocked on a scored LoCoMo run pair that does not exist. |
+| **D3 visibility** | Pinned defect. Needs a channel `judge_answer`'s bool return does not have. |
+| **E6 supersession over facts** | Unblocked since `a0cd73d`; its `invalid_at` prerequisite is now genuinely sound rather than nominally so. |
+| **Grove E3** | Pre-registered, unbuilt; its "behind Campaign E" sequencing tie is released now that Campaign E is closed as a scored campaign. |
+| **Grove E4** | Pre-registered, unbuilt; still tied to the Stage 3c flip decision (same dependency as Plan C), NOT to Campaign E. |
+| **`main`** | 209 commits behind `Beam-optimisation`, which now holds Campaign E, narrative facts, schema v19→v26 and this audit under a name that no longer describes it. |
