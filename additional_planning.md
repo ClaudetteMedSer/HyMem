@@ -695,28 +695,30 @@ Same standing contract as every plan in this
 file: front-run gate before any build, additive-only, mechanism > score, nothing
 reads oracle labels, per-category LME deltas under ~±5pp are noise.*
 
-### Scoreboard — state as of 2026-07-30 (read this first; the per-step blocks below are the chronological record)
+### Scoreboard — state as of 2026-08-25 (read this first; the per-step blocks below are the chronological record)
 
 | Item | State | Verdict in one line |
 |---|---|---|
-| **E1 narrative facts** | **BUILT 2026-08-02 (schema v26) — `G-F1b` PASSED, Step 4 landed** | G-F1 failed twice ON deepseek-v4-flash (0.55–0.76 vs 0.90), but the revival gate `G-F1b` cleared decisively on gpt-oss-120b (**123/123 strict**, all five criteria, truncation-tail clean). Step 4 built as specced: `narrative_facts` + FTS/vec, `hymem/dreaming/facts.py` (append-only, own watermark, forward-only prompt versioning), additive `ctx.facts` tier, FACTS block in `ask()`. The gate-passing prompt ships VERBATIM as `FACTS_SYSTEM`/`facts.v2`. Defaults ON; **Step 5 (scored confirmation) is now the open item.** |
+| **E1 narrative facts** | **BUILT 2026-08-02 (schema v26); Step 5 RAN 2026-08-04/05 — verdict `READ OFF, WRITE ON`** | G-F1 failed twice ON deepseek-v4-flash (0.55–0.76 vs 0.90), but the revival gate `G-F1b` cleared decisively on gpt-oss-120b (**123/123 strict**, all five criteria, truncation-tail clean). Step 4 built as specced: `narrative_facts` + FTS/vec, `hymem/dreaming/facts.py` (append-only, own watermark, forward-only prompt versioning), additive `ctx.facts` tier, FACTS block in `ask()`; prompt ships VERBATIM as `FACTS_SYSTEM`/`facts.v2`. **Step 5 then measured a COST on LoCoMo** — fired-subset McNemar −2.9pp (b=10/c=24, z=−2.40, p=0.024) against a flat not-fired control (+0.9pp, p=0.45), where the all-800 net (−1.4pp, z=−1.72) had read as non-significant. **Defaults now `facts_enabled=False` (read) / `facts_extraction_enabled=True` (write)** — see the Step 5 verdict block below for the mechanism, the LME null, and the judge artifact. |
 | **E5 anaphora** | **SHIPPED ✓** | `hymem/query/coref.py`, on by default; 31/31 resolution, 0/12 no-harm. The hedge that paid. |
 | **E3 rerank A/B (M1+M2)** | **RUN 2026-07-30/31 — VERDICT IN, NOTHING FLIPPED** | **M1 FAIL on latency arithmetic** (CE is 10.7× *slower* than the API on CPU vs a required ≥10× faster; ~9.5ms/candidate is unreachable — mxbai 108× off, bge 37× off) and its quality row is **unmeasured**, not parity (it ran on the vacuous handset). **M2 = parity, not a bge win** (NL R@1 +4/20 at p≥0.125, EN −2/15; fails the pre-registered effect size once rescaled to n=20). bge's real edge is latency (3–4× on CPU, language-flat). **Decision: keep both defaults as they are** — Step 6 closes unexercised. |
 | **E6 supersession over facts** | **UNBLOCKED 2026-08-02 (E1 landed) — not built** | Its prerequisites are now met: G-F1b passed and Step 4 shipped `narrative_facts` with `invalid_at` as the one mutable field, which is exactly the column E6 closes. At v4-flash's faithfulness it would have been an amplifier of fabrication — which is why it had to follow a faithfulness pass, not precede one. Sequence it behind Step 5. |
 | **E4 temporal boost (query-side)** | **NOT BUILT — closed by decomposition, then by selectivity arithmetic** | LME gate technically PASSED (8.8% / 90.9% / 0) but the same rules fail across corpora on the speech-time/event-time axis, and selective fire rate lands under criterion 1 on both. **Carry-forward `G-E4b` (ingest-side `valid_at`) PRE-REGISTERED 2026-07-31 — and its Step 0 pre-check closes the query-range consumer for free: ceiling ≈0.22% of queries (LME), ~20× under the bar.** The only live path is Fork B (an existing `valid_at` reader — supersession / recency-dating), which is a different feature and must be argued on its own terms. |
-| **E2 per-entity observations** | **DORMANT (double-blocked)** | Needs flip-watch green (currently red AND untestable — box store quiescent since ~Jul 12) AND a new faithfulness result clearing `fact_probe.py`'s bar. Not schedulable as pending work. |
+| **E2 per-entity observations** *(Campaign E's E2 — not Grove's recovery gauge)* | **DORMANT (still double-blocked, but one blocker is now moving)** | Needs flip-watch green AND a new faithfulness result clearing `fact_probe.py`'s bar. The flip-watch leg is no longer *untestable*: schema v30 (persisted leaf watermark) and v31 (structural rebuild forecast) closed the observability holes, criterion 6 (keying integrity) was banked 2026-08-09, and the first post-v31 dream `#1182` read clean (predicted=9, residual=0, reuse 91.7%). The gate is now **PENDING on accrual** — it needs every verdict row to carry a populated `aggregation_keying_residual` — not blocked on a defect. The faithfulness leg is untouched. |
 | **E7 usage feedback** | **OPEN, ungated** | Artifact-agnostic long game; no front-run designed yet. |
 
-**Uncommitted as of this note:** this file only (the E3 verdict). All instrument
-work is in HEAD — the E4 re-run verdict + `reldate_probe.py` per-rule-precision
-and small-n-caveat additions, and E3's `rerank_ab.py` overlap fix + handset v3.
+**Campaign E is closed as a scored campaign.** Every item is either shipped (E5),
+run-and-verdicted (E1 Step 5, E3), closed by argument (E4), or dormant on a named
+blocker (Campaign-E E2, E6, E7). Nothing in Campaign E is awaiting a run.
 
-**Next actions, in order:** (1) commit the E4 verdict + instrument work + the
-G-F1b protocol; (2) run the free selectivity measurement for the ingest-side
-E4 candidate (in progress); (3) pre-register the G-F1b candidate model and run
-the gate on the box (~500 calls + hand-score). ~~(4) unblock E3~~ **E3 is DONE —
-run, verdict in, nothing flipped (Step 3 status block below).** With E3 closed,
-**G-F1b is the only live scored item in the campaign.**
+**Next actions, in order** (2026-08-25, superseding the 2026-07-30 list): the live
+work is now Plan D + Grove E2, sequenced in that plan's own section below.
+(1) run `benchmarks/recovery_probe.py` read-only on the box **and** on a LoCoMo
+`--db-dir` store — its `anchor_delta` gates both Grove E2 Stage 1 and Plan D's
+seed predicate; (2) build Plan D behind a default-OFF flag and run the shadow
+probe over both corpora; (3) if C1 proceeds, the scored LoCoMo A/B under the
+OFF-arm stratification specced in Plan D. Grove E1 is **deferred** — see the note
+in the Plan E section.
 
 ### E0. Evidence base and the six review constraints
 
@@ -1507,12 +1509,13 @@ append-only + UNIQUE).
 
 ---
 
-### Step 5 — scored confirmation (box; protocol, not a build) — **LIVE: Step 4 has landed**
+### Step 5 — scored confirmation (box; protocol, not a build) — **RAN 2026-08-04/05, VERDICT: READ OFF, WRITE ON**
 
-> **REINSTATED 2026-08-02** — Step 4 built, so this runs as written below. The
-> facts tier ships defaulted ON and **unmeasured on every benchmark**: nothing
-> here has been scored since the build, and the pre-registered reading order
-> (mechanism BEFORE score) is what keeps a null result readable.
+> **REINSTATED 2026-08-02** — Step 4 built, so this ran as written below. The
+> facts tier shipped defaulted ON and unmeasured on every benchmark; the
+> pre-registered reading order (mechanism BEFORE score) is what kept the result
+> readable. **The protocol below is the pre-registration; the verdict block that
+> follows it is the result. Read them in that order.**
 
 - **LoCoMo, n=800, `--fresh` (core changed → stores rebuilt), seed 0, canonical
   3×/24k.** Pre-registered reads, in order: (a) mechanism — facts rendered in
@@ -1526,6 +1529,56 @@ append-only + UNIQUE).
   against it.
 - All runs: config recorded in metadata (adapter contract), paired reads via
   `locomo_flip.py` / `compare_recall.py`.
+
+#### STATUS 2026-08-05 — RESULT: E1 measurably COSTS on LoCoMo; verdict `read off, write on`
+
+Instrument: `benchmarks/facts_ab.py` (fire rate → McNemar FIRED vs NOT-FIRED,
+the latter a built-in negative control).
+
+**LoCoMo n=800 — the battery's only measured signal.** Fired-subset McNemar
+**−2.9pp (b=10/c=24, z=−2.40, p=0.024)** with a **flat not-fired control**
+(+0.9pp, p=0.45), so the arms differ by the facts flag and nothing else. The
+all-800 net (−1.4pp, z=−1.72) had read as non-significant — the pre-registered
+fired-subset read is what made the cost visible, and it is the reason that read
+exists.
+
+**Mechanism is DISTRACTION, not crowding.** The facts block is appended *before*
+`total_chars=0`, so it adds context and displaces nothing: the ON arm saw a
+strict SUPERSET of the OFF arm's context and still lost. This retires the
+assumption that "additive, displaces nothing" is a harm-free property — it is
+exactly the property this tier had while costing 2.9pp. **Every future additive
+query-side tier inherits a RELEVANCE-PRECISION bar on top of faithfulness.**
+
+**LME paired 2026-08-05 — NO benefit, and structurally unreadable.** Fire rate
+99.8% ⇒ the not-fired control is n=1, i.e. **vacuous**; `gold_in_facts` only
+5.1%; the MS sign is NEGATIVE (−6.6pp), opposite the retracted +3.0. The 66-flip
+hand-check puts **100% of the net in COUNT/SUM questions**: an unconditional
+top-8 with no relevance floor reads as a COMPLETE enumeration, so the model
+counts the 8 facts instead of the raw turns below (both `_abs` abstentions lost
+2/2; 2 of 4 gold-in-facts rows lost, including a current-vs-previous PB pair).
+Self-containment strips the completeness / ordering / supersession structure
+those questions need.
+
+**Judge artifact found in the same dump.** 6/66 flips have BOTH arms refusing yet
+score discordant (5 lost / 1 gained = −4 of −12), because the judge credits a
+gold value recited incidentally *inside a refusal* — a judge-side `_lex_match`
+trap. It leaves LME null either way but **strengthens** the count/sum reading
+(residual −8 total, count/sum −11). **It is UNRUN on LoCoMo**, where the same
+rate would land near z≈−2.1, so the record must not harden past *"costs on
+LoCoMo in this regime."*
+
+**MSC / BEAM / LME-MS were all under-powered ⇒ UNMEASURED, not null.**
+
+**Verdict: read off, write on.** `facts_enabled=False`,
+`facts_extraction_enabled=True` (`hymem/config.py`). This rests on **zero
+measured benefit**, not on the harm — the store keeps filling so the tier can be
+revived without a backfill. **Any revival must pre-register the count-gate
+prediction.** E2/Plan C inherit the relevance-precision bar. E6 is unblocked (its
+`invalid_at` column exists).
+
+Collateral: the `[:4000]` recorder bug had turned 50 faithful facts into
+"inventions" (50/50 resolved faithful) ⇒ **G-F1's v4-flash 0.55–0.76 still needs
+the same full-source recheck before the migration story is settled.**
 
 ---
 
@@ -2051,6 +2104,44 @@ run through existing `_fts_search` / `_vec_search` / `_rrf_merge`. Additive
 only, budget-capped (≤5 rows / ≤400 tokens), never reorders or suppresses
 existing rows. Zero schema change, zero prompt change, zero dream spend.
 
+> **CORRECTIONS 2026-08-25, before any build — banked ahead of the numbers.**
+>
+> **1. The predicate quoted above is INCOMPLETE.** `_anchor_facts`
+> (`aggregate.py:801-835`) leads with **profile rows** (via `load_profile`,
+> which outrank graph edges and consume part of `cap`), and its edge clause also
+> carries `AND pos_evidence > neg_evidence` with
+> `ORDER BY pos_evidence - neg_evidence DESC, last_seen DESC, id LIMIT ?`. Seeding
+> from the three-clause version quoted here would seed from a **different set than
+> the digest actually uses**. Copy the full clause; seed profile rows too, as a
+> separate source with its own counter so the probe can attribute hits.
+>
+> **2. Typed values are not on the edge row.** They live in `kg_evidence`
+> (`value_text` / `value_numeric` / `value_unit` / `temporal_scope`), so
+> "(+ typed values)" costs a JOIN against the C3 cost line. Skip them in v1.
+>
+> **3. This plan is COUPLED to Grove E2 and cannot be gated independently.** The
+> `invalid_at IS NULL` clause is redundant with `status='active'` *except* on
+> re-asserted edges — the exact population Grove E2 measures (see the amendment
+> in the Plan E → E2 section). So the clause is a deliberate decision here, not a
+> copy: run E2's Stage 0 probe first, and if its `anchor_delta > 0`, drop the
+> clause in the anchor selector with the rationale recorded. A state anchor whose
+> job is tracking what is *currently* true should not silently bar facts that were
+> retracted and re-confirmed.
+>
+> **4. C2 and C4 are NOT harm gates.** As pre-registered below they assert
+> "additive, displaces nothing, existing rows byte-identical" — which is
+> **exactly the property the narrative-facts tier had while costing 2.9pp on
+> LoCoMo** (Campaign E Step 5; mechanism was DISTRACTION, not crowding). Only the
+> scored A/B can clear harm. Likewise **C1 is a proceed-gate, not a flip-gate**:
+> reachability has already failed to convert here once (the LoCoMo
+> message-vector probe bridged 3/54 true vocabulary gaps).
+>
+> **5. The scored A/B needs an OFF-arm stratification and an A/A control.** The
+> obvious "fired = the tier added a row the OFF arm lacked" conditions on the
+> treatment arm's own output, routes the distraction harm into the control, and
+> makes the run read VOID rather than FAIL. Full design in the Plan D + Grove E2
+> plan (Item 3).
+
 **RAPTOR interference — CLEAR (mirrors Idea A):** query-time read of active
 edges; writes nothing; `_aggregation_search` writes a different ctx field and
 shares no state; digest anchor read is dream-time and unaffected.
@@ -2099,6 +2190,33 @@ Four items survived the review; each is a separate, independently gated tier.
 
 ### E1 — Labeled wildcard slot in augment (mode-gated exploration)
 
+> **DEFERRED 2026-08-25 — not built, and the selection mechanism as specced below
+> is NOT IMPLEMENTABLE.** Two independent reasons, both structural:
+>
+> 1. **No substrate for the counter.** There is no retrieval/surface log table in
+>    the schema, and `HyMem.augment()` runs on a connection with
+>    `PRAGMA query_only = ON` (`hymem/api.py:191`) — the query path *cannot
+>    write*. The "zero-prior-surface counter over recent augment calls" has
+>    nowhere to live.
+> 2. **The process-local alternative is a defect we already paid to fix.** A
+>    module global keyed to nothing is exactly `_LAST_LEAF_SET`: readable only
+>    within one process lifetime (so NULL on ~175/187 rows on a box that starts a
+>    fresh process per dream) *and* silently cross-contaminating when one process
+>    serves two stores. Schema v30 moved that watermark into the store;
+>    re-introducing the same shape on the query path would re-open it.
+>
+> **Sequenced behind Plan D's verdict.** D is the same *kind* of bet — an additive
+> query-side tier — and Campaign E Step 5 showed one of those can cost 2.9pp while
+> displacing nothing. D's result tells us whether this class can pay here at all
+> before a second one is built.
+>
+> **If revived, it needs two changes to this spec:** (a) a store-derived dormancy
+> proxy (low `pos_evidence`, old `last_seen`, never surfaced in an episode) in
+> place of UCB — deterministic, no counter, no writes; and (b) a **third placebo
+> arm** in the gate (a random dormant row), because the C1 below cannot separate
+> "the selection works" from "adding any extra row works". Without the placebo the
+> gate reads PASS for an inert selector.
+
 **Adaptation:** after the RRF merge in `query/augment.py`, when
 `cfg.augment_wildcard_mode != "off"`, reserve exactly ONE result slot for a
 relevant-but-dormant row: drawn from the shortlist tail / dormant band
@@ -2132,6 +2250,50 @@ only), runs in parallel with G-F1b without touching the dream budget.
   score-chasing; UNMEASURED → extend sample once or keep shadow.
 
 ### E2 — Recovery-rate gauge (read-only instrument)
+
+> **AMENDED 2026-08-25, before any build.** Reading the actual bitemporal code
+> changed three things about the spec below. Recorded here so the amendments are
+> banked ahead of the numbers, not fitted to them.
+>
+> **(a) The signal exists with no schema change — as an ARTIFACT, not a design.**
+> `phase1.py:654-666` resurrects a retracted edge to `status='active'` but never
+> clears `invalid_at`, and **nothing in `hymem/` ever clears it on
+> `knowledge_graph`** (only `rules.py:407` does, on a different table). So
+> `status='active' AND invalid_at IS NOT NULL AND derived=0` *is* the
+> recovered population. It is also a live defect: `_anchor_facts`
+> (`aggregate.py:828-830`) is the **only** query in the codebase that reads
+> `invalid_at` on this table, so a re-confirmed fact is authoritative at query
+> time and **invisible to the digest anchor**; and because `stamp_invalidation`
+> (`bitemporal.py:76`) and `value_supersession` are both write-once, a later
+> re-retraction leaves the *first* retraction's date in place permanently.
+> **Decision: measure, do not fix** — the fix would change `_anchor_facts`'
+> output, rekeying the root digest on every store and injecting a
+> deploy-refusion into the live criterion-6 accrual.
+>
+> **(b) Stage 0 is a read-only probe, and the headline number is a COUNTERFACTUAL
+> DIFF, not a row count.** A raw count of the recovered population overstates the
+> impact, because `_anchor_facts` also requires `pos_evidence > neg_evidence`,
+> takes only the top `cap`, and lets profile rows consume part of that cap — most
+> recovered edges fail the evidence margin anyway. Run the real anchor query
+> twice, with and without the `invalid_at IS NULL` clause, and diff the rendered
+> lists: **`anchor_delta`** is the gate. `anchor_delta == 0` means the clause is
+> inert and there is nothing to fix. Gate Stage 1 (the in-dream gauge) on it —
+> instrumenting a population known to be empty is the unreachable-code-path trap.
+> Pre-register a *rate*, not `> 0`: ordinary decay-then-re-mention churn satisfies
+> any `> 0` bar on any store. Hand-verify ≥3 rows against `kg_evidence`
+> polarity/`extracted_at` ordering, or the number cannot distinguish genuine
+> recovery from value oscillation.
+>
+> **(c) Instrument the TRANSITION, not the stock; and one obvious confound counter
+> is dead on arrival.** A phase-3 read of "currently active, previously closed" is
+> a slowly-drifting cumulative stock that will be misread as a per-run rate — count
+> the flip at `phase1.py:662` instead. And **do not use `invalid_at = last_seen` as
+> a migration-015 backfill counter**: the same UPDATE that creates a recovery sets
+> `last_seen = CURRENT_TIMESTAMP`, so on the numerator that counter reads 0 by
+> construction. Detect backfill against the evidence trail instead (a genuine
+> closure has a matching `kg_evidence` row with `polarity = -1`).
+>
+> Full build + measurement plan: see the Plan D + Grove E2 plan (Item 1).
 
 **Adaptation:** count, over the store's bitemporal history, the fraction of
 currently-active facts (`status='active' AND derived=0`) that were previously
