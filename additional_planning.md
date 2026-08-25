@@ -2181,6 +2181,85 @@ with G-F1b without touching the dream budget.
 - MindCache's own evidence for anchors is "Observed in Development" (manual) —
   the reason this gate exists before any build spend beyond the LLM-free probe.
 
+#### STATUS 2026-08-25 — **CLOSED, FAIL-mechanism** (LoCoMo conv-26, n=74)
+
+Built D1-D4 (`hymem/query/state_anchor.py`, `benchmarks/state_anchor_probe.py`,
+22 tests). Task 6 never built — the gate closed first. **Zero LLM spend.**
+
+**The first run was an artifact and must not be cited.** It reported 2.7%
+anchored-only reach. Both of those hits were **provenance-circular**: the gold
+chunk WAS the chunk the seed edge had been extracted from, so the anchor
+"reached" it by tautology. The probe as first written omitted two of D4's four
+pre-registered corrections — the circularity exclusion and the baseline-coverage
+denominator — and `test_probe_reports_the_anchored_only_hit` used
+`c-evidence`, the seed edge's own evidence chunk, as gold. **The single test
+certifying the mechanism was itself the tautology.** Both corrections were added
+and control-verified (revert circularity exclusion →
+`test_a_provenance_circular_gold_does_not_score` fails; revert the headroom
+denominator → `test_a_saturated_baseline_reports_zero_headroom` fails).
+
+**Corrected matrix** (headroom = queries whose gold the baseline does NOT
+already hold; `sep` = the banked separate-cap config, `shared` = the digest's
+profile-first squeeze):
+
+| leg | hit_rate | within headroom | circular | wrong-state | p95 |
+|---|---|---|---|---|---|
+| sep + FTS | **0.0%** | 0/22 | 2 | 0 | 7.3ms |
+| shared + FTS | 1.35% | 1/22 | 0 | 0 | 6.9ms |
+| sep + vec | **0.0%** | 0/18 | 2 | 0 | 235ms |
+| shared + vec | 1.35% | 1/18 | 1 | 0 | 183ms |
+
+**The ceiling rules out the saturation reading.** `c1_ceiling` = 29.7% (FTS) /
+24.3% (vec): the baseline covers 70.3% of gold (52/74), leaving 22 queries with
+real headroom. So the low number is not the LME 99.8% pattern — there WAS room
+and the mechanism did not reach it. This is what makes the run interpretable;
+without the denominator the first number was unreadable in both directions.
+
+**Verdict against the banked gate.** C1 **FAIL-mechanism**: 0.0-1.35% against a
+5% bar on sampled queries. On the pre-registered denominator the separate-cap
+legs REJECT H0 (true rate >= 5%) at exact-binomial p = 0.022 — a supported
+FAIL, not merely a number under a line. The shared-cap legs (1 hit) do not
+reject (p = 0.11), and they are the gate-invalid config anyway. C2 **PASS**: 0
+wrong-state in all four combos. C3 **mixed**: FTS clean (0 LLM, <=5 rows /
+298 tokens, 7.3ms); both vec legs blow the +100ms budget at 183-235ms p95, so
+C3 holds for FTS only. C4 **never measured and never will be** — it gates the
+Task-6 A/B, which FAIL-mechanism forecloses. That is the correct outcome, not
+an open gap.
+
+> **Do NOT re-read this on the headroom denominator.** Within headroom nothing
+> rejects at any leg (0/22 → p = 0.32; 0/18 → p = 0.40). That denominator was
+> not banked; adopting it after seeing the numbers would be post-hoc, and it is
+> underpowered in both directions. The gate closes on its banked terms.
+
+> **A prediction of mine that the data falsified.** Plan D correction 5 (banked
+> 2026-08-25, above) argued the shared cap would starve the edge seed and make
+> C1 read near zero for the wrong reason. The gate-VALIDITY half of that
+> argument stands — a tier seeded from 0 edges cannot be tested. The empirical
+> half was wrong: separate caps produced FEWER non-circular hits (0) than the
+> shared cap (1), not more. The difference is one question and neither is a
+> signal, so the honest reading is that the cap policy did not matter here at
+> all — but the correction did not rescue the mechanism, and the record should
+> not imply it might have.
+
+**Third failure of reachability-to-convert in this project** — after the LoCoMo
+message-vector probe (3/54 true vocabulary gaps bridged) and narrative facts
+(perfectly additive, cost 2.9pp). C1 was pre-registered as a proceed-gate that
+could only ever kill; it did.
+
+**Known limits of this close, stated rather than discovered later.** (a) One
+store, one conversation — the LME and BEAM legs of the pre-registered sample
+never ran. (b) Only the CHUNK corpus was probed; `expand_over_messages` exists
+and is tested but the probe never calls it, so D5's per-corpus requirement is
+satisfied for one corpus of two. (c) Two blind spots named in the plan remain
+structural: an anchor that makes rows the reader ALREADY had interpretable
+scores 0 here, as does an anchor edge that simply IS the answer.
+
+**Code kept, not deleted.** `hymem/query/state_anchor.py` imports into nothing
+in production (Task 6 unbuilt) so it costs no runtime path, and
+`test_the_predicate_matches_the_digest_anchor_row_for_row` is independently
+useful: it fails if `_anchor_facts`' predicate ever drifts, which is a live
+concern during the criterion-6 accrual window.
+
 **Rejected MindCache items (recorded 2026-08-14, do not revisit without new
 evidence):** topic taxonomy (graph already encodes structure), Leiden
 partitioning (overkill at our scale), input denoiser (recall risk — could drop
