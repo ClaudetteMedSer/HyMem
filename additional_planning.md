@@ -2472,6 +2472,80 @@ behaviour change on the LIVE digest. LoCoMo conv-26 shows the same shape in
 miniature (4 edge slots for 55 edges). Unrelated to `invalid_at`; it is server
 code and needs its own pre-registered gate — do NOT hotfix it in this branch.
 
+#### STATUS 2026-08-25 — gate RAN, **fix REFUSED at S1-C1**; the defect stays open
+
+Gate built and run: `benchmarks/digest_squeeze_probe.py` (Stage 0, read-only,
+zero LLM) and `benchmarks/digest_squeeze_dump.py` (Stage 1 instrument,
+read-only, LLM-LESS — prints prompts for hand-scoring, writes nothing, has no
+output-path argument), 31 tests. The `_anchor_facts` fix was deliberately NOT
+built: it was gated on Stage 1, and Stage 1 refused it.
+
+**Stage 0 (box, cap 20).** 23 active profile rows fill the cap → edge budget 0
+→ early return fires → the digest fuses **profile-only** (20 facts). Under
+separate budgets the block would hold 40 facts. `EDGES_RESTORED = 20`. Verdict
+**SQUEEZED**. conv-26: 16 profile → 4 edge slots, block 20 → 36, **NOT-SQUEEZED
+but NOT a null control** (the shared cap still costs it 16 edges).
+
+> **Two corrections to the numbers this section previously carried.**
+> **(a) 8754 was the wrong population.** The anchor-eligible count adds
+> `invalid_at IS NULL AND pos_evidence > neg_evidence`: **8,380 eligible of
+> 8,772 active non-derived**, 392 excluded. Keyed on the wrong count, a store
+> full of ineligible edges reads non-VACUOUS while restoration is structurally
+> zero — the guard-encoding finding.
+> **(b) The delivery figure is 20, not 8,380.** `edge_cap` is 20, so the pool
+> only decides which 20 win the `pos_evidence - neg_evidence` ordering. Every
+> "0 of 8,754 edges reach the digest" framing is true but implies the fix
+> delivers thousands of facts. It delivers **twenty**.
+
+**Stage 1 (box, hand-scored locally, counts only — digest text is personal
+conversation content and never left the box).** ARM A is the byte-for-byte
+production prompt, pinned by a fidelity test against what a real
+`build_aggregation_nodes` dream hands the LLM, so this scores what ships today.
+
+| # | criterion | bar | measured | result |
+|---|---|---|---|---|
+| S1-C1 | grounding gain | >=3/10 | **2/10** | **FAIL** |
+| S1-C2 | faithfulness | 0 | 0/10 | PASS |
+| S1-C3 | no regression | 0 | 0/10 | PASS |
+| S1-C4 | cost | <=40 lines | 40/40 | PASS, **zero headroom** |
+
+Both C1 gains sit in project/organization structure — the only material
+difference between the arms; the other 8 slots are identity/activity claims
+identical in both. **Verdict: the additive fix does not ship.** It failed by
+ONE claim-slot at n=10, and the gate's banked honesty note applies in full:
+this refuses, it does not demonstrate uselessness. Moving the bar now would be
+post-hoc.
+
+> **The reserved-edge-floor fallback is dead too, and for a stronger reason.**
+> It DISPLACES the profile tail to make room for the same 20 lines that just
+> failed to earn their place — taking on displacement harm for a benefit
+> measured at 2/10, when the non-displacing variant already scored 0/10 on both
+> harm criteria. Do not fall back to it.
+
+**What S1 did NOT measure, and what therefore stays open.** The gate scored
+digest *text* at one instant. It cannot see the second, independent
+consequence, which both contracts state explicitly:
+`config.py:205-206` — *"The root node's cache id includes a hash of this block,
+so the digest regenerates whenever the anchor facts change"*; `aggregate.py:
+1235-1239` — *"a changed graph (new fact, supersession) regenerates the digest
+even when the tree's membership is unchanged ... the price of NOT doing it is a
+digest pinned to stale ground truth."* On the box `anchor_facts` is profile-only,
+so **a graph change cannot regenerate the root digest through the fact block.
+That price is being paid silently today**, and S1-C1's refusal does not touch
+it: staleness needs a criterion observed ACROSS a graph change, not two blocks
+compared at one instant. Reopening on that basis needs its own pre-registration,
+not a re-run of this one.
+
+**S1-C4 sits ON its bar** (40 of 40) with an unbounded profile side (23 rows,
+multi-valued slots accumulate). Whatever revives this must re-size the cap pair
+first.
+
+**Coupling for whenever a fix does land:** `recovery_probe.measure_recovery`'s
+`remaining = cap - n_profile` mirrors the early return and must change in the
+SAME commit, or Grove E2's `anchor_delta` silently goes wrong. The two new
+probes have no such coupling (the Stage 0 probe imports production
+`_anchor_facts` for its CURRENT arm rather than re-implementing it).
+
 ### E3 — Trajectory-based resurfacing for retracted facts
 
 **Adaptation:** when dreaming's re-assertion path re-proposes a
