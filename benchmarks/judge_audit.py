@@ -227,6 +227,40 @@ C3 2.13% raw (10/470) -> hand-check corrected 1.87% (FP 3/25=12%, FN 0/25)
     reachable either way. Any loosening of the token rule changes the licence
     arithmetic as well as the C3 decomposition; gate it on its own.
 
+    THE GATE, PRE-REGISTERED 2026-08-26 BEFORE `recites_gold_v2` SCORED A ROW.
+    v2 = numerals are content (zero tolerance), gloss is not, prose gets
+    `RECITE_ALPHA_COVERAGE` slack. `recites_gold` still ALIASES v1 and does not
+    move until this returns PASS on the banked replies.
+
+      R1 recall     — the documented FN MECHANISMS are recovered on fixtures:
+                      numeral-carrying gold, mandatory-gloss gold, one-word
+                      prose miss. Bar: each fixture v1 False -> v2 True.
+      R2 precision  — hand-check the rows `--verify-recitation` reports as
+                      NEWLY flagged. Bar: FP <= 1 of the newly-flagged sample.
+      R3 discrimin. — free negative control: re-score with golds SHUFFLED
+                      against answers. Bar: v2 shuffled fire rate <= v1's
+                      + 2.0pp AND v2 true-pair rate >= 3x its own shuffled
+                      rate. This is the arm that answers the retracted
+                      55%-vs-11% episode directly: a rule that fires as often
+                      on mismatched pairs is measuring text volume.
+      R4 licence    — restate `c3_ceiling_non_abs` under both rules. REPORTED,
+                      not a pass bar. A ceiling above the bar licenses a spend
+                      and never substitutes for it.
+
+    R1 ALONE CANNOT BE THE GATE — it re-finds the rows the rule was written
+    from, which is a confirmation pass. R2 and R3 are the gate, and they are
+    the arms v1 never needed, because loosening reverses the safe direction.
+
+    Fixtures are RECONSTRUCTIONS of the mechanisms recorded above, not the
+    original rows: those live in `judge_audit.json` on the box, and whether v2
+    recovers all five of them is measured by `--verify-recitation` in A5, not
+    asserted here. A fixture pass is not that measurement.
+
+    PASS (R1-R3) -> flip the alias to v2, restate the C3 footnote and the
+    licence numerator in this docstring and in additional_planning.md.
+    FAIL on R2 or R3 -> close, keep v1, record. Do NOT re-tune the token rule
+    until it passes; that is what makes a bar a bar. STATUS: UNRUN.
+
 D2 CLOSED BY FIX, 2026-08-25. `judge_answer` now calls
     `longmemeval_adapter.parse_judge_verdict`: word-boundary tokens, first
     verdict wins, negated affirmatives and the `[LLM_ERROR: ...]` sentinel score
@@ -402,10 +436,65 @@ def classify_refusal(answer: str) -> dict:
 
 
 _TOKEN = re.compile(r"[a-z0-9]+")
+_DIGIT = re.compile(r"\d")
+# A parenthetical gloss: "(21 days is also acceptable)". Gold authors use it to
+# widen what counts as right, so its tokens are ALTERNATIVES, not requirements.
+_PAREN_GLOSS = re.compile(r"\([^)]*\)")
+# The same widening written without brackets, as a trailing clause.
+_TRAILING_GLOSS = re.compile(
+    r"[,;]?\s*(?:\b(?:or|and)\b\s+)?[^,;]*?\bis\s+also\s+"
+    r"(?:acceptable|correct|fine|ok|okay|valid)\b.*$")
+
+# v2's one tunable, PRE-REGISTERED before any row was scored (see R1-R4 in the
+# module docstring). Numerals are zero-tolerance; alphabetic content tokens get
+# this much slack, which is what recovers the row that failed on the single word
+# "taking". It self-scales: a 5-token gold may miss one, a 2-token gold may not.
+RECITE_ALPHA_COVERAGE = 0.8
 
 
-def recites_gold(answer: str, gold: str) -> bool:
-    """STRICT gold recitation: the normalised gold string appears verbatim, or
+def _gold_primary_clause(gold: str) -> str:
+    """Gold minus the gloss that widens it.
+
+    A gold of the form `22 days (21 days is also acceptable)` states ONE fact
+    and then names a second acceptable rendering of it. v1 tokenised the whole
+    string and required every token, so the gloss became mandatory content — an
+    answer reciting the fact perfectly still failed for want of the words
+    "also acceptable"."""
+    g = _PAREN_GLOSS.sub(" ", gold)
+    g = _TRAILING_GLOSS.sub(" ", g)
+    stripped = g.strip(" ,;:-")
+    # Never return an empty clause: a gold that is ENTIRELY gloss falls back to
+    # the original string rather than matching everything vacuously.
+    return stripped if _TOKEN.search(stripped) else gold
+
+
+def _content_tokens(gold: str, keep_short_numerals: bool) -> tuple[list[str], list[str]]:
+    """(numeric, alphabetic) content tokens of `gold`.
+
+    `keep_short_numerals` is the v1/v2 difference in one flag: v1's `len(t) > 2`
+    filter silently deleted "22", "21", "5" — the payload of every
+    temporal-reasoning gold — while keeping the prose around them."""
+    nums, alphas = [], []
+    for t in _TOKEN.findall(gold):
+        if _DIGIT.search(t):
+            if len(t) > 2 or keep_short_numerals:
+                nums.append(t)
+        elif len(t) > 2:
+            alphas.append(t)
+    return nums, alphas
+
+
+def recites_gold_v1(answer: str, gold: str) -> bool:
+    """The rule FROZEN as of 2026-08-25. DO NOT re-sync it to v2.
+
+    This is the rule that produced the numbers already in the ledger: C3's
+    numerator 10/470, its `rsc_recite` decomposition 5 of 10, and the
+    `free_precheck` ceiling 16/470 = 3.40% that licensed the 2026-08-25 spend.
+    Re-syncing it would make `--verify-recitation`'s before/after diff a
+    constant zero BY CONSTRUCTION — the same trap `shipping_verdict` is frozen
+    against, and one test exists solely to fail on a well-meant tidy-up.
+
+    STRICT gold recitation: the normalised gold string appears verbatim, or
     every gold content token (len > 2) appears in the answer.
 
     Deliberately strict. A loose similarity check on this exact shape is what
@@ -421,6 +510,50 @@ def recites_gold(answer: str, gold: str) -> bool:
     toks = [t for t in _TOKEN.findall(g) if len(t) > 2]
     return bool(toks) and all(t in a for t in toks)
 
+
+def recites_gold_v2(answer: str, gold: str) -> bool:
+    """Numerals are content; gloss is not. Hand-read from C3's own numerator.
+
+    All 10 rows of the 2026-08-25 C3 numerator were read by hand: zero genuine
+    judge errors, and 5 of 10 were v1 FALSE NEGATIVES. Two mechanisms, both
+    fixed here:
+
+      1. `len(t) > 2` discarded "22", "21" — the entire payload of a
+         temporal-reasoning gold. One row states BOTH "22 days" and "21 days"
+         verbatim and v1 still scores it False.
+      2. `all(...)` over the whole gold made the widening gloss MANDATORY, so
+         the answer had to recite "also acceptable" to count as reciting.
+
+    THE SAFE DIRECTION IS NOW REVERSED, and that is the whole reason this is
+    gated separately rather than folded into the audit. v1's under-count could
+    only wrongly REFUSE a spend; v2 can wrongly LICENSE one, because
+    `free_precheck`'s ceiling numerator is this function. So v2 keeps numerals
+    at ZERO tolerance (a wrong number is not a recitation) and buys its slack
+    only on prose, bounded by `RECITE_ALPHA_COVERAGE` and checked against a
+    shuffled-gold negative control (R3) rather than against intuition."""
+    if not gold or not answer:
+        return False
+    a, g = answer.lower(), gold.lower().strip()
+    if g and g in a:
+        return True
+    nums, alphas = _content_tokens(_gold_primary_clause(g), keep_short_numerals=True)
+    if not nums and not alphas:
+        return False
+    if any(t not in a for t in nums):
+        return False
+    if not alphas:
+        return True
+    hit = sum(1 for t in alphas if t in a)
+    return hit >= RECITE_ALPHA_COVERAGE * len(alphas)
+
+
+# The rule the audit REPORTS under. Every caller goes through this name, so the
+# four call sites (`rejudge_row`, `free_precheck`, `build_report`,
+# `write_handcheck_sample_pre`) do not each grow a v1/v2 branch.
+# UNRUN as of 2026-08-25: still v1 until `--verify-recitation` returns a PASS on
+# the banked replies. Flipping this before that verdict would restate the C3
+# footnote and the spend licence on an unmeasured rule.
+recites_gold = recites_gold_v1
 
 # ── Row loading and judge-input reconstruction ──────────────────────────
 # The judge input MUST be rebuilt exactly as the adapter built it. A re-judge
