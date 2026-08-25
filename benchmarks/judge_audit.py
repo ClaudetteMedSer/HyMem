@@ -181,6 +181,46 @@ exact call count a real pass would cost. Spend is one judge call per judged row.
 
     # then hand-check the labelled sample it wrote, and re-report with controls
     python judge_audit.py --report judge_audit.json --handcheck FP,FN
+
+POST-RUN LEDGER — LME pass 2026-08-25
+====================================
+    python judge_audit.py --run <LME canonical run json> --bench lme --spend \
+        --handcheck 3,0 --judge-model deepseek-v4-flash \
+        --judge-extra-body '{"thinking":{"type":"disabled"}}'
+
+Judge = the shipping judge of the audited run (its metadata records
+judge_model deepseek-v4-flash @ api.deepseek.com). The extra body is REQUIRED
+for v4-flash: without it the reasoning preamble consumes the budget and content
+comes back empty (probed: reasoning_content present, content '', finish=length).
+500 rows, 500 judgeable, 30 _abs, 112 non-_abs refusals, 0 judge LLM_ERROR.
+
+C1 0.00% — IMMATERIAL, but as a LOWER BOUND on a compliant judge: C2 0.00%
+(every reply a bare yes/no) means the substring rule never had a non-compliant
+reply to misfire on. It is LATENT in judge_answer, not absent. This run is
+exactly the anchor-it-while-inert window.
+
+C3 2.13% raw (10/470) -> hand-check corrected 1.87% (FP 3/25=12%, FN 0/25)
+    -> WATCH. THE BAND IS NOT RESOLVED. Raw 10/470: Wilson 95% CI 1.16-3.87%.
+    FP 3/25: Wilson 95% CI 4.2-30.0%. Breakeven FP for MATERIAL at m=10 is
+    6.00% = 1.5/25; one hand-scored FP moves the verdict (0 FP -> 2.128%
+    MATERIAL, 1 -> 2.043% MATERIAL, 2 -> 1.957% WATCH, 3 -> 1.872% WATCH).
+    The 2.0% bar sits INSIDE both CIs: C3 ~= 2%, ON the bar, and no sample in
+    hand places which side. Recorded as WATCH-at-bar, NOT as "below material".
+    Numerator decomposition (hand-read): all 10 refusal-scored-correct rows are
+    the containment criterion per its own prompt — no genuine judge error. 5
+    pass the strict recitation test; the other 5 are ALL recites_gold FALSE
+    NEGATIVES: the len(t)>2 filter excludes the numerals (the payload of
+    temporal-reasoning golds — one row states BOTH "22 days" and "21 days"
+    verbatim and still fails) while requiring the trailing "also acceptable"
+    gloss; one row fails on the single word "taking"; the preference row is a
+    paraphrase the rubric's "recalls and utilizes personal information" clause
+    credits. => C3's size is D1 by design, not judge error; the instrument's
+    recitation token rule, not the judge, is the mis-calibrated piece.
+
+C4. NOT RUN — blocked, recorded not dropped. No scored LoCoMo run pair exists
+    on this box; the only conv-26 artifact is a --diag-only dump (correct=null,
+    empty ai_answer, no reader calls by construction), which would have audited
+    nothing. Recovering the pair = 1,600 reader calls, not proportionate.
 """
 
 from __future__ import annotations
