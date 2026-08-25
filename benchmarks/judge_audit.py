@@ -448,29 +448,107 @@ def rec_with_answer(rec: dict, answer: str, gold: str) -> dict:
 # ── Free pre-check (no LLM) ─────────────────────────────────────────────
 
 def free_precheck(rows: list[dict], bench: str) -> dict:
+    """Counts only, no LLM. The load-bearing output is `c3_ceiling_non_abs`.
+
+    `refusals_reciting_gold` alone is NOT comparable to the C3 bar. C3 is
+    defined over non-`_abs` rows only (`build_report` denominates on
+    `len(non_abs)`), while an `_abs` row that refuses AND recites is the
+    INTENDED behaviour, not the defect. Counting the two together inflates the
+    ceiling by exactly the rows the criterion excludes, and on a benchmark
+    whose refusals concentrate in the abstention slice that difference can
+    straddle the 2.0% bar in either direction.
+
+    So the split is reported, and `c3_ceiling_non_abs` — the share of judged
+    non-`_abs` rows where a refusal recites gold — is the free upper bound on
+    C3. Reading it:
+
+      ceiling < C3_MATERIAL -> the material branch is UNREACHABLE on this run;
+                               a paid re-judge cannot produce a MATERIAL verdict
+                               and is not worth spending.
+      ceiling >= C3_MATERIAL -> reachable but NOT established: the ceiling
+                               assumes every such row is scored correct by the
+                               judge, which is what the paid pass measures.
+
+    It is a ceiling, never a reading. A ceiling above the bar licenses the
+    spend; it does not substitute for it.
+    """
     n = len(rows)
     judged, abs_rows, refusals, canon, recite = 0, 0, 0, 0, 0
+    judged_non_abs, refusals_non_abs, recite_non_abs = 0, 0, 0
     for r in rows:
         qtype, _q, gold, answer = judge_inputs(r, bench)
-        if "_abs" in qtype:
+        is_abs = "_abs" in qtype
+        if is_abs:
             abs_rows += 1
         if not judgeable(answer):
             continue
         judged += 1
+        if not is_abs:
+            judged_non_abs += 1
         cls = classify_refusal(answer)
         if cls["refusal"]:
             refusals += 1
             canon += cls["canonical"]
+            if not is_abs:
+                refusals_non_abs += 1
             if recites_gold(answer, gold):
                 recite += 1
+                if not is_abs:
+                    recite_non_abs += 1
     return {"n": n, "judgeable": judged, "abs_rows": abs_rows,
             "refusals": refusals, "refusals_canonical": canon,
             "refusals_reciting_gold": recite,
-            "refusal_rate": pct(refusals, judged)}
+            "refusal_rate": pct(refusals, judged),
+            "judgeable_non_abs": judged_non_abs,
+            "refusals_non_abs": refusals_non_abs,
+            "refusals_reciting_gold_non_abs": recite_non_abs,
+            "refusals_reciting_gold_abs": recite - recite_non_abs,
+            "c3_ceiling_non_abs": pct(recite_non_abs, judged_non_abs)}
 
 
 def pct(a: int, b: int) -> float:
     return 100.0 * a / b if b else 0.0
+
+
+# Licence codes, in the order the branches must be evaluated.
+LICENCE_NO_REFUSALS = "NO_REFUSALS"
+LICENCE_NO_DENOMINATOR = "NO_DENOMINATOR"
+LICENCE_UNREACHABLE = "UNREACHABLE"
+LICENCE_REACHABLE = "REACHABLE"
+
+
+def c3_spend_licence(pre: dict) -> tuple[str, str]:
+    """Decide, for free, whether a paid re-judge could move C3 at all.
+
+    Extracted from `main` so it is reachable from a test. Inlined in the printer
+    it was only assertable by reading source, and a guard whose test cannot fail
+    is not a guard.
+
+    ORDER IS LOAD-BEARING. The degenerate cases must be caught BEFORE the
+    numeric comparison, because 0/0 renders as 0.00% and would otherwise fall
+    into UNREACHABLE — reporting a confident 'nothing to find here' for a run
+    that measured nothing. That is the E3 failure mode: a criterion with no
+    denominator reading as PASS.
+    """
+    if pre["refusals"] == 0:
+        return LICENCE_NO_REFUSALS, (
+            "G1: zero refusals — a spend here would MEASURE NOTHING. Do not spend.")
+    if pre["judgeable_non_abs"] == 0:
+        return LICENCE_NO_DENOMINATOR, (
+            "C3 UNMEASURABLE — every judgeable row is _abs, so the criterion has "
+            "no denominator. The 0.00% ceiling above is 0/0, NOT a clean result.")
+    ceil_ = pre["c3_ceiling_non_abs"]
+    if ceil_ < C3_MATERIAL:
+        return LICENCE_UNREACHABLE, (
+            f"SPEND NOT LICENSED for C3: even if the judge scored EVERY reciting "
+            f"refusal correct, C3 would be {ceil_:.2f}% < {C3_MATERIAL:.1f}% — the "
+            f"MATERIAL branch is unreachable on this run. (C1 is a separate "
+            f"criterion and may still justify the spend.)")
+    return LICENCE_REACHABLE, (
+        f"SPEND LICENSED for C3: the ceiling {ceil_:.2f}% clears the "
+        f"{C3_MATERIAL:.1f}% bar, so MATERIAL is REACHABLE. This is a ceiling, "
+        f"not a reading — it assumes the judge scores every one of those rows "
+        f"correct. Only the paid pass says how many it actually does.")
 
 
 def pair_precheck(rows_a: list[dict], rows_b: list[dict], bench: str) -> dict:
@@ -690,10 +768,15 @@ def main(argv=None, client=None) -> int:
         print(f"    refusals (lexical): {pre['refusals']} "
               f"({pre['refusal_rate']:.2f}%)   "
               f"canonical-phrase: {pre['refusals_canonical']}")
-        print(f"    refusals also reciting gold: {pre['refusals_reciting_gold']}")
-        if pre["refusals"] == 0:
-            print("    G1: zero refusals — a spend here would MEASURE NOTHING. "
-                  "Do not spend.")
+        print(f"    refusals also reciting gold: {pre['refusals_reciting_gold']}"
+              f"   (non-_abs: {pre['refusals_reciting_gold_non_abs']}, "
+              f"_abs: {pre['refusals_reciting_gold_abs']})")
+        ceil_ = pre["c3_ceiling_non_abs"]
+        print(f"    C3 CEILING (non-_abs only): {ceil_:.2f}%  "
+              f"({pre['refusals_reciting_gold_non_abs']}/"
+              f"{pre['judgeable_non_abs']})   bar = {C3_MATERIAL:.1f}%")
+        _code, _msg = c3_spend_licence(pre)
+        print(f"    {_msg}")
         print(f"\n    a --spend pass would cost {len(to_judge)} judge calls "
               f"(1 per judgeable row, max_tokens=10).")
         print("    add --spend to run it.\n")

@@ -877,3 +877,115 @@ def test_handcheck_sample_size_and_correction_divisor_cannot_drift_apart():
     import inspect
     sig = inspect.signature(JA.write_handcheck_sample)
     assert sig.parameters["k"].default == JA.HANDCHECK_K
+
+
+# ── C3 ceiling: the _abs cross-tab that licenses (or refuses) the spend ──
+
+def _lme(qtype: str, answer: str, gold: str = "marathon") -> dict:
+    return {"question_type": qtype, "question": "q",
+            "answer": gold, "hypothesis": answer}
+
+
+_RECITING_REFUSAL = "I don't have enough information; the context says marathon."
+
+
+def test_abs_reciting_refusals_are_excluded_from_the_C3_ceiling():
+    """C3 is denominated on non-_abs rows only. An _abs row that refuses AND
+    recites gold is the INTENDED behaviour, so counting it toward the ceiling
+    inflates the licence to spend by exactly the rows the criterion throws away.
+
+    Carrier: the two _abs rows here recite, the non-_abs rows do not, so the
+    pooled count is 2 while the ceiling that matters is 0."""
+    rows = [_lme("single-session-user_abs", _RECITING_REFUSAL) for _ in range(2)]
+    rows += [_lme("knowledge-update", "she ran a 10k") for _ in range(8)]
+    pre = JA.free_precheck(rows, "lme")
+
+    assert pre["refusals_reciting_gold"] == 2          # pooled, as before
+    assert pre["refusals_reciting_gold_abs"] == 2
+    assert pre["refusals_reciting_gold_non_abs"] == 0
+    assert pre["c3_ceiling_non_abs"] == 0.0
+
+
+def test_a_non_abs_reciting_refusal_does_raise_the_ceiling():
+    """Negative control for the test above. If the ceiling read 0 for BOTH
+    populations the exclusion would be untested — a filter that drops every row
+    passes the carrier just as well as a correct one."""
+    rows = [_lme("knowledge-update", _RECITING_REFUSAL) for _ in range(2)]
+    rows += [_lme("knowledge-update", "she ran a 10k") for _ in range(8)]
+    pre = JA.free_precheck(rows, "lme")
+
+    assert pre["refusals_reciting_gold_non_abs"] == 2
+    assert pre["refusals_reciting_gold_abs"] == 0
+    assert pre["c3_ceiling_non_abs"] == pytest.approx(20.0)
+
+
+def test_the_ceiling_denominator_matches_the_C3_denominator_exactly():
+    """The ceiling is only comparable to the C3 bar if it is denominated the
+    same way `build_report` denominates C3 (`len(non_abs)`, i.e. JUDGED non-_abs
+    rows). An LLM-error row is not judgeable and must leave BOTH denominators."""
+    rows = [_lme("knowledge-update", _RECITING_REFUSAL)]
+    rows += [_lme("knowledge-update", "she ran a 10k") for _ in range(3)]
+    rows += [_lme("single-session-user_abs", "no idea")]
+    rows += [_lme("knowledge-update", "[LLM_ERROR: upstream 503]")]
+    pre = JA.free_precheck(rows, "lme")
+
+    assert pre["n"] == 6
+    assert pre["judgeable"] == 5           # the LLM_ERROR row drops out
+    assert pre["judgeable_non_abs"] == 4   # ... of the non-_abs denominator too
+    assert pre["c3_ceiling_non_abs"] == pytest.approx(25.0)
+
+
+def test_an_all_abs_run_is_unmeasurable_and_not_a_clean_zero():
+    """Zero non-_abs rows gives 0/0, which renders as 0.00% — numerically
+    identical to a genuinely clean run. If the degenerate check did not precede
+    the numeric comparison, an all-_abs run would report UNREACHABLE: a
+    confident 'nothing to find here' for a run that measured nothing. That is
+    the E3 trap in miniature."""
+    rows = [_lme("single-session-user_abs", _RECITING_REFUSAL) for _ in range(4)]
+    pre = JA.free_precheck(rows, "lme")
+    assert pre["judgeable_non_abs"] == 0
+    assert pre["c3_ceiling_non_abs"] == 0.0     # indistinguishable from clean
+
+    code, msg = JA.c3_spend_licence(pre)
+    assert code == JA.LICENCE_NO_DENOMINATOR
+    assert "0/0" in msg and "NOT a clean result" in msg
+
+
+def test_a_genuinely_clean_run_is_unreachable_not_unmeasurable():
+    """Negative control for the test above: same 0.00% ceiling, real
+    denominator. The two must NOT collapse to one code, or the degenerate guard
+    would be indistinguishable from the finding it is meant to protect."""
+    rows = [_lme("knowledge-update", "I don't know") for _ in range(4)]
+    pre = JA.free_precheck(rows, "lme")
+    assert pre["judgeable_non_abs"] == 4
+    assert pre["c3_ceiling_non_abs"] == 0.0
+
+    code, _ = JA.c3_spend_licence(pre)
+    assert code == JA.LICENCE_UNREACHABLE
+
+
+def test_zero_refusals_outranks_every_other_licence_branch():
+    """G1 is first: with no refusals at all there is nothing for C3 to measure,
+    and that is a stronger statement than 'below the bar'."""
+    rows = [_lme("knowledge-update", "she ran a 10k") for _ in range(4)]
+    pre = JA.free_precheck(rows, "lme")
+    assert JA.c3_spend_licence(pre)[0] == JA.LICENCE_NO_REFUSALS
+
+
+def test_the_licence_keys_on_the_banked_bar_not_a_hard_coded_literal():
+    """If the threshold were inlined, re-banking C3_MATERIAL would silently
+    leave the licence keyed to the OLD bar — authorising spends the gate no
+    longer justifies, with no test failing."""
+    rows = [_lme("knowledge-update", _RECITING_REFUSAL)]
+    rows += [_lme("knowledge-update", "she ran a 10k") for _ in range(99)]
+    pre = JA.free_precheck(rows, "lme")
+    assert pre["c3_ceiling_non_abs"] == pytest.approx(1.0)
+
+    old = JA.C3_MATERIAL
+    try:
+        JA.C3_MATERIAL = 5.0
+        assert JA.c3_spend_licence(pre)[0] == JA.LICENCE_UNREACHABLE
+        JA.C3_MATERIAL = 0.5
+        assert JA.c3_spend_licence(pre)[0] == JA.LICENCE_REACHABLE
+    finally:
+        JA.C3_MATERIAL = old
