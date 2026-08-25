@@ -478,7 +478,19 @@ class HyMemConfig:
     context for the digest anchor, profile, ask() and conflicts()). Every firing
     logs `bitemporal.supersede ...` at INFO — a `prefers`/multi-valued row there
     is the rollback signal. Set False to disable.
-    See `hymem/dreaming/value_supersession.py`."""
+    See `hymem/dreaming/value_supersession.py`.
+
+    Watch note (2026-08-25, following the invalid_at re-assert fix in
+    phase1._upsert_triple): the rollback signal is "a `prefers`/multi-valued
+    row" — NOT "the same pair fires twice." A positive re-mention of a
+    value-superseded edge now clears its invalid_at and reactivates it, so
+    old and new value are BOTH active until the next dream re-retracts the
+    loser by valid_at. That is pre-existing behaviour (the status flip already
+    did it); the fix only makes invalid_at agree with it. Consequence: the
+    `bitemporal.supersede` line can legitimately fire twice on the same pair.
+    Do NOT roll back the feature on a double firing — that is the feature
+    converging, not the guard failing.
+    """
 
     reinforce_window_days: int = 30
     """Window for soft positive reinforcement from co-mention. Symmetric to
