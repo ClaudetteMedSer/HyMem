@@ -2136,7 +2136,25 @@ existing rows. Zero schema change, zero prompt change, zero dream spend.
 > reachability has already failed to convert here once (the LoCoMo
 > message-vector probe bridged 3/54 true vocabulary gaps).
 >
-> **5. The scored A/B needs an OFF-arm stratification and an A/A control.** The
+> **5. `select_anchor_edges` must NOT copy the SHARED CAP — separate caps for
+> profile and edges (banked 2026-08-25, before the shadow probe ran).** The Grove
+> E2 Stage 0 probe found `_anchor_facts` returns early at `aggregate.py:823-824`
+> once profile rows fill the cap: on the box that is 22 profile rows against
+> cap=20, so the edge budget is **0 of 8754 active edges**, and on LoCoMo conv-26
+> it is 4 slots for 55 edges. A shared cap is correct for `_anchor_facts` — it is
+> budgeting ONE PROMPT BLOCK, where profile rows genuinely should outrank edges.
+> It is wrong for an anchor SELECTOR, which is a seed source: starving the edge
+> seeds is not prioritization, it makes the tier inert.
+>
+> **This is a gate-validity issue, not a preference.** Copying the shared cap
+> would have the shadow probe measure a tier seeded from 4 edges (LoCoMo) or none
+> (box), C1 would read near zero, and Plan D would close FAIL-mechanism because
+> of the digest's block budget rather than because state anchors do not work —
+> a confident wrong answer, and the cheapest kind to avoid. `select_anchor_edges`
+> therefore takes `edge_cap` and `profile_cap` independently and never returns
+> early. Everything else in the predicate is copied verbatim.
+>
+> **6. The scored A/B needs an OFF-arm stratification and an A/A control.** The
 > obvious "fired = the tier added a row the OFF arm lacked" conditions on the
 > treatment arm's own output, routes the distraction harm into the control, and
 > makes the run read VOID rather than FAIL. Full design in the Plan D + Grove E2
@@ -2328,11 +2346,15 @@ Instrument: `benchmarks/recovery_probe.py` (read-only, LLM-free, `mode=ro`,
 
 | Leg | cap split | `anchor_delta` | recovered | verdict |
 |---|---|---|---|---|
-| Box `~/.hermes/hymem.sqlite` | 20 profile + **0 edge** | 0 | 2 of 8722 active (6 retracted, 0 unstamped) | **VACUOUS** |
+| Box `~/.hermes/hymem.sqlite` @ cap 20 (production shape) | 22 profile + **0 edge** | 0 | 2 of 8754 active (6 retracted, 0 unstamped) | **VACUOUS** |
+| **Box @ cap 100 — the measured evidence, supersedes the row above** | 22 profile + **78 edge** | **0** (arms 78/78 identical) | 2 of 8754 | **INERT (strong)** |
 | LoCoMo conv-26 (fresh) | 16 profile + 4 edge | 0 (both arms byte-identical) | 0 of 55 | **INERT-EMPTY** |
 
-**The close rests on the recovery POPULATION, not on a measured-inert clause.**
-There is no `evidence_backed` row anywhere: the box's 2 recovered edges are both
+**The close rests on BOTH legs of the argument.** Re-running the box at the cap
+the VACUOUS verdict itself prescribes gave a 78-fact edge budget with the 2
+recovered edges present and `anchor_delta` still 0 — the strong INERT branch: a
+non-empty recovery population the clause nonetheless costs nothing. And there is
+no `evidence_backed` row anywhere: the box's 2 recovered edges are both
 `no_negative_evidence` (pos>0, neg=0, no evidence trail — backfill or
 cascade-deleted evidence, not quotable), and LoCoMo has 0 of 0. An in-dream gauge
 would instrument an empty set on both stores, which is the unreachable-code-path
@@ -2349,19 +2371,27 @@ nothing. Two verdicts added, each with a binding negative control:
 **`VACUOUS`** (`edge_budget <= 0` — cannot answer) and **`INERT-EMPTY`**
 (`recovered == 0` — nothing to bar, a correct close for that store that does not
 generalise to one where retractions fire). The strong `INERT` now requires a
-non-empty recovered population that the clause still fails to bar. **Neither leg
-produced a strong INERT**, and the honest scope caveat is the one already banked:
+non-empty recovered population that the clause still fails to bar. The
+production-shape leg produced no strong INERT, but **the cap-100 re-run did**,
+which is why the close is firmer than the first reading suggested. The honest
+scope caveat still stands:
 LoCoMo conv-26 is a one-conversation single-dream store where no retraction ever
 fired, and the box could not measure the delta at production cap.
 
 **Collateral finding, separate issue — the box digest anchor contains ZERO graph
 edges.** `_anchor_facts` gives profile rows the whole cap first and returns early
-when `remaining <= 0` (`aggregate.py:820-823`). The box has 20 active profile rows
-against `aggregation_digest_anchor_facts = 20`, so **none of its 8722 active
+when `remaining <= 0` (`aggregate.py:820-823`). The box has **22** active profile
+rows against `aggregation_digest_anchor_facts = 20`, so **none of its 8754 active
 edges reach the VERIFIED FACTS block**, and the graph has been silently squeezed
-out of the root digest as the profile grew. LoCoMo conv-26 shows the same shape
-in miniature (4 edge slots for 55 edges). This is unrelated to `invalid_at` and
-needs its own pre-registered gate — see the Plan D + Grove E2 plan.
+out of the root digest as the profile grew. `facts_hash` (`aggregate.py:1241`) is
+computed over the returned block, so on this store the root digest cache id is
+keyed on the profile ALONE — a graph change cannot invalidate it through the fact
+block. The docstring's language is *prioritization* ("profile rows lead", "graph
+edges fill the remainder"); the early return silently converts that into
+*exclusion* the moment the profile meets the cap, which is an unreported
+behaviour change on the LIVE digest. LoCoMo conv-26 shows the same shape in
+miniature (4 edge slots for 55 edges). Unrelated to `invalid_at`; it is server
+code and needs its own pre-registered gate — do NOT hotfix it in this branch.
 
 ### E3 — Trajectory-based resurfacing for retracted facts
 
