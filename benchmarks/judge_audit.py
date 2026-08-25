@@ -217,6 +217,16 @@ C3 2.13% raw (10/470) -> hand-check corrected 1.87% (FP 3/25=12%, FN 0/25)
     credits. => C3's size is D1 by design, not judge error; the instrument's
     recitation token rule, not the judge, is the mis-calibrated piece.
 
+    RECITATION TOKEN RULE — PRE-REGISTERED AS ITS OWN CHANGE, NOT FOLDED IN.
+    `recites_gold`'s len(t)>2 filter excludes the numerals and therefore
+    under-counts reciting refusals. The C3 numerator is not the only thing it
+    sizes: `free_precheck`'s ceiling numerator is `recites_gold` too. With the
+    five FNs counted, the 2026-08-25 ceiling numerator is >=21 (>=4.47%), not
+    16 (3.40%). Direction is conservative for the licence — an under-count can
+    only wrongly refuse a spend, never wrongly license one — and this spend was
+    reachable either way. Any loosening of the token rule changes the licence
+    arithmetic as well as the C3 decomposition; gate it on its own.
+
 D2 CLOSED BY FIX, 2026-08-25. `judge_answer` now calls
     `longmemeval_adapter.parse_judge_verdict`: word-boundary tokens, first
     verdict wins, negated affirmatives and the `[LLM_ERROR: ...]` sentinel score
