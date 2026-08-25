@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""Audit of `longmemeval_adapter.judge_answer` — the single function behind
+LoCoMo 68.2%, LME 68.4% and MSC ~84.0%.
+
+    NOT YET RUN. The thresholds below are PRE-REGISTERED: they were written and
+    committed before this script made its first LLM call, precisely so the
+    verdict cannot be chosen after seeing the numbers.
+
+WHAT IS BROKEN, AND WHY IT IS UNMEASURED
+========================================
+`judge_answer` is two lines::
+
+    raw = llm.chat(messages, temperature=0.0, max_tokens=10)
+    return "yes" in raw.lower()
+
+`tests/test_judge_instrument.py` pins its behaviour offline. Two defect classes
+survive that pinning because they need a real judge to size:
+
+D1. THE CRITERION. The five non-abstention judge prompts instruct CONTAINMENT —
+    "answer yes if the response contains the correct answer". A hedged refusal
+    that recites context ("I can't tell which is her PB, though the context
+    mentions 3:42") literally contains it. The `_abs` branch asks the RIGHT
+    question ("does the model correctly identify the question as unanswerable"),
+    so the two criteria disagree on exactly this shape. The offline test proves
+    the judge is handed BYTE-IDENTICAL instructions for a committed answer and
+    for a reciting refusal; how often a real judge then says "yes" is what this
+    script measures.
+
+    Blast radius is not uniform. MSC hard-codes `single-session-user` at its only
+    judge call site, so 100% of MSC rows are containment-judged. LoCoMo routes
+    only category 5 to the `_abs` branch. LME routes every `*_abs` type.
+
+D2. THE DECISION RULE. `"yes" in raw.lower()` is an unanchored substring test.
+    It is correct on compliant replies and fails safe on the empty reply, and it
+    is wrong on "yes and no", on "not yes", and — the amplifier — on "yes" INSIDE
+    another word: "yesterday" and "eyes" both score CORRECT. "yesterday" is not
+    hypothetical; temporal-reasoning is a scored category on both LME and LoCoMo
+    and is exactly where a non-compliant judge reply would use that word. The
+    "no" half of a reply is never consulted, so every conflict resolves to
+    correct. `max_tokens=10` truncates any non-compliant reply mid-sentence and
+    the fragment is then scored as if it were a verdict.
+
+    Nothing records `raw`. `judge_answer` returns a bare bool, so the rate is not
+    merely unmeasured, it is unmeasurABLE from any stored run — the existing
+    `--rejudge` paths in both adapters call `judge_answer` and inherit the same
+    blindness. Recording `raw` is this script's entire reason to exist.
+
+D3 (incidental, recorded here because the audit will surface it). `LLMClient.chat`
+    returns `"[LLM_ERROR: ...]"` after exhausting retries. `judge_answer` scores
+    that sentinel exactly like a genuine "no": the question is recorded WRONG and
+    the outage is invisible. Both `--rejudge` paths test for the sentinel on the
+    ANSWER only, never on the judge reply.
+
+PRE-REGISTERED CRITERIA
+=======================
+Four numbers decide this, and they are banked here BEFORE the first run.
+
+The unit of materiality throughout is "questions that could move", compared
+against the smallest effect this battery is actually asked to resolve. Two
+anchors from the project ledger set that scale:
+
+  * the only measured signal in Campaign E is the LoCoMo E1 fired-subset McNemar
+    at z = -2.40: b=10 / c=24, a net of 14 questions out of 800 with 34
+    discordant pairs. That is the resolution the instrument must not blur.
+  * a prior re-judge measured ZERO judge flips on 200 rows. Judge
+    nondeterminism is therefore ~0, which has a sharp consequence: anything this
+    audit finds is SYSTEMATIC, not noise. It does not average out with n, and it
+    cannot be absorbed by the ~4-5%/question churn band — that band is defined
+    for RANDOM reader churn and widens a confidence interval; a systematic
+    criterion defect SHIFTS the point estimate. Bands do not protect against bias.
+
+C1. MISSCORE RATE (D2) — the primary decision number.
+    Definition: share of judged rows where the shipping substring rule and the
+    reference first-token rule DISAGREE. This is the exposure, not the raw
+    non-compliance rate: a non-compliant reply that still scores the way the
+    judge meant costs nothing.
+
+        >= 1.0%  MATERIAL. Fix the parse and re-baseline LoCoMo, LME and MSC.
+        0.2-1.0% WATCH. Record the rate; do not re-baseline on it alone.
+        <  0.2%  IMMATERIAL. Bank the number and close D2.
+
+    Why 1.0%: on LoCoMo n=800 that is 8 questions. The measured E1 effect the
+    battery rests on is a 14-question net over 34 discordant pairs. A defect
+    source able to move 8 questions is roughly half that discordant mass and
+    cannot be assumed away. On LME n=500 it is 5 questions, which is the same
+    size as a per-category delta the ledger already classes as noise on a 70-item
+    category — so 1.0% sits exactly at the boundary where a defect stops being
+    absorbable.
+    Why 0.2%: below ~1-2 questions per benchmark nothing can change a rank
+    ordering at any n this repo runs.
+
+    C1 IS A LOWER BOUND, not an estimate. The reference rule shares one blind
+    spot with the shipping rule: "not yes" carries a word-boundary "yes" and no
+    word-boundary "no", so both rules score it correct and the disagreement
+    column cannot see it. Negated affirmatives are therefore counted separately
+    (C1b) and are ADDITIVE to C1 when judging materiality. If C1 lands in WATCH
+    and C1b is non-trivial, treat the pair as MATERIAL.
+
+C2. NON-COMPLIANCE RATE (D2) — the leading indicator, NOT the decision number.
+    Share of judged rows whose reply is not a bare yes/no after normalisation.
+    Reported always, because it bounds C1 from above and because a rate that
+    climbs after a model migration is the early warning that C1 will follow.
+    No threshold triggers a re-baseline on its own. If C2 is high while C1 is
+    near zero, the judge is chatty but consistent and only the parse is fragile.
+
+C3. REFUSAL-SCORED-CORRECT RATE (D1) — the absolute-baseline number.
+    Share of judged rows where the model answer is a refusal AND the judge
+    scored it correct. Restricted to non-`_abs` rows: on an `_abs` row a
+    refusal SHOULD score correct, and counting those would be a ceiling
+    instrument reporting a huge, meaningless number.
+
+        >= 2.0%  MATERIAL. The criterion is wrong in practice. Fix
+                 `get_judge_prompt` and re-baseline all three canonical numbers.
+        0.5-2.0% WATCH.
+        <  0.5%  IMMATERIAL. Close D1 as a theoretical defect that does not fire.
+
+    Why 2.0%: on LoCoMo n=800 that is 16 questions = 2.0pp on the headline,
+    larger than the entire measured E1 all-800 net (-1.4pp) and, being
+    one-directional, not absorbable by the churn band. A prior exists and it is
+    close to this line: the Campaign E hand-check found 6 rows in a 66-flip LME
+    dump where BOTH arms refused yet scored discordant, the judge crediting a
+    gold value recited inside a refusal. Against ~500 LME rows that is ~1.2%,
+    i.e. already in the WATCH band before this script runs. The ledger records
+    that check as UNRUN on LoCoMo, which is where the battery's only significant
+    result lives.
+    Why 0.5%: ~4 questions on LoCoMo, below the discordant mass of any gate.
+
+C4. ARM-ASYMMETRY (D1, and the reason a bad criterion can survive a gate).
+    A criterion defect that fires equally on both arms of an A/B LARGELY CANCELS
+    in a paired comparison: it biases the absolute baseline without biasing the
+    delta. It stops cancelling exactly when the two arms differ in how often the
+    reader refuses — which is precisely what happens when the feature under test
+    changes abstention behaviour (E1 lost both `_abs` abstentions, 2/2).
+
+        Refusal-rate difference between two compared arms >= 1.0pp
+        => the defect does not cancel, and any gate decision resting on that
+           pair is VOID until re-judged under a fixed criterion.
+
+    This one costs NOTHING: it is a lexical classification of stored answers in
+    two run files. `--pair A.json B.json` computes it with no LLM call at all,
+    and it should be run BEFORE spending anything on C1/C3 — the same shape as
+    the E4 free Step-0 pre-check that killed Fork A for the price of arithmetic.
+
+DEGENERACY GUARDS (the trap this project has hit repeatedly: a ceiling
+instrument, a degenerate criterion and an unreachable code path all read as PASS)
+==============================================================================
+G1. NO REFUSALS IN SAMPLE. If the refusal classifier flags zero rows, C3 has
+    MEASURED NOTHING. It must report UNMEASURED, never a clean 0.0%. A 0%
+    refusal rate on a real run means the classifier is broken or the sample is
+    wrong, not that the criterion is safe.
+G2. NO `_abs` ROWS. MSC has none by construction and a LoCoMo sample can easily
+    have none. Then the abstention-branch contrast is unmeasured and the report
+    says so instead of implying the branches agree.
+G3. CLASSIFIER CEILING. If the refusal classifier flags more than 50% of rows it
+    is matching something generic; the run is declared BROKEN rather than
+    reporting a spectacular rate.
+G4. HAND-CHECK REQUIRED — AND IT CORRECTS THE NUMBER, not just the gate. The refusal classifier and the gold-recitation check
+    are lexical, and this project has already been burned by a surface check
+    that false-positived at 55% against an 11% correct-answer control. So the
+    verdict is INCOMPLETE — never PASS, never MATERIAL — until hand-check counts
+    are supplied via `--handcheck FP,FN`. The script writes a labelled sample
+    containing BOTH refusal-classified and committed-classified rows, so the
+    control is a correct-answer control and not just a confirmation pass.
+G5. NOTHING JUDGED. Rows whose answer is empty or an `[LLM_ERROR]` sentinel are
+    not judgeable; if that leaves no rows, the report says so.
+
+COST DISCIPLINE
+===============
+No LLM client is constructed at import, and none is constructed at all without
+an explicit `--spend`. The default run is a free pre-check: it loads the rows,
+runs every lexical classifier, applies the degeneracy guards and prints the
+exact call count a real pass would cost. Spend is one judge call per judged row.
+
+    # free, spends nothing — run this first
+    python judge_audit.py --run locomo_canonical.json --bench locomo
+    python judge_audit.py --pair e1_on.json e1_off.json --bench locomo
+
+    # costs tokens; one judge call per sampled row
+    python judge_audit.py --run locomo_canonical.json --bench locomo \\
+        --limit 200 --spend --judge-model gpt-oss-120b --out judge_audit.json
+
+    # then hand-check the labelled sample it wrote, and re-report with controls
+    python judge_audit.py --report judge_audit.json --handcheck FP,FN
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Pre-registered thresholds, as data so the report cannot quietly disagree with
+# the docstring.
+C1_MATERIAL, C1_WATCH = 1.0, 0.2      # misscore rate, % of judged rows
+C3_MATERIAL, C3_WATCH = 2.0, 0.5      # refusal-scored-correct rate, %
+C4_MATERIAL = 1.0                     # arm refusal-rate difference, pp
+G3_CEILING = 50.0                     # refusal classifier ceiling, %
+HANDCHECK_K = 25                      # rows per arm in the hand-check sample
+HANDCHECK_FP_BROKEN = 0.5             # classifier FP rate above which C3 is void
+
+
+# ── Reply classification (D2) ───────────────────────────────────────────
+
+_DECORATION = " \t\r\n.,;:!*_`\"'()[]-–—"
+
+# Deliberately NOT proposed as the fix. It is a REFERENCE rule whose only job is
+# to size the exposure: where it and the shipping rule disagree, the shipping
+# rule scored something other than the judge's verdict. Choosing the actual
+# replacement is a separate decision, and it re-baselines three numbers.
+_YES_WORD = re.compile(r"\byes\b")
+_NO_WORD = re.compile(r"\bno\b")
+# A NEGATED affirmative. Called out separately because the reference rule shares
+# the shipping rule's blind spot here: "not yes" contains a word-boundary "yes"
+# and no word-boundary "no" ("not" is not "no"), so BOTH rules score it correct
+# and the disagreement column cannot see it. That is why C1 is reported as a
+# LOWER BOUND on misscoring rather than as the misscore rate itself.
+_NEGATED_YES = re.compile(r"\b(?:not|never|isn't|is not|wasn't|n't)\b[^.]{0,20}?\byes\b")
+
+
+def normalise_reply(raw: str) -> str:
+    return (raw or "").strip().strip(_DECORATION).strip().lower()
+
+
+def shipping_verdict(raw: str) -> bool:
+    """EXACTLY what `judge_answer` does. Duplicated rather than imported so the
+    audit still reports correctly if `judge_answer` is later fixed — at which
+    point the disagreement column becomes the before/after diff."""
+    return "yes" in (raw or "").lower()
+
+
+def reference_verdict(raw: str) -> bool:
+    """First word-boundary verdict token wins; no token at all means no."""
+    low = (raw or "").lower()
+    y, n = _YES_WORD.search(low), _NO_WORD.search(low)
+    if y and n:
+        return y.start() < n.start()
+    return bool(y)
+
+
+def classify_reply(raw: str) -> dict:
+    """Bucket a raw judge reply. Buckets are mutually exclusive and ordered from
+    most to least specific."""
+    text = raw or ""
+    low = text.lower()
+    norm = normalise_reply(text)
+
+    if text.startswith("[LLM_ERROR"):
+        bucket = "llm_error"          # D3: silently scored as a wrong answer
+    elif not text.strip():
+        bucket = "empty"
+    elif norm == "yes":
+        bucket = "compliant_yes"
+    elif norm == "no":
+        bucket = "compliant_no"
+    elif _NEGATED_YES.search(low):
+        bucket = "negated_yes"        # invisible to BOTH rules — see C1 caveat
+    elif _YES_WORD.search(low) and _NO_WORD.search(low):
+        bucket = "both_tokens"        # "yes and no", "no ... yes"
+    elif "yes" in low and not _YES_WORD.search(low):
+        bucket = "yes_substring_only"  # "yesterday", "eyes" — the amplifier
+    elif _YES_WORD.search(low):
+        bucket = "verbose_yes"
+    elif _NO_WORD.search(low):
+        bucket = "verbose_no"
+    else:
+        bucket = "no_verdict_token"   # a truncated preamble with no verdict
+
+    ship, ref = shipping_verdict(text), reference_verdict(text)
+    return {
+        "bucket": bucket,
+        "compliant": bucket in ("compliant_yes", "compliant_no"),
+        "shipping": ship,
+        "reference": ref,
+        "disagrees": ship != ref,
+        "negated": bool(_NEGATED_YES.search(low)),
+        "chars": len(text),
+    }
+
+
+# ── Refusal classification (D1) ─────────────────────────────────────────
+# The reader is INSTRUCTED to emit a specific phrase family when it cannot
+# answer (longmemeval_adapter.py:275/282 and the permissive prompt), so the
+# canonical markers are high-precision by construction. The loose markers are
+# reported separately: if they carry the count, the classifier is doing
+# something the prompts never asked for and the hand-check matters more.
+
+_CANONICAL_REFUSAL = (
+    "i don't have enough information",
+    "i do not have enough information",
+    "don't have enough information",
+    "not enough information",
+)
+
+_LOOSE_REFUSAL = (
+    "i can't tell", "i cannot tell", "i can't determine", "i cannot determine",
+    "i don't know", "i do not know", "unable to determine", "cannot be determined",
+    "isn't mentioned", "is not mentioned", "no mention of", "not specified",
+    "doesn't specify", "does not specify", "the context does not",
+    "the context doesn't", "unclear from the context",
+)
+
+
+def classify_refusal(answer: str) -> dict:
+    low = (answer or "").lower()
+    canon = [m for m in _CANONICAL_REFUSAL if m in low]
+    loose = [m for m in _LOOSE_REFUSAL if m in low]
+    return {"refusal": bool(canon or loose),
+            "canonical": bool(canon),
+            "loose_only": bool(loose and not canon)}
+
+
+_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def recites_gold(answer: str, gold: str) -> bool:
+    """STRICT gold recitation: the normalised gold string appears verbatim, or
+    every gold content token (len > 2) appears in the answer.
+
+    Deliberately strict. A loose similarity check on this exact shape is what
+    false-positived at 55% against an 11% correct-answer control earlier in this
+    project; the resulting number was retracted. Strictness here biases the
+    measured rate DOWN, which is the safe direction for a defect hunt: a rate
+    that clears C3 despite a strict check is real."""
+    if not gold or not answer:
+        return False
+    a, g = answer.lower(), gold.lower().strip()
+    if g and g in a:
+        return True
+    toks = [t for t in _TOKEN.findall(g) if len(t) > 2]
+    return bool(toks) and all(t in a for t in toks)
+
+
+# ── Row loading and judge-input reconstruction ──────────────────────────
+# The judge input MUST be rebuilt exactly as the adapter built it. A re-judge
+# that reconstructs it differently measures prompt drift, not the judge.
+
+_TRAP_RE = re.compile(r"^\[unanswerable; trap: (.*)\]$", re.S)
+
+
+def load_rows(path: str) -> list[dict]:
+    obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(obj, list):
+        return obj
+    for key in ("per_question", "results", "rows"):
+        if isinstance(obj.get(key), list):
+            return obj[key]
+    raise SystemExit(f"{path}: no per-question list found (keys: {sorted(obj)[:10]})")
+
+
+def judge_inputs(row: dict, bench: str) -> tuple[str, str, str, str]:
+    """(question_type, question, gold, answer) exactly as the adapter passes them."""
+    if bench == "locomo":
+        from locomo_adapter import CATEGORY_JUDGE, _gold_for_judge
+        cat = row["category"]
+        qtype = CATEGORY_JUDGE[cat]
+        gold = row.get("answer")
+        if cat == 5:
+            m = _TRAP_RE.match(str(gold))
+            gold = _gold_for_judge(5, None, m.group(1) if m else "")
+        return qtype, row["question"], (gold if gold is not None else ""), \
+            str(row.get("ai_answer") or "")
+    if bench == "msc":
+        # msc_adapter.py:513 hard-codes this type at its only judge call site.
+        return "single-session-user", row.get("question", ""), \
+            str(row.get("answer", "")), str(row.get("ai_answer") or "")
+    if bench == "lme":
+        return row.get("question_type", ""), row.get("question", ""), \
+            str(row.get("answer", "")), str(row.get("hypothesis") or "")
+    raise SystemExit(f"unknown --bench {bench!r}")
+
+
+def judgeable(answer: str) -> bool:
+    return bool(answer) and not answer.startswith("[LLM_ERROR")
+
+
+def stable_sample(rows: list[dict], limit: int | None, key: str = "id") -> list[dict]:
+    """Deterministic content-addressed sample, so re-running the audit re-judges
+    the SAME rows instead of a fresh draw whose delta would be pure sampling."""
+    if not limit or limit >= len(rows):
+        return rows
+    def h(r: dict) -> str:
+        ident = str(r.get(key) or r.get("qa_id") or r.get("question_id")
+                    or r.get("question", ""))
+        return hashlib.sha256(ident.encode("utf-8")).hexdigest()
+    return sorted(rows, key=h)[:limit]
+
+
+# ── Recording judge wrapper ─────────────────────────────────────────────
+
+class RecordingJudge:
+    """Wraps ANY injected `.chat()`-shaped client and keeps the raw reply.
+
+    This wrapper is the whole instrument. `judge_answer` throws `raw` away, so
+    the only way to count non-compliant replies without touching production code
+    is to record them one level below it."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.replies: list[str] = []
+
+    def chat(self, messages: list, temperature: float = 0.1,
+             max_tokens: int = 1024) -> str:
+        raw = self.inner.chat(messages, temperature=temperature,
+                              max_tokens=max_tokens)
+        self.replies.append(raw)
+        return raw
+
+
+def rejudge_row(client, row: dict, bench: str) -> dict:
+    """One judge call, with the raw reply retained. `client` is INJECTED — this
+    module never builds one for you."""
+    from longmemeval_adapter import judge_answer
+
+    qtype, question, gold, answer = judge_inputs(row, bench)
+    rec = RecordingJudge(client)
+    verdict = judge_answer(rec, qtype, question, gold, answer)
+    raw = rec.replies[-1] if rec.replies else ""
+    ref = classify_reply(raw)
+    ref.update({
+        "id": row.get("id") or row.get("qa_id") or row.get("question_id"),
+        "question_type": qtype,
+        "is_abs": "_abs" in qtype,
+        "verdict": verdict,
+        "verdict_original": row.get("correct"),
+        "raw": raw,
+        **{f"answer_{k}": v for k, v in classify_refusal(answer).items()},
+        "recites_gold": recites_gold(answer, gold),
+    })
+    return rec_with_answer(ref, answer, gold)
+
+
+def rec_with_answer(rec: dict, answer: str, gold: str) -> dict:
+    """Answer/gold text is carried ONLY into the hand-check file, never into the
+    printed report. Benchmark text is public, but a report is for counts."""
+    rec["_answer"] = answer
+    rec["_gold"] = gold
+    return rec
+
+
+# ── Free pre-check (no LLM) ─────────────────────────────────────────────
+
+def free_precheck(rows: list[dict], bench: str) -> dict:
+    n = len(rows)
+    judged, abs_rows, refusals, canon, recite = 0, 0, 0, 0, 0
+    for r in rows:
+        qtype, _q, gold, answer = judge_inputs(r, bench)
+        if "_abs" in qtype:
+            abs_rows += 1
+        if not judgeable(answer):
+            continue
+        judged += 1
+        cls = classify_refusal(answer)
+        if cls["refusal"]:
+            refusals += 1
+            canon += cls["canonical"]
+            if recites_gold(answer, gold):
+                recite += 1
+    return {"n": n, "judgeable": judged, "abs_rows": abs_rows,
+            "refusals": refusals, "refusals_canonical": canon,
+            "refusals_reciting_gold": recite,
+            "refusal_rate": pct(refusals, judged)}
+
+
+def pct(a: int, b: int) -> float:
+    return 100.0 * a / b if b else 0.0
+
+
+def pair_precheck(rows_a: list[dict], rows_b: list[dict], bench: str) -> dict:
+    """C4, for free. If two compared arms refuse at different rates, a criterion
+    defect does not cancel in the paired comparison and the gate is void."""
+    a, b = free_precheck(rows_a, bench), free_precheck(rows_b, bench)
+    diff = abs(a["refusal_rate"] - b["refusal_rate"])
+    return {"a": a, "b": b, "diff_pp": diff,
+            "verdict": "VOID — refusal asymmetry, criterion defect does not cancel"
+                       if diff >= C4_MATERIAL else
+                       "OK — arms refuse at comparable rates; defect largely cancels"}
+
+
+# ── Report ──────────────────────────────────────────────────────────────
+
+def build_report(recs: list[dict], precheck: dict, handcheck: tuple[int, int] | None) -> dict:
+    n = len(recs)
+    buckets = Counter(r["bucket"] for r in recs)
+    noncompliant = sum(1 for r in recs if not r["compliant"])
+    missc = [r for r in recs if r["disagrees"]]
+    non_abs = [r for r in recs if not r["is_abs"]]
+    refusals = [r for r in non_abs if r["answer_refusal"]]
+    rsc = [r for r in refusals if r["verdict"]]
+    rsc_recite = [r for r in rsc if r["recites_gold"]]
+
+    c1 = pct(len(missc), n)
+    c2 = pct(noncompliant, n)
+    c3 = pct(len(rsc), len(non_abs))
+
+    blocked: list[str] = []
+    if n == 0:
+        blocked.append("G5 NOTHING JUDGED — no judgeable rows in the sample.")
+    if not refusals:
+        blocked.append(
+            "G1 UNMEASURED — zero refusals among non-_abs rows. C3 measured "
+            "NOTHING; this is NOT a clean 0%. Either the classifier is broken "
+            "or the sample is wrong.")
+    if precheck["abs_rows"] == 0:
+        blocked.append(
+            "G2 UNMEASURED — no _abs rows in the sample, so the "
+            "containment-vs-abstention criterion contrast is untested here. "
+            "(Expected for MSC, which has no _abs rows by construction.)")
+    if non_abs and pct(len(refusals), len(non_abs)) > G3_CEILING:
+        blocked.append(
+            f"G3 BROKEN — refusal classifier flagged "
+            f"{pct(len(refusals), len(non_abs)):.1f}% of rows (> {G3_CEILING}%). "
+            "It is matching something generic; do not read C3.")
+    if handcheck is None:
+        blocked.append(
+            "G4 INCOMPLETE — no hand-check counts supplied. The refusal and "
+            "gold-recitation checks are lexical. Hand-check the labelled sample "
+            "(both refusal- AND committed-classified rows) and re-report with "
+            "--handcheck FP,FN.")
+
+    def band(v, mat, watch):
+        return "MATERIAL" if v >= mat else ("WATCH" if v >= watch else "IMMATERIAL")
+
+    # The hand-check does not merely unlock the gate — it CORRECTS the number.
+    # Lifting G4 while still banding the raw rate would make the control
+    # ceremonial: an operator could report a 50%-wrong classifier and the
+    # verdict would not move. C3 is scaled by the measured false-positive rate
+    # of the refusal classifier, and the banded value is the corrected one.
+    c3_adj, fp_rate, fn_rate = c3, None, None
+    if handcheck is not None:
+        fp, fn = handcheck
+        n_flag = min(HANDCHECK_K, len(refusals))
+        n_ctrl = min(HANDCHECK_K, len(non_abs) - len(refusals))
+        fp_rate = (fp / n_flag) if n_flag else None
+        fn_rate = (fn / n_ctrl) if n_ctrl else None
+        if fp_rate is not None:
+            c3_adj = c3 * (1.0 - fp_rate)
+        if fp_rate is not None and fp_rate > HANDCHECK_FP_BROKEN:
+            blocked.append(
+                f"HAND-CHECK BROKEN — refusal classifier false-positive rate "
+                f"{fp_rate*100:.0f}% (> {HANDCHECK_FP_BROKEN*100:.0f}%). C3 is "
+                "not measuring refusals; do not read it.")
+        if fn_rate is not None and fn_rate > 0.2:
+            blocked.append(
+                f"HAND-CHECK UNDER-COUNT — classifier false-negative rate "
+                f"{fn_rate*100:.0f}%: real refusals are being missed, so C3 is a "
+                "floor. Widen the markers and re-run before reading a band.")
+
+    c3_band = band(c3_adj, C3_MATERIAL, C3_WATCH)
+    c1_band = band(c1, C1_MATERIAL, C1_WATCH)
+    verdict = "INCOMPLETE" if blocked else \
+        ("MATERIAL" if "MATERIAL" in (c1_band, c3_band) else
+         "WATCH" if "WATCH" in (c1_band, c3_band) else "IMMATERIAL")
+
+    return {
+        "n_judged": n,
+        "C1_misscore_rate": c1, "C1_band": c1_band,
+        "C1_n": len(missc),
+        "C1_is_a_lower_bound": True,
+        "C1b_negated_yes_invisible_to_both_rules": sum(1 for r in recs if r["negated"]),
+        "C2_noncompliance_rate": c2, "C2_n": noncompliant,
+        "C3_refusal_scored_correct_rate": c3,
+        "C3_rate_handcheck_adjusted": c3_adj,
+        "C3_band": c3_band,
+        "C3_n": len(rsc), "C3_denominator_non_abs": len(non_abs),
+        "C3_of_which_recite_gold": len(rsc_recite),
+        "n_refusals_non_abs": len(refusals),
+        "buckets": dict(buckets),
+        "llm_error_replies": buckets.get("llm_error", 0),
+        "handcheck": ({"fp": handcheck[0], "fn": handcheck[1],
+                       "fp_rate": fp_rate, "fn_rate": fn_rate}
+                      if handcheck is not None else None),
+        "blocked": blocked,
+        "verdict": verdict,
+    }
+
+
+def print_report(rep: dict, precheck: dict) -> None:
+    print(f"\n{'='*72}\nJUDGE AUDIT — pre-registered criteria (see module docstring)\n{'='*72}")
+    print(f"  rows: {precheck['n']}   judgeable: {precheck['judgeable']}   "
+          f"_abs rows: {precheck['abs_rows']}")
+    print(f"  judged in this pass: {rep['n_judged']}")
+    print(f"\n  C1 misscore (shipping vs reference rule disagree): "
+          f"{rep['C1_misscore_rate']:.2f}%  ({rep['C1_n']})   -> {rep['C1_band']}")
+    print(f"     LOWER BOUND: + {rep['C1b_negated_yes_invisible_to_both_rules']} "
+          f"negated-yes replies that BOTH rules score correct")
+    print(f"  C2 non-compliant replies (indicator only):        "
+          f"{rep['C2_noncompliance_rate']:.2f}%  ({rep['C2_n']})")
+    print(f"  C3 refusal scored CORRECT (non-_abs rows):        "
+          f"{rep['C3_refusal_scored_correct_rate']:.2f}%  "
+          f"({rep['C3_n']}/{rep['C3_denominator_non_abs']})")
+    if rep["handcheck"]:
+        print(f"     hand-check adjusted (FP rate "
+              f"{(rep['handcheck']['fp_rate'] or 0)*100:.0f}%):              "
+              f"{rep['C3_rate_handcheck_adjusted']:.2f}%   -> {rep['C3_band']}")
+    else:
+        print(f"     -> {rep['C3_band']} (UNADJUSTED — no hand-check)")
+    print(f"     of which the refusal recites the gold value:   "
+          f"{rep['C3_of_which_recite_gold']}")
+    print(f"  refusals found (non-_abs): {rep['n_refusals_non_abs']}   "
+          f"judge-side LLM_ERROR replies: {rep['llm_error_replies']}")
+    print(f"\n  reply buckets: {rep['buckets']}")
+    if rep["blocked"]:
+        print("\n  GUARDS TRIPPED:")
+        for b in rep["blocked"]:
+            print(f"    - {b}")
+    print(f"\n  VERDICT: {rep['verdict']}")
+    if rep["verdict"] == "MATERIAL":
+        print("    => fix the judge and re-baseline LoCoMo, LME and MSC together.")
+    print(f"{'='*72}\n")
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────
+
+def build_judge_client(args):
+    """Constructed ONLY here, ONLY under --spend. Never at import."""
+    import os
+    from longmemeval_adapter import DEEPSEEK_BASE_URL, LLMClient
+    extra = json.loads(args.judge_extra_body) if args.judge_extra_body else None
+    return LLMClient(args.judge_model,
+                     args.api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
+                     base_url=args.judge_base_url or DEEPSEEK_BASE_URL,
+                     extra_body=extra)
+
+
+def main(argv=None, client=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--run", help="stored per-question results JSON")
+    ap.add_argument("--pair", nargs=2, metavar=("A.json", "B.json"),
+                    help="C4 arm-asymmetry pre-check — FREE, no LLM calls")
+    ap.add_argument("--report", help="re-print a saved audit JSON (free)")
+    ap.add_argument("--bench", choices=("locomo", "lme", "msc"), default="locomo")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="deterministic content-addressed sample size")
+    ap.add_argument("--spend", action="store_true",
+                    help="REQUIRED to make any LLM call. Without it this is a "
+                         "free pre-check that prints the cost it would incur.")
+    ap.add_argument("--handcheck", metavar="FP,FN",
+                    help="hand-check counts for the refusal/recitation "
+                         "classifiers; required to lift the G4 INCOMPLETE gate")
+    ap.add_argument("--out", default="judge_audit.json")
+    ap.add_argument("--judge-model", default="gpt-oss-120b")
+    ap.add_argument("--judge-base-url", default=None)
+    ap.add_argument("--judge-extra-body", default=None, metavar="JSON")
+    ap.add_argument("--api-key", default="")
+    ap.add_argument("--workers", type=int, default=1)
+    args = ap.parse_args(argv)
+
+    handcheck = None
+    if args.handcheck:
+        fp, fn = args.handcheck.split(",")
+        handcheck = (int(fp), int(fn))
+
+    if args.report:
+        saved = json.loads(Path(args.report).read_text(encoding="utf-8"))
+        rep = build_report(saved["records"], saved["precheck"], handcheck)
+        print_report(rep, saved["precheck"])
+        return 0
+
+    if args.pair:
+        a, b = (load_rows(p) for p in args.pair)
+        res = pair_precheck(a, b, args.bench)
+        print(f"\n  C4 arm asymmetry (FREE, no LLM):")
+        print(f"    A refusal rate: {res['a']['refusal_rate']:.2f}% "
+              f"({res['a']['refusals']}/{res['a']['judgeable']})")
+        print(f"    B refusal rate: {res['b']['refusal_rate']:.2f}% "
+              f"({res['b']['refusals']}/{res['b']['judgeable']})")
+        print(f"    difference: {res['diff_pp']:.2f}pp  "
+              f"(threshold {C4_MATERIAL}pp)\n    {res['verdict']}\n")
+        return 0
+
+    if not args.run:
+        ap.error("one of --run, --pair or --report is required")
+
+    rows = stable_sample(load_rows(args.run), args.limit)
+    pre = free_precheck(rows, args.bench)
+    to_judge = [r for r in rows if judgeable(judge_inputs(r, args.bench)[3])]
+
+    if not args.spend:
+        print(f"\n  FREE PRE-CHECK — {args.run} ({args.bench})")
+        print(f"    rows: {pre['n']}   judgeable: {pre['judgeable']}   "
+              f"_abs rows: {pre['abs_rows']}")
+        print(f"    refusals (lexical): {pre['refusals']} "
+              f"({pre['refusal_rate']:.2f}%)   "
+              f"canonical-phrase: {pre['refusals_canonical']}")
+        print(f"    refusals also reciting gold: {pre['refusals_reciting_gold']}")
+        if pre["refusals"] == 0:
+            print("    G1: zero refusals — a spend here would MEASURE NOTHING. "
+                  "Do not spend.")
+        print(f"\n    a --spend pass would cost {len(to_judge)} judge calls "
+              f"(1 per judgeable row, max_tokens=10).")
+        print("    add --spend to run it.\n")
+        return 0
+
+    if client is None:
+        client = build_judge_client(args)
+
+    recs: list[dict] = []
+    if args.workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            recs = list(pool.map(lambda r: rejudge_row(client, r, args.bench),
+                                 to_judge))
+    else:
+        for i, r in enumerate(to_judge, 1):
+            recs.append(rejudge_row(client, r, args.bench))
+            if i % 25 == 0:
+                print(f"  ── judged {i}/{len(to_judge)}", flush=True)
+
+    rep = build_report(recs, pre, handcheck)
+    Path(args.out).write_text(
+        json.dumps({"precheck": pre, "report": rep, "records": recs}, indent=2),
+        encoding="utf-8")
+    write_handcheck_sample(recs, args.out)
+    print_report(rep, pre)
+    print(f"  full records → {args.out}")
+    print(f"  hand-check sample → {Path(args.out).with_suffix('.handcheck.json')}")
+    return 0
+
+
+def write_handcheck_sample(recs: list[dict], out: str,
+                           k: int = HANDCHECK_K) -> Path:
+    """G4's correct-answer control. Writes BOTH refusal-classified and
+    committed-classified rows, labelled, so the hand-check can measure false
+    POSITIVES and false NEGATIVES. A sample of only flagged rows would be a
+    confirmation pass and could not produce an FN count."""
+    flagged = [r for r in recs if r["answer_refusal"]][:k]
+    control = [r for r in recs if not r["answer_refusal"]][:k]
+    dest = Path(out).with_suffix(".handcheck.json")
+    dest.write_text(json.dumps(
+        {"instructions":
+            "For each row decide if `_answer` is genuinely a refusal. "
+            "FP = classified refusal but is a real answer. "
+            "FN = classified committed but is a refusal. "
+            "Re-report with --handcheck FP,FN.",
+         "classified_refusal": flagged,
+         "classified_committed_CONTROL": control},
+        indent=2), encoding="utf-8")
+    return dest
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
