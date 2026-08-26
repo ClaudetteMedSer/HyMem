@@ -648,7 +648,7 @@ def test_v26_adds_facts_table_watermark_and_dream_run_columns(tmp_path: Path):
 
     core_db.initialize(conn)
 
-    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 31
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 32
     assert "facts_message_id" in _cols(conn, "sessions")
     assert {"facts_extracted", "fact_failures"} <= _cols(conn, "dream_runs")
     assert _cols(conn, "narrative_facts") >= {

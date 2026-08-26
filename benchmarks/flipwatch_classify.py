@@ -114,7 +114,10 @@ REFUSION_BUILT_FRACTION = 0.8
 # Stamped into every RESULT block. The third watch ran against a classifier
 # that could not read the v29 columns; a run under this build is a FOURTH
 # watch, and the block has to say so rather than look like a continuation.
-CLASSIFIER_VERSION = ("v4 (2026-08-09) — criterion 6 (keying integrity) added; criteria 1-5 unchanged")
+CLASSIFIER_VERSION = (
+    "v5 (2026-08-26) — dead-watch guard added (>= 5 consecutive no-agg/"
+    "layer-off rows = hard FAIL) + v32 layer-state read; criterion 6 unchanged"
+)
 
 # `aggregation_leaf_changed` is THREE-state and the two non-numeric states are
 # easy to destroy on the way in. NULL means the leaf-set snapshot was
