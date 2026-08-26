@@ -406,7 +406,8 @@ matching the #1303 delta) and never entered any verdict row's delta. So the
 append criterion is exercised at granularity +1 only; the +91 backlog churn
 was untested by the verdict set. The only sub-bar v31 append evidence remains
 **#1183 = 79.2%** — which raises, not lowers, the stakes on its amplification
-analysis. Same class as the third watch's paper pass: a window-aggregate check
+analysis (RESOLVED below: forecast-exact, discharged). Same class as the
+third watch's paper pass: a window-aggregate check
 cannot see a defect that splits the window in two.
 
 **#1303 — env-parity artifact row (recorded, NOT excused).** `2026-08-26
@@ -462,11 +463,54 @@ the verdict. Re-anchor the watch as follows:
   in the new window**; reuse% is NOT predicted (small-churn appends may sit
   below 90% exactly like Aug-8 era — that is the gate's verdict, not an
   excuse).
-- Criterion 6 floor: n=4 today (#1182–#1184, #1303). The banked floor is
-  n≥5 populated → one more residual=0 row reaches it; a bank/pass verdict
-  must not be drawn at n=4.
+- Criterion 6 floor: **n=4 carried, not n=0** — see the carry rule below.
+  The banked floor is n≥5 populated; with the carry, ONE more
+  residual=0 row reaches it; a bank/pass verdict must not be drawn at
+  n=4.
 
-**INSTRUMENT GAP — remains to be built (separate commit, 2026-08-26).** (b)
+**CRITERION-6 CARRY RULE (banked 2026-08-26, before the new window's first
+row).** How much of the pre-fix window crosses the `--since 2026-08-26 11:15`
+restart boundary — split by quantity KIND, matching the instrument's own
+cost/correctness split:
+- **Reuse% does NOT cross.** It is a cost rate; the pre-fix era is not
+  representative of the fixed-launcher regime (env split, MCP-path-only ON).
+  Post-fix reuse below 90% is the gate's verdict, not a carry-over.
+- **Criterion 6 (keying integrity — `aggregation_keying_residual`) DOES
+  cross.** It is a correctness invariant: structural, not sampled; it reads
+  the whole keying in one dream; there is no variance band to absorb. A
+  correctly-instrumented row is valid evidence regardless of which window
+  it fell in, and the restart cause (env parity) has no bearing on whether
+  a keyed id matched.
+- Accounting: n=4 carried (#1182, #1183, #1184, #1303 — all residual=0) +
+  one fresh post-fix residual=0 row = floor n≥5. The new window opens at
+  criterion-6 n=4, not n=0; this is the cost/correctness distinction the
+  gate already draws, written beside the pre-registration — deliberately
+  NOT a silent default in the classifier.
+
+**#1183 AMPLIFICATION ANALYSIS — resolved 2026-08-26 (the named
+precondition).** The A-model (`rebuilt ~ A·level0_missed + root + leaf`) is
+**subsumed by the v31 structural forecast** for v31+ rows: the forecast
+predicted `rebuilt` EXACTLY on every v31 row — #1182 9==9, #1183 22==22,
+#1184 8==8, #1303 35==35 — residual=0 on all four. #1183's 7.3/miss is
+therefore NOT amplification: it is a **forecast-exact structural rebuild**,
+the same arrival-driven class as #1303 — **DISCHARGED**. Pre-v31 offenders
+#1178 (12, 4.0/miss) and #1180 (14, 3.5/miss) fall inside the observed
+Δ=1 band (2.2–4.0 per miss, n≥10; the docstring's "~3.3 at #1158" is one
+member of that band, and the retracted earlier estimate is not) —
+**DISCHARGED** under any reasonable leaf-term assignment. #1303's 11.7 is
+not A-dispersion at Δ=91: it too is forecast-exact. **Pre-registered bound
+(envelope, not fit):** for rows without a forecast, A(Δ=1) ≤ 4.0·l0miss —
+the observed Δ=1 maximum from rows OTHER than the one under test; refined
+only by new Δ=1 observations, never by the row it judges.
+**Consequence for the old window:** the 14/17-≥90% signal's three offenders
+are ALL arrival-driven — the FAIL verdict's blocker is the dead-watch (ops,
+now fixed) and criterion 6 n<5, NOT an amplification defect. Criterion
+"100% ≥90%" reads clean in the new window at the same bar; the old window's
+FAIL is preserved as banked (contaminated window, no pass on any criterion),
+but no leftover amplification question now awaits the flip.
+
+**INSTRUMENT GAP — BUILT 2026-08-26, committed separately (see the
+flipwatch-v32 commits).** (b)
 one nullable column set from the effective config at dream start
 (`aggregation_effective`), plus a classifier label that hard-FAILs on a
 no-agg streak (≥5 consecutive, tail-of-window) instead of silently excluding.
