@@ -1,0 +1,40 @@
+-- v33: split the rebuild count by tree level, so the "leaf-changed family" is
+-- decidable instead of arguable.
+--
+-- Why this column set exists (2026-08-26). Three rows now share one signature:
+-- #1183 (79.2% reuse, 7.3 rebuilds per level-0 miss), #1307 (81.4%, 6.3) and
+-- the post-flip #1317 (80.6%, 6.7) -- all with aggregation_leaf_changed = 1,
+-- all with keying_residual = 0, all far above the observed delta=1 band of
+-- 2.2-4.0 that ordinary appends sit in.
+--
+-- Residual 0 settles CORRECTNESS: every rebuild was a genuine member-set
+-- change, so the salt/hash/rowid-shadow class is clean. It says nothing about
+-- COST, which is what the reuse bar gates and what these rows are low on. The
+-- standing explanation -- "a leaf-set change re-keys a subtree, structural not
+-- a regression" -- may well be right, but it CANNOT BE CHECKED, because
+-- aggregation_leaf_changed is binary. It cannot distinguish
+--
+--   (a) the leaf term explains all 20 rebuilds  (benign, structural)
+--   (b) the leaf term explains 3 and the tree leaked 17  (the 2026-07-05
+--       oldest-anchored windowing confinement failing, which is the row class
+--       raptor_digest_plan.md routes to REOPEN THE WINDOWING ANALYSIS rather
+--       than discharge)
+--
+-- Splitting the rebuild by level decides it on one dream with nothing fitted,
+-- exactly as the v31 forecast did for keying. Level 0 nodes rebuild when
+-- episodes arrive into clusters. Level >= 1 interior nodes rebuild when the
+-- digest leaf set shifts and the cascade re-keys parents. The root rebuilds on
+-- membership OR the anchor-facts hash. So for #1317: rebuilt_level0 = 3 with
+-- rebuilt_rollup = 16 is reading (a) and the family is closed benign, while
+-- rebuilt_level0 = 17 is reading (b) and the confinement invariant is leaking.
+--
+-- Derived from `rows` at build time with no new state and no extra pass. The
+-- three counts sum to `actual` (aggregation_nodes_built minus reused) by
+-- construction, which makes them self-checking.
+--
+-- NULL is unattributed, for the same reason as v29 and v31: these are only
+-- meaningful for a dream that ran aggregation, and 0/0/0 is a real reading (a
+-- clean fixed point), so pre-v33 history must not be backfilled into it.
+ALTER TABLE dream_runs ADD COLUMN aggregation_rebuilt_level0 INTEGER;
+ALTER TABLE dream_runs ADD COLUMN aggregation_rebuilt_rollup INTEGER;
+ALTER TABLE dream_runs ADD COLUMN aggregation_rebuilt_root INTEGER;

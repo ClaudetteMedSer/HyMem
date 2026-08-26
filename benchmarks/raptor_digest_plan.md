@@ -611,6 +611,53 @@ it looks:
 Downstream: Plan C **UNBLOCKED** (`additional_planning.md`); Stage 4a remains
 gated on its own build spec below, not on this flip.
 
+### The leaf-changed family — instrument BUILT 2026-08-26 (schema v33)
+
+Three rows now share one signature, and the post-flip verification dream made
+it a population rather than a curiosity:
+
+| row | reuse | leaf_changed | l0miss | rebuilt | rebuilds/miss | residual |
+|---|---|---|---|---|---|---|
+| #1183 | 79.2% | 1 | 3 | 22 | 7.3 | 0 |
+| #1307 | 81.4% | 1 | 3 | 19 | 6.3 | 0 |
+| #1317 (post-flip) | 80.6% | 1 | 3 | 20 | 6.7 | 0 |
+
+Against a Δ=1 band of 2.2–4.0, and against #1309/#1312 which sat inside it at
+2.7/3.0. **Residual 0 settles CORRECTNESS on all three** — every rebuild was a
+genuine member-set change, so the salt/hash/rowid-shadow class is clean. It
+says nothing about COST, which is what the reuse bar gates and what these rows
+are low on. Reading the residual as a discharge is the move this plan already
+forbids for this row class (see the #1183 paragraph above): the standing
+"leaf-set change re-keys a subtree, structural not a regression" explanation
+may well be right, but **`aggregation_leaf_changed` is BINARY and cannot
+distinguish**
+
+- (a) the leaf term explains all 20 rebuilds — benign digest cascade, from
+- (b) the leaf term explains 3 and the tree leaked 17 — the 2026-07-05
+  oldest-anchored windowing confinement failing.
+
+So the family stayed arguable across three separate readings, which is the
+real cost: not a wrong answer, an *undecidable* one.
+
+**Fix: split the rebuild by tree level** (`aggregation_rebuilt_level0` /
+`_rollup` / `_root`, migration 033). Level-0 rebuilds track episode arrivals
+into clusters; level ≥1 interior rebuilds track the digest leaf set shifting
+and cascading up; the root keys on membership OR the anchor-facts hash, so it
+is counted separately rather than smeared into the cascade term. Derived from
+the build's own `rows` with no new state, no extra pass and nothing fitted —
+the same move v31 made for keying. The three counts sum to `built - reused` by
+construction, so the instrument is self-checking; a split that stops summing is
+lying, and the test asserts it end-to-end through the store.
+
+**On the next leaf-changed row this decides the family outright:** l0=3 with
+rollup≈16 closes it benign; l0≈17 reopens the windowing analysis with the row
+as its starting evidence. No bar, no accrual, one dream.
+
+Deliberately NOT done: no threshold, no gate criterion, no classifier change.
+This adds an observation channel to a question that was being answered
+qualitatively — it does not answer it in advance, and it must not be read as
+having pre-judged which branch is true.
+
 ---
 
 ## Stage 4 — Query-time consumption v2 (only after Stage 3)

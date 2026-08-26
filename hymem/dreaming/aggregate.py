@@ -85,6 +85,9 @@ class AggregationResult(NamedTuple):
     predicted_rebuild: int = 0
     keying_residual: int = 0
     facts_rekey: int = 0
+    rebuilt_level0: int = 0
+    rebuilt_rollup: int = 0
+    rebuilt_root: int = 0
 
 # Fusion-prompt versions, baked into the node-id salt of the level the prompt
 # serves. Reuse is keyed by node id, so bumping a version when its prompt
@@ -583,6 +586,11 @@ class _RebuildForecast(NamedTuple):
     actual: int
     residual: int
     facts_rekey: int
+    # v33: `actual` split by tree level. level0 + rollup + root == actual by
+    # construction, so the triple is self-checking.
+    rebuilt_level0: int = 0
+    rebuilt_rollup: int = 0
+    rebuilt_root: int = 0
 
 
 def _forecast_rebuild(
@@ -625,11 +633,24 @@ def _forecast_rebuild(
     a clamp would hide the collision.
     """
     predicted = actual = facts_rekey = 0
+    lvl0 = rollup = root = 0
     for r in rows:
         membership_is_new = (r["level"], frozenset(r["member_ids"])) not in prev_membership
         was_rebuilt = not r.get("reused", False)
         if was_rebuilt:
             actual += 1
+            # v33 decomposition. Which LEVEL rebuilt is what separates the two
+            # readings of a low-reuse leaf-changed row: level-0 rebuilds track
+            # episode arrivals into clusters, level->=1 interior rebuilds track
+            # the digest leaf set shifting and cascading up. `leaf_changed` is
+            # binary and cannot tell those apart, which is why #1183/#1307/#1317
+            # stayed arguable across three readings.
+            if r["is_root"]:
+                root += 1
+            elif r["level"] == 0:
+                lvl0 += 1
+            else:
+                rollup += 1
         if membership_is_new:
             predicted += 1
         elif was_rebuilt and r["is_root"]:
@@ -637,7 +658,9 @@ def _forecast_rebuild(
             # carries something other than membership.
             facts_rekey += 1
             predicted += 1
-    return _RebuildForecast(predicted, actual, actual - predicted, facts_rekey)
+    return _RebuildForecast(
+        predicted, actual, actual - predicted, facts_rekey, lvl0, rollup, root,
+    )
 
 
 def _leaf_fingerprint(leaf_ids: frozenset[str]) -> str:
@@ -1107,8 +1130,10 @@ def build_aggregation_nodes(
         level0_missed, -1 if leaf_changed is None else leaf_changed, len(episodes),
     )
     log.info(
-        "aggregate.forecast predicted=%d actual=%d residual=%d facts_rekey=%d",
+        "aggregate.forecast predicted=%d actual=%d residual=%d facts_rekey=%d "
+        "rebuilt_level0=%d rebuilt_rollup=%d rebuilt_root=%d",
         forecast.predicted, forecast.actual, forecast.residual, forecast.facts_rekey,
+        forecast.rebuilt_level0, forecast.rebuilt_rollup, forecast.rebuilt_root,
     )
     if forecast.residual > 0:
         # Membership-identical nodes that did not reuse. Nothing in the build
@@ -1125,6 +1150,7 @@ def build_aggregation_nodes(
         len(rows), reused, failures, len(episodes), blocking,
         level0_missed, leaf_res,
         forecast.predicted, forecast.residual, forecast.facts_rekey,
+        forecast.rebuilt_level0, forecast.rebuilt_rollup, forecast.rebuilt_root,
     )
 
 

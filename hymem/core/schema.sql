@@ -561,6 +561,18 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     aggregation_predicted_rebuild INTEGER,
     aggregation_keying_residual INTEGER,
     aggregation_facts_rekey INTEGER,
+    -- v32 effective layer state at dream start ('enabled'/'disabled'), so
+    -- "layer on, nothing to do" is distinguishable from "layer off" per row --
+    -- the defect that silently zeroed the flip-watch twice. NULL = pre-v32.
+    aggregation_effective TEXT,
+    -- v33 rebuild decomposition by tree level. Sums to (built - reused) by
+    -- construction, so it is self-checking. Splits the leaf term from the tree
+    -- term, which aggregation_leaf_changed (binary) cannot: it decides whether
+    -- a low-reuse leaf-changed row is a benign digest cascade or the windowing
+    -- confinement leaking. NULL = unattributed, never backfilled.
+    aggregation_rebuilt_level0 INTEGER,
+    aggregation_rebuilt_rollup INTEGER,
+    aggregation_rebuilt_root INTEGER,
     -- v25 digest attribution: a per-session digest that raises or returns an
     -- unparseable payload is logged and skipped (one bad session must not abort
     -- a dream), and episode creation can stall silently while chunks keep
