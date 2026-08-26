@@ -600,7 +600,8 @@ it looks:
   OFF switch (`bootstrap.py:86` semantics need no change).
 - **No benchmark regime changes.** `msc_adapter` (reused wholesale by
   `locomo_adapter`) and `beam_adapter` were default-config consumers and now
-  pin `aggregation_nodes_enabled=False` explicitly, so the LoCoMo / MSC / BEAM
+  pin `overrides["aggregation_nodes_enabled"] = False` explicitly (dict-item
+  form — that is the string to grep for), so the LoCoMo / MSC / BEAM
   canonical baselines stay comparable to every run behind them.
   `longmemeval_adapter:532` already pinned it True. Moving a benchmark onto
   the shipped config is a pre-registered scored decision, never a side effect

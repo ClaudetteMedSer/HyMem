@@ -130,7 +130,8 @@ extend the watch instead of deciding — the gate needs at least 5 verdict rows.
 >   `beam_adapter` never pinned the flag, so the one-line change would have
 >   silently switched the layer + digest ON for the LoCoMo / MSC / BEAM dream
 >   path and broken comparability with the canonical baselines behind them.
->   Both now pin `aggregation_nodes_enabled=False` in the same commit.
+>   Both now pin `overrides["aggregation_nodes_enabled"] = False` in the same
+>   commit (dict-item form — that is the string to grep for).
 >   `longmemeval_adapter:532` already pinned True. Generalize the lesson: a
 >   config-DEFAULT flip has a blast radius the size of its default-config
 >   consumer set, and that set is not what the gate measured.
