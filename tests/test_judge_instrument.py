@@ -856,14 +856,23 @@ def test_a_gold_that_is_entirely_gloss_does_not_match_everything():
     assert JA.recites_gold_v2("nothing relevant here at all", "(also acceptable)") is False
 
 
-def test_the_shipping_alias_is_still_v1_until_the_gate_runs():
-    """STATUS: UNRUN. The alias is the flip, and it has not happened.
+def test_the_shipping_alias_stays_v1_because_R2_FAILED():
+    """The gate RAN (A5, 2026-08-26) and FAILED R2. The alias is the flip.
 
-    Flipping it before --verify-recitation returns a PASS would restate the C3
-    footnote and the spend licence on an unmeasured rule — the licence being
-    the part that can wrongly authorise money."""
+    Before A5 this test read "until the gate runs" and pinned STATUS: UNRUN.
+    That is no longer the reason: R2's bar was FP <= 1 of the newly-flagged
+    sample and the hand-check found 2, failing on both readings of "sample"
+    (2 of 12 newly-flagged, 2 of the 3 refusal-arm rows). So a flip is now a
+    documented violation of a resolved bar, not a premature act — and this
+    test is what makes that distinction cost something.
+
+    The waiver argued at the time — that the 2 FPs "only inflate the upper
+    bound" — is the hazard R2 exists to catch. The ceiling licenses the spend;
+    inflating it wrongly authorises money. Re-tuning RECITE_ALPHA_COVERAGE
+    until R2 clears is the move the banked verdict language forbids by name."""
     assert JA.recites_gold is JA.recites_gold_v1
-    assert "STATUS: UNRUN" in JA.__doc__
+    assert "R2 FAIL" in JA.__doc__
+    assert "STATUS: UNRUN" not in JA.__doc__
 
 
 def test_recites_gold_v1_stays_frozen_at_the_pre_fix_behaviour():

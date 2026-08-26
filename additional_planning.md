@@ -3012,3 +3012,47 @@ to be guarded all along.
 | **D3 visibility** | **CLOSED.** |
 | **E6, Grove E3/E4, digest staleness** | Unchanged. Note Grove E3's measured population is ~2 rows on the box and 0 on conv-26, and nothing consumes `retraction_history` — the shape that closed Grove E2 FAIL-mechanism. |
 | **`main`** | Now 214 commits behind `Beam-optimisation` and 4 ahead: a real merge, not a fast-forward. |
+
+### A5 RAN — `recites_gold` v2 CLOSED, R2 FAIL (2026-08-26, Afrodite)
+
+Gate ran free on `lme_audit_spend.json` (500 records, zero LLM calls).
+**Verdict: R2 FAIL → alias stays `recites_gold_v1`. Rejected, not re-tuned.**
+
+| # | bar | measured | |
+|---|---|---|---|
+| R1 | fixtures recover the FN mechanisms | 3 real rows LOST by v2 are all the numeral defect; v1 wrong on all 3 | confirmed |
+| R2 | **FP ≤ 1 of newly-flagged** | **2 FP** (`f420262c`, `4dfccbf8`) | **FAIL** |
+| R3 | shuffled ≤ v1+2.0pp AND true ≥ 3× shuffled | 4.02% vs 4.22%; 52.00% true = 13× | PASS |
+| R4 | ceiling, reported | 3.40% → 4.04% nominal → **3.62% honest** | reported |
+
+R2 fails on both readings of "sample": 2 of 12 newly-flagged, and 2 of the 3
+refusal-arm rows. **No reading passes.**
+
+**Two waivers argued and refused.** (a) "report not barred" is R4's clause,
+verbatim and only R4's; R2's is "Bar: FP <= 1", and reading the waiver one row
+up the table turns the gate into its own confirmation pass. (b) "the FPs only
+inflate the upper bound" is the hazard R2 was written to catch — the banked
+direction argument ("an under-count can only wrongly refuse a spend, never
+wrongly license one") holds for the STRICT rule and **reverses** under
+loosening, and the ceiling is what licenses the spend.
+
+**The decomposition is worse than the bar, and is the keeper finding.** 8 of
+v2's 12 new flags are non-refusal prose rows that do not move the ceiling.
+On the refusal arm — the only population the licence reads — v2 is **1 TP / 3**.
+Gains land where they do not count; errors concentrate where they do.
+
+**The licence prediction is falsified independently.** `5884adf` pre-registered
+the numerator at **≥21 (≥4.47%)** with the five FNs counted. v2 measured 19
+(4.04%) nominal, 17 (3.62%) honest — below on both. Even waiving R2 entirely,
+the flip never reaches the numerator that motivated the work: **the spend stays
+unlicensed either way**, so the flip would cost the frozen baseline and buy
+nothing. R3's 13× separation stands as a real result about v2's mechanism; it
+is not a licence, because R3 was never the arm in question.
+
+**Revival = a NEW pre-registration written before scoring**, not a re-tune.
+The question A5 surfaced: does the refusal arm need a different rule from the
+prose arm (≈10/12 precision overall vs 1/3 there)? Do not answer it by moving
+`RECITE_ALPHA_COVERAGE` until that gate exists.
+
+Also fixed: `judge_scored`'s docstring said five call sites (six), and
+`judge_audit.py` said four `recites_gold` callers (three).
