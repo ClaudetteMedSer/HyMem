@@ -1278,7 +1278,7 @@ def judge_scored(llm: LLMClient, question_type: str, question: str,
                  answer: str, ai_answer: str) -> tuple[bool | None, str]:
     """(correct, raw) where `correct` is None iff the JUDGE itself errored.
 
-    The one place the D3 policy is written down, so five call sites across three
+    The one place the D3 policy is written down, so six call sites across three
     adapters cannot each decide it differently:
 
       * a judge sentinel yields `correct = None` — the row is UNSCORED, not

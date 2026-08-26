@@ -259,7 +259,58 @@ C3 2.13% raw (10/470) -> hand-check corrected 1.87% (FP 3/25=12%, FN 0/25)
     PASS (R1-R3) -> flip the alias to v2, restate the C3 footnote and the
     licence numerator in this docstring and in additional_planning.md.
     FAIL on R2 or R3 -> close, keep v1, record. Do NOT re-tune the token rule
-    until it passes; that is what makes a bar a bar. STATUS: UNRUN.
+    until it passes; that is what makes a bar a bar.
+
+    STATUS: RUN 2026-08-26 on Afrodite, `lme_audit_spend.json` (500 records).
+    VERDICT: **R2 FAIL -> alias stays v1. Closed, not re-tuned.**
+
+      R1 mechanisms  CONFIRMED on real rows, not only fixtures: the 3 rows v2
+                     NO LONGER flags are all the numeral defect ("2.5 years" vs
+                     "3.5 years older"; "27m45s" vs "26m30s"; "10 times" vs an
+                     enumerated ride list). v1 was wrong on all three.
+      R2 precision   **FAIL. Bar was FP <= 1 of the newly-flagged sample; the
+                     hand-check found 2** (f420262c mentions 3 of 4 airlines
+                     inside a refusal; 4dfccbf8 mentions ukulele lessons and
+                     Rachel separately while correctly refusing). It fails on
+                     BOTH readings of "sample": 2 of 12 newly-flagged, and 2 of
+                     the 3 refusal-arm rows. No reading of R2 passes.
+      R3 discrimin.  PASS, cleanly. Shuffled control v1 4.22% / v2 4.02% over
+                     498 mismatched pairs vs a 52.00% true-pair rate — 13x
+                     separation, well inside both halves of the bar. This is
+                     the arm that answers the retracted 55%-vs-11% episode, and
+                     it says v2 measures recitation, not text volume.
+      R4 licence     REPORTED: ceiling 16/470 = 3.40% (v1) -> 19/470 = 4.04%
+                     (v2 nominal) -> 17/470 = 3.62% (v2 hand-checked honest).
+
+    WHY R2 IS NOT WAIVABLE HERE, in the two shapes the waiver was argued:
+
+      (a) "report not barred" is R4's clause, verbatim and only R4's. R2's
+          clause is "Bar: FP <= 1". Reading the waiver one row up the table
+          converts the gate into its own confirmation pass.
+      (b) "the FPs only inflate the upper bound, never deflate" describes the
+          hazard R2 was written to catch, not a mitigation. The banked
+          direction argument holds only for the STRICT rule: an under-count
+          "can only wrongly refuse a spend, never wrongly license one".
+          Loosening reverses it, and the ceiling is what licenses the spend.
+
+    THE DECOMPOSITION IS WORSE THAN THE BAR, and it is the finding worth
+    keeping: 8 of v2's 12 new flags are non-refusal prose rows that do not move
+    the ceiling at all. On the refusal arm — the ONLY population the licence
+    reads — v2 is 1 TP / 3. v2's gains land where they do not count and its
+    errors concentrate where they do.
+
+    AND THE LICENCE PREDICTION IS FALSIFIED INDEPENDENTLY. This block
+    pre-registered ">=21 (>=4.47%)" with the five FNs counted. v2 measured 19
+    (4.04%) nominal and 17 (3.62%) honest — below the pre-registration on both.
+    So even waiving R2 entirely, the flip does not reach the numerator that
+    motivated the work: the spend stays unlicensed either way. The flip would
+    cost the frozen baseline and buy nothing.
+
+    REVIVAL, if any, is a NEW gate with its own pre-registration written before
+    scoring — not a re-tune of this one. The open question A5 actually surfaced
+    is whether the refusal arm needs a different rule from the prose arm, since
+    v2's precision splits ~10/12 overall against 1/3 there. Do not answer it by
+    adjusting RECITE_ALPHA_COVERAGE until that gate exists.
 
 D2 CLOSED BY FIX, 2026-08-25. `judge_answer` now calls
     `longmemeval_adapter.parse_judge_verdict`: word-boundary tokens, first
@@ -567,7 +618,7 @@ def recites_gold_v2(answer: str, gold: str) -> bool:
 
 
 # The rule the audit REPORTS under. Every caller goes through this name, so the
-# four call sites (`rejudge_row`, `free_precheck`, `build_report`,
+# three call sites (`rejudge_row`, `free_precheck`,
 # `write_handcheck_sample_pre`) do not each grow a v1/v2 branch.
 # UNRUN as of 2026-08-25: still v1 until `--verify-recitation` returns a PASS on
 # the banked replies. Flipping this before that verdict would restate the C3
