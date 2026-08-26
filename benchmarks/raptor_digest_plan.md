@@ -460,9 +460,18 @@ the verdict. Re-anchor the watch as follows:
   CORRECTNESS. A low-reuse append row is a cost signal, not a defect. A
   positive `aggregation_keying_residual` is a defect with no tolerance,
   regardless of reuse. Prediction: **residual == 0 on every aggregation row
-  in the new window**; reuse% is NOT predicted (small-churn appends may sit
-  below 90% exactly like Aug-8 era — that is the gate's verdict, not an
-  excuse).
+  in the new window** (correctness half).
+- **COST HALF IS ALSO PREDICTED: reuse% ≥ 90 on the first incremental
+  append.** Rationale: the +91 backlog was consumed by #1303 OUTSIDE the
+  window, so the row this session kicks off is the first incremental append
+  the 90% bar has ever seen on v31+v32 code — the cost mechanism is
+  untested post-fix. If this first row lands reuse < 90% WITH residual == 0,
+  that is NOT a settling artifact and NOT a keying defect: it is a
+  **windowing-confinement finding** (per the 2026-07-05 reversal, an
+  append's churn must stay confined to the still-filling newest tail
+  window; a small Δ re-keying many member sets means the confinement
+  invariant is leaking) and it routes to the plan's windowing re-analysis,
+  not to "extend and ignore".
 - Criterion 6 floor: **n=4 carried, not n=0** — see the carry rule below.
   The banked floor is n≥5 populated; with the carry, ONE more
   residual=0 row reaches it; a bank/pass verdict must not be drawn at
@@ -487,27 +496,40 @@ cost/correctness split:
   gate already draws, written beside the pre-registration — deliberately
   NOT a silent default in the classifier.
 
-**#1183 AMPLIFICATION ANALYSIS — resolved 2026-08-26 (the named
-precondition).** The A-model (`rebuilt ~ A·level0_missed + root + leaf`) is
-**subsumed by the v31 structural forecast** for v31+ rows: the forecast
-predicted `rebuilt` EXACTLY on every v31 row — #1182 9==9, #1183 22==22,
-#1184 8==8, #1303 35==35 — residual=0 on all four. #1183's 7.3/miss is
-therefore NOT amplification: it is a **forecast-exact structural rebuild**,
-the same arrival-driven class as #1303 — **DISCHARGED**. Pre-v31 offenders
-#1178 (12, 4.0/miss) and #1180 (14, 3.5/miss) fall inside the observed
-Δ=1 band (2.2–4.0 per miss, n≥10; the docstring's "~3.3 at #1158" is one
-member of that band, and the retracted earlier estimate is not) —
-**DISCHARGED** under any reasonable leaf-term assignment. #1303's 11.7 is
-not A-dispersion at Δ=91: it too is forecast-exact. **Pre-registered bound
-(envelope, not fit):** for rows without a forecast, A(Δ=1) ≤ 4.0·l0miss —
-the observed Δ=1 maximum from rows OTHER than the one under test; refined
-only by new Δ=1 observations, never by the row it judges.
-**Consequence for the old window:** the 14/17-≥90% signal's three offenders
-are ALL arrival-driven — the FAIL verdict's blocker is the dead-watch (ops,
-now fixed) and criterion 6 n<5, NOT an amplification defect. Criterion
-"100% ≥90%" reads clean in the new window at the same bar; the old window's
-FAIL is preserved as banked (contaminated window, no pass on any criterion),
-but no leftover amplification question now awaits the flip.
+**#1183 — CORRECTNESS discharged, COST still open (re-resolved 2026-08-26
+after an over-reach was pulled back).** One fact only:
+`aggregation_keying_residual == 0` on all four populated rows (#1182,
+#1183, #1184, #1303). By definition `residual = rebuilt − predicted` and
+`rebuilt = built − reused`, so residual == 0 ⟺ rebuilt == predicted —
+four rows are **four instances of one fact** (criterion 6 passing), not
+independent corroboration of a second claim. What it discharges: every
+cache miss on those rows was a genuine member-set change — the
+salt/hash/rowid-shadow class criterion 6 exists to catch is clean.
+What it does NOT discharge: why 22 member sets changed on a Δ=1 append
+(#1183: input_eps 1042→1043, l0miss=3, leaf_changed=1, built 108→106,
+reused 99→84, 79.2%). That is the COST question, and it is live: the
+2026-07-05 oldest-anchored windowing reversal exists to confine an
+append's churn to the still-filling newest tail window — 22 rebuilds from
+one arrival reads like the confinement invariant leaking. The recorded
+`aggregation_leaf_changed=1` splits it partially (some of the 22 may be
+leaf_term — unclustered episodes entering the digest rollup, which move
+on every arrival — rather than the tree proper), but the flag is binary
+and no per-term decomposition is persisted, so that split is qualitative.
+The plan's own routing for this row class: REOPEN THE WINDOWING ANALYSIS
+with the row's `input_eps`/`built` delta as starting evidence — NOT
+"discharge". **Pre-registered bound (fallback ONLY — dead letter inside
+the deciding window):** for rows WITHOUT a forecast, A(Δ=1) ≤ 4.0·l0miss
+(observed Δ=1 max, n≥10; the docstring's "~3.3 at #1158" is one member of
+that band). Every post-v32 row carries a forecast, so the envelope only
+ever applies OUTSIDE the deciding window — kept as a fallback, NOT
+counted as a satisfied precondition.
+**Consequence for the old window:** the three below-bar offenders carry no
+keying-defect evidence (correctness clean on all four rows). The COST
+half is left to the new window: the 90% bar on incremental appends is
+UNTESTED on v31+v32 code (the +91 backlog was consumed by #1303 outside
+the window) — the first post-fix row tests it, outcome pre-registered
+above (reuse ≥ 90 predicted; < 90 with residual == 0 = windowing finding).
+The old window's FAIL stays banked as-is.
 
 **INSTRUMENT GAP — BUILT 2026-08-26, committed separately (see the
 flipwatch-v32 commits).** (b)
