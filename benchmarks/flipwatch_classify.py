@@ -21,9 +21,17 @@ the window gets exactly one label, top to bottom:
   append             input_episodes grew. IN the verdict — this is the failure
                      mode both prior watches died on.
   quiescent          none of the above. IN the verdict.
+  layer-off          built = 0 with aggregation_effective = 'disabled' (v32):
+                     the layer was OFF at dream start, not idle. Excluded from
+                     the verdict like no-agg, but it is a white flag: a window
+                     ending in a long layer-off/no-agg run means the watch
+                     stopped accruing. See the dead-watch guard below.
 
 Rows that did no aggregation work (lock-skips, errors, built = 0) are excluded
-as `no-agg` and never reach the gate.
+as `no-agg` / `layer-off` and never reach the gate — BUT the gate hard-FAILs
+on a run of >= 5 consecutive such rows (dead-watch guard, banked 2026-08-26):
+the window is not evidence either way, and the reader hears that instead of a
+silent exclusion.
 
 Usage (on the box, store is opened read-only):
   python flipwatch_classify.py \
@@ -132,13 +140,15 @@ BASE_COLUMNS = (
 
 # Optional columns, read when present and NULL-filled when not, so an older
 # store still classifies exactly as it did before — just with those channels
-# unattributed. v29 = deficit attribution, v31 = the structural forecast.
+# unattributed. v29 = deficit attribution, v31 = the structural forecast,
+# v32 = effective aggregation layer state at dream start.
 OPTIONAL_COLUMNS = {
     "level0_missed": "aggregation_level0_missed",
     "leaf_changed": "aggregation_leaf_changed",
     "predicted": "aggregation_predicted_rebuild",
     "residual": "aggregation_keying_residual",
     "facts_rekey": "aggregation_facts_rekey",
+    "effective": "aggregation_effective",
 }
 
 
@@ -233,10 +243,19 @@ def check_episodes(db: Path, since: str) -> dict:
     return out
 
 
-def render_episodes(eps: dict, has_append: bool, since: str) -> list[str]:
+def render_episodes(eps: dict, rows: list[dict], since: str) -> list[str]:
     """Render the append-capability read. This is a diagnosis of the evidence,
     not a gate criterion — it says whether the window COULD have produced the
-    append rows the gate wants."""
+    append rows the gate wants.
+
+    The honest quantity is NOT the window's total episode growth: episodes
+    that arrive after the last aggregation row (or during a no-agg/dead
+    stretch) never entered an `input_eps` delta on any row the gate read, so
+    they are untested by construction. The tested quantity is the sum of
+    `input_eps` deltas across the window's aggregation rows — printed
+    alongside the raw growth so a window split in two (growth during a dead
+    era + small tested appends) cannot read as "append genuinely exercised".
+    """
     lines = ["**Append capability (store growth during the window)**", ""]
     for key in ("episodes", "messages", "sessions"):
         row = eps.get(key, {})
@@ -249,6 +268,21 @@ def render_episodes(eps: dict, has_append: bool, since: str) -> list[str]:
             )
     new_eps = (eps.get("episodes", {}) or {}).get("in_window") or 0
     new_msgs = (eps.get("messages", {}) or {}).get("in_window") or 0
+
+    # Aggregation-visible growth: sum of positive input_eps deltas across
+    # aggregation rows only (the rows the gate actually read).
+    delta_sum = 0
+    churns: list[int] = []
+    prev: int | None = None
+    for r in rows:
+        if r.get("built") and not r.get("skipped_locked") and not r.get("error"):
+            if prev is not None:
+                d = r["input_eps"] - prev
+                if d > 0:
+                    delta_sum += d
+                    churns.append(d)
+            prev = r["input_eps"]
+    has_append = any(r["label"] == "append" for r in rows)
     lines.append("")
     if new_eps == 0 and new_msgs > 0:
         lines.append(
@@ -274,11 +308,35 @@ def render_episodes(eps: dict, has_append: bool, since: str) -> list[str]:
             "dream row shows input_eps growth. Suspect the attribution column or the "
             "snapshot ceiling before trusting any reuse number."
         )
-    else:
+    elif new_eps > 0 and delta_sum == 0:
         lines.append(
-            f"Store grew by {new_eps} episode(s) during the window and the verdict "
-            "set contains append rows — the append criterion was genuinely exercised."
+            f"**UNTESTED**: {new_eps} episode(s) created in the window, but "
+            f"{delta_sum} of them entered an input_eps delta on any aggregation row "
+            "the gate read. All growth arrived during a no-agg/dead stretch (or after "
+            "the last aggregation row) — the append criterion was NOT exercised, no "
+            "matter what the total says."
         )
+    elif new_eps > 0:
+        unseen = new_eps - delta_sum
+        churn_str = (
+            f"{len(churns)} appended, churn {min(churns)}–{max(churns)}"
+            if churns else "no positive deltas"
+        )
+        if unseen > 0:
+            lines.append(
+                f"Store grew by {new_eps} episode(s); the verdict rows account for "
+                f"{delta_sum} of them ({churn_str}). Of the remaining {unseen}, "
+                "episodes arrived after the last aggregation row (or during a "
+                "no-agg/dead stretch) and never entered an input_eps delta on any row "
+                "the gate read — UNTESTED by construction. The tested quantity is the "
+                f"{delta_sum}."
+            )
+        else:
+            lines.append(
+                f"Store grew by {new_eps} episode(s) during the window and every one "
+                f"appears in an aggregation row's input_eps delta ({churn_str}) — the "
+                "append criterion was genuinely exercised."
+            )
     return lines + [""]
 
 
@@ -376,8 +434,18 @@ def classify(rows: list[dict], heal_grace: bool = True) -> list[dict]:
             out.append(rec)
             continue
         if not row["built"]:
-            rec["label"] = "no-agg"
-            rec["note"] = "no aggregation work"
+            effective = row.get("effective")
+            if effective == "disabled":
+                rec["label"] = "layer-off"
+                rec["note"] = "layer disabled (effective config at dream start)"
+            elif effective == "enabled":
+                rec["label"] = "no-agg"
+                rec["note"] = ("layer enabled, no aggregation work — read the "
+                               "dead-watch streak check")
+            else:
+                rec["label"] = "no-agg"
+                rec["note"] = ("no aggregation work (pre-v32 layer state "
+                               "unrecorded)")
             out.append(rec)
             continue
 
@@ -471,7 +539,37 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
     # excused (a confirmed salt bump legitimately re-keys a whole tree) — the
     # same carve-out label 1 already gets, and a SECOND refusion is labelled
     # `unclassifiable`, so it stays in scope here.
-    agg_rows = [r for r in rows if r["label"] != "no-agg"]
+    # Rows that ran no aggregation at all — no-agg (nothing to do / pre-v32
+    # unknown) or layer-off (v32 says the layer was disabled). Neither is an
+    # aggregation row: attribution, criterion 6 and the distribution must not
+    # read them.
+    non_agg = ("no-agg", "layer-off")
+
+    # Dead-watch guard (banked 2026-08-26 WITH the layer-state column, before
+    # any post-fix row existed): a run of no-agg/layer-off rows inside the
+    # window means the watch stopped accruing. 118 consecutive such rows
+    # produced "pending on accrual" for 18 days while nothing could accrue —
+    # silent exclusions. Any run >= MIN_VERDICT_ROWS is a hard ops FAIL: the
+    # window is not evidence either way and the reader must be told why, not
+    # left with an empty answer.
+    streak = worst = 0
+    worst_from = worst_to = -1
+    for i, r in enumerate(rows):
+        if r["label"] in non_agg:
+            streak += 1
+            if streak > worst:
+                worst, worst_from, worst_to = streak, i - streak + 1, i
+        else:
+            streak = 0
+    dead_rows = [r for r in rows if r["label"] in non_agg]
+    dead_layers: dict[str, int] = {}
+    for r in dead_rows:
+        key = r.get("effective") or "unrecorded (pre-v32)"
+        dead_layers[key] = dead_layers.get(key, 0) + 1
+    dead_layers_str = ", ".join(f"{k}: {v}" for k, v in sorted(dead_layers.items()))
+    dead_fail = worst >= MIN_VERDICT_ROWS
+
+    agg_rows = [r for r in rows if r["label"] not in non_agg]
     keying_offenders = [
         r for r in agg_rows
         if (r["residual"] or 0) > 0 and r["label"] != "deploy-refusion"
@@ -499,6 +597,10 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
         f"{len(unclassifiable)}" + ids(unclassifiable),
         f"- [{mark(len(verdict_rows) >= MIN_VERDICT_ROWS)}] sanity floor: >= "
         f"{MIN_VERDICT_ROWS} verdict rows — {len(verdict_rows)}",
+        f"- [{mark(not dead_fail)}] dead-watch guard: no run of >= "
+        f"{MIN_VERDICT_ROWS} consecutive no-agg/layer-off rows — longest {worst}"
+        + (f" (#{rows[worst_from]['id']}–#{rows[worst_to]['id']})" if worst else "")
+        + (f"; layer readout: {dead_layers_str}" if dead_rows else ""),
         f"- [{keying_mark()}] keying integrity: zero rows with "
         f"aggregation_keying_residual > 0 — found {len(keying_offenders)}"
         + ids(keying_offenders)
@@ -519,6 +621,13 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
             f"**thin append coverage**: only {len(appends)} append row(s) "
             f"({', '.join('#' + str(r['id']) for r in appends)}). Prefer a few more "
             "before flipping."
+        )
+    if dead_rows and not dead_fail:
+        advisories.append(
+            f"**no-agg presence**: {len(dead_rows)} no-agg/layer-off row(s), "
+            f"longest run {worst} (threshold {MIN_VERDICT_ROWS}); layer "
+            f"readout: {dead_layers_str}. Confirms the window accrues, but read "
+            "it against the append read above."
         )
     if any(r["label"] == "failure-heal" for r in rows):
         advisories.append(
@@ -559,7 +668,8 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
             "unexplained REBUILDS), but it means two levels share a member set, "
             "which makes the level key load-bearing. Worth a look, not a block."
         )
-    keying = [r for r in rows if r["label"] != "no-agg" and (r["residual"] or 0) > 0]
+    keying = [r for r in rows if r["label"] not in non_agg
+              and (r["residual"] or 0) > 0]
     if keying:
         advisories.append(
             f"**keying residual**: {len(keying)} row(s){ids(keying)} rebuilt nodes "
@@ -579,7 +689,8 @@ def gate(rows: list[dict]) -> tuple[str, list[str], list[str]]:
             "FAIL as a fusion-path defect."
         )
 
-    hard_fail = bool(below or blocking or unclassifiable or keying_offenders)
+    hard_fail = bool(below or blocking or unclassifiable or keying_offenders
+                     or dead_fail)
     if not hard_fail and (len(verdict_rows) < MIN_VERDICT_ROWS or residual_pending):
         # Too few rows, or criterion 6 not yet answerable. Both mean "extend the
         # watch", never "flip" — an unattributed residual is not a clean one.
@@ -595,7 +706,7 @@ def render_attribution(rows: list[dict]) -> list[str]:
     no deficit to attribute, and folding them in would dilute the very
     dispersion the future bound has to be set from.
     """
-    agg = [r for r in rows if r["label"] != "no-agg"]
+    agg = [r for r in rows if r["label"] not in ("no-agg", "layer-off")]
     # The ratio distribution is read ONLY off verdict rows. A refusion or a
     # fusion-failure row also has a level0_missed and therefore also has a
     # ratio, but its rebuild is charged to a salt bump or to failed fusions —
@@ -718,9 +829,7 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
         ]
 
     if eps:
-        lines += render_episodes(
-            eps, any(r["label"] == "append" for r in rows), since
-        )
+        lines += render_episodes(eps, rows, since)
 
     lines += [
         "| id | started_at | built | reused | reuse% | fail | input_eps | blocking "
@@ -791,7 +900,9 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
         lines += [
             "Do NOT flip. Bank this as another failed-watch RESULT and route by "
             "label (§0.3): `blocking-flip` -> env parity (sqlite-vec on both trigger "
-            "paths); a `failure` streak -> LLM transport/retry work; an "
+            "paths); a `no-agg`/`layer-off` streak -> launcher env / layer state "
+            "(the dead-watch guard is FAILing for a reason); a "
+            "`failure` streak -> LLM transport/retry work; an "
             "`unclassifiable` row -> reopen the windowing analysis with that row's "
             "`input_eps`/`built` delta as the starting evidence; a criterion-6 "
             "offender -> keying, NOT membership (salt bump, hash instability, "
@@ -860,7 +971,7 @@ def main() -> int:
         fields = ["id", "started_at", "built", "reused", "reuse_pct", "failures",
                   "input_eps", "blocking", "level0_missed", "leaf_changed", "rebuilt",
                   "ratio", "attr_state", "predicted", "residual", "facts_rekey",
-                  "skipped_locked", "error", "label", "note"]
+                  "effective", "skipped_locked", "error", "label", "note"]
         with args.csv.open("w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()

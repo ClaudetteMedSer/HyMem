@@ -1,0 +1,20 @@
+-- v32: effective aggregation layer state, recorded per dream row.
+--
+-- Why this column exists (2026-08-26). The FLIP-WATCH died twice on the same
+-- class of defect: `aggregation_nodes_enabled` defaults to False
+-- (config.py), so an env var unset in the executors that actually run dreams
+-- silently disables the layer, and dream_runs built==0 reads as "no
+-- aggregation work" — indistinguishable from "the layer was off". The box
+-- had three trigger paths (honcho launch, periodic hymem-dream.sh, MCP
+-- server wrapper) carrying two different layer states for 18 days: 118
+-- consecutive no-agg rows while the tree stayed frozen.
+--
+-- One nullable column from the EFFECTIVE config at dream start makes
+-- "layer on, nothing to do" vs "layer off" observable per row, and lets the
+-- flip-watch classifier hard-FAIL on a no-agg streak instead of silently
+-- excluding it.
+--
+-- NULL = pre-v32 row (layer state unrecorded). 'enabled'/'disabled' are the
+-- only values the runner writes; they mirror the effective
+-- aggregation_nodes_enabled at dream start, after env resolution.
+ALTER TABLE dream_runs ADD COLUMN aggregation_effective TEXT;

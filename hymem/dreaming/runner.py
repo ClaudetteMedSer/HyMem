@@ -137,7 +137,9 @@ def run_dreaming(
     holder = f"{socket.gethostname()}:{os.getpid()}"
 
     run_id = conn.execute(
-        "INSERT INTO dream_runs(started_at) VALUES (CURRENT_TIMESTAMP)"
+        "INSERT INTO dream_runs(started_at, aggregation_effective) "
+        "VALUES (CURRENT_TIMESTAMP, ?)",
+        ("enabled" if cfg.aggregation_nodes_enabled else "disabled",),
     ).lastrowid
 
     if not _acquire_lock(conn, holder):
