@@ -386,6 +386,93 @@ near-full on runs 2..N — that ratio is the flip signal. The flip itself stays
 the one-line config-default change, now backed by data rather than the demo
 pass.*
 
+**FLIP-WATCH RESULT — v4 run, 2026-08-26** (window `--since 2026-08-08`, `--check-episodes` on, 135 window rows, 17 verdict rows, floor ≥5 met).
+**G-FLIP: FAIL.** 14/17 at reuse ≥90%. Offenders: **#1178 = 88.8%, #1180 = 87.0%,
+#1183 = 79.2%** (all Aug-8 deploy-day rows; #1178/#1180 ran pre-v31). Zero
+blocking-flips, zero failure rows, zero unclassifiable rows. Criterion 6 n=3
+(#1182–#1184, all residual=0 — clean, but under the 5-row floor).
+Verdict recorded as FAIL; NOT banked as a pass on any criterion — the window
+is contaminated (see env-parity note below). CSV
+`~/.hermes/benchmarks/flipwatch_2026-08.csv`, full write-up
+`benchmarks/flipwatch_result.md`.
+
+**APPEND-CAPABILITY CORRECTION (2026-08-26).** The "store grew 106 / append
+genuinely exercised" line was a window-aggregate instrument artifact, and it
+was wrong. The honest quantities: **(a) verdict-set-visible append = +15
+episodes** — summed `aggregation_input_episodes` deltas over the surviving
+aggregation rows (#1169–#1184), all at churn **+1**; **(b) 91 episodes**
+arrived during the dead era (`episodes.created_at >= 2026-08-09 22:16` = 91,
+matching the #1303 delta) and never entered any verdict row's delta. So the
+append criterion is exercised at granularity +1 only; the +91 backlog churn
+was untested by the verdict set. The only sub-bar v31 append evidence remains
+**#1183 = 79.2%** — which raises, not lowers, the stakes on its amplification
+analysis. Same class as the third watch's paper pass: a window-aggregate check
+cannot see a defect that splits the window in two.
+
+**#1303 — env-parity artifact row (recorded, NOT excused).** `2026-08-26
+09:43:19–09:45:55`: input 1044→1135 (delta +91), built=103, reused=68
+(66.0%), failures=0, blocking=knn, level0-missed=3, leaf-changed=1,
+**predicted=35 == rebuilt=35, residual=0**. It ran on the flag-carrying MCP
+path BEFORE the launcher fix, so it is not "the settling dream" of the
+re-enabled layer and gets no excusal label. Recorded because it is real
+aggregation data: criterion 6 held (residual 0) through a +91 append, and the
+structural forecast was exact. With it, criterion 6 has n=4 populated values
+(all residual=0) — still under the 5-row floor.
+
+**ENV-PARITY DEFECT — the real reason the watch died (this is the keystone).**
+Three executors carried two different layer states:
+| path | flag | since |
+|---|---|---|
+| honcho (post-restart.sh launch) | OFF — `config.py:112` default, var absent; `build_from_env` reads `os.environ` only, no dotenv | restart 2026-08-09 22:16 |
+| periodic `hymem-dream.sh` | OFF — `HyMemConfig` default; it sources `/home/node/.hymem.env` which did not exist | all along |
+| MCP server (`hymem-server-wrapper:14`) | ON — `export HYMEM_AGGREGATION_NODES_ENABLED=true` | wrapper changed 2026-08-10 19:48 |
+
+Consequence: **118 consecutive no-agg rows (#1185–#1302, 2026-08-09 22:16 →
+2026-08-26 08:58)** — silent exclusions, indistinguishable from "nothing to
+do" in the classifier (`flipwatch_classify.py:377-380`). This is the second
+time an unset env var has zeroed this watch (cf. the 2026-06-13 0/0 columns
+and the 2026-06-17 "ENABLE PATH LANDED" note; the flat-34 "steady-state
+reuse" was a demo script, not production). The fragility: `False` default =
+unset var silently disables the layer, and the flip that removes that
+fragility is gated on the watch the fragility keeps killing.
+
+**FIX LANDED 2026-08-26** — all three paths now agree, flag ON:
+1. `post-restart.sh` honcho launch: var added above the env block (bash -n
+   clean; honcho restarted, `/proc/<pid>/environ` + `/health` verified).
+2. `/home/node/.hymem.env` created with the var (the file the periodic script
+   sources — it did not exist).
+3. `hymem-dream.sh`: exports the var before sourcing (with a comment; layered
+   env-line comments break `env` — keep them OUTSIDE continuation lists).
+
+**PRE-REGISTRATION — post-fix window (banked 2026-08-26, BEFORE any post-fix
+row exists).** The first dreams after the fix are ordinary append rows: no
+new label, no "settling"/"deploy-refusion" excusal (no salt bump), they are IN
+the verdict. Re-anchor the watch as follows:
+- `--since 2026-08-26 11:15` — after the last env-split row (#1303 ended
+  09:45:55) and after all three paths agree.
+- `--restart-reason "env-parity defect fixed 2026-08-26: all three trigger
+  paths (post-restart.sh, hymem-dream.sh, MCP wrapper) now pass
+  HYMEM_AGGREGATION_NODES_ENABLED=true; rows before 2026-08-26 11:15 are
+  artifacts of the split (honcho+cron OFF since 2026-08-09 22:16, MCP ON
+  since 2026-08-10 19:48)"`.
+- **Excuse reuse%, never criterion 6.** Reuse% gates COST, residual gates
+  CORRECTNESS. A low-reuse append row is a cost signal, not a defect. A
+  positive `aggregation_keying_residual` is a defect with no tolerance,
+  regardless of reuse. Prediction: **residual == 0 on every aggregation row
+  in the new window**; reuse% is NOT predicted (small-churn appends may sit
+  below 90% exactly like Aug-8 era — that is the gate's verdict, not an
+  excuse).
+- Criterion 6 floor: n=4 today (#1182–#1184, #1303). The banked floor is
+  n≥5 populated → one more residual=0 row reaches it; a bank/pass verdict
+  must not be drawn at n=4.
+
+**INSTRUMENT GAP — remains to be built (separate commit, 2026-08-26).** (b)
+one nullable column set from the effective config at dream start
+(`aggregation_effective`), plus a classifier label that hard-FAILs on a
+no-agg streak (≥5 consecutive, tail-of-window) instead of silently excluding.
+`MIN_VERDICT_ROWS` is implemented — the sanity floor is fine; the hole is
+that `built == 0` is indistinguishable from "layer switched off".
+
 ---
 
 ## Stage 4 — Query-time consumption v2 (only after Stage 3)
