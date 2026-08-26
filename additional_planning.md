@@ -2546,6 +2546,89 @@ SAME commit, or Grove E2's `anchor_delta` silently goes wrong. The two new
 probes have no such coupling (the Stage 0 probe imports production
 `_anchor_facts` for its CURRENT arm rather than re-implementing it).
 
+#### G-DS1 — digest-staleness gate, PRE-REGISTERED 2026-08-26, **CONDITIONAL / not runnable on the box today**
+
+Written before any fix exists, so it can never be shaped around one. Filed
+**blocked**, not open: with F1 refused, F2 dead and F3 (below) incoherent, there
+is currently no live fix for it to accept and no population on the box to run it
+against.
+
+**Established by reading the code, not by measurement.** `aggregate.py:801-836`
+— profile leads, `remaining = cap - len(profile)`, `if remaining <= 0: return
+profile`. `load_profile(conn, cap=20)` truncates at 20
+(`user_profile.py:343`), so 23 active rows give `n_profile=20` → `remaining=0` →
+ZERO graph edges. `aggregate.py:1240-1242` — `facts_hash =
+sha1(facts_block)[:12]`, `root_id = _node_id(member_ids,
+salt=f"{_ROOT_SALT}|{facts_hash}")`. So the root cache id is a function of
+(member set, profile rows) ONLY: a graph change with stable membership and
+stable profile leaves `root_id` untouched, the cache hits, nothing regenerates.
+Both contracts' promise is broken. **This is a proof and needs no gate.**
+
+**Correction to the framing this defect was carried under.** "A graph change
+cannot regenerate the digest — the price both contracts say they are paying to
+avoid" is right about the broken promise and wrong about the price, and the
+difference decides which fix is even coherent. Under saturation the graph edges
+are NOT IN THE FUSION INPUT AT ALL. The cached digest is therefore not stale
+relative to its inputs — it is correctly cached over inputs that never contained
+the graph. Invalidating the cache key on a graph change would re-run the fusion
+with a BYTE-IDENTICAL prompt, paying a fresh LLM call for nondeterministic
+variation on the same content.
+
+**Consequence: staleness is DOWNSTREAM of the squeeze, not independent of it.**
+It is a real, observable phenomenon only where edges reach the block, i.e. where
+`edge_budget > 0`. This kills the one fix shape S1 had not already refused:
+
+| fix | status |
+|---|---|
+| F1 separate budgets | **REFUSED** — S1-C1, 2/10 vs bar >=3/10 |
+| F2 reserved edge floor | **DEAD, stronger reason** — displacement harm for a 2/10 benefit |
+| F3 salt-only / cache-key (fold a graph-state hash into the root salt without changing the block) | **INCOHERENT under saturation** — identical prompt, pure LLM churn |
+
+**The gate itself.**
+
+*Population.* Consecutive dream pairs where (a) the root's member set is
+identical across the pair, (b) the active profile row set is identical, and
+(c) **`edge_budget > 0` in both dreams**. Condition (c) is what makes the gate
+self-scoping: the population is EMPTY on the box today, non-empty on conv-26
+(16 profile → 4 edge slots), and becomes non-empty on the box only if a cap fix
+lands or the profile is pruned below 20.
+
+*Arms.* Treatment = pairs where the top-`remaining` eligible edge slice changed.
+Control = pairs where it did not.
+
+*Criterion.* Treatment: `root_id` changes on >= 90% of pairs. Control: `root_id`
+changes on **0** pairs.
+
+*Predictions.* Under a working fix, treatment ~ N/N and control 0/N. Under the
+defect **both arms read 0** — the arms are indistinguishable, and that
+indistinguishability IS the finding. Control showing ANY change voids the run
+(filter (a) or (b) is broken): the built-in vacuity detector, in the shape the
+diagnostic-controls lesson demands.
+
+*Gate on `root_id`, never on digest text* — text can coincidentally match; the
+cache id is the mechanism.
+
+*Instrument, per dream (read-only, zero LLM, counts-only reporting — digest text
+never leaves the box):* `n_profile`, `edge_budget`, `facts_block`, `facts_hash`,
+`root_id`, root member-set hash, and a hash of the top-N eligible edges under
+the production ordering.
+
+*Floor.* n>=5 treatment pairs, n>=3 control, mirroring the criterion-6 floor.
+
+**Sequencing.** Land nothing here before G-FLIP resolves. Every candidate fix
+changes `facts_hash` behaviour, which changes root regeneration frequency, which
+changes aggregation reuse% — the metric the flip watch is accruing on right now.
+A fix landed mid-watch contaminates the window the same way the launcher env
+loss killed the last one.
+
+**What this actually reopens.** Not a separate defect with its own repair: the
+SQUEEZE, with staleness as an additional argument in that gate's favour. Any
+revival must re-size the cap pair first (S1-C4 sits at 40/40, zero headroom) and
+must move `recovery_probe.measure_recovery`'s `remaining = cap - n_profile`
+(`benchmarks/recovery_probe.py:184-188`) in the SAME commit — that mirror is
+currently CORRECT (`_anchor_edge_facts` guards `limit <= 0 -> []`), and an
+F1/F2-shaped fix is exactly what breaks it.
+
 ### E3 — Trajectory-based resurfacing for retracted facts
 
 **Adaptation:** when dreaming's re-assertion path re-proposes a

@@ -550,6 +550,78 @@ is nothing for them to crowd, covering vague/global/cold-start queries ("what do
 about my projects?") that LME never asks. Config: `aggregation_fallback_min_hits`
 (0 disables). Tests offline; no LME run (invariant 1).
 
+**4a BUILD SPEC (written 2026-08-26, UNBUILT — do not land a default change
+before the 3c flip resolves).** Code sites confirmed against HEAD: the gate to
+amend is `augment.py:584`
+(`if cfg.aggregation_nodes_enabled and _aggregation_tier_fires(cfg, ability):`),
+the ability predicate is `_aggregation_tier_fires` (`augment.py:2209-2218`), and
+the knob belongs beside `aggregation_inject_abilities` (`config.py:208`). The
+tier ordering already works: `ctx.fts_hits` (set at `augment.py:441-466`),
+`ctx.message_hits` (:531) and `ctx.episodes` (:560) are all populated before the
+aggregation gate at :584, so the thinness test reads live counts with no
+reordering.
+
+*Shape.* New `aggregation_fallback_min_hits: int = 0` (0 disables — 4a ships
+inert). Gate becomes
+`if cfg.aggregation_nodes_enabled and (_aggregation_tier_fires(cfg, ability) or _sparse_signal_fires(cfg, ctx))`.
+
+Three properties, ordered by how easy they are to get wrong:
+
+1. **Strict OR, never a relaxation.** The G4 A/B is what pinned
+   `aggregation_inject_abilities` to TR-only: broad injection reshuffles ranking
+   against gold turns. 4a's whole licence is "nodes appear when there is nothing
+   to crowd", so the fallback must be an INDEPENDENT condition that only ever
+   adds firings on starved queries. It must never widen, soften or bypass the
+   ability gate for a query that already has hits.
+2. **Thinness is one named function.** `_raw_signal_count(ctx)`, so the
+   definition lives in one place and is directly testable. Ship this section's
+   spec (`len(message_hits) + len(fts_hits)`) as the default.
+3. **Provenance on the firing mode.** A fallback firing tags its hits
+   (`why_retrieved += ["sparse_fallback(raw=N)"]`). Ability-gated and
+   fallback-gated firings have completely different expected effects; without
+   the chip no later A/B can separate them. Cheap now, unrecoverable later.
+
+> **Pre-registered open choice, flagged not decided:** whether `ctx.episodes`
+> joins the thinness count. The readings point opposite ways — EXCLUDING
+> episodes (this section's text) fires the tier when a dreamed store already has
+> session summaries covering the query, i.e. when nodes are REDUNDANT rather
+> than crowding; INCLUDING them means the fallback almost never fires on a
+> mature store, i.e. 4a is inert in practice rather than merely default-off.
+> Ship the excluding variant, record the including variant with its reason, and
+> decide any switch on a stated argument. **Do not decide it by trying both and
+> keeping the better number.**
+
+*Reachability caveat — belongs in the code, not only here.* With
+`aggregation_nodes_enabled=False` (production, and staying so until the flip)
+the entire 4a path is UNREACHABLE in production. That is intended, but this
+project has been burned by a guard reading PASS because its path was unreachable
+from the config under test (see the E3 gates lesson). So: every 4a test must
+construct a config with BOTH the master switch and the fallback ON — a test that
+exercises 4a with the layer off tests nothing and passes regardless — and the
+`aggregation_fallback_min_hits` docstring must say it is subordinate to
+`aggregation_nodes_enabled` and inert until the 3c flip.
+
+*Test matrix (offline, zero LLM, invariant 1 respected).*
+
+| # | config | expect |
+|---|---|---|
+| 1 | fallback=0 (default), layer ON | firing set identical to today's TR-only — the inert-default regression guard |
+| 2 | layer ON, fallback=2, ability=None, 0 raw hits, nodes exist | fires; hits carry the `sparse_fallback` chip |
+| 3 | layer ON, fallback=2, ability=None, 3 raw hits | does NOT fire |
+| 4 | layer ON, fallback=2, ability="TR", 10 raw hits | fires via the ability gate; chip attributes to ability, not fallback |
+| 5 | **layer OFF**, fallback=5, 0 raw hits | does NOT fire — the master switch dominates |
+| 6 | fallback firing vs same query fallback off | `message_hits` / `fts_hits` / `episodes` BYTE-IDENTICAL |
+| 7 | raw hits == min_hits exactly | does not fire (strict `<`), documented |
+| 8 | fallback fires, zero nodes built | returns `[]`, no error |
+
+Test 6 is what earns the feature: it turns "nodes appear when there is nothing
+to crowd" from a claim into a mechanical assertion. Tests 1 and 5 together are
+what let 4a land DURING the flip watch without touching it.
+
+*Cost.* The fallback runs `_aggregation_search` (FTS + a vec scan bounded by
+`embedding_max_scan`) on starved queries. No LLM call. Assert the call count,
+not wall-clock.
+
 **4b. Drill-down API.** `HyMem.expand_node(node_id)` → member episodes (and for ≥1
 levels, child nodes) — the RAPTOR tree-traversal read. `member_episode_ids` already
 persisted; this is a thin read-only accessor + tests. Lets a host show "why does my
