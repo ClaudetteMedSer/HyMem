@@ -41,8 +41,21 @@ def _digest_llm(
 
 
 def _digest_calls(llm: StubLLMClient) -> list:
-    """The subset of recorded calls that hit the batched digest prompt."""
-    return [c for c in llm.calls if "Return the JSON object now" in c.user]
+    """The subset of recorded calls that hit the batched SESSION digest prompt.
+
+    Discriminated on the system prompt, not on the "Return the JSON object now"
+    user-tail marker: that marker is shared by the RAPTOR ROOT digest fusion
+    ("You write the standing digest ..."), which became a default-on call when
+    `aggregation_nodes_enabled` flipped True on 2026-08-26. These tests measure
+    session-digest BATCHING (one tail call per session, not three); counting an
+    unrelated subsystem's call against that bar reads as a batching regression
+    that never happened.
+    """
+    return [
+        c for c in llm.calls
+        if "Return the JSON object now" in c.user
+        and c.system.startswith("You analyze one conversation session")
+    ]
 
 
 def _seed_session(hy: HyMem, sid: str, turns: list[tuple[str, str]]) -> None:

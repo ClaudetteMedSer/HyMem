@@ -357,6 +357,14 @@ class HyMemAdapter:
             overrides["facts_enabled"] = self.facts_enabled
         if self.facts_extraction is not None:
             overrides["facts_extraction_enabled"] = self.facts_extraction
+        # RAPTOR aggregation layer: pinned OFF explicitly. The config default
+        # flipped False -> True on 2026-08-26 (G-FLIP PASS); this benchmark was
+        # a default-config consumer, so without the pin the flip would silently
+        # switch the layer + digest ON and the canonical baseline would stop
+        # being comparable to every run behind it. Moving a benchmark onto the
+        # shipped config is a pre-registered scored decision, not a side effect
+        # of a default change.
+        overrides["aggregation_nodes_enabled"] = False
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,  # raw message keyword hits — critical for BEAM

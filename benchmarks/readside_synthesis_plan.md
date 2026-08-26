@@ -112,6 +112,30 @@ extend the watch instead of deciding — the gate needs at least 5 verdict rows.
 
 ### 0.4 On PASS — the flip (one-line build + doc ripple)
 
+> **DONE 2026-08-26 — G-FLIP PASSED (7/7, re-anchored window, 5 verdict rows,
+> min reuse 91.3%) and every step below is executed.** Result table + verdict
+> banked in `raptor_digest_plan.md` (Stage 3c FLIP-WATCH RESULT, v6). Steps 1-3
+> and 5 landed in one commit; step 4 (post-flip verification on the box) is the
+> only item still pending an observation.
+>
+> Two amendments the flip made to this section as written:
+> - **Step 4 is a WEAK test, not a confirmation.** Prod has run with the layer
+>   ON via env on all three launch paths since the same-day env-parity fix, so
+>   the effective config is unchanged and the verification dream cannot fail for
+>   flip-related reasons. High reuse there is near-guaranteed and is not
+>   evidence for the flip; a refusion means something else moved.
+> - **Step 3 needed a fourth item this section did not list.** The flip changes
+>   every DEFAULT-CONFIG consumer, and three benchmark adapters were exactly
+>   that: `msc_adapter` (reused wholesale by `locomo_adapter`) and
+>   `beam_adapter` never pinned the flag, so the one-line change would have
+>   silently switched the layer + digest ON for the LoCoMo / MSC / BEAM dream
+>   path and broken comparability with the canonical baselines behind them.
+>   Both now pin `aggregation_nodes_enabled=False` in the same commit.
+>   `longmemeval_adapter:532` already pinned True. Generalize the lesson: a
+>   config-DEFAULT flip has a blast radius the size of its default-config
+>   consumer set, and that set is not what the gate measured.
+
+
 1. `hymem/config.py:112` — `aggregation_nodes_enabled: bool = False` → `True`,
    docstring updated to record the flip date + gate evidence pointer.
    Bootstrap semantics already do the right thing (`hymem/bootstrap.py:86`: an

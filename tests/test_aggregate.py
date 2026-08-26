@@ -587,7 +587,11 @@ def test_build_is_noop_when_disabled(conn, cfg):
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres", "billing"])
         _seed_episode(conn, "e2", "s2", "t2", "s", ["postgres", "billing"])
-    built = build_aggregation_nodes(conn, cfg, _agg_llm(), None).nodes  # cfg disabled by default
+    # The layer defaults ON since the 2026-08-26 G-FLIP flip, so this arm has to
+    # switch it OFF explicitly. The test's claim is unchanged: master switch off
+    # => build is a no-op.
+    disabled = replace(cfg, aggregation_nodes_enabled=False)
+    built = build_aggregation_nodes(conn, disabled, _agg_llm(), None).nodes
     assert built == 0
     assert conn.execute("SELECT COUNT(*) AS c FROM aggregation_nodes").fetchone()["c"] == 0
 

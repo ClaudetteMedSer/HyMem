@@ -14,7 +14,10 @@ only needed while running an **older** HyMem server.
 **Checklist (current HyMem):**
 
 1. Upgrade HyMem to a build at or after 2026-07-06 (dual-field peer-context response; the session-context wiring from commit `0b5eb55` is older still) (§Prerequisites).
-2. `HYMEM_AGGREGATION_NODES_ENABLED=true` in the HyMem server environment, then let one dream run (§Prerequisites).
+2. **Legacy (pre-2026-08-26 builds only).** `HYMEM_AGGREGATION_NODES_ENABLED=true` in the HyMem
+   server environment. The config default flipped to **True** on 2026-08-26 (RAPTOR Stage 3c,
+   G-FLIP PASS), so on a current build the layer is on without it and the var is now an explicit
+   **OFF** switch. Still let one dream run before expecting a digest (§Prerequisites).
 3. **Pin `HYMEM_LLM_MODEL` explicitly** (and `HYMEM_EMBEDDING_MODEL`) rather than
    relying on the shipped default. Model names get hard-deprecated out from
    under a running server — `deepseek-chat` was, on 2026-07-24 — and a dead
@@ -106,12 +109,18 @@ Two HyMem-side fixes matter:
 The digest only exists if the RAPTOR aggregation layer is on. In the HyMem
 server's environment:
 
+On a build at or after **2026-08-26** the layer is **on by default**
+(`aggregation_nodes_enabled` flipped False → True on the Stage 3c G-FLIP PASS)
+and nothing needs setting. The env vars are now explicit overrides:
+
 ```bash
-export HYMEM_AGGREGATION_NODES_ENABLED=true
+# Only needed to turn things OFF, or on a server older than 2026-08-26:
+export HYMEM_AGGREGATION_NODES_ENABLED=true   # legacy: required pre-2026-08-26
 # HYMEM_AGGREGATION_DIGEST_ENABLED defaults on — only set it to turn the digest OFF
 ```
 
-Without the master switch, `HyMem.digest()` is `None` and
+Without the master switch (an older build with the var unset, or a current
+build with it explicitly false), `HyMem.digest()` is `None` and
 `peer_representation` is byte-for-byte plain `USER.md` — the patch below is
 then harmless but does nothing visible.
 

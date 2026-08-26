@@ -109,18 +109,43 @@ class HyMemConfig:
     of `ProcedureHit`s than the default `fts_top_k`. Other abilities keep
     `fts_top_k`."""
 
-    aggregation_nodes_enabled: bool = False
-    """Master switch for the Phase-2 RAPTOR cross-session aggregation layer (off
-    by default). When True, dreaming clusters episodes across sessions
-    (connected components over embedding-OR-entity overlap) and fuses each
-    multi-session cluster into one `aggregation_nodes` summary, and augment()
-    surfaces matching nodes in `ctx.aggregation_nodes` as an ADDITIVE tier (it
-    never replaces episode/chunk/message retrieval). It targets the multi-session
-    *synthesis* residual: a question whose answer is spread one-fact-per-session
-    can be read off a single cluster summary instead of re-fusing dozens of raw
-    turns. Off → zero extra LLM cost at dream time and zero behavior change at
-    query time. The front-run co-location probe that gated this build lives in
-    `benchmarks/raptor_cluster_probe.py`."""
+    aggregation_nodes_enabled: bool = True
+    """Master switch for the Phase-2 RAPTOR cross-session aggregation layer.
+    When True, dreaming clusters episodes across sessions (connected components
+    over embedding-OR-entity overlap) and fuses each multi-session cluster into
+    one `aggregation_nodes` summary, and augment() surfaces matching nodes in
+    `ctx.aggregation_nodes` as an ADDITIVE tier (it never replaces
+    episode/chunk/message retrieval). It targets the multi-session *synthesis*
+    residual: a question whose answer is spread one-fact-per-session can be read
+    off a single cluster summary instead of re-fusing dozens of raw turns. The
+    front-run co-location probe that gated this build lives in
+    `benchmarks/raptor_cluster_probe.py`.
+
+    **FLIPPED False → True 2026-08-26** on G-FLIP PASS (Stage 3c,
+    raptor_digest_plan.md): 7/7 checks green on the re-anchored window
+    (`--since 2026-08-26 11:15`, v6, 5 verdict rows) — 5/5 rows ≥ 90% (min
+    91.3%), zero blocking-flip, zero failure-attributed, zero unclassifiable,
+    sanity floor met, dead-watch streak 0, keying residual 0 on every row.
+
+    Two things this flip deliberately does NOT mean.
+    (a) It is a near no-op for the prod box, which has run with the layer ON via
+    `HYMEM_AGGREGATION_NODES_ENABLED=1` on all three launch paths since the
+    2026-08-26 env-parity fix. What it removes is the FRAGILITY: an unset env
+    var no longer silently disables the layer, which is what zeroed this watch
+    twice (2026-06-17 and 2026-08-09). The corollary is that the post-flip
+    verification dream is a WEAK test — the effective config is unchanged, so
+    it cannot fail for flip-related reasons; a refusion there means something
+    else moved (salt bump, member-set shift) and is a red flag on its own terms.
+    (b) It does not change any benchmark regime. `msc_adapter` (which
+    `locomo_adapter` reuses wholesale) and `beam_adapter` were default-config
+    consumers and now pin this False explicitly, so the LoCoMo/MSC/BEAM
+    canonical baselines stay comparable. `longmemeval_adapter` already pinned it
+    True. Moving a benchmark onto the shipped config is a pre-registered scored
+    decision, never a side effect of a default change.
+
+    Query-time exposure stays bounded by `aggregation_inject_abilities`
+    (default TR-only — the G4 A/B showed broad injection reshuffles ranking
+    against gold turns). Set False to restore the pre-flip behavior."""
 
     aggregation_emb_threshold: float = 0.55
     """Cosine threshold above which two episodes link into the same cluster

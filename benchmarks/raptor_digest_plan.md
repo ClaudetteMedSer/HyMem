@@ -539,6 +539,77 @@ no-agg streak (≥5 consecutive, tail-of-window) instead of silently excluding.
 `MIN_VERDICT_ROWS` is implemented — the sanity floor is fine; the hole is
 that `built == 0` is indistinguishable from "layer switched off".
 
+### FLIP-WATCH RESULT — v6 run, re-anchored window, 2026-08-26: **G-FLIP PASS → FLIPPED**
+
+Window `--since 2026-08-26 11:15` (the pre-registered re-anchor; restart reason
+= env-parity fix). 5 verdict rows. **All seven checks green.**
+
+| # | check | bar | measured | result |
+|---|---|---|---|---|
+| 1 | every verdict row ≥ 90% | 5/5 | 5/5, min **91.3%** | PASS |
+| 2 | blocking-flip rows | 0 | 0 | PASS |
+| 3 | failure-attributed rows | ≤2 | 0 | PASS |
+| 4 | unclassifiable low-reuse rows | 0 | 0 | PASS |
+| 5 | sanity floor | ≥5 | 5 | PASS |
+| 6 | dead-watch streak (v5 guard) | <5 | longest **0** | PASS |
+| 7 | keying integrity (`residual > 0`) | 0 | 0 | PASS |
+
+| row | time | kind | reuse | rebuild | resid |
+|---|---|---|---|---|---|
+| #1309 | 11:45 | append, eps Δ+1 | 92.2% | 2.7/miss | 0 |
+| #1310, #1311 | — | quiescent | 100% | — | 0 |
+| #1312 | 14:30 | append, eps Δ+1 | 91.3% | 3.0/miss | 0 |
+| #1313 | 14:44 | quiescent | 100% | — | 0 |
+
+**The cost half — the open question this window existed to answer — holds.**
+The pre-registered prediction was reuse ≥ 90 on an incremental append; both
+appends cleared it (92.2, 91.3) at 2.7–3.0 rebuilds per level-0 miss, the
+classic Δ=1 band (2.2–4.0). **No #1183-class leak in-window**: nothing
+resembling 7.3/miss appeared, so the windowing-confinement question raised by
+#1183 stays open as a historical row and is NOT reproduced by current code.
+Criterion 6 reaches n=5 (4 carried + fresh rows), all residual 0.
+
+**Advisory, recorded and deliberately NOT treated as a bar: thin append
+coverage.** Only #1312 counts as window-internal append evidence (#1309's Δ
+straddles the anchor, so the banked split-window rule credits it to neither
+side). One counted append is thin. It is recorded as an advisory because
+**raising a bar after seeing a PASS is post-hoc tightening — structurally the
+same move as the loosening the A5 verdict refused two waivers for.** The
+pre-registered criteria (including quiescent rows counting toward
+`MIN_VERDICT_ROWS`) were banked before the numbers existed and are met. The
+correct response to thin evidence is to keep reading, not to withhold the
+flip: the classifier keeps running on the post-flip window against the same
+bar, and an append below 90% later is a finding to act on — actionable
+precisely because the bar was not moved to avoid it.
+
+**FLIPPED 2026-08-26** — `hymem/config.py:112`
+`aggregation_nodes_enabled: bool = False → True`.
+
+Two scope limits written into the docstring, because the flip is narrower than
+it looks:
+
+- **Near no-op for prod.** The box has run with the layer ON via
+  `HYMEM_AGGREGATION_NODES_ENABLED=1` on all three launch paths since the
+  env-parity fix earlier the same day. What the flip removes is the
+  FRAGILITY — an unset env var no longer silently disables the layer, which
+  is what zeroed this watch twice (2026-06-17, 2026-08-09). **Corollary: the
+  post-flip verification dream is a WEAK test.** The effective config is
+  unchanged, so it cannot fail for flip-related reasons; treat a refusion
+  there as evidence that something ELSE moved (salt bump, member-set shift),
+  not as the flip being validated. Post-flip the env var becomes an explicit
+  OFF switch (`bootstrap.py:86` semantics need no change).
+- **No benchmark regime changes.** `msc_adapter` (reused wholesale by
+  `locomo_adapter`) and `beam_adapter` were default-config consumers and now
+  pin `aggregation_nodes_enabled=False` explicitly, so the LoCoMo / MSC / BEAM
+  canonical baselines stay comparable to every run behind them.
+  `longmemeval_adapter:532` already pinned it True. Moving a benchmark onto
+  the shipped config is a pre-registered scored decision, never a side effect
+  of a default change — the same argument that keeps the LoCoMo canonical
+  deliberately narrow.
+
+Downstream: Plan C **UNBLOCKED** (`additional_planning.md`); Stage 4a remains
+gated on its own build spec below, not on this flip.
+
 ---
 
 ## Stage 4 — Query-time consumption v2 (only after Stage 3)

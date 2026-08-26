@@ -19,8 +19,12 @@ plus the Grove Memory borrows (added 2026-08-18, see
 
 Ideas A and B have been checked against the current RAPTOR/aggregation
 architecture (see [§0](#0-raptor-interference-check)) and are clear to build.
-Plan C is sequenced BEHIND the RAPTOR Stage 3c flip decision (see its
-sequencing constraint).
+Plan C was sequenced BEHIND the RAPTOR Stage 3c flip decision — **UNBLOCKED
+2026-08-26**, when G-FLIP passed 7/7 on the re-anchored window and
+`aggregation_nodes_enabled` flipped to True. Its OTHER precondition is
+unchanged and still binding: the episode rewrite must clear
+`benchmarks/fact_probe.py`'s faithfulness bar on the candidate model before
+it ships. It must also not overlap the post-flip verification dream.
 
 > Reviewed for staleness 2026-07-02: `aggregate.py` line refs updated after the
 > Option B snapshot fix landed (commit 8b36501); schema still v21; suite at 695
@@ -596,8 +600,12 @@ review)*
 > correct-answer control, ≥0.90) on episode rewrites specifically. The
 > granularity motivation below (BEAM EO/SUM post-mortem, rate-distortion
 > framing) still stands — the *diagnosis* was never in question, only the
-> generative remedy. Both remaining sequencing constraints are unchanged: this
-> plan touches episode membership, so it stays gated on the RAPTOR flip-watch.
+> generative remedy. **RAPTOR flip-watch constraint DISCHARGED 2026-08-26**
+> (G-FLIP PASS 7/7, `aggregation_nodes_enabled` flipped True). The
+> faithfulness constraint above is unchanged and still binding. One residual
+> ordering rule survives the discharge: this plan rewrites episode membership,
+> so it must not OVERLAP the post-flip verification dream — schedule it as its
+> own effort and re-verify aggregation reuse once after it lands.
 
 ### Motivation
 
@@ -680,9 +688,10 @@ first, then granularity, then re-verify reuse once on the new episode set.
 2. **Idea B** second — lower implementation risk (purely additive context), but
    the payoff is behavioral and only validatable via the compliance gate, so it
    won't move headline numbers and shouldn't be judged by them.
-3. **Plan C** independently of A/B but strictly after the RAPTOR flip decision
-   (see its sequencing constraint) — A/B don't touch episodes, so they can
-   proceed while the reuse watch runs.
+3. **Plan C** independently of A/B. The RAPTOR flip decision it waited on
+   RESOLVED 2026-08-26 (PASS → flipped), so the gate is discharged; what
+   remains is the faithfulness bar and the no-overlap rule against the
+   post-flip verification dream (see its sequencing constraint).
 
 ---
 
