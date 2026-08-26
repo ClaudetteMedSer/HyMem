@@ -145,3 +145,110 @@ def test_peer_card_parses(honcho, hy_with_embed):
     peer = honcho.peer("user-1")
     card = peer.get_card()
     assert card is None or isinstance(card, list)
+
+
+def test_peer_context_representation_reaches_sdk(honcho, hy_with_embed):
+    """Regression: the peer context endpoint returned only
+    `peer_representation`, but the SDK's PeerContextResponse declares the field
+    as `representation` with no alias — Pydantic silently dropped the value, so
+    SDK consumers (e.g. the Hermes harness prefetch path) saw an empty
+    representation on this route every time. The route now sends both names;
+    the *parsed model* must carry the digest + USER.md content.
+    """
+    hy_with_embed.config.user_md_path.write_text(
+        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
+    )
+    # A root aggregation node, inserted directly: the representation surfaces
+    # only read it via load_digest(), no aggregation build needed.
+    hy_with_embed.conn.execute(
+        "INSERT INTO aggregation_nodes "
+        "(id, title, summary, member_episode_ids, session_ids, "
+        " n_members, n_sessions, level, is_root) "
+        "VALUES ('root-test', 'User digest', 'Works on HyMem and Hermes.', "
+        " '[]', '[]', 3, 3, 1, 1)"
+    )
+    hy_with_embed.conn.commit()
+
+    ctx = honcho.peer("user-1").context()
+    assert ctx.representation, "SDK dropped the representation field"
+    assert "Works on HyMem and Hermes." in ctx.representation
+    assert "prefers uv" in ctx.representation
+
+
+def _seed_docker_graph(honcho, hy_with_embed):
+    """Log a turn and dream a 2-edge graph the docker query reliably retrieves."""
+    session = honcho.session("sess-seed")
+    user = honcho.peer("user-1")
+    session.add_messages([
+        user.message("No, we use uv and system Python. Don't suggest Docker."),
+    ])
+    triples = [
+        {"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1},
+        {"subject": "local_dev", "predicate": "uses", "object": "Docker", "polarity": -1},
+    ]
+    hy_with_embed.set_llm(make_routed_llm(triples, []))
+    hy_with_embed.dream()
+
+
+def test_peer_chat_returns_answer_when_graph_has_facts(honcho, hy_with_embed):
+    """Regression: peer.chat() reads the answer from `content`. HyMem used to
+    return only `response`, so the SDK returned None and honcho_reasoning came
+    back empty. Through the real SDK we now get a non-None answer.
+    """
+    _seed_docker_graph(honcho, hy_with_embed)
+    answer = honcho.peer("user-1").chat("should we use docker for dev?")
+    assert isinstance(answer, str) and answer
+    assert "docker" in answer.lower()
+
+
+def test_peer_search_parses_and_returns_facts(honcho, hy_with_embed):
+    """Regression: peer.search() POSTs to .../peers/{id}/search, which HyMem
+    didn't implement — the call 404'd and honcho_search came back empty. The
+    SDK must now parse a non-empty list of Messages.
+    """
+    _seed_docker_graph(honcho, hy_with_embed)
+    results = honcho.peer("user-1").search("should we use docker for dev?")
+    assert isinstance(results, list)
+    assert results, "peer.search must surface the dreamed graph fact"
+    assert any("docker" in m.content.lower() for m in results)
+
+
+def test_all_supported_sdk_methods_round_trip(honcho, hy_with_embed):
+    """Drive every Honcho SDK call HyMem backs end-to-end through the real SDK.
+
+    `test_honcho_server.py::test_every_supported_sdk_route_is_registered`
+    proves the routes *exist*; this proves the SDK can *call them and parse the
+    result* without raising — the integration `test_peer_chat_parses` was too
+    lenient to catch (it accepted None).
+    """
+    _seed_docker_graph(honcho, hy_with_embed)
+
+    # workspace / peer / session get-or-create
+    user = honcho.peer("user-1", metadata={"name": "Alice"})
+    agent = honcho.peer("agent-main")
+    session = honcho.session("sess-roundtrip", metadata={"topic": "demo"})
+    assert user.id == "user-1" and session.id == "sess-roundtrip"
+
+    # messages: add + paginated list
+    msgs = session.add_messages([
+        user.message("we use uv for local dev"),
+        agent.message("understood"),
+    ])
+    assert len(msgs) == 2
+    assert isinstance(list(session.messages(page=1, size=10)), list)
+
+    # session peers + per-peer config
+    session.add_peers(["user-1", "agent-main"])
+    assert session.get_peer_configuration("user-1") is not None
+
+    # session context + search
+    assert session.context() is not None
+    assert isinstance(session.search("docker"), list)
+
+    # peer card / context / search / chat
+    assert (user.get_card() is None) or isinstance(user.get_card(), list)
+    peer_ctx = user.context()
+    assert peer_ctx.peer_id == "user-1"
+    assert isinstance(user.search("docker"), list)
+    chat = user.chat("should we use docker for dev?")
+    assert chat is None or isinstance(chat, str)

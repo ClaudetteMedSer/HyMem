@@ -10,7 +10,8 @@ Endpoint mapping (high level):
   POST .../sessions/{sid}/search      → hy.augment() as Message objects
   GET  .../sessions/{sid}/context     → MEMORY.md + USER.md + recent turns
   POST .../sessions/{sid}/peers       → register peer → role mapping
-  GET  .../peers/{pid}/card           → USER.md behavioral profile
+  GET  .../peers/{pid}/card           → standing digest + USER.md behavioral profile
+  POST .../peers/{pid}/search         → hy.augment() as Message objects (peer-scoped)
   POST .../peers/{pid}/chat           → dialectic Q&A via hy.augment()
 
 Configuration is entirely environment-driven — see hymem.bootstrap and
@@ -35,6 +36,7 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("pip install 'hymem[server]'") from exc
 
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
+from hymem import rules as rules_mod
 from hymem.bootstrap import get_instance as _get_hy, set_instance as set_hy
 from hymem.core import db as core_db
 from hymem.dreaming.scheduler import DreamScheduler
@@ -110,6 +112,19 @@ app = FastAPI(title="HyMem Honcho-compatible server", version="1.0.0", lifespan=
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "backend": "hymem"}
+
+
+@app.get("/dream-status")
+def dream_status() -> dict:
+    """Operator visibility into the re-extraction backlog.
+
+    Not workspace-scoped — dreaming is global to the HyMem instance, like
+    `/health`. Wraps `hy.dream_status()` (pure SQL, no LLM) so an operator can
+    see how many chunks are pending for the current prompt_version, whether a
+    dream is in progress, and the last dream's outcome — making the surge after
+    a prompt_version bump transparent rather than mysterious.
+    """
+    return _get_hy().dream_status()
 
 
 # ── workspace (get-or-create) ────────────────────────────────────────────────
@@ -248,9 +263,13 @@ def add_messages(
 ) -> list[dict]:
     hy = _get_hy()
     roles = [_resolve_role(workspace_id, m.peer_id) for m in body.messages]
-    # One transaction for the whole batch (see HyMem.log_messages).
+    # One transaction for the whole batch (see HyMem.log_messages). Pass each
+    # message's caller-supplied created_at through so the persisted row carries
+    # the real event time, not bulk-ingestion time — chronological/temporal
+    # retrieval (ORDER BY created_at) depends on it.
     msg_ids = hy.log_messages(
-        session_id, [(role, m.content) for role, m in zip(roles, body.messages)]
+        session_id,
+        [(role, m.content, m.created_at) for role, m in zip(roles, body.messages)],
     )
     responses = [
         msg(msg_id, m.content, m.peer_id, session_id, workspace_id,
@@ -316,13 +335,22 @@ def list_messages(
     }
 
 
-@app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/search")
-def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> list[dict]:
-    ctx = _get_hy().augment(body.query)
+def _augment_messages(
+    query: str, limit: int, session_id: str, workspace_id: str
+) -> list[dict]:
+    """Run augment() and shape the hits as MessageResponse dicts.
+
+    Shared by the session-scoped and peer-scoped search endpoints — both map
+    HyMem's augment() output (graph facts + FTS hits) onto the SDK's
+    ``list[Message]`` search contract. HyMem retrieval is global (peers are
+    modelled as roles, not authorship partitions), so the two endpoints surface
+    the same content; only the SDK call site differs.
+    """
+    ctx = _get_hy().augment(query)
     results: list[dict] = []
 
     for fact in ctx.graph_facts:
-        if len(results) >= body.limit:
+        if len(results) >= limit:
             break
         content = (
             f"{fact.subject} {fact.predicate} {fact.object} "
@@ -340,7 +368,7 @@ def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> 
         ))
 
     for hit in ctx.fts_hits:
-        if len(results) >= body.limit:
+        if len(results) >= limit:
             break
         results.append(msg(
             f"fts_{hit.chunk_id}",
@@ -348,7 +376,22 @@ def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> 
             {"type": "fts_hit"},
         ))
 
+    for hit in ctx.message_hits:
+        if len(results) >= limit:
+            break
+        results.append(msg(
+            hit.message_id, hit.text[:600], hit.role,
+            hit.session_id, workspace_id,
+            {"type": "message_hit", "score": hit.score},
+            hit.created_at or None,
+        ))
+
     return results
+
+
+@app.post("/v3/workspaces/{workspace_id}/sessions/{session_id}/search")
+def search_messages(workspace_id: str, session_id: str, body: SearchRequest) -> list[dict]:
+    return _augment_messages(body.query, body.limit, session_id, workspace_id)
 
 
 # ── context ──────────────────────────────────────────────────────────────────
@@ -366,10 +409,10 @@ def get_context(
         cfg.memory_md_path.read_text(encoding="utf-8")
         if cfg.memory_md_path.exists() else ""
     )
-    user_text = (
-        cfg.user_md_path.read_text(encoding="utf-8")
-        if cfg.user_md_path.exists() else ""
-    )
+    # Standing rules ride ahead of MEMORY.md in the returned summary.
+    rules_block = _rules_block()
+    if rules_block:
+        memory_text = rules_block + ("\n\n" + memory_text if memory_text.strip() else "")
 
     session_row = hy.conn.execute(
         "SELECT summary FROM sessions WHERE id = ?", (session_id,)
@@ -402,7 +445,7 @@ def get_context(
     return {
         "summary": summary_obj,
         "messages": messages,
-        "peer_representation": user_text,
+        "peer_representation": _peer_representation(),
         "peers": [{"id": role} for role in peer_roles],
     }
 
@@ -455,14 +498,65 @@ def get_peer_config(workspace_id: str, session_id: str, peer_id: str) -> dict:
 
 # ── peers (workspace-scoped) ─────────────────────────────────────────────────
 
+@app.post("/v3/workspaces/{workspace_id}/peers/{peer_id}/search")
+def search_peer_messages(
+    workspace_id: str, peer_id: str, body: SearchRequest
+) -> list[dict]:
+    """Peer-scoped search — the route the Honcho SDK's ``peer.search()`` calls.
+
+    The SDK documents this as "search across all messages in the workspace with
+    this peer as author." HyMem's augment() is global, so this returns the same
+    graph-fact + FTS hits as the session-scoped search. Implementing it is what
+    keeps ``peer.search()`` from 404-ing — the gap that made honcho_search come
+    back empty. Peer-scoped results carry no session id (search spans sessions).
+    """
+    return _augment_messages(body.query, body.limit, "", workspace_id)
+
+
+def _rules_block() -> str:
+    """The STANDING RULES tier rendered for the Honcho representation/context —
+    always_on + contextual imperatives the agent must follow, ahead of MEMORY.md
+    (BrainDB's always_on injects into every context call). Empty when the tier is
+    disabled or no rules exist; degrades to '' on a pre-v23 store."""
+    hy = _get_hy()
+    if not hy.config.rules_enabled:
+        return ""
+    active = rules_mod.list_rules(hy.conn)
+    if not active:
+        return ""
+    return "=== STANDING RULES (always follow) ===\n" + "\n".join(
+        f"- {r.text}" for r in active
+    )
+
+
+def _peer_representation() -> str:
+    """The user-representation text the peer card/context and session context
+    endpoints return: the standing root digest (when the aggregation layer has
+    built one) above USER.md. The digest is HyMem's analogue of Honcho's dialectic user model —
+    a whole-store "what do you know about me?" narrative — so it belongs on
+    exactly the endpoints the SDK reads a user representation from. Rendered
+    via Digest.as_context_block(), whose footer carries coverage + generated_at
+    so the consumer can see how stale the dream-time artifact is. Degrades to
+    plain USER.md (today's behavior) when no digest exists."""
+    hy = _get_hy()
+    cfg = hy.config
+    parts: list[str] = []
+    rules_block = _rules_block()          # standing rules lead — always-follow tier
+    if rules_block:
+        parts.append(rules_block)
+    digest = hy.digest()
+    if digest is not None:
+        parts.append(digest.as_context_block())
+    if cfg.user_md_path.exists():
+        user_md = cfg.user_md_path.read_text(encoding="utf-8")
+        if user_md.strip():
+            parts.append(user_md)
+    return "\n\n".join(parts)
+
+
 @app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}/card")
 def get_peer_card(workspace_id: str, peer_id: str) -> dict:
-    cfg = _get_hy().config
-    content = (
-        cfg.user_md_path.read_text(encoding="utf-8")
-        if cfg.user_md_path.exists() else ""
-    )
-    return adapters.peer_card_response(peer_id, workspace_id, content)
+    return adapters.peer_card_response(peer_id, workspace_id, _peer_representation())
 
 
 @app.get("/v3/workspaces/{workspace_id}/peers/{peer_id}/context")
@@ -482,9 +576,7 @@ def get_peer_context(
     hy = _get_hy()
     cfg = hy.config
 
-    peer_representation = ""
-    if cfg.user_md_path.exists():
-        peer_representation = cfg.user_md_path.read_text(encoding="utf-8")
+    peer_representation = _peer_representation()
 
     messages = []
     if search_query:
@@ -502,6 +594,14 @@ def get_peer_context(
                 hit.chunk_id, hit.text[:600], role,
                 hit.session_id, workspace_id,
                 {"type": "fts_hit", "score": getattr(hit, "score", 0.0)},
+            ))
+        for hit in ctx.message_hits:
+            # Raw turns already carry their role — no chunk->message lookup.
+            messages.append(msg(
+                hit.message_id, hit.text[:600], hit.role,
+                hit.session_id, workspace_id,
+                {"type": "message_hit", "score": hit.score},
+                hit.created_at or None,
             ))
         for fact in ctx.graph_facts:
             content = (
@@ -524,6 +624,17 @@ def get_peer_context(
             summary_obj = adapters.summary_obj(memory_text, "memory")
 
     return {
+        # honcho-ai's PeerContextResponse requires peer_id/target_id and
+        # declares the representation field as `representation` with no alias
+        # (SessionContext, by contrast, maps `peer_representation` correctly).
+        # Without all three the SDK either raises a ValidationError or silently
+        # drops the value — either way SDK consumers (e.g. the Hermes harness
+        # prefetch path) got an empty representation from this route. Send the
+        # required ids plus both representation names so the digest arrives
+        # without a client-side patch.
+        "peer_id": peer_id,
+        "target_id": target or peer_id,
+        "representation": peer_representation,
         "summary": summary_obj,
         "messages": messages,
         "peer_representation": peer_representation,
@@ -567,6 +678,9 @@ def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest) -> dict:
         if ctx.fts_hits:
             snippets = [f"- {h.text[:300]}" for h in ctx.fts_hits]
             parts.append("From conversation history:\n" + "\n".join(snippets))
+        if ctx.message_hits:
+            snippets = [f"- {h.text[:300]}" for h in ctx.message_hits]
+            parts.append("From raw turns:\n" + "\n".join(snippets))
         answer = "\n\n".join(parts) if parts else "No relevant information found in memory."
         responses.append(answer)
         facts_per_query.append([
@@ -580,10 +694,15 @@ def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest) -> dict:
             for f in ctx.graph_facts
         ])
 
-    # `facts` is additive metadata for SDK consumers that want the structured
-    # why_retrieved trail without parsing prose. Aligns with `response` (first
-    # query); `facts_by_query` carries the full per-query breakdown.
+    # `content` is the field the honcho-ai SDK's peer.chat() actually reads
+    # (`data.get("content")`); without it the SDK returns None and
+    # honcho_reasoning comes back empty. `response` is kept as an alias for
+    # consumers that read the HyMem-native shape. `facts` is additive metadata
+    # for consumers that want the structured why_retrieved trail without parsing
+    # prose — it aligns with the first query; `facts_by_query` carries the full
+    # per-query breakdown.
     return {
+        "content": responses[0],
         "response": responses[0],
         "queries": queries,
         "facts": facts_per_query[0] if facts_per_query else [],

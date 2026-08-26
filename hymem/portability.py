@@ -3,8 +3,9 @@
 Emits the canonical HyMem state as JSON Lines — one record per line, each
 ``{"type": <kind>, "record": {...}}`` — preceded by a ``_meta`` header. The
 format is stable and human-inspectable, suitable for backups, project-to-
-project migration, and feeding external tooling. Stays in-process; no service
-layer.
+project migration, and feeding external tooling. Embedded-first: this runs
+in-process against the SQLite file, independent of the optional MCP/Honcho
+server adapters.
 
 Import is additive and idempotent: rows are INSERT-OR-IGNOREd in
 dependency order (sessions before their chunks/episodes/procedures), so
@@ -26,7 +27,9 @@ from hymem.core import db as core_db
 
 log = logging.getLogger("hymem.portability")
 
-EXPORT_VERSION = 1
+# v2 (schema v15): edge records gained valid_at / invalid_at. Import stays
+# backward-compatible — a v1 export simply omits them and they default NULL.
+EXPORT_VERSION = 2
 
 # (kind, table, columns) in export order. Import re-orders so a row's
 # referenced session always lands first.
@@ -48,7 +51,7 @@ _EXPORT_SPEC: list[tuple[str, str, list[str]]] = [
     ("edge", "knowledge_graph", [
         "id", "subject_canonical", "predicate", "object_canonical",
         "pos_evidence", "neg_evidence", "first_seen", "last_seen",
-        "last_reinforced", "status", "derived",
+        "last_reinforced", "valid_at", "invalid_at", "status", "derived",
     ]),
     ("profile_entry", "profile_entries", [
         "id", "kind", "text", "pos_evidence", "neg_evidence",

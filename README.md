@@ -4,13 +4,15 @@
 
 ## TL;DR / Executive Summary
 
-**HyMem** is a local-first, embedded memory system for AI agents. It gives the **Hermes** agent persistent memory across conversations by extracting a structured SQLite knowledge graph from chat logs during idle "dreaming" cycles, then making that knowledge queryable at conversation time via keyword search, vector search, semantic graph search, and entity lookup. It also auto-maintains two Markdown files (`MEMORY.md` and `USER.md`) that the agent reads before each conversation.
+**HyMem** is a local-first, embedded memory system for AI agents. It gives the **Hermes** agent persistent memory across conversations by extracting a structured SQLite knowledge graph from chat logs during idle "dreaming" cycles, then making that knowledge queryable at conversation time via keyword search, vector search, semantic graph search, and entity lookup — plus a working-memory tier of recent raw turns so facts from the current session are recallable before they're dreamed. It also auto-maintains two Markdown files (`MEMORY.md` and `USER.md`) that the agent reads before each conversation, and — with aggregation enabled — a standing whole-store digest (`HyMem.digest()`, the RAPTOR root) answering "what do you know about this user?" for system-prompt injection.
 
 **No cloud, no Postgres, no 500MB Docker images.** One SQLite file, two Markdown files, and a Python library. Query-time retrieval defaults to LLM-free — FTS5 + sqlite-vec ANN + graph traversal. An optional hybrid reranker (cross-encoder *or* the configured LLM) can be enabled to break ties when keyword and semantic search disagree, gated by an ambiguity threshold so the LLM hot path stays the exception, not the rule.
 
 **Two deployment modes:** an MCP tools server for direct agent integration, and a **Honcho v3-compatible HTTP server** so Hermes can use the standard `honcho-ai` SDK and treat HyMem as a drop-in replacement for Honcho's managed cloud service.
 
-**~7,600 lines of Python**, zero npm, zero Docker required.
+**~15,000 lines of Python**, zero npm, zero Docker required.
+
+**Benchmarked on LongMemEval.** On the 500-question LongMemEval-S suite, HyMem scores **70.0% overall on the production path** — the in-library ability router shaping retrieval with *no* oracle labels, so the number reflects what real Hermes gets, not a benchmark-only ceiling. The headline runs with **dreaming on** (worth +3.6pp; the A/B and per-category lifts are in §11). Full table and methodology in [§11](#11-benchmark-results-longmemeval).
 
 ---
 
@@ -25,6 +27,8 @@ pip install 'hymem[server]'
 export HYMEM_LLM_API_KEY=sk-...        # extraction LLM (DeepSeek/OpenAI/...)
 export HYMEM_EMBEDDING_API_KEY=sk-...  # optional — omit for FTS-only retrieval
 export HYMEM_ROOT=~/.hermes            # optional — SQLite + Markdown live here
+export HYMEM_AGGREGATION_NODES_ENABLED=true  # optional — standing whole-store
+                                             # digest (see §7 Hermes integration)
 
 hymem-doctor      # preflight: verify config before launching
 hymem-honcho      # Honcho v3-compatible HTTP server on :8765
@@ -73,7 +77,7 @@ All of this is surfaced automatically to Hermes before each user message via the
            ▼                      ▼
     ┌──────────────┐    ┌────────────────────┐
     │  server.py   │    │  honcho/  package  │
-    │  7 MCP tools │    │  19 HTTP endpoints │
+    │  9 MCP tools │    │  19 HTTP endpoints │
     └──────┬───────┘    └─────────┬──────────┘
            │                      │
            └──────────┬───────────┘
@@ -110,46 +114,63 @@ All of this is surfaced automatically to Hermes before each user message via the
 hymem/
 ├── api.py              Public HyMem class — single entry point for all ops
 ├── config.py           HyMemConfig dataclass — all tunable parameters
-├── session.py          Session lifecycle (open/close) and message logging
+├── redaction.py        Best-effort secret/PII scrubbing at the ingest chokepoint
+├── session.py          Session lifecycle (open/close), message logging, recent_messages
 ├── bootstrap.py        Env-var resolution + build_from_env() + shared singleton
 ├── doctor.py           hymem-doctor — preflight diagnostics (keys, endpoints,
 │                         sqlite-vec, schema, embedding-dim drift, canonical drift)
-├── server.py           MCP server — 7 tools (capture, log, dream, augment,
-│                         profile, alias, retract)
+├── server.py           MCP server — 9 tools (capture, log, dream, augment,
+│                         ask, profile, digest, alias, retract)
 ├── honcho_server.py    Back-compat shim → hymem.honcho
 │
 ├── honcho/             Honcho v3-compatible HTTP server
-│   ├── app.py          FastAPI routes (19 endpoints) + entry point
+│   ├── app.py          FastAPI routes (19 Honcho endpoints + /health, /dream-status) + entry point
 │   ├── models.py       Typed Pydantic request models (one per endpoint body)
 │   └── adapters.py     Response shaping + request-shape normalization
 │
 ├── core/
 │   ├── db.py           SQLite connection management (WAL), schema init, migrations
-│   ├── schema.sql      19 tables + FTS5 virtual tables + triggers
+│   ├── schema.sql      28 tables + 5 FTS5 virtual tables + triggers
 │   └── markdown_io.py  Read/write HTML-comment-delimited sections in MD files
 │
 ├── dreaming/
 │   ├── runner.py       Orchestrates full pipeline with advisory lock
+│   ├── scheduler.py    Long-lived daemon thread owning background dream cycles
+│   │                   (one forked HyMem connection for its whole lifetime)
 │   ├── chunks.py       Regex-based high-salience chunk extraction
 │   ├── canonicalize.py Deterministic entity name normalization + aliases +
 │   │                   drift detection/repair (find_/repair_canonical_drift)
 │   ├── mentions.py     Entity mention indexing for decay calculations
+│   ├── temporal.py     Per-message date-mention indexing (temporal_mentions)
+│   ├── dates.py        Stdlib-only date extraction primitives for the TR path
 │   ├── embeddings.py   Batch embedding of chunks + knowledge-graph edges (JSON + sqlite-vec)
-│   ├── phase1.py       LLM extraction: triples + behavioral markers
+│   ├── phase1.py       Extraction persist + dedup (lock-free embed, same-wave collapse)
+│   ├── digest.py       Batched per-session episodes+summary+procedures (one LLM call)
 │   ├── phase2.py       Consolidation: markers→profile, graph→MEMORY.md
 │   ├── phase3.py       Co-occurrence-aware decay + retraction
 │   ├── inference.py    Transitive closure over depends_on edges
+│   ├── bitemporal.py   Valid-time stamping: valid_at/invalid_at on edges
+│   ├── value_supersession.py  Single-assertion supersession for typed-value
+│   │                   edges — a knowledge UPDATE closes the old value without
+│   │                   waiting for evidence accumulation
+│   ├── user_profile.py Typed personal-fact slots (role/employer/location/…)
+│   │                   the tech-domain graph vocabulary never captures
 │   ├── episodes.py     LLM-powered episodic memory extraction
 │   ├── procedures.py   LLM-powered procedural memory extraction
 │   ├── summary.py      LLM-powered session summarization
+│   ├── aggregate.py    RAPTOR cross-session aggregation: cluster episodes →
+│   │                   fuse → hierarchy levels up to the root standing digest
+│   ├── behavioral_dedup.py  Dry-run report of pre-collapse behavioral duplicates
 │   └── retention.py    Chunk pruning with graph-aware eviction
 │
 ├── extraction/
 │   ├── llm.py          LLMClient Protocol + StubLLMClient (for tests)
 │   ├── embeddings.py   EmbeddingClient Protocol + StubEmbeddingClient +
 │   │                   CachedEmbeddingClient (LRU over (model, text))
-│   ├── triples.py      LLM prompt → (subject, predicate, object, polarity)
-│   ├── markers.py      LLM prompt → behavioral markers
+│   ├── chunk.py        Merged single-call chunk extraction (triples + markers)
+│   ├── triples.py      Triple parsing/validation (subject, predicate, object, polarity)
+│   ├── markers.py      Behavioral-marker parsing/validation
+│   ├── retry.py        Bounded exponential backoff for external API calls
 │   └── prompts/        System/user prompts for extraction, episodes, procedures,
 │                         summaries, and reranking
 │
@@ -157,6 +178,15 @@ hymem/
 │   ├── augment.py      FTS5 + vector + RRF merge + LLM rerank + hybrid graph
 │   │                   ranker (routed + per-candidate fallback branches,
 │   │                   token-overlap entity expansion)
+│   ├── ask.py          Dialectic endpoint behind HyMem.ask() — renders the
+│   │                   retrieval tiers and makes one synthesis LLM call
+│   ├── rerank.py       Cross-source rerank after RRF (LLM or cross-encoder
+│   │                   backend, ambiguity-gated)
+│   ├── count_routing.py Graph-native exact counting for in-domain MR queries
+│   ├── intent.py       detect_ability() router — infers MR/TR question-type from
+│   │                   the query alone (EN+NL regex, label-free) + AbilitySignal
+│   │                   observability, so ability shaping fires in production with
+│   │                   no oracle label
 │   ├── predicate_routing.py  Keyword → predicate mapping for query expansion
 │   ├── conflicts.py    Contradiction detection over the knowledge graph
 │   └── entities.py     Token-based entity matching against knowledge graph
@@ -169,11 +199,12 @@ hymem/
 
 ---
 
-## 4. The Data Model (19 SQLite Tables)
+## 4. The Data Model (28 SQLite Tables + 5 FTS5 Indexes)
 
 **Conversation storage:**
 - `sessions` — session ID + start/end timestamps + LLM-generated summary
 - `messages` — raw turns (user, assistant, system, tool)
+- `messages_fts` — FTS5 over raw turns, indexed live at ingest; powers the `message_hits` tier so a turn is recallable before any dream chunks it
 
 **Extraction artifacts:**
 - `chunks` — high-salience conversation segments
@@ -182,9 +213,12 @@ hymem/
 - `processed_chunks` — idempotency tracking per (chunk_id, prompt_version)
 - `entity_mentions` — inverted index: chunk → canonical entity
 - `entity_types` — canonical entity → type classification (language, framework, database, etc.)
+- `entity_properties` — free-form key/value attributes per canonical entity (e.g. `language=python`), extracted alongside types
+- `temporal_mentions` — per-message date mentions extracted at dream time; feeds the `ability="TR"` chronology
+- `embedding_cache` — content-addressed (text, model) → vector cache deduplicating embedding-API calls across chunks/edges/episodes
 
 **Knowledge graph:**
-- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges
+- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges. **Bi-temporal** (schema v15): alongside the transaction-time columns (`first_seen`/`last_seen` — when HyMem *learned* a fact), each edge carries a valid-time interval `valid_at`/`invalid_at` — when the fact was true *in the world*, sourced from the originating message's date — so supersession is a closed interval (`invalid_at IS NULL` = still valid) rather than a status flip that erases the "what was true as of date X" axis
 - `kg_evidence` — per-source provenance linking edges to chunks, with value/text/temporal metadata
 - `edge_embeddings` — JSON-encoded embedding vectors for knowledge graph edges, keyed on triple text so churning derived edges reuse cached vectors
 - `entity_aliases` — surface form → canonical entity mapping
@@ -192,39 +226,48 @@ hymem/
 **Behavioral profiling:**
 - `behavioral_markers` — raw extracted signals (correction, preference, rejection, style)
 - `profile_entries` — structured profile with evidence tracking
+- `user_profile` — typed personal-fact slots (role, name, employer, location, language, …) with bi-temporal `valid_at`/`invalid_at`; consumed by the digest's verified-facts anchor, `ctx.user_profile`, and `HyMem.profile()`
 
 **Episodic & procedural memory:**
 - `episodes` — named, summarized conversation segments with outcomes and entities
 - `episodes_fts` — FTS5 search over episode titles and summaries
+- `episode_embeddings` — vectors for semantic episode search (`vec_episodes`)
 - `procedures` — step-by-step workflows with triggers and involved entities
 - `procedures_fts` — FTS5 search over procedure names, descriptions, and steps
+
+**Aggregation & digest (RAPTOR):**
+- `aggregation_nodes` — cross-session cluster summaries plus hierarchy levels rolled up to one root **standing digest** (`HyMem.digest()`); levels ≥ 1 never enter query-time retrieval
+- `aggregation_nodes_fts` — FTS5 over node summaries for the (opt-in, additive) query-time tier
+- `aggregation_node_embeddings` — cache-keyed summary vectors, so re-dreaming a stable store re-fuses nothing
 
 **Self-improvement:**
 - `extraction_feedback` — wrongly-extracted triples stored as negative examples for future extraction
 
 **Operational:**
+- `schema_meta` — schema version guard (see §8)
 - `peers` — Honcho peer registry (peer_id → role mapping)
 - `run_lock` — advisory mutex for dreaming concurrency
 - `dream_runs` — per-cycle audit log
+- `token_overlap_index` — persisted token → canonical map backing the overlap-expansion cache (empty = cold start; rebuilt on demand)
 
 ---
 
 ## 5. The Dreaming Pipeline (How Memory Gets Built)
 
-Dreaming is the offline process that converts raw chat logs into structured knowledge. It's called by Hermes after each conversation (or on a cron-like schedule). The pipeline holds an advisory lock so concurrent runs bail out safely.
+Dreaming is the offline process that converts raw chat logs into structured knowledge. It's called by Hermes after each conversation (or on a cron-like schedule). The pipeline holds an advisory lock so concurrent runs bail out safely; a slow run heartbeats that lock once per session so it isn't mistaken for a crashed holder (see §8 *Advisory lock with lease heartbeat*).
 
 ### Phase 1 — Extraction (`dreaming/phase1.py`)
 
 1. **Chunking**: Regex-based salience detection extracts high-signal conversation segments (min 30 chars). Chunks are persisted with a `salience_reason` field.
 2. **Entity mention indexing**: Each chunk's text is scanned for known entity surface forms, populating the `entity_mentions` inverted index.
-3. **LLM extraction**: Each unprocessed chunk is sent to the LLM with a locked-vocabulary prompt:
+3. **LLM extraction (one merged call per chunk)**: Each unprocessed chunk is sent to the LLM with a single locked-vocabulary prompt that returns one JSON object with both `triples` and `markers` — halving the per-chunk LLM cost versus the old two-call (triples + markers) design. The combined prompt carries the full triple ruleset and the marker ruleset:
    - **Triples**: `{subject, predicate, object, polarity}` where predicate must be one of 18: `uses`, `depends_on`, `prefers`, `rejects`, `avoids`, `replaces`, `conflicts_with`, `deploys_to`, `part_of`, `equivalent_to`, `implements`, `contains`, `configured_with`, `requires_version`, `runs_on`, `connects_to`, `generates`, `tested_by`. Polarity is +1 (assertion) or -1 (negation/retraction). Optional fields: `value_text`, `value_numeric`, `value_unit`, `temporal_scope`. The prompt explicitly authorises people, teams, projects, and codebases as subjects/objects, with a worked linking example — `"Atta is working on MedFlow"` → `(atta, part_of, medflow)` — so identity↔artifact relationships land as 1-hop graph edges instead of sibling canonicals that only a fuzzy text match could connect.
    - **Markers**: `{kind, statement}` where kind is one of: `correction`, `preference`, `rejection`, `style`. Only explicit behavioral signals — no mood/emotion inference.
    - **Entity types**: LLM also infers entity type labels (language, framework, database, service, tool, etc.) for query expansion.
 4. **Feedback-driven extraction**: Before processing, the runner loads up to 10 recently retracted triples from `extraction_feedback` and injects them into the prompt as negative examples: "DO NOT extract these relationships." This self-corrects past hallucination patterns.
 5. **Entity canonicalization**: Surface forms (e.g., "Postgres", "PostgreSQL", "postgresql") are normalized via Unicode folding, CamelCase splitting, article/parenthetical stripping, and an alias table.
-6. **Knowledge graph upsert**: New triples insert edges, repeated triples reinforce evidence counters. Negations add negative evidence.
-7. **Idempotency**: Each chunk is processed at most once per `prompt_version`. Bump the version string in config and all chunks reprocess with new prompts.
+6. **Knowledge graph upsert + dedup (lock-free embedding)**: New triples insert edges, repeated triples reinforce evidence counters, negations add negative evidence. Before each chunk's persist transaction opens, dedup candidate vectors are batch-embedded *outside* the write lock (`prepare_dedup_vectors`); the in-transaction path then does pure SQL + in-memory cosine only — no embedding-API call ever runs while the SQLite writer lock is held. A new triple that is a near-duplicate of an existing edge (same predicate, one shared endpoint, lexical-sibling varying endpoint, cosine ≥ threshold) attaches its evidence to that edge instead of minting a sibling. **Same-wave collapse**: because `edge_embeddings` only holds *prior-cycle* vectors, sibling variants minted within the *same* dream are also compared against an in-memory pool of edges created earlier in the cycle (same gates), so a `prompt_version` re-extraction wave can't fan a single preference out into many phrasal-variant edges.
+7. **Idempotency**: Each chunk is processed at most once per `prompt_version`. Bump the version string in config and all chunks reprocess with new prompts (see §13 for the re-extraction-surge note).
 
 ### Inter-Phase Steps (`dreaming/runner.py`)
 
@@ -257,29 +300,49 @@ Results are written to `MEMORY.md`'s auto-section, capped at `insights_max_entri
    - If no → leave alone (topic hasn't resurfaced)
 2. Any edge whose Laplace-smoothed confidence `(pos+1)/(pos+neg+2)` drops below the retract threshold (default: 0.15) gets `status = 'retracted'` — kept for audit but excluded from query results.
 
+**Bi-temporal stamping** (`dreaming/bitemporal.py`, schema v15): after decay, `stamp_validity()` opens the valid-time interval on every edge minted this cycle — `valid_at` ← the earliest **positive**-evidence source-message date (falling back to `first_seen`), write-once and idempotent. When an edge is superseded — phase-3 retraction here, or an explicit `retract_edge()` — `stamp_invalidation()` closes it: `invalid_at` ← the newest **negative**-evidence date (the moment the contradicting fact arrived), falling back to the flip time. Behavioral-dedup retraction is *not* stamped: collapsing duplicate edges into a survivor is representational, not a valid-time invalidation.
+
 **Transitive inference** (`inference.py`): After decay, computes transitive closure for derived edges via two rules. (1) `A depends_on B, B depends_on C → A depends_on C` (BFS over the depends_on subgraph). (2) `A uses B, B depends_on C → A depends_on C` (one-hop cross-predicate, folded into `depends_on` so the predicate vocabulary stays stable and no schema migration is required). All derived edges are marked `derived=1` with confidence equal to the product of the source edges' smoothed confidences; previously-derived edges are wiped each cycle so the closure refreshes from scratch. Edges below the retract threshold are filtered out.
 
 After inference, Phase 2 insights are refreshed to reflect the new graph state, and old unreferenced chunks are pruned via `retention.py`.
 
-**Edge embedding** (`embeddings.py`): Once the graph has settled, every active edge — base and derived — is embedded as `"{subject} {predicate} {object}"` text into `edge_embeddings` and the `vec_edges` sqlite-vec table, so the query layer can do semantic search against the graph (see §6). The cache is keyed on triple text, not edge id: derived edges are deleted and recreated every cycle with fresh ids, so keying on text means a recreated edge reuses its cached vector instead of re-hitting the embedding API. Only genuinely new triple texts cost an embedding call. Skipped entirely when no embedding client is configured.
+**Edge embedding** (`embeddings.py`): Once the graph has settled, every active edge — base and derived — is embedded as `"{subject} {predicate} {object}"` text into `edge_embeddings` and the `vec_edges` sqlite-vec table, so the query layer can do semantic search against the graph (see §6). The cache is keyed on triple text, not edge id: derived edges are deleted and recreated every cycle with fresh ids, so keying on text means a recreated edge reuses its cached vector instead of re-hitting the embedding API. Only genuinely new triple texts cost an embedding call — and the lock-free dedup pass in Phase 1 has usually pre-warmed the content-addressed `embedding_cache` with those texts already, so this pass mostly reads the cache rather than calling the API again. Skipped entirely when no embedding client is configured.
 
 ---
 
 ## 6. Query-Time Augmentation (How Memory Gets Used)
 
-When Hermes receives a user message, it calls `hy.augment(user_message)` which returns an `AugmentedContext`:
+When Hermes receives a user message, it calls `hy.augment(user_message, session_id=...)` which returns an `AugmentedContext`:
 
 ```
 AugmentedContext(
     user_md: str,              # USER.md content
     memory_md: str,            # MEMORY.md content
     fts_hits: list[FtsHit],    # Ranked relevant chunks
+    message_hits: list[MessageHit],   # Raw-message keyword hits (see below)
+    total_message_matches: int,       # Candidate count for ability="MR" (see below)
     graph_facts: list[GraphFact],     # Ranked knowledge graph edges (see below)
+    temporal_events: list[TemporalEvent], # Date-ordered chronology for ability="TR"
     episodes: list[EpisodeHit],       # Matching episodes
     procedures: list[ProcedureHit],   # Matching procedures
     matched_entities: list[str],      # Entities found in user message
+    recent_turns: list[Message],      # Working-memory tier (see below)
+    detected_ability: str | None,     # MR/TR inferred by detect_ability when the host passes no label
+    detected_rule: str | None,        # which router rule fired (observability — see §3 intent.py)
 )
 ```
+
+**Raw-message tier (`message_hits`).** Alongside chunk FTS, `augment()` runs a direct FTS5 keyword search over the raw `messages` table (user/assistant turns), indexed live at ingest — so a turn is recallable across sessions and *before* any dream chunks it, the gap chunk-only FTS leaves. Hits are separate from `fts_hits` (different granularity; non-comparable BM25) and each carries `created_at`/`message_id`. Knob: `message_fts_top_k` (default 5, 0 disables).
+
+**Ability hints (`augment(..., ability=...)`).** An optional question-type hint (`IE`, `MR`, `TR`, `SUM`, `IF`, `KU`) that shapes *what HyMem returns*, never how the host answers. An explicit host hint always wins; when the host passes none, `augment()` runs the label-free `detect_ability` router (`query/intent.py`) and fills `MR`/`TR` from the query text alone — so ability shaping fires in production without an oracle label, and the result records `detected_ability` + `detected_rule` for observability. Unknown/None leaves the default path byte-for-byte unchanged.
+
+- **`ability="IF"`** (instruction/step recall — "what steps did I take to implement X?") pulls a wider procedure set (`procedure_top_k_if`, default 10) since procedures are the natural fit.
+- **`ability="MR"`** ("how many X across all my requests?") is an **opt-in counting path** (default off — set `message_fts_aggregate_cap > 0`). LLMs count poorly across a long context, so HyMem does the deterministic part: it restricts to **user** turns (assistant echoes would double-count actions), drops query stopwords (EN + NL), collapses literal restatements (conservative dedup that never merges turns differing by a number or entity — so distinct events aren't under-counted), and returns the **distinct count** in `total_message_matches` plus those turns in `message_hits` as evidence. The count is a *candidate* — one turn may state several items or none — so the host's LLM verifies it against the turns; it stays exact even when evidence is capped. Crucially the count is **additive** — it layers on top of normal relevance retrieval rather than replacing it — so a mis-routed MR question still gets full context and stays answerable. Off by default because keyword counting only fits *lexical* "how many" questions; semantic ones ("how many different ways…") need the answering LLM.
+- **`ability="TR"`** (temporal reasoning — "what did I do *before* X?", "how long ago?") builds a date-ordered chronology in `temporal_events` from dates extracted at dream time plus session-date anchors on retrieved turns, so the answerer has an explicit timeline instead of guessing order from prose.
+
+The host assembles these pieces into its prompt and **decides ordering** — for single-conversation *task-recall* questions, `message_hits`/`procedures` should outrank `graph_facts`, whose cross-session tool/preference facts can otherwise crowd the context.
+
+**Working-memory tier (`recent_turns`).** All the fields above are built from *dreaming artifacts* (chunks, embeddings, graph) — so a fact stated this session is invisible to `augment()` until a dream runs. When called with a `session_id`, `augment()` also returns the last `working_memory_turns` (default 10) raw turns of that session, oldest→newest, so within-session facts are recallable *before* any dream has consolidated them. Omitting `session_id` leaves `recent_turns` empty (unchanged legacy behavior). The turns are already secret-redacted at ingest (see §8), so they are safe to surface.
 
 Each `GraphFact` carries the edge (`subject`, `predicate`, `object`), its `confidence`, evidence counters, `derived` flag, the final `score`, and a `why_retrieved` list of reason codes explaining *why* the edge surfaced — e.g. `["semantic_0.84", "predicate:uses", "entity_type:framework", "recency_3d", "entity_match"]`. The reason codes are the ranking formula itself, so the agent gets an explanation with zero extra LLM calls.
 
@@ -330,7 +393,7 @@ It's pure SQL over the existing schema — no LLM call — and ignores retracted
 
 ### MCP Server (`hymem-server` → `server.py`)
 
-Exposes 7 tools via the Model Context Protocol:
+Exposes 9 tools via the Model Context Protocol:
 
 | Tool | Purpose |
 |---|---|
@@ -338,13 +401,15 @@ Exposes 7 tools via the Model Context Protocol:
 | `hymem_log` | Log one turn at a time (fallback) |
 | `hymem_dream` | Run a dreaming cycle manually |
 | `hymem_augment` | Retrieve graph facts + FTS context for a message |
+| `hymem_ask` | Dialectic Q&A — same retrieval, plus one LLM call that synthesizes a grounded answer (quotes values/dates, states both sides of a contradiction, says plainly when memory has no answer) |
 | `hymem_profile` | Return USER.md + MEMORY.md |
+| `hymem_digest` | Standing whole-store digest (RAPTOR root) with coverage + generated-at footer |
 | `hymem_alias` | Register surface-form→canonical mapping |
 | `hymem_retract` | Retract a wrongly extracted edge |
 
 ### Honcho HTTP Server (`hymem-honcho` → `hymem/honcho/`)
 
-A FastAPI server implementing a **Honcho v3-compatible REST protocol** — 19 endpoints. Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
+A FastAPI server implementing a **Honcho v3-compatible REST protocol** — 19 endpoints, plus two HyMem-native operational routes (`/health`, `/dream-status`). Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
 
 The server is a small package, not a monolith: `models.py` holds the typed Pydantic request models (so an SDK shape mismatch is a clean 422, not an `AttributeError` deep in a handler), `adapters.py` owns all response shaping and request-shape normalization (one place that knows "what shape the SDK expects"), and `app.py` holds the routes. The pinned `honcho-ai` SDK is exercised end-to-end against a live server in `test_honcho_contract.py`.
 
@@ -360,15 +425,16 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 | `POST .../sessions/{sid}/messages/upload` | File upload as message | For migrating MEMORY.md/USER.md |
 | `POST .../sessions/{sid}/messages/list` | Paginated message listing | page + size, returns total/pages |
 | `POST .../sessions/{sid}/search` | `hy.augment()` as Message objects | Graph facts + FTS hits |
-| `GET .../sessions/{sid}/context` | MEMORY.md + USER.md + recent turns + summary | Session summary from dreaming |
+| `GET .../sessions/{sid}/context` | MEMORY.md + recent turns + summary | `peer_representation` = digest + USER.md, like the peer routes |
 | `POST .../sessions/{sid}/peers` | Register peers + role mappings | |
 | `GET .../sessions/{sid}/peers/{pid}/config` | Per-session peer config | |
-| `GET .../peers/{pid}/card` | USER.md behavioral profile | |
-| `GET .../peers/{pid}/context` | Peer-scoped context with optional search | |
+| `GET .../peers/{pid}/card` | Standing digest + USER.md behavioral profile | Digest block (when built) precedes USER.md |
+| `GET .../peers/{pid}/context` | Peer-scoped context with optional search | `peer_representation` = digest + USER.md |
 | `POST .../peers/{pid}/representation` | Update peer representation | |
 | `POST .../peers/{pid}/chat` | Dialectic Q&A via `hy.augment()` | Returns prose + structured `facts[]` with `why` |
 | `GET /v3/workspaces/{wid}/conflicts` | `hy.conflicts()` over the graph | Pure SQL, no LLM call |
 | `GET /health` | Health check | |
+| `GET /dream-status` | `hy.dream_status()` — extraction backlog | Pending/total chunks, prompt_version, in_progress, last run |
 
 **Key design choices in the Honcho server:**
 - **Dream cooldown**: Background dreaming kicks at most once per configurable cooldown (env: `HYMEM_DREAM_COOLDOWN_SECONDS`, default 60s). Uses FastAPI `BackgroundTasks` so the HTTP response isn't blocked.
@@ -377,6 +443,13 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 - **Role inference**: Peer IDs matching `user[-_]|human|client|telegram|discord|slack` → user role, `agent|hermes|assistant|ai[-_]|bot|llm` → assistant role.
 - **LLM-free query path by default**: Search, context, and chat endpoints only call `hy.augment()`. With the default config (`rerank_model="llm"`, ambiguity-gated) the reranker fires only when FTS and vec disagree enough to trigger ambiguity; pick `rerank_model="cross-encoder"` for a local sentence-transformers reranker, or raise `rerank_ambiguity_threshold` to suppress it entirely. SQLite-only is the steady state.
 - **Explainability surfaced as metadata, not prose**: `graph_fact` results carry `metadata.why` with the ranker's reason codes (`fallback:entity_anchored`, `semantic_0.83`, `predicate:uses`, `recency_3d`, …). The `/chat` endpoint returns clean prose alongside a structured `facts[]` array — Hermes-friendly text without losing the trail.
+
+### Getting the standing digest into the host agent's context (Hermes)
+
+HyMem's whole-store digest (the RAPTOR root, §11) is served by this server: the peer `card`/`context` routes **and** the session-scoped `GET .../sessions/{sid}/context` all return `peer_representation` = digest + USER.md. That is the entire HyMem side — it ships with the package, nothing to patch after `pip install`. For the digest to actually reach the agent's auto-injected context block, two things must hold on the *host* side:
+
+1. **Aggregation is enabled** — set `HYMEM_AGGREGATION_NODES_ENABLED=true` (§9) and let one dream complete so a digest exists. Until then `peer_representation` degrades byte-for-byte to plain `USER.md`.
+2. **HyMem is at or after 2026-07-06** — then a stock, unpatched harness receives the digest. The peer-context route now returns an SDK-parseable response with the representation under both field names, working around two upstream `honcho-ai` SDK issues: `PeerContextResponse` expects `representation` (no alias for the wire name `peer_representation`) and requires `peer_id`/`target_id`, so the route previously failed SDK validation and the peer path came back empty. Pinned by a real-SDK contract test. Older HyMem servers instead need the two-line harness patch in [hymem/Hermes_instruction.md](hymem/Hermes_instruction.md) — the runbook also covers verification, always in a **fresh** session, since the harness caches its assembled base context.
 
 ---
 
@@ -414,7 +487,17 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 
 **Managed Markdown sections.** `USER.md` and `MEMORY.md` use HTML comment delimiters (`<!-- HyMem:auto:section:start -->` / `<!-- HyMem:auto:section:end -->`). Humans can edit everything outside these sections; HyMem only touches its auto-sections. Atomic writes via tempfile + `os.replace()` prevent corruption.
 
-**Advisory lock with stale takeover.** The `run_lock` table prevents concurrent dreaming cycles. If a holder process crashes, the lock is released after 5 minutes of inactivity so the system doesn't deadlock.
+**Advisory lock with lease heartbeat.** The `run_lock` table prevents concurrent dreaming cycles. A holder that crashes is reclaimed after a 2-minute stale-takeover TTL so the system doesn't deadlock. But a *genuinely slow* run (a `prompt_version` re-extraction wave can take minutes) would otherwise cross that TTL while still alive and be wrongly taken over — so a live dream heartbeats the lease once per session (`_refresh_lock`, holder-guarded so it can't steal another process's lock), keeping `acquired_at` fresh. Net: live dreams hold the lock as long as they need; only crashed ones are reclaimed.
+
+**Secret redaction + ingest guards.** Message content is scrubbed for high-confidence secrets (API keys, JWTs, private-key blocks, bearer tokens, credentials-in-URLs, emails) at the single ingest chokepoint (`HyMem._prepare_content`) before it reaches SQLite, so the on-disk store and the chunks derived from it never hold the raw value (toggle: `redact_secrets`, default on). The same chokepoint caps message length (`max_message_chars`) and `augment()` caps query length (`max_query_chars`) so a pathological turn can't bloat the DB or stall extraction.
+
+**Working memory before dreaming.** `augment(session_id=...)` returns the last N raw turns of the active session (`recent_turns`, `working_memory_turns` default 10) so within-session facts are recallable immediately, without waiting for a dream to consolidate them — see §6.
+
+**One LLM call per chunk.** Phase-1 extraction emits a single prompt returning both triples and markers in one JSON object, halving the dominant per-chunk LLM cost versus the prior two-call design. Bump-driven re-extraction therefore costs half what it used to.
+
+**Lock-free dedup embedding + same-wave collapse.** Triple-dedup similarity vectors are embedded *before* the per-chunk write transaction opens, so no embedding-API round-trip is ever held inside the SQLite writer lock; the in-lock path is pure SQL + in-memory cosine. The same in-memory vectors let sibling variants minted within one dream collapse against each other (not just against prior-cycle edges), which curbs the phrasal-variant edge proliferation a `prompt_version` bump used to cause — see §5.
+
+**Bounded retries on external calls.** The contrib OpenAI-compatible LLM and embedding clients wrap their network calls in bounded exponential backoff (`extraction/retry.py`), so a transient API blip doesn't drop a whole dream cycle. The read/`augment()` hot path stays retry-free.
 
 ---
 
@@ -437,13 +520,22 @@ dimension).
 | `HYMEM_HONCHO_HOST` | `127.0.0.1` | Honcho server bind address |
 | `HYMEM_HONCHO_PORT` | `8765` | Honcho server port |
 | `HYMEM_DREAM_COOLDOWN_SECONDS` | `60` | Min seconds between bg dream kicks |
+| `HYMEM_AGGREGATION_NODES_ENABLED` | unset (config default: off) | Master switch: RAPTOR aggregation + standing digest built at dream time |
+| `HYMEM_AGGREGATION_DIGEST_ENABLED` | unset (config default: on) | Sub-switch: roll cluster nodes up into the root digest (active only with the master switch on) |
 
 Tunable in `HyMemConfig` dataclass (programmatic):
 
 | Parameter | Default | Purpose |
 |---|---|---|
 | `salience_min_chars` | 30 | Min chunk size before extraction |
+| `redact_secrets` | `True` | Scrub secrets/PII from messages before storage |
+| `max_message_chars` | 100000 | Truncate a logged message longer than this (0 disables) |
+| `max_query_chars` | 10000 | Truncate an `augment()` query longer than this (0 disables) |
+| `working_memory_turns` | 10 | Recent raw turns `augment(session_id=…)` returns (0 disables) |
 | `fts_top_k` | 5 | FTS results to return |
+| `message_fts_top_k` | 5 | Raw-message keyword hits in `message_hits` (0 disables) |
+| `message_fts_aggregate_cap` | 0 | Opt-in `ability="MR"` counting path; evidence cap, count stays exact (0 = off) |
+| `procedure_top_k_if` | 10 | Procedure budget for `ability="IF"` (else `fts_top_k`) |
 | `graph_top_k_per_entity` | 3 | Entity-anchored graph facts per matched entity |
 | `embedding_max_scan` | 5000 | Max embeddings to scan in Python fallback |
 | `graph_semantic_top_k` | 10 | KNN candidates pulled from `vec_edges` |
@@ -460,7 +552,10 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
 | `profile_max_entries` | 16 | Max profile entries in USER.md |
 | `insights_max_entries` | 12 | Max insights in MEMORY.md |
-| `prompt_version` | `"v7"` | Bump to force full reprocessing |
+| `prompt_version` | `"v9"` | Bump to force full reprocessing |
+| `aggregation_nodes_enabled` | `False` | Master switch for the RAPTOR aggregation layer + digest |
+| `aggregation_digest_enabled` | `True` | Build the root standing digest at dream time (needs the master switch) |
+| `aggregation_inject_abilities` | `("TR",)` | Abilities whose queries surface aggregation nodes at query time (additive tier) |
 | `dream_budget` | 50 | Max chunks to process per dreaming cycle |
 | `max_chunks` | 50000 | Soft cap on total stored chunks |
 | `retention_days` | 90 | Chunks newer than this always kept |
@@ -473,7 +568,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ## 10. Test Coverage
 
-**209 tests total, 100% passing** across 23 test files:
+**703 tests total, 100% passing** across 51 test files (core suite; the LongMemEval/BEAM evaluation harness in `benchmarks/` is separate — see §11):
 
 - `test_dreaming.py` — Full pipeline: chunk→extract→consolidate→decay
 - `test_extraction.py` — Triple extraction, marker extraction, polarity handling, numeric / temporal value parsing
@@ -491,9 +586,15 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_markdown_io.py` — Section read/write atomicity
 - `test_integration.py` — End-to-end capture→dream→augment, retract workflow
 - `test_phase3_perf.py` — Decay correctness, mention indexing, backfill idempotency
-- `test_mcp_server.py` — MCP tool correctness (all 7 tools)
+- `test_mcp_server.py` — MCP tool correctness (all 9 tools, incl. `hymem_ask` synthesis and `hymem_digest`)
 - `test_retract.py` — Edge retraction, alias resolution, idempotency, feedback-row recording
-- `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording
+- `test_bitemporal.py` — Valid-time interval: valid_at from positive-evidence world date (write-once), invalid_at on supersession from newest negative-evidence date, as-of resolution, retract_edge interval-close, migration backfill + export round-trip
+- `test_raptor_cluster_probe.py` — Pure connected-components clustering core of the Phase-2 RAPTOR front-run gate (`benchmarks/raptor_cluster_probe.py`): cosine/Jaccard primitives, OR-link predicate (embedding *or* entity overlap), transitive closure, embedding-bridge across disjoint entity sets, threshold sensitivity. The DB/dream side runs only on the box; this pins the clusterer the build reuses (re-exported from `hymem.dreaming.aggregate`, so probe/tests/production share one clusterer)
+- `test_aggregate.py` — Phase-2 RAPTOR aggregation layer (`hymem/dreaming/aggregate.py` + the additive retrieval tier): cluster-selection policy (only cross-session, multi-member clusters become nodes; singletons/single-session dropped), content-hash node id (order-independent, membership-sensitive), the persisted node + summary-embedding shape, full-rebuild semantics (no stale node lingers), the off-by-default build/query guards, and that retrieval surfaces nodes *additively* without displacing the episode tier
+- `test_dream_runs.py` — Audit log persistence, lock-skip recording, error recording, lock-lease heartbeat (`_refresh_lock` owner advance / holder-guard / once-per-session), `dream_status()` backlog + in-progress reporting
+- `test_dedup_delock.py` — Dedup similarity vectors embedded outside the write lock (`conn.in_transaction` False at every embed), behavior preserved end-to-end
+- `test_dedup_samewave.py` — Same-cycle sibling collapse (same- and cross-chunk), no over-merging of non-siblings, lexical guard still applies, no in-lock embed
+- `test_hardening.py` — Secret/PII redaction, message/query size caps, embedding model/dim guard (incl. mixed-corpus), external-call retry/backoff
 - `test_dream_scheduler.py` — Background dream cooldown + concurrency
 - `test_honcho_server.py` — Full Honcho v3 protocol (19 endpoints, all passing)
 - `test_honcho_contract.py` — Real honcho-ai SDK driven against a live server (response-parse contract)
@@ -501,7 +602,73 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ---
 
-## 11. Comparison with Honcho
+## 11. Benchmark Results (LongMemEval)
+
+HyMem is evaluated end-to-end on **LongMemEval-S**, the standard long-term-memory benchmark: 500 questions across six question types, each answered over a multi-session conversation "haystack" of distractor sessions. The harness (`benchmarks/longmemeval_adapter.py`) runs the *real* pipeline per question — ingest the haystack → optionally dream → `hy.augment()` → the host LLM answers from the returned context → an LLM judge scores it.
+
+**Two numbers, always — and the one that counts is production-truth.** A result is only treated as real if it carries to live Hermes; nothing that reads the oracle `question_type` label (which production does not have) is allowed to drive the score. So every run reports both:
+
+- **Oracle** — the question-type label drives retrieval shaping. The category ceiling.
+- **Production-truth (`--auto-ability`)** — the in-library `detect_ability` router (`query/intent.py`, §3) infers the ability from the query alone, label-free, exactly as it does in Hermes. The honest number.
+
+**Production-truth: 70.0% overall** on the full 500-question suite (auto-ability router; permissive, abstention-guarded default answer prompt; recency-dated raw-message context; **full dream**). Answering and judging use the default DeepSeek model. Earlier headline runs were no-dream (LME's single-haystack setup once looked dream-neutral); the definitive A/B below overturns that — dream is worth **+3.6pp overall** and the graph facts it consolidates now carry real weight in retrieval.
+
+| Question type | Score |
+|---|---|
+| Single-session-user (SS-U) | 95.7% |
+| Knowledge-update (KU) | 76.9% |
+| Temporal-reasoning (TR) | 72.9% |
+| Single-session-preference (SS-P) | 66.7% |
+| Single-session-assistant (SS-A) | 66.1% |
+| Multi-session (MS) | 51.9% |
+| **Overall** | **70.0%** |
+
+For context, published LongMemEval figures place this local, embedded, SQLite-only system ahead of Honcho (63.8) and the RAG / LIGHT baselines (48.5 / 51.7); the frontier system (Hindsight, 89.4) leads almost entirely on **multi-session** — which is exactly HyMem's lowest row and its open frontier (below).
+
+**Dreaming is worth +3.6pp — the definitive A/B (500q, seed 0, auto-ability, permissive-default).** The full-dream table above is the canonical number; the no-dream column below is the same config with the dream cycle skipped:
+
+| Question type | No-dream | Full-dream | Δ |
+|---|---|---|---|
+| Knowledge-update (KU) | 70.5% | 76.9% | +6.4pp |
+| Multi-session (MS) | 42.9% | 51.9% | +9.0pp |
+| Temporal-reasoning (TR) | 74.4% | 72.9% | −1.5pp |
+| Single-session-preference (SS-P) | 56.7% | 66.7% | +10.0pp |
+| Single-session-assistant (SS-A) | 67.9% | 66.1% | −1.8pp |
+| Single-session-user (SS-U) | 94.3% | 95.7% | +1.4pp |
+| **Overall** | **66.4%** | **70.0%** | **+3.6pp** |
+
+The biggest lifts land where cross-session consolidation matters most: **MS +9pp** (dream bridges fractured sessions), **SS-P +10pp** (preferences extracted into graph facts), **KU +6.4pp** (knowledge updates consolidated). The TR and SS-A dips are within LLM-judge variance (~1.5–2pp). The recall ceiling confirms the *mechanism*, not just the score: retrieval misses dropped 42 → 39, and the "both" recovery tier (message + graph facts) jumped **0 → 98** — dream's graph facts are now actively contributing — while MS ranking misses dropped 10 (67 → 57), so the consolidated facts also improve the reranker's candidate quality. Abstention improves in step (70.0% → 76.7% correct refusals): graph consolidation helps the system tell "I truly don't know" from "I just can't find it in messages." The cost is real — **140 min vs 12 min (11.7×), ~1.7M tokens** — which is why dream is a background idle cycle in production, not an inline step.
+
+**What drives the score — every lever carries to production, none reads the oracle label:**
+
+- **Raw-message FTS tier** (`message_hits`, schema v13, §6) — a direct BM25 index over raw turns, recallable across sessions and *before* any dream consolidates them. Historically the single biggest jump.
+- **Label-free ability routing** (`detect_ability`, EN+NL regex, §3) — fills MR/TR shaping in production with no oracle label. MR layers a deterministic, **additive** user-turn count on normal retrieval (a false-positive route stays harmless — retrieval is never suppressed); TR injects a date-ordered chronology.
+- **Recency-dated context** — `message_hits` are stamped with their `created_at`, plus a value-aware recency clause so the answerer prefers the most recent turn that actually *states* a value rather than a later tangential mention. Lifted knowledge-update from 62.8% → 75.6%.
+- **Permissive, abstention-guarded default prompt** — recovers single-session-preference questions the strict prompt refused, while holding the abstention guard tight on single-turn facts.
+- **Dreaming (graph consolidation)** — the background dream cycle extracts a cross-session knowledge graph whose facts join the retrieval pool; worth +3.6pp overall and the dominant lever on MS / SS-P / KU (the A/B above).
+
+**The open frontier is multi-session (51.9%).** Extensive LLM-free probing established that MS *retrieval* is effectively closed — the gold turns do reach the answer context; the residual is cross-session **synthesis** (a reader problem, not retrieval) plus a small floor of facts buried as incidental asides inside otherwise off-topic turns. One tempting "fix" (a user-only context filter for MR) was built, measured, and **reverted**: it was neutral on its target and dropped assistant-turn gold on MR-misrouted single-session-assistant questions — a worked example of the project's rule that you never *suppress* retrieval on a routed ability that has false positives, only *add* to it. The full investigation, including dead-ends not to re-chase, lives in `benchmarks/longmemeval_roadmap.md`.
+
+**RAPTOR cross-session aggregation (Phase 2), gate PASSED → built.** Since the MS residual is *synthesis* (all gold turns reach context, the reader fails to fuse ~45 raw slots), the fix is upstream: pre-compute hierarchical aggregation nodes so the answer model fuses a handful of cluster summaries instead of dozens of raw turns. This only helps if clustering *co-locates* a question's synthesis inputs into a single node — so, mirroring the front-run discipline that killed the L3 diversity-pack, it was gated by an offline probe (`benchmarks/raptor_cluster_probe.py`) **before** any table or migration was built. The probe dreams each MS miss into episodes, clusters them across sessions by embedding-or-entity overlap, and measures how often the gold-bearing episodes land in one cluster. **Result (grid emb≥0.55 OR ent≥0.50, 53 MS ranking misses): of the 31 questions whose gold turns became episodes, 27 (87%) had all their gold episodes land in a single cluster (mean 1.13 gold-clusters/question against 16.8 clusters/question)** — one aggregation-node summary captures everything the reader must fuse. The remaining 22/53 (42%) have *no* gold episode at all: a dream **coverage** gap (episode-extraction recall), not a clustering gap, and a separate lever that doesn't block this build. High co-location → build, so the layer has LANDED: schema v16 (`aggregation_nodes` + `aggregation_node_embeddings`, migration `016`), `dreaming/aggregate.py` (cluster → fuse each cross-session multi-session cluster with one LLM call → full-rebuild the nodes, cache-keyed summary embeddings), a dream-runner step, and an **additive, off-by-default** retrieval tier (`cfg.aggregation_nodes_enabled`) that surfaces cluster summaries in `ctx.aggregation_nodes` without displacing the episode/chunk/message tiers. Off by default → zero dream-time cost and zero query-time behavior change until a host opts in. It is unit-covered offline (`test_aggregate.py`, plus the clusterer pinned in `test_raptor_cluster_probe.py`); the decisive co-location run was on the Hermes box (it needs real dreams).
+
+**G4 verdict (2026-06-11): closed as an LME lever → pivoted to a standing digest.** The on/off LME A/B lost (69.0 vs 70.0): the nodes recovered no messages the message/chunk tiers missed — they only reshuffled ranking, crowding knowledge-update gold out of the answer pool — and a TR-gated re-run was a wash (temporal-reasoning dead flat; the earlier +3pp was run variance). Retrieval-side injection structurally can't win where raw-message FTS already closes recall, so the layer's consumption model is now **host-facing standing context**: schema v17 adds RAPTOR hierarchy levels — dreaming recursively rolls the level-0 cluster nodes plus all unclustered episodes (capped, most-recent-first) up into one **root digest node**, with a consecutive-chunk fallback that guarantees convergence even when nothing clusters — and `HyMem.digest()` returns that root for system-prompt injection: the "what do you know about me?" answer no keyword retrieval can produce. Levels ≥ 1 never enter the query-time tier (level-0 filter in `_aggregation_search`), so the digest cannot crowd retrieval by construction, and every fusion is reuse-cached by member-set hash, so re-dreaming a stable store costs zero LLM calls. The query-time tier itself stays additive and ability-gated (`cfg.aggregation_inject_abilities`, default TR-only) for hosts that opt in.
+
+**Reproduce:**
+
+```bash
+# production-truth (the 70.0% headline — full dream, ~140 min at this config)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
+    --workers 4 --permissive-default
+# fast no-dream A/B (the 66.4% column, ~12 min)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
+    --workers 4 --no-dream --permissive-default
+# oracle ceiling (question-type label drives shaping)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8
+```
+
+---
+
+## 12. Comparison with Honcho
 
 | Dimension | HyMem | Honcho (plastic-labs) |
 |---|---|---|
@@ -518,7 +685,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (19 endpoints, real-SDK contract tests) | Native |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
 | **SDKs** | Python + MCP + Honcho SDK | Python + TypeScript |
-| **Maturity** | v0.1.0, ~7,600 lines | v3.0.6, 514 commits, 3.4k stars |
+| **Maturity** | v0.1.0, ~15,000 lines | v3.0.6, 514 commits, 3.4k stars |
 | **License** | Not specified | AGPL-3.0 |
 
 **The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, semantic-and-explainable graph ranking, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
@@ -527,7 +694,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 
 ---
 
-## 12. Limitations & Known Gaps
+## 13. Limitations & Known Gaps
 
 - **Python cosine fallback**: sqlite-vec is the primary vector search path (vec0 KNN over `vec_chunks` / `vec_edges` / `vec_episodes`), but the extension isn't available on every platform. When it's not loadable, retrieval falls back to a pure-Python cosine scan capped at `embedding_max_scan` chunks (default 5000); on installs where the extension is missing, vector search degrades beyond that cap.
 - **No streaming**: The Honcho server doesn't implement SSE streaming for chat responses.
@@ -535,3 +702,5 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - **No authentication**: Both MCP and Honcho servers are unauthenticated — they assume localhost-only access.
 - **Latin-script only**: Canonicalization, query-time entity matching, and the LLM prompts handle Latin-script languages (English, Dutch, French, German, Spanish, etc.) — accents are folded into canonical keys. Chunking salience triggers are tuned for English and Dutch; other languages fall back to length-based salience (the LLM is still the real filter). Non-Latin scripts (CJK, Cyrillic, Arabic) are not supported.
 - **LLM-dependent extraction quality**: While feedback learning helps, extraction quality ultimately depends on the LLM's capabilities. A weak LLM will produce noisy graphs.
+- **Re-extraction surge after a `prompt_version` bump**: bumping the version invalidates every chunk's processed-marker, so the next dream cycles reprocess the whole backlog — minutes of work, and the first dream after a deploy is always the slow one. This is expected, not a hang; `GET /dream-status` (or `HyMem.dream_status()`) reports `pending_chunks` / `total_chunks` so the surge is observable rather than opaque. Bounded per-cycle re-extraction (so a bump amortizes over many dreams instead of one storm) is not yet implemented.
+- **Best-effort redaction, not a guarantee**: secret/PII scrubbing targets high-confidence patterns (provider key prefixes, JWTs, PEM blocks, bearer/credential strings, emails). It deliberately avoids generic high-entropy heuristics that would shred ordinary prose, so a novel or unstructured secret format can slip through. Treat it as defense-in-depth, not a substitute for not pasting secrets.

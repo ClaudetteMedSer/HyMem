@@ -77,3 +77,7 @@ pip-delete-this-directory.txt
 *.pyc
 *.pyc
 *.pyc
+*.lock
+
+# Benchmark datasets (licenses vary; LoCoMo is CC BY-NC 4.0 — decide before committing)
+benchmarks/data/

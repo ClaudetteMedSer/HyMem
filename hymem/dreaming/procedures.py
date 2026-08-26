@@ -5,6 +5,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 
+from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import PROCEDURE_SYSTEM, PROCEDURE_USER_TEMPLATE
 
@@ -57,9 +58,18 @@ def extract_procedures_for_session(
     )
     raw = llm.complete(request)
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+    # PROCEDURE_SYSTEM asks for a bare JSON array; fences/prose around it are
+    # tolerated (dream 1013 — json_object mode is a request, not a contract).
+    data = loads_lenient(raw, expect="array")
+    if data is None:
+        log.warning("procedures.parse_failure session_id=%s raw_len=%d",
+                    session_id, len(raw) if isinstance(raw, str) else -1)
+        return ProceduresExtraction()
+    if not isinstance(data, list):
+        # validate_procedure_items() absorbs a non-list into [], which reads
+        # downstream as "no procedures in this session" rather than a drop.
+        log.warning("procedures.shape_failure session_id=%s type=%s",
+                    session_id, type(data).__name__)
         return ProceduresExtraction()
 
     return ProceduresExtraction(items=validate_procedure_items(data))

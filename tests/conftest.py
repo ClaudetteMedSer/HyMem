@@ -32,6 +32,23 @@ def hy(cfg: HyMemConfig, stub_llm: StubLLMClient):
 
 
 @pytest.fixture
+def hy_agg(cfg: HyMemConfig, stub_llm: StubLLMClient):
+    """HyMem in MR replace-mode with a wide counting cap (200) so aggregation
+    tests see the aggregate's own evidence turns (distinct deduped user turns
+    with enumerates_items flags) as `message_hits`. `mr_aggregate_additive=False`
+    pins the legacy path these tests assert on; the additive default (relevance
+    retrieval + a layered count) is covered separately."""
+    from dataclasses import replace
+
+    instance = HyMem(
+        replace(cfg, message_fts_aggregate_cap=200, mr_aggregate_additive=False),
+        llm=stub_llm,
+    )
+    yield instance
+    instance.close()
+
+
+@pytest.fixture
 def hy_with_embed(
     cfg: HyMemConfig, stub_llm: StubLLMClient, embed_stub: StubEmbeddingClient
 ):
@@ -66,12 +83,21 @@ def seed_edge(
 
 
 def make_routed_llm(triples: list[dict], markers: list[dict]) -> StubLLMClient:
-    """Stub that routes triple prompts to one payload and marker prompts to another.
+    """Stub for the merged per-chunk extraction call.
 
-    Distinguishes via unique strings in the respective system prompts.
+    Phase 1 now issues a SINGLE call whose prompt returns a JSON object with
+    both "triples" and "markers". The combined prompt contains both distinctive
+    substrings ("structured technical relationships" and "EXPLICIT behavioral
+    signals"), so a single fixture keyed on either routes to the combined object.
+    The separate-key fixtures are retained so any code still issuing the old
+    standalone triple/marker prompts continues to route correctly.
     """
+    combined = json.dumps({"triples": triples, "markers": markers})
     return StubLLMClient(
         fixtures={
+            # Combined chunk-extraction prompt -> object with both keys.
+            "single pass": combined,
+            # Legacy standalone prompts (extract_triples / extract_markers).
             "structured technical relationships": json.dumps(triples),
             "EXPLICIT behavioral signals": json.dumps(markers),
         },

@@ -318,3 +318,85 @@ def test_mark_procedure_stale_unknown_id_returns_false(cfg, stub_llm):
         assert hy.mark_procedure_stale("does-not-exist@proc0") is False
     finally:
         hy.close()
+
+
+# --- fenced replies (dream 1013) -------------------------------------------
+
+
+_PROC_TURNS = [
+    ("assistant", "how do we deploy?"),
+    ("user", "Pretend there's a deploy procedure here long enough to clear the salience minimum."),
+]
+
+
+def _hy_with_chunks(cfg, sid: str) -> HyMem:
+    """HyMem whose `sid` has real chunks, ready for a direct extract call."""
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    _seed_session(hy, sid, _PROC_TURNS)
+    hy.dream()
+    return hy
+
+
+def test_extract_procedures_parses_fenced_reply(cfg):
+    """The procedure call sets response_format="json"; dream 1013 proved a
+    provider will fence the reply anyway, and this path had no retry and no
+    log — a fenced reply was silent, permanent data loss."""
+    sid = "s_fenced_proc"
+    hy = _hy_with_chunks(cfg, sid)
+    try:
+        fenced = "```json\n" + json.dumps([{
+            "name": "Deploy to staging",
+            "description": "Ship the build.",
+            "steps": [{"order": 1, "action": "build the image"}],
+        }]) + "\n```"
+        hy.set_llm(StubLLMClient(
+            fixtures={"identify step-by-step procedures": fenced}, default="[]",
+        ))
+        ext = extract_procedures_for_session(hy.conn, sid, hy._llm)
+        assert ext is not None
+        assert [i["name"] for i in ext.items] == ["Deploy to staging"]
+    finally:
+        hy.close()
+
+
+def test_extract_procedures_refusal_yields_empty_extraction(cfg, caplog):
+    """An unparseable reply keeps the documented empty ProceduresExtraction,
+    now with a warning instead of silence."""
+    sid = "s_refusal_proc"
+    hy = _hy_with_chunks(cfg, sid)
+    try:
+        hy.set_llm(StubLLMClient(
+            fixtures={"identify step-by-step procedures": "I cannot do that."},
+            default="[]",
+        ))
+        with caplog.at_level("WARNING"):
+            ext = extract_procedures_for_session(hy.conn, sid, hy._llm)
+        assert ext == ProceduresExtraction()
+        assert any(
+            "procedures.parse_failure" in r.message and sid in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        hy.close()
+
+
+def test_extract_procedures_wrong_shape_yields_empty_extraction(cfg, caplog):
+    """validate_procedure_items() absorbs a non-list into [], which reads as
+    "no procedures in this session" — the one thing a dropped reply must not
+    be mistaken for."""
+    sid = "s_shape_proc"
+    hy = _hy_with_chunks(cfg, sid)
+    try:
+        hy.set_llm(StubLLMClient(
+            fixtures={"identify step-by-step procedures": '{"procedures": "none"}'},
+            default="[]",
+        ))
+        with caplog.at_level("WARNING"):
+            ext = extract_procedures_for_session(hy.conn, sid, hy._llm)
+        assert ext == ProceduresExtraction()
+        assert any(
+            "procedures.shape_failure" in r.message and sid in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        hy.close()

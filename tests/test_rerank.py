@@ -45,6 +45,38 @@ def test_llm_rerank_returns_passthrough_on_garbage():
     assert [h.text for h in out] == ["a", "b"]
 
 
+def test_llm_rerank_accepts_object_wrapped_ratings():
+    """Strict-JSON-mode backends (response_format json_object) must emit an
+    object, not a bare array — the prompt asks for {"ratings": [...]} and the
+    parser must unwrap it."""
+    candidates = [
+        _Hit(text="completely irrelevant blue elephant trivia"),
+        _Hit(text="how to deploy api to staging via docker"),
+    ]
+    llm = StubLLMClient(default=json.dumps({"ratings": [
+        {"index": 0, "relevance": 1},
+        {"index": 1, "relevance": 5},
+    ]}))
+    out = llm_rerank("how do I deploy?", candidates, llm, top_k=2)
+    assert "deploy" in out[0].text
+    assert out[0].score_kind == "reranked"
+
+
+def test_llm_rerank_returns_passthrough_when_backend_raises():
+    """The Reranker contract (never raise) sits on augment()'s hot path: a
+    network/rate-limit error from the LLM must degrade to the un-reranked
+    list, not abort the whole augment call."""
+
+    class _ExplodingLLM:
+        def complete(self, request):
+            raise ConnectionError("simulated 429")
+
+    candidates = [_Hit(text="a"), _Hit(text="b"), _Hit(text="c")]
+    out = llm_rerank("q", candidates, _ExplodingLLM(), top_k=2)
+    assert [h.text for h in out] == ["a", "b"]
+    assert out[0].score_kind == "rrf"
+
+
 def test_rerank_dispatch_with_llm_model():
     candidates = [_Hit(text="x"), _Hit(text="y")]
     llm = StubLLMClient(default=json.dumps([{"index": 1, "relevance": 5}]))
@@ -85,6 +117,74 @@ def test_rerank_dispatch_cross_encoder_falls_back_to_llm(monkeypatch):
     out = rerank("q", candidates, top_k=1, model="cross-encoder", llm=llm)
     assert out[0].text == "relevant"
     assert out[0].score_kind == "reranked"
+
+
+def test_message_tier_reranks_wider_pool_then_trims(hy):
+    """The raw-message tier must pull a `rerank_top_k`-wide BM25 pool and rerank
+    it down to `message_fts_top_k` — the fix for ranking-loss misses, since this
+    tier carries most of the gold yet was historically returned in raw BM25 order.
+
+    We deliberately do NOT dream, so `chunks_fts` is empty and the chunk-tier
+    rerank never fires (should_rerank needs both fts+vec). The only rerank call
+    is therefore the message-tier one, and we assert its candidate pool exceeds
+    the returned cut."""
+    hy.open_session("s_msg_pool")
+    # Many raw turns sharing a keyword so the message FTS pool is deep.
+    for i in range(12):
+        hy.log_message("s_msg_pool", "user", f"deploy pipeline note {i}: staging rollout")
+
+    rerank_llm = StubLLMClient(default="[]")
+    hy.set_llm(rerank_llm)
+
+    from dataclasses import replace as dc_replace
+    hy.config = dc_replace(
+        hy.config,
+        message_fts_top_k=3,
+        rerank_top_k=10,
+        rerank_message_hits=True,
+    )
+
+    ctx = hy.augment("deploy pipeline")
+
+    # The cut is honoured.
+    assert len(ctx.message_hits) <= 3
+    # A message-tier rerank ran over a pool wider than the cut.
+    rerank_calls = [
+        c for c in rerank_llm.calls if "evaluate the relevance" in c.system
+    ]
+    assert rerank_calls, "message-tier rerank was never invoked"
+    user = rerank_calls[-1].user
+    marker_count = sum(
+        1 for line in user.splitlines() if line.startswith("[") and "]" in line
+    )
+    assert marker_count > 3
+    assert marker_count <= 10
+
+
+def test_message_tier_rerank_disabled_keeps_raw_bm25(hy):
+    """With `rerank_message_hits=False` the tier returns raw BM25 (no rerank
+    call, no wider pool) — the escape hatch must fully restore prior behaviour."""
+    hy.open_session("s_msg_off")
+    for i in range(12):
+        hy.log_message("s_msg_off", "user", f"deploy pipeline note {i}: staging rollout")
+
+    rerank_llm = StubLLMClient(default="[]")
+    hy.set_llm(rerank_llm)
+
+    from dataclasses import replace as dc_replace
+    hy.config = dc_replace(
+        hy.config,
+        message_fts_top_k=3,
+        rerank_top_k=10,
+        rerank_message_hits=False,
+    )
+
+    hy.augment("deploy pipeline")
+
+    rerank_calls = [
+        c for c in rerank_llm.calls if "evaluate the relevance" in c.system
+    ]
+    assert not rerank_calls, "message-tier rerank fired despite being disabled"
 
 
 def test_augment_uses_rerank_top_k_as_candidate_pool(hy_with_embed):
@@ -132,3 +232,67 @@ def test_augment_uses_rerank_top_k_as_candidate_pool(hy_with_embed):
     marker_count = sum(1 for line in user.splitlines() if line.startswith("[") and "]" in line)
     assert marker_count > 3
     assert marker_count <= 10
+
+
+# --- fenced replies (dream 1013) -------------------------------------------
+
+
+def test_llm_rerank_parses_fenced_ratings():
+    """The rerank call sets response_format="json"; dream 1013 proved a
+    provider will fence the reply anyway. Recovery here is pure string work —
+    no extra request, so augment()'s retry-free hot path stays retry-free."""
+    candidates = [
+        _Hit(text="completely irrelevant blue elephant trivia"),
+        _Hit(text="how to deploy api to staging via docker"),
+    ]
+    fenced = "```json\n" + json.dumps({"ratings": [
+        {"index": 0, "relevance": 1},
+        {"index": 1, "relevance": 5},
+    ]}) + "\n```"
+    out = llm_rerank("how do I deploy?", candidates, StubLLMClient(default=fenced), top_k=2)
+    assert "deploy" in out[0].text
+    assert out[0].score_kind == "reranked"
+
+
+def test_llm_rerank_refusal_returns_passthrough(caplog):
+    """An unparseable reply keeps the documented passthrough (input order,
+    truncated to top_k, score_kind untouched) — leniency must not invent
+    ratings — and the drop is now audible."""
+    candidates = [_Hit(text="a"), _Hit(text="b"), _Hit(text="c")]
+    llm = StubLLMClient(default="I'm sorry, I can't rate these.")
+    with caplog.at_level("WARNING"):
+        out = llm_rerank("q", candidates, llm, top_k=2)
+    assert [h.text for h in out] == ["a", "b"]
+    assert all(h.score_kind == "rrf" for h in out)
+    assert any("rerank.parse_failure" in r.message for r in caplog.records)
+
+
+def test_llm_rerank_parses_a_fenced_BARE_array():
+    """The prompt asks for {"ratings": [...]} but this function deliberately
+    accepts a bare array too (models without strict JSON mode emit one). The
+    recovery has to cover both, or a shape the reranker is otherwise happy to
+    consume gets dropped purely because the model fenced it."""
+    candidates = [
+        _Hit(text="completely irrelevant blue elephant trivia"),
+        _Hit(text="how to deploy api to staging via docker"),
+    ]
+    fenced = "```json\n" + json.dumps([
+        {"index": 0, "relevance": 1},
+        {"index": 1, "relevance": 5},
+    ]) + "\n```"
+    out = llm_rerank("how do I deploy?", candidates, StubLLMClient(default=fenced), top_k=2)
+    assert "deploy" in out[0].text
+    assert out[0].score_kind == "reranked"
+
+
+def test_llm_rerank_wrong_shape_is_passthrough_and_audible(caplog):
+    """Valid JSON of the wrong shape. Downstream this is indistinguishable
+    from "nothing was rated relevant" — candidates come back in upstream order
+    either way — so it needs its own log line to be diagnosable."""
+    candidates = [_Hit(text="a"), _Hit(text="b")]
+    llm = StubLLMClient(default=json.dumps({"verdict": "all equally good"}))
+    with caplog.at_level("WARNING"):
+        out = llm_rerank("q", candidates, llm, top_k=2)
+    assert [h.text for h in out] == ["a", "b"]
+    assert all(h.score_kind == "rrf" for h in out)
+    assert any("rerank.shape_failure" in r.message for r in caplog.records)

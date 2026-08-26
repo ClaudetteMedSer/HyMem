@@ -14,7 +14,7 @@ from hymem.core.vectors import decode_vector
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 12
+EXPECTED_SCHEMA_VERSION = 31
 
 
 def _load_schema() -> str:
@@ -87,6 +87,12 @@ def _split_sql_statements(script: str) -> list[str]:
     """Split a migration script into individual statements, treating a
     ``CREATE TRIGGER ... BEGIN ... END;`` block as one statement (its internal
     semicolons must not split it). Full-line ``--`` comments are dropped.
+
+    Only FULL-LINE comments are stripped, so a semicolon inside a TRAILING
+    ``--`` comment still terminates the statement and cuts a CREATE TABLE in
+    half ("incomplete input"). Keep migration end-of-line comments
+    semicolon-free; schema.sql has no such constraint (executescript hands the
+    whole file to SQLite, which parses comments properly).
     """
     body = "\n".join(
         line for line in script.splitlines() if not line.strip().startswith("--")
@@ -147,7 +153,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         log.info("migrated schema to v%d (%s)", version, entry.name)
 
 
-_VEC_TABLES = frozenset({"vec_chunks", "vec_edges", "vec_episodes"})
+_VEC_TABLES = frozenset({"vec_chunks", "vec_edges", "vec_episodes", "vec_facts"})
 
 
 def _ensure_vec_table_named(conn: sqlite3.Connection, name: str, dim: int) -> None:
@@ -173,25 +179,25 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
             "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
         ).fetchone()
         if existing_dim and int(existing_dim["value"]) == dim:
-            # Dim unchanged — still ensure vec_edges / vec_episodes exist and
-            # are populated for DBs that embedded chunks before those tables
-            # were introduced.
+            # Dim unchanged — still ensure vec_edges / vec_episodes / vec_facts
+            # exist and are populated for DBs that embedded chunks before those
+            # tables were introduced.
             _ensure_vec_table_named(conn, "vec_edges", dim)
             _backfill_vec_edges(conn, dim)
             _ensure_vec_table_named(conn, "vec_episodes", dim)
             _backfill_vec_episodes(conn, dim)
+            _ensure_vec_table_named(conn, "vec_facts", dim)
+            _backfill_vec_facts(conn, dim)
             return
         if existing_dim:
             conn.execute("DELETE FROM schema_meta WHERE key = 'vec_dim'")
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("DROP TABLE IF EXISTS vec_chunks")
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("DROP TABLE IF EXISTS vec_edges")
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("DROP TABLE IF EXISTS vec_episodes")
+            for stale in ("vec_chunks", "vec_edges", "vec_episodes", "vec_facts"):
+                with contextlib.suppress(sqlite3.OperationalError):
+                    conn.execute(f"DROP TABLE IF EXISTS {stale}")
         _ensure_vec_table_named(conn, "vec_chunks", dim)
         _ensure_vec_table_named(conn, "vec_edges", dim)
         _ensure_vec_table_named(conn, "vec_episodes", dim)
+        _ensure_vec_table_named(conn, "vec_facts", dim)
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('vec_dim', ?)",
             (str(dim),),
@@ -199,6 +205,7 @@ def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
         _backfill_vec(conn, dim)
         _backfill_vec_edges(conn, dim)
         _backfill_vec_episodes(conn, dim)
+        _backfill_vec_facts(conn, dim)
     except sqlite3.OperationalError:
         log.info("vec tables unavailable; using Python cosine search")
 
@@ -301,8 +308,147 @@ def _backfill_vec_episodes(conn: sqlite3.Connection, dim: int) -> None:
     log.info("backfilled vec_episodes from %d episode rows", len(rows))
 
 
+def _backfill_vec_facts(conn: sqlite3.Connection, dim: int) -> None:
+    """Populate vec_facts (rowid = narrative_facts.id, an INTEGER PRIMARY KEY,
+    so VACUUM-stable like vec_edges) from the JSON mirror on cold start / dim
+    change. Suppresses its own missing-table error so ensure_vec_table keeps
+    working against a pre-v26 store."""
+    with contextlib.suppress(sqlite3.OperationalError):
+        rows = conn.execute(
+            "SELECT fact_id, vector_json FROM narrative_fact_embeddings"
+        ).fetchall()
+        if not rows:
+            return
+        have = conn.execute("SELECT COUNT(*) AS c FROM vec_facts").fetchone()["c"]
+        if have >= len(rows):
+            return
+        for r in rows:
+            try:
+                vec = decode_vector(r["vector_json"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if len(vec) != dim:
+                vec = list(vec) + [0.0] * (dim - len(vec))
+            conn.execute(
+                "INSERT OR IGNORE INTO vec_facts(rowid, embedding) VALUES (?, ?)",
+                (r["fact_id"], _pack_vector(vec)),
+            )
+        log.info("backfilled vec_facts from %d fact rows", len(rows))
+
+
 def _pack_vector(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rowid-shadow integrity. episodes / chunks / aggregation_nodes have TEXT
+# primary keys, so their rowids are implicit — and SQLite's VACUUM may RENUMBER
+# implicit rowids (it compacts freelist gaps). Everything keyed on those rowids
+# from the outside silently decouples when that happens: the external-content
+# FTS tables (chunks_fts / episodes_fts / aggregation_nodes_fts) start joining
+# match hits to the wrong content rows, and the vec_* mirrors translate KNN
+# hits to the wrong ids. Worse, the drift then compounds: each new episode
+# INSERTs its vector at its (new) rowid, overwriting whichever old row happened
+# to sit there. This was a root cause of the 2026-07-12 RAPTOR reuse
+# instability — candidate blocking clustered on garbage neighborhoods after
+# post-prune VACUUMs — and it quietly degrades plain FTS/vec retrieval too.
+# messages_fts (content_rowid='id', INTEGER PRIMARY KEY), vec_edges (rowid =
+# knowledge_graph.id, INTEGER PRIMARY KEY), and narrative_facts_fts/vec_facts
+# (rowid = narrative_facts.id, INTEGER PRIMARY KEY) are VACUUM-stable and need
+# nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ROWID_FTS_TABLES = ("chunks_fts", "episodes_fts", "aggregation_nodes_fts")
+
+
+def resync_rowid_shadows(conn: sqlite3.Connection) -> None:
+    """Rebuild every index keyed on an implicit (renumberable) rowid from its
+    content table's CURRENT rowids. Must be called immediately after VACUUM;
+    also the repair step for stores VACUUMed by earlier releases. Idempotent,
+    and cheap next to the VACUUM that makes it necessary."""
+    for fts in _ROWID_FTS_TABLES:
+        with contextlib.suppress(sqlite3.OperationalError, sqlite3.DatabaseError):
+            conn.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+    if not _load_vec_extension(conn):
+        return
+    dim_row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
+    ).fetchone()
+    if not dim_row:
+        return
+    dim = int(dim_row["value"])
+    for table, backfill in (
+        ("vec_chunks", _backfill_vec),
+        ("vec_episodes", _backfill_vec_episodes),
+    ):
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            _ensure_vec_table_named(conn, table, dim)
+            backfill(conn, dim)
+    log.info("rowid shadows resynced (fts rebuilt, vec_chunks/vec_episodes refilled)")
+
+
+def vec_episodes_aligned(conn: sqlite3.Connection, sample: int = 8) -> bool:
+    """Cheap probe: do vec_episodes rows still hold the vectors of the episodes
+    whose rowids they sit at? Compares the stored blob against the packed
+    mirror vector for up to `sample` episodes drawn from both ends of the rowid
+    range (a renumber shifts everything above the first closed gap, so the
+    newest rows drift the most). Returns True when unverifiable (extension or
+    table absent, no embedded episodes) so callers only act on a proven
+    mismatch."""
+    if not _load_vec_extension(conn) or not has_vec_table(conn, table="vec_episodes"):
+        return True
+    dim_row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
+    ).fetchone()
+    if not dim_row:
+        return True
+    dim = int(dim_row["value"])
+    half = max(1, sample // 2)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT e.rowid AS rid, em.vector_json
+                FROM episodes e JOIN episode_embeddings em ON em.episode_id = e.id
+                ORDER BY e.rowid ASC LIMIT ?
+            )
+            UNION
+            SELECT * FROM (
+                SELECT e.rowid AS rid, em.vector_json
+                FROM episodes e JOIN episode_embeddings em ON em.episode_id = e.id
+                ORDER BY e.rowid DESC LIMIT ?
+            )
+            """,
+            (half, half),
+        ).fetchall()
+        for r in rows:
+            vec = decode_vector(r["vector_json"])
+            if len(vec) != dim:
+                vec = list(vec) + [0.0] * (dim - len(vec))
+            stored = conn.execute(
+                "SELECT embedding FROM vec_episodes WHERE rowid = ?", (r["rid"],)
+            ).fetchone()
+            if stored is None or bytes(stored["embedding"]) != _pack_vector(vec):
+                return False
+    except (sqlite3.OperationalError, json.JSONDecodeError, TypeError, ValueError):
+        return True    # unverifiable ≠ misaligned; never resync on a probe error
+    return True
+
+
+def heal_rowid_shadows(conn: sqlite3.Connection) -> bool:
+    """Probe vec_episodes alignment and, on a proven mismatch, resync every
+    rowid shadow. Returns True when a repair ran. Called by the dream runner
+    before aggregation so stores skewed by pre-fix VACUUMs heal on their next
+    dream instead of their next VACUUM."""
+    if vec_episodes_aligned(conn):
+        return False
+    log.warning(
+        "vec_episodes misaligned with episodes rowids (post-VACUUM renumber); "
+        "resyncing all rowid shadows"
+    )
+    resync_rowid_shadows(conn)
+    return True
 
 
 def vec_search(

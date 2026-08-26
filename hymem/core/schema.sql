@@ -30,7 +30,24 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- +procedures). The dream runner skips the per-session digest LLM call when
     -- this matches the current prompt_version and no chunk was re-extracted.
     -- Migration 012 adds this for existing DBs (ALTER lives there only).
-    digested_prompt_version TEXT
+    digested_prompt_version TEXT,
+    -- PROFILE_PROMPT_VERSION of the last successful user-profile extraction
+    -- (same skip mechanics as digested_prompt_version, but decoupled so a
+    -- profile-prompt bump alone re-extracts). Migration 019 adds this for
+    -- existing DBs (ALTER lives there only).
+    profile_prompt_version TEXT,
+    -- Highest message id covered by a successful digest. The digest reads only
+    -- chunks ABOVE this watermark, so a long-lived session's tail keeps getting
+    -- digested instead of the head being re-read forever (the truncation was
+    -- `combined[:max_chars]` over the whole session), and new traffic re-opens
+    -- the digest even when no chunk was freshly extracted. NULL = no coverage
+    -- recorded, so the next dream digests from the start of the session.
+    -- Migration 024 adds this for existing DBs (ALTER lives there only).
+    digested_message_id INTEGER,
+    -- Facts watermark (v26): same mechanics as digested_message_id but for the
+    -- narrative-facts extractor, its own column so facts and digest coverage
+    -- advance independently. Migration 026 adds this for existing DBs.
+    facts_message_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -41,6 +58,32 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+-- FTS over raw message text — a direct keyword path to the session log,
+-- complementing chunks_fts (which only covers high-salience spans materialized
+-- during dreaming). Populated live at ingest via triggers, so a turn is
+-- searchable the moment it is logged: across sessions and before any dream has
+-- consolidated it. Only user/assistant turns are indexed; tool/system turns are
+-- excluded as retrieval noise / index bloat. messages.id is INTEGER PRIMARY KEY
+-- (a rowid alias), so content_rowid='id' joins straight back to the row.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id',
+    tokenize='porter unicode61'
+);
+
+-- Messages are append-only (no UPDATE path in session.py), so insert + delete
+-- triggers keep the index in sync; the WHEN guard mirrors the role filter so
+-- tool/system turns never enter — and a delete of one safely no-ops.
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages
+WHEN new.role IN ('user','assistant') BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages
+WHEN old.role IN ('user','assistant') BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+END;
 
 -- High-salience chunks identified during dreaming phase 1.
 CREATE TABLE IF NOT EXISTS chunks (
@@ -63,6 +106,27 @@ CREATE TABLE IF NOT EXISTS entity_mentions (
 );
 CREATE INDEX IF NOT EXISTS idx_entity_mentions_canonical ON entity_mentions(entity_canonical);
 CREATE INDEX IF NOT EXISTS idx_entity_mentions_chunk ON entity_mentions(chunk_id);
+
+-- Explicit dates written in raw message text, extracted during dreaming
+-- (dreaming/temporal.py). The temporal-reasoning (TR) augment path reads this
+-- to return events already sorted by date, so the host LLM never has to find
+-- dates in noise. `normalized_date` is ISO YYYY-MM-DD when a full date (incl.
+-- year) was resolvable, else NULL for a year-less mention whose raw_text and
+-- the turn's `created_at` still carry ordering signal. One row per distinct
+-- (message_id, raw_text) so a re-dreamed chunk does not duplicate mentions.
+-- Migration 014 adds this to existing DBs.
+CREATE TABLE IF NOT EXISTS temporal_mentions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    normalized_date TEXT,
+    raw_text TEXT NOT NULL,
+    surrounding_text TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (message_id, raw_text)
+);
+CREATE INDEX IF NOT EXISTS idx_temporal_mentions_date ON temporal_mentions(normalized_date);
+CREATE INDEX IF NOT EXISTS idx_temporal_mentions_message ON temporal_mentions(message_id);
 
 -- FTS over chunk text. External-content table keeps storage tight.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -119,6 +183,18 @@ CREATE TABLE IF NOT EXISTS processed_chunks (
     PRIMARY KEY (chunk_id, prompt_version)
 );
 
+-- Consecutive failed extraction attempts per chunk (v28). A failed extraction
+-- is HELD (no processed_chunks row) and retried next dream; this bounds that
+-- retry so a permanently-broken chunk cannot consume a dream_budget slot
+-- forever. Cleared on success, so the count is consecutive failures.
+CREATE TABLE IF NOT EXISTS chunk_extraction_attempts (
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    prompt_version TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_failure_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chunk_id, prompt_version)
+);
+
 -- Entity canonicalization. surface forms map to a canonical id.
 CREATE TABLE IF NOT EXISTS entity_aliases (
     alias TEXT PRIMARY KEY,
@@ -161,7 +237,8 @@ CREATE TABLE IF NOT EXISTS knowledge_graph (
         'uses','depends_on','prefers','rejects','avoids',
         'replaces','conflicts_with','deploys_to','part_of','equivalent_to',
         'implements','contains','configured_with','requires_version',
-        'runs_on','connects_to','generates','tested_by'
+        'runs_on','connects_to','generates','tested_by',
+        'owns','located_in','participates_in','has_attribute'
     )),
     object_canonical TEXT NOT NULL,
     pos_evidence INTEGER NOT NULL DEFAULT 0,
@@ -169,6 +246,12 @@ CREATE TABLE IF NOT EXISTS knowledge_graph (
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_reinforced TIMESTAMP,
+    -- Bi-temporal VALID time (distinct from the transaction-time columns above):
+    -- valid_at = world date the fact became true, invalid_at = world date it was
+    -- superseded (NULL = still valid). Added in migration 015; the validity index
+    -- lives in that migration only (see its header for why it can't sit here).
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','stale','retracted')),
     derived BOOLEAN NOT NULL DEFAULT 0,
     UNIQUE(subject_canonical, predicate, object_canonical)
@@ -283,6 +366,104 @@ CREATE TABLE IF NOT EXISTS episode_embeddings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- RAPTOR cross-session aggregation nodes (schema v16; hierarchy in v17). A
+-- level-0 node fuses a cluster of episodes (connected components over
+-- embedding-OR-entity overlap) that span multiple sessions, so a synthesis
+-- question reads a handful of cluster summaries instead of dozens of raw turns.
+-- Levels >= 1 (v17) are RAPTOR rollups whose member_episode_ids hold CHILD ids
+-- (lower-level node ids and/or pass-through episode ids), recursing until one
+-- is_root digest node — the standing "what do you know about me" summary
+-- exposed via HyMem.digest(). Only level 0 enters query-time retrieval. The
+-- whole layer is additive and off by default (cfg.aggregation_nodes_enabled).
+-- Rebuilt from scratch each dream — membership is a pure function of the
+-- current episodes — so there is no stable-id UPSERT churn; the id is a content
+-- hash of members, which also keys reuse of an unchanged node's LLM fusion.
+CREATE TABLE IF NOT EXISTS aggregation_nodes (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    member_episode_ids TEXT NOT NULL DEFAULT '[]',
+    session_ids TEXT NOT NULL DEFAULT '[]',
+    n_members INTEGER NOT NULL DEFAULT 0,
+    n_sessions INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    level INTEGER NOT NULL DEFAULT 0,
+    is_root INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS aggregation_nodes_fts USING fts5(
+    title, summary,
+    content='aggregation_nodes', content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_insert AFTER INSERT ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_delete AFTER DELETE ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(aggregation_nodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_update AFTER UPDATE ON aggregation_nodes BEGIN
+    INSERT INTO aggregation_nodes_fts(aggregation_nodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+    INSERT INTO aggregation_nodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+
+-- Node-summary embeddings, keyed by node id. Retrieval does a Python-cosine
+-- scan over these (no vec0 table) since the node count is small and the tier is
+-- off by default — keeping the vec0 plumbing limited to chunks/edges/episodes.
+CREATE TABLE IF NOT EXISTS aggregation_node_embeddings (
+    node_id TEXT PRIMARY KEY REFERENCES aggregation_nodes(id) ON DELETE CASCADE,
+    vector_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Durable leaf-set watermark (schema v30) for the leftover-displacement term
+-- of the deficit model. Replaces a module global that only ever compared
+-- against the previous dream IN THE SAME PROCESS, which on a box that starts a
+-- fresh process per dream made `aggregation_leaf_changed` unreadable on 175 of
+-- 187 rows. Written inside the node-persist transaction, so the watermark
+-- advances only when the dream that consumed the leaf set landed; a store that
+-- has never aggregated has no row, and that reads as NULL (unattributed), not
+-- as an unchanged leaf set.
+CREATE TABLE IF NOT EXISTS aggregation_leaf_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    fingerprint TEXT NOT NULL,
+    n_leaves INTEGER NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Typed user-profile slots (schema v18, Stage 1 / P4). Durable personal facts
+-- the tech-domain knowledge-graph vocabulary can never hold (role, name,
+-- employer, location, ...), extracted from USER turns only during dreaming
+-- under the CLOSED slot vocabulary the CHECK enforces — the LLM cannot invent
+-- a slot. slot_key parameterizes a slot ('relationship' is keyed by the other
+-- person); NULL for unkeyed slots. Bi-temporal like knowledge_graph (v15
+-- semantics): valid_at = world date the fact became true (evidence message
+-- created_at), invalid_at = world date a conflicting value on the same
+-- (slot, slot_key) superseded it (NULL = still valid). Consumed additively by
+-- the digest's VERIFIED FACTS anchor, augment()'s ctx.user_profile tier, and
+-- HyMem.profile(). The index is safe here (unlike migration-added columns)
+-- because the table is created whole in this same script.
+CREATE TABLE IF NOT EXISTS user_profile (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot TEXT NOT NULL CHECK (slot IN (
+        'role','name','employer','location','language','relationship',
+        'possession','age_birthday','health_condition','recurring_activity'
+    )),
+    slot_key TEXT,
+    value TEXT NOT NULL,
+    evidence_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    confidence REAL NOT NULL DEFAULT 1.0
+        CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_user_profile_active
+    ON user_profile(slot, slot_key, invalid_at);
+
 -- Procedural memory: step-by-step workflows extracted from conversations.
 CREATE TABLE IF NOT EXISTS procedures (
     id TEXT PRIMARY KEY,
@@ -362,7 +543,123 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     edges_embedded INTEGER NOT NULL DEFAULT 0,
     triples_extracted INTEGER NOT NULL DEFAULT 0,
     markers_extracted INTEGER NOT NULL DEFAULT 0,
+    aggregation_nodes_built INTEGER NOT NULL DEFAULT 0,
+    aggregation_nodes_reused INTEGER NOT NULL DEFAULT 0,
+    aggregation_fusion_failures INTEGER NOT NULL DEFAULT 0,
+    aggregation_input_episodes INTEGER NOT NULL DEFAULT 0,
+    aggregation_blocking TEXT NOT NULL DEFAULT '',
+    -- v29 deficit attribution (renumbered from 027): NULL = unattributed, NOT
+    -- a fixed point. The fixed-point signature is level0_missed=0 AND
+    -- leaf_changed=0 alongside a nonzero built count, so pre-v29 rows stay
+    -- NULL rather than being backfilled into counterfeit fixed points.
+    aggregation_level0_missed INTEGER,
+    aggregation_leaf_changed INTEGER,
+    -- v31 structural rebuild forecast. predicted counts nodes whose (level,
+    -- member set) is absent from the previous tree; residual = actual -
+    -- predicted counts nodes that kept their membership and still missed the
+    -- fusion cache, which is an id-keying defect and reads on ONE dream.
+    aggregation_predicted_rebuild INTEGER,
+    aggregation_keying_residual INTEGER,
+    aggregation_facts_rekey INTEGER,
+    -- v25 digest attribution: a per-session digest that raises or returns an
+    -- unparseable payload is logged and skipped (one bad session must not abort
+    -- a dream), and episode creation can stall silently while chunks keep
+    -- arriving — the 2026-07-30 starvation bug. These make both visible without
+    -- a join against episodes.
+    digest_failures INTEGER NOT NULL DEFAULT 0,
+    episodes_created INTEGER NOT NULL DEFAULT 0,
+    -- v26 facts attribution, mirroring the digest counters above: a stalled or
+    -- failing narrative-facts extractor must be a one-line read.
+    facts_extracted INTEGER NOT NULL DEFAULT 0,
+    fact_failures INTEGER NOT NULL DEFAULT 0,
     skipped_locked INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dream_runs_started ON dream_runs(started_at);
+
+-- v23: `always_on` Rules as a first-class node type (Idea B). Standing
+-- behavioral imperatives ("always run the tests before pushing") injected into
+-- every augment() context via ctx.rules; scope='contextual' rules fire only on
+-- trigger_entities overlap with matched_entities. Bi-temporal like
+-- knowledge_graph / user_profile (a contradicting rule closes invalid_at rather
+-- than overwriting); text UNIQUE so re-assert reinforces. See hymem/rules.py.
+-- Constraint (additional_planning.md §0): NOT fed into the RAPTOR digest anchor.
+-- v26: narrative facts — the E1 middle-granularity tier. Dream-time extraction
+-- of self-contained narrative statements ("Atta moved the MedFlow deploy to
+-- fly.io"), stored APPEND-ONLY (text is immutable; a prompt bump extracts
+-- forward only under a new prompt_version tag) and served as an additive
+-- retrieval tier plus the lead evidence block in ask(). fact_date holds
+-- EXPLICIT dates the conversation wrote; relative references stay NULL (E4's
+-- job — stamping the session date was a proven invention amplifier).
+-- invalid_at is the ONLY mutable field (E6 supersession closes it); retrieval
+-- filters invalid_at IS NULL, the row stays for audit. Built behind the
+-- G-F1b extraction-faithfulness gate (PASSED 2026-08-02, 123/123 strict);
+-- see hymem/dreaming/facts.py. The index is safe here (table created whole
+-- in this script); migration 026 carries it for existing DBs.
+CREATE TABLE IF NOT EXISTS narrative_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    start_message_id INTEGER NOT NULL,
+    end_message_id INTEGER NOT NULL,
+    text TEXT NOT NULL,                    -- self-contained narrative; IMMUTABLE
+    fact_date TEXT,                        -- ISO or NULL (explicit dates; relatives = E4)
+    entities TEXT NOT NULL DEFAULT '[]',   -- JSON array of canonical names
+    prompt_version TEXT NOT NULL,          -- 'facts.v2' provenance tag
+    valid_at TEXT,                         -- bi-temporal, mirrors knowledge_graph
+    invalid_at TEXT,                       -- the ONLY mutable field (E6 closes it)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (session_id, start_message_id, text)
+);
+CREATE INDEX IF NOT EXISTS idx_narrative_facts_session
+    ON narrative_facts(session_id);
+
+-- content_rowid='id' on an INTEGER PRIMARY KEY (rowid alias): VACUUM-stable
+-- like messages_fts/vec_edges, so no resync_rowid_shadows coverage needed.
+-- The update trigger is drift-proofing only — the sanctioned UPDATE path
+-- (invalid_at) never touches text.
+CREATE VIRTUAL TABLE IF NOT EXISTS narrative_facts_fts USING fts5(
+    text,
+    content='narrative_facts',
+    content_rowid='id',
+    tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS narrative_facts_fts_insert AFTER INSERT ON narrative_facts BEGIN
+    INSERT INTO narrative_facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS narrative_facts_fts_delete AFTER DELETE ON narrative_facts BEGIN
+    INSERT INTO narrative_facts_fts(narrative_facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS narrative_facts_fts_update AFTER UPDATE ON narrative_facts BEGIN
+    INSERT INTO narrative_facts_fts(narrative_facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO narrative_facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+-- JSON mirror for fact vectors (vec_facts is created at runtime by
+-- ensure_vec_table when sqlite-vec is present). Fact text is immutable, so a
+-- row here means "embedded" — no staleness path.
+CREATE TABLE IF NOT EXISTS narrative_fact_embeddings (
+    fact_id INTEGER PRIMARY KEY REFERENCES narrative_facts(id) ON DELETE CASCADE,
+    vector_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL DEFAULT 'always_on'
+        CHECK (scope IN ('always_on', 'contextual')),
+    trigger_entities TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'user'
+        CHECK (source IN ('user', 'agent_inferred')),
+    pos_evidence INTEGER NOT NULL DEFAULT 1,
+    neg_evidence INTEGER NOT NULL DEFAULT 0,
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'retracted')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_rules_active ON rules(scope, status, invalid_at);

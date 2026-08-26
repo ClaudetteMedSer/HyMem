@@ -1,0 +1,13 @@
+-- v27: RESERVED — no-op placeholder.
+--
+-- The per-dream deficit attribution columns (aggregation_level0_missed,
+-- aggregation_leaf_changed) were developed as "027" on a box whose database
+-- had already been migrated to v28 by other work before this file reached the
+-- repository. A forward-only migration numbered <= the current schema_version
+-- is silently SKIPPED by the runner (db.py), so shipping it as 027 would have
+-- guaranteed it never ran on any database that matters. The columns therefore
+-- ship as 029 (this renumber), where they actually execute.
+--
+-- 027 stays occupied so migration numbers remain contiguous (the discovery
+-- test asserts versions == range(2, EXPECTED + 1)); it contains no
+-- statements and applies nothing.

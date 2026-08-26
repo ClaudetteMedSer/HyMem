@@ -1,0 +1,55 @@
+{
+  "description": "Track A — CANONICAL local G-A1 read on GENUINE (non-hub) bridges. Each chain routes through a low-degree intermediate entity (degree 2: `medflow`, `acme`, ...), the substrate multi-hop is actually designed for — NOT the LME personal-memory star, whose only 2-hop paths run through the `user` super-hub and are hub-mediated non-bridges (see tests/test_multihop.py::test_hub_guard_*). This probe needs no --store and no LME data: `python benchmarks/multihop_probe.py --probe benchmarks/multihop_genuine_bridges.json --verbose`. G-A1: multihop recall must rise off->on; control (1-hop) recall must not drop; p95 latency < 1.5x baseline.",
+  "edges": [
+    {"subject": "atta",   "predicate": "part_of",     "object": "medflow"},
+    {"subject": "medflow", "predicate": "deploys_to",  "object": "fly.io"},
+    {"subject": "atta",   "predicate": "owns",        "object": "laptop"},
+
+    {"subject": "bob",    "predicate": "part_of",     "object": "acme"},
+    {"subject": "acme",   "predicate": "located_in",  "object": "berlin"},
+    {"subject": "bob",    "predicate": "owns",        "object": "phone"},
+
+    {"subject": "carol",  "predicate": "part_of",     "object": "dataco"},
+    {"subject": "dataco", "predicate": "runs_on",     "object": "aws"},
+    {"subject": "carol",  "predicate": "uses",        "object": "postgres"},
+
+    {"subject": "dave",   "predicate": "part_of",     "object": "nimbus"},
+    {"subject": "nimbus", "predicate": "uses",        "object": "redis"},
+    {"subject": "dave",   "predicate": "owns",        "object": "tablet"},
+
+    {"subject": "erin",   "predicate": "part_of",     "object": "orbit"},
+    {"subject": "orbit",  "predicate": "connects_to", "object": "stripe"},
+
+    {"subject": "island", "predicate": "runs_on",     "object": "k8s"}
+  ],
+  "items": [
+    {"id": "mh-atta",  "set": "multihop", "route": false,
+     "question": "where is the project atta works on deployed?",
+     "seeds": ["atta"],  "bridge": ["medflow", "deploys_to", "fly.io"]},
+    {"id": "mh-bob",   "set": "multihop", "route": false,
+     "question": "where is bob's team located?",
+     "seeds": ["bob"],   "bridge": ["acme", "located_in", "berlin"]},
+    {"id": "mh-carol", "set": "multihop", "route": false,
+     "question": "what does carol's project run on?",
+     "seeds": ["carol"], "bridge": ["dataco", "runs_on", "aws"]},
+    {"id": "mh-dave",  "set": "multihop", "route": false,
+     "question": "what datastore does dave's service use?",
+     "seeds": ["dave"],  "bridge": ["nimbus", "uses", "redis"]},
+    {"id": "mh-erin",  "set": "multihop", "route": false,
+     "question": "what does erin's project connect to?",
+     "seeds": ["erin"],  "bridge": ["orbit", "connects_to", "stripe"]},
+
+    {"id": "ctl-atta",  "set": "control", "route": false,
+     "question": "what does atta own?",
+     "seeds": ["atta"],  "bridge": ["atta", "owns", "laptop"]},
+    {"id": "ctl-bob",   "set": "control", "route": false,
+     "question": "what does bob own?",
+     "seeds": ["bob"],   "bridge": ["bob", "owns", "phone"]},
+    {"id": "ctl-carol", "set": "control", "route": false,
+     "question": "what does carol use?",
+     "seeds": ["carol"], "bridge": ["carol", "uses", "postgres"]},
+    {"id": "ctl-dave",  "set": "control", "route": false,
+     "question": "what does dave own?",
+     "seeds": ["dave"],  "bridge": ["dave", "owns", "tablet"]}
+  ]
+}

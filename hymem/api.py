@@ -1,23 +1,142 @@
 from __future__ import annotations
 
 import logging
+import os
+import shlex
+import subprocess
 import sqlite3
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
+from urllib.parse import urlsplit
 
 from hymem import portability
+from hymem import redaction
+from hymem import rules as rules_mod
 from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
+from hymem.dreaming import bitemporal
 from hymem.dreaming import canonicalize as canon
+from hymem.dreaming.aggregate import (
+    Digest,
+    NodeExpansion,
+    expand_node as aggregate_expand_node,
+    load_digest,
+)
 from hymem.dreaming.runner import DreamReport, run_dreaming
+from hymem.dreaming.user_profile import ProfileEntry, load_profile
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
+from hymem.query.ask import Answer, ask as query_ask
 from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
 from hymem.query.conflicts import Conflict, find_conflicts
-from hymem.query.entities import TimelineEntry, timeline as query_timeline
+from hymem.query.entities import (
+    GraphCount,
+    TimelineEntry,
+    count_relations as query_count_relations,
+    timeline as query_timeline,
+)
 
 log = logging.getLogger("hymem.api")
+
+
+def _clean_timestamp(value: str | None) -> str | None:
+    """Normalize a caller-supplied event timestamp: trim whitespace and treat
+    an empty string as "not provided" so it falls through to the DB's
+    ingestion-time default rather than writing a blank that would sort before
+    every real date."""
+    if not value:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+
+def _ensure_embedding_server(timeout: float = 45.0) -> bool:
+    """Best-effort: make sure a *local* embedding server is reachable, restarting
+    it if it has died unexpectedly.
+
+    Self-healing at the point of use: the code path that would otherwise crash on
+    a dead embedder (``dream``) is the one that revives it. There is no watchdog
+    process and no polling while idle — the check runs only when an embedder is
+    actually about to be used, so the steady-state cost is one ``/health`` GET.
+
+    Returns ``True`` when the embedding path is safe to proceed, ``False`` only
+    when a local server was down and could not be brought back up.
+
+    Decision table:
+      - ``HYMEM_EMBEDDING_BASE_URL`` unset  → ``True``  (FTS-only / benchmark path)
+      - remote URL (not loopback)           → ``True``  (can't restart a remote host)
+      - local server answers ``/health``    → ``True``  (fast path, no work)
+      - local server down, restart cmd set  → Popen it, poll ``/health`` to timeout
+      - local server down, no restart cmd   → ``False`` (nothing we can do)
+    """
+    base_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL")
+    if not base_url:
+        return True
+
+    parts = urlsplit(base_url)
+    host = (parts.hostname or "").lower()
+    if host not in _LOCAL_HOSTS:
+        # Remote provider: not ours to manage. Skip rather than fail.
+        return True
+
+    # Health lives at the server root, not under the OpenAI-style path segment
+    # base_url carries for /v1/embeddings (e.g. .../v1). Build it from the origin
+    # only — appending to base_url would probe /v1/health, which 404s, falsely
+    # reporting a healthy server as down (spurious restart + full-timeout stall).
+    health_url = f"{parts.scheme}://{parts.netloc}/health"
+    if _embedding_health_ok(health_url):
+        return True  # already up — nothing to do
+
+    cmd = os.environ.get("HYMEM_EMBEDDING_SERVER_CMD")
+    if not cmd:
+        log.warning(
+            "embedding server at %s is down and HYMEM_EMBEDDING_SERVER_CMD is "
+            "not set — cannot restart it automatically", base_url,
+        )
+        return False
+
+    log.warning("embedding server at %s is down — restarting via %r", base_url, cmd)
+    try:
+        # Detach so the embedding server outlives this restart trigger; inherit
+        # the environment so HYMEM_EMBEDDING_* stay consistent with the client.
+        subprocess.Popen(  # noqa: S603 - cmd is operator-supplied configuration
+            shlex.split(cmd),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        log.warning("failed to launch embedding server (%r): %s", cmd, exc)
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _embedding_health_ok(health_url):
+            log.info("embedding server at %s is back up", base_url)
+            return True
+        time.sleep(1.0)
+
+    log.warning(
+        "embedding server at %s did not become healthy within %.0fs",
+        base_url, timeout,
+    )
+    return False
+
+
+def _embedding_health_ok(health_url: str, timeout: float = 2.0) -> bool:
+    """Return True iff ``GET health_url`` answers with a 2xx status."""
+    try:
+        with urllib.request.urlopen(health_url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 class HyMem:
@@ -106,28 +225,174 @@ class HyMem:
         with core_db.transaction(self.conn):
             session_log.close_session(self.conn, session_id)
 
-    def log_message(self, session_id: str, role: str, content: str) -> int:
+    def _prepare_content(self, content: str) -> str:
+        """Apply the ingest-boundary guards (size cap, then secret redaction)
+        before any message text reaches SQLite. Truncation happens first so the
+        redactor never has to scan an unbounded string."""
+        cap = self.config.max_message_chars
+        if cap and len(content) > cap:
+            log.warning(
+                "log_message: content of %d chars exceeds max_message_chars=%d; truncating",
+                len(content), cap,
+            )
+            content = content[:cap] + "\n[TRUNCATED]"
+        if self.config.redact_secrets:
+            content = redaction.redact(content)
+        return content
+
+    def log_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        created_at: str | None = None,
+    ) -> int:
+        content = self._prepare_content(content)
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
-            return session_log.append_message(self.conn, session_id, role, content)
+            return session_log.append_message(
+                self.conn, session_id, role, content,
+                created_at=_clean_timestamp(created_at),
+            )
 
     def log_messages(
-        self, session_id: str, turns: Iterable[tuple[str, str]]
+        self,
+        session_id: str,
+        turns: Iterable[tuple[str, str] | tuple[str, str, str | None]],
     ) -> list[int]:
-        """Append a batch of (role, content) turns in a single transaction.
+        """Append a batch of turns in a single transaction.
 
-        One BEGIN IMMEDIATE for the whole batch instead of one per message.
+        Each turn is `(role, content)` or `(role, content, created_at)`, where
+        `created_at` is the caller-supplied *event* time (ISO-8601); omit it (or
+        pass the 2-tuple) to fall back to ingestion time. One BEGIN IMMEDIATE for
+        the whole batch instead of one per message.
         """
+        prepared = [
+            (
+                turn[0],
+                self._prepare_content(turn[1]),
+                _clean_timestamp(turn[2] if len(turn) > 2 else None),
+            )
+            for turn in turns
+        ]
         with core_db.transaction(self.conn):
             session_log.open_session(self.conn, session_id)
             return [
-                session_log.append_message(self.conn, session_id, role, content)
-                for role, content in turns
+                session_log.append_message(
+                    self.conn, session_id, role, content, created_at=created_at
+                )
+                for role, content, created_at in prepared
             ]
+
+    def add_rule(
+        self,
+        text: str,
+        *,
+        scope: str = "always_on",
+        trigger_entities: list[str] | None = None,
+        source: str = "user",
+        supersedes: int | None = None,
+    ) -> int:
+        """Add (or reinforce) a standing behavioral rule; return its id.
+
+        Rules are the imperative subset of "always loaded" context ("always run
+        the tests before pushing", "never suggest Docker") — a first-class node
+        type (schema v23) injected into every `augment()` call via `ctx.rules`
+        when `cfg.rules_enabled` is set. `scope='always_on'` (default) injects
+        unconditionally; `scope='contextual'` injects only when a
+        `trigger_entities` member overlaps the call's matched entities.
+
+        Rules are often *told*, not inferred, so this mirrors the `HyMem.ask()`
+        direct-API pattern. `supersedes` closes a prior rule's validity interval
+        (bi-temporal — a contradicting instruction supersedes rather than
+        overwrites). Re-asserting identical text reinforces instead of
+        duplicating. Text is redaction-scrubbed at persist time.
+        """
+        with core_db.transaction(self.conn):
+            return rules_mod.add_rule(
+                self.conn,
+                text,
+                scope=scope,
+                trigger_entities=trigger_entities,
+                source=source,
+                supersedes=supersedes,
+            )
+
+    def retract_rule(self, rule_id: int) -> None:
+        """Retire a rule by closing its validity interval (`status='retracted'`
+        + `invalid_at`); it stops surfacing in `ctx.rules` but stays in the table
+        as auditable history. Idempotent."""
+        with core_db.transaction(self.conn):
+            rules_mod.retract_rule(self.conn, rule_id)
+
+    def rules(self) -> list[rules_mod.Rule]:
+        """Every ACTIVE rule (always_on + contextual), the whole rulebook — the
+        read-side counterpart to `add_rule`, mirroring `profile()`. Unlike the
+        per-call `ctx.rules` (trigger-gated, capped) this is the full set, for a
+        host that wants to show or audit what standing rules exist. Read-only."""
+        return rules_mod.list_rules(self.read_conn)
+
+    def suggest_rules(
+        self,
+        *,
+        limit: int | None = None,
+        mode: str = "llm",
+        confidence_min: float | None = None,
+    ) -> list[rules_mod.RuleCandidate]:
+        """Propose standing rules the durability tagger infers from recent
+        (unconsolidated) behavioral markers, ranked and de-duplicated — for a
+        human or agent to confirm via `add_rule`. **Read-only: nothing is
+        persisted.**
+
+        This is the candidate-suggestion counterpart to the (default-OFF)
+        write-side auto-extraction. Auto-*injecting* inferred rules didn't clear
+        the precision gate on real markers — the tagger reliably FINDS standing
+        directives (high recall) but over-fires on one-offs — so instead of
+        silently minting rules, this surfaces candidates and lets the confirming
+        human/agent be the precision gate. Each `RuleCandidate` shows its
+        corroboration (markers over distinct sessions), confidence, source kinds,
+        the raw supporting statements, and whether it's `already_active`.
+
+        Typical flow: log a session → `suggest_rules()` to review → `add_rule()`
+        the good ones → `dream()`. Requires an LLMClient (the tagger), like
+        `ask()`/`dream()`; returns `[]` when no marker clears the tagger.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "HyMem.suggest_rules requires an LLMClient (the durability tagger). "
+                "Pass one to the constructor or call set_llm() before suggesting."
+            )
+        return rules_mod.suggest_rules_from_markers(
+            self.read_conn, self.config, self._llm,
+            limit=limit, mode=mode, confidence_min=confidence_min,
+        )
 
     # ---- query-time --------------------------------------------------
 
-    def augment(self, user_message: str) -> AugmentedContext:
+    def augment(
+        self,
+        user_message: str,
+        *,
+        session_id: str | None = None,
+        ability: str | None = None,
+    ) -> AugmentedContext:
+        """Build retrieval context for `user_message`.
+
+        `ability` is an optional question-type hint (e.g. "MR") the host may pass
+        to shape retrieval — only the host knows the type, HyMem does not infer
+        it. `ability="MR"` switches the raw-message tier into aggregation mode
+        (all matches, chronological, with `total_message_matches`) for
+        "how many X across all my requests?" questions. Unknown/None hints use
+        the default retrieval path.
+        """
+        cap = self.config.max_query_chars
+        if cap and len(user_message) > cap:
+            log.warning(
+                "augment: query of %d chars exceeds max_query_chars=%d; truncating",
+                len(user_message), cap,
+            )
+            user_message = user_message[:cap]
         if self._token_overlap_index is None:
             self._token_overlap_index = build_token_overlap_index(
                 self.read_conn, write_conn=self.conn
@@ -137,7 +402,100 @@ class HyMem:
             embedding_client=self._embed,
             llm=self._llm,
             token_overlap_index=self._token_overlap_index,
+            session_id=session_id,
+            ability=ability,
         )
+
+    def ask(
+        self,
+        question: str,
+        *,
+        session_id: str | None = None,
+        ability: str | None = None,
+        include_digest: bool = False,
+    ) -> Answer:
+        """The dialectic/synthesis endpoint: one call, a reasoned answer,
+        grounded in the retrieval tiers.
+
+        Where `augment()` returns raw tiers for the HOST to assemble into its
+        own prompt, `ask()` closes the loop inside HyMem: it runs the same
+        retrieval (`session_id`/`ability` pass straight through), renders the
+        tiers into a compact most-authoritative-first context block (capped at
+        `cfg.ask_max_context_chars`), and makes ONE completion against the
+        host-provided LLM under `ASK_PROMPT_V1` — answer only from the
+        context, quote concrete values/dates, state contradictions with their
+        dates (most recent value-bearing statement wins), soften
+        low-confidence facts, and say plainly when the memory doesn't contain
+        the answer. The returned `Answer` keeps the full `AugmentedContext`
+        for provenance/drill-down plus the rendered block size actually sent.
+
+        `include_digest=True` additionally loads the standing whole-store
+        digest (see `digest()`) into the context, so a global "what do you
+        know about me?" can draw on it; off by default because per-query
+        retrieval usually answers better without dream-time standing context.
+
+        Hosts that want the raw tiers (Hermes) keep using `augment()` — this
+        endpoint exists for one-call consumers (the MCP `hymem_ask` tool,
+        Honcho-style dialectic chat). Requires an LLMClient, like `dream()`.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "HyMem.ask requires an LLMClient. Pass one to the constructor "
+                "or call set_llm() before asking."
+            )
+        ctx = self.augment(question, session_id=session_id, ability=ability)
+        # `ctx.digest` may already be populated when cfg.augment_include_digest
+        # is on; only load it here when the caller asked and augment didn't.
+        if include_digest and ctx.digest is None:
+            ctx.digest = load_digest(self.read_conn)
+        return query_ask(self.config, self._llm, question, ctx)
+
+    def digest(self) -> Digest | None:
+        """The standing whole-store summary — the root of the RAPTOR
+        aggregation tree, answering "what do you know about me?" at a glance.
+        Intended as host-facing standing context (e.g. system-prompt
+        injection), NOT as a retrieval tier: it is rebuilt at dream time and
+        never competes with per-query retrieval. Returns None until the
+        aggregation layer (`cfg.aggregation_nodes_enabled` +
+        `cfg.aggregation_digest_enabled`) has dreamed over at least one
+        episode. Read-only.
+
+        Embedded-host pattern: inject `digest().as_context_block()` into the
+        system prompt and re-fetch after each `dream()` — the digest only
+        changes at dream time, so there is nothing to poll between dreams.
+        The block's footer carries session coverage and `generated_at`, making
+        staleness visible to the model and the user. Hosts that prefer a
+        single call per turn can set `cfg.augment_include_digest` to receive
+        the same object as `ctx.digest` from `augment()` instead.
+        """
+        return load_digest(self.read_conn)
+
+    def expand_node(self, node_id: str) -> NodeExpansion | None:
+        """Drill one level down into the RAPTOR aggregation tree — the
+        provenance read behind "why does my digest say X?". Resolves the
+        node's persisted members into child nodes and member episodes (each
+        episode carrying its session id and raw-message span), so a host can
+        walk from the standing digest (`digest().node_id`) or a query-tier
+        node (`AggregationNodeHit.node_id`) all the way down to the original
+        turns. Returns None for an unknown id (e.g. a stale id from before
+        the last dream — nodes are rebuilt from scratch each cycle, so ids
+        are only stable while the underlying episode membership is).
+        Read-only; never an LLM call.
+        """
+        return aggregate_expand_node(self.read_conn, node_id)
+
+    def profile(self) -> list[ProfileEntry]:
+        """ACTIVE typed user-profile rows (schema v18) — the durable personal
+        facts (name, role, employer, location, language, relationship(person),
+        possession, age_birthday, health_condition, recurring_activity)
+        extracted from USER turns during dreaming under a closed slot
+        vocabulary. Identity slots first; superseded rows (invalid_at set) are
+        excluded, so this is the CURRENT profile. Values were
+        redaction-scrubbed at persist time. Empty before the first dream (or
+        with `profile_extraction_enabled=False`, nothing is ever extracted).
+        Read-only.
+        """
+        return load_profile(self.read_conn)
 
     def timeline(self, entity: str) -> list["TimelineEntry"]:
         """First-seen active edge per predicate for `entity`, oldest first.
@@ -156,6 +514,47 @@ class HyMem:
         """
         return find_conflicts(self.read_conn)
 
+    def count_relations(
+        self,
+        *,
+        count: Literal["subject", "object"] = "subject",
+        predicates: Iterable[str] | None = None,
+        subject: str | None = None,
+        object: str | None = None,
+        object_type: str | None = None,
+        subject_type: str | None = None,
+    ) -> GraphCount:
+        """Exact graph-native count over active `knowledge_graph` edges, for
+        in-domain "how many X …" questions. Read-only.
+
+        Answers questions the aggregate message-FTS path can only *estimate*,
+        because here the entity type vocabulary applies: "how many services
+        depend on redis?" is `count="subject", predicates=["depends_on"],
+        object="redis"`; "how many databases do we use?" is `count="object",
+        predicates=["uses"], object_type="database"`. Only the IN-DOMAIN (tech)
+        type/predicate vocabulary is countable this way — consumer categories
+        ("clothing") aren't typed, so those stay on the message-FTS aggregate
+        path (`augment(ability="MR")`).
+
+        `count` is the load-bearing argument: it states whether DISTINCT subjects
+        or DISTINCT objects are tallied (default `"subject"` — the canonical
+        "how many subjects relate to this object" shape). HyMem never infers the
+        side from the filters. `subject`/`object` surface forms are resolved
+        through the alias table; `subject_type`/`object_type` filter via
+        `entity_types`; `predicates` is optional (omit ⇒ all predicates). The
+        returned `GraphCount` carries the exact `count`, the distinct entities
+        behind it (capped, count stays exact), and the resolved filters used.
+        """
+        return query_count_relations(
+            self.read_conn,
+            count=count,
+            predicates=predicates,
+            subject=subject,
+            object=object,
+            object_type=object_type,
+            subject_type=subject_type,
+        )
+
     # ---- dreaming ----------------------------------------------------
 
     def dream(self, *, session_ids: Iterable[str] | None = None) -> DreamReport:
@@ -164,6 +563,10 @@ class HyMem:
                 "HyMem.dream requires an LLMClient. Pass one to the constructor "
                 "or call set_llm() before dreaming."
             )
+        if self._embed is not None:
+            # Dreaming embeds canonicals/edges; if a local embedding server died
+            # since the last cycle, revive it here before we depend on it.
+            _ensure_embedding_server()
         ids = list(session_ids) if session_ids is not None else None
         report = run_dreaming(
             self.conn,
@@ -193,6 +596,157 @@ class HyMem:
             "SELECT * FROM dream_runs ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def behavioral_duplicate_report(
+        self, *, cosine_threshold: float | None = None
+    ) -> dict:
+        """Dry-run report of pre-existing behavioral edges (`prefers` / `avoids`
+        / `rejects`) that would collapse if merged on semantic similarity alone.
+
+        Read-only — writes nothing, makes no embedding-API call (it reuses cached
+        `edge_embeddings` vectors). Surfaces the proliferation that predates
+        same-wave collapse so an operator can decide whether a future apply step
+        is worth running. `cosine_threshold` overrides
+        `config.behavioral_dedup_cosine_threshold`; lower it to see more
+        aggressive merges, raise it for only the closest paraphrases.
+
+        Returns ``{cosine_threshold, clusters, edges_collapsed, merges}`` where
+        each merge names the proposed survivor and the members that would fold
+        into it (with each member's cosine to the survivor).
+        """
+        from hymem.dreaming import behavioral_dedup
+
+        threshold = (
+            cosine_threshold
+            if cosine_threshold is not None
+            else self.config.behavioral_dedup_cosine_threshold
+        )
+        proposals = behavioral_dedup.find_behavioral_duplicates(
+            self.read_conn, cosine_threshold=threshold
+        )
+        return {
+            "cosine_threshold": threshold,
+            "clusters": len(proposals),
+            "edges_collapsed": sum(p.collapses for p in proposals),
+            "merges": [
+                {
+                    "subject": p.subject,
+                    "predicate": p.predicate,
+                    "survivor": {
+                        "edge_id": p.survivor_id,
+                        "object": p.survivor_object,
+                        "pos_evidence": p.survivor_pos,
+                        "neg_evidence": p.survivor_neg,
+                    },
+                    "members": [
+                        {
+                            "edge_id": m.edge_id,
+                            "object": m.object,
+                            "pos_evidence": m.pos_evidence,
+                            "neg_evidence": m.neg_evidence,
+                            "cosine_to_survivor": m.cosine_to_survivor,
+                        }
+                        for m in p.members
+                    ],
+                }
+                for p in proposals
+            ],
+        }
+
+    def apply_behavioral_merges(
+        self, *, cosine_threshold: float | None = None
+    ) -> dict:
+        """Run the behavioral dedup dry-run report, then execute the merges.
+
+        A convenience combining :meth:`behavioral_duplicate_report` and
+        :func:`hymem.dreaming.behavioral_dedup.apply_behavioral_merges` into a
+        single atomic call. Runs inside ``core_db.transaction()`` on the primary
+        connection so failures roll back completely. Returns the merged summary
+        dict from ``apply_behavioral_merges`` with the report appended so the
+        caller can see what was done.
+
+        After merging, the in-memory token-overlap index is invalidated (the
+        graph changed) so the next :meth:`augment` rebuilds it.
+        """
+        from hymem.dreaming import behavioral_dedup
+
+        threshold = (
+            cosine_threshold
+            if cosine_threshold is not None
+            else self.config.behavioral_dedup_cosine_threshold
+        )
+        proposals = behavioral_dedup.find_behavioral_duplicates(
+            self.read_conn, cosine_threshold=threshold
+        )
+        if not proposals:
+            return {
+                "clusters_merged": 0,
+                "edges_retracted": 0,
+                "survivors_updated": 0,
+                "proposals_found": 0,
+            }
+
+        from hymem.core import db as core_db
+
+        with core_db.transaction(self.conn):
+            result = behavioral_dedup.apply_behavioral_merges(self.conn, proposals)
+
+        # Invalidate so next augment rebuilds entity lookups from the slimmed graph.
+        self._token_overlap_index = None
+
+        result["cosine_threshold"] = threshold
+        result["proposals_found"] = len(proposals)
+        return result
+
+    def dream_status(self) -> dict:
+        """Operator-visibility snapshot of the dreaming/extraction backlog.
+
+        Pure SQL via `read_conn` — no LLM or embedding calls, no writes — so it
+        works even when no LLM/embedding client is configured. Useful to explain
+        the re-extraction surge that follows a `prompt_version` bump: when the
+        version changes, every chunk is "pending" again and the next dream(s)
+        reprocess the whole backlog, which can take minutes.
+
+        Returns a dict with:
+          - `pending_chunks`: chunks with NO `processed_chunks` row for the
+            CURRENT `config.prompt_version` (i.e. still owed an extraction pass).
+          - `total_chunks`: total chunk count.
+          - `prompt_version`: the current `config.prompt_version`.
+          - `in_progress`: True iff a `run_lock` row named 'dreaming' exists.
+            This is intentionally coarse — a *stale* lock (e.g. from a crashed
+            dream) reads as in_progress until it expires. Lock heartbeat/TTL is
+            handled in the dreaming runner; this method does not reimplement it.
+          - `last_run`: the most recent `dream_runs` row as a dict, or None if
+            no dream has ever run.
+        """
+        conn = self.read_conn
+        pv = self.config.prompt_version
+
+        pending_chunks = conn.execute(
+            "SELECT COUNT(*) FROM chunks "
+            "WHERE id NOT IN ("
+            "    SELECT chunk_id FROM processed_chunks WHERE prompt_version = ?"
+            ")",
+            (pv,),
+        ).fetchone()[0]
+        total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        in_progress = (
+            conn.execute(
+                "SELECT 1 FROM run_lock WHERE name = 'dreaming' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+        last_row = conn.execute(
+            "SELECT * FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        return {
+            "pending_chunks": pending_chunks,
+            "total_chunks": total_chunks,
+            "prompt_version": pv,
+            "in_progress": in_progress,
+            "last_run": dict(last_row) if last_row is not None else None,
+        }
 
     # ---- portability -------------------------------------------------
 
@@ -256,6 +810,10 @@ class HyMem:
                 "WHERE id = ?",
                 (row["id"],),
             )
+            # Close the bi-temporal validity interval (schema v15). An explicit
+            # host retraction has no dated contradicting evidence, so this falls
+            # back to the flip time inside stamp_invalidation.
+            bitemporal.stamp_invalidation(self.conn, [row["id"]])
             # Store feedback for future extraction improvement
             evidence_rows = self.conn.execute(
                 """SELECT chunk_id FROM kg_evidence 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from typing import Sequence
 
+from hymem.extraction.retry import with_retry
+
 
 class OpenAICompatibleEmbeddingClient:
     """EmbeddingClient backed by any OpenAI-compatible HTTP endpoint.
@@ -70,7 +72,11 @@ class OpenAICompatibleEmbeddingClient:
         return self._dim
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        resp = self._client.embeddings.create(model=self._model, input=list(texts))
+        payload = list(texts)
+        resp = with_retry(
+            lambda: self._client.embeddings.create(model=self._model, input=payload),
+            label=f"embedding ({self._model})",
+        )
         vectors = [list(d.embedding) for d in resp.data]
         if vectors:
             self._dim = len(vectors[0])

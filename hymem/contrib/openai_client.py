@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 from hymem.extraction.llm import LLMClient, LLMRequest
+from hymem.extraction.retry import with_retry
+
+# Accepted values for the thinking override (env var / constructor argument).
+# "disabled" force-sends the vendor body key, "off"/"enabled" force-omit it.
+_THINKING_MODES = {"auto", "disabled", "off", "enabled"}
 
 
 class OpenAICompatibleClient:
@@ -15,7 +21,11 @@ class OpenAICompatibleClient:
     Environment variables (all optional if arguments are passed directly):
         HYMEM_LLM_API_KEY   — API key (falls back to OPENAI_API_KEY)
         HYMEM_LLM_BASE_URL  — base URL (default: https://api.deepseek.com)
-        HYMEM_LLM_MODEL     — model name (default: deepseek-chat)
+        HYMEM_LLM_MODEL     — model name (default: deepseek-v4-flash)
+        HYMEM_LLM_THINKING  — whether to send DeepSeek's `thinking` body key:
+                              "auto" (default, send only on DeepSeek endpoints),
+                              "disabled" (always send it, i.e. force reasoning
+                              off), "off"/"enabled" (never send it).
     """
 
     def __init__(
@@ -23,6 +33,7 @@ class OpenAICompatibleClient:
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
+        thinking: str | None = None,
     ) -> None:
         try:
             from openai import OpenAI
@@ -47,7 +58,35 @@ class OpenAICompatibleClient:
             or os.environ.get("HYMEM_LLM_BASE_URL")
             or "https://api.deepseek.com"
         )
-        self.model = model or os.environ.get("HYMEM_LLM_MODEL") or "deepseek-chat"
+        self.model = model or os.environ.get("HYMEM_LLM_MODEL") or "deepseek-v4-flash"
+
+        # `thinking` is a DeepSeek-specific body key: deepseek-v4-flash otherwise
+        # spends its whole token budget reasoning and returns empty content. But
+        # the OpenAI API rejects unknown body params with a 400, and vLLM's
+        # tolerance varies by version — and because every call goes through
+        # with_retry(), an unconditional send turns "wrong vendor" into three
+        # doomed attempts with sleeps in between rather than one clean failure.
+        # So resolve the decision once, here, from the endpoint we actually
+        # resolved above, and let an operator override it either way.
+        mode = (
+            thinking
+            or os.environ.get("HYMEM_LLM_THINKING")
+            or "auto"
+        ).strip().lower()
+        if mode not in _THINKING_MODES:
+            raise ValueError(
+                f"Invalid HYMEM_LLM_THINKING value {mode!r}; "
+                f"expected one of {sorted(_THINKING_MODES)}."
+            )
+        if mode == "auto":
+            # Substring match, not equality: DeepSeek is also reached via
+            # regional hosts and reverse proxies that keep the vendor name in
+            # the host or the model id.
+            host = (urlsplit(resolved_base).hostname or "").lower()
+            self._send_thinking = "deepseek" in host or "deepseek" in self.model.lower()
+        else:
+            self._send_thinking = mode == "disabled"
+
         self._client = OpenAI(api_key=resolved_key, base_url=resolved_base)
 
     def complete(self, request: LLMRequest) -> str:
@@ -60,8 +99,15 @@ class OpenAICompatibleClient:
             temperature=request.temperature,
             max_tokens=request.max_tokens,
         )
+        # Omit the key entirely rather than passing an empty/None extra_body:
+        # some servers reject a body they were not expecting at all.
+        if self._send_thinking:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if request.response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
-        resp = self._client.chat.completions.create(**kwargs)
+        resp = with_retry(
+            lambda: self._client.chat.completions.create(**kwargs),
+            label=f"LLM completion ({self.model})",
+        )
         return resp.choices[0].message.content
