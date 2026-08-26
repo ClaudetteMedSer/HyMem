@@ -1355,7 +1355,7 @@ that **three separate measurements in this step — the ceiling handset, the
 degenerate ≤15 share, and the proposed LME guard — were each incapable of
 failing.** A gate that cannot fail returns a confident constant and reads as a
 pass. Check reachability and headroom on the instrument before spending anything
-on the arms. See [[project-diagnostic-controls]].
+on the arms. See [docs/diagnostic_controls.md](docs/diagnostic_controls.md).
 
 ---
 
@@ -2690,6 +2690,12 @@ personal information" clause credits.
 > REACHABLE under either count. Any loosening changes the licence arithmetic as
 > well as the C3 footnote. Gate it separately. **UNRUN.**
 
+*(Pre-registration above is banked verbatim and is not edited. Resolution, added
+after the fact: the gate was built 2026-08-26, RAN the same day, and **FAILED
+R2** — 2 FP against a bar of ≤1. The alias stayed at `recites_gold_v1` and the
+rule was not re-tuned. Note the direction argument quoted above holds only for
+v1: loosening inverts it, which is why R2/R3 existed at all. See "A5 RAN".)*
+
 #### D2 — CLOSED BY FIX, in its only inert window
 
 `judge_answer` now calls `longmemeval_adapter.parse_judge_verdict`: word-boundary
@@ -2867,7 +2873,7 @@ that is ever non-trivial, and build it against observed cases.
 | Item | State |
 |---|---|
 | **D1 / C3** | **WATCH-at-bar, band NOT resolved.** Pre-registration says record, do not re-baseline on it alone. Reviving needs a new gate; note the numerator is containment-by-design with 0 judge errors, so a judge-prompt fix has no measured defect to fix. |
-| **`recites_gold` token rule** | Pre-registered `5884adf`, **UNRUN**, free. Changes the licence arithmetic, not just the C3 footnote. |
+| **`recites_gold` token rule** | Pre-registered `5884adf`, **UNRUN**, free. Changes the licence arithmetic, not just the C3 footnote. *(State as of 2026-08-25. Built 2026-08-26; RAN the same day and **FAILED R2** — see "A5 RAN" below. Closed, alias stays v1.)* |
 | **C4 arm asymmetry** | Blocked on a scored LoCoMo run pair that does not exist. |
 | **D3 visibility** | Pinned defect. Needs a channel `judge_answer`'s bool return does not have. |
 | **E6 supersession over facts** | Unblocked since `a0cd73d`; its `invalid_at` prerequisite is now genuinely sound rather than nominally so. |
@@ -2890,7 +2896,7 @@ built and tested; Part A's VERDICT is unrun and can only run where the banked
 replies are. This is the same shape that blocks C4, and it is stated rather than
 worked around.
 
-### Part A — the `recites_gold` token rule (built, gated, UNRUN)
+### Part A — the `recites_gold` token rule (built, gated; RAN 2026-08-26 → **R2 FAIL**)
 
 The pre-registration (`5884adf`) recorded that the C3 numerator's 5 false
 negatives came from the instrument's token rule, not the judge, and said to gate
@@ -2901,8 +2907,9 @@ any loosening on its own. That is now built.
 16/470 = 3.40% ceiling that licensed the 2026-08-25 spend. **v2** keeps the
 verbatim fast path, strips the widening gloss from gold, keeps numerals as
 content, and allows `RECITE_ALPHA_COVERAGE` slack on prose.
-**`recites_gold` still aliases v1.** The alias IS the flip, and it has not
-happened.
+**`recites_gold` still aliases v1.** The alias IS the flip, and it never
+happened: A5 ran on 2026-08-26 and failed R2. What follows is the state as
+built and banked, *before* the verdict; the verdict is recorded below.
 
 > **The safe direction reverses, which is the whole reason this is separate.**
 > The banked note argues v1's under-count "can only wrongly REFUSE a spend,
@@ -2938,6 +2945,10 @@ numerals, so it un-flags rows v1 flagged.
 -check the `.recitation.json` sample it writes, and record R1–R4 with numbers.
 PASS flips one line; FAIL keeps v1 and closes. Do not re-tune the rule to make
 it pass.
+
+> **DONE 2026-08-26.** It ran, and it FAILED R2 (2 FP against a bar of ≤1).
+> The alias stayed at v1 and the rule was not re-tuned. Numbers in "A5 RAN"
+> below.
 
 ### Part B — D3, the judge-outage channel (CLOSED)
 
@@ -3007,7 +3018,7 @@ to be guarded all along.
 | Item | State |
 |---|---|
 | **D1 / C3** | Unchanged: WATCH-at-bar, band NOT resolved. |
-| **`recites_gold` gate** | **BUILT, bars banked, UNRUN.** Needs `judge_audit.json` on Afrodite. Free. |
+| **`recites_gold` gate** | **CLOSED — R2 FAIL.** Ran free on Afrodite the same day; 2 FP against a bar of ≤1. Alias stays v1, rule not re-tuned. See "A5 RAN" below. |
 | **C4 arm asymmetry** | Still blocked on the old pair; **unblocked for the next one** now that `judge_raw` is persisted. |
 | **D3 visibility** | **CLOSED.** |
 | **E6, Grove E3/E4, digest staleness** | Unchanged. Note Grove E3's measured population is ~2 rows on the box and 0 on conv-26, and nothing consumes `retraction_history` — the shape that closed Grove E2 FAIL-mechanism. |

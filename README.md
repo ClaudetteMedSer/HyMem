@@ -666,6 +666,13 @@ python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8
 ```
 
+**Methodology.** Every diagnostic behind these numbers is run against a control
+arm before its result is read — see
+[docs/diagnostic_controls.md](docs/diagnostic_controls.md) for the standing
+discipline, the measured false-alarm rates per benchmark, and the read-only
+instruments. It is not optional housekeeping: a missing control has already cost
+this project one retracted ceiling and three reversed lever orderings.
+
 ---
 
 ## 12. Comparison with Honcho

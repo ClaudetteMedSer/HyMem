@@ -161,6 +161,7 @@ G4. HAND-CHECK REQUIRED — AND IT CORRECTS THE NUMBER, not just the gate. The r
     are supplied via `--handcheck FP,FN`. The script writes a labelled sample
     containing BOTH refusal-classified and committed-classified rows, so the
     control is a correct-answer control and not just a confirmation pass.
+    The standing discipline is docs/diagnostic_controls.md.
 G5. NOTHING JUDGED. Rows whose answer is empty or an `[LLM_ERROR]` sentinel are
     not judgeable; if that leaves no rows, the report says so.
 
@@ -620,9 +621,11 @@ def recites_gold_v2(answer: str, gold: str) -> bool:
 # The rule the audit REPORTS under. Every caller goes through this name, so the
 # three call sites (`rejudge_row`, `free_precheck`,
 # `write_handcheck_sample_pre`) do not each grow a v1/v2 branch.
-# UNRUN as of 2026-08-25: still v1 until `--verify-recitation` returns a PASS on
-# the banked replies. Flipping this before that verdict would restate the C3
-# footnote and the spend licence on an unmeasured rule.
+# RAN 2026-08-26 and FAILED R2 (2 FP, bar was <=1) — see the A5 verdict block in
+# the module docstring. This stays v1 permanently unless a NEW pre-registration
+# is banked first; re-tuning the token rule until R2 clears is the move the
+# banked verdict language forbids by name. Flipping it would restate the C3
+# footnote and the spend licence on a rule that failed its own precision bar.
 recites_gold = recites_gold_v1
 
 # ── Row loading and judge-input reconstruction ──────────────────────────
