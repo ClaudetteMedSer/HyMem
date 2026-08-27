@@ -581,13 +581,30 @@ def augment(
     # injection reshuffles ranking against gold message hits everywhere except
     # temporal reasoning). Never displaces the tiers above — it layers a
     # synthesis view on top.
-    if cfg.aggregation_nodes_enabled and _aggregation_tier_fires(cfg, ability):
-        ctx.aggregation_nodes = _aggregation_search(
-            conn, query,
-            top_k=cfg.aggregation_top_k,
-            embedding_client=embedding_client,
-            max_scan=cfg.embedding_max_scan,
-        )
+    # Stage 4a adds a STRICT-OR second condition: a starved query (raw signal
+    # below `aggregation_fallback_min_hits`) fires the tier too, on the licence
+    # that nodes cannot crowd what is not there. It only ever ADDS firings —
+    # `_aggregation_tier_fires` is evaluated unchanged and is never relaxed.
+    if cfg.aggregation_nodes_enabled:
+        by_ability = _aggregation_tier_fires(cfg, ability)
+        by_fallback = _sparse_signal_fires(cfg, ctx)
+        if by_ability or by_fallback:
+            ctx.aggregation_nodes = _aggregation_search(
+                conn, query,
+                top_k=cfg.aggregation_top_k,
+                embedding_client=embedding_client,
+                max_scan=cfg.embedding_max_scan,
+            )
+            # Provenance: chip ONLY the firings the fallback actually caused.
+            # An ability-gated firing on a thin query is still an ability
+            # firing — the two modes have completely different expected
+            # effects, and without the split no later A/B can separate them.
+            if by_fallback and not by_ability:
+                chip = f"sparse_fallback(raw={_raw_signal_count(ctx)})"
+                ctx.aggregation_nodes = [
+                    replace(h, why_retrieved=[*h.why_retrieved, chip])
+                    for h in ctx.aggregation_nodes
+                ]
 
     # ability="IF" (instruction/step recall) pulls a wider procedure set, since
     # procedures — ordered step-by-step workflows — are the natural fit for
@@ -2220,6 +2237,26 @@ def _aggregation_tier_fires(cfg: HyMemConfig, ability: str | None) -> bool:
     if not allowed:
         return True
     return ability is not None and ability in {a.upper() for a in allowed}
+
+
+def _raw_signal_count(ctx: AugmentedContext) -> int:
+    """How much RAW evidence the tiers above the aggregation gate produced, as
+    one named definition so thinness lives in exactly one testable place.
+
+    Counts `message_hits + fts_hits`; `episodes` are deliberately EXCLUDED —
+    see `aggregation_fallback_min_hits` for the recorded reasoning and for why
+    the alternative must be decided on an argument, not on a better number."""
+    return len(ctx.message_hits) + len(ctx.fts_hits)
+
+
+def _sparse_signal_fires(cfg: HyMemConfig, ctx: AugmentedContext) -> bool:
+    """Stage 4a: whether raw retrieval is thin enough to fire the node tier as a
+    fallback. Strict `<`, so a query landing exactly ON the threshold does NOT
+    fire — the knob reads as "fewer than N hits is starved". `<= 0` disables,
+    which is the shipped default, so the condition is inert until set."""
+    if cfg.aggregation_fallback_min_hits <= 0:
+        return False
+    return _raw_signal_count(ctx) < cfg.aggregation_fallback_min_hits
 
 
 def _aggregation_row_hit(

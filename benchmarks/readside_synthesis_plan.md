@@ -135,6 +135,25 @@ extend the watch instead of deciding — the gate needs at least 5 verdict rows.
 >   `longmemeval_adapter:532` already pinned True. Generalize the lesson: a
 >   config-DEFAULT flip has a blast radius the size of its default-config
 >   consumer set, and that set is not what the gate measured.
+>
+> **Step 4 CLOSED 2026-08-27, and it closed the section with it.** The
+> verification dream (#1317) came back at 80.6% reuse — a `leaf_changed=1` row
+> of the known family, residual 0 — which is exactly the weak-test outcome the
+> first amendment predicted: unmeasured, not "flip failed". Two clean appends
+> followed (#1318, #1319 at 92.2%, 2.7 rebuilds/miss, residual 0).
+>
+> **A third amendment this section could not have anticipated: §0.4's criteria
+> stop being an instrument the moment the flip lands.** #1317 sits permanently
+> in the post-flip window at 80.6%, so criterion 1 ("*every* verdict row ≥ 90%")
+> reads FAIL on every future evaluation no matter what new rows do — a constant
+> output is not a measurement. The fix is NOT to re-anchor the window (that is
+> post-hoc tightening's mirror image). It is to name the two roles apart: the
+> flip gate is CLOSED/PASSED/historical, and an ongoing regression monitor
+> (**G-MON**) is pre-registered separately in `raptor_digest_plan.md`. Generalize
+> alongside the blast-radius lesson: **a gate written to authorize a one-time
+> decision does not convert into a monitor for free** — reusing its criteria
+> verbatim buys a stuck verdict, which is the same failure mode as an
+> unreachable guard reading PASS.
 
 
 1. `hymem/config.py:112` — `aggregation_nodes_enabled: bool = False` → `True`,

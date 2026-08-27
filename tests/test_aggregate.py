@@ -36,7 +36,15 @@ from hymem.dreaming.aggregate import (
     select_clusters,
 )
 from hymem.extraction.llm import StubLLMClient
-from hymem.query.augment import augment
+from hymem.query.augment import (
+    augment,
+    AugmentedContext,
+    EpisodeHit,
+    FtsHit,
+    MessageHit,
+    _raw_signal_count,
+    _sparse_signal_fires,
+)
 
 # The aggregation summary call is keyed on a phrase unique to AGGREGATE_SYSTEM, so
 # it never collides with the episode/digest fixtures keyed on the user template.
@@ -1221,3 +1229,203 @@ def test_hymem_expand_node_api(cfg):
         assert hy.expand_node("anything") is None  # empty store, no error
     finally:
         hy.close()
+
+
+# ── Stage 4a: sparse-signal fallback injection ───────────────────────────────
+#
+# The banked build spec (benchmarks/raptor_digest_plan.md, Stage 4 "4a BUILD
+# SPEC") pre-registered this matrix. Every integration test below sets BOTH
+# `aggregation_nodes_enabled` and `aggregation_fallback_min_hits`: 4a is
+# subordinate to the master switch, so a test that exercises it with the layer
+# off tests nothing and passes regardless (the E3 unreachable-path lesson).
+
+
+def _seed_message(conn, sid: str, content: str, role: str = "user") -> None:
+    conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES (?)", (sid,))
+    conn.execute(
+        "INSERT INTO messages(session_id, role, content) VALUES (?, ?, ?)",
+        (sid, role, content),
+    )
+
+
+def _two_session_nodes(conn, acfg, embed) -> None:
+    """The standard cross-session cluster the retrieval tests above use."""
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres", "billing"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres", "billing"])
+    build_aggregation_nodes(conn, acfg, _agg_llm(), embed)
+
+
+def _ctx(n_msgs: int = 0, n_fts: int = 0, n_eps: int = 0) -> AugmentedContext:
+    return AugmentedContext(
+        message_hits=[
+            MessageHit(message_id=i, session_id="s", role="user", text="t",
+                       score=0.0)
+            for i in range(n_msgs)
+        ],
+        fts_hits=[
+            FtsHit(chunk_id=str(i), session_id="s", text="t", score=0.0)
+            for i in range(n_fts)
+        ],
+        episodes=[
+            EpisodeHit(episode_id=str(i), session_id="s", title="t", summary="s",
+                       score=0.0)
+            for i in range(n_eps)
+        ],
+    )
+
+
+# — the named thinness definition (spec property 2) —
+
+def test_raw_signal_count_sums_messages_and_chunks_only(cfg):
+    # Episodes are EXCLUDED by the pre-registered choice; this pins that the
+    # shipped variant is the excluding one, so a later switch has to change a
+    # failing test (and therefore state an argument) rather than drift.
+    assert _raw_signal_count(_ctx(n_msgs=2, n_fts=3)) == 5
+    assert _raw_signal_count(_ctx(n_msgs=0, n_fts=0, n_eps=9)) == 0
+
+
+def test_sparse_fallback_is_strictly_below_threshold(cfg):
+    # Test 7 of the matrix: landing exactly ON the threshold does NOT fire.
+    acfg = replace(cfg, aggregation_fallback_min_hits=3)
+    assert _sparse_signal_fires(acfg, _ctx(n_msgs=2)) is True
+    assert _sparse_signal_fires(acfg, _ctx(n_msgs=3)) is False
+    assert _sparse_signal_fires(acfg, _ctx(n_msgs=4)) is False
+
+
+def test_sparse_fallback_disabled_at_zero_and_below(cfg):
+    for value in (0, -1):
+        acfg = replace(cfg, aggregation_fallback_min_hits=value)
+        assert _sparse_signal_fires(acfg, _ctx()) is False
+
+
+# — matrix rows 1-8, through augment() —
+
+def test_row1_inert_default_leaves_the_firing_set_unchanged(conn, cfg):
+    # Matrix 1: the regression guard that lets 4a land without touching the
+    # flip watch. Default fallback=0, layer ON => byte-identical to TR-only.
+    acfg = _enabled(cfg)
+    assert acfg.aggregation_fallback_min_hits == 0, "4a must ship inert"
+    embed = StubEmbeddingClient()
+    _two_session_nodes(conn, acfg, embed)
+
+    assert augment(conn, acfg, "postgres billing",
+                   embedding_client=embed).aggregation_nodes == []
+    assert augment(conn, acfg, "postgres billing", embedding_client=embed,
+                   ability="TR").aggregation_nodes
+
+
+def test_row2_starved_query_fires_and_carries_the_chip(conn, cfg):
+    # Matrix 2: no ability, zero raw hits, nodes exist => the fallback fires
+    # and every hit is chipped with the firing mode.
+    acfg = replace(_enabled(cfg), aggregation_fallback_min_hits=2)
+    embed = StubEmbeddingClient()
+    _two_session_nodes(conn, acfg, embed)
+
+    ctx = augment(conn, acfg, "postgres billing", embedding_client=embed)
+    assert _raw_signal_count(ctx) == 0, "precondition: the query is starved"
+    assert ctx.aggregation_nodes, "fallback must fire when there is nothing to crowd"
+    for hit in ctx.aggregation_nodes:
+        assert any(c.startswith("sparse_fallback(raw=0)") for c in hit.why_retrieved)
+
+
+def test_row3_query_with_raw_hits_does_not_fire(conn, cfg):
+    # Matrix 3: the same unrouted query, but raw retrieval found turns. The
+    # licence ("nodes appear when there is nothing to crowd") is gone, so the
+    # tier stays silent.
+    acfg = replace(_enabled(cfg), aggregation_fallback_min_hits=2)
+    embed = StubEmbeddingClient()
+    _two_session_nodes(conn, acfg, embed)
+    with core_db.transaction(conn):
+        _seed_message(conn, "s1", "We run billing on postgres in production.")
+        _seed_message(conn, "s2", "The postgres billing shard was resized.")
+        _seed_message(conn, "s2", "Postgres billing costs went up.")
+
+    ctx = augment(conn, acfg, "postgres billing", embedding_client=embed)
+    assert _raw_signal_count(ctx) >= 2, "precondition: raw retrieval is NOT thin"
+    assert ctx.aggregation_nodes == []
+
+
+def test_row4_ability_firing_is_attributed_to_ability_not_fallback(conn, cfg):
+    # Matrix 4: TR fires via the ability gate. Even though the fallback is
+    # enabled, the chip must not claim a fallback firing — the two modes have
+    # different expected effects and no later A/B can separate them if the
+    # provenance smears.
+    acfg = replace(_enabled(cfg), aggregation_fallback_min_hits=2)
+    embed = StubEmbeddingClient()
+    _two_session_nodes(conn, acfg, embed)
+    with core_db.transaction(conn):
+        _seed_message(conn, "s1", "We run billing on postgres in production.")
+        _seed_message(conn, "s2", "The postgres billing shard was resized.")
+        _seed_message(conn, "s2", "Postgres billing costs went up.")
+
+    ctx = augment(conn, acfg, "postgres billing", embedding_client=embed,
+                  ability="TR")
+    assert ctx.aggregation_nodes
+    for hit in ctx.aggregation_nodes:
+        assert not any("sparse_fallback" in c for c in hit.why_retrieved)
+
+
+def test_row4b_ability_firing_on_a_thin_query_still_attributes_to_ability(conn, cfg):
+    # The case where both conditions are true at once. `by_ability` wins the
+    # attribution, so a TR query on a cold store is not miscounted as fallback
+    # evidence when the A/B is read.
+    acfg = replace(_enabled(cfg), aggregation_fallback_min_hits=2)
+    embed = StubEmbeddingClient()
+    _two_session_nodes(conn, acfg, embed)
+
+    ctx = augment(conn, acfg, "postgres billing", embedding_client=embed,
+                  ability="TR")
+    assert _raw_signal_count(ctx) == 0
+    assert ctx.aggregation_nodes
+    for hit in ctx.aggregation_nodes:
+        assert not any("sparse_fallback" in c for c in hit.why_retrieved)
+
+
+def test_row5_master_switch_dominates_the_fallback(conn, cfg):
+    # Matrix 5: layer OFF + a generous fallback + a starved query => nothing.
+    # Paired with row 1 this is what makes landing 4a during the flip watch
+    # safe: neither the default nor an off store can reach the new path.
+    built = replace(_enabled(cfg), aggregation_fallback_min_hits=5)
+    embed = StubEmbeddingClient()
+    _two_session_nodes(conn, built, embed)
+
+    off = replace(built, aggregation_nodes_enabled=False)
+    ctx = augment(conn, off, "postgres billing", embedding_client=embed)
+    assert _raw_signal_count(ctx) == 0
+    assert ctx.aggregation_nodes == []
+
+
+def test_row6_fallback_firing_displaces_nothing(conn, cfg):
+    # Matrix 6 — the test that earns the feature. It turns "nodes appear when
+    # there is nothing to crowd" from a claim into a mechanical assertion:
+    # every other tier is byte-identical between the two arms, so whatever the
+    # fallback costs later, it cannot be crowding.
+    on = replace(_enabled(cfg), aggregation_fallback_min_hits=8)
+    embed = StubEmbeddingClient()
+    _two_session_nodes(conn, on, embed)
+    with core_db.transaction(conn):
+        _seed_message(conn, "s1", "We run billing on postgres in production.")
+        _seed_message(conn, "s2", "The postgres billing shard was resized.")
+
+    off = replace(on, aggregation_fallback_min_hits=0)
+    ctx_on = augment(conn, on, "postgres billing", embedding_client=embed)
+    ctx_off = augment(conn, off, "postgres billing", embedding_client=embed)
+
+    assert ctx_on.aggregation_nodes, "precondition: the arm under test fired"
+    assert ctx_off.aggregation_nodes == []
+    assert ctx_on.message_hits == ctx_off.message_hits
+    assert ctx_on.fts_hits == ctx_off.fts_hits
+    assert ctx_on.episodes == ctx_off.episodes
+
+
+def test_row8_fallback_on_an_empty_store_returns_no_nodes(conn, cfg):
+    # Matrix 8: the fallback condition is satisfied but nothing was ever
+    # dreamed. Must degrade to [] rather than raising on the missing tables.
+    acfg = replace(_enabled(cfg), aggregation_fallback_min_hits=3)
+    embed = StubEmbeddingClient()
+
+    ctx = augment(conn, acfg, "postgres billing", embedding_client=embed)
+    assert ctx.aggregation_nodes == []

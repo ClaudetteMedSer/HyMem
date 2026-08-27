@@ -242,6 +242,35 @@ class HyMemConfig:
     merely adds a summary tier (never displaces other tiers), a false negative
     is identical to the layer being off."""
 
+    aggregation_fallback_min_hits: int = 0
+    """Stage 4a sparse-signal fallback: also fire the aggregation tier when raw
+    retrieval came back THIN — fewer than this many combined message+chunk hits
+    — regardless of the routed ability. 0 (the default) disables it entirely, so
+    4a ships INERT and the firing set is byte-identical to the TR-only
+    `aggregation_inject_abilities` behaviour above.
+
+    The licence is narrow and is the whole argument for the knob: the G4 A/B
+    killed BROAD injection because nodes crowd gold turns out of the answer
+    pool, so a fallback is only defensible where there is nothing to crowd.
+    It is therefore a STRICT OR — an independent condition that can only ADD
+    firings on starved queries. It never widens, softens or bypasses the ability
+    gate for a query that already has hits, and a firing it causes is chipped
+    `sparse_fallback(raw=N)` so a later A/B can separate the two firing modes.
+
+    Thinness counts `message_hits + fts_hits` and deliberately EXCLUDES
+    `episodes` (`_raw_signal_count`). Recorded because the readings point
+    opposite ways: excluding episodes fires the tier when a dreamed store
+    already has session summaries covering the query — i.e. when nodes are
+    REDUNDANT rather than crowding; including them means the fallback almost
+    never fires on a mature store — i.e. 4a is inert in practice rather than
+    merely default-off. The excluding variant ships; any switch needs a stated
+    argument, never a better number from trying both.
+
+    **Subordinate to `aggregation_nodes_enabled`**: with the master switch off
+    this path is unreachable and this knob does nothing at any value. Tests must
+    set BOTH — a 4a test run with the layer off exercises nothing and passes
+    regardless (the E3 unreachable-code-path lesson)."""
+
     augment_include_digest: bool = False
     """When True, `augment()` also loads the standing root digest into
     `ctx.digest` so a single-call host gets the whole-store summary without a

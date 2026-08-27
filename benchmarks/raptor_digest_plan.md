@@ -658,9 +658,92 @@ This adds an observation channel to a question that was being answered
 qualitatively — it does not answer it in advance, and it must not be read as
 having pre-judged which branch is true.
 
+**First live v33 row — #1319, 2026-08-26 17:37:58.** `rebuilt_level0/rollup/root
+= 3 / 4 / 1`, and `3 + 4 + 1 = 8 = predicted = built - reused`. The
+self-check asserted twice offline (`test_decomposition_sums_to_actual` at unit
+level, `test_decomposition_is_persisted_on_the_dream_run` through the store)
+holds end-to-end on the instrument's first production row. It is a
+`leaf_changed=0` row, so it calibrates the CLEAN baseline, not the family.
+
+**PRE-REGISTERED PREDICTION for the next `leaf_changed=1` row — banked
+2026-08-27, before that row exists.** Writing it down now is the whole point:
+the argument below is available *before* the measurement, so if it is simply
+recited afterwards the reading is a confirmation, not a finding. Two facts
+already in hand constrain the answer:
+
+| family | leaf_changed | l0miss | rebuilt | /miss |
+|---|---|---|---|---|
+| #1318, #1319 | 0 | 3 | 8 | 2.7 |
+| #1183, #1307, #1317 | 1 | 3 | 19-22 | 6.3-7.3 |
+
+`l0miss` is **3 in BOTH families**, so the ~12-rebuild gap cannot be coming from
+episode arrivals into clusters — that input is constant across the split. And
+#1319 gives the clean-row calibration directly: `rebuilt_level0 = 3 = l0miss`,
+exactly. Structurally this is what the tree shape predicts, since the digest
+leaf set is level-0 nodes plus leftover *episodes*, and which leftovers get
+sampled does not touch cluster membership.
+
+- **Prediction:** `rebuilt_level0 ~= 3` (tracking `l0miss`, unchanged across
+  families), `rollup ~= 15-18`, `root = 1` => reading **(a)**, benign digest
+  cascade, family CLOSED.
+- **Falsifier, and it is sharp:** `rebuilt_level0 ~= 17` means the 2026-07-05
+  oldest-anchored windowing confinement is leaking => reading **(b)**, and the
+  windowing analysis reopens with that row as its starting evidence.
+
+A middle result (`level0` in 6-12) falsifies neither cleanly and should be
+recorded as such rather than rounded to the nearer branch.
+
+### The flip gate vs the regression monitor — SEPARATED 2026-08-27
+
+**The post-flip window is structurally unpassable as anchored, and that is a
+signal problem, not a reason to touch #1317.**
+
+Criterion 1 is "*every* verdict row >= 90%". #1317 sits in the window at 80.6%
+and was correctly NOT re-anchored away. The consequence is arithmetic: this
+watch returns FAIL on every future read regardless of what new rows do. #1318
+and #1319 came back textbook-clean (92.2%, 2.7/miss, residual 0) and the
+classifier still says FAIL; two more clean rows will not change it. That is the
+confident-constant failure mode in a new dress — an instrument whose output no
+longer varies with the thing it is measuring (see the diagnostic-controls
+lesson: a gate that cannot register the difference between "fine" and
+"regressed" is not reading anything).
+
+The cause is role reuse, not a defect. The seven criteria were designed to
+authorize a **one-time decision** ("is it safe to flip?"). They are now being
+run verbatim as an **ongoing regression monitor**, which is a different job with
+a different natural criterion. The resolution is to name the two roles apart:
+
+- **G-FLIP, the flip gate: CLOSED, PASSED 2026-08-26, historical.** It did its
+  job on the 11:15 window. It is not re-run, not re-anchored, and not re-scored.
+  Its verdict does not change if later rows are worse — that is what makes a
+  later bad row a *finding* rather than a retroactive re-litigation.
+- **G-MON, the regression monitor: pre-registered here, 2026-08-27, distinct
+  from G-FLIP.** Criterion: **no NEW below-bar append row** — i.e. every
+  `append`-classified verdict row stamped after the flip commit (52adfe5) is
+  >= 90% reuse with `residual = 0`. Rows predating the flip stay on the record
+  and are excluded from G-MON's *scoring* while remaining visible in the
+  listing. One below-bar append after the flip is a finding to act on; a
+  `leaf_changed=1` row below the bar is routed to the family question above
+  (which now has its own instrument) rather than counted as a regression, since
+  that population was already known to be low-reuse *before* the flip.
+
+#1317 stays exactly where it is under either framing — it is pre-flip evidence
+for a known open question, and it is not an append. What changes is that G-MON
+can register a difference again, which G-FLIP-as-monitor no longer can.
+
+**Deliberately NOT done:** #1317 is not dropped, the window is not re-anchored,
+and G-FLIP's bar is not moved. Re-anchoring to clear a failing row after seeing
+it fail is post-hoc tightening's mirror image and is refused on the same grounds
+the A5 verdict refused two waivers.
+
 ---
 
 ## Stage 4 — Query-time consumption v2 (only after Stage 3)
+
+**Stage 3 RESOLVED 2026-08-26 (G-FLIP PASS -> flipped), so Stage 4 is open.**
+4a BUILT 2026-08-27 (inert default); 4b BUILT 2026-06-12. Stage 4 is complete
+as specced — what remains is a *flip* decision for 4a's threshold, which is a
+separate pre-registered scored decision and is NOT taken here.
 
 **4a. Sparse-signal fallback injection.** Fire the node tier when raw retrieval is THIN
 (e.g. `len(message_hits) + len(fts_hits) < threshold`, or top BM25 score below floor)
@@ -669,8 +752,32 @@ is nothing for them to crowd, covering vague/global/cold-start queries ("what do
 about my projects?") that LME never asks. Config: `aggregation_fallback_min_hits`
 (0 disables). Tests offline; no LME run (invariant 1).
 
-**4a BUILD SPEC (written 2026-08-26, UNBUILT — do not land a default change
-before the 3c flip resolves).** Code sites confirmed against HEAD: the gate to
+**4a BUILT 2026-08-27 — ships INERT (`aggregation_fallback_min_hits = 0`).**
+The spec's own gating note ("do not land a default change before the 3c flip
+resolves") is DISCHARGED: 3c resolved PASS and flipped on 2026-08-26, and 4a
+lands with a default of 0 anyway, so no default behaviour changes on any store.
+Built exactly to the spec below — `_raw_signal_count` / `_sparse_signal_fires`
+(`augment.py`), strict OR at the gate, `sparse_fallback(raw=N)` chip applied
+only when `by_fallback and not by_ability`, the episodes-excluding variant of
+thinness. All 8 matrix rows plus 3 unit rows on the predicates: **11 tests,
+suite 1287 passed / 8 failed**, the 8 being the pre-existing local
+`sqlite_vec`-missing set, byte-identical to the baseline measured by `git stash`
+in the same session (1276 passed before). No LME run, invariant 1 intact.
+
+Two spec points that survived contact with the code and are worth reading as
+banked, because both are the kind of thing that silently rots:
+
+- **Attribution, not just firing.** Matrix row 4 was extended with a row 4b —
+  a TR query on a *starved* store, where BOTH conditions are true at once.
+  `by_ability` wins the attribution there, so a cold-start TR query cannot be
+  miscounted as fallback evidence when the later A/B is read. Row 4 alone
+  would have passed with the chip smearing.
+- **Rows 1 and 5 are the landing licence.** Row 1 pins the inert default
+  (firing set identical to TR-only), row 5 pins that the master switch
+  dominates at any fallback value. Together they are why this could land during
+  the post-flip monitor window without perturbing it.
+
+*Original spec, retained verbatim as the build record.* Code sites confirmed against HEAD: the gate to
 amend is `augment.py:584`
 (`if cfg.aggregation_nodes_enabled and _aggregation_tier_fires(cfg, ability):`),
 the ability predicate is `_aggregation_tier_fires` (`augment.py:2209-2218`), and
