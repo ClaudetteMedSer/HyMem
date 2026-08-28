@@ -81,3 +81,12 @@ pip-delete-this-directory.txt
 
 # Benchmark datasets (licenses vary; LoCoMo is CC BY-NC 4.0 — decide before committing)
 benchmarks/data/
+
+# Local experiment scripts — NEVER COMMIT.
+# Added 2026-08-29. These files carry a hardcoded live DEEPSEEK_API_KEY
+# (box_dream.py, box_dream2.py, box_dream3.py, p4_gate_v2.py,
+# p4_gate_verify.py). This repo is PUBLIC. The directory has never been
+# tracked and the key is not in history, so nothing is exposed — this rule
+# exists so that a future `git add -A` cannot change that.
+# Remove the key from the files before removing this rule.
+/scripts/
