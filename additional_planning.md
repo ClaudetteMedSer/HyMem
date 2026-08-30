@@ -851,6 +851,46 @@ review)*
 > not a drive-by on the way past. Recorded here so it is not rediscovered as
 > a mystery — and it bounds how far the v4-flash migration story can be
 > called settled.
+>
+> **LEVER BUILT 2026-08-31 (`--episode-granularity`), and the pass that built it
+> found a live contamination in the same adapter.** The flip's own LME
+> non-regression guard could not be executed: `episode_granularity_enabled`
+> appeared nowhere under `benchmarks/`, so the granular arm was unreachable from
+> the CLI and the guard would have run the blob prompt in both arms — a clean
+> null produced by an instrument that never touched the lever, which is the
+> unreachable-code-path shape from the diagnostic-controls memo. The flag is
+> write-side: it changes what the dream extracts, so the arm MUST be built with
+> `--fresh` and without `--no-dream`, and a run reusing a store dreamt under the
+> other prompt measures the store, not the lever. The help text says so.
+>
+> **The contamination: `benchmarks/longmemeval_adapter.py` never pinned
+> `aggregation_nodes_enabled`.** It set only the True leg, so when the library
+> default flipped False -> True on 2026-08-26 this adapter silently gained the
+> aggregation layer + digest — while every run through it was still being
+> compared to a 68.4 baseline that ran without them. `beam_adapter` and
+> `msc_adapter` were pinned that day (`52adfe5`, `4853f08`); this one was
+> missed, and the banked record ("the three benchmark adapters were silent
+> default-config consumers and now pin it False") asserted a state that was true
+> of two files out of three. The doc was checked against itself rather than
+> against the code, which is the same failure the `4853f08` write-up called a
+> doc/code form mismatch — caught there, repeated here on the file that carries
+> the frozen baseline.
+>
+> Both levers are now pinned in BOTH positions, unconditionally, and three tests
+> assert it. The aggregation test deliberately also asserts that the LIBRARY
+> default is True: that is what makes "adapter reads False" evidence of a pin
+> rather than of an inherited default, and if the default ever moves back the
+> test SHOULD fail rather than keep reading green while testing nothing. Both
+> mutation-checked — restoring the conditional form fails one, dropping the
+> granularity override fails the other. Suite 1336 passed (+3 on this
+> interpreter; the new file skips where `requests` is absent and runs on the
+> box).
+>
+> **Consequence for the guard, and it is not small.** Any LME run through this
+> adapter dated after 2026-08-26 was an aggregation-ON run under an
+> aggregation-OFF label. That is a comparability question about those runs, not
+> a finding about the layer, and it should be settled by checking dates before
+> any of them is used as a baseline for the flip.
 
 ### Motivation
 
@@ -998,6 +1038,18 @@ is DISCUSSABLE, not automatic — the LME full guard (non-regression only), the
 dream cost watch, and the no-overlap rule against a RAPTOR verification dream
 are separate gates and all three still stand. **The next decision is the FLIP
 itself, and it needs those three discharged, not a fourth probe.**
+
+**Gate status 2026-08-31 (box-side read).** No-overlap: DISCHARGED (#1317 is the
+banked RAPTOR post-flip verification dream; a post-flip reuse re-verify is still
+owed AFTER the granularity flip lands). Dream cost watch: BASELINE READY (dreams
+1342/1343 at 47s/58s wall clock, input 1167→1168, reuse 91-100%, 0 fusion
+failures) — the watch is one-time re-digest cost plus steady-state delta,
+measurable before/after, free. LME full guard: was BLOCKED ON A MISSING LEVER,
+now UNBLOCKED — `--episode-granularity` exists as of this entry. The guard is
+~1,000 reader calls plus dream calls, ~2-3h, and both arms must be `--fresh`
+because the lever is write-side. **Before it spends, check the aggregation
+contamination above: the OFF arm must be built by the same pinned adapter, and
+any pre-existing post-2026-08-26 run must not be reused as its baseline.**
 
 1. ~~**RUN, box-side:** `benchmarks/fact_probe.py` faithfulness.~~ **RAN
    2026-08-30 — G-F1 PASS on v4-flash at full source, faithfulness 1.00

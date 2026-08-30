@@ -478,6 +478,7 @@ class HyMemAdapter:
                  rerank_top_k: int | None = None, rerank_model: str | None = None,
                  rerank_message_hits: bool | None = None,
                  aggregation_nodes: bool = False, aggregation_broad: bool = False,
+                 episode_granularity: bool = False,
                  value_supersession: bool = True,
                  graph_multihop: bool = False,
                  graph_multihop_max_hops: int | None = None,
@@ -495,6 +496,7 @@ class HyMemAdapter:
         self.rerank_message_hits = rerank_message_hits
         self.aggregation_nodes = aggregation_nodes
         self.aggregation_broad = aggregation_broad
+        self.episode_granularity = episode_granularity
         self.value_supersession = value_supersession
         self.graph_multihop = graph_multihop
         self.graph_multihop_max_hops = graph_multihop_max_hops
@@ -528,10 +530,30 @@ class HyMemAdapter:
         # nodes, the TR-gated tier fires per cfg.aggregation_inject_abilities);
         # --aggregation-broad additionally clears the ability allowlist, which
         # reproduces the broad-injection G4 run that lost 69.0 vs 70.0.
-        if self.aggregation_nodes:
-            overrides["aggregation_nodes_enabled"] = True
+        #
+        # PINNED BOTH WAYS, and that is the fix, not the style. This adapter set
+        # only the True leg until 2026-08-31, so when the config default flipped
+        # False -> True on 2026-08-26 (G-FLIP PASS) every run here silently
+        # gained the aggregation layer + digest while still being compared to a
+        # 68.4 baseline that ran without it. beam_adapter and msc_adapter were
+        # pinned that day and this one was missed; the record read "the three
+        # benchmark adapters now pin it False", so the gap was invisible to the
+        # docs as well as to the code. A conditional override inherits whatever
+        # the library decides later, which is exactly what a benchmark must not
+        # do -- moving onto a new shipped default is a pre-registered scored
+        # decision, never a side effect.
+        overrides["aggregation_nodes_enabled"] = self.aggregation_nodes
         if self.aggregation_broad:
             overrides["aggregation_inject_abilities"] = ()
+        # Plan C lever: episode granularity (decision-level episodes instead of
+        # one blob segment per session). WRITE-side only -- it changes what the
+        # dream extracts, so it does nothing at all against an existing store:
+        # the guard arm needs a --fresh rebuild, and a run that reuses a store
+        # built under the other prompt measures the store, not the lever. Pinned
+        # both ways for the same reason as the line above: the flip is under
+        # consideration, and the day it lands this adapter must not move with
+        # it silently.
+        overrides["episode_granularity_enabled"] = self.episode_granularity
         # Bi-temporal KU lever: dream-cycle single-assertion value supersession.
         # Pinned explicitly BOTH ways so a run is reproducible whatever the
         # library default: ON since 2026-07-02 (guard cleared — score-neutral,
@@ -1799,6 +1821,7 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
                           rerank_message_hits=args.rerank_message_hits,
                           aggregation_nodes=args.aggregation_nodes,
                           aggregation_broad=args.aggregation_broad,
+                          episode_granularity=args.episode_granularity,
                           value_supersession=args.value_supersession,
                           graph_multihop=args.graph_multihop,
                           graph_multihop_max_hops=args.graph_multihop_max_hops,
@@ -2037,6 +2060,8 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                           rerank_message_hits=args.rerank_message_hits,
                           aggregation_nodes=args.aggregation_nodes,
                           aggregation_broad=args.aggregation_broad,
+                          episode_granularity=getattr(
+                              args, "episode_granularity", False),
                           value_supersession=args.value_supersession,
                           facts_enabled=getattr(args, "facts", None),
                           facts_extraction=getattr(args, "facts_extraction", None))
@@ -2490,6 +2515,19 @@ def main():
                              "broad-injection G4 A/B that lost 69.0 vs 70.0 (KU −9.0pp from "
                              "nodes crowding gold turns out of the answer pool). For "
                              "comparison runs only.")
+    parser.add_argument("--episode-granularity", action="store_true",
+                        help="Plan C lever (cfg.episode_granularity_enabled): extract "
+                             "DECISION-level episodes -- several per session, each with "
+                             "its own outcome -- instead of one blob segment per session. "
+                             "DEFAULT OFF, and OFF is the frozen-baseline arm. This is a "
+                             "WRITE-side lever: it changes what the dream extracts, so it "
+                             "is inert against an existing store and the arm MUST be built "
+                             "with --fresh (and without --no-dream). A run that reuses a "
+                             "store dreamt under the other prompt measures the store, not "
+                             "the lever, and will read as a clean null. Front-run gate "
+                             "G-EP1 PASSED 2026-08-31 (benchmarks/episode_probe.py); this "
+                             "flag exists to run the LME non-regression guard the flip "
+                             "still owes.")
     parser.add_argument("--graph-multihop", action="store_true",
                         help="Track A / Idea A lever (cfg.graph_multihop_enabled): enable "
                              "query-time multi-hop graph traversal (Source 4 of _graph_lookup) "
