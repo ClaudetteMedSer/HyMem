@@ -218,12 +218,14 @@ def persist_episodes(
     disagree with its source.
 
     ``supersede_window`` (start, end) turns the write into a REPLACE of the
-    episodes inside that message window, and only the Plan C granular arm passes
-    it. Without it a granularity change is silently additive: UPSERT refreshes a
-    row only when the new episode resolves to the SAME id, so the old
-    one-blob-per-session rows (different range, therefore different id) survive
-    the re-extraction and the store ends up serving both granularities of the
-    same conversation. Scoped deliberately:
+    episodes inside that message window, and the runner passes it on EITHER side
+    of a granularity change -- flipping on, and reverting off again. Without it
+    a granularity change is silently additive: UPSERT refreshes a row only when
+    the new episode resolves to the SAME id, so the rows written under the other
+    id shape (different id, therefore no conflict) survive the re-extraction and
+    the store ends up serving both granularities of the same conversation. It is
+    NOT passed on a store that has only ever run the blob prompt, whose re-dreams
+    stay additive exactly as before. Scoped deliberately:
 
       * only rows whose range lies wholly INSIDE the window this call re-read —
         a session's older, already-covered episodes are outside it and must not

@@ -413,9 +413,11 @@ class HyMemConfig:
     EO/SUM post-mortem traced the floor to). Swaps
     SESSION_DIGEST_SYSTEM/_USER_TEMPLATE for the granular pair, bounds the
     result at `dream_max_episodes_per_session`, stamps
-    EPISODE_GRANULAR_PROMPT_VERSION on the session and on each row (schema
-    v35), and supersedes the episodes inside the re-read window so the old
-    blob rows do not survive beside the new ones.
+    EPISODE_GRANULAR_PROMPT_VERSION on the session (schema v35 -- one column,
+    on `sessions`; a per-ROW copy was considered and dropped as derived state
+    that can disagree with its source, see migration 035), and supersedes the
+    episodes inside the re-read window so the old blob rows do not survive
+    beside the new ones.
 
     DEFAULT OFF, and it stays off until `benchmarks/episode_probe.py` scores
     the granular prompt at faithfulness >= 0.90 on a stratified sample with a
@@ -430,7 +432,15 @@ class HyMemConfig:
     re-reads from the start of each session), then returns to the usual
     zero-tail-call steady state. Flipping it back False re-digests once more,
     under the blob prompt, which is the correct revert: the stamp goes back to
-    NULL and the granular rows in each re-read window are superseded."""
+    NULL and the granular rows in each re-read window are superseded. That
+    second leg is keyed on the session's STAMP, not on this flag -- the blob
+    arm supersedes only where granularity had actually been on -- so a store
+    that never enabled it keeps the purely additive episode writes it has
+    always had. Two gaps in the revert, both in the over-KEEPING direction: a
+    session whose blob re-extraction returns no usable episode is not
+    superseded at all (an empty reply must never delete a previous
+    extraction's work), and a granular row reaching past the re-read window
+    lies outside it and survives."""
 
     dream_max_episodes_per_session: int = 12
     """Cap on validated episodes accepted from one granular digest call; a

@@ -591,3 +591,158 @@ def test_v35_adds_the_session_stamp_to_a_pre_v35_store(tmp_path):
         "an existing session must read as the shipping prompt, not as granular"
     )
     conn.close()
+
+
+# --- the revert leg, at row level ------------------------------------------
+
+
+def test_reverting_supersedes_the_granular_rows_it_replaces(cfg, granular_cfg):
+    """The revert leg of the flip contract, asserted on ROWS.
+
+    ``test_reverting_the_flag_re_extracts_under_the_blob_prompt`` above pins the
+    prompt and the stamp, and neither can see the failure this test exists for:
+    granular ids are ``range#titlehash`` while blob ids are the bare ``range``,
+    so on a flip-off the two shapes cannot collide and UPSERT alone leaves BOTH
+    granularities of the same conversation standing. The store then serves a
+    decision-grained row and a blob row over the same turns — the mixed store
+    the supersession was built to prevent, in the direction nobody looked.
+
+    Three passes because chunking happens INSIDE the dream: the chunk ids an
+    episode has to cite do not exist until one has run. Asserted at a non-NULL
+    range on purpose — a NULL-range row is deliberately never superseded
+    (unattributable to any window), so citing no chunks would pass this test for
+    the wrong reason.
+    """
+    # Pass 1 — blob arm, no episodes: this exists only to create the chunks.
+    llm0 = _digest_llm(summary="A short but valid session summary about deploys.")
+    hy0 = HyMem(cfg, llm=llm0)
+    try:
+        _seed(hy0, "s_mix")
+        hy0.dream()
+        cids = _chunk_ids(hy0, "s_mix")
+        assert cids, "no chunks — the range-id path would be untested"
+    finally:
+        hy0.close()
+
+    payload = [
+        _episode("Chose fly.io over render", cids),
+        _episode("Hit the 512MB memory limit", cids),
+    ]
+
+    # Pass 2 — flip ON. The NULL stamp mismatches the granular version, so the
+    # session is re-read and both decisions persist as separate rows.
+    llm1 = _digest_llm(episodes=payload, summary="Deploy notes for staging.")
+    hy1 = HyMem(granular_cfg, llm=llm1)
+    try:
+        hy1.dream()
+        granular_ids = [
+            r["id"] for r in hy1.conn.execute(
+                "SELECT id FROM episodes WHERE session_id = 's_mix'"
+            ).fetchall()
+        ]
+        assert len(granular_ids) == 2, granular_ids
+        assert all("#" in i for i in granular_ids), granular_ids
+        assert all(
+            r["start_message_id"] is not None
+            for r in hy1.conn.execute(
+                "SELECT start_message_id FROM episodes WHERE session_id = 's_mix'"
+            ).fetchall()
+        ), "NULL range — the supersede guard skips these, test would be vacuous"
+    finally:
+        hy1.close()
+
+    # Pass 3 — flip back OFF. The blob rewrite must take the window with it.
+    llm2 = _digest_llm(episodes=payload, summary="Deploy notes for staging.")
+    hy2 = HyMem(cfg, llm=llm2)
+    try:
+        hy2.dream()
+        rows = [
+            r["id"] for r in hy2.conn.execute(
+                "SELECT id FROM episodes WHERE session_id = 's_mix'"
+            ).fetchall()
+        ]
+        assert not [i for i in rows if i in granular_ids], (
+            f"granular rows survived the revert: {rows}"
+        )
+        # Both blob episodes resolve to the same range, hence one bare-range id.
+        assert rows == [f"s_mix@{_range(hy2, 's_mix')}"], rows
+    finally:
+        hy2.close()
+
+
+def _range(hy: HyMem, sid: str) -> str:
+    row = hy.conn.execute(
+        "SELECT MIN(start_message_id) AS s, MAX(end_message_id) AS e "
+        "FROM chunks WHERE session_id = ?",
+        (sid,),
+    ).fetchone()
+    return f"{row['s']}-{row['e']}"
+
+
+def test_the_window_is_passed_on_a_change_and_never_on_a_blob_only_store(
+    cfg, granular_cfg, monkeypatch
+):
+    """The wiring itself, in all three states — this is where the bug was.
+
+    Superseding is keyed on the session's STAMP, not on the flag, so it fires on
+    either side of a granularity CHANGE and never on a store that has only ever
+    run the shipping prompt. That last case is the inertness guarantee: without
+    it, turning a default-OFF feature on for nobody would still have made every
+    blob re-dream destructive-in-window, which is a silent default change.
+
+    Asserted on the argument rather than on surviving rows because a blob-only
+    re-dream re-cuts to the SAME ids, so there is nothing for a stray DELETE to
+    remove and a row-level assertion here would pass no matter how it is wired.
+    """
+    import hymem.dreaming.runner as runner
+
+    seen: list = []
+    real = runner.persist_episodes
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("supersede_window", "MISSING"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "persist_episodes", spy)
+
+    eps = [_episode("Chose fly.io over render", [])]
+
+    # (a) blob-only store, first dream: stamp NULL -> no window.
+    llm0 = _digest_llm(episodes=eps, summary="Deploy notes for staging.")
+    hy0 = HyMem(cfg, llm=llm0)
+    try:
+        _seed(hy0, "s_wire")
+        hy0.dream()
+    finally:
+        hy0.close()
+    assert seen == [None], seen
+
+    # (b) blob-only store re-extracting under a bumped prompt version: still
+    # NULL, still no window. The re-dream stays additive, as it always was.
+    seen.clear()
+    llm1 = _digest_llm(episodes=eps, summary="Deploy notes, take two.")
+    hy1 = HyMem(dataclasses.replace(cfg, prompt_version="v9-bumped"), llm=llm1)
+    try:
+        hy1.dream()
+    finally:
+        hy1.close()
+    assert seen == [None], seen
+
+    # (c) flip ON, then (d) flip OFF again: a window on both.
+    seen.clear()
+    llm2 = _digest_llm(episodes=eps, summary="Deploy notes for staging.")
+    hy2 = HyMem(granular_cfg, llm=llm2)
+    try:
+        hy2.dream()
+    finally:
+        hy2.close()
+    assert len(seen) == 1 and seen[0] is not None, seen
+
+    seen.clear()
+    llm3 = _digest_llm(episodes=eps, summary="Deploy notes for staging.")
+    hy3 = HyMem(cfg, llm=llm3)
+    try:
+        hy3.dream()
+    finally:
+        hy3.close()
+    assert len(seen) == 1 and seen[0] is not None, seen

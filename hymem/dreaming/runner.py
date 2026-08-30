@@ -460,6 +460,19 @@ def run_dreaming(
                 digested is not None
                 and digested["episodes_prompt_version"] == episode_prompt_version
             )
+            # A REVERT (granular -> blob) is the one case where the blob arm
+            # must supersede: the rows it is replacing were written under the
+            # granular id shape, so they cannot collide with the bare-range ids
+            # this pass writes and UPSERT alone would leave both granularities
+            # of the same conversation in the store. Keyed on the STAMP, not on
+            # the flag, so it fires only on a store that actually had
+            # granularity on: a store that never enabled it reads NULL here,
+            # passes no window, and keeps the purely additive blob behaviour it
+            # has always had. That is what keeps the feature inert when off.
+            had_granular_stamp = (
+                digested is not None
+                and digested["episodes_prompt_version"] is not None
+            )
             already_digested = (
                 digested is not None
                 and digested["digested_prompt_version"] == cfg.prompt_version
@@ -511,18 +524,22 @@ def run_dreaming(
                                     conn, session_id, digest.episodes,
                                     granular=cfg.episode_granularity_enabled,
                                     # Supersede the episodes inside the window
-                                    # this call re-read, granular arm only: the
-                                    # blob rows it replaces have a different
-                                    # message range, so UPSERT alone would leave
-                                    # both granularities of the same
-                                    # conversation in the store. Only reached
-                                    # when the extraction produced items (the
-                                    # `if` above), so an empty reply can never
-                                    # delete a previous extraction's work.
+                                    # this call re-read, on either side of a
+                                    # granularity CHANGE: the rows being
+                                    # replaced resolve to a different id shape,
+                                    # so UPSERT alone would leave both
+                                    # granularities of the same conversation in
+                                    # the store. Only reached when the
+                                    # extraction produced items (the `if`
+                                    # above), so an empty reply can never delete
+                                    # a previous extraction's work -- that leaves
+                                    # stale rows standing, which is the
+                                    # recoverable direction.
                                     supersede_window=(
                                         (digest.start_message_id,
                                          digest.covered_message_id)
-                                        if cfg.episode_granularity_enabled
+                                        if (cfg.episode_granularity_enabled
+                                            or had_granular_stamp)
                                         else None
                                     ),
                                 )
