@@ -733,6 +733,92 @@ review)*
 > > unconditional window, which is what pins the inertness leg rather than
 > > asserting it. Offline only; no spend. Suite 1331 passed (+2), same 8
 > > `sqlite_vec`-absent failures on the verifying interpreter, 0 on the box.
+>
+> **STATUS 2026-08-31 — G-EP1 RAN: PASS.** `episode_probe.py`, 20 sessions/arm
+> (40 extraction calls, seed 0, 23 miss + 23 control questions, 10 gold-bearing
+> / 10 filler per arm), model deepseek-v4-flash @ api.deepseek.com/v1, source
+> `longmemeval-v2-hymem-20260607T164031Z-seed0.json` (the G-F1 instrumented
+> run, so the selection is the banked readside §2.1 rule and the arms match
+> G-F1's question set), dataset `longmemeval_s_cleaned.json`. All five criteria:
+> faithfulness **0.98** (67/68 episodes strict, hand-read counts-only against
+> the hash-verified `extractor_input`), median episodes/substantive session
+> **4.0** (in 3-8), concrete-value share **68%** (≥60%), coverage **100%**
+> (≥90%), control median **4.0** (≤12). Parse failures **0**. Verdict: PASS —
+> the flip is now DISCUSSABLE, not automatic (LME full guard, dream cost watch
+> and the no-overlap rule against a RAPTOR verification dream are separate and
+> still stand).
+>
+> Two findings from the run, both instrument-level.
+>
+> **The first 20/arm run was UNREADABLE — and the probe's own diagnostic was
+> wrong about why.** 21/40 parse failures (52.5% > 2% ceiling → INCOMPLETE as
+> designed). The probe advised "re-run at a higher --max-tokens"; the true
+> cause was that `deepseek-v4-flash` is a REASONING model: as called without
+> `extra_body`, it burns the full 8192-token output budget on
+> `reasoning_content` and returns `content==""` (finish=length, content_len=0,
+> reasoning_len≈32k), which `loads_lenient` turns into a parse failure. The
+> adapter's own docstring already documents the fix — post-2026-07-24 the
+> provider prepends thinking tokens unless the request carries
+> `{"thinking":{"type":"disabled"}}` (longmemeval_adapter.py:327-330) — and
+> `episode_probe.py` supports it via `--extra-body`; the first invocation
+> simply didn't pass it. Re-run with the flag: 0 parse failures. Higher
+> --max-tokens would have been the wrong remedy (it re-spends the budget on
+> reasoning and can still end length-stopped with empty content).
+>
+> **The parse-failure row discards the raw response, so a run can fail 52%
+> without one shard of evidence about the failure class.** The dump stores
+> `extractor_input` (what was sent) but nothing of what came back; the
+> diagnostic had to be inferred and was wrong. One line — record the raw
+> response's `finish_reason` and length (or a fixed-size tail) on parse
+> failure only — would have made this diagnosis immediate. **Suggested, not
+> applied** (attn: user gate — box spend and instrument edits are both the
+> user's call; the probe is unchanged).
+>
+> **Disagreement between G-MON and G-MON-b, live and resolved by design, not by
+> waiver.** The G-MON first read (2026-08-27) banks a family-routing rule: a
+> below-bar append with `leaf_changed=1` goes to the family question rather
+> than being counted as a regression — and G-MON-b's literal bar (amp ≤ 4.5)
+> would fire on exactly those rows (family amps 6.3-7.3 exceed the bar by
+> construction). #1336 (2026-08-30 16:36 UTC, post-flip, leaf_changed=1, reuse
+> 77.7%) is such a row: below-bar append, amp 7.7, residual 0. Read under G-MON
+> it is family-routed (no regression finding); read under G-MON-b's literal
+> bar it fires. The banked text anticipated this: "if the two disagree on a
+> future row, that disagreement is itself the datum." The record: the family
+> row is not a regression finding, and G-LD1 — scored on this same row, first
+> leaf_changed=1 carrying a non-NULL delta (add 6 / rem 6, rollup 19) —
+> CONFIRMED the LARGE leaf-delta branch (rollup≥15 → added+removed≥5; observed
+> 12≥5; falsifier not fired). So the disagreement resolved in the direction
+> the family instrument predicted, and the G-LD1 ladder held its first
+> pre-dated test.
+>
+> **The transferred pre-dated family test also already CONFIRMED — on #1327,
+> before the transfer was written.** "First leaf_changed=1 row stamped after
+> 2026-08-27 09:43:38 UTC" resolves to #1327 (08-27 10:09:21 UTC): level0=3
+> (=l0miss, exact), rollup=18 (predicted 15-18), root=1, self-check 3+18+1=22
+> = built-reused, residual 0 → reading (a), benign digest cascade, family
+> CLOSED. The falsifier (level0≈17) never fired on any row. Status honesty:
+> #1327 predates the transfer commit, so this is a blind-status confirmation
+> (the doc's knowledge stops at #1324 — corroborating trace), not full
+> pre-dated strength; the family question did not need #1336 or #1341 to
+> close. #1334 (v34's first post-deploy dream) reports NULL deltas by contract
+> and #1336 is the first scorable row — so G-LD1's first pre-dated test is
+> #1336 at full strength (banked 15:04:21 UTC in d3f6178, scored 16:36:34
+> UTC).
+>
+> **Faithfulness hand-score detail (the 0.98, not 1.00).** 68 episodes in the
+> sample; 67 fully grounded. The one exception: the grocery-expense session
+> (9aaed6a3__answer_353d3c6d_1) — episode "Add skincare expense at Sephora"
+> carries "$227.99 and total expenses to $302.99" in its summary, and those two
+> numbers are NOT literally in the extractor input: the input's last turn is
+> the user's "$50 at Sephora", and the assistant's reply with the running
+> totals is past the chunk boundary. The extractor COMPUTED the totals from
+> grounded operands ($177.99+$50=$227.99; $252.99+$50=$302.99 — both
+> arithmetic steps the assistant itself performs two turns earlier), and the
+> arithmetic is correct. Classified: derived-and-correct, NOT confabulation.
+> The strict spelling of the bar ("every name, number, date and version must
+> appear in the input") counts it as a miss, so it is scored at 0.98 rather
+> than 1.00 — the conservative reading; even at 1.00 the verdict is the same
+> (≥0.90).
 
 ### Motivation
 
