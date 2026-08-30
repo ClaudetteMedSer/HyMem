@@ -820,7 +820,7 @@ review)*
 > than 1.00 — the conservative reading; even at 1.00 the verdict is the same
 > (≥0.90).
 >
-> **The instrument fix is now APPLIED (`d1967c3`), and it is the same one
+> **The instrument fix is now APPLIED (`b7748c1`), and it is the same one
 > the run above suggested.** `CapturingLLM` records `reply_chars` (the true
 > full length) plus a bounded, explicitly-diagnostic `reply_head`; the dump
 > row carries both and the backend error; `summarize` splits the failures
