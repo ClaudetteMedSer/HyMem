@@ -606,6 +606,42 @@ review)*
 > ordering rule survives the discharge: this plan rewrites episode membership,
 > so it must not OVERLAP the post-flip verification dream — schedule it as its
 > own effort and re-verify aggregation reuse once after it lands.
+>
+> > **STATUS 2026-08-30 — the MODEL-level concern is discharged; the
+> > EPISODE-REWRITE bar is not, and the difference is the whole point of how it
+> > was worded.** G-F1 re-ran on v4-flash against full sources and passed at
+> > **faithfulness 1.00 (98/98)**, which settles what the paragraph above was
+> > actually afraid of: the 0.55-0.76 that made this warning urgent was an
+> > instrument artifact, the "1 invented claim per 3-4 items" never happened,
+> > and the confabulation-over-the-truncation-boundary mode was the recorder's,
+> > not the model's.
+> >
+> > But the bar as banked reads "on episode rewrites **specifically**", and that
+> > run measured the NARRATIVE-FACTS extractor — `fact_probe.py` is G-F1, and
+> > the four criteria reported (gold in <= 5 facts, faithfulness, median
+> > facts/session, control median) are G-F1's own. Facts extraction and episode
+> > re-cutting are different generative tasks against the same turns, and this
+> > plan's text already argues its own is HARDER: it rewrites the artifact
+> > retrieval depends on, where E1 only added a new one. Accepting a facts
+> > result as the episode result is the reuse-another-benchmark's-driver trap
+> > that has now cost this project three times (MSC parity, deixis,
+> > answerability).
+> >
+> > **The bar is also unmeasurable as written, and that is a defect in the
+> > banked text rather than a reason to waive it.** There is no episode-rewrite
+> > prompt to score — Plan C is unbuilt — so "clear the bar before you run it"
+> > is circular. **Resolution: Plan C proceeds PROBE-FIRST**, the pattern this
+> > repo already uses (Idea A/B both shipped core-mechanism-first, default OFF).
+> > Build the episode-rewrite prompt and a faithfulness probe over ITS output;
+> > measure >= 0.90 on a stratified sample with a correct-answer control on
+> > EPISODE REWRITES; only then does any default change become discussable.
+> > Nothing ships on the strength of the facts number.
+> >
+> > What the facts result legitimately buys: the prior is now "this model is
+> > faithful when asked to produce self-contained items from session turns",
+> > where before it was "this model invents at 1-in-3.5". That changes the
+> > expected value of building the probe enough to justify building it. It does
+> > not pre-score it.
 
 ### Motivation
 
@@ -738,23 +774,42 @@ Grove E1 is **deferred** — see the note in the Plan E section.
 **Next actions, in order (2026-08-27, superseding the list above).** Plan D and
 Grove E2 are both closed, so the live work is what those closes left standing:
 
-1. **RUN, box-side, and it unblocks two things at once:**
-   `benchmarks/fact_probe.py` faithfulness on the candidate model. It is Plan
-   C's one remaining precondition (>= 0.90 on the episode rewrite), and it is
-   also the **full-source recheck G-F1 still owes** — the `[:4000]` recorder bug
-   turned 50 faithful facts into "inventions", and v4-flash's 0.55-0.76 has
-   never been re-read against full sources. One run, two open questions. Must
-   not overlap the post-flip verification dream.
+1. ~~**RUN, box-side:** `benchmarks/fact_probe.py` faithfulness.~~ **RAN
+   2026-08-30 — G-F1 PASS on v4-flash at full source, faithfulness 1.00
+   (98/98).** It closed the `[:4000]` open item outright (see the G-F1b block)
+   but did NOT clear Plan C's bar, which is banked "on episode rewrites
+   specifically" and measured the facts extractor instead. Plan C proceeds
+   probe-first; see its STATUS 2026-08-30 block. The no-overlap constraint was
+   satisfied by construction (#1317 was already banked).
 2. **ACCRUE, passive:** G-MON / G-MON-b on post-flip append rows, and `G-LD1`
    (the v34 leaf-delta prediction) on the first leaf-changed rows carrying a
    non-NULL delta. Both are reads of dreams that happen anyway; neither needs a
    run of its own. Note v34 reports NULL on its first post-deploy dream by
    contract.
-3. **RUN, free and already pre-registered:** the LoCoMo leg of the E1 judge
-   artifact (`_lex_match` crediting a gold value recited inside a refusal). It
-   is UNRUN on the only corpus where E1 showed a measured signal (z = -2.40),
-   and until it runs the record must not harden past "costs on LoCoMo in this
-   regime".
+3. ~~**RUN, free and already pre-registered:** the LoCoMo leg of the E1 judge
+   artifact.~~ **BLOCKED 2026-08-30 — INPUTS LOST, and it is no longer free.**
+   See the note below.
+
+**The LoCoMo judge-artifact leg is BLOCKED, and the price must not be
+re-quoted as zero.** The leg is a zero-LLM re-analysis of the banked Step-5
+paired runs (`locomo_e1_on.json` / `locomo_e1_off.json`), and those dumps no
+longer exist: untracked files on a box that was restore-stamped 2026-08-09, with
+the `/tmp` db-dir wiped on container restart — the same loss class that took the
+July `locomo_dbs_emb` stores. Searched and not found in git (any branch, commit
+or loose object), on GitHub, in `~/.hermes/benchmarks/`, or on the Mac. The
+flips dump alone would not suffice even if it survived: it carries correctness
+flags, not the `ai_answer` texts the refusal check reads.
+
+Re-running the pair costs ~3,200 reader calls (n=800 x 2 arms x answer+judge,
+~4h ON / ~1.5h OFF). **Recommendation: bank as blocked, do not re-run**, on
+three grounds. (a) It cannot change a default: E1's `read off` rests on zero
+measured BENEFIT, not on the harm, so removing the harm entirely still leaves
+nothing to turn on. (b) The expected direction is attenuation, not reversal —
+the LME artifact rate applied to -2.9pp lands near z = -2.1, still significant.
+(c) This document already priced recovering a pair at 1,600 reader calls as
+"not proportionate"; this is twice that, for a confirmatory read. The record
+therefore stays exactly where the honesty rule put it — **"costs on LoCoMo in
+this regime"** — and that wording is now load-bearing rather than provisional.
 
 **Not next, and why**, so the sequencing is auditable rather than implicit:
 **E6** is unblocked but would close `invalid_at` on a tier whose READ default is
@@ -1118,6 +1173,43 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 > 0.55–0.76 — so if the v1/v2 dumps survive anywhere, the same free rescore
 > settles whether v4-flash actually invented the GPA-3.6/Stanford and
 > Billy-&-Nanny content. Not on this box (confirmed); recorded open.
+>
+> > **OPEN ITEM CLOSED 2026-08-30 — by a stronger route than the one proposed.**
+> > The v1/v2 dumps never turned up, so the free rescore was never available.
+> > G-F1 was instead re-RUN on v4-flash against full sources (prompt v2,
+> > 20-session stratified sample, 950 extraction calls, 0 parse failures) and
+> > **PASSES all four criteria**: provenance 10/10 (100%) vs a >= 60% bar,
+> > **faithfulness 1.00 (98/98)**, median 3.0 facts/session (<= 8), control
+> > median 4.0 (<= 12). The dump was verified to carry complete extractor input
+> > (min 6,454 / max 12,000 chars, no slice markers), and the pre-flagged
+> > "invention" session `answer_35c5419d_3` — GPA 3.6 / Dean's list / Stanford —
+> > **re-scores verbatim-verified against the full source**.
+> >
+> > **So the 0.55-0.76 was an instrument artifact end to end, on BOTH models.**
+> > The `[:4000]` trap did not merely depress one gpt-oss-120b run; it laid a
+> > false floor under the model this project then migrated away from partly on
+> > faithfulness grounds. v4-flash is not a confabulator, and E1's original
+> > "banked dead by G-F1" was a reading of a broken recorder rather than of a
+> > model. A fresh run is the stronger closure anyway: a rescore of surviving
+> > dumps would have inherited whatever else those dumps got wrong.
+> >
+> > **What this does NOT change.** E1's shipped verdict stays `read off, write
+> > on`. That came from Step 5's SCORED LoCoMo measurement (-2.9pp on the fired
+> > subset, z = -2.40) and from zero measured benefit anywhere — both
+> > independent of G-F1, which only ever gated whether E1 got BUILT. A
+> > faithfulness result cannot revive a read side that was turned off for
+> > costing.
+> >
+> > Attribution was audited beyond substring containment: association-risky
+> > claims (Tybee, Topsail, Fish Factory, meal plan / Coach $800 / gym, and a
+> > $10 train fare the user was REPORTING A FRIEND'S CLAIM about) all read clean
+> > against the actual turns, the reported-speech case attributed correctly
+> > rather than asserted. The "recovered 23 vs banked 20" warning is the
+> > documented widening — the gate is a fraction and was run as one — and the
+> > probe's own docstring already calls it conservative for the gate.
+> >
+> > Artifacts (box): `~/.hermes/benchmarks/facts_v4flash_fullsrc_20260830.json`,
+> > `..._scored.json`.
 
 **Idea.** Extract narrative facts with a draft prompt from the haystacks of the
 ~20 banked LME MS synthesis misses plus an equal-sized control of MS hits, and
