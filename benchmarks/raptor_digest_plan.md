@@ -747,6 +747,87 @@ NOT built here and NOT pre-judged: a count of the leaf-set delta itself,
 derived from the build's own rows the way v33's split was, so the continuous
 driver is measured instead of inferred from a flag.
 
+#### v34 BUILT 2026-08-27 — leaf-set delta (`aggregation_leaf_added/_removed`)
+
+The channel named above as a candidate is now built, on the same terms v33 was:
+derived from a set already in memory against the watermark the store already
+keeps, no extra pass, no new query, **no threshold and no gate criterion**. It
+does not answer the family question in advance and must not be read as having
+pre-judged it.
+
+Migration 034 supersedes an explicit decision in 030, which stored a
+fingerprint rather than the id list because "the comparison only ever tests
+equality". That was true when written. #1324 made it false — two rows carrying
+the same flag value differ by ~8 rebuilds, so the flag abbreviates a continuous
+quantity.
+
+**Self-checking on two independent identities**, which is what makes it an
+instrument rather than a number:
+
+1. `leaf_changed = 1` **iff** `added + removed > 0`. The v29 flag and the v34
+   counts reach the same comparison by different routes — hash equality vs set
+   difference — so a disagreement means one is broken. Logged as
+   `aggregate.leafdelta_disagreement`, not raised: an instrument that aborts
+   the dream it is measuring costs more than the reading is worth.
+2. `added - removed = n_leaves - previous n_leaves`, using the count v30
+   already persists.
+
+**NULL is unattributed**, as in v29/v31/v33 — a pre-v34 watermark row has no
+predecessor id list, and an empty set would make every leaf look newly added
+and manufacture a large delta out of a store that never moved. **The first
+dream after this deploys therefore reports NULL and the second reports
+numbers.** A NULL on the first post-deploy row is the contract working, not a
+failure.
+
+12 tests. Three of them exist because the first drafts were wrong in ways that
+would have passed:
+
+- the end-to-end persistence test originally seeded *clustered pairs*, which
+  leave nothing over, so the leaf set was EMPTY and identity (1) reduced to
+  `0 == int(0 > 0)` — satisfied by an implementation returning zeros
+  unconditionally. It now seeds singletons and asserts a **swap** (1 added, 1
+  removed), so the identity is exercised at 1 rather than satisfied at 0.
+- `test_a_swap_is_the_case_n_leaves_cannot_see` pins the case a cheaper
+  count-delta channel reports as 0.
+- `test_the_disagreement_warning_can_actually_fire` forges a violation
+  (matching id list, corrupted fingerprint) to prove the self-check is
+  reachable — the E3 lesson that an unreachable guard reads clean regardless.
+
+Both mutants confirm the tests bite: always-zero fails 3, and returning
+`frozenset()` instead of NULL fails 3 including both counterfeit guards.
+
+#### PRE-REGISTERED PREDICTION `G-LD1` — banked in the SAME COMMIT that builds v34
+
+**This one is genuinely pre-dated and the ordering is checkable**: v34 reports
+NULL on its first post-deploy dream, so no row this prediction can be scored
+against exists anywhere yet — not on the box, not in principle. That is the
+property #1324 turned out to lack, and it is worth having explicitly rather
+than by luck.
+
+The ladder to be explained, at constant `l0miss = 3`:
+
+| rows | leaf_changed | rollup |
+|---|---|---|
+| #1318, #1319 | 0 | 4 |
+| #1324 | 1 | 8 |
+| #1183, #1307, #1317 | 1 | 15-18 |
+
+**Prediction:** the rollup term is driven by **how many** leaves moved, so
+`rollup - 4` rises monotonically with `added + removed`. Concretely, over the
+next leaf-changed rows: a row with `rollup ~ 8` carries a SMALL delta
+(`added + removed <= 3`), and a row with `rollup >= 15` carries a LARGE one
+(`added + removed >= 5`).
+
+**Falsifier, and it is sharp in both directions:** a row with `rollup >= 15` at
+`added + removed <= 2`, or a row with `rollup ~ 8` at `added + removed >= 8`.
+Either says the *count* of moved leaves is not the driver — and the live
+alternative is then **which** leaves moved (their position in the tree, so one
+leaf under a heavy subtree re-keys more than four under light ones), which is a
+different mechanism needing its own instrument rather than a bigger sample.
+
+A result inside neither branch is recorded as unclassed, exactly as #1324 was,
+and NOT rounded to the nearer one.
+
 ### The flip gate vs the regression monitor — SEPARATED 2026-08-27
 
 **The post-flip window is structurally unpassable as anchored, and that is a

@@ -728,10 +728,39 @@ on both stores both times, but the second run found the probe's premise broken b
 `8c6925c`; the Plan D licence stands **re-based onto a selectivity argument** and
 now carries a tripwire. Read the STATUS 2026-08-27 block before starting (2), and
 carry the selectivity framing — not "the clause is inert" — into Plan D's text;
-(2) build Plan D behind a default-OFF flag and run the shadow
+~~(2) build Plan D behind a default-OFF flag and run the shadow
 probe over both corpora; (3) if C1 proceeds, the scored LoCoMo A/B under the
-OFF-arm stratification specced in Plan D. Grove E1 is **deferred** — see the note
-in the Plan E section.
+OFF-arm stratification specced in Plan D.~~ **STEPS 2-3 FORECLOSED 2026-08-26:
+the shadow probe RAN and Plan D closed C1 FAIL-mechanism** (0.0-1.35% against a
+5% bar; the separate-cap legs reject H0 at p = 0.022). There is no A/B to run.
+Grove E1 is **deferred** — see the note in the Plan E section.
+
+**Next actions, in order (2026-08-27, superseding the list above).** Plan D and
+Grove E2 are both closed, so the live work is what those closes left standing:
+
+1. **RUN, box-side, and it unblocks two things at once:**
+   `benchmarks/fact_probe.py` faithfulness on the candidate model. It is Plan
+   C's one remaining precondition (>= 0.90 on the episode rewrite), and it is
+   also the **full-source recheck G-F1 still owes** — the `[:4000]` recorder bug
+   turned 50 faithful facts into "inventions", and v4-flash's 0.55-0.76 has
+   never been re-read against full sources. One run, two open questions. Must
+   not overlap the post-flip verification dream.
+2. **ACCRUE, passive:** G-MON / G-MON-b on post-flip append rows, and `G-LD1`
+   (the v34 leaf-delta prediction) on the first leaf-changed rows carrying a
+   non-NULL delta. Both are reads of dreams that happen anyway; neither needs a
+   run of its own. Note v34 reports NULL on its first post-deploy dream by
+   contract.
+3. **RUN, free and already pre-registered:** the LoCoMo leg of the E1 judge
+   artifact (`_lex_match` crediting a gold value recited inside a refusal). It
+   is UNRUN on the only corpus where E1 showed a measured signal (z = -2.40),
+   and until it runs the record must not harden past "costs on LoCoMo in this
+   regime".
+
+**Not next, and why**, so the sequencing is auditable rather than implicit:
+**E6** is unblocked but would close `invalid_at` on a tier whose READ default is
+off (E1 Step 5's `read off, write on`) — instrumenting a path nothing consumes
+is the unreachable-code-path trap. **E7** is ungated with no front-run designed.
+**The `_anchor_facts` squeeze fix** was refused at S1-C1 and stays refused.
 
 ### E0. Evidence base and the six review constraints
 

@@ -431,6 +431,10 @@ CREATE TABLE IF NOT EXISTS aggregation_leaf_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     fingerprint TEXT NOT NULL,
     n_leaves INTEGER NOT NULL,
+    -- v34: the id list itself, so the shift can be sized and not merely
+    -- detected. NULL on a pre-v34 watermark row, which must read as
+    -- "unattributable" and never as an empty set.
+    leaf_ids TEXT,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -573,6 +577,10 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     aggregation_rebuilt_level0 INTEGER,
     aggregation_rebuilt_rollup INTEGER,
     aggregation_rebuilt_root INTEGER,
+    -- v34: symmetric difference of the digest leaf set against the previous
+    -- dream's, the continuous quantity aggregation_leaf_changed abbreviates.
+    aggregation_leaf_added INTEGER,
+    aggregation_leaf_removed INTEGER,
     -- v25 digest attribution: a per-session digest that raises or returns an
     -- unparseable payload is logged and skipped (one bad session must not abort
     -- a dream), and episode creation can stall silently while chunks keep

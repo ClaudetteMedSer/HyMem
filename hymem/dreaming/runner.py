@@ -91,6 +91,9 @@ class DreamReport:
     aggregation_rebuilt_level0: int | None = None
     aggregation_rebuilt_rollup: int | None = None
     aggregation_rebuilt_root: int | None = None
+    # v34: size of the digest leaf-set shift the binary flag stands in for.
+    aggregation_leaf_added: int | None = None
+    aggregation_leaf_removed: int | None = None
     aggregation_facts_rekey: int | None = None
     aggregation_blocking: str = ""
     digest_failures: int = 0
@@ -829,6 +832,8 @@ def run_dreaming(
                 report.aggregation_rebuilt_level0 = agg.rebuilt_level0
                 report.aggregation_rebuilt_rollup = agg.rebuilt_rollup
                 report.aggregation_rebuilt_root = agg.rebuilt_root
+                report.aggregation_leaf_added = agg.leaf_added
+                report.aggregation_leaf_removed = agg.leaf_removed
                 report.aggregation_facts_rekey = agg.facts_rekey
             except Exception:
                 log.exception("aggregate.build_failure")
@@ -862,6 +867,8 @@ def run_dreaming(
                 aggregation_rebuilt_level0 = ?,
                 aggregation_rebuilt_rollup = ?,
                 aggregation_rebuilt_root = ?,
+                aggregation_leaf_added = ?,
+                aggregation_leaf_removed = ?,
                 digest_failures = ?,
                 episodes_created = ?,
                 facts_extracted = ?,
@@ -890,6 +897,8 @@ def run_dreaming(
                 report.aggregation_rebuilt_level0,
                 report.aggregation_rebuilt_rollup,
                 report.aggregation_rebuilt_root,
+                report.aggregation_leaf_added,
+                report.aggregation_leaf_removed,
                 report.digest_failures,
                 report.episodes_created,
                 report.facts_extracted,

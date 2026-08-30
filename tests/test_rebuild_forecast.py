@@ -295,3 +295,54 @@ def test_decomposition_is_persisted_on_the_dream_run(cfg):
         assert row["l0"] + row["rollup"] + row["root"] == row["built"] - row["reused"]
     finally:
         hy.close()
+
+
+def test_v34_leaf_delta_is_persisted_and_self_checks_through_the_store(cfg):
+    """v34's counterpart to the decomposition self-check above, end to end.
+
+    Two dreams: the first has no predecessor id list and must persist NULL
+    (unattributed), the second must persist numbers AND satisfy identity (1)
+    against the flag the store already carried. Asserting through `dream_runs`
+    rather than the result object is the point — these columns exist to be read
+    off verdict rows, and a value that never reaches the table is not an
+    instrument."""
+    hy = HyMem(_cfg(cfg), llm=_agg_llm(), embedding_client=StubEmbeddingClient())
+    try:
+        # SINGLETONS, not `_seed_pairs`. Cross-session pairs survive
+        # `select_clusters` and become level-0 nodes, so NOTHING is left over
+        # and the digest leaf set is EMPTY — under which identity (1) reduces
+        # to `0 == int(0 > 0)` and holds for any implementation, including one
+        # that returns zeros unconditionally. The first draft of this test did
+        # exactly that and passed. Disjoint singletons are kept by no cluster,
+        # so they become the leaves this channel measures.
+        with core_db.transaction(hy.conn):
+            for i in range(1, 4):
+                _seed_episode(hy.conn, f"L{i}", f"ls{i}", [f"solo{i}"])
+        hy.dream()
+        first = hy.conn.execute(
+            "SELECT aggregation_leaf_added AS added, "
+            "       aggregation_leaf_removed AS removed "
+            "FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert first["added"] is None and first["removed"] is None
+        assert hy.conn.execute(
+            "SELECT n_leaves FROM aggregation_leaf_state WHERE id = 1"
+        ).fetchone()["n_leaves"] == 3          # the channel has something to read
+
+        with core_db.transaction(hy.conn):
+            hy.conn.execute("DELETE FROM episodes WHERE id = 'L1'")
+            _seed_episode(hy.conn, "L9", "ls9", ["solo9"])
+        hy.dream()
+        row = hy.conn.execute(
+            "SELECT aggregation_leaf_added AS added, "
+            "       aggregation_leaf_removed AS removed, "
+            "       aggregation_leaf_changed AS changed "
+            "FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        # A SWAP: one leaf out, one in. Both arms non-zero, so identity (1) is
+        # exercised at 1 rather than satisfied at 0, and the count-delta a
+        # cheaper implementation would have used is 0 here.
+        assert (row["added"], row["removed"]) == (1, 1)
+        assert row["changed"] == int(row["added"] + row["removed"] > 0) == 1
+    finally:
+        hy.close()

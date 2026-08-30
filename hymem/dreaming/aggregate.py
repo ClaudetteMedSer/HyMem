@@ -88,6 +88,8 @@ class AggregationResult(NamedTuple):
     rebuilt_level0: int = 0
     rebuilt_rollup: int = 0
     rebuilt_root: int = 0
+    leaf_added: int | None = None
+    leaf_removed: int | None = None
 
 # Fusion-prompt versions, baked into the node-id salt of the level the prompt
 # serves. Reuse is keyed by node id, so bumping a version when its prompt
@@ -682,20 +684,40 @@ def _read_leaf_fingerprint(conn: sqlite3.Connection) -> str | None:
     return row[0] if row else None
 
 
+def _read_leaf_ids(conn: sqlite3.Connection) -> frozenset[str] | None:
+    """The previous dream's leaf ID SET, for the v34 size-of-shift channel.
+
+    None means "not attributable" and covers BOTH the no-predecessor case and a
+    pre-v34 watermark row that only ever stored a fingerprint. Both must read
+    NULL rather than an empty set: `frozenset()` would make every leaf look
+    newly added, which is a counterfeit reading of exactly the kind v29's NULL
+    contract exists to prevent."""
+    row = conn.execute(
+        "SELECT leaf_ids FROM aggregation_leaf_state WHERE id = 1"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return frozenset(json.loads(row[0]))
+
+
 def _write_leaf_fingerprint(conn: sqlite3.Connection, fingerprint: str,
-                            n_leaves: int) -> None:
+                            n_leaves: int,
+                            leaf_ids: frozenset[str] | None = None) -> None:
     """Advance the watermark. Called INSIDE the node-persist transaction so it
     commits with the nodes that consumed this leaf set, never ahead of them."""
     conn.execute(
         """
-        INSERT INTO aggregation_leaf_state(id, fingerprint, n_leaves, updated_at)
-        VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO aggregation_leaf_state(id, fingerprint, n_leaves, leaf_ids,
+                                           updated_at)
+        VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             fingerprint = excluded.fingerprint,
             n_leaves = excluded.n_leaves,
+            leaf_ids = excluded.leaf_ids,
             updated_at = CURRENT_TIMESTAMP
         """,
-        (fingerprint, n_leaves),
+        (fingerprint, n_leaves,
+         json.dumps(sorted(leaf_ids)) if leaf_ids is not None else None),
     )
 
 
@@ -1041,6 +1063,9 @@ def build_aggregation_nodes(
     leaf_changed = -1               # instrumentation: -1 when digest disabled
     leaf_fingerprint: str | None = None      # None => nothing to advance
     leaf_count = 0
+    leaf_set: frozenset[str] = frozenset()
+    leaf_added: int | None = None            # v34: NULL until a predecessor
+    leaf_removed: int | None = None          # id list exists to diff against
     if cfg.aggregation_digest_enabled:
         # Digest leaves = the level-0 nodes plus every episode no cluster
         # absorbed (capped by a churn-stable hash-rank sample), so the root
@@ -1062,6 +1087,13 @@ def build_aggregation_nodes(
         leaf_fingerprint = _leaf_fingerprint(leaf_set)
         leaf_count = len(leaf_set)
         previous_fingerprint = _read_leaf_fingerprint(conn)
+        previous_leaf_ids = _read_leaf_ids(conn)
+        if previous_leaf_ids is not None:
+            # v34: the SIZE of the shift, which the binary flag cannot carry.
+            # Computed from a set already in memory against the watermark the
+            # store already keeps — no extra pass, no new query, no threshold.
+            leaf_added = len(leaf_set - previous_leaf_ids)
+            leaf_removed = len(previous_leaf_ids - leaf_set)
         if previous_fingerprint is None:
             # No predecessor to compare against. Report unattributed (NULL),
             # not a counterfeit 0 — leaf_changed=0 is part of the fixed-point
@@ -1116,7 +1148,7 @@ def build_aggregation_nodes(
             # persisting must not leave the watermark pointing at a leaf set no
             # tree was ever built from, which would report the NEXT dream's
             # genuine displacement as unchanged.
-            _write_leaf_fingerprint(conn, leaf_fingerprint, leaf_count)
+            _write_leaf_fingerprint(conn, leaf_fingerprint, leaf_count, leaf_set)
 
     if embedding_client is not None and rows:
         with core_db.transaction(conn):
@@ -1146,11 +1178,31 @@ def build_aggregation_nodes(
     leaf_res: int | None = leaf_changed
     if leaf_res is not None and leaf_res < 0:
         leaf_res = None
+    if leaf_added is not None and leaf_removed is not None:
+        log.info(
+            "aggregate.leafdelta added=%d removed=%d net=%d",
+            leaf_added, leaf_removed, leaf_added - leaf_removed,
+        )
+        # v34 self-check, identity (1): the v29 flag and the v34 counts are two
+        # independent routes to the same comparison — hash equality vs set
+        # difference. They cannot disagree unless one is broken. Logged rather
+        # than raised: an instrument that aborts the dream it is measuring
+        # costs more than the reading is worth, and a silent disagreement is
+        # the failure mode this channel exists to make visible.
+        moved = int(leaf_added + leaf_removed > 0)
+        if leaf_res is not None and moved != leaf_res:
+            log.warning(
+                "aggregate.leafdelta_disagreement leaf_changed=%d but "
+                "added+removed=%d — the fingerprint and set-difference routes "
+                "disagree; one of them is broken",
+                leaf_res, leaf_added + leaf_removed,
+            )
     return AggregationResult(
         len(rows), reused, failures, len(episodes), blocking,
         level0_missed, leaf_res,
         forecast.predicted, forecast.residual, forecast.facts_rekey,
         forecast.rebuilt_level0, forecast.rebuilt_rollup, forecast.rebuilt_root,
+        leaf_added, leaf_removed,
     )
 
 

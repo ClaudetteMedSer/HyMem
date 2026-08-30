@@ -176,11 +176,153 @@ def test_watermark_is_written_inside_the_persist_transaction(conn, cfg, monkeypa
     seen: list[bool] = []
     real = agg_mod._write_leaf_fingerprint
 
-    def spy(conn_, fingerprint, n_leaves):
+    def spy(conn_, fingerprint, n_leaves, leaf_ids=None):
         seen.append(conn_.in_transaction)
-        return real(conn_, fingerprint, n_leaves)
+        return real(conn_, fingerprint, n_leaves, leaf_ids)
 
     monkeypatch.setattr(agg_mod, "_write_leaf_fingerprint", spy)
     _seed(conn)
     _dream(conn, cfg)
     assert seen == [True]
+
+
+# ── v34: the SIZE of the shift, not just whether it moved ───────────────────
+#
+# `leaf_changed` is binary, and #1324 showed it is standing in for a continuous
+# quantity: at constant level0_missed=3 the rollup term ranged 4 -> 8 -> 15-18
+# across rows carrying the same flag. These tests pin the symmetric difference
+# that measures it, and — more importantly — pin the two identities that make
+# it self-checking, plus a control proving the self-check can actually fail.
+
+def _leaf_state(conn):
+    return conn.execute(
+        "SELECT fingerprint, n_leaves, leaf_ids FROM aggregation_leaf_state "
+        "WHERE id = 1"
+    ).fetchone()
+
+
+def test_first_dream_reports_the_delta_unattributed_not_zero(conn, cfg):
+    """No predecessor id list means NULL, never (0, 0). A counterfeit zero
+    would read as "the leaf set held still" on exactly the row where nothing is
+    known — the same trap v29's NULL contract exists to prevent."""
+    _seed(conn, n=3)
+    result = _dream(conn, cfg)
+    assert result.leaf_added is None
+    assert result.leaf_removed is None
+    assert json.loads(_leaf_state(conn)["leaf_ids"]) == ["e1", "e2", "e3"]
+
+
+def test_an_unchanged_leaf_set_reads_zero_zero(conn, cfg):
+    _seed(conn, n=3)
+    _dream(conn, cfg)
+    result = _dream(conn, cfg)
+    assert (result.leaf_added, result.leaf_removed) == (0, 0)
+    assert result.leaf_changed == 0
+
+
+def test_an_added_leaf_is_counted_on_the_added_side(conn, cfg):
+    _seed(conn, n=3)
+    _dream(conn, cfg)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e4", "s4", ["topic4"])
+    result = _dream(conn, cfg)
+    assert (result.leaf_added, result.leaf_removed) == (1, 0)
+    assert result.leaf_changed == 1
+
+
+def test_a_removed_leaf_is_counted_on_the_removed_side(conn, cfg):
+    _seed(conn, n=3)
+    _dream(conn, cfg)
+    with core_db.transaction(conn):
+        conn.execute("DELETE FROM episodes WHERE id = 'e3'")
+    result = _dream(conn, cfg)
+    assert (result.leaf_added, result.leaf_removed) == (0, 1)
+    assert result.leaf_changed == 1
+
+
+def test_a_swap_is_the_case_n_leaves_cannot_see(conn, cfg):
+    """THE test that justifies the column pair. One leaf out, one in: the set
+    turned over, `n_leaves` is identical, and a count-delta channel would
+    report 0. Only the symmetric difference registers it — and this is the
+    shape the #1324 ladder is made of, since those rows differ by ~8 rebuilds
+    while sitting at the same level0_missed."""
+    _seed(conn, n=3)
+    _dream(conn, cfg)
+    before = _leaf_state(conn)["n_leaves"]
+    with core_db.transaction(conn):
+        conn.execute("DELETE FROM episodes WHERE id = 'e3'")
+        _seed_episode(conn, "e9", "s9", ["topic9"])
+    result = _dream(conn, cfg)
+    assert (result.leaf_added, result.leaf_removed) == (1, 1)
+    assert _leaf_state(conn)["n_leaves"] == before      # count says nothing
+    assert result.leaf_changed == 1
+
+
+def test_identity_1_the_flag_and_the_counts_agree(conn, cfg):
+    """`leaf_changed == 1` IFF `added + removed > 0`, across a changed and an
+    unchanged dream. Two independent routes to one comparison — hash equality
+    and set difference — so a disagreement means one is broken."""
+    _seed(conn, n=3)
+    _dream(conn, cfg)
+    for mutate in (False, True):
+        if mutate:
+            with core_db.transaction(conn):
+                _seed_episode(conn, "e5", "s5", ["topic5"])
+        r = _dream(conn, cfg)
+        assert r.leaf_changed == int(r.leaf_added + r.leaf_removed > 0)
+
+
+def test_identity_2_net_delta_tracks_n_leaves(conn, cfg):
+    """`added - removed == n_leaves - previous n_leaves`, on a mixed change so
+    the arms are not trivially equal (added 2, removed 1, net +1)."""
+    _seed(conn, n=3)
+    _dream(conn, cfg)
+    before = _leaf_state(conn)["n_leaves"]
+    with core_db.transaction(conn):
+        conn.execute("DELETE FROM episodes WHERE id = 'e1'")
+        _seed_episode(conn, "e7", "s7", ["topic7"])
+        _seed_episode(conn, "e8", "s8", ["topic8"])
+    result = _dream(conn, cfg)
+    assert (result.leaf_added, result.leaf_removed) == (2, 1)
+    assert result.leaf_added - result.leaf_removed == (
+        _leaf_state(conn)["n_leaves"] - before
+    )
+
+
+def test_a_prev34_watermark_row_reads_unattributed(conn, cfg):
+    """A store migrated from v30-v33 carries a fingerprint with no id list.
+    That must read NULL, not `frozenset()` — an empty predecessor would make
+    every leaf look newly added and manufacture a large delta out of a store
+    that never moved."""
+    _seed(conn, n=3)
+    _dream(conn, cfg)
+    with core_db.transaction(conn):
+        conn.execute("UPDATE aggregation_leaf_state SET leaf_ids = NULL")
+    result = _dream(conn, cfg)
+    assert result.leaf_added is None
+    assert result.leaf_removed is None
+    assert result.leaf_changed == 0        # the fingerprint arm still reads
+
+
+def test_the_disagreement_warning_can_actually_fire(conn, cfg, caplog):
+    """Control for the self-check itself. A guard whose path is unreachable
+    from the config under test reads clean regardless (the E3 lesson), so the
+    identity-1 assertion above is only worth having if a violation is
+    detectable. Forge one: leave the id list matching (delta 0) while
+    corrupting the fingerprint (flag 1), and the two routes must disagree."""
+    _seed(conn, n=3)
+    _dream(conn, cfg)
+    with core_db.transaction(conn):
+        conn.execute("UPDATE aggregation_leaf_state SET fingerprint = 'forged'")
+    with caplog.at_level("WARNING"):
+        result = _dream(conn, cfg)
+    assert (result.leaf_added, result.leaf_removed) == (0, 0)
+    assert result.leaf_changed == 1
+    assert "leafdelta_disagreement" in caplog.text
+
+
+def test_the_delta_reaches_dream_runs(conn, cfg):
+    """The columns are only worth adding if they land in the table the verdict
+    rows are read from."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(dream_runs)")}
+    assert {"aggregation_leaf_added", "aggregation_leaf_removed"} <= cols
