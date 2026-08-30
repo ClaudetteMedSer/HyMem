@@ -404,6 +404,46 @@ class HyMemConfig:
     measured median 7.0-8.0), so the cap and the gate agree on what a
     reasonable session yields."""
 
+    episode_granularity_enabled: bool = False
+    """Plan C stage 1: cut the per-session digest's episodes at DECISION
+    granularity — one episode per decision, change or outcome, with the
+    concrete values (names, numbers, dates, versions) in the summary — instead
+    of the 1-2 abstract blobs per session the shipping prompt produces
+    ("developed budget tracker with Flask, added auth", the shape the BEAM
+    EO/SUM post-mortem traced the floor to). Swaps
+    SESSION_DIGEST_SYSTEM/_USER_TEMPLATE for the granular pair, bounds the
+    result at `dream_max_episodes_per_session`, stamps
+    EPISODE_GRANULAR_PROMPT_VERSION on the session and on each row (schema
+    v35), and supersedes the episodes inside the re-read window so the old
+    blob rows do not survive beside the new ones.
+
+    DEFAULT OFF, and it stays off until `benchmarks/episode_probe.py` scores
+    the granular prompt at faithfulness >= 0.90 on a stratified sample with a
+    correct-answer control — ON EPISODE REWRITES. G-F1's 1.00 was measured on
+    the narrative-facts extractor, a different generative task over the same
+    turns, and accepting one gate's driver for another's question is the trap
+    that has cost this project three times (MSC parity, deixis,
+    answerability). This rewrites the artifact retrieval already depends on,
+    where E1 only added a new one, so the bar is if anything higher.
+
+    Flipping it True re-digests every session ONCE (the stamp mismatch
+    re-reads from the start of each session), then returns to the usual
+    zero-tail-call steady state. Flipping it back False re-digests once more,
+    under the blob prompt, which is the correct revert: the stamp goes back to
+    NULL and the granular rows in each re-read window are superseded."""
+
+    dream_max_episodes_per_session: int = 12
+    """Cap on validated episodes accepted from one granular digest call; a
+    runaway reply (the model emitting one episode per turn) is truncated here
+    before any row is written. Mirrors `profile_max_items_per_session`.
+
+    12, not 8: the granular prompt TARGETS 3-8 for a substantive session, and a
+    cap set at the target would silently trim the honest top of that range —
+    the cap is the runaway bound, the probe's granularity criterion (median
+    episodes/session) is what judges the target. Applies to the granular arm
+    only; the blob prompt has never been capped and capping it here would be a
+    default change wearing a Plan C label."""
+
     coref_enabled: bool = True
     """Campaign E / E5: resolve anaphora + ellipsis in the query BEFORE any
     retrieval tier runs (`hymem/query/coref.py`). A follow-up like "what did she

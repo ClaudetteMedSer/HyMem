@@ -47,7 +47,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Facts watermark (v26): same mechanics as digested_message_id but for the
     -- narrative-facts extractor, its own column so facts and digest coverage
     -- advance independently. Migration 026 adds this for existing DBs.
-    facts_message_id INTEGER
+    facts_message_id INTEGER,
+    -- EPISODE_GRANULAR_PROMPT_VERSION of the last digest that wrote this
+    -- session's episodes (v35, Plan C). Same skip mechanics as
+    -- profile_prompt_version, decoupled so an episode-granularity change alone
+    -- re-extracts: the digest guard keys on cfg.prompt_version, which a
+    -- granularity flip does not move. NULL = the shipping blob digest prompt
+    -- (and every pre-v35 row), so a store that never enables granularity never
+    -- sees a mismatch and pays no re-extraction. Migration 035 adds this for
+    -- existing DBs (ALTER lives there only).
+    episodes_prompt_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (

@@ -1,0 +1,42 @@
+-- v35: Plan C stage 1 — per-session episode-prompt stamp + per-episode
+-- attribution. Both columns are inert until `episode_granularity_enabled` is
+-- turned on; the feature ships default OFF, probe-first (see
+-- benchmarks/episode_probe.py and additional_planning.md, Plan C STATUS
+-- 2026-08-30).
+--
+-- 1. sessions.episodes_prompt_version — the episode-prompt version this
+--    session was last digested under, mirroring profile_prompt_version (v19)
+--    and, before it, digested_prompt_version (v12). The digest skip-guard keys
+--    on cfg.prompt_version, so without a stamp of its own a granularity change
+--    could never re-extract an already-digested session: the episodes would
+--    stay at the granularity they were written at, forever, on every session
+--    the store had already dreamed.
+--
+--    Why a stamp and not a forward-only watermark like facts (v26). Facts are
+--    append-only and immutable, so a prompt bump there extracts FORWARD only
+--    and every stored fact stays attributable to the prompt that wrote it.
+--    Episodes are UPSERTed by message range: re-cutting a session's episodes
+--    means rewriting rows that already exist, which is exactly what a re-read
+--    from the start does. Hence the v19 stamp pattern, not the v26 one.
+--
+--    NULL means "the shipping blob digest prompt" — which is what every
+--    existing row in every existing store was extracted under, and what the
+--    flag-off code path keeps writing. So a store that never enables
+--    granularity compares NULL against NULL, never sees a mismatch, and pays no
+--    re-extraction. That is the property that makes this migration free.
+--
+-- Deliberately ONE column, on `sessions`. A per-EPISODE prompt stamp was
+-- considered and dropped: the extraction call is per session, so the session
+-- row is already the finest attribution unit that corresponds to something
+-- that actually happened, and a per-row copy of it would be derived state that
+-- can disagree with its source. Which rows a granular re-cut wrote is answered
+-- by the supersession window (persist_episodes), not by a column.
+--
+-- Forward-only and idempotent: re-applying against a schema.sql database that
+-- already has the columns raises "duplicate column name", which the migration
+-- runner tolerates (the digested_prompt_version v12 precedent).
+--
+-- No end-of-line comments below: _split_sql_statements strips only FULL-LINE
+-- `--` comments, so a semicolon inside a trailing comment terminates the
+-- statement early and cuts it in half.
+ALTER TABLE sessions ADD COLUMN episodes_prompt_version TEXT;

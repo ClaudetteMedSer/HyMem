@@ -472,6 +472,89 @@ SESSION_DIGEST_USER_TEMPLATE = """Conversation session:
 Return the JSON object now."""
 
 
+# --- Plan C: decision-grained session digest (default OFF) ------------------
+# A SECOND digest prompt, not an edit of the one above. The shipping prompt
+# stays byte-identical because it is what every existing episode in every store
+# was extracted under, and because Plan C is unmeasured: the granularity claim
+# has no faithfulness number on EPISODE REWRITES yet (G-F1's 1.00 was measured
+# on the narrative-facts extractor — a different generative task on the same
+# turns, and reusing another gate's driver is the trap that has cost this
+# project three times). So this text ships behind
+# `episode_granularity_enabled=False`, pinned by EPISODE_GRANULAR_PROMPT_VERSION
+# in hymem/dreaming/digest.py, and `benchmarks/episode_probe.py` scores THIS
+# wording before any default moves.
+#
+# What changes vs SESSION_DIGEST_SYSTEM, and why:
+#   1. The unit is a DECISION/CHANGE/OUTCOME, not a "coherent segment". The BEAM
+#      EO/SUM post-mortem traced the floor to episodes so abstract ("developed
+#      budget tracker with Flask, added auth") that the rubric's event sequence
+#      could not be recovered from them — one blob per session is a summary of a
+#      summary.
+#   2. Concrete values are mandatory IN THE SUMMARY, because the summary is what
+#      retrieval matches and what ask() renders. An episode that drops the
+#      version number is unretrievable by that version number.
+#   3. The invention ban is stated BEFORE the coverage instruction and the
+#      3-8 target is explicitly NOT a quota — both are the FACTS_PROMPT_V2
+#      lessons, banked from a hand-read where "2 to 8 facts" read as a floor and
+#      the cheapest way to satisfy a floor was to invent (loyalty programmes, a
+#      GPA, named goats — none in the source). This prompt rewrites the artifact
+#      retrieval ALREADY depends on, so the same failure would be worse here.
+#   4. chunk_ids stay REQUIRED and per-episode, because the message range they
+#      resolve to is the episode's identity (see _episode_id) — at this
+#      granularity two episodes citing the same chunks are indistinguishable
+#      downstream, so the prompt asks for the narrowest citation that supports
+#      each one.
+# The summary/procedures halves are deliberately identical in CONTRACT to the
+# blob prompt: only the episode unit is under test, and holding the other two
+# tiers fixed is what makes the probe's arms comparable.
+SESSION_DIGEST_GRANULAR_SYSTEM = """You re-read one conversation session and produce three things in a single pass: decision-grained episodes, a one-sentence summary, and any step-by-step procedures.
+
+Each chunk in the input is tagged like `[chunk chk_abc123]` — the chunk id appears in square brackets before its text.
+
+THE ONLY RULE THAT MATTERS: every name, number, date, version, price and claim you write must ALREADY BE PRESENT in the chunks below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal episode is correct; a rich episode containing one invented detail is a failure. Never record an outcome that was not reached.
+
+Output a strict JSON OBJECT (not an array) with exactly these three keys:
+
+"episodes": a JSON array of episodes. ONE EPISODE PER DECISION, CHANGE OR OUTCOME — not one per session and not one per topic. If the session settled on a library, hit an error, fixed it, and then agreed a deadline, that is four episodes, not one. Each item:
+- title (string): Short descriptive name, max 8 words, naming the specific thing decided or changed
+- summary (string): 1-2 sentences saying what was decided, changed or established — and CARRYING THE CONCRETE VALUES: the names, numbers, dates, versions, file paths and error messages exactly as the chunks state them. "Pinned pandas to 2.1.4 after the 2.2 groupby regression" — not "resolved a dependency issue".
+- outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear. REQUIRED (non-null) when the session actually reached one; null is for genuinely open ends, never a hedge.
+- key_entities (list of strings): Named tools, services, files, or concepts involved, exactly as written
+- chunk_ids (list of strings): The `chk_...` ids that support THIS episode, in conversation order. Must be non-empty and contain only ids that appear in the input. Cite the narrowest set that supports it — do not attach every chunk to every episode.
+NO QUOTA. A substantive working session usually yields 3 to 8 episodes; a session that decided one thing yields one; small talk yields []. Those numbers describe what such sessions contain, they are not a target to fill, and [] is always available to you.
+
+"summary": a single string — one sentence covering what was accomplished, decisions made, problems solved, topics covered. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid if there is nothing to summarize.
+
+"procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
+- name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
+- description (string): 1 sentence describing what the procedure accomplishes
+- steps (list of objects): Ordered steps, each with:
+    order (integer): Step number starting at 1
+    action (string): What to do, imperative form
+    tool (string or null): Tool/command/CLI used, if mentioned explicitly
+- triggers (list of strings): Words/phrases someone might use to ask about this procedure
+- entities_involved (list of strings): Named tools, services, platforms, files involved
+Only extract procedures that are EXPLICITLY described; do not invent them. Empty array [] is valid.
+
+Before writing each episode, check: can I point at the exact words in the chunks that state every value in it? If not, drop the value — or the episode.
+
+Always return all three keys. Example shape:
+{"episodes": [], "summary": "", "procedures": []}
+"""
+
+# The closer is deliberately UNIQUE ("Return the granular digest JSON object
+# now.") — the USER_PROFILE precedent. Test stubs and the probe route on prompt
+# substrings, so a granular call that ended with the blob closer would be
+# indistinguishable from the shipping digest in every fixture and every call
+# count that discriminates on it.
+SESSION_DIGEST_GRANULAR_USER_TEMPLATE = """Conversation session:
+\"\"\"
+{text}
+\"\"\"
+
+Return the granular digest JSON object now."""
+
+
 # --- Typed user-profile extraction (Stage 1 / P4, schema v18) ---------------
 # Runs over USER turns only, once per dreamed session, alongside the batched
 # session digest. The slot vocabulary is CLOSED and re-enforced downstream

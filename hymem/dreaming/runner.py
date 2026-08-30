@@ -34,7 +34,10 @@ from hymem.dreaming.embeddings import (
     persist_fact_embeddings,
     prepare_chunk_embed_batch,
 )
-from hymem.dreaming.digest import extract_session_digest
+from hymem.dreaming.digest import (
+    active_episode_prompt_version,
+    extract_session_digest,
+)
 from hymem.dreaming.episodes import persist_episodes
 from hymem.dreaming.facts import extract_facts, persist_facts
 from hymem.dreaming.procedures import persist_procedures
@@ -436,12 +439,31 @@ def run_dreaming(
             # steady-state re-dreams of unchanged sessions cost zero tail calls.
             digested = conn.execute(
                 "SELECT summary, digested_prompt_version, profile_prompt_version, "
-                "digested_message_id FROM sessions WHERE id = ?",
+                "digested_message_id, episodes_prompt_version "
+                "FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
+            # Plan C (schema v35): the episode prompt has its OWN per-session
+            # stamp, for the same reason the profile call needed one at v19 —
+            # the guard below keys on cfg.prompt_version, which an episode
+            # granularity flip does not move, so without this leg an
+            # already-digested session would keep its old-granularity episodes
+            # forever and only never-digested sessions would get the new ones.
+            # `active_episode_prompt_version` returns None when the flag is off,
+            # which equals the NULL every pre-v35 row carries: a store that
+            # never enables granularity can never see a mismatch here, so the
+            # zero-tail-call steady state is untouched.
+            episode_prompt_version = active_episode_prompt_version(
+                cfg.episode_granularity_enabled
+            )
+            episodes_current = (
+                digested is not None
+                and digested["episodes_prompt_version"] == episode_prompt_version
+            )
             already_digested = (
                 digested is not None
                 and digested["digested_prompt_version"] == cfg.prompt_version
+                and episodes_current
             )
             has_summary = digested is not None and bool(digested["summary"])
             # Schema v24: the guard also asks whether the session has traffic
@@ -473,6 +495,8 @@ def run_dreaming(
                         # below is monotonic, so that re-read cannot un-cover a
                         # tail this session already had.
                         since_message_id=watermark if already_digested else None,
+                        granular=cfg.episode_granularity_enabled,
+                        max_episodes=cfg.dream_max_episodes_per_session,
                     )
                 except Exception:
                     report.digest_failures += 1
@@ -483,7 +507,25 @@ def run_dreaming(
                     if digest is not None:
                         with core_db.transaction(conn):
                             if digest.episodes.items:
-                                ep_count = persist_episodes(conn, session_id, digest.episodes)
+                                ep_count = persist_episodes(
+                                    conn, session_id, digest.episodes,
+                                    granular=cfg.episode_granularity_enabled,
+                                    # Supersede the episodes inside the window
+                                    # this call re-read, granular arm only: the
+                                    # blob rows it replaces have a different
+                                    # message range, so UPSERT alone would leave
+                                    # both granularities of the same
+                                    # conversation in the store. Only reached
+                                    # when the extraction produced items (the
+                                    # `if` above), so an empty reply can never
+                                    # delete a previous extraction's work.
+                                    supersede_window=(
+                                        (digest.start_message_id,
+                                         digest.covered_message_id)
+                                        if cfg.episode_granularity_enabled
+                                        else None
+                                    ),
+                                )
                                 report.episodes_created += ep_count
                                 log.debug(
                                     "episodes session_id=%s count=%d", session_id, ep_count
@@ -505,6 +547,19 @@ def run_dreaming(
                             conn.execute(
                                 "UPDATE sessions SET digested_prompt_version = ? WHERE id = ?",
                                 (cfg.prompt_version, session_id),
+                            )
+                            # ...and the episode-prompt stamp with it (v35).
+                            # Written unconditionally, including the None the
+                            # flag-off path supplies: that write is a no-op on
+                            # any store that never enabled granularity (NULL
+                            # over NULL), and it is what makes a REVERT correct
+                            # — turning the flag back off clears the stamp in
+                            # the same transaction that rewrote the session's
+                            # episodes under the blob prompt.
+                            conn.execute(
+                                "UPDATE sessions SET episodes_prompt_version = ? "
+                                "WHERE id = ?",
+                                (episode_prompt_version, session_id),
                             )
                             # Advance the watermark only over what the LLM
                             # actually saw, and never backwards (a re-digest

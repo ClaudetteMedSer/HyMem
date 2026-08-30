@@ -68,17 +68,30 @@ def extract_episodes_for_session(
     return EpisodesExtraction(items=validate_episode_items(data, valid_chunk_ids))
 
 
-def validate_episode_items(data: object, valid_chunk_ids: set[str]) -> list[dict]:
+def validate_episode_items(
+    data: object,
+    valid_chunk_ids: set[str],
+    *,
+    max_items: int | None = None,
+) -> list[dict]:
     """Validate raw LLM episode items into clean dicts ready to persist.
 
     Shared by the standalone episode call and the batched session digest. Drops
     items missing title/summary and strips hallucinated chunk_ids not present in
     the input. Returns [] for any non-list ``data``.
+
+    ``max_items`` (Plan C's ``dream_max_episodes_per_session``) truncates a
+    runaway reply BEFORE any row is written — the profile/facts validator
+    precedent. It defaults to None = unbounded, which is what every pre-Plan-C
+    caller gets: the blob prompt asks for a handful of segments and has never
+    been capped, and capping it here would be a silent default change.
     """
     if not isinstance(data, list):
         return []
     items: list[dict] = []
     for item in data:
+        if max_items is not None and len(items) >= max_items:
+            break
         if not isinstance(item, dict):
             continue
         title = item.get("title", "")
@@ -145,11 +158,19 @@ def _resolve_participants(
     return [r["role"] for r in rows]
 
 
+def _title_hash(session_id: str, title: str) -> str:
+    return hashlib.sha1(
+        f"{session_id}|{title.strip().lower()}".encode("utf-8")
+    ).hexdigest()[:12]
+
+
 def _episode_id(
     session_id: str,
     start_msg: int | None,
     end_msg: int | None,
     title: str,
+    *,
+    granular: bool = False,
 ) -> str:
     """Stable id for an episode.
 
@@ -157,19 +178,30 @@ def _episode_id(
     UPSERT updates the title/summary in place. When the LLM didn't provide
     chunk_ids (so range is unknown) we fall back to a content hash so the row
     is still re-findable on the next run for the same content.
+
+    `granular` (Plan C) appends a title hash to the RANGE id, and the reason is
+    the whole reason Plan C needs a persist change at all: at decision
+    granularity several episodes of one session legitimately cite the same
+    chunk — "chose fly.io" and "hit the 512MB memory limit" can both rest on
+    chunk chk_7 — so they resolve to the SAME message range. Under the bare
+    range id the second UPSERT would silently overwrite the first and a
+    3-8-episode session would persist as one row, which reads downstream as the
+    granularity change having done nothing. Same range + same title still means
+    the same id, so re-dreams still UPSERT in place instead of duplicating.
     """
     if start_msg is not None and end_msg is not None:
-        return f"{session_id}@{start_msg}-{end_msg}"
-    digest = hashlib.sha1(
-        f"{session_id}|{title.strip().lower()}".encode("utf-8")
-    ).hexdigest()[:12]
-    return f"{session_id}@h{digest}"
+        base = f"{session_id}@{start_msg}-{end_msg}"
+        return f"{base}#{_title_hash(session_id, title)}" if granular else base
+    return f"{session_id}@h{_title_hash(session_id, title)}"
 
 
 def persist_episodes(
     conn: sqlite3.Connection,
     session_id: str,
     extraction: EpisodesExtraction,
+    *,
+    granular: bool = False,
+    supersede_window: tuple[int | None, int | None] | None = None,
 ) -> int:
     """Insert/UPSERT validated episodes. Caller wraps in core_db.transaction().
 
@@ -177,7 +209,31 @@ def persist_episodes(
     ``_episode_id``). UPSERT-on-conflict refreshes title/summary/outcome
     /key_entities/participants for re-dreams without reshuffling rowids —
     important for FTS and vec_episodes alignment.
+
+    ``granular`` (Plan C) selects the id shape — range+title instead of the bare
+    range — and nothing else about the row changes. Which prompt an episode came
+    from is recorded once per extraction call, on
+    ``sessions.episodes_prompt_version`` (schema v35), because the call is what
+    has a prompt version; a per-row copy would be derived state that can
+    disagree with its source.
+
+    ``supersede_window`` (start, end) turns the write into a REPLACE of the
+    episodes inside that message window, and only the Plan C granular arm passes
+    it. Without it a granularity change is silently additive: UPSERT refreshes a
+    row only when the new episode resolves to the SAME id, so the old
+    one-blob-per-session rows (different range, therefore different id) survive
+    the re-extraction and the store ends up serving both granularities of the
+    same conversation. Scoped deliberately:
+
+      * only rows whose range lies wholly INSIDE the window this call re-read —
+        a session's older, already-covered episodes are outside it and must not
+        be deleted just because this dream read the tail;
+      * only rows with a known range. A NULL range is unattributable to any
+        window (the hash-id fallback), and NULL means unattributed, so those
+        rows are left alone rather than guessed at;
+      * never the ids just written.
     """
+    written_ids: list[str] = []
     count = 0
     for item in extraction.items:
         title = item.get("title", "").strip()
@@ -190,7 +246,9 @@ def persist_episodes(
         outcome = item.get("outcome")
         outcome = outcome if outcome in _VALID_OUTCOMES else None
         key_entities = json.dumps(item.get("key_entities", []))
-        episode_id = _episode_id(session_id, start_msg, end_msg, title)
+        episode_id = _episode_id(
+            session_id, start_msg, end_msg, title, granular=granular
+        )
 
         conn.execute(
             """
@@ -213,8 +271,64 @@ def persist_episodes(
                 start_msg, end_msg, outcome, key_entities,
             ),
         )
+        written_ids.append(episode_id)
         count += 1
+
+    if supersede_window is not None:
+        _supersede_window(conn, session_id, supersede_window, written_ids)
 
     if count:
         log.debug("episodes.persisted session_id=%s count=%d", session_id, count)
     return count
+
+
+def _supersede_window(
+    conn: sqlite3.Connection,
+    session_id: str,
+    window: tuple[int | None, int | None],
+    keep_ids: list[str],
+) -> int:
+    """Delete this session's episodes that lie wholly inside ``window`` and were
+    not just written. Returns the number deleted (0 on an unknown window).
+
+    Deleting rather than leaving the row is the point: an episode is a retrieval
+    surface, so a stale one is not inert — it competes for the same episode
+    slots as the row that replaced it and it renders in ``ask()``. The FTS
+    shadow is kept in sync by the ``episodes_fts_delete`` trigger and
+    ``episode_embeddings`` cascades, the same path ``prune_episodes_and
+    _procedures`` already takes; ``vec_episodes`` is repaired by the existing
+    ``heal_rowid_shadows``/resync machinery, which is where every other episode
+    delete in this codebase leaves it too.
+    """
+    start, end = window
+    if start is None or end is None:
+        # An unknown window would make the DELETE unbounded. Nothing is deleted
+        # and the stale rows stay: over-keeping is recoverable, over-deleting is
+        # not.
+        return 0
+    if not keep_ids:
+        # The caller persisted nothing, so there is no replacement to supersede
+        # anything with. Wiping the window here would turn an empty extraction —
+        # a legitimate "this slice held nothing" — into deletion of episodes
+        # that a previous, successful extraction produced.
+        return 0
+    placeholders = ",".join("?" * len(keep_ids))
+    cur = conn.execute(
+        f"""
+        DELETE FROM episodes
+        WHERE session_id = ?
+          AND start_message_id IS NOT NULL
+          AND end_message_id IS NOT NULL
+          AND start_message_id >= ?
+          AND end_message_id <= ?
+          AND id NOT IN ({placeholders})
+        """,
+        (session_id, start, end, *keep_ids),
+    )
+    deleted = cur.rowcount if cur.rowcount > 0 else 0
+    if deleted:
+        log.info(
+            "episodes.superseded session_id=%s window=%s-%s deleted=%d kept=%d",
+            session_id, start, end, deleted, len(keep_ids),
+        )
+    return deleted

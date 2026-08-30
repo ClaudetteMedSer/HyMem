@@ -14,7 +14,7 @@ from hymem.core.vectors import decode_vector
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 34
+EXPECTED_SCHEMA_VERSION = 35
 
 
 def _load_schema() -> str:

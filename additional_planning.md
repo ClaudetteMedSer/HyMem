@@ -642,6 +642,55 @@ review)*
 > > where before it was "this model invents at 1-in-3.5". That changes the
 > > expected value of building the probe enough to justify building it. It does
 > > not pre-score it.
+> >
+> > **BUILT 2026-08-30 (stage 1, probe-first, default OFF; UNCOMMITTED — no
+> > benchmark or LLM spend was incurred).** What exists now:
+> >
+> > * `SESSION_DIGEST_GRANULAR_SYSTEM` / `_USER_TEMPLATE` — a SECOND digest
+> >   prompt beside the shipping one (which is untouched, byte for byte),
+> >   pinned by `EPISODE_GRANULAR_PROMPT_VERSION = "episodes.granular.v1"` in
+> >   `hymem/dreaming/digest.py`. Its user closer is deliberately unique so
+> >   stubs, probes and call counts can tell the arms apart.
+> > * `episode_granularity_enabled = False` and
+> >   `dream_max_episodes_per_session = 12` (a runaway bound, NOT the 3-8
+> >   target — the cap applies to the granular arm only, since capping the
+> >   shipping prompt would be a default change).
+> > * Schema **v35**: `sessions.episodes_prompt_version`, the v19 stamp
+> >   pattern. NULL = the shipping blob prompt, which is what every pre-v35
+> >   store already reads, so an untouched store never re-extracts; flipping
+> >   the flag re-digests each session ONCE and then returns to zero tail
+> >   calls; flipping it back re-digests once under the blob prompt.
+> > * Two persist changes the granularity forces, granular arm only: the
+> >   episode id carries a title hash (several decisions of one session
+> >   legitimately cite the same chunk, so they share a message range and would
+> >   otherwise collide onto ONE row), and the re-read window is SUPERSEDED
+> >   (UPSERT refreshes only matching ranges, so the old blob rows would
+> >   otherwise survive beside the new ones).
+> > * `benchmarks/episode_probe.py` (G-EP1) + 31 offline tests
+> >   (`tests/test_episode_granularity.py`, `tests/test_episode_probe.py`).
+> >
+> > **G-EP1, pre-registered here before any run.** FLIP-DISCUSSABLE iff all of:
+> > (1) faithfulness hand-score >= 0.90 on the stratified sample; (2) median
+> > episodes per SUBSTANTIVE session in [3, 8] on the target arm; (3) >= 60% of
+> > episodes carry a concrete value in the summary; (4) >= 90% session
+> > coverage; (5) the correct-answer control median <=
+> > `dream_max_episodes_per_session`. Above a 2% parse-failure rate the run is
+> > INCOMPLETE, never FAIL (truncation biases the criteria in opposite
+> > directions — the G-F1b ceiling, same reasoning). Criteria 2-4 are
+> > mechanical and the probe computes them; criterion 1 is a hand-read and the
+> > probe reports INCOMPLETE until `--faithfulness` supplies it, so a subset of
+> > criteria can never print PASS. A PASS makes the flip DISCUSSABLE, not
+> > automatic: the LME full guard (non-regression only), the dream cost watch
+> > and the no-overlap rule against a RAPTOR verification dream are separate
+> > and still stand.
+> >
+> > Two instrument decisions worth banking. The probe scores the CHUNK-shaped
+> > digest input, not raw turns, because that is the corpus the feature reads —
+> > scoring the convenient shape is the mistake `dreaming/facts.py` documents
+> > from the other side. And the dump records the LITERAL prompt string the
+> > extractor sent, hashed at send time and re-hashed on read
+> > (`assert_full_source`), so the `[:4000]` class of defect is a hard failure
+> > rather than an invisible one.
 
 ### Motivation
 
