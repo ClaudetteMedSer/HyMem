@@ -819,6 +819,38 @@ review)*
 > appear in the input") counts it as a miss, so it is scored at 0.98 rather
 > than 1.00 — the conservative reading; even at 1.00 the verdict is the same
 > (≥0.90).
+>
+> **The instrument fix is now APPLIED (`d1967c3`), and it is the same one
+> the run above suggested.** `CapturingLLM` records `reply_chars` (the true
+> full length) plus a bounded, explicitly-diagnostic `reply_head`; the dump
+> row carries both and the backend error; `summarize` splits the failures
+> into empty vs non-empty; and `report` picks the remedy from the recording
+> instead of from an assumption, saying "cause UNKNOWN" outright when the
+> failing replies were not recorded. A note also prints BEFORE the spend
+> whenever `--extra-body` is empty, which is the cheapest place to catch the
+> invocation that started this. Two tests, mutation-checked in both
+> directions: dropping the recording fails one, counting recorded replies
+> over all rows fails the other. Offline only, no spend. Suite 1333 passed
+> (+2), same 8 `sqlite_vec`-absent failures on the verifying interpreter.
+>
+> One defect found while checking the fix against its own output, and it is
+> the reusable part: the first cut counted recorded replies over ALL rows, so
+> a single recorded SUCCESS made a set of unrecorded FAILURES look diagnosed
+> and the report printed a confident wrong cause. That is the E3 shape — a
+> diagnostic that returns a constant when broken — reappearing inside the fix
+> for a diagnostic that returned a constant when broken. Both counts are now
+> over the FAILING rows only, and the mixed case is pinned by a test.
+>
+> **Second finding, NOT acted on.** `longmemeval_adapter._call` raises on
+> `content is None` but passes `content == ""` straight through as data. The
+> probe only noticed because a parse failure is countable there; on the
+> canonical LoCoMo/LME/MSC paths the same empty reply becomes an empty answer
+> and is scored as a WRONG one rather than counted as a failure. Deliberately
+> left alone: widening that guard changes retry behaviour in shared scoring
+> code mid-campaign, which needs its own reason and its own pre-registration,
+> not a drive-by on the way past. Recorded here so it is not rediscovered as
+> a mystery — and it bounds how far the v4-flash migration story can be
+> called settled.
 
 ### Motivation
 
@@ -949,13 +981,23 @@ the shadow probe RAN and Plan D closed C1 FAIL-mechanism** (0.0-1.35% against a
 Grove E1 is **deferred** — see the note in the Plan E section.
 
 **Next actions, in order (2026-08-31, superseding the 2026-08-27 list).** Items
-1 and 3 below are now closed or blocked, which leaves **G-EP1 as the only live
-item that can move anything** — everything else on this list is passive accrual
-or foreclosed. Sequenced: `--cost` first (free), then a 2-per-arm smoke to flush
-the real-API path, which has never executed, then the full 20-per-arm run. The
-hand-score is DECOUPLED from the run (`--rescore` re-reads the dump at zero
-spend), so a PASS/FAIL does not have to be reached in one sitting, and the
-digest text stays on the box either way — hand-scoring is counts-only.
+1 and 3 below are now closed or blocked, which left **G-EP1 as the only live
+item that could move anything** — everything else on this list is passive
+accrual or foreclosed.
+
+**AMENDED, same day — G-EP1 RAN and PASSED, so this list is now empty of live
+items.** Its first invocation aborted at 52.5% parse failures (no
+`--extra-body '{"thinking":{"type":"disabled"}}'`, a reasoning model returning
+empty content) and read INCOMPLETE by the ceiling, exactly as designed: it never
+scored, so re-running it was the same pre-registration and not a revival. The
+re-run with the flag returned 0 parse failures and PASS on all five criteria
+(faithfulness 0.98). The instrument now records what came BACK, so the next run
+that fails this way names its own cause rather than being attributed to
+truncation by inference. What that PASS buys is bounded and unchanged: the flip
+is DISCUSSABLE, not automatic — the LME full guard (non-regression only), the
+dream cost watch, and the no-overlap rule against a RAPTOR verification dream
+are separate gates and all three still stand. **The next decision is the FLIP
+itself, and it needs those three discharged, not a fourth probe.**
 
 1. ~~**RUN, box-side:** `benchmarks/fact_probe.py` faithfulness.~~ **RAN
    2026-08-30 — G-F1 PASS on v4-flash at full source, faithfulness 1.00

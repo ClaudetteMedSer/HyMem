@@ -270,10 +270,26 @@ class CapturingLLM:
             "user_chars": len(request.user),
         })
         try:
-            return self._backend(request.system, request.user)
+            reply = self._backend(request.system, request.user)
         except Exception as exc:  # a probe row must never abort the run
             self.last_error = f"{type(exc).__name__}: {exc}"
-            return ""
+            reply = ""
+        reply = reply if isinstance(reply, str) else ""
+        # What came BACK, recorded next to what went out. The first real run of
+        # this probe read 52.5% parse failures and the diagnostic blamed
+        # truncation, because the reply was discarded the moment it failed to
+        # parse and the cause had to be INFERRED. It was not truncation: a
+        # reasoning model with no `thinking.disabled` spends the whole output
+        # budget on thinking tokens and returns an EMPTY string, which is
+        # indistinguishable from malformed JSON once thrown away. `reply_head`
+        # is a bounded SLICE and is diagnostic only -- never hand-score it, and
+        # never re-derive a length from it; `reply_chars` is the true full
+        # length, which is the one number that separates the two causes.
+        self.sent[-1].update({
+            "reply_chars": len(reply),
+            "reply_head": reply[:240],
+        })
+        return reply
 
 
 def sim_backend(system: str, user: str) -> str:
@@ -372,6 +388,11 @@ def extract_one(conn, entry: dict, llm: CapturingLLM, cfg: HyMemConfig,
         "extractor_input": None,
         "extractor_input_sha256": None,
         "extractor_input_chars": 0,
+        # Recorded so a parse failure names its own cause instead of being
+        # attributed to truncation by inference (see CapturingLLM.complete).
+        "reply_chars": None,
+        "reply_head": None,
+        "backend_error": None,
         "error": None,
     }
     before = llm.calls
@@ -408,6 +429,9 @@ def extract_one(conn, entry: dict, llm: CapturingLLM, cfg: HyMemConfig,
         row["extractor_input"] = sent["user"]
         row["extractor_input_sha256"] = sent["user_sha256"]
         row["extractor_input_chars"] = sent["user_chars"]
+        row["reply_chars"] = sent.get("reply_chars")
+        row["reply_head"] = sent.get("reply_head")
+    row["backend_error"] = llm.last_error
     return row
 
 
@@ -526,6 +550,19 @@ def summarize(target_rows: list[dict], control_rows: list[dict],
     parse_failures = sum(
         1 for r in target_rows + control_rows if r.get("parse_failed"))
     parse_failure_rate = (parse_failures / calls) if calls else 0.0
+    # Split the failures by CAUSE rather than leaving it to be inferred. An
+    # empty reply and a malformed one both land in `parse_failures` and have
+    # opposite remedies (disable the model's thinking vs raise --max-tokens).
+    # `replies_recorded` exists so a dump written before this was recorded
+    # reads as UNKNOWN instead of as "no empty replies" -- a missing field
+    # must not answer the question it cannot answer. Both counts are over the
+    # FAILING rows only: recording is what makes a failure diagnosable, so a
+    # dump where the successes recorded and the failures did not must still
+    # read as unknown rather than borrowing the successes' evidence.
+    failed_rows = [r for r in target_rows + control_rows if r.get("parse_failed")]
+    replies_recorded = sum(
+        1 for r in failed_rows if r.get("reply_chars") is not None)
+    empty_replies = sum(1 for r in failed_rows if r.get("reply_chars") == 0)
 
     gate = {
         "faithfulness_ok": (faithfulness is not None
@@ -557,8 +594,9 @@ def summarize(target_rows: list[dict], control_rows: list[dict],
         verdict = (
             f"INCOMPLETE (parse-failure ceiling: {parse_failures}/{calls} = "
             f"{parse_failure_rate:.1%} > {_MAX_PARSE_FAILURE_RATE:.0%} — "
-            f"truncation biases the criteria in opposite directions; re-run at a "
-            f"higher --max-tokens, never read as FAIL)")
+            f"a failure this size biases the criteria in opposite directions, so "
+            f"the run is UNREADABLE; never read as FAIL. See the cause line in "
+            f"the report before choosing a remedy)")
     elif all(gate.values()):
         verdict = "PASS"
     elif all(mechanical.values()) and faithfulness is None:
@@ -572,6 +610,8 @@ def summarize(target_rows: list[dict], control_rows: list[dict],
         "calls": calls,
         "parse_failures": parse_failures,
         "parse_failure_rate": parse_failure_rate,
+        "empty_replies": empty_replies,
+        "replies_recorded": replies_recorded,
         "faithfulness": faithfulness,
         "gate": gate,
         "verdict": verdict,
@@ -645,9 +685,25 @@ def report(s: dict, diag: dict, arm_label: str, verbose: bool,
     if s.get("parse_failure_rate", 0.0) > _MAX_PARSE_FAILURE_RATE:
         print(f"  ⚠ PARSE-FAILURE CEILING EXCEEDED: {s['parse_failures']}/"
               f"{s['calls']} = {s['parse_failure_rate']:.1%} > "
-              f"{_MAX_PARSE_FAILURE_RATE:.0%}. Truncation biases the criteria in "
-              f"opposite directions — this run is UNREADABLE, not a FAIL. Re-run "
-              f"at a higher --max-tokens.")
+              f"{_MAX_PARSE_FAILURE_RATE:.0%}. This biases the criteria in "
+              f"opposite directions — the run is UNREADABLE, not a FAIL.")
+        empty, recorded = s.get("empty_replies", 0), s.get("replies_recorded", 0)
+        if empty:
+            print(f"    cause: {empty}/{s['parse_failures']} failures came back "
+                  f"EMPTY (0 chars), which is neither malformed nor truncated "
+                  f"JSON. A reasoning model spends its whole output budget on "
+                  f"thinking tokens and returns nothing unless it is sent "
+                  f"--extra-body '{{\"thinking\":{{\"type\":\"disabled\"}}}}'. "
+                  f"Raising --max-tokens will not fix an empty reply.")
+        elif recorded == s["parse_failures"]:
+            print("    cause: every failing reply came back non-empty, so this "
+                  "is malformed or truncated JSON — raising --max-tokens is the "
+                  "remedy here.")
+        else:
+            print(f"    cause UNKNOWN: only {recorded}/{s['parse_failures']} "
+                  f"failing replies were recorded (a dump predating reply "
+                  f"recording). Re-run to record them rather than guessing at a "
+                  f"remedy.")
     print("  faithfulness: "
           + (f"{s['faithfulness']:.2f} (hand-scored)"
              if s["faithfulness"] is not None
@@ -814,6 +870,16 @@ def main() -> None:
         extra = json.loads(args.extra_body) if args.extra_body else None
         client = ApiClient(args.model, args.api_key, base_url=args.base_url,
                            extra_body=extra)
+        if not extra:
+            # Printed BEFORE the spend, because this is what the first real run
+            # of this probe got wrong: a reasoning model with thinking left on
+            # returns an empty reply, which arrives here as a parse failure
+            # rather than as an error, and 52.5% of the run was unreadable.
+            print("  note: no --extra-body. A reasoning model (deepseek-v4-flash "
+                  "and kin) spends its whole output budget on thinking tokens "
+                  "and returns an EMPTY reply unless sent "
+                  "'{\"thinking\":{\"type\":\"disabled\"}}' — which this probe "
+                  "counts as a parse failure, not as an error.", flush=True)
 
         def backend(system: str, user: str) -> str:
             return client.chat(

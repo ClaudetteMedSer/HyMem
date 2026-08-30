@@ -358,3 +358,78 @@ def test_sample_rows_carry_no_error_and_at_least_one_episode():
     rows[1]["session_id"] = "empty"
     sample = build_faithfulness_sample(rows, size=8, seed=0)
     assert [e["session_id"] for e in sample] == [rows[0]["session_id"]]
+
+
+# ── the reply is recorded, so a parse failure names its own cause ───────────
+
+def test_an_empty_reply_is_recorded_as_empty_not_inferred_as_truncation(tmp_path):
+    """The instrument gap the first real G-EP1 invocation exposed.
+
+    A reasoning model with thinking left enabled burns the whole output budget
+    and returns "" — content_len 0, finish_reason length. The probe discarded
+    the reply the moment it failed to parse, so a 52.5% failure rate was
+    attributed to TRUNCATION by inference and the emitted remedy (raise
+    --max-tokens) could not have worked. The row must carry the true reply
+    length, which is the one number that separates the two causes.
+    """
+    def backend(system: str, user: str) -> str:
+        return ""
+
+    cfg = HyMemConfig(root=tmp_path)
+    entries = [_entry("s1", "target")]
+    conn = build_store(tmp_path / "probe.sqlite", entries, cfg)
+    try:
+        row = extract_one(conn, entries[0], CapturingLLM(backend), cfg,
+                          granular=True)
+    finally:
+        conn.close()
+    assert row["parse_failed"] is True
+    assert row["reply_chars"] == 0          # empty, NOT unrecorded
+    assert row["reply_head"] == ""
+    # And a non-empty reply that still fails to parse must NOT read as empty,
+    # or the two causes collapse back into one and the remedy is a coin flip.
+    conn = build_store(tmp_path / "probe2.sqlite", entries, cfg)
+    try:
+        row2 = extract_one(conn, entries[0],
+                           CapturingLLM(lambda sysm, usr: "{not json"), cfg,
+                           granular=True)
+    finally:
+        conn.close()
+    assert row2["parse_failed"] is True
+    assert row2["reply_chars"] == len("{not json")
+
+
+def test_a_dump_without_recorded_replies_reads_unknown_not_zero():
+    """A missing field must not answer the question it cannot answer.
+
+    Dumps written before reply recording carry no `reply_chars`. Counting those
+    as "0 empty replies" would report a confident cause for a run whose replies
+    were thrown away — the failure shape the diagnostic-controls memo calls a
+    device that returns a constant when it is broken.
+    """
+    old = [_row("target", parse_failed=True, episodes=0) for _ in range(4)]
+    for r in old:
+        r.pop("reply_chars", None)
+    s_old = summarize(old, [_row("control")], None)
+    assert s_old["replies_recorded"] == 0
+    assert s_old["empty_replies"] == 0      # unknown, and the report says so
+
+    new = [_row("target", parse_failed=True, episodes=0) for _ in range(4)]
+    for r in new:
+        r["reply_chars"] = 0
+    s_new = summarize(new, [_row("control")], None)
+    assert s_new["replies_recorded"] == 4
+    assert s_new["empty_replies"] == 4
+
+    # And the counts are over the FAILING rows only. A first cut counted every
+    # row, so a single recorded SUCCESS made an unrecorded set of failures look
+    # diagnosed and the report printed a confident, wrong remedy.
+    mixed = [_row("target", parse_failed=True, episodes=0) for _ in range(3)]
+    for r in mixed:
+        r.pop("reply_chars", None)
+    ok_row = _row("target")
+    ok_row["reply_chars"] = 500
+    s_mixed = summarize(mixed + [ok_row], [_row("control")], None)
+    assert s_mixed["parse_failures"] == 3
+    assert s_mixed["replies_recorded"] == 0     # not 1, and not 5
+    assert s_mixed["empty_replies"] == 0
