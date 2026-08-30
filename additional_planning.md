@@ -862,8 +862,14 @@ the shadow probe RAN and Plan D closed C1 FAIL-mechanism** (0.0-1.35% against a
 5% bar; the separate-cap legs reject H0 at p = 0.022). There is no A/B to run.
 Grove E1 is **deferred** — see the note in the Plan E section.
 
-**Next actions, in order (2026-08-27, superseding the list above).** Plan D and
-Grove E2 are both closed, so the live work is what those closes left standing:
+**Next actions, in order (2026-08-31, superseding the 2026-08-27 list).** Items
+1 and 3 below are now closed or blocked, which leaves **G-EP1 as the only live
+item that can move anything** — everything else on this list is passive accrual
+or foreclosed. Sequenced: `--cost` first (free), then a 2-per-arm smoke to flush
+the real-API path, which has never executed, then the full 20-per-arm run. The
+hand-score is DECOUPLED from the run (`--rescore` re-reads the dump at zero
+spend), so a PASS/FAIL does not have to be reached in one sitting, and the
+digest text stays on the box either way — hand-scoring is counts-only.
 
 1. ~~**RUN, box-side:** `benchmarks/fact_probe.py` faithfulness.~~ **RAN
    2026-08-30 — G-F1 PASS on v4-flash at full source, faithfulness 1.00
