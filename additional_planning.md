@@ -660,12 +660,14 @@ review)*
 > >   store already reads, so an untouched store never re-extracts; flipping
 > >   the flag re-digests each session ONCE and then returns to zero tail
 > >   calls; flipping it back re-digests once under the blob prompt.
-> > * Two persist changes the granularity forces, granular arm only: the
-> >   episode id carries a title hash (several decisions of one session
+> > * Two persist changes the granularity forces: the episode id carries a
+> >   title hash on the granular arm (several decisions of one session
 > >   legitimately cite the same chunk, so they share a message range and would
-> >   otherwise collide onto ONE row), and the re-read window is SUPERSEDED
-> >   (UPSERT refreshes only matching ranges, so the old blob rows would
-> >   otherwise survive beside the new ones).
+> >   otherwise collide onto ONE row), and the re-read window is SUPERSEDED on
+> >   either side of a granularity CHANGE (UPSERT refreshes only matching
+> >   ranges, so rows written under the other id shape would otherwise survive
+> >   beside the new ones). The second was built granular-arm-only and CORRECTED
+> >   2026-08-31 — see the revert-hole note below.
 > > * `benchmarks/episode_probe.py` (G-EP1) + 31 offline tests
 > >   (`tests/test_episode_granularity.py`, `tests/test_episode_probe.py`).
 > >
@@ -691,6 +693,46 @@ review)*
 > > extractor sent, hashed at send time and re-hashed on read
 > > (`assert_full_source`), so the `[:4000]` class of defect is a hard failure
 > > rather than an invisible one.
+>
+> > **CORRECTION 2026-08-31 — the flip contract had an asymmetric hole, found
+> > box-side by reading the code against its own docstring.** `supersede_window`
+> > was passed only when `episode_granularity_enabled` is True, so flipping ON
+> > was clean and flipping OFF was not: the blob rewrite writes bare-range ids,
+> > the granular rows it replaces carry `range#titlehash`, the two shapes cannot
+> > collide, UPSERT refreshes nothing, and the store is left serving BOTH
+> > granularities of the same conversation — the exact mixed store the
+> > supersession exists to prevent, in the direction nobody looked. The config
+> > docstring meanwhile asserted that the revert superseded. Damage was nil (the
+> > flag has never been on anywhere), but a false claim in a docstring is how a
+> > property gets banked as verified.
+> >
+> > Fixed in `f256443`, keyed on the session's STAMP rather than on the flag.
+> > That distinction is the substance of the fix, not a detail: passing the
+> > window unconditionally would also have closed the hole, and would have made
+> > every blob re-dream destructive-in-window on stores that never opted in — a
+> > silent default change smuggled in under a default-OFF feature, which is the
+> > thing `validate_episode_items(max_items=None)` was written two files over to
+> > avoid. A store that has only ever run the shipping prompt reads NULL, passes
+> > no window, and keeps the additive re-dream it has always had.
+> >
+> > Two further stale claims in the same docstring, both inherited from the
+> > pre-backout brief: episodes are stamped on the SESSION only (one column; a
+> > per-row copy was dropped as derived state that can disagree with its source,
+> > per migration 035), and the revert has two documented gaps, both in the
+> > over-KEEPING direction — an empty blob reply supersedes nothing (an empty
+> > extraction must never delete a previous one's work) and a granular row
+> > reaching past the re-read window lies outside it and survives.
+> >
+> > **Process finding, and it is the reusable part.** The pre-existing revert
+> > test asserted the prompt and the stamp; neither can see a surviving row, and
+> > the file's own header lists five things it pins, of which "the store does not
+> > end up mixed" is not one. A test suite written from a feature's INTENT
+> > covers the direction the feature is meant to run. The two new tests are
+> > mutation-checked in BOTH directions — the row-level one fails against the old
+> > wiring, the wiring one fails against the old wiring AND against an
+> > unconditional window, which is what pins the inertness leg rather than
+> > asserting it. Offline only; no spend. Suite 1331 passed (+2), same 8
+> > `sqlite_vec`-absent failures on the verifying interpreter, 0 on the box.
 
 ### Motivation
 
