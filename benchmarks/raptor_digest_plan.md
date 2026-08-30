@@ -666,7 +666,9 @@ holds end-to-end on the instrument's first production row. It is a
 `leaf_changed=0` row, so it calibrates the CLEAN baseline, not the family.
 
 **PRE-REGISTERED PREDICTION for the next `leaf_changed=1` row — banked
-2026-08-27, before that row exists.** Writing it down now is the whole point:
+2026-08-27 09:43:38 UTC (commit `ea6b188`). The clause originally written here,
+"before that row exists", is FALSE — see "Timing correction" below.** Writing it
+down now is the whole point:
 the argument below is available *before* the measurement, so if it is simply
 recited afterwards the reading is a confirmation, not a finding. Two facts
 already in hand constrain the answer:
@@ -692,6 +694,58 @@ sampled does not touch cluster membership.
 
 A middle result (`level0` in 6-12) falsifies neither cleanly and should be
 recorded as such rather than rounded to the nearer branch.
+
+#### Timing correction — the target row already existed. Read 2026-08-27.
+
+`dream_runs.started_at` is `CURRENT_TIMESTAMP` (UTC). **Row #1324, the first
+`leaf_changed=1` row after #1319, ran 08:26:38 UTC — 77 minutes BEFORE the
+prediction was committed at 09:43:38 UTC.** The sentence above claimed the
+prediction predated the row. It did not.
+
+What actually held is weaker, and the difference matters: the prediction was
+written *without sight of* #1324 (this document's own knowledge stops at #1319
+and never mentions 1320-1324, which is the corroborating trace). That is a
+**blind** read, not a **pre-dated** one — and blindness is not third-party
+verifiable, where a timestamp ordering is. So #1324 is recorded at the weaker
+status it earns, and it does not discharge the pre-registration.
+
+**The pre-dated test transfers forward:** it is now the first `leaf_changed=1`
+row stamped after 2026-08-27 09:43:38 UTC, i.e. strictly after #1324. The
+prediction's text is unchanged and is not re-tuned against #1324's values —
+re-fitting it now is exactly the move the A5 verdict refuses.
+
+#### Finding — #1324 SPLITS the prediction. Unclassed, and informative anyway.
+
+`level0 = 3` (`l0miss = 3` — exact), `rollup = 8`, `root = 1`, `rebuilt = 12`
+(3+8+1 = 12, the v33 self-check holds on its second family row), `residual = 0`,
+reuse 88.3%.
+
+- The **structurally argued** component landed exactly: `rebuilt_level0 = 3 =
+  l0miss`, the same identity #1319 gave on the clean side. That component was
+  the one derived from tree shape rather than from the observed gap.
+- The **magnitude** component missed: `rollup = 8` against a predicted 15-18.
+- **The sharp falsifier did not fire.** `level0 ~= 17` would have meant the
+  2026-07-05 oldest-anchored windowing confinement is leaking; `level0 = 3`
+  says it is not, for this row.
+- The middle clause (`level0` in 6-12) does not apply either.
+
+Per the rule banked above, this is **unclassed, not rounded to the nearer
+branch**. Reading (b) is dead *for this row*; reading (a) is not established,
+because (a)'s predicted cascade size did not reproduce.
+
+**What it does establish: `leaf_changed=1` is not a monolith.** At *constant*
+`l0miss = 3`, `rebuilt` now forms a monotone ladder — 8 (#1318/#1319, clean) ->
+12 (#1324) -> 19-22 (#1183/#1307/#1317) — and **every bit of that variance sits
+in the `rollup` term**, which is precisely what the v33 split was built to
+expose. Family 1's rollup of 15-18 did not reproduce in family 2.
+
+The flag is binary; the cascade it is standing in for is clearly continuous.
+That reframes the open question from "why do leaf-changed rows rebuild more?"
+to "what sets the *size* of the leaf-set shift?" — and the honest answer is that
+no instrument currently measures that size. Candidate next observation channel,
+NOT built here and NOT pre-judged: a count of the leaf-set delta itself,
+derived from the build's own rows the way v33's split was, so the continuous
+driver is measured instead of inferred from a flag.
 
 ### The flip gate vs the regression monitor — SEPARATED 2026-08-27
 
@@ -735,6 +789,62 @@ can register a difference again, which G-FLIP-as-monitor no longer can.
 and G-FLIP's bar is not moved. Re-anchoring to clear a failing row after seeing
 it fail is post-hoc tightening's mirror image and is refused on the same grounds
 the A5 verdict refused two waivers.
+
+#### G-MON, first read 2026-08-27: the criterion FIRED on #1320.
+
+| row | class | leaf | reuse | l0miss | level0/rollup/root | residual | /miss |
+|---|---|---|---|---|---|---|---|
+| #1319 | append | 0 | 92.2% | 3 | 3 / 4 / 1 | 0 | 2.7 |
+| **#1320** | **append** | **0** | **87.5%** | **5** | **5 / 7 / 1** | **0** | **2.6** |
+| #1321-#1323 | append | 0 | clean | - | - | 0 | - |
+| #1324 | append | 1 | 88.3% | 3 | 3 / 8 / 1 | 0 | 4.0 |
+
+#1324 routes to the family instrument per G-MON's own text and is **not** a
+regression reading. #1320 is a below-bar `append` row stamped after the flip
+commit, which is exactly the condition G-MON pre-registered as "a finding to act
+on". **The finding fired. It is recorded as fired.**
+
+It is also birth-dated: #1320 ran ~24h before G-MON was written, so the
+criterion applies to it retroactively. That is not grounds to exclude it —
+excluding a row because the criterion was written after it is the same move as
+re-anchoring a window to clear #1317, and it is refused for the same reason.
+
+**Acting on it — diagnosis: #1320 is the most rebuild-efficient row on record,
+and it fails anyway.** Per-miss amplification is **2.6**, below #1318/#1319's
+clean 2.7 and far below the family's 6.3-7.3. Nothing is amplifying. The reuse
+deficit is proportional to `l0miss = 5` — more leaves genuinely changed.
+
+**And that exposes a defect in the criterion itself, by arithmetic rather than
+by hindsight.** `built` is ~103 on all three measured rows (8/92.2%, 13/87.5%,
+12/88.3% all invert to 103 within rounding), so at this tree size reuse% is a
+linear restatement of `rebuilt`, and the 90% bar is exactly `rebuilt <= 10`.
+Since `rebuilt = amplification x l0miss`, at the clean amplification of ~2.7 the
+bar is breached by `l0miss >= 4` on its own:
+
+> **G-MON's 90% reuse bar is arithmetically equivalent to "no more than three
+> changed leaves per dream" — a cap on how much the STORE changed, not on how
+> efficiently the tree rebuilt.** A busier day fails it with a perfectly healthy
+> cascade.
+
+This derivation needs no knowledge of which direction #1320 went; it follows
+from the definition of reuse% and was available when G-MON was written. It was
+missed. Recorded as an amendment prompted by a failing row, because that is what
+it is.
+
+**Correction, forward-only — G-MON-b, pre-registered 2026-08-27, first scored on
+rows stamped after this entry.** Criterion: per-miss amplification
+`rebuilt / l0miss <= 4.5` on `append` rows with `residual = 0`, which is
+`l0miss`-invariant and therefore measures the thing G-MON was built to catch.
+The 4.5 bar sits above the clean band (2.6-2.7) and #1324 (4.0) and below the
+family (6.3-7.3) — it is set from the *pre-existing* calibration, not from
+#1320.
+
+**Deliberately NOT done:** G-MON's raw 90% bar is **not** retracted, not
+loosened, and not re-scored. #1320 stays a fired finding. G-MON-b runs
+*alongside* it, so the substitution is visible in the record rather than
+silently applied — a criterion swapped in after a failure has to be readable as
+a swap, or the next reader cannot tell a fix from a fudge. If the two disagree
+on a future row, that disagreement is itself the datum.
 
 ---
 

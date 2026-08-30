@@ -722,9 +722,13 @@ blocker (Campaign-E E2, E6, E7). Nothing in Campaign E is awaiting a run.
 
 **Next actions, in order** (2026-08-25, superseding the 2026-07-30 list): the live
 work is now Plan D + Grove E2, sequenced in that plan's own section below.
-(1) run `benchmarks/recovery_probe.py` read-only on the box **and** on a LoCoMo
-`--db-dir` store — its `anchor_delta` gates both Grove E2 Stage 1 and Plan D's
-seed predicate; (2) build Plan D behind a default-OFF flag and run the shadow
+(1) ~~run `benchmarks/recovery_probe.py` read-only on the box **and** on a LoCoMo
+`--db-dir` store~~ — **DONE 2026-08-25, RE-RUN 2026-08-27.** `anchor_delta = 0`
+on both stores both times, but the second run found the probe's premise broken by
+`8c6925c`; the Plan D licence stands **re-based onto a selectivity argument** and
+now carries a tripwire. Read the STATUS 2026-08-27 block before starting (2), and
+carry the selectivity framing — not "the clause is inert" — into Plan D's text;
+(2) build Plan D behind a default-OFF flag and run the shadow
 probe over both corpora; (3) if C1 proceeds, the scored LoCoMo A/B under the
 OFF-arm stratification specced in Plan D. Grove E1 is **deferred** — see the note
 in the Plan E section.
@@ -2137,6 +2141,17 @@ existing rows. Zero schema change, zero prompt change, zero dream spend.
 > job is tracking what is *currently* true should not silently bar facts that were
 > retracted and re-confirmed.
 >
+> > **RESOLVED 2026-08-27 — keep the clause, on a re-based rationale.**
+> > `anchor_delta = 0` on both stores on both runs, so the copy is licensed. But
+> > the 2026-08-27 re-run found the E2 premise broken by `8c6925c` (the writer
+> > now clears `invalid_at` on any positive mention), so the licence rests on
+> > **selectivity** — tombstoned edges are ~0.077% of active edges against a
+> > ~0.376% anchor budget share, and the fix shrinks that further — **not** on
+> > "the clause is inert". Copy the predicate verbatim, and copy this rationale
+> > with it. **Tripwire:** if a measured store ever shows `retracted_share`
+> > approaching `edge_budget_share`, the clause becomes live and this decision
+> > reopens. See the STATUS 2026-08-27 block in the Plan E -> E2 section.
+>
 > **4. C2 and C4 are NOT harm gates.** As pre-registered below they assert
 > "additive, displaces nothing, existing rows byte-identical" — which is
 > **exactly the property the narrative-facts tier had while costing 2.9pp on
@@ -2365,6 +2380,13 @@ only), runs in parallel with G-F1b without touching the dream budget.
 > `phase1.py:654-666` resurrects a retracted edge to `status='active'` but never
 > clears `invalid_at`, and **nothing in `hymem/` ever clears it on
 > `knowledge_graph`** (only `rules.py:407` does, on a different table). So
+>
+> > **PREMISE RETRACTED 2026-08-27 — the bolded clause is FALSE** as of commit
+> > `8c6925c` (2026-08-25 20:09 UTC). See the STATUS block at the end of this
+> > section. Note also that this amendment's **"Decision: measure, do not fix"**
+> > below was overtaken ~11 hours later the same day by that commit, from a
+> > different thread, and the two were never linked.
+> 
 > `status='active' AND invalid_at IS NOT NULL AND derived=0` *is* the
 > recovered population. It is also a live defect: `_anchor_facts`
 > (`aggregate.py:828-830`) is the **only** query in the codebase that reads
@@ -2480,6 +2502,87 @@ edges fill the remainder"); the early return silently converts that into
 behaviour change on the LIVE digest. LoCoMo conv-26 shows the same shape in
 miniature (4 edge slots for 55 edges). Unrelated to `invalid_at`; it is server
 code and needs its own pre-registered gate — do NOT hotfix it in this branch.
+
+#### STATUS 2026-08-27 — Stage 0 RE-RUN; **the premise broke underfoot, and the close is RE-BASED**
+
+Two read-only re-runs, no torn-snapshot retries, artifacts preserved to
+`~/.hermes/benchmarks/`.
+
+| Leg | cap split | `anchor_delta` | recovered | retracted | verdict |
+|---|---|---|---|---|---|
+| LoCoMo conv-26 | 16 profile + 4 edge, anchor 4/4 | 0 | 0 of 55 | 0 | **INERT-EMPTY** (identical to Aug 25 — ingested snapshot, no dreams land there) |
+| Box @ cap 20 (production shape) | 20 profile + **0 edge** | 0 | — | — | **VACUOUS** (degeneracy guard fires, as Aug 25) |
+| Box @ cap 60 | 26 profile + **34 edge**, anchor 34/34 both arms | **0** | **0 of 9047** | **7** (all stamped, all inside the 30-day prune window) | see below |
+
+**The Aug-25 strong-INERT reading is no longer reproducible, and the cause is
+one of our own commits.** On Aug 25 the box read `recovered = 2` — edges 1872
+and 2840, both `no_negative_evidence`, closed 2026-05-29. Today both are active
+with `invalid_at` NULL and nothing re-retracted them. **`8c6925c` (2026-08-25
+20:09 UTC, "phase1/phase3: clear invalid_at on re-assert and reinforce") cleared
+them**; its own commit message names edge 1872 as the corrupted row. The box
+pulled it with v33 (~17:30 UTC Aug 26) and the dreams since (#1319-#1324) ran
+the fixed code — both rows self-healed via soft reinforcement (`pos_evidence`
++49/+37), which also explains the otherwise-odd absence of any new `kg_evidence`
+rows: reinforcement increments counters without inserting evidence.
+
+**What is retracted, precisely.**
+1. The premise sentence in amendment (a) and in the probe's docstring
+   ("nothing in `hymem/` ever clears it"). Corrected in both places.
+2. The **reproducibility** of the strong-`INERT` branch — *not* the Aug-25
+   measurement, which was validly taken on the store as it then stood. Post-fix
+   the `recovered` stock self-drains on any live store, so the probe will report
+   `INERT-EMPTY` in the healthy steady state forever. The strong branch requires
+   a non-empty recovered population and is now **unreachable, not unmet**. That
+   is the degenerate criterion the probe's own verdict function was amended to
+   guard against, arriving one level up.
+
+So **neither store now establishes "the clause is inert" as a mechanism fact**:
+conv-26 is empty because it never retracted an edge, and the box is empty
+because the fix healed the only two recoveries it had. Banking the
+unreachable-code-path conclusion on today's numbers would bank it against the
+wrong evidence base.
+
+**What survives, on a NEW argument.** The clause still costs **0** anchor facts
+on both stores under direct measurement — but the licence for Plan D must now
+rest on **selectivity**, not on the writer never clearing the stamp. At cap 60
+the box has 34 edge slots against 9,047 active edges and 7 tombstoned ones: the
+barred population is **0.077%** of the edges against a **0.376%** budget share —
+5x below it — and both arms returned the same 34 edges, so no tombstoned edge
+came close to ranking in. This is the **E4 lesson repeated**: precision and
+selectivity are independent, and precision alone never licensed the clause. The
+clause is precise (it bars genuinely-retracted edges) and non-selective (the
+barred set is far too small to reach the budget). Crucially, `8c6925c` pushes
+this argument in the *favourable* direction — it shrinks the tombstone
+population further — so the re-basing does not weaken the conclusion, it changes
+what the conclusion is made of.
+
+**Verdict: Plan D's "copy the `_anchor_facts` predicate verbatim" licence
+STANDS, re-based from inertness to selectivity, and now carries a tripwire it
+did not have before** — if `retracted_share` ever approaches `edge_budget_share`
+on a measured store, the clause becomes live and Plan D inherits a real
+decision instead of a free copy. Grove E2 Stage 1 stays CLOSED, but its stated
+ground changes from "FAIL-mechanism, the population is empty" to "FAIL-mechanism
+*by selectivity*, the population cannot reach the budget". Anyone re-reading the
+Aug-25 close should read this block with it.
+
+**The consequence amendment (a) feared did NOT materialise.** (a) declined the
+`_anchor_facts` fix because it "would change `_anchor_facts`' output, rekeying
+the root digest on every store and injecting a deploy-refusion into the live
+criterion-6 accrual". `8c6925c` fixed the *writer* rather than the reader and
+produced that same output change — arriving on the box after G-FLIP's 11:15
+Aug-26 window had already closed. The first post-pull dream (#1319) came back
+clean at 92.2% with `residual = 0`. No refusion spike.
+
+**Process finding, and it is the reusable one:** a "measure, do not fix"
+decision banked in a plan section does not bind a commit landing from another
+thread. It was recorded as an *intent* rather than as a named code path, so
+nothing connected `phase1._upsert_triple` to the E2 premise that depended on it.
+Such decisions need to name the function they are protecting.
+
+**Not done, deliberately:** no hand-verify (`evidence_backed = 0`, so the >=3-row
+check does not apply); the probe's verdict function is **not** re-tuned to make
+`INERT-EMPTY` mean more than it does; and no selectivity criterion is
+retro-scored onto the Aug-25 artifacts.
 
 #### STATUS 2026-08-25 — gate RAN, **fix REFUSED at S1-C1**; the defect stays open
 

@@ -7,6 +7,24 @@ WHAT THIS MEASURES, AND WHY IT IS A DIFF AND NOT A COUNT
 clears `invalid_at`, and nothing in `hymem/` ever clears it on
 `knowledge_graph` (only `rules.py:407` does, on a different table). So
 
+    !! PREMISE RETRACTED 2026-08-27. The paragraph above was true when this
+    !! probe was written and is FALSE as of commit 8c6925c (2026-08-25 20:09
+    !! UTC), which clears `invalid_at` on any positive mention -- in BOTH
+    !! `phase1._upsert_triple` and `phase3.reinforce`. Consequence for this
+    !! instrument: the `recovered` population now SELF-DRAINS. A recovered
+    !! edge heals on its next positive mention, so on a live store this probe
+    !! reads `recovered = 0` in the healthy steady state, and the strong
+    !! `INERT` verdict -- which REQUIRES a non-empty recovered population the
+    !! clause still fails to bar -- becomes unreachable rather than unmet.
+    !! That is the degenerate-criterion trap this file's own verdict function
+    !! was amended to guard against, arriving one level up: a criterion that
+    !! reports the same thing on every store. Read `INERT-EMPTY` from this
+    !! probe as "no stock right now", NEVER as "the mechanism is empty".
+    !! The measured Aug-25 strong-INERT reading STANDS as taken; what does
+    !! not stand is any expectation of reproducing it. See the E2 STATUS
+    !! block in additional_planning.md for the re-derived verdict.
+
+
     status='active' AND derived=0 AND invalid_at IS NOT NULL
 
 is the population of facts that were retracted and have since been re-asserted.
