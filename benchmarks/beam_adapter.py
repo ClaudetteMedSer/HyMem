@@ -234,6 +234,194 @@ def resolve_answer_provider(spec: str, deepseek_key: str):
     return model, base_url, api_key, provider
 
 
+# ── Episode-tier answer-bearing probe (Plan C pre-check) ──────────
+# The LME guard for `episode_granularity_enabled` came back an exact tie, and the
+# 2026-08-31 keep-db probe explained why: both arms saturate the episode cap, so
+# the lever can only change episode CONTENT -- and on LME `gold_in_episodes` was
+# 0/9, i.e. the tier is narrative, not answer-bearing. A lever whose only channel
+# is the content of a tier that never carries the answer has no path to the score,
+# which makes LME structurally uninformative rather than merely underpowered.
+#
+# BEAM is where that could differ: EO and SUM grade ORDERING and SUMMARISATION,
+# and the assembly below already leads those two abilities with `episode_hits[:8]`
+# on the observed finding that message hits otherwise slice episodes out entirely.
+# So this block measures, per question and per tier, how much of the ideal answer
+# the tier actually carries -- BEFORE any A/B is scheduled against it.
+#
+# The instrument is built to be unable to return a confident zero:
+#   * every measure returns None, never 0.0, when it cannot be computed (empty
+#     tier, no distinctive gold tokens) -- an unretrieved tier must not report as
+#     "retrieved and empty", which is exactly how `recall_tier`'s missing
+#     "episode" value read as a result;
+#   * the MESSAGE tier is measured identically as a positive control. If message
+#     coverage is also ~0 the measure is broken, not the tier. No episode number
+#     here means anything without its message counterpart on the same question.
+
+
+def _norm_text(s: str) -> str:
+    """Whitespace-collapse + lowercase for robust substring matching."""
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+# Minimum normalized answer length for containment to carry signal; a 2-char
+# string is inside a thousand sentences by chance. Mirrors the constant of the
+# same name in longmemeval_adapter.py / fact_probe.py.
+_MIN_ANSWER_CHARS = 4
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+_STOPWORDS = frozenset("""
+a an the and or but if then else than that this these those of in on at to for
+from by with without about into over under again further is are was were be been
+being am do does did doing have has had having it its he she they them him her his
+their we us our you your i me my mine not no nor so too very can could will would
+shall should may might must just only own same as up out off down here there also
+because while during before after between each few more most other some such any
+both all what when where which who whom whose how why
+""".split())
+
+
+def _content_tokens(s: str) -> set[str]:
+    """Distinctive lowercase tokens of a string.
+
+    Stopwords and 1-2 char words are dropped as collision-prone; 2-digit numbers
+    are KEPT because dates and counts are precisely the answer-bearing content on
+    TR/MR, while single digits are not distinctive enough to survive.
+    """
+    out = set()
+    for t in _TOKEN_RE.findall(_norm_text(s)):
+        if t in _STOPWORDS:
+            continue
+        if len(t) > 2 or (t.isdigit() and len(t) == 2):
+            out.add(t)
+    return out
+
+
+def _gold_tokens(ideal_answer: str, question: str) -> set[str]:
+    """Answer tokens that are NOT already in the question.
+
+    Load-bearing subtraction: retrieval selected these memories BY matching the
+    question, so every tier trivially "covers" question terms. Leaving them in
+    measures the retriever's input, not the tier's answer content -- the same
+    precision-without-selectivity error that closed E4's query-side range boost.
+    """
+    return _content_tokens(ideal_answer) - _content_tokens(question)
+
+
+def _answer_in_texts(answer: str, texts: list[str]) -> bool | None:
+    """One-directional containment of a SHORT gold answer in any of `texts`.
+
+    Returns None when the answer is too short to be distinctive. BEAM ideal
+    answers are frequently full sentences, for which containment is near-
+    impossible even when the tier carries the content -- so this is the
+    secondary measure here and `_tier_coverage` is the primary one.
+    """
+    a = _norm_text(answer)
+    if len(a) < _MIN_ANSWER_CHARS:
+        return None
+    return any(a in _norm_text(t) for t in texts if t and t.strip())
+
+
+def _tier_coverage(gold: set[str], texts: list[str]) -> float | None:
+    """Share of the answer's distinctive tokens present anywhere in a tier.
+
+    None (not 0.0) when the tier is empty or no gold token survived filtering:
+    "the tier was not retrieved" and "the tier was retrieved and carried nothing"
+    are different findings and must not share an encoding.
+    """
+    if not gold or not texts:
+        return None
+    seen: set[str] = set()
+    for t in texts:
+        if t and t.strip():
+            seen |= set(_TOKEN_RE.findall(_norm_text(t)))
+    if not seen:
+        return None
+    return round(len(gold & seen) / len(gold), 4)
+
+
+def episode_probe(memories: list[dict], question: str, ideal_answer: str) -> dict:
+    """Per-question, per-tier answer-bearing record. Purely additive: reads the
+    already-assembled `memories` list (so it measures what actually reached the
+    reader, post-slice) and changes nothing about the run."""
+    by_tier: dict[str, list[str]] = defaultdict(list)
+    for m in memories:
+        if isinstance(m, dict) and (m.get("content") or "").strip():
+            by_tier[m.get("type") or "?"].append(m["content"])
+
+    ep, msg = by_tier.get("episode", []), by_tier.get("message_hit", [])
+    gold = _gold_tokens(ideal_answer, question)
+    return {
+        # Fired-indicators: which tiers reached the reader at all.
+        "n_memories": len(memories),
+        "n_episodes": len(ep),
+        "n_messages": len(msg),
+        "n_procedures": len(by_tier.get("procedure", [])),
+        "n_fts": len(by_tier.get("fts_hit", [])),
+        "n_graph": len(by_tier.get("graph_fact", [])),
+        "n_recent": len(by_tier.get("recent", [])),
+        # Denominator, recorded so a coverage of None is readable as
+        # "no distinctive gold tokens" rather than an unexplained blank.
+        "n_gold_tokens": len(gold),
+        # PRIMARY measure + its positive control, same question, same tokens.
+        "cov_episodes": _tier_coverage(gold, ep),
+        "cov_messages": _tier_coverage(gold, msg),
+        # SECONDARY: LME-comparable containment, mostly None on long answers.
+        "gold_in_episodes": _answer_in_texts(ideal_answer, ep) if ep else None,
+        "gold_in_messages": _answer_in_texts(ideal_answer, msg) if msg else None,
+    }
+
+
+def print_episode_probe(all_results: list[dict]) -> None:
+    """Per-ability readout of the pre-check. The decision rule is written into
+    the output rather than left to the reader: episode coverage is only
+    interpretable relative to the message control on the same rows."""
+    rows = [(q["ability"], q.get("probe") or {})
+            for conv in all_results for q in conv["questions"]]
+    rows = [(a, p) for a, p in rows if p]
+    if not rows:
+        return
+
+    print()
+    print("=" * 80)
+    print("  EPISODE-TIER ANSWER-BEARING PRE-CHECK (Plan C)")
+    print("  cov = share of answer-specific tokens (question terms removed)")
+    print("  carried by the tier. msg column is the positive control.")
+    print("=" * 80)
+    print(f"  {'ability':<9}{'n':>4}{'ep>0':>6}{'cov_ep':>9}{'cov_msg':>9}"
+          f"{'ratio':>8}{'contain':>9}")
+    print("  " + "-" * 74)
+
+    def _pct(v, w=9):
+        return f"{'—':>{w}}" if v is None else f"{v*100:>{w-1}.1f}%"
+
+    def _num(v, w=8):
+        return f"{'—':>{w}}" if v is None else f"{v:>{w}.2f}"
+
+    for ability in sorted({a for a, _ in rows}) + ["ALL"]:
+        sel = rows if ability == "ALL" else [(a, p) for a, p in rows if a == ability]
+        n = len(sel)
+        ep_present = sum(1 for _, p in sel if p["n_episodes"] > 0)
+        ce = [p["cov_episodes"] for _, p in sel if p["cov_episodes"] is not None]
+        cm = [p["cov_messages"] for _, p in sel if p["cov_messages"] is not None]
+        gi = [p["gold_in_episodes"] for _, p in sel if p["gold_in_episodes"] is not None]
+        me = sum(ce) / len(ce) if ce else None
+        mm = sum(cm) / len(cm) if cm else None
+        ratio = (me / mm) if (me is not None and mm not in (None, 0)) else None
+        contain = (sum(gi) / len(gi)) if gi else None
+        sep = "  " + "-" * 74 + "\n" if ability == "ALL" else ""
+        print(f"{sep}  {ability:<9}{n:>4}{ep_present:>6}"
+              f"{_pct(me)}{_pct(mm)}{_num(ratio)}{_pct(contain)}")
+
+    print()
+    print("  Reading it: cov_msg at/near zero on a row means the MEASURE failed")
+    print("  there, not the tier -- discard the row rather than the hypothesis.")
+    print("  Episodes are answer-bearing on an ability only where cov_ep is")
+    print("  non-trivial AND the ratio is not far below 1. A near-zero cov_ep")
+    print("  under a healthy cov_msg reproduces the LME finding and closes")
+    print("  Plan C on score grounds for that ability.")
+
+
 # ── BEAM Dataset Loader ───────────────────────────────────────────────
 
 def load_beam_conversations(scales: list[str], max_conv: int = None) -> dict:
@@ -365,6 +553,14 @@ class HyMemAdapter:
         # shipped config is a pre-registered scored decision, not a side effect
         # of a default change.
         overrides["aggregation_nodes_enabled"] = False
+        # Same reasoning, one lever earlier: `episode_granularity_enabled`
+        # is under active decision (Plan C) and this adapter was the last
+        # unpinned default-config consumer of it. The pin matches the
+        # current default, so it changes nothing today -- that is the point.
+        # It means the pre-check below reads a KNOWN arm, and a future
+        # default flip cannot silently move BEAM off its baseline the way
+        # the aggregation flip nearly did.
+        overrides["episode_granularity_enabled"] = False
         cfg = HyMemConfig(
             root=self.db_path.parent,
             message_fts_top_k=15,  # raw message keyword hits — critical for BEAM
@@ -814,6 +1010,10 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
             "rubric": q["rubric"],
             "score": judge_result["score"],
             "scores": judge_result["scores"],
+            # Plan C pre-check. Additive record only -- computed from the
+            # already-returned `memories`, so it cannot affect the answer or
+            # the score, and it costs no extra call.
+            "probe": episode_probe(memories, question, q["ideal_answer"]),
         })
 
     return {
@@ -974,6 +1174,7 @@ def main():
         "sample_size": max_conv,
         "top_k": top_k,
     })
+    print_episode_probe(all_results)
 
     # Save — one file per run, so cross-run comparisons keep their metadata
     # (sample size, top_k, models) instead of each run clobbering the last.
