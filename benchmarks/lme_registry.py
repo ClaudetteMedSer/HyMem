@@ -51,8 +51,11 @@ FLAG_COLUMNS = [
     "value_supersession_enabled",  # NULL where never recorded
 ]
 # Config keys known to be *absent* in run JSONs even though they were
-# active: these are filled from `overrides` in the adapter, which never
-# made it into the config block.  Recorded as NULL so the gap is visible.
+# active: pre-6543ee6 runs never carried these in the config block; the guard
+# arms and all earlier rows fill them via `--set` only (NULL = not recorded).
+# Post-6543ee6 the adapter writes them into the config block at :2887, so
+# newer runs ingest without --set. Rows predating 6543ee6 stay NULL —
+# the gap is visible, not guessed.
 KNOWN_ABSENT = {"aggregation_nodes_enabled", "episode_granularity_enabled",
                 "value_supersession_enabled"}
 
