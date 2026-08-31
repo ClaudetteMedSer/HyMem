@@ -99,6 +99,11 @@ SPEC = {
     "patterns": ("beam-v*.json", "beam-*.json"),
     "excludes": ("latest", "comparison"),
     "kind_class": "beam",
+    # §6 stamp policy: beam stems carry no \\d{8}T\\d{6}Z stamp
+    # (beam-v14-preference-fix.json) -> recording NULL is the domain
+    # truth, not a defect.  Rejudge artifacts carry stamps (source +
+    # exec) and read the source date from their own rejudged_from.
+    "stamp_policy": "optional",
     "gap_label": "levers (facts/facts_extraction/embeddings/no_dream/aggregation)",
     "gap_note": (
         "SELECT COUNT(*) FROM runs WHERE facts IS NULL AND facts_extraction IS NULL "
@@ -132,11 +137,30 @@ def _beam_row(data: dict, path: Path) -> dict:
         scale = (cfg.get("scales") or [None])[0]
         eff_cfg = cfg
 
+    kind = _beam_kind(path.name)
+    # §6: stamp-derived dates.  Rejudge: source_date from rejudged_from,
+    # run_date = last stamp (rejudge exec); stats NULL (inherited-but-wrong
+    # is worse than missing).  Archive/variant: first stem stamp or NULL.
+    if kind == "rejudge":
+        src_date, exec_date = rr.rejudge_dates(
+            path.name, meta.get("rejudged_from") or "",
+            SPEC.get("stamp_policy", "optional"))
+        run_date = exec_date or str(data.get("date") or meta.get("date") or "")[:19]
+        source_date = src_date
+        total_tokens = None
+        elapsed_s = None
+    else:
+        run_date = str(data.get("date") or meta.get("date") or "")[:19]
+        source_date = rr.stem_source_date(
+            path.name, SPEC.get("stamp_policy", "optional"))
+        total_tokens = cfg.get("total_tokens")
+        elapsed_s = meta.get("elapsed_s") or cfg.get("elapsed_s")
+
     row = {c: None for c, _ in BEAM_COLUMNS}
     row["archive"] = path.name
-    row["kind"] = _beam_kind(path.name)
-    row["run_date"] = str(data.get("date") or meta.get("date") or "")[:19]
-    row["source_date"] = path.stem[:16]
+    row["kind"] = kind
+    row["run_date"] = run_date
+    row["source_date"] = source_date
     row["scale"] = scale
     row["sample"] = eff_cfg.get("sample") or (meta.get("sample") if meta else None)
     row["top_k"] = eff_cfg.get("top_k") or (meta.get("top_k") if meta else None)
@@ -157,8 +181,8 @@ def _beam_row(data: dict, path: Path) -> dict:
     row["count"] = cfg.get("count") or (meta.get("count") if meta else None)
     row["answer_calls"] = cfg.get("answer_calls") or (meta.get("answer_calls") if meta else None)
     row["judge_calls"] = cfg.get("judge_calls") or (meta.get("judge_calls") if meta else None)
-    row["total_tokens"] = cfg.get("total_tokens")
-    row["elapsed_s"] = meta.get("elapsed_s") or cfg.get("elapsed_s")
+    row["total_tokens"] = total_tokens
+    row["elapsed_s"] = elapsed_s
     row["extras"] = json_dumps({
         "config": data.get("config"),
         "metadata": data.get("metadata"),
@@ -175,6 +199,12 @@ def json_dumps(obj):
 
 _ROW_BUILDER = _beam_row
 _KIND = _beam_kind
+
+
+def _backfill(db_path=None):
+    spec = dict(SPEC)
+    spec["builder"] = _beam_row
+    return rr.cmd_backfill(spec, db_path=db_path)
 
 
 def _ingest(files, overrides=None, db_path=None):
@@ -254,6 +284,8 @@ def main():
     if cmd == "ingest":
         files, ov = _parse_set(sys.argv[2:])
         _ingest(files or None, ov)
+    elif cmd == "backfill":
+        _backfill()
     elif cmd == "record-doc":
         files, ov = _parse_set(sys.argv[2:])
         if not files:

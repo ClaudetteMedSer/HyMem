@@ -2356,6 +2356,7 @@ def _rejudge_run(args, api_key: str) -> None:
         return out
 
     new_rows: list[dict] = [None] * len(pq)
+    t0 = time.time()
     if args.workers > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -2373,6 +2374,7 @@ def _rejudge_run(args, api_key: str) -> None:
     orig_scores = compute_scores(
         [{**r, "correct": r.get("correct_original")} for r in new_rows])
     new_scores = compute_scores(new_rows)
+    elapsed = time.time() - t0
 
     print(f"\n{'─'*72}\nJUDGE DRIFT  ({orig_judge} → {args.judge_model})")
     print(f"  {'category':<26} {'orig':>7} {'rejudged':>9} {'Δpp':>7} {'n':>5}")
@@ -2387,13 +2389,24 @@ def _rejudge_run(args, api_key: str) -> None:
           f"net {len(to_right) - len(to_wrong):+d}   (re-judged {n_judged}/{len(new_rows)})")
 
     out = dict(run)
+    # §6.3 (2026-08-31): the rejudge artifact must carry its OWN date and
+    # stats — previously `out = dict(run)` inherited the source run's date,
+    # total_tokens and elapsed_s (registry row id=41: byte-identical to the
+    # source row id=42), so a reader could not tell the rejudge's cost from
+    # the run's cost.  The registry NULLs these columns for rejudge rows
+    # regardless; the artifact itself simply must not lie.
+    out["date"] = datetime.now(timezone.utc).isoformat()
     out["per_question"] = new_rows
     out["scores"] = {qtype: {"accuracy": round(d["accuracy"] * 100, 1), "count": d["count"]}
                      for qtype, d in new_scores.items()}
     cfg = dict(out.get("config", {}) or {})
     cfg.update({"rejudged_from": src.name, "rejudge_original_judge": orig_judge,
                 "judge_model": args.judge_model,
-                "judge_extra_body": getattr(args, "judge_extra_body_obj", None)})
+                "judge_extra_body": getattr(args, "judge_extra_body_obj", None),
+                "answer_calls": 0,
+                "judge_calls": judge_llm.call_count,
+                "total_tokens": judge_llm.total_tokens,
+                "elapsed_s": elapsed})
     out["config"] = cfg
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest = src.with_name(f"{src.stem}-rejudged-{args.judge_model.replace('/', '_')}-{stamp}.json")

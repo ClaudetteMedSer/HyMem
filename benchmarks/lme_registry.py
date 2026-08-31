@@ -25,6 +25,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
+try:  # package import (tests): benchmarks.run_registry
+    from . import run_registry as rr
+except (ImportError, ValueError):  # direct CLI: python benchmarks/lme_registry.py
+    import run_registry as rr
+
 DB = Path(os.environ.get("LME_REGISTRY_DB", "/home/node/.hermes/benchmarks/lme_runs.db"))
 BENCH_DIR = Path(os.environ.get("LME_BENCH_DIR", "/home/node/.hermes/benchmarks"))
 
@@ -73,8 +78,11 @@ CREATE TABLE IF NOT EXISTS runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     archive     TEXT UNIQUE NOT NULL,
     kind        TEXT NOT NULL DEFAULT 'archive',  -- archive | variant | rejudge
-    run_date    TEXT NOT NULL,          -- from JSON date field (UTC-ish ISO)
-    source_date TEXT NOT NULL,          -- archive file stem timestamp as provenance
+    run_date    TEXT NOT NULL,          -- from JSON date field (UTC-ish ISO);
+                                        -- rejudge rows: last stem stamp (exec)
+    source_date TEXT,              -- filename timestamp stamp (first
+                                        -- stamp / rejudged_from); NULL for
+                                        -- analyst-named variants (no stamp)
     -- flags (all NULL if not present in the run config block)
     auto_ability               INTEGER,
     no_dream                   INTEGER,
@@ -120,6 +128,17 @@ CREATE INDEX IF NOT EXISTS idx_runs_aggr ON runs(aggregation_nodes_enabled);
 def connect():
     con = sqlite3.connect(DB)
     con.executescript(SCHEMA)
+    # §6 migration (2026-08-31): source_date became nullable — NULL is the
+    # honest value where a stem carries no stamp (beam/locomo-style rows,
+    # analyst-renamed LME variants).  SQLite cannot drop a NOT NULL in
+    # place, so rebuild the table when the old constraint is present.
+    cols = {r[1]: r for r in con.execute("PRAGMA table_info(runs)")}
+    if cols.get("source_date") and cols["source_date"][3]:  # notnull flag
+        con.execute("ALTER TABLE runs RENAME TO runs_prestamp")
+        con.executescript(SCHEMA)
+        con.execute("INSERT INTO runs SELECT * FROM runs_prestamp")
+        con.execute("DROP TABLE runs_prestamp")
+        con.commit()
     return con
 
 
@@ -132,6 +151,38 @@ def _to_int(v):
         return int(v)
     except (TypeError, ValueError):
         return v
+
+
+# ---- stamp policy (§6, 2026-08-31) --------------------------------------
+# LME adapter-written names always carry a \\d{8}T\\d{6}Z stamp (archive +
+# rejudge): policy "required" — a missing stamp RAISES via the shared
+# helper.  A NULL there is a defect, not a domain fact (it would look
+# identical to a legitimately stamp-less beam/locomo row).  Analyst-renamed
+# variants (longmemeval-v2-hymem-additive.json, -auto-ability-fulldream.json)
+# carry no stamp by construction -> policy "optional", NULL recorded.
+STAMP_POLICY = {"archive": "required", "rejudge": "required", "variant": "optional"}
+
+
+def _stamp_fields(kind: str, archive: str, data: dict, cfg: dict):
+    """(run_date, source_date, total_tokens, elapsed_s) under §6 rules.
+
+    Rejudge: run_date = last stem stamp (rejudge exec; the artifact's own
+    date field is the SOURCE's date, inherited) or the artifact date fallback;
+    source_date = first stamp of rejudged_from (the source pointer); stats
+    = NULL (inherited-but-wrong is worse than missing).
+    Archive: run_date = artifact date; source_date = first stem stamp
+    (required policy -> raises if a stamp-bearing name lacks one).
+    Variant: same, optional policy (analyst labels may carry no stamp).
+    """
+    policy = STAMP_POLICY.get(kind, "optional")
+    if kind == "rejudge":
+        source_date, exec_date = rr.rejudge_dates(
+            archive, cfg.get("rejudged_from") or "", policy)
+        return (exec_date or str(data.get("date", ""))[:19],
+                source_date, None, None)
+    return (str(data.get("date", ""))[:19],
+            rr.stem_source_date(archive, policy),
+            cfg.get("total_tokens"), cfg.get("elapsed_s"))
 
 
 def ingest_file(con, path: Path, overrides: dict | None = None):
@@ -170,6 +221,9 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
     else:
         kind = "variant"
 
+    run_date, source_date, total_tokens, elapsed_s = _stamp_fields(
+        kind, archive, data, cfg)
+
     extras = {
         "config": cfg,
         "scores": scores,
@@ -180,8 +234,8 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
     prov = "recorded" if not overrides else "recorded + " + "; ".join(proven)
     row = (archive,
            kind,
-           str(data.get("date", ""))[:19],
-           path.stem[:16],
+           run_date,
+           source_date,
            _to_int(cfg.get("auto_ability")),
            _to_int(cfg.get("no_dream")),
            _to_int(cfg.get("permissive_default")),
@@ -211,8 +265,8 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
            _to_int(cfg.get("count")) or (overall.get("count") if isinstance(overall, dict) else None),
            cfg.get("answer_calls"),
            cfg.get("judge_calls"),
-           cfg.get("total_tokens"),
-           cfg.get("elapsed_s"),
+           total_tokens,
+           elapsed_s,
            prov,
            json.dumps(extras, default=str),
            )
@@ -289,6 +343,61 @@ def cmd_query(sql):
         print(" | ".join("-" if v is None else str(v) for v in r))
 
 
+def cmd_backfill(bench_dir=None):
+    """§6.4: recompute stamp-derived fields for EVERY row from its artifact
+    file; UPDATE where the value differs.  The read-back is a DIFF against
+    the pre-backfill values, not a spot check that new values parse — the
+    interesting failure is a row that changes when it shouldn't."""
+    con = connect()
+    bench = Path(bench_dir or BENCH_DIR)
+    rows = con.execute(
+        "SELECT id, archive, kind, run_date, source_date, total_tokens, "
+        "elapsed_s FROM runs ORDER BY id").fetchall()
+    changed, missing = [], []
+    for _id, archive, kind, cur_rd, cur_sd, cur_tt, cur_es in rows:
+        if kind == "doc":
+            continue
+        p = bench / archive
+        if not p.exists():
+            missing.append((_id, archive, "file not found"))
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:  # noqa: BLE001
+            missing.append((_id, archive, f"unreadable: {e}"))
+            continue
+        try:
+            cfg = dict(data.get("config") or {})
+            new_rd, new_sd, new_tt, new_es = _stamp_fields(kind, archive, data, cfg)
+        except ValueError as e:
+            missing.append((_id, archive, f"recompute failed: {e}"))
+            continue
+        diffs = []
+        if cur_rd != new_rd:
+            diffs.append(("run_date", cur_rd, new_rd))
+        if cur_sd != new_sd:
+            diffs.append(("source_date", cur_sd, new_sd))
+        if cur_tt != new_tt:
+            diffs.append(("total_tokens", cur_tt, new_tt))
+        if cur_es != new_es:
+            diffs.append(("elapsed_s", cur_es, new_es))
+        if not diffs:
+            continue
+        changed.append((_id, archive, kind, diffs))
+        con.execute(
+            "UPDATE runs SET run_date=?, source_date=?, total_tokens=?, "
+            "elapsed_s=? WHERE id=?",
+            (new_rd, new_sd, new_tt, new_es, _id))
+    con.commit()
+    print(f"backfill: {len(changed)} row(s) changed, {len(missing)} row(s) "
+          f"skipped (missing/unreadable/recompute-failed)")
+    for _id, archive, kind, diffs in changed:
+        for f, old, newv in diffs:
+            print(f"  id={_id} [{kind}] {archive} {f}: {old!r} -> {newv!r}")
+    for _id, archive, why in missing:
+        print(f"  id={_id} {archive}: SKIPPED ({why})")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -307,6 +416,8 @@ def main():
             else:
                 i += 1
         cmd_ingest(args or None, ov)  # noqa: E1123
+    elif cmd == "backfill":
+        cmd_backfill()
     elif cmd == "list":
         import argparse
         p = argparse.ArgumentParser()

@@ -171,6 +171,137 @@ def test_beam_record_doc_provenance(tmp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# §6 stamp semantics (2026-08-31)
+# ---------------------------------------------------------------------------
+
+def _make_beam_results(path: Path, date="2026-08-31T16:50:39.701802+00:00",
+                       **meta_extra):
+    """Dialect-C beam artifact with a stamped results_* filename (run A)."""
+    data = {
+        "metadata": {
+            "date": date,
+            "answer_model": "deepseek-chat",
+            "judge_model": "deepseek-chat",
+            "sample": 5,
+            "top_k": 10,
+            "elapsed_s": 5471.57,
+            "answer_calls": 160,
+            "judge_calls": 160,
+            **meta_extra,
+        },
+        "summary": {"100K": {"ABS": 1.0, "OVERALL": 0.51}},
+        "conversations": [],
+    }
+    path.write_text(json.dumps(data))
+    return path
+
+
+def test_beam_stampless_archive_source_date_null(tmp_db, tmp_path):
+    p = make_beam(tmp_path / "beam-v13-hymem.json")
+    benchmarks.beam_registry._ingest([p], db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    r = _row(con, p.name)
+    assert r[_cols(con).index("source_date")] is None
+
+
+def test_beam_stamped_archive_source_date_from_stamp(tmp_db, tmp_path):
+    p = _make_beam_results(tmp_path / "results_20260831T165039Z.json")
+    benchmarks.beam_registry._ingest([p], db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    idx = _cols(con)
+    r = _row(con, p.name)
+    assert r[idx.index("source_date")] == "20260831T165039Z"
+    assert r[idx.index("run_date")] == "2026-08-31T16:50:39"
+    assert r[idx.index("elapsed_s")] == pytest.approx(5471.57)  # own stats kept
+
+
+def test_beam_rejudge_dates_and_null_stats(tmp_db, tmp_path):
+    # Run B shape: stamped source pointer + exec stamp in the own stem.
+    p = _make_beam_results(
+        tmp_path / "results_20260831T165039Z-rejudged-deepseek-chat-20260831T200531Z.json",
+        date="2026-08-31T20:05:31.089405+00:00",
+        rejudged_from="results_20260831T165039Z.json",
+        judge_gold=True, a_date="2026-08-31T16:50:39.701802+00:00",
+        elapsed_s=290.9, answer_calls=0, judge_calls=161)
+    benchmarks.beam_registry._ingest([p], db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    idx = _cols(con)
+    r = _row(con, p.name)
+    assert r[idx.index("kind")] == "rejudge"
+    assert r[idx.index("source_date")] == "20260831T165039Z"  # source's stamp
+    assert r[idx.index("run_date")] == "20260831T200531Z"     # exec stamp
+    assert r[idx.index("total_tokens")] is None               # §6.2: NULL
+    assert r[idx.index("elapsed_s")] is None                  # §6.2: NULL
+
+
+def test_beam_rejudge_one_stamp_source_date_null(tmp_db, tmp_path):
+    # beam rejudge of a stamp-less v13-v16 source: the only stamp is the
+    # exec — source_date must NOT read the exec stamp as the source date.
+    p = _make_beam_results(
+        tmp_path / "beam-v16-mr-tr-fix-rejudged-deepseek-v4-flash-20260831T200531Z.json",
+        date="2026-08-31T20:05:31.089405+00:00",
+        rejudged_from="beam-v16-mr-tr-fix.json", judge_gold=True)
+    benchmarks.beam_registry._ingest([p], db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    idx = _cols(con)
+    r = _row(con, p.name)
+    assert r[idx.index("source_date")] is None
+    assert r[idx.index("run_date")] == "20260831T200531Z"
+
+
+def test_beam_backfill_diff_and_idempotence(tmp_db, tmp_path):
+    # Seed the DB with OLD-builder values (truncated stems, inherited stats)
+    # and check the read-back is a diff against pre-backfill values, that
+    # exactly the wrong fields flip, and that a second run changes nothing.
+    a = _make_beam_results(tmp_path / "results_20260831T165039Z.json")
+    b = _make_beam_results(
+        tmp_path / "results_20260831T165039Z-rejudged-deepseek-chat-20260831T200531Z.json",
+        date="2026-08-31T20:05:31.089405+00:00",
+        rejudged_from="results_20260831T165039Z.json",
+        judge_gold=True, a_date="2026-08-31T16:50:39.701802+00:00",
+        elapsed_s=290.9, answer_calls=0, judge_calls=161)
+    con = sqlite3.connect(tmp_db)
+    spec = dict(benchmarks.beam_registry.SPEC)
+    spec["builder"] = benchmarks.beam_registry._beam_row
+    benchmarks.run_registry.connect(spec, db_path=tmp_db).close()  # create schema
+    names = [c for c, _ in spec["columns"]] + ["flags_provenance", "extras"]
+    # old-style A row: truncated stem source_date, own meta run_date
+    con.execute(f"INSERT INTO runs ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                [a.name, "variant", "2026-08-31T16:50:39", "results_20260831",
+                 None] + [None] * (len(names) - 5))
+    con.execute(f"INSERT INTO runs ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                [b.name, "rejudge", "2026-08-31T20:05:31", "results_20260831",
+                 None] + [None] * (len(names) - 5))
+    con.commit()
+    con.close()
+
+    benchmarks.run_registry.cmd_backfill(spec, bench_dir=tmp_path, db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    idx = _cols(con)
+    ra = _row(con, a.name)
+    rb = _row(con, b.name)
+    # A: only source_date moved (run_date was already own-meta-derived)
+    assert ra[idx.index("source_date")] == "20260831T165039Z"
+    assert ra[idx.index("run_date")] == "2026-08-31T16:50:39"
+    assert ra[idx.index("elapsed_s")] == pytest.approx(5471.57)
+    # B: source_date fixed, run_date fixed to exec stamp, stats NULLed
+    assert rb[idx.index("source_date")] == "20260831T165039Z"
+    assert rb[idx.index("run_date")] == "20260831T200531Z"
+    assert rb[idx.index("total_tokens")] is None
+    assert rb[idx.index("elapsed_s")] is None
+    # Idempotence: a second backfill must not touch anything (the diff is
+    # against pre-backfill values; nothing should change a second time).
+    con.close()
+
+    benchmarks.run_registry.cmd_backfill(spec, bench_dir=tmp_path, db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    rb2 = _row(con, b.name)
+    assert rb2[idx.index("run_date")] == "20260831T200531Z"
+    assert rb2[idx.index("elapsed_s")] is None
+    con.close()
+
+
+# ---------------------------------------------------------------------------
 # LoCoMo
 # ---------------------------------------------------------------------------
 
@@ -256,3 +387,53 @@ def test_locomo_record_doc_idempotent(tmp_db, tmp_path):
     assert benchmarks.locomo_registry._record_doc(a, {"overall": 74.1}, db_path=tmp_db) == "skipped"
     con = sqlite3.connect(tmp_db)
     assert con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# §6 stamp semantics (2026-08-31)
+# ---------------------------------------------------------------------------
+
+def test_locomo_source_date_null_without_stamp(tmp_db, tmp_path):
+    p = make_locomo(tmp_path / "locomo_conv26_diag.json",
+                    rows=[{"category": 1, "correct": None}])
+    benchmarks.locomo_registry._ingest([p], db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    r = _row(con, p.name)
+    assert r[_cols(con).index("source_date")] is None
+
+
+def test_locomo_source_date_stamp_when_present(tmp_db, tmp_path):
+    p = make_locomo(tmp_path / "locomo_results_20260729T000000Z.json")
+    benchmarks.locomo_registry._ingest([p], db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    r = _row(con, p.name)
+    assert r[_cols(con).index("source_date")] == "20260729T000000Z"
+
+
+def test_locomo_backfill_diff_and_idempotence(tmp_db, tmp_path):
+    p = make_locomo(tmp_path / "locomo_conv26_diag.json",
+                    rows=[{"category": 1, "correct": None}])
+    con = sqlite3.connect(tmp_db)
+    spec = dict(benchmarks.locomo_registry.SPEC)
+    spec["builder"] = benchmarks.locomo_registry._locomo_row
+    benchmarks.run_registry.connect(spec, db_path=tmp_db).close()  # create schema
+    names = [c for c, _ in spec["columns"]] + ["flags_provenance", "extras"]
+    # old-builder row: truncated stem source_date
+    con.execute(f"INSERT INTO runs ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                [p.name, "diag", "", "locomo_conv26_di"] + [None] * (len(names) - 4))
+    con.commit()
+    con.close()
+
+    benchmarks.run_registry.cmd_backfill(
+        spec, bench_dir=tmp_path, db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    r = _row(con, p.name)
+    assert r[_cols(con).index("source_date")] is None
+    con.close()
+
+    # idempotent: second run must not touch the row
+    benchmarks.run_registry.cmd_backfill(spec, bench_dir=tmp_path, db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    r2 = _row(con, p.name)
+    assert r2[_cols(con).index("source_date")] is None
+    con.close()

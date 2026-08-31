@@ -87,6 +87,9 @@ SPEC = {
     "overrides": LOCOMO_OVERRIDES,
     "patterns": ("locomo*.json", "locomo-*.json"),
     "excludes": ("recovery_probe_", "planD_", "locomo_stores"),
+    # §6 stamp policy: locomo stems carry no \\d{8}T\\d{6}Z stamp
+    # (locomo_conv26_diag.json) -> NULL is the domain truth, not a defect.
+    "stamp_policy": "optional",
     "gap_label": "flags (the adapter records none of them in --out files)",
     "gap_note": (
         "SELECT COUNT(*) FROM runs WHERE sample IS NULL AND top_k IS NULL "
@@ -111,7 +114,9 @@ def _locomo_row(data, path: Path) -> dict:
     row = {c: None for c, _ in LOCOMO_COLUMNS}
     row["archive"] = path.name
     row["kind"] = _locomo_kind(path.name)
-    row["source_date"] = path.stem[:16]
+    # §6: stamp-derived source date (NULL when the stem carries none).
+    row["source_date"] = rr.stem_source_date(
+        path.name, SPEC.get("stamp_policy", "optional"))
     if isinstance(data, dict):  # probe artifacts / metadata wrappers
         row["run_date"] = str(data.get("date", ""))[:19]
         rows = data.get("results") or data.get("rows") or []
@@ -147,6 +152,12 @@ def _locomo_row(data, path: Path) -> dict:
         "keys": sorted(rows[0].keys()) if isinstance(rows, list) and rows else [],
     }, default=str)
     return row
+
+
+def _backfill(db_path=None):
+    spec = dict(SPEC)
+    spec["builder"] = _locomo_row
+    return rr.cmd_backfill(spec, db_path=db_path)
 
 
 def _ingest(files, overrides=None, db_path=None):
@@ -227,6 +238,8 @@ def main():
     if cmd == "ingest":
         files, ov = _parse_set(sys.argv[2:])
         _ingest(files or None, ov)
+    elif cmd == "backfill":
+        _backfill()
     elif cmd == "record-doc":
         files, ov = _parse_set(sys.argv[2:])
         if not files:
