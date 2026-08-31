@@ -33,12 +33,18 @@ pytest.importorskip("requests")
 _BENCH = Path(__file__).resolve().parent.parent / "benchmarks"
 sys.path.insert(0, str(_BENCH))
 from beam_adapter import (  # noqa: E402
+    ABILITY_MAP,
+    GOLD_FIELDS,
     PROBE_CONTROL_SHARE,
     PROBE_MIN_ROWS,
     PROBE_NULL_MARGIN,
     _content_tokens,
+    PROBE_GOLD_KINDS,
     _decoy_answer,
     _gold_tokens,
+    _probe_gold,
+    _resolve_gold,
+    print_gold_audit,
     _probe_verdict,
     _tier_coverage,
     episode_probe,
@@ -207,9 +213,9 @@ def test_the_null_fires_on_shared_vocabulary_and_stays_below_the_signal():
 
 def test_a_decoy_is_drawn_from_the_same_conversation_preferring_the_ability():
     questions = [
-        {"ability_short": "EO", "ideal_answer": "first A then B"},
-        {"ability_short": "IE", "ideal_answer": "the answer is C"},
-        {"ability_short": "EO", "ideal_answer": "first D then E"},
+        {"ability_short": "EO", "gold_text": "first A then B", "gold_kind": "response"},
+        {"ability_short": "IE", "gold_text": "the answer is C", "gold_kind": "response"},
+        {"ability_short": "EO", "gold_text": "first D then E", "gold_kind": "response"},
     ]
     assert _decoy_answer(questions, 0) == "first D then E"   # same ability
     assert _decoy_answer(questions, 1) in {"first A then B", "first D then E"}
@@ -303,3 +309,115 @@ def test_the_pooled_row_emits_no_verdict(capsys):
                 if ln.strip().startswith(("EO", "SUM", "ALL"))}
     assert verdicts["EO"] == "YES" and verdicts["SUM"] == "no"
     assert verdicts["ALL"] == "—"
+
+
+# ── the gold-field map ─────────────────────────────────────────────
+# BEAM keys the gold answer differently per ability. The old parse
+# (`q.get("ideal_response", q.get("ideal_answer", ""))`) resolved for 2 of 10
+# and returned "" for the rest, so the coverage probe had no denominator on
+# the abilities it exists to measure and the judge received an empty IDEAL
+# ANSWER field. The failure was silent because a lookup that could not find
+# its value returned a value anyway, and nothing asked whether it was real.
+
+def test_every_ability_has_a_gold_field():
+    """The map must be exhaustive over the abilities the adapter can emit --
+    a missing entry is how eight of them went three months without gold."""
+    covered = {ABILITY_MAP[a] for a in GOLD_FIELDS if a in ABILITY_MAP}
+    assert covered == set(ABILITY_MAP.values()), (
+        f"abilities with no GOLD_FIELDS entry: "
+        f"{set(ABILITY_MAP.values()) - covered}")
+
+
+@pytest.mark.parametrize("ability,field,kind", [
+    ("abstention", "ideal_response", "response"),
+    ("event_ordering", "answer", "response"),
+    ("summarization", "ideal_summary", "summary"),
+    ("instruction_following", "expected_compliance", "compliance_spec"),
+])
+def test_gold_resolves_from_the_ability_s_own_field(ability, field, kind):
+    text, got_kind = _resolve_gold({field: "the gold text"}, ability)
+    assert (text, got_kind) == ("the gold text", kind)
+
+
+def test_missing_gold_is_kind_none_not_an_empty_answer():
+    """"" as a gold answer is indistinguishable from a real empty one. The
+    kind carries the difference so downstream can check it."""
+    assert _resolve_gold({"question": "q"}, "event_ordering") == ("", "none")
+
+
+def test_a_map_miss_recovers_loudly_rather_than_silently(capsys):
+    text, kind = _resolve_gold({"ideal_summary": "recovered"}, "event_ordering")
+    assert text == "recovered"
+    out = capsys.readouterr().out
+    assert "gold-field map miss" in out and "event_ordering" in out
+
+
+def test_compliance_specs_are_never_probe_gold():
+    """A spec describes what an answer must DO. Scoring tier coverage against
+    it measures the spec's vocabulary, which is a different quantity."""
+    assert "compliance_spec" not in PROBE_GOLD_KINDS
+    spec = {"gold_text": "must mention the deadline", "gold_kind": "compliance_spec"}
+    real = {"gold_text": "the deadline is April 5", "gold_kind": "response"}
+    assert _probe_gold(spec) == ""
+    assert _probe_gold(real) == "the deadline is April 5"
+
+
+def test_the_probe_has_a_denominator_on_an_event_ordering_question():
+    """The regression test for the whole defect: before the map, an EO question
+    parsed to "" and every coverage number on it was None for lack of gold."""
+    q = {"ability": "event_ordering",
+         "answer": "First the schema migration, then the aggregation rebuild."}
+    text, kind = _resolve_gold(q, "event_ordering")
+    probe = episode_probe([_ANSWER_BEARING], QUESTION,
+                          _probe_gold({"gold_text": text, "gold_kind": kind}))
+    assert probe["n_gold_tokens"] > 0
+    assert probe["cov_episodes"] is not None
+
+
+def test_decoys_are_only_drawn_from_questions_with_usable_gold():
+    questions = [
+        {"ability_short": "EO", "gold_text": "a", "gold_kind": "response"},
+        {"ability_short": "IF", "gold_text": "spec", "gold_kind": "compliance_spec"},
+        {"ability_short": "EO", "gold_text": "real gold", "gold_kind": "response"},
+    ]
+    assert _decoy_answer(questions, 0) == "real gold"
+    # The compliance-spec row is not a usable decoy for anyone.
+    assert _decoy_answer(questions, 1) in {"a", "real gold"}
+
+
+def test_the_gold_audit_names_abilities_with_no_gold(capsys):
+    conversations = {"100K": [{"questions": [
+        {"ability_short": "EO", "gold_text": "", "gold_kind": "none"},
+        {"ability_short": "ABS", "gold_text": "yes", "gold_kind": "response"},
+    ]}]}
+    print_gold_audit(conversations)
+    out = capsys.readouterr().out
+    assert "MISSING" in out and "WARNING" in out
+    assert "EO" in out
+
+
+def test_the_judge_s_field_is_unchanged_by_the_probe_fix():
+    """The parse fix must not silently repoint the judge.
+
+    Feeding the judge real gold changes what every BEAM score MEANS -- post-fix
+    runs stop being comparable to v13-v16 -- so it is gated behind --judge-gold
+    and pre-registered separately. Here the two fields must DIFFER on an EO
+    question: `gold_text` resolves, `ideal_answer` stays empty exactly as it
+    was for the runs already in the record.
+    """
+    from beam_adapter import _parse_sample
+
+    sample = {
+        "conversation_id": "c1",
+        "chat": [[{"role": "user", "content": "hi", "time_anchor": None}]],
+        "probing_questions": {
+            "event_ordering": [
+                {"question": "in what order?", "answer": "first A then B",
+                 "rubric": ["mentions A before B"]},
+            ],
+        },
+    }
+    q = _parse_sample(sample, "100K", 0)["questions"][0]
+    assert q["gold_text"] == "first A then B"
+    assert q["gold_kind"] == "response"
+    assert q["ideal_answer"] == ""      # the judge's input, deliberately untouched

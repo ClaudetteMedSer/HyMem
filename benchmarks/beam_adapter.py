@@ -150,6 +150,76 @@ ABILITY_MAP = {
     "summarization": "SUM",
 }
 
+# BEAM stores the gold answer under a DIFFERENT key per ability, and behind
+# those keys sit three different KINDS of gold. `_parse_sample` used to read
+# `q.get("ideal_response", q.get("ideal_answer", ""))`, which resolved for
+# abstention and contradiction_resolution and silently produced "" for the
+# other EIGHT -- including EO and SUM. Empty gold has been reaching the judge
+# as `IDEAL ANSWER: ` (an empty LABELLED field, which asserts the ideal answer
+# is blank rather than omitting it) since 145eff8, 2026-06-02.
+#
+# The field names were the symptom. The defect was the `""` default: a lookup
+# that cannot find its value returned a value anyway, and nothing downstream
+# asked whether it was real. So the map is explicit, exhaustively tested
+# against ABILITY_MAP, and misses are LOUD.
+#
+# The kinds are tracked because they are not interchangeable:
+#   response       -- an answer to the question. Usable as probe gold.
+#   summary        -- a gold summary. Usable as probe gold.
+#   compliance_spec-- a description of what a correct answer must DO, not an
+#                     answer. Scoring a tier's coverage against it measures
+#                     whether the tier carries the SPEC's vocabulary, which is
+#                     a different quantity; it is recorded and excluded rather
+#                     than quietly pooled with the other two.
+GOLD_FIELDS = {
+    "abstention":               ("ideal_response", "response"),
+    "contradiction_resolution": ("ideal_answer", "response"),
+    "event_ordering":           ("answer", "response"),
+    "information_extraction":   ("answer", "response"),
+    "knowledge_update":         ("answer", "response"),
+    "multi_session_reasoning":  ("answer", "response"),
+    "temporal_reasoning":       ("answer", "response"),
+    "summarization":            ("ideal_summary", "summary"),
+    "instruction_following":    ("expected_compliance", "compliance_spec"),
+    "preference_following":     ("expected_compliance", "compliance_spec"),
+}
+# Kinds the coverage probe may use as gold. compliance_spec is deliberately out.
+PROBE_GOLD_KINDS = frozenset({"response", "summary"})
+
+_ALL_GOLD_KEYS = ("ideal_response", "ideal_answer", "answer", "ideal_summary",
+                  "expected_compliance", "gold_answer", "response")
+_gold_warnings: set = set()
+
+
+def _resolve_gold(q: dict, ability: str) -> tuple[str, str]:
+    """(text, kind) for one question, loudly rather than silently.
+
+    A miss falls back to scanning every known key -- not to paper over the map,
+    but so the WARN names the keys the row actually has. A row that resolves to
+    nothing returns kind "none", which is a value the probe and the gold audit
+    both check for; it is never an empty string standing in for an answer.
+    """
+    field, kind = GOLD_FIELDS.get(ability, (None, None))
+    if field:
+        text = (q.get(field) or "")
+        if isinstance(text, (list, tuple)):
+            text = " ".join(str(t) for t in text)
+        if str(text).strip():
+            return str(text), kind
+    present = [k for k in _ALL_GOLD_KEYS if str(q.get(k) or "").strip()]
+    if present:
+        recovered = str(q.get(present[0]))
+        warn = (ability, field, present[0])
+        if warn not in _gold_warnings:
+            _gold_warnings.add(warn)
+            print(f"  WARN gold-field map miss: ability={ability!r} expected "
+                  f"{field!r}, recovered from {present[0]!r}. Update "
+                  f"GOLD_FIELDS -- a recovered field's KIND is a guess.",
+                  flush=True)
+        return recovered, (kind or "unknown")
+    return "", "none"
+
+
 PUBLISHED_SOTA = {
     "100K": {"Hindsight": 73.4, "Honcho": 63.0, "Mnemosyne v3": 65.2, "LIGHT": 35.8, "RAG": 32.3},
     "500K": {"Hindsight": 71.1, "Honcho": 64.9, "LIGHT": 35.9, "RAG": 33.0},
@@ -349,6 +419,13 @@ PROBE_NULL_MARGIN = 2.0   # cov_ep must be >= 2x its own shuffled null
 PROBE_CONTROL_SHARE = 0.5 # cov_ep must be >= 0.5x the message control
 
 
+def _probe_gold(q: dict) -> str:
+    """Gold text the coverage probe may use, or "" if this ability has none of
+    a usable KIND. Gated on PROBE_GOLD_KINDS so a compliance_spec can never
+    silently become the denominator of a coverage number."""
+    return q.get("gold_text", "") if q.get("gold_kind") in PROBE_GOLD_KINDS else ""
+
+
 def _decoy_answer(questions: list[dict], qi: int) -> str:
     """Another question's ideal answer from the SAME conversation.
 
@@ -361,11 +438,13 @@ def _decoy_answer(questions: list[dict], qi: int) -> str:
     """
     mine = questions[qi]
     same = [q for j, q in enumerate(questions)
-            if j != qi and q.get("ability_short") == mine.get("ability_short")]
-    pool = same or [q for j, q in enumerate(questions) if j != qi]
+            if j != qi and q.get("ability_short") == mine.get("ability_short")
+            and _probe_gold(q)]
+    pool = same or [q for j, q in enumerate(questions)
+                    if j != qi and _probe_gold(q)]
     if not pool:
         return ""
-    return pool[qi % len(pool)].get("ideal_answer", "") or ""
+    return _probe_gold(pool[qi % len(pool)])
 
 
 def _probe_verdict(n_pair: int, cov_ep, cov_msg, null_ep, null_msg) -> str:
@@ -579,6 +658,44 @@ def _parse_time_anchor(raw: str | None) -> str | None:
     return None
 
 
+def print_gold_audit(conversations: dict) -> None:
+    """Per-ability gold coverage, printed BEFORE any question is scored.
+
+    This is the check whose absence let empty gold run for three months: the
+    parse produced "" for 8 of 10 abilities and nothing ever asked whether a
+    gold answer was actually there. A count of zero is now impossible to miss,
+    and it is printed for every run rather than only when something looks wrong
+    -- a check that only runs on suspicion is a check nobody runs.
+    """
+    stats: dict = defaultdict(lambda: [0, 0, set()])
+    for convs in conversations.values():
+        for conv in convs:
+            for q in conv["questions"]:
+                row = stats[q["ability_short"]]
+                row[0] += 1
+                if str(q.get("gold_text") or "").strip():
+                    row[1] += 1
+                row[2].add(q.get("gold_kind", "none"))
+    if not stats:
+        return
+    print()
+    print("  Gold-answer coverage by ability (GOLD_FIELDS resolution):")
+    empty = []
+    for ability in sorted(stats):
+        n, have, kinds = stats[ability]
+        kind = "/".join(sorted(kinds))
+        flag = "" if have == n else "   <-- MISSING"
+        if have < n:
+            empty.append(ability)
+        print(f"    {ability:<5} {have:>4}/{n:<4} {kind:<16}{flag}")
+    if empty:
+        print(f"  WARNING: {', '.join(empty)} have questions with NO gold text. "
+              f"The coverage probe has no denominator there and reports n-a; "
+              f"check GOLD_FIELDS against the dataset before reading any "
+              f"verdict.", flush=True)
+    print()
+
+
 def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
     all_messages = []
     chat = sample.get("chat", [])
@@ -614,12 +731,21 @@ def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
         if isinstance(questions, list):
             for q in questions:
                 if isinstance(q, dict):
+                    _gold = _resolve_gold(q, ability)
                     all_questions.append({
                         "ability": ability,
                         "ability_short": ABILITY_MAP.get(ability, ability[:3].upper()),
                         "question_id": q.get("question_id") or q.get("id") or "",
                         "question": q.get("question", ""),
-                        "ideal_answer": q.get("ideal_response", q.get("ideal_answer", "")),
+                        # `ideal_answer` intentionally keeps the ORIGINAL
+                        # (mostly empty) parse, because it is what the judge
+                        # reads: repointing the judge changes what every BEAM
+                        # score MEANS and is a separate pre-registered decision
+                        # (--judge-gold), not a side effect of fixing the probe.
+                        "ideal_answer": q.get("ideal_response",
+                                              q.get("ideal_answer", "")),
+                        "gold_text": _gold[0],
+                        "gold_kind": _gold[1],
                         "rubric": q.get("rubric", []),
                     })
 
@@ -1069,7 +1195,7 @@ def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_ans
 
 # ── Evaluation ───────────────────────────────────────────────────────
 
-def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter,
+def evaluate_conversation(judge_gold: bool, llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter,
                           conv: dict, top_k: int) -> dict:
     conv_id = conv["id"]
     scale = conv["scale"]
@@ -1111,7 +1237,13 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
                                  narrative_facts=narrative_facts)
 
         # Judge
-        judge_result = judge_answer(judge_llm, question, q["ideal_answer"], q["rubric"], answer)
+        # Default keeps the ORIGINAL (mostly empty) gold so this run stays
+        # comparable to v13-v16. --judge-gold is the pre-registered switch: it
+        # changes what the score MEANS, so post-flip runs need a fresh baseline
+        # and the old canonical retires as a comparison point rather than
+        # reading as a regression or an improvement.
+        _judge_ideal = q.get("gold_text", "") if judge_gold else q["ideal_answer"]
+        judge_result = judge_answer(judge_llm, question, _judge_ideal, q["rubric"], answer)
         print(f"      Score: {judge_result['score']:.2f}")
 
         results.append({
@@ -1125,7 +1257,8 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
             # Plan C pre-check. Additive record only -- computed from the
             # already-returned `memories`, so it cannot affect the answer or
             # the score, and it costs no extra call.
-            "probe": episode_probe(memories, question, q["ideal_answer"],
+            "gold_kind": q.get("gold_kind", "none"),
+            "probe": episode_probe(memories, question, _probe_gold(q),
                                    _decoy_answer(conv["questions"], qi)),
         })
 
@@ -1208,6 +1341,14 @@ def main():
                         help="E1 WRITE side (cfg.facts_extraction_enabled). None = config "
                              "default (ON). Changes what the dream STORES, so it only "
                              "differs on a fresh store — not a read-side A/B knob.")
+    parser.add_argument("--judge-gold", action="store_true",
+                        help="Feed the judge the REAL per-ability gold answer "
+                             "(GOLD_FIELDS) instead of the legacy parse, which "
+                             "resolved for 2 of 10 abilities and sent an empty "
+                             "IDEAL ANSWER field for the rest from 145eff8 "
+                             "onward. This changes what every BEAM score means: "
+                             "runs with it on are NOT comparable to v13-v16 and "
+                             "need their own baseline.")
     parser.add_argument("--keep-db", action="store_true")
     args = parser.parse_args()
 
@@ -1260,7 +1401,8 @@ def main():
     conversations = load_beam_conversations(scales, max_conv)
     total_convs = sum(len(v) for v in conversations.values())
     total_questions = sum(len(c["questions"]) for v in conversations.values() for c in v)
-    print(f"  Total: {total_convs} conversations, {total_questions} questions\n")
+    print(f"  Total: {total_convs} conversations, {total_questions} questions")
+    print_gold_audit(conversations)
 
     # Evaluate
     all_results = []
@@ -1272,7 +1414,8 @@ def main():
         print(f"Evaluating {scale} ({len(conversations[scale])} conversations)...", flush=True)
         for ci, conv in enumerate(conversations[scale]):
             print(f"  [{ci+1}/{len(conversations[scale])}] Conv {conv['id']}", flush=True)
-            result = evaluate_conversation(answer_llm, judge_llm, hy, conv, top_k)
+            result = evaluate_conversation(args.judge_gold, answer_llm, judge_llm,
+                                           hy, conv, top_k)
             all_results.append(result)
             print()
 
