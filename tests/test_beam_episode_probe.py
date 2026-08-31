@@ -421,3 +421,22 @@ def test_the_judge_s_field_is_unchanged_by_the_probe_fix():
     assert q["gold_text"] == "first A then B"
     assert q["gold_kind"] == "response"
     assert q["ideal_answer"] == ""      # the judge's input, deliberately untouched
+
+
+def test_no_usable_gold_is_labelled_apart_from_too_few_rows(capsys):
+    """IF/PF are 0 paired rows at EVERY sample size, by design. Reporting that
+    as n-a invites "raise --sample", which chases a number that cannot move."""
+    spec_row = episode_probe([_NARRATIVE, _mem("message_hit", "x")],
+                             QUESTION, "", DECOY)          # excluded gold kind
+    no_episodes = episode_probe([_mem("message_hit", "x")], QUESTION, IDEAL, DECOY)
+    assert spec_row["n_gold_tokens"] == 0
+
+    print_episode_probe([{"questions": [
+        {"ability": "IF", "probe": spec_row},
+        {"ability": "IE", "probe": no_episodes},
+    ]}])
+    decision = capsys.readouterr().out.split("ability     n")[0].splitlines()
+    verdicts = {ln.split()[0]: ln.split()[-1] for ln in decision
+                if ln.strip().startswith(("IF", "IE"))}
+    assert verdicts["IF"] == "no-gold"    # cannot be fixed by more sampling
+    assert verdicts["IE"] == "n-a"        # can

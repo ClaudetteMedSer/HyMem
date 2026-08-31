@@ -572,12 +572,20 @@ def print_episode_probe(all_results: list[dict]) -> None:
         ne = _mean([p["cov_episodes_null"] for p in pair])
         nm = _mean([p["cov_messages_null"] for p in pair])
         ratio = (me / mm) if (me is not None and mm not in (None, 0)) else None
+        # "No usable gold" is not "too few rows". IF/PF carry compliance_spec,
+        # which is deliberately excluded from PROBE_GOLD_KINDS, so their pair
+        # count is 0 by DESIGN and will be 0 at every sample size. Printing that
+        # as n-a invites the reading "underpowered, raise --sample", which would
+        # be chasing a number that cannot move. Distinguished by the rows
+        # themselves: no gold tokens anywhere, as opposed to no episodes.
+        no_gold = bool(sel) and all(p["n_gold_tokens"] == 0 for _, p in sel)
         # No verdict on the pooled row. The rule is per-ability by design, and
         # pooling abilities with different answer SHAPES can clear every
         # criterion while its own components disagree -- a synthetic run with
         # EO=YES and SUM=no pooled to YES. A number that can contradict all of
         # its parts is not a summary of them, and it would get quoted.
         verdict = ("—" if ability == "ALL"
+                   else "no-gold" if no_gold
                    else _probe_verdict(len(pair), me, mm, ne, nm))
         sep = "  " + "-" * 74 + "\n" if ability == "ALL" else ""
         print(f"{sep}  {ability:<8}{len(pair):>5}{_pct(me)}{_pct(ne)}"
@@ -611,6 +619,9 @@ def print_episode_probe(all_results: list[dict]) -> None:
     print("                    not the hypothesis.")
     print("  n-a            -> too few paired rows to be a result. Raise --sample;")
     print("                    do not read the numbers next to it.")
+    print("  no-gold        -> no usable gold on this ability (IF/PF carry a")
+    print("                    compliance spec, excluded by design). Not a power")
+    print("                    problem: --sample cannot move it.")
 
 
 # ── BEAM Dataset Loader ───────────────────────────────────────────────
