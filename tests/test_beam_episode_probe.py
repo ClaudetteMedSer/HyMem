@@ -48,6 +48,7 @@ from beam_adapter import (  # noqa: E402
 QUESTION = "What order did the user complete the migration milestones in?"
 IDEAL = ("The user first drafted the schema migration, then benchmarked the "
          "aggregation rebuild, and finally flipped the granularity default.")
+DECOY = "The user reviewed timings and discussed configuration options at length."
 
 
 def _mem(tier: str, content: str) -> dict:
@@ -245,22 +246,60 @@ def test_the_thresholds_are_the_pre_registered_ones():
 
 # ── the control has to be a SAME-ROW control ───────────────────────
 
-def test_ratio_uses_only_rows_where_both_columns_exist(capsys):
-    """Averaging two independently-filtered columns compares different question
-    sets and calls it a ratio. Rows without episodes must not lift cov_msg."""
-    with_both = episode_probe(
+def test_verdict_rows_are_fully_measured(capsys):
+    """Every number the verdict reads must come from ONE row set.
+
+    Averaging two independently-filtered columns compares different question
+    sets and calls it a ratio -- and the same applies to a column against its
+    own chance floor, which sits inside the decision rule rather than beside it.
+    """
+    both = episode_probe(
         [_NARRATIVE, _mem("message_hit", "drafted schema, benchmarked "
                           "aggregation rebuild, flipped granularity default")],
-        QUESTION, IDEAL)
+        QUESTION, IDEAL, decoy_answer=DECOY)
     msg_only = episode_probe(
-        [_mem("message_hit", "totally unrelated chatter")], QUESTION, IDEAL)
-    assert msg_only["cov_episodes"] is None  # would be dropped from cov_ep only
+        [_mem("message_hit", "totally unrelated chatter")], QUESTION, IDEAL,
+        decoy_answer=DECOY)
+    no_null = episode_probe(          # single-question conversation: no decoy
+        [_NARRATIVE, _mem("message_hit", "drafted schema")], QUESTION, IDEAL)
+
+    assert msg_only["cov_episodes"] is None
+    assert no_null["cov_episodes_null"] is None
 
     print_episode_probe([{"questions": [
-        {"ability": "EO", "probe": with_both},
-        {"ability": "EO", "probe": msg_only},
+        {"ability": "EO", "probe": both},
+        {"ability": "EO", "probe": msg_only},   # dropped: no episode coverage
+        {"ability": "EO", "probe": no_null},    # dropped: no chance floor
     ]}])
     out = capsys.readouterr().out
-    # One paired row, not two: the msg-only row is excluded from BOTH columns.
-    eo = next(ln for ln in out.splitlines() if ln.strip().startswith("EO"))
+    decision = out.split("ability     n")[0]
+    eo = next(ln for ln in decision.splitlines() if ln.strip().startswith("EO"))
     assert eo.split()[1] == "1"
+    # ... while the secondary table still reports all three raw rows, so the
+    # gap between "questions asked" and "questions the verdict rests on" is
+    # visible rather than silently absorbed.
+    secondary = out.split("ability     n")[1]
+    eo2 = next(ln for ln in secondary.splitlines() if ln.strip().startswith("EO"))
+    assert eo2.split()[1] == "3"
+
+
+def test_the_pooled_row_emits_no_verdict(capsys):
+    """Pooling abilities can clear every criterion while its components
+    disagree, so ALL reports numbers and withholds a decision."""
+    ep_good = _mem("episode", "drafted schema, benchmarked aggregation "
+                              "rebuild, flipped granularity default")
+    msg = _mem("message_hit", "drafted schema, benchmarked aggregation "
+                              "rebuild, flipped granularity default")
+    questions = (
+        [{"ability": "EO", "probe": episode_probe([ep_good, msg], QUESTION,
+                                                  IDEAL, DECOY)}
+         for _ in range(PROBE_MIN_ROWS + 2)]
+        + [{"ability": "SUM", "probe": episode_probe([_NARRATIVE, msg], QUESTION,
+                                                     IDEAL, DECOY)}
+           for _ in range(PROBE_MIN_ROWS + 1)])
+    print_episode_probe([{"questions": questions}])
+    decision = capsys.readouterr().out.split("ability     n")[0].splitlines()
+    verdicts = {ln.split()[0]: ln.split()[-1] for ln in decision
+                if ln.strip().startswith(("EO", "SUM", "ALL"))}
+    assert verdicts["EO"] == "YES" and verdicts["SUM"] == "no"
+    assert verdicts["ALL"] == "—"

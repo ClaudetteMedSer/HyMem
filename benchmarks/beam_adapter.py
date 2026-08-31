@@ -370,6 +370,8 @@ def _decoy_answer(questions: list[dict], qi: int) -> str:
 
 def _probe_verdict(n_pair: int, cov_ep, cov_msg, null_ep, null_msg) -> str:
     """The pre-registered rule, executed. Returns YES / no / INVALID / n-a."""
+    # The None guards are belt-and-braces: the readout hands this only
+    # fully-measured row sets. They stay because this is also called directly.
     if n_pair < PROBE_MIN_ROWS or cov_ep is None or cov_msg is None:
         return "n-a"
     # Control sanity first: if the message tier cannot beat its own chance
@@ -475,19 +477,29 @@ def print_episode_probe(all_results: list[dict]) -> None:
 
     for ability in sorted({a for a, _ in rows}) + ["ALL"]:
         sel = rows if ability == "ALL" else [(a, p) for a, p in rows if a == ability]
-        # PAIRED rows only. A control is only a control on the rows it shares
-        # with the thing it controls; averaging two independently-filtered
-        # columns compares different question sets and calls it a ratio.
-        pair = [p for _, p in sel
-                if p["cov_episodes"] is not None and p["cov_messages"] is not None]
+        # FULLY-MEASURED rows only: all four numbers the verdict reads, on one
+        # identical row set. A control is only a control on the rows it shares
+        # with the thing it controls, and that applies to a column against its
+        # own chance floor exactly as it applies to the ep/msg ratio -- the
+        # floor is IN the decision rule, so a floor averaged over a different
+        # subset than the coverage it gates is the same defect somewhere worse.
+        # Rows short a decoy (single-question conversation) or short distinctive
+        # decoy tokens therefore drop out entirely rather than partially.
+        keys = ("cov_episodes", "cov_messages", "cov_episodes_null",
+                "cov_messages_null")
+        pair = [p for _, p in sel if all(p[k] is not None for k in keys)]
         me = _mean([p["cov_episodes"] for p in pair])
         mm = _mean([p["cov_messages"] for p in pair])
-        ne = _mean([p["cov_episodes_null"] for p in pair
-                    if p["cov_episodes_null"] is not None])
-        nm = _mean([p["cov_messages_null"] for p in pair
-                    if p["cov_messages_null"] is not None])
+        ne = _mean([p["cov_episodes_null"] for p in pair])
+        nm = _mean([p["cov_messages_null"] for p in pair])
         ratio = (me / mm) if (me is not None and mm not in (None, 0)) else None
-        verdict = _probe_verdict(len(pair), me, mm, ne, nm)
+        # No verdict on the pooled row. The rule is per-ability by design, and
+        # pooling abilities with different answer SHAPES can clear every
+        # criterion while its own components disagree -- a synthetic run with
+        # EO=YES and SUM=no pooled to YES. A number that can contradict all of
+        # its parts is not a summary of them, and it would get quoted.
+        verdict = ("—" if ability == "ALL"
+                   else _probe_verdict(len(pair), me, mm, ne, nm))
         sep = "  " + "-" * 74 + "\n" if ability == "ALL" else ""
         print(f"{sep}  {ability:<8}{len(pair):>5}{_pct(me)}{_pct(ne)}"
               f"{_pct(mm)}{_pct(nm, 10)}{_num(ratio)}{verdict:>9}")
