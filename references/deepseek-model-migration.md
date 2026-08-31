@@ -19,6 +19,17 @@ Upstream adapters (July 2026) use `--judge-extra-body` and `--answer-extra-body`
 
 ## Fix locations (all upstream-complete as of 2026-08-07)
 
+**VERIFIED 2026-08-31 on Beam-optimisation HEAD 50951e0 (local check, not upstream):**
+`benchmarks/beam_adapter.py:44-45` is STILL `deepseek-chat` (not migrated), and beam_adapter has
+NO `--answer-extra-body`/`--judge-extra-body`, NO `--rejudge`, and `LLMClient._call()` reads
+`message.get("content","")` with no reasoning fallback. Explicit `deepseek-v4-flash` pin on this
+adapter REQUIRES adding extra_body plumbing + a client-path canary first; bare pin hits the
+content="" trap (see lme_runs.db id=53: 0.6% no-extra-body vs id=54: 69.8% same-day with
+extra_body). The `deepseek-chat` alias path is the currently-working choice.
+(UPDATE 2026-08-31 later, HEAD 90ced81: `--rejudge` now EXISTS on beam_adapter
+(judge-only rejudge, gold-reparse guarded, canary + silent-0 abort + ABS/CR gate); NO
+extra_body plumbing still, so the v4-flash-pin trap rule above is unchanged.)
+
 | File | What |
 |---|---|
 | `hymem/contrib/openai_client.py:51` | Default fallback → `deepseek-v4-flash` |
