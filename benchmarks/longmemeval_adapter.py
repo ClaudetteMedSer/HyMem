@@ -1503,6 +1503,17 @@ def evaluate_question(
         "num_sessions": stats["sessions"],
         "num_messages": stats["messages"],
         "num_memories": len(memories),
+        # Fired-indicators for the two tiers a lever can switch on, recorded
+        # for the reason `n_facts` below already is: E1's all-800 net read NULL
+        # while the FIRED subset read -2.9pp (p=0.024), so an unconditional net
+        # is not evidence of no effect unless you can also show the tier reached
+        # the reader. The 2026-08-31 episode-granularity guard could only produce
+        # the all-500 net because nothing here counted episodes -- the E1 lesson
+        # had been instrumented for E1 and not generalised. Same basis as
+        # `num_memories`: the pool handed to the reader.
+        "n_episodes": sum(1 for m in memories
+                         if isinstance(m, dict) and m.get("type") == "episode"),
+        "n_agg_nodes": len(aggregation_nodes) if aggregation_nodes else 0,
         "recall_ceiling": recall_ceiling,
         "recall_tier": recall_tier,
         "gold_mode": gold_mode,
@@ -2852,6 +2863,20 @@ def main():
             "auto_ability": args.auto_ability,
             "workers": args.workers,
             "no_dream": args.no_dream,
+            # The two config LEVERS this adapter pins, recorded because a run
+            # that varies one of them has to be able to EVIDENCE which arm it
+            # was. The 2026-08-31 granularity guard diffed the two arms' config
+            # blocks and found them "byte-identical except elapsed_s" -- which
+            # was true, and vacuous: neither lever was in the block, so the diff
+            # could not see the only thing the run varied, and would have read
+            # the same had --episode-granularity been forgotten on the ON arm.
+            # A drift control that cannot observe the variable is not a control
+            # over it (the E3 shape: a check that reads PASS when broken).
+            # `aggregation_nodes` matters for a different reason: the library
+            # default flipped False -> True on 2026-08-26, so it is what makes a
+            # score comparable (or not) to the pre-flip 70.0 / 68.4 baselines.
+            "aggregation_nodes": args.aggregation_nodes,
+            "episode_granularity": getattr(args, "episode_granularity", False),
             "graph_facts_first": args.graph_facts_first,
             "permissive_default": args.permissive_default,
             "embeddings": args.embeddings,
