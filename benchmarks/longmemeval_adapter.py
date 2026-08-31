@@ -2863,7 +2863,7 @@ def main():
             "auto_ability": args.auto_ability,
             "workers": args.workers,
             "no_dream": args.no_dream,
-            # The two config LEVERS this adapter pins, recorded because a run
+            # The config LEVERS this adapter pins, recorded because a run
             # that varies one of them has to be able to EVIDENCE which arm it
             # was. The 2026-08-31 granularity guard diffed the two arms' config
             # blocks and found them "byte-identical except elapsed_s" -- which
@@ -2875,8 +2875,16 @@ def main():
             # `aggregation_nodes` matters for a different reason: the library
             # default flipped False -> True on 2026-08-26, so it is what makes a
             # score comparable (or not) to the pre-flip 70.0 / 68.4 baselines.
-            "aggregation_nodes": args.aggregation_nodes,
-            "episode_granularity": getattr(args, "episode_granularity", False),
+            # Key names match hymem.config field names exactly, because
+            # benchmarks/lme_registry.py reads them by that name -- it lists
+            # all three under KNOWN_ABSENT ("filled from `overrides` in the
+            # adapter, which never made it into the config block"). Writing
+            # them under any other spelling would leave those columns NULL
+            # forever while looking recorded here.
+            "aggregation_nodes_enabled": args.aggregation_nodes,
+            "episode_granularity_enabled": getattr(
+                args, "episode_granularity", False),
+            "value_supersession_enabled": args.value_supersession,
             "graph_facts_first": args.graph_facts_first,
             "permissive_default": args.permissive_default,
             "embeddings": args.embeddings,
