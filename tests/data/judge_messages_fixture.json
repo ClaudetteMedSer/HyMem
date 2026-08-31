@@ -1,0 +1,62 @@
+[
+ {
+  "label": "pool_KU_gold",
+  "inputs": {
+   "question": "What is the average response time of the dashboard API?",
+   "ideal": "Around 250ms due to caching optimizations",
+   "rubric": [
+    "LLM response should state: 250ms"
+   ],
+   "answer": "Based on the context, the dashboard API response time was initially 800ms, then reduced to 300ms (as of 2024-04-05), and later improved to 250ms (also on 2024-04-05). The most recent memory states 250ms, so the average response time is 250ms."
+  },
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are an impartial judge evaluating AI responses against rubrics.\n\nScore 0 or 1 for each rubric item:\n- 1: The answer fully satisfies this criterion\n- 0: The answer does not satisfy this criterion\n\nReturn ONLY valid JSON:\n{\"scores\": [1, 0, ...], \"total_score\": 0.X, \"explanation\": \"brief\"}\nwhere total_score = sum(scores) / len(scores)"
+   },
+   {
+    "role": "user",
+    "content": "QUESTION: What is the average response time of the dashboard API?\n\nIDEAL ANSWER: Around 250ms due to caching optimizations\n\nAI ANSWER: Based on the context, the dashboard API response time was initially 800ms, then reduced to 300ms (as of 2024-04-05), and later improved to 250ms (also on 2024-04-05). The most recent memory states 250ms, so the average response time is 250ms.\n\nRUBRIC (score 0-1 each):\n1. LLM response should state: 250ms\n\nReturn JSON with 'scores' list and 'total_score'."
+   }
+  ],
+  "temperature": 0.0,
+  "max_tokens": 512,
+  "sanity_score": {
+   "score": 0.5,
+   "scores": [
+    0,
+    1
+   ]
+  }
+ },
+ {
+  "label": "control_ABS_legacy",
+  "inputs": {
+   "question": "How did the user feedback influence the UI/UX improvements I made before the public launch?",
+   "ideal": "Based on the provided chat, there is no information related to how user feedback influenced UI/UX improvements.",
+   "rubric": [
+    "Based on the provided chat, there is no information related to how user feedback influenced UI/UX improvements"
+   ],
+   "answer": "Based on the context, the user mentioned they were \"finalizing the deployment of my application and I want to make sure the UI/UX is improved based on user feedback\" before the public launch. However, the context does not provide specific details about what the user feedback was or how it specifically influenced the UI/UX improvements. The memories show discussions about dark mode toggles, collapsible sidebars, and responsive design, but no explicit connection to user feedback is stated.\n\nI don't have enough information to answer this question."
+  },
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are an impartial judge evaluating AI responses against rubrics.\n\nScore 0 or 1 for each rubric item:\n- 1: The answer fully satisfies this criterion\n- 0: The answer does not satisfy this criterion\n\nReturn ONLY valid JSON:\n{\"scores\": [1, 0, ...], \"total_score\": 0.X, \"explanation\": \"brief\"}\nwhere total_score = sum(scores) / len(scores)"
+   },
+   {
+    "role": "user",
+    "content": "QUESTION: How did the user feedback influence the UI/UX improvements I made before the public launch?\n\nIDEAL ANSWER: Based on the provided chat, there is no information related to how user feedback influenced UI/UX improvements.\n\nAI ANSWER: Based on the context, the user mentioned they were \"finalizing the deployment of my application and I want to make sure the UI/UX is improved based on user feedback\" before the public launch. However, the context does not provide specific details about what the user feedback was or how it specifically influenced the UI/UX improvements. The memories show discussions about dark mode toggles, collapsible sidebars, and responsive design, but no explicit connection to user feedback is stated.\n\nI don't have enough information to answer this question.\n\nRUBRIC (score 0-1 each):\n1. Based on the provided chat, there is no information related to how user feedback influenced UI/UX improvements\n\nReturn JSON with 'scores' list and 'total_score'."
+   }
+  ],
+  "temperature": 0.0,
+  "max_tokens": 512,
+  "sanity_score": {
+   "score": 0.5,
+   "scores": [
+    0,
+    1
+   ]
+  }
+ }
+]

@@ -1175,12 +1175,12 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
     return prediction
 
 
-def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_answer: str) -> dict:
-    if not rubric:
-        return {"score": 0.0, "scores": []}
-
+def _judge_messages(question: str, ideal: str, rubric: list, ai_answer: str) -> list:
+    """Assemble the judge messages. Extracted verbatim from judge_answer so a
+    byte-equality test can pin the construction (and the rejudge can compare
+    before/after). MUST NOT change message content."""
     rubric_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(rubric))
-    messages = [
+    return [
         {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
         {"role": "user", "content": (
             f"QUESTION: {question}\n\n"
@@ -1191,6 +1191,14 @@ def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_ans
         )},
     ]
 
+
+def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_answer: str,
+                 return_raw: bool = False) -> dict:
+    if not rubric:
+        return {"score": 0.0, "scores": []}
+
+    messages = _judge_messages(question, ideal, rubric, ai_answer)
+
     raw = llm.chat(messages, temperature=0.0, max_tokens=512)
     try:
         json_match = re.search(r'\{[^}]+\}', raw.replace('\n', ' '))
@@ -1198,10 +1206,16 @@ def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_ans
             result = json.loads(json_match.group())
             scores = result.get("scores", [])
             total = sum(scores) / len(scores) if scores else 0.0
-            return {"score": total, "scores": scores}
+            out = {"score": total, "scores": scores}
+            if return_raw:
+                out["judge_raw"] = raw
+            return out
     except Exception:
         pass
-    return {"score": 0.0, "scores": []}
+    out = {"score": 0.0, "scores": []}
+    if return_raw:
+        out["judge_raw"] = raw
+    return out
 
 
 # ── Evaluation ───────────────────────────────────────────────────────
@@ -1330,6 +1344,290 @@ def print_report(summary: dict, config: dict):
             print("  |  ".join(sota_parts))
 
 
+def _rejudge_run(args, api_key: str) -> None:
+    """Judge-only rejudge of a stored beam artifact (B in the gold-delta plan).
+
+    Port of longmemeval_adapter._rejudge_run (mechanism, not design) adapted to
+    beam's per-row shape and the pre-registered error classes:
+      * silent-0 (non-empty rubric AND scores == [])  → ABORT (exit 2)
+      * explicit LLM error ([LLM_ERROR / rate failures) → keep prior score,
+        _rejudged=False, excluded from the falsifier; >5% → INVALID
+    No answer calls. Answer bytes fixed from the artifact. Gold comes from a
+    fresh dataset reparse (deterministic; 160/160 guard) matched on
+    (ability, question).
+    """
+    src = Path(args.rejudge)
+    with open(src) as f:
+        run = json.load(f)
+    rows = [q for c in run.get("conversations", []) for q in c.get("questions", [])]
+    if not rows:
+        print(f"ERROR: {src.name} has no rows to re-judge.")
+        sys.exit(2)
+    orig_judge = run.get("metadata", {}).get("judge_model", "unknown")
+    n_rows = len(rows)
+    print(f"\n=== REJUDGE {src.name} ===")
+    print(f"  rows: {n_rows}   original judge: {orig_judge}   new judge: {args.judge_model}")
+
+    # Guardrail ported from LME :2327-2329: extra_body does not exist on beam,
+    # so a bare v4-flash judge would hit the thinking-token trap. ABORT.
+    if "v4-flash" in args.judge_model and not getattr(args, "judge_extra_body_obj", None):
+        print("  ERROR: v4-flash judge without --judge-extra-body is not supported on beam "
+              "(no extra_body plumbing here). Forbidden by the pre-registration.")
+        sys.exit(2)
+
+    judge_llm = LLMClient(args.judge_model, api_key)
+
+    # ── gold reparse (before canary: canary uses a real row's gold) ────────
+    data = load_beam_conversations(["100K"], max_conv=8)
+    convs = data["100K"]
+    gold_map, gold_rows = _rejudge_gold_map(run, convs=convs, rows=rows)
+    cover = sum(len(v) for v in gold_rows.values())
+    if cover != n_rows:
+        print(f"  ABORT: gold reparse covers {cover} rows, artifact has {n_rows}.")
+        sys.exit(3)
+
+    # ── CANARY: exact client path, representative judge prompt ──────────────
+    # A trivial "say OK" prompt cannot reproduce the trap shape (content == ""
+    # with text in reasoning_content, finish=length): the model must burn its
+    # whole budget before writing content. Judge-style messages (long, real)
+    # reproduce it. Asserts content NON-EMPTY (not just non-null).
+    first = rows[0]
+    canary_ideal = gold_rows[first["ability"]][first["question"]]["gold_text"]
+    canary_msgs = _judge_messages(first["question"], canary_ideal, first["rubric"], first["answer"])
+    canary_raw = judge_llm.chat(canary_msgs, temperature=0.0, max_tokens=512)
+    if not canary_raw.strip():
+        print("  CANARY FAILED: judge returned EMPTY content on the exact client path "
+              "(trap shape). Raw repr: " + repr(canary_raw))
+        sys.exit(1)
+    if canary_raw.startswith("[LLM_ERROR"):
+        print(f"  CANARY FAILED: {canary_raw[:120]}")
+        sys.exit(1)
+    print(f"  CANARY OK: {len(canary_raw)} chars content on full judge prompt.")
+
+    # ── gap / metadata ─────────────────────────────────────────────────────
+    a_date = run.get("metadata", {}).get("date", "")
+    try:
+        a_dt = datetime.fromisoformat(a_date)
+        if a_dt.tzinfo is None:
+            a_dt = a_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        a_dt = None
+    b_start = datetime.now(timezone.utc)
+    gap_hours = (b_start - a_dt).total_seconds() / 3600.0 if a_dt else None
+
+    # ── judge every row ────────────────────────────────────────────────────
+    new_questions = []
+    silent0 = []
+    explicit_err = []
+    t0 = time.time()
+    for i, r in enumerate(rows):
+        gold = gold_rows[r["ability"]][r["question"]]
+        ideal = gold["gold_text"] if args.judge_gold else r.get("ideal_answer", "")
+        jr = judge_answer(judge_llm, r["question"], ideal, r["rubric"], r["answer"],
+                          return_raw=True)
+        raw = jr.get("judge_raw", "")
+        if not r["rubric"]:
+            # nothing to score against; keep prior (mirrors LME no-hyp rule)
+            judged = False
+            new_score, new_scores = r["score"], r["scores"]
+        elif jr["score"] == 0.0 and jr["scores"] == []:
+            if raw.startswith("[LLM_ERROR"):
+                # explicit, loud, retriable — keep prior, don't count as verdict
+                explicit_err.append((r["ability"], r["question"], raw[:80]))
+                judged = False
+                new_score, new_scores = r["score"], r["scores"]
+            else:
+                # silent-0: parse-fail / empty content / nested JSON — all
+                # indistinguishable from a real 0.0 without raw. ABORT.
+                silent0.append((r["ability"], r["question"], raw[:120]))
+                judged = False
+                new_score, new_scores = r["score"], r["scores"]
+        else:
+            judged = True
+            new_score, new_scores = jr["score"], jr["scores"]
+        out = dict(r)
+        out["score"] = new_score
+        out["scores"] = new_scores
+        out["score_original"] = r["score"]
+        out["judge_raw"] = raw
+        out["judge_error"] = bool(raw) and raw.startswith("[LLM_ERROR")
+        out["_rejudged"] = judged
+        out["judge_ideal_used"] = ideal
+        new_questions.append(out)
+        if (i + 1) % 20 == 0:
+            print(f"  ── judged {i+1}/{n_rows}", flush=True)
+
+    elapsed = time.time() - t0
+    print(f"\n  judge calls: {judge_llm.call_count} (+1 canary)   elapsed: {elapsed:.0f}s")
+    if silent0:
+        print(f"  ABORT: {len(silent0)} silent-0 parse failures (A had 0/160; "
+              f"B rate must be <= A). First rows:")
+        for ab, qu, raw in silent0[:10]:
+            print(f"    {ab} | {qu[:60]} | raw={raw[:100]!r}")
+        print("  Run void per pre-registration §4.7. No verdict artifact written.")
+        sys.exit(3)
+    if explicit_err:
+        print(f"  ⚠ {len(explicit_err)} explicit judge errors kept as prior (excluded from falsifier):")
+        for ab, qu, raw in explicit_err[:10]:
+            print(f"    {ab} | {qu[:60]} | {raw}")
+
+    # ── write rejudged artifact ────────────────────────────────────────────
+    new_convs = []
+    qi = 0
+    for c in run.get("conversations", []):
+        m = len(c.get("questions", []))
+        nc = dict(c)
+        nc["questions"] = new_questions[qi:qi + m]
+        qi += m
+        new_convs.append(nc)
+    summary = compute_scores(new_convs)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    meta = dict(run.get("metadata", {}))
+    meta.update({
+        "date": datetime.now(timezone.utc).isoformat(),
+        "elapsed_s": elapsed,
+        "answer_calls": 0,
+        "judge_calls": judge_llm.call_count,
+        "judge_gold": bool(args.judge_gold),
+        "a_date": a_date,
+        "gap_hours": gap_hours,
+        "rejudged_from": src.name,
+        "rejudge_original_judge": orig_judge,
+        "judge_model": args.judge_model,
+    })
+    out = {"metadata": meta, "summary": {sc: {ab: d["avg"] for ab, d in abils.items()}
+                                         for sc, abils in summary.items()},
+           "conversations": new_convs}
+    dest = src.with_name(f"{src.stem}-rejudged-{args.judge_model.replace('/', '_')}-{stamp}.json")
+    with open(dest, "w") as f:
+        json.dump(out, f, indent=2, default=str)
+    print(f"\n  Archived → {dest.name}")
+    print(f"  {len(silent0)} silent-0 / {len(explicit_err)} explicit / "
+          f"{sum(1 for q in new_questions if q['_rejudged'])} rejudged of {n_rows}")
+
+    # ── readout (pre-registered §5 — formulas fixed before counts) ─────────
+    _rejudge_readout(run, new_questions, meta=meta)
+
+
+def _rejudge_gold_map(run: dict, convs: list = None, rows: list = None) -> tuple:
+    """Reparse the dataset and return (None, gold_rows); gold_rows is
+    gold_rows[ability][question] -> reparse question dict. Guards: every
+    artifact row must match a reparse row by (ability, question) and stored
+    fields must be identical — dataset drift cannot silently change gold."""
+    if convs is None:
+        data = load_beam_conversations(["100K"], max_conv=8)
+        convs = data["100K"]
+    if rows is None:
+        rows = [q for c in run.get("conversations", []) for q in c.get("questions", [])]
+    fresh = {}
+    for conv in convs:
+        for q in conv["questions"]:
+            fresh[(q["ability_short"], q["question"])] = q
+    gold_rows = {}
+    diffs = []
+    for r in rows:
+        key = (r["ability"], r["question"])
+        q = fresh.get(key)
+        if q is None:
+            diffs.append(f"{key}: no reparse match")
+            continue
+        for field in ("ideal_answer", "rubric", "gold_kind"):
+            if r.get(field) != q.get(field):
+                diffs.append(f"{key}: {field} differs")
+        if not q.get("gold_text"):
+            diffs.append(f"{key}: EMPTY gold_text")
+        gold_rows.setdefault(r["ability"], {})[r["question"]] = q
+    if diffs:
+        print(f"  ABORT: reparse does not reproduce the artifact ({len(diffs)} diffs).")
+        for d in diffs[:15]:
+            print("   ", d)
+        sys.exit(3)
+    return (None, gold_rows)
+
+
+def _rejudge_readout(run: dict, new_questions: list, meta: dict) -> None:
+    """Pre-registered §5 readout. Formulas fixed before counts: continuous
+    primary (SE from control SD), binarized companion (t=0.45, 2√D band),
+    OR verdict, ABS/CR gate."""
+    import math
+    pool_abs = {"EO", "IE", "IF", "KU", "MR", "PF", "SUM", "TR"}
+    ctl_abs = {"ABS", "CR"}
+
+    def mean(xs): return sum(xs) / len(xs) if xs else 0.0
+
+    def sd(xs):
+        if len(xs) < 2:
+            return 0.0
+        m = mean(xs)
+        return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+    pool = [q for q in new_questions if q["ability"] in pool_abs and q["_rejudged"]]
+    ctl = [q for q in new_questions if q["ability"] in ctl_abs and q["_rejudged"]]
+    dpool = [q["score"] - q["score_original"] for q in pool]
+    dctl = [q["score"] - q["score_original"] for q in ctl]
+
+    print(f"\n{'─'*72}")
+    print("  READOUT (pre-registered 2026-08-31) — gold delta B − A")
+    print(f"  pool rows rejudged: {len(pool)}   control rows rejudged: {len(ctl)}")
+    print(f"  pool mean delta δ̄  = {mean(dpool)*100:+.3f}pp   "
+          f"control mean δ̄_ctl = {mean(dctl)*100:+.3f}pp")
+    sd_ctl = sd(dctl)
+    print(f"  control SD per row = {sd_ctl:.4f}  (n={len(dctl)})")
+
+    # GATE (amendment d4): control beyond its own band → VOID
+    if sd_ctl == 0:
+        flips_ctl = sum(1 for q in ctl if q["score"] != q["score_original"])
+        gate_bad = flips_ctl > 0
+        gate_txt = f"flip-gate (SD=0): {flips_ctl} control flips"
+    else:
+        gate_bad = abs(mean(dctl)) > 2 * sd_ctl / math.sqrt(max(len(dctl), 1))
+        gate_txt = "2·SD/√32"
+    verdict_gate = "VOID (unattributable)" if gate_bad else "PASS"
+    print(f"  CONTROL GATE: |δ̄_ctl| vs {gate_txt} → {verdict_gate}")
+
+    # PRIMARY (continuous): SE from control SD
+    se = sd_ctl / math.sqrt(len(pool)) if sd_ctl > 0 else 0.0
+    band = 2 * se
+    delta_pp = mean(dpool) * 100
+    inside = abs(delta_pp) <= band * 100
+    print(f"\n  PRIMARY (continuous): δ̄ = {delta_pp:+.3f}pp   band = ±{band*100:.3f}pp "
+          f"(2·SD_ctl/√128)  → {'INSIDE (H0 holds)' if inside else 'OUTSIDE (meaning changed)'}")
+
+    # COMPANION (binarized): t=0.45 from A's marginal
+    T = 0.45
+    pairs = [(q["score_original"], q["score"]) for q in pool]
+    D = sum(1 for a, b in pairs if (a >= T) != (b >= T))
+    gained = sum(1 for a, b in pairs if a < T <= b)
+    lost = sum(1 for a, b in pairs if a >= T > b)
+    net_q = gained - lost
+    band_c = 2 * math.sqrt(D)
+    net_inside = abs(net_q) <= band_c
+    print(f"  COMPANION (t=0.45): D={D}  gained={gained}  lost={lost}  net={net_q:+d}  "
+          f"band 2√D={band_c:.2f}  → {'INSIDE' if net_inside else 'OUTSIDE'}")
+
+    # VERDICT (OR, 2α conservative — stated reason)
+    if verdict_gate.startswith("VOID"):
+        verdict = "RUN VOID (control gate)"
+    else:
+        reject = (not inside) or (not net_inside)
+        verdict = ("REBASE REQUIRED (meaning changed)" if reject
+                   else "RECORD STANDS (H0 holds; defect cost nothing measurable)")
+    print(f"\n  VERDICT: {verdict}")
+    print("  (OR reason: two tests → FPR toward 2α, conservative toward declaring")
+    print("   a rebase — correct asymmetry: trusting a contaminated record costs more)")
+
+    # per-ability descriptive (n=16, knife-edge caveat)
+    print(f"\n  {'ability':<6} {'A':>7} {'B':>7} {'Δpp':>7} {'flips':>5}")
+    for ab in sorted(set(q["ability"] for q in new_questions)):
+        qs = [q for q in new_questions if q["ability"] == ab and q["_rejudged"]]
+        if not qs:
+            continue
+        a = mean([q["score_original"] for q in qs])
+        b = mean([q["score"] for q in qs])
+        fl = sum(1 for q in qs if (q["score_original"] >= T) != (q["score"] >= T))
+        print(f"  {ab:<6} {a*100:>6.2f} {b*100:>6.2f} {(b-a)*100:>+6.2f} {fl:>5}")
+
+
 def main():
     global DEEPSEEK_API_KEY
 
@@ -1360,6 +1658,13 @@ def main():
                              "onward. This changes what every BEAM score means: "
                              "runs with it on are NOT comparable to v13-v16 and "
                              "need their own baseline.")
+    parser.add_argument("--rejudge", default="",
+                        help="Judge-only rejudge of an existing results artifact "
+                             "(B in the gold-delta plan). Answer bytes are fixed "
+                             "from the stored rows; no answer calls. Gold comes "
+                             "from a deterministic dataset reparse guarded "
+                             "160/160. Reads output with --judge-gold to feed "
+                             "real gold instead of the legacy IDEAL ANSWER.")
     parser.add_argument("--keep-db", action="store_true")
     args = parser.parse_args()
 
@@ -1379,6 +1684,10 @@ def main():
         sys.exit(1)
 
     print(f"API key: ...{DEEPSEEK_API_KEY[-4:]}", flush=True)  # confirm suffix
+
+    if args.rejudge:
+        _rejudge_run(args, DEEPSEEK_API_KEY)
+        return
 
     scales = [s.strip() for s in args.scales.split(",")]
     max_conv = args.sample if args.sample > 0 else None
