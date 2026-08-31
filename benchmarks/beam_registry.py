@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -92,8 +93,19 @@ BEAM_DOC_OVERRIDES = BEAM_OVERRIDES | {
     "ability_tr", "count", "answer_calls", "judge_calls", "run_date",
 }
 
+# §6.5: beam artifacts are split across two dirs -- the v13-v16 archives
+# sit beside the registry, the current results_*.json land in the beam
+# run output dir.  Override with BEAM_ARTIFACT_DIRS (os.pathsep-separated).
+ARTIFACT_DIRS = tuple(
+    Path(p) for p in os.environ["BEAM_ARTIFACT_DIRS"].split(os.pathsep)
+) if os.environ.get("BEAM_ARTIFACT_DIRS") else (
+    DEFAULT_REGISTRY_DIR,
+    Path.home() / "hymem_beam",
+)
+
 SPEC = {
     "db_file": "beam_runs.db",
+    "artifact_dirs": ARTIFACT_DIRS,
     "columns": BEAM_COLUMNS,
     "overrides": BEAM_OVERRIDES,
     "patterns": ("beam-v*.json", "beam-*.json"),
@@ -145,12 +157,12 @@ def _beam_row(data: dict, path: Path) -> dict:
         src_date, exec_date = rr.rejudge_dates(
             path.name, meta.get("rejudged_from") or "",
             SPEC.get("stamp_policy", "optional"))
-        run_date = exec_date or str(data.get("date") or meta.get("date") or "")[:19]
+        run_date = rr.iso_ts(exec_date or data.get("date") or meta.get("date"))
         source_date = src_date
         total_tokens = None
         elapsed_s = None
     else:
-        run_date = str(data.get("date") or meta.get("date") or "")[:19]
+        run_date = rr.iso_ts(data.get("date") or meta.get("date"))
         source_date = rr.stem_source_date(
             path.name, SPEC.get("stamp_policy", "optional"))
         total_tokens = cfg.get("total_tokens")
@@ -230,7 +242,11 @@ def _record_doc(archive, overrides=None, db_path=None):
         if k not in BEAM_DOC_OVERRIDES:
             continue
         typ = dict(BEAM_COLUMNS).get(k, "TEXT")
-        row[k] = _coerce(v, typ)
+        # §6.5: doc rows are analyst-set and carry bare dates.  cmd_backfill
+        # canonicalises them in place too, but a row entered without a
+        # later backfill would otherwise sit at width 10 in the sort
+        # column -- so both entry points canonicalise on write.
+        row[k] = rr.iso_ts(v) if k == "run_date" else _coerce(v, typ)
         applied[k] = row[k]
     row["archive"] = archive
     row["kind"] = "doc"
@@ -285,7 +301,8 @@ def main():
         files, ov = _parse_set(sys.argv[2:])
         _ingest(files or None, ov)
     elif cmd == "backfill":
-        _backfill()
+        if _backfill():
+            sys.exit(1)   # §6.5: unreachable rows were not migrated
     elif cmd == "record-doc":
         files, ov = _parse_set(sys.argv[2:])
         if not files:

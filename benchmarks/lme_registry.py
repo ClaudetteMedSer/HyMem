@@ -163,6 +163,24 @@ def _to_int(v):
 STAMP_POLICY = {"archive": "required", "rejudge": "required", "variant": "optional"}
 
 
+def _require_run_date(run_date: str | None, archive: str) -> str:
+    """§6.5: this table declares `run_date TEXT NOT NULL` (see SCHEMA).
+
+    iso_ts records an absent date as None, which beam/locomo store as NULL
+    but LME's schema cannot.  Raise the §6-style defect here rather than
+    let SQLite raise IntegrityError from inside the INSERT: an LME
+    artifact carrying neither a date field nor an exec stamp is a defect
+    in the artifact, and the error should name the file that caused it.
+    """
+    if run_date is None:
+        raise ValueError(
+            f"no usable run_date for {archive!r}: this benchmark's table "
+            "declares run_date NOT NULL -- an artifact with no date field "
+            "and no exec stamp is a defect, not a domain fact"
+        )
+    return run_date
+
+
 def _stamp_fields(kind: str, archive: str, data: dict, cfg: dict):
     """(run_date, source_date, total_tokens, elapsed_s) under §6 rules.
 
@@ -178,9 +196,10 @@ def _stamp_fields(kind: str, archive: str, data: dict, cfg: dict):
     if kind == "rejudge":
         source_date, exec_date = rr.rejudge_dates(
             archive, cfg.get("rejudged_from") or "", policy)
-        return (exec_date or str(data.get("date", ""))[:19],
+        return (_require_run_date(
+                    rr.iso_ts(exec_date or data.get("date")), archive),
                 source_date, None, None)
-    return (str(data.get("date", ""))[:19],
+    return (_require_run_date(rr.iso_ts(data.get("date")), archive),
             rr.stem_source_date(archive, policy),
             cfg.get("total_tokens"), cfg.get("elapsed_s"))
 
@@ -347,19 +366,26 @@ def cmd_backfill(bench_dir=None):
     """§6.4: recompute stamp-derived fields for EVERY row from its artifact
     file; UPDATE where the value differs.  The read-back is a DIFF against
     the pre-backfill values, not a spot check that new values parse — the
-    interesting failure is a row that changes when it shouldn't."""
+    interesting failure is a row that changes when it shouldn't.
+
+    §6.5: a row whose artifact BENCH_DIR cannot supply is UNREACHABLE,
+    reported separately from unreadable/recompute-failed and returned as
+    a count so main() exits nonzero.  LME artifacts all live in one dir,
+    so no multi-dir search is needed here (beam splits across two) — but
+    the guarantee all three registries share is that a row the backfill
+    could not migrate can never read as success."""
     con = connect()
     bench = Path(bench_dir or BENCH_DIR)
     rows = con.execute(
         "SELECT id, archive, kind, run_date, source_date, total_tokens, "
         "elapsed_s FROM runs ORDER BY id").fetchall()
-    changed, missing = [], []
+    changed, missing, unreachable = [], [], []
     for _id, archive, kind, cur_rd, cur_sd, cur_tt, cur_es in rows:
         if kind == "doc":
             continue
         p = bench / archive
         if not p.exists():
-            missing.append((_id, archive, "file not found"))
+            unreachable.append((_id, archive, f"no artifact in {bench}"))
             continue
         try:
             data = json.loads(p.read_text())
@@ -390,12 +416,19 @@ def cmd_backfill(bench_dir=None):
             (new_rd, new_sd, new_tt, new_es, _id))
     con.commit()
     print(f"backfill: {len(changed)} row(s) changed, {len(missing)} row(s) "
-          f"skipped (missing/unreadable/recompute-failed)")
+          f"skipped (unreadable/recompute-failed), "
+          f"{len(unreachable)} row(s) UNREACHABLE")
     for _id, archive, kind, diffs in changed:
         for f, old, newv in diffs:
             print(f"  id={_id} [{kind}] {archive} {f}: {old!r} -> {newv!r}")
     for _id, archive, why in missing:
         print(f"  id={_id} {archive}: SKIPPED ({why})")
+    for _id, archive, why in unreachable:
+        print(f"  id={_id} {archive}: UNREACHABLE ({why})")
+    if unreachable:
+        print("  NOTE: unreachable rows were NOT migrated -- fix the "
+              "artifact path or LME_BENCH_DIR and re-run")
+    return len(unreachable)
 
 
 def main():
@@ -417,7 +450,8 @@ def main():
                 i += 1
         cmd_ingest(args or None, ov)  # noqa: E1123
     elif cmd == "backfill":
-        cmd_backfill()
+        if cmd_backfill():
+            sys.exit(1)   # §6.5: unreachable rows were not migrated
     elif cmd == "list":
         import argparse
         p = argparse.ArgumentParser()

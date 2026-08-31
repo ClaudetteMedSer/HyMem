@@ -105,7 +105,7 @@ def test_beam_dialect_b_no_date(tmp_db, tmp_path):
     con = sqlite3.connect(tmp_db)
     idx = _cols(con)
     r = _row(con, p.name)
-    assert r[idx.index("run_date")] == ""            # recorded as absent, no guess
+    assert r[idx.index("run_date")] is None          # absent -> NULL (§6.5)
     assert r[idx.index("overall")] == 37.0
 
 
@@ -164,7 +164,7 @@ def test_beam_record_doc_provenance(tmp_db, tmp_path):
     assert r[idx.index("kind")] == "doc"
     assert r[idx.index("overall")] == pytest.approx(51.3)
     assert r[idx.index("ability_ie")] == pytest.approx(63.9)
-    assert r[idx.index("run_date")] == "2026-06-09"
+    assert r[idx.index("run_date")] == "2026-06-09T00:00:00"   # §6.5 padded
     prov = r[idx.index("flags_provenance")]
     assert prov.startswith("analyst:doc=")
     assert "recorded" not in prov
@@ -229,7 +229,7 @@ def test_beam_rejudge_dates_and_null_stats(tmp_db, tmp_path):
     r = _row(con, p.name)
     assert r[idx.index("kind")] == "rejudge"
     assert r[idx.index("source_date")] == "20260831T165039Z"  # source's stamp
-    assert r[idx.index("run_date")] == "20260831T200531Z"     # exec stamp
+    assert r[idx.index("run_date")] == "2026-08-31T20:05:31"     # exec stamp
     assert r[idx.index("total_tokens")] is None               # §6.2: NULL
     assert r[idx.index("elapsed_s")] is None                  # §6.2: NULL
 
@@ -246,7 +246,83 @@ def test_beam_rejudge_one_stamp_source_date_null(tmp_db, tmp_path):
     idx = _cols(con)
     r = _row(con, p.name)
     assert r[idx.index("source_date")] is None
-    assert r[idx.index("run_date")] == "20260831T200531Z"
+    assert r[idx.index("run_date")] == "2026-08-31T20:05:31"
+
+
+def test_beam_backfill_canonicalises_doc_rows(tmp_db, tmp_path):
+    # §6.5: doc rows have no artifact to recompute from, so cmd_backfill
+    # skips the rebuild -- but their analyst-typed run_date still shares the
+    # sort column, and a bare date sits at width 10 among 19-char values.
+    # Without this test, deleting the doc branch from cmd_backfill is silent.
+    spec = dict(benchmarks.beam_registry.SPEC)
+    spec["builder"] = benchmarks.beam_registry._beam_row
+    benchmarks.run_registry.connect(spec, db_path=tmp_db).close()
+    names = [c for c, _ in spec["columns"]] + ["flags_provenance", "extras"]
+    con = sqlite3.connect(tmp_db)
+    con.execute(f"INSERT INTO runs ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                ["beam-results-history.md:2026-06-09 e3c8955 51.3%", "doc",
+                 "2026-06-09", "DOC", None] + [None] * (len(names) - 5))
+    con.commit()
+    con.close()
+
+    benchmarks.run_registry.cmd_backfill(spec, bench_dir=tmp_path, db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    idx = _cols(con)
+    r = con.execute("SELECT * FROM runs").fetchone()
+    assert r[idx.index("run_date")] == "2026-06-09T00:00:00"
+    assert r[idx.index("source_date")] == "DOC"   # provenance untouched
+    con.close()
+
+    # Idempotent: the canonical value must survive a second pass unchanged.
+    benchmarks.run_registry.cmd_backfill(spec, bench_dir=tmp_path, db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    assert con.execute("SELECT run_date FROM runs").fetchone()[0] == "2026-06-09T00:00:00"
+    con.close()
+
+
+def test_beam_backfill_unreachable_row_is_not_a_silent_skip(tmp_db, tmp_path):
+    # §6.5: a row whose artifact no dir can supply was NOT migrated.  It must
+    # be counted as unreachable (the CLI exits nonzero on it), not folded in
+    # with unreadable/recompute-failed rows where it reads as benign.
+    spec = dict(benchmarks.beam_registry.SPEC)
+    spec["builder"] = benchmarks.beam_registry._beam_row
+    benchmarks.run_registry.connect(spec, db_path=tmp_db).close()
+    names = [c for c, _ in spec["columns"]] + ["flags_provenance", "extras"]
+    con = sqlite3.connect(tmp_db)
+    con.execute(f"INSERT INTO runs ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                ["results_20260831T165039Z.json", "variant",
+                 "2026-08-31T16:50:39", None, None] + [None] * (len(names) - 5))
+    con.commit()
+    con.close()
+    assert benchmarks.run_registry.cmd_backfill(
+        spec, bench_dir=tmp_path, db_path=tmp_db) == 1
+
+
+def test_beam_backfill_searches_every_artifact_dir(tmp_db, tmp_path):
+    # §6.5: beam artifacts are split across two dirs.  Resolution must try
+    # each declared dir, or the CLI (which passes no bench_dir) can never
+    # reach the results_*.json rows -- the ones a rejudge actually writes.
+    other = tmp_path / "hymem_beam"
+    other.mkdir()
+    a = _make_beam_results(other / "results_20260831T165039Z.json")
+    spec = dict(benchmarks.beam_registry.SPEC)
+    spec["builder"] = benchmarks.beam_registry._beam_row
+    spec["artifact_dirs"] = (tmp_path, other)
+    benchmarks.run_registry.connect(spec, db_path=tmp_db).close()
+    names = [c for c, _ in spec["columns"]] + ["flags_provenance", "extras"]
+    con = sqlite3.connect(tmp_db)
+    con.execute(f"INSERT INTO runs ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                [a.name, "variant", "2026-08-31T16:50:39", "results_20260831",
+                 None] + [None] * (len(names) - 5))
+    con.commit()
+    con.close()
+
+    # No bench_dir: resolution comes from spec["artifact_dirs"] alone.
+    assert benchmarks.run_registry.cmd_backfill(spec, db_path=tmp_db) == 0
+    con = sqlite3.connect(tmp_db)
+    idx = _cols(con)
+    assert _row(con, a.name)[idx.index("source_date")] == "20260831T165039Z"
+    con.close()
 
 
 def test_beam_backfill_diff_and_idempotence(tmp_db, tmp_path):
@@ -286,7 +362,7 @@ def test_beam_backfill_diff_and_idempotence(tmp_db, tmp_path):
     assert ra[idx.index("elapsed_s")] == pytest.approx(5471.57)
     # B: source_date fixed, run_date fixed to exec stamp, stats NULLed
     assert rb[idx.index("source_date")] == "20260831T165039Z"
-    assert rb[idx.index("run_date")] == "20260831T200531Z"
+    assert rb[idx.index("run_date")] == "2026-08-31T20:05:31"
     assert rb[idx.index("total_tokens")] is None
     assert rb[idx.index("elapsed_s")] is None
     # Idempotence: a second backfill must not touch anything (the diff is
@@ -296,7 +372,7 @@ def test_beam_backfill_diff_and_idempotence(tmp_db, tmp_path):
     benchmarks.run_registry.cmd_backfill(spec, bench_dir=tmp_path, db_path=tmp_db)
     con = sqlite3.connect(tmp_db)
     rb2 = _row(con, b.name)
-    assert rb2[idx.index("run_date")] == "20260831T200531Z"
+    assert rb2[idx.index("run_date")] == "2026-08-31T20:05:31"
     assert rb2[idx.index("elapsed_s")] is None
     con.close()
 
@@ -337,7 +413,7 @@ def test_locomo_rows_compute_scores(tmp_db, tmp_path):
     assert r[idx.index("count")] == 5
     assert r[idx.index("flags_provenance")] == "recorded"
     # No date in bare lists -> recorded as absent
-    assert r[idx.index("run_date")] == ""
+    assert r[idx.index("run_date")] is None          # absent -> NULL (§6.5)
 
 
 def test_locomo_diag_rows_no_score(tmp_db, tmp_path):

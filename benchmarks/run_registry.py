@@ -44,6 +44,13 @@ DEFAULT_REGISTRY_DIR = Path("/home/node/.hermes/benchmarks")
 
 STAMP_RE = re.compile(r"\d{8}T\d{6}Z")
 
+# The same stamp as it appears in a run_date value.  The trailing Z is
+# optional here (it is NOT in STAMP_RE, which matches stamps embedded in
+# filenames): a stamp that lost its Z would otherwise fail every branch of
+# iso_ts and pass through at width 15 -- a mixed width in the sort column,
+# which is the exact defect §6.5 exists to close.
+COMPACT_TS_RE = re.compile(r"(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?")
+
 
 def stem_stamps(name: str) -> list[str]:
     """All \\d{8}T\\d{6}Z stamps in a filename, in order of appearance."""
@@ -104,8 +111,55 @@ def rejudge_dates(own_name: str, source_name: str | None = None,
         source_date = None
     return source_date, stamps[-1]
 
+def iso_ts(ts) -> str | None:
+    """Normalise a run_date to canonical 19-char ISO 'YYYY-MM-DDTHH:MM:SS'.
+
+    §6.5: run_date is the registry's sort key -- the only date column any
+    ORDER BY reads (cmd_list here, _list in lme_registry).  SQLite sorts
+    TEXT lexicographically, so mixing formats in that column silently
+    reorders the table: at index 4 a compact stamp has '0' (0x30) where
+    ISO has '-' (0x2D), so EVERY compact row outranks EVERY ISO row
+    regardless of real time, and a 10-char bare date sorts below any
+    19-char value from the same day.  Fixed width is the property that
+    makes lexicographic ordering chronological; nothing else here does.
+
+    All four shapes present in the live registries are normalised:
+      '20260831T200531Z'     stem stamp    -> '2026-08-31T20:05:31'
+      '20260831T200531'      stamp, no Z   -> '2026-08-31T20:05:31'
+      '2026-08-31T16:50:39'  ISO datetime  -> unchanged
+      '2026-06-09'           bare date     -> '2026-06-09T00:00:00'
+      '' / None              absent        -> None
+
+    Absent becomes None rather than '': source_date already records
+    absence as NULL (§6.1), and run_date recording it as '' left one
+    clause with two conventions -- '' also sorts to the bottom on DESC
+    and to the top on ASC, so it is never merely cosmetic.
+
+    source_date is deliberately NOT routed through this: it is the
+    provenance pointer -- the literal filename stamp, greppable against
+    the artifact name -- and is never sorted on.  Normalising it would
+    destroy the property that makes it auditable.
+    """
+    if ts is None:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    m = COMPACT_TS_RE.fullmatch(s)
+    if m:
+        return "{}-{}-{}T{}:{}:{}".format(*m.groups())
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        return s + "T00:00:00"
+    return s[:19] or None
+
+
 # Per-benchmark specs.  Each entry:
 #   db_file      - SQLite file under DEFAULT_REGISTRY_DIR
+#   artifact_dirs- dirs searched for a row's archive file, in order.
+#                  A benchmark's artifacts need not all live in one
+#                  place (beam: beam-v*.json in the registry dir,
+#                  results_*.json in the run output dir), and a
+#                  backfill that cannot reach a row cannot migrate it.
 #   columns      - ordered list of (name, type) for flags+scores
 #   overrides    - column names settable via --set (whitelist)
 #   patterns     - glob patterns searched by default ingest
@@ -232,25 +286,51 @@ def cmd_backfill(spec, bench_dir=None, db_path=None):
     the pre-backfill values, not a spot check that new values parse — the
     interesting failure is a row that changes when it shouldn't.
 
-    Fields recomputed: source_date always; for kind='rejudge' also
-    run_date, total_tokens, elapsed_s (only columns present in the spec).
-    Rows whose archive file is missing are reported; doc rows untouched.
+    Fields recomputed: every field in field_list (source_date, run_date,
+    total_tokens, elapsed_s -- whichever the spec declares) for every
+    non-doc/probe row.  The builder decides what each kind yields; the
+    backfill does not special-case rejudge.
+    doc/probe rows: source_date and stats untouched (no artifact to
+    recompute from), run_date canonicalised in place -- it shares the
+    sort column with every other row.
+    Rows whose artifact no declared dir can supply are UNREACHABLE, not
+    'skipped': they were not migrated, and the count is returned so the
+    CLI can exit nonzero.
     """
     con = connect(spec, db_path)
-    bench = Path(bench_dir or DEFAULT_REGISTRY_DIR)
+    # §6.5: search every declared artifact dir.  An explicit bench_dir
+    # overrides the spec (single-dir callers and tests).
+    if bench_dir is not None:
+        search_dirs = [Path(bench_dir)]
+    else:
+        search_dirs = [Path(d) for d in
+                       (spec.get("artifact_dirs") or [DEFAULT_REGISTRY_DIR])]
     field_list = [c for c in ("source_date", "run_date", "total_tokens",
                               "elapsed_s") if any(c == n for n, _ in spec["columns"])]
     cols = ["id", "archive", "kind"] + field_list
     rows = con.execute(f"SELECT {', '.join(cols)} FROM runs ORDER BY id").fetchall()
-    changed, missing = [], []
+    changed, missing, unreachable = [], [], []
     for r in rows:
         _id, archive, kind = r[0], r[1], r[2]
         cur = dict(zip(field_list, r[3:]))
         if kind == "doc" or kind == "probe":
+            # §6.5: doc/probe rows have no artifact to recompute from, but
+            # their analyst-typed run_date still shares the sort column.
+            # Canonicalise it in place so the migration leaves no mixed
+            # widths behind; idempotent, and a no-op once already ISO.
+            if "run_date" in field_list:
+                norm = iso_ts(cur["run_date"])
+                if norm != cur["run_date"]:
+                    changed.append((_id, archive, kind,
+                                    [("run_date", cur["run_date"], norm)]))
+                    con.execute("UPDATE runs SET run_date=? WHERE id=?",
+                                (norm, _id))
             continue
-        p = bench / archive
-        if not p.exists():
-            missing.append((_id, archive, "file not found"))
+        p = next((d / archive for d in search_dirs if (d / archive).exists()),
+                 None)
+        if p is None:
+            unreachable.append((_id, archive, "no artifact in " + ", ".join(
+                str(d) for d in search_dirs)))
             continue
         try:
             data = json.loads(Path(p).read_text())
@@ -273,12 +353,23 @@ def cmd_backfill(spec, bench_dir=None, db_path=None):
                     [new.get(f) for f in field_list] + [_id])
     con.commit()
     print(f"backfill: {len(changed)} row(s) changed, {len(missing)} row(s) "
-          f"skipped (missing/unreadable/recompute-failed)")
+          f"skipped (unreadable/recompute-failed), "
+          f"{len(unreachable)} row(s) UNREACHABLE")
     for _id, archive, kind, diffs in changed:
         for f, old, newv in diffs:
             print(f"  id={_id} [{kind}] {archive} {f}: {old!r} -> {newv!r}")
     for _id, archive, why in missing:
         print(f"  id={_id} {archive}: SKIPPED ({why})")
+    for _id, archive, why in unreachable:
+        print(f"  id={_id} {archive}: UNREACHABLE ({why})")
+    if unreachable:
+        # §6.5: a row the backfill could not read is a row it did not
+        # migrate.  Reporting that as a benign "skipped" is how a
+        # half-done migration passes for a finished one -- the caller
+        # gets a nonzero count so the CLI can exit nonzero.
+        print("  NOTE: unreachable rows were NOT migrated -- fix the "
+              "artifact path or spec['artifact_dirs'] and re-run")
+    return len(unreachable)
 
 
 def cmd_list(spec, limit=30, flag=None, db_path=None):

@@ -118,13 +118,13 @@ def _locomo_row(data, path: Path) -> dict:
     row["source_date"] = rr.stem_source_date(
         path.name, SPEC.get("stamp_policy", "optional"))
     if isinstance(data, dict):  # probe artifacts / metadata wrappers
-        row["run_date"] = str(data.get("date", ""))[:19]
+        row["run_date"] = rr.iso_ts(data.get("date"))
         rows = data.get("results") or data.get("rows") or []
         if not rows and "correct" not in data:
             rows = []
     else:
         rows = data if isinstance(data, list) else []
-        row["run_date"] = ""  # bare lists record no date
+        row["run_date"] = None  # §6.5: bare lists record absence as NULL
 
     scored = [r for r in rows if isinstance(r.get("correct"), bool)]
     n = len(scored)
@@ -184,7 +184,10 @@ def _record_doc(archive, overrides=None, db_path=None):
         if k not in DOC_OVERRIDES:
             continue
         typ = dict(SPEC["columns"]).get(k, "TEXT")
-        row[k] = rr._coerce(v, typ)
+        # §6.5: same canonicalisation as beam._record_doc -- both doc entry
+        # points must agree, or a locomo doc row entered without a
+        # subsequent backfill sits at width 10 in the sort column.
+        row[k] = rr.iso_ts(v) if k == "run_date" else rr._coerce(v, typ)
         applied[k] = row[k]
     row["archive"] = archive
     row["kind"] = "doc"
@@ -239,7 +242,8 @@ def main():
         files, ov = _parse_set(sys.argv[2:])
         _ingest(files or None, ov)
     elif cmd == "backfill":
-        _backfill()
+        if _backfill():
+            sys.exit(1)   # §6.5: unreachable rows were not migrated
     elif cmd == "record-doc":
         files, ov = _parse_set(sys.argv[2:])
         if not files:

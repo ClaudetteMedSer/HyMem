@@ -163,7 +163,7 @@ def test_rejudge_row_dates_and_null_stats(tmp_db):
     cols = [d[0] for d in con.execute("SELECT * FROM runs").description]
     r = dict(zip(cols, con.execute("SELECT * FROM runs").fetchone()))
     assert r["kind"] == "rejudge"
-    assert r["run_date"] == "20260725T191314Z"     # exec stamp, not source date
+    assert r["run_date"] == "2026-07-25T19:13:14"     # exec stamp, not source date
     assert r["source_date"] == "20260610T094858Z"  # source pointer stamp
     assert r["total_tokens"] is None               # §6.2: inherited => NULL
     assert r["elapsed_s"] is None
@@ -216,7 +216,7 @@ def test_backfill_diff_and_idempotence(tmp_db):
     assert sr["run_date"] == "2026-06-10T09:48:58"
     assert sr["total_tokens"] == 1718606
     # rejudge row: run_date -> exec stamp, source_date -> stamp, stats NULLed
-    assert rr["run_date"] == "20260725T191314Z"
+    assert rr["run_date"] == "2026-07-25T19:13:14"
     assert rr["source_date"] == "20260610T094858Z"
     assert rr["total_tokens"] is None
     assert rr["elapsed_s"] is None
@@ -226,9 +226,26 @@ def test_backfill_diff_and_idempotence(tmp_db):
     con = sqlite3.connect(db)
     rr2 = dict(zip(cols, con.execute(
         "SELECT * FROM runs WHERE archive=?", (rj,)).fetchone()))
-    assert rr2["run_date"] == "20260725T191314Z"
+    assert rr2["run_date"] == "2026-07-25T19:13:14"
     assert rr2["elapsed_s"] is None
     con.close()
+
+
+def test_backfill_unreachable_row_is_not_a_silent_skip(tmp_db):
+    # §6.5: the guarantee all three registries share -- a row whose artifact
+    # BENCH_DIR cannot supply was NOT migrated, so it is counted as
+    # unreachable (main() exits nonzero on it) rather than folded into the
+    # benign-looking unreadable/recompute-failed bucket.  LME is the largest
+    # registry; a half-run migration reading as success costs most here.
+    mod, db, bench = tmp_db
+    con = mod.connect()
+    con.execute("INSERT INTO runs (archive, kind, run_date) VALUES (?,?,?)",
+                ("longmemeval-v2-hymem-20260610T094858Z-seed0.json",
+                 "archive", "2026-06-10T09:48:58"))
+    con.commit()
+    con.close()
+    # The artifact was never written to bench/ -> unreachable, count of 1.
+    assert mod.cmd_backfill() == 1
 
 
 def test_old_format_lever_captured_separately(tmp_db):
