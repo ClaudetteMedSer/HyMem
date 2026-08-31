@@ -1479,6 +1479,9 @@ def evaluate_question(
                                  distilled=distilled_lines,
                                  narrative_facts=narrative_facts)
 
+    _ep_texts = [m["content"] for m in memories
+                 if isinstance(m, dict) and m.get("type") == "episode"]
+
     # Judge (binary yes/no, or None when the JUDGE itself errored — D3)
     correct, judge_raw = judge_scored(judge_llm, question_type, question,
                                       answer, ai_answer)
@@ -1514,6 +1517,29 @@ def evaluate_question(
         "n_episodes": sum(1 for m in memories
                          if isinstance(m, dict) and m.get("type") == "episode"),
         "n_agg_nodes": len(aggregation_nodes) if aggregation_nodes else 0,
+        # `n_episodes > 0` is NOT the fired-subset variable, and pre-registering
+        # it as one would repeat E1's LME death exactly: episodes reach the
+        # reader on nearly every question (cap 10 via the fts_top_k=10 pin at
+        # :598-604, sorted to the head of `rest` at confidence 0.8), so the
+        # "fired" subset is ~the whole set and its band equals the all-500 band,
+        # with a not-fired control of n≈0. E1's fire rate was 99.8% and its
+        # control was n=1. `gold_in_episodes` is the analogue of the instrument
+        # that DID work there -- the tier's own hit rate, independent of whether
+        # the answer was right. None = answer too short to test.
+        "gold_in_episodes": (
+            _answer_in_texts(str(answer), _ep_texts)
+            if _ep_texts else False
+        ),
+        # Procedures share the episode budget (`proc_top_k = fts_top_k` for
+        # every ability but IF, where procedure_top_k_if is also 10), so the
+        # retrieved pool can reach 15+10+10+10+10 = 55 and the memories[:45] cut
+        # is NOT inert by construction -- it is inert for EPISODES, which land in
+        # slots 16-25 (no procedures) to 26-35 (max), never near the cut.
+        # Recorded because nothing else distinguishes "45 = every tier full"
+        # from "45 = truncated from 55", and a 70% pile at exactly 45 reads the
+        # same either way.
+        "n_procedures": sum(1 for m in memories
+                            if isinstance(m, dict) and m.get("type") == "procedure"),
         "recall_ceiling": recall_ceiling,
         "recall_tier": recall_tier,
         "gold_mode": gold_mode,
