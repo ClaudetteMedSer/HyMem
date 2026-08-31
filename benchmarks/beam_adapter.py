@@ -340,10 +340,60 @@ def _tier_coverage(gold: set[str], texts: list[str]) -> float | None:
     return round(len(gold & seen) / len(gold), 4)
 
 
-def episode_probe(memories: list[dict], question: str, ideal_answer: str) -> dict:
+# Pre-registered decision thresholds. Fixed 2026-08-31, BEFORE any BEAM run of
+# this instrument. They are constants executed by the readout rather than prose
+# left to whoever reads the table, because a threshold chosen after seeing the
+# numbers is not a threshold. Changing one is a NEW pre-registration, not a tweak.
+PROBE_MIN_ROWS = 12       # per ability; below this the verdict is n/a, not a result
+PROBE_NULL_MARGIN = 2.0   # cov_ep must be >= 2x its own shuffled null
+PROBE_CONTROL_SHARE = 0.5 # cov_ep must be >= 0.5x the message control
+
+
+def _decoy_answer(questions: list[dict], qi: int) -> str:
+    """Another question's ideal answer from the SAME conversation.
+
+    Every BEAM question draws on one shared corpus, so a tier will cover some
+    answer tokens by vocabulary alone -- which makes a bare cov_ep number
+    uninterpretable. Scoring the same tier against an answer it cannot possibly
+    contain gives the chance floor. Same ability where one exists, so answer
+    STYLE (ordering language, summary language) is controlled too, and picked
+    deterministically so the readout is reproducible from the run alone.
+    """
+    mine = questions[qi]
+    same = [q for j, q in enumerate(questions)
+            if j != qi and q.get("ability_short") == mine.get("ability_short")]
+    pool = same or [q for j, q in enumerate(questions) if j != qi]
+    if not pool:
+        return ""
+    return pool[qi % len(pool)].get("ideal_answer", "") or ""
+
+
+def _probe_verdict(n_pair: int, cov_ep, cov_msg, null_ep, null_msg) -> str:
+    """The pre-registered rule, executed. Returns YES / no / INVALID / n-a."""
+    if n_pair < PROBE_MIN_ROWS or cov_ep is None or cov_msg is None:
+        return "n-a"
+    # Control sanity first: if the message tier cannot beat its own chance
+    # floor, the MEASURE failed on these rows and neither column is evidence.
+    if null_msg is not None and cov_msg <= null_msg:
+        return "INVALID"
+    if null_ep is None:
+        return "n-a"
+    if cov_ep < PROBE_NULL_MARGIN * null_ep:
+        return "no"
+    if cov_ep < PROBE_CONTROL_SHARE * cov_msg:
+        return "no"
+    return "YES"
+
+
+def episode_probe(memories: list[dict], question: str, ideal_answer: str,
+                  decoy_answer: str = "") -> dict:
     """Per-question, per-tier answer-bearing record. Purely additive: reads the
     already-assembled `memories` list (so it measures what actually reached the
-    reader, post-slice) and changes nothing about the run."""
+    reader, post-slice) and changes nothing about the run.
+
+    `decoy_answer` is another question's ideal answer from the same conversation;
+    scoring the same tiers against it gives each column its own chance floor.
+    """
     by_tier: dict[str, list[str]] = defaultdict(list)
     for m in memories:
         if isinstance(m, dict) and (m.get("content") or "").strip():
@@ -366,6 +416,15 @@ def episode_probe(memories: list[dict], question: str, ideal_answer: str) -> dic
         # PRIMARY measure + its positive control, same question, same tokens.
         "cov_episodes": _tier_coverage(gold, ep),
         "cov_messages": _tier_coverage(gold, msg),
+        # NEGATIVE CONTROL: the same tiers scored against an answer they cannot
+        # contain. Coverage above this is tier content; coverage at it is the
+        # shared vocabulary of one conversation and means nothing.
+        "cov_episodes_null": (
+            _tier_coverage(_gold_tokens(decoy_answer, question), ep)
+            if decoy_answer else None),
+        "cov_messages_null": (
+            _tier_coverage(_gold_tokens(decoy_answer, question), msg)
+            if decoy_answer else None),
         # SECONDARY: LME-comparable containment, mostly None on long answers.
         "gold_in_episodes": _answer_in_texts(ideal_answer, ep) if ep else None,
         "gold_in_messages": _answer_in_texts(ideal_answer, msg) if msg else None,
@@ -373,53 +432,94 @@ def episode_probe(memories: list[dict], question: str, ideal_answer: str) -> dic
 
 
 def print_episode_probe(all_results: list[dict]) -> None:
-    """Per-ability readout of the pre-check. The decision rule is written into
-    the output rather than left to the reader: episode coverage is only
-    interpretable relative to the message control on the same rows."""
+    """Per-ability readout that EXECUTES the pre-registered rule.
+
+    The verdict column is computed, not narrated, so the decision cannot drift
+    to fit the numbers once they are on screen. Three things must hold for an
+    ability to read YES, and all three are constants above:
+      * enough paired rows to be a result at all (PROBE_MIN_ROWS);
+      * cov_ep clears its own chance floor by PROBE_NULL_MARGIN -- otherwise the
+        coverage is one conversation's shared vocabulary, not tier content;
+      * cov_ep is at least PROBE_CONTROL_SHARE of the message control.
+    A control that cannot beat its own floor reads INVALID: on those rows the
+    measure failed, and neither column is evidence either way.
+    """
     rows = [(q["ability"], q.get("probe") or {})
             for conv in all_results for q in conv["questions"]]
     rows = [(a, p) for a, p in rows if p]
     if not rows:
         return
 
+    def _pct(v, w=9):
+        return f"{'—':>{w}}" if v is None else f"{v*100:>{w - 1}.1f}%"
+
+    def _num(v, w=7):
+        return f"{'—':>{w}}" if v is None else f"{v:>{w}.2f}"
+
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else None
+
     print()
     print("=" * 80)
     print("  EPISODE-TIER ANSWER-BEARING PRE-CHECK (Plan C)")
     print("  cov = share of answer-specific tokens (question terms removed)")
-    print("  carried by the tier. msg column is the positive control.")
+    print("  carried by a tier. null = same tier vs another question's answer")
+    print("  (chance floor). msg = positive control, on the SAME rows.")
+    print(f"  Rule: YES iff pair>={PROBE_MIN_ROWS} and cov_ep >= "
+          f"{PROBE_NULL_MARGIN:g}x null_ep and cov_ep >= "
+          f"{PROBE_CONTROL_SHARE:g}x cov_msg.")
     print("=" * 80)
-    print(f"  {'ability':<9}{'n':>4}{'ep>0':>6}{'cov_ep':>9}{'cov_msg':>9}"
-          f"{'ratio':>8}{'contain':>9}")
+    print(f"  {'ability':<8}{'pair':>5}{'cov_ep':>9}{'null_ep':>9}"
+          f"{'cov_msg':>9}{'null_msg':>10}{'ratio':>7}{'verdict':>9}")
     print("  " + "-" * 74)
-
-    def _pct(v, w=9):
-        return f"{'—':>{w}}" if v is None else f"{v*100:>{w-1}.1f}%"
-
-    def _num(v, w=8):
-        return f"{'—':>{w}}" if v is None else f"{v:>{w}.2f}"
 
     for ability in sorted({a for a, _ in rows}) + ["ALL"]:
         sel = rows if ability == "ALL" else [(a, p) for a, p in rows if a == ability]
-        n = len(sel)
-        ep_present = sum(1 for _, p in sel if p["n_episodes"] > 0)
-        ce = [p["cov_episodes"] for _, p in sel if p["cov_episodes"] is not None]
-        cm = [p["cov_messages"] for _, p in sel if p["cov_messages"] is not None]
-        gi = [p["gold_in_episodes"] for _, p in sel if p["gold_in_episodes"] is not None]
-        me = sum(ce) / len(ce) if ce else None
-        mm = sum(cm) / len(cm) if cm else None
+        # PAIRED rows only. A control is only a control on the rows it shares
+        # with the thing it controls; averaging two independently-filtered
+        # columns compares different question sets and calls it a ratio.
+        pair = [p for _, p in sel
+                if p["cov_episodes"] is not None and p["cov_messages"] is not None]
+        me = _mean([p["cov_episodes"] for p in pair])
+        mm = _mean([p["cov_messages"] for p in pair])
+        ne = _mean([p["cov_episodes_null"] for p in pair
+                    if p["cov_episodes_null"] is not None])
+        nm = _mean([p["cov_messages_null"] for p in pair
+                    if p["cov_messages_null"] is not None])
         ratio = (me / mm) if (me is not None and mm not in (None, 0)) else None
-        contain = (sum(gi) / len(gi)) if gi else None
+        verdict = _probe_verdict(len(pair), me, mm, ne, nm)
         sep = "  " + "-" * 74 + "\n" if ability == "ALL" else ""
-        print(f"{sep}  {ability:<9}{n:>4}{ep_present:>6}"
-              f"{_pct(me)}{_pct(mm)}{_num(ratio)}{_pct(contain)}")
+        print(f"{sep}  {ability:<8}{len(pair):>5}{_pct(me)}{_pct(ne)}"
+              f"{_pct(mm)}{_pct(nm, 10)}{_num(ratio)}{verdict:>9}")
+
+    # Secondary: what reached the reader, and the LME-comparable containment
+    # number. Kept out of the decision table because containment is near-blind
+    # on the long ideal answers EO/SUM carry -- it is a cross-benchmark
+    # comparison point, not evidence about BEAM.
+    print()
+    print(f"  {'ability':<8}{'n':>5}{'ep>0':>6}{'ep/q':>7}{'msg/q':>7}"
+          f"{'proc/q':>8}{'contain_ep':>12}")
+    print("  " + "-" * 74)
+    for ability in sorted({a for a, _ in rows}) + ["ALL"]:
+        sel = [p for a, p in rows if ability in (a, "ALL")]
+        gi = [p["gold_in_episodes"] for p in sel if p["gold_in_episodes"] is not None]
+        sep = "  " + "-" * 74 + "\n" if ability == "ALL" else ""
+        print(f"{sep}  {ability:<8}{len(sel):>5}"
+              f"{sum(1 for p in sel if p['n_episodes'] > 0):>6}"
+              f"{_num(_mean([p['n_episodes'] for p in sel]))}"
+              f"{_num(_mean([p['n_messages'] for p in sel]))}"
+              f"{_num(_mean([p['n_procedures'] for p in sel]), 8)}"
+              f"{_pct(_mean(gi) if gi else None, 12)}")
 
     print()
-    print("  Reading it: cov_msg at/near zero on a row means the MEASURE failed")
-    print("  there, not the tier -- discard the row rather than the hypothesis.")
-    print("  Episodes are answer-bearing on an ability only where cov_ep is")
-    print("  non-trivial AND the ratio is not far below 1. A near-zero cov_ep")
-    print("  under a healthy cov_msg reproduces the LME finding and closes")
-    print("  Plan C on score grounds for that ability.")
+    print("  YES on EO/SUM  -> episodes are answer-bearing there; Plan C gets an")
+    print("                    instrument and an A/B can be pre-registered on it.")
+    print("  no  everywhere -> reproduces the LME finding; Plan C closes on score")
+    print("                    grounds battery-wide.")
+    print("  INVALID        -> the measure failed on those rows; discard the rows,")
+    print("                    not the hypothesis.")
+    print("  n-a            -> too few paired rows to be a result. Raise --sample;")
+    print("                    do not read the numbers next to it.")
 
 
 # ── BEAM Dataset Loader ───────────────────────────────────────────────
@@ -1013,7 +1113,8 @@ def evaluate_conversation(llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter
             # Plan C pre-check. Additive record only -- computed from the
             # already-returned `memories`, so it cannot affect the answer or
             # the score, and it costs no extra call.
-            "probe": episode_probe(memories, question, q["ideal_answer"]),
+            "probe": episode_probe(memories, question, q["ideal_answer"],
+                                   _decoy_answer(conv["questions"], qi)),
         })
 
     return {

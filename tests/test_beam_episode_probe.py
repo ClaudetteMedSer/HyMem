@@ -33,10 +33,16 @@ pytest.importorskip("requests")
 _BENCH = Path(__file__).resolve().parent.parent / "benchmarks"
 sys.path.insert(0, str(_BENCH))
 from beam_adapter import (  # noqa: E402
+    PROBE_CONTROL_SHARE,
+    PROBE_MIN_ROWS,
+    PROBE_NULL_MARGIN,
     _content_tokens,
+    _decoy_answer,
     _gold_tokens,
+    _probe_verdict,
     _tier_coverage,
     episode_probe,
+    print_episode_probe,
 )
 
 QUESTION = "What order did the user complete the migration milestones in?"
@@ -140,6 +146,7 @@ def test_every_probe_key_is_present_on_every_question():
     expected = {
         "n_memories", "n_episodes", "n_messages", "n_procedures", "n_fts",
         "n_graph", "n_recent", "n_gold_tokens", "cov_episodes", "cov_messages",
+        "cov_episodes_null", "cov_messages_null",
         "gold_in_episodes", "gold_in_messages",
     }
     for memories in ([], [_NARRATIVE], [_ANSWER_BEARING, _mem("recent", "hi")]):
@@ -174,3 +181,86 @@ def test_both_decision_levers_are_pinned_explicitly(tmp_path, monkeypatch):
         assert seen["episode_granularity_enabled"] is False
     finally:
         adapter.close()
+
+
+# ── the chance floor ───────────────────────────────────────────────
+# Every BEAM question draws on one shared corpus, so a tier covers some answer
+# tokens by vocabulary alone. Without a floor, any non-zero cov_ep reads as
+# signal -- the same shape as a measure that returns a confident constant.
+
+def test_null_is_none_without_a_decoy_rather_than_zero():
+    probe = episode_probe([_ANSWER_BEARING], QUESTION, IDEAL)
+    assert probe["cov_episodes_null"] is None
+    assert probe["cov_messages_null"] is None
+
+
+def test_the_null_fires_on_shared_vocabulary_and_stays_below_the_signal():
+    """A tier that genuinely carries THIS answer must score above what it scores
+    against another answer built from the same conversation's vocabulary."""
+    decoy = ("The user reviewed the aggregation rebuild timings and discussed "
+             "the schema at length.")
+    probe = episode_probe([_ANSWER_BEARING], QUESTION, IDEAL, decoy_answer=decoy)
+    assert probe["cov_episodes_null"] is not None
+    assert probe["cov_episodes"] > probe["cov_episodes_null"]
+
+
+def test_a_decoy_is_drawn_from_the_same_conversation_preferring_the_ability():
+    questions = [
+        {"ability_short": "EO", "ideal_answer": "first A then B"},
+        {"ability_short": "IE", "ideal_answer": "the answer is C"},
+        {"ability_short": "EO", "ideal_answer": "first D then E"},
+    ]
+    assert _decoy_answer(questions, 0) == "first D then E"   # same ability
+    assert _decoy_answer(questions, 1) in {"first A then B", "first D then E"}
+    assert _decoy_answer([questions[0]], 0) == ""            # nothing to draw on
+
+
+# ── the pre-registered rule ────────────────────────────────────────
+
+def test_verdict_requires_all_three_criteria():
+    n = PROBE_MIN_ROWS
+    # clears the floor and the control share
+    assert _probe_verdict(n, 0.40, 0.60, 0.10, 0.10) == "YES"
+    # fails the chance floor: coverage is shared vocabulary
+    assert _probe_verdict(n, 0.19, 0.60, 0.10, 0.10) == "no"
+    # clears the floor but is far below the control
+    assert _probe_verdict(n, 0.20, 0.90, 0.05, 0.10) == "no"
+
+
+def test_verdict_is_not_a_result_below_the_row_minimum():
+    assert _probe_verdict(PROBE_MIN_ROWS - 1, 0.9, 0.1, 0.0, 0.0) == "n-a"
+
+
+def test_a_control_that_cannot_beat_its_own_floor_invalidates_the_row():
+    """If the message tier scores no better against the real answer than against
+    an unrelated one, the measure failed there -- neither column is evidence."""
+    assert _probe_verdict(PROBE_MIN_ROWS, 0.40, 0.10, 0.01, 0.10) == "INVALID"
+
+
+def test_the_thresholds_are_the_pre_registered_ones():
+    """Guards the pre-registration itself: a threshold edited after a run is a
+    new pre-registration, and this test is where that has to be acknowledged."""
+    assert (PROBE_MIN_ROWS, PROBE_NULL_MARGIN, PROBE_CONTROL_SHARE) == (12, 2.0, 0.5)
+
+
+# ── the control has to be a SAME-ROW control ───────────────────────
+
+def test_ratio_uses_only_rows_where_both_columns_exist(capsys):
+    """Averaging two independently-filtered columns compares different question
+    sets and calls it a ratio. Rows without episodes must not lift cov_msg."""
+    with_both = episode_probe(
+        [_NARRATIVE, _mem("message_hit", "drafted schema, benchmarked "
+                          "aggregation rebuild, flipped granularity default")],
+        QUESTION, IDEAL)
+    msg_only = episode_probe(
+        [_mem("message_hit", "totally unrelated chatter")], QUESTION, IDEAL)
+    assert msg_only["cov_episodes"] is None  # would be dropped from cov_ep only
+
+    print_episode_probe([{"questions": [
+        {"ability": "EO", "probe": with_both},
+        {"ability": "EO", "probe": msg_only},
+    ]}])
+    out = capsys.readouterr().out
+    # One paired row, not two: the msg-only row is excluded from BOTH columns.
+    eo = next(ln for ln in out.splitlines() if ln.strip().startswith("EO"))
+    assert eo.split()[1] == "1"
