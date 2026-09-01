@@ -36,7 +36,10 @@ def _rows(score_of):
     return [{"ability": ab, "question": f"q{ab}{i}", "answer": f"a{ab}{i}",
              "ideal_answer": f"gold{ab}{i}", "rubric": f"rub{ab}{i}",
              "gold_kind": "ideal_answer", "score": score_of(ab, i),
-             "scores": [score_of(ab, i)], "judge_parse": "ok"}
+             "scores": [score_of(ab, i)], "judge_parse": "ok",
+             # What the judge READ -- computed fresh per arm from its own
+             # reparse, unlike every other field here, which is inherited.
+             "judged_ideal": f"read{ab}{i}"}
             for ab in ABILITIES for i in range(16)]
 
 
@@ -278,21 +281,89 @@ def _corrupt(field, value, tag_to_hit="C1"):
     return mutate
 
 
+def test_a_difference_in_what_the_judge_read_aborts(tmp_path):
+    """§4.2 as it should always have been.
+
+    B carries no `dataset_revisions` and a rejudge reparses the dataset for
+    gold. The question is whether the four arms reparsed the SAME gold, and the
+    only field that can answer it is the one each arm computes from its own
+    reparse."""
+    r = _run(tmp_path, _flat({t: 4 for t in GOLD}),
+             mutate=_corrupt("judged_ideal", "DIFFERENT GOLD"))
+    assert r.returncode == 3
+    assert "4.2 gold identity" in r.stdout
+    assert "reparsed different gold" in r.stdout
+
+
+def test_the_older_field_name_is_accepted(tmp_path):
+    """The four arms on disk predate `judged_ideal` and record the same thing
+    as `judge_ideal_used` (90ced81). §10 said they could not be retrofitted;
+    they can, and this is what lets the scorer read them."""
+    def mutate(tag, path):
+        d = json.loads(path.read_text())
+        for q in d["conversations"][0]["questions"]:
+            q["judge_ideal_used"] = q.pop("judged_ideal")
+        path.write_text(json.dumps(d))
+    r = _run(tmp_path, _flat({t: 4 for t in GOLD}), mutate=mutate)
+    assert r.returncode == 0, r.stdout[-2000:]
+    assert "4.2 gold identity" in r.stdout
+
+
+def test_an_arm_that_never_recorded_what_it_read_aborts(tmp_path):
+    """A pre-4d9906b main-path artifact. §4.2 must refuse rather than fall back
+    to an inherited field and report a pass it did not earn."""
+    def mutate(tag, path):
+        if tag != "C1":
+            return
+        d = json.loads(path.read_text())
+        for q in d["conversations"][0]["questions"]:
+            q.pop("judged_ideal")
+        path.write_text(json.dumps(d))
+    r = _run(tmp_path, _flat({t: 4 for t in GOLD}), mutate=mutate)
+    assert r.returncode == 3
+    assert "nothing here that could fail" in r.stdout
+
+
+def test_a_constant_judged_gold_is_refused_as_powerless(tmp_path):
+    """THE test this whole correction exists for (§10.3, turned on §4.2 itself).
+
+    If every arm-row carries the same string, identity across arms is automatic
+    and the check reports agreement exactly as it would if it had measured
+    something. That is indistinguishable from a pass, so it must not be one."""
+    def mutate(tag, path):
+        d = json.loads(path.read_text())
+        for q in d["conversations"][0]["questions"]:
+            q["judged_ideal"] = "SAME FOR EVERY ROW"
+        path.write_text(json.dumps(d))
+    r = _run(tmp_path, _flat({t: 4 for t in GOLD}), mutate=mutate)
+    assert r.returncode == 3
+    assert "4.2 power" in r.stdout
+    assert "carries no information" in r.stdout
+
+
 @pytest.mark.parametrize("field", ["rubric", "ideal_answer", "gold_kind"])
-def test_a_rubric_difference_aborts(tmp_path, field):
-    """§4.2 -- B carries no dataset_revisions, and a rejudge reparses the
-    dataset for gold. Byte-identity across the four arms is what converts that
-    unwitnessed assumption into a measured fact, so a difference is not a row
-    to drop; it means the arms are not measuring the same thing."""
+def test_an_inherited_field_difference_still_aborts_as_a_swapped_file(tmp_path, field):
+    """§4.2b. These fields are inherited from A by every arm, so a difference
+    cannot mean "reparsed differently" -- it means one of the five files is not
+    a rejudge of this anchor. The check is kept; only its claim changed."""
     r = _run(tmp_path, _flat({t: 4 for t in GOLD}), mutate=_corrupt(field, "DIFFERENT"))
     assert r.returncode == 3
-    assert "4.2 rubric identity" in r.stdout
+    assert "4.2b inherited-field identity" in r.stdout
+    assert "not four rejudges of one anchor" in r.stdout
 
 
-def test_a_regenerated_answer_aborts(tmp_path):
+def test_the_scorer_never_claims_the_inherited_fields_measured_a_reparse(tmp_path):
+    """The retracted sentence, and the shape of it, must not come back."""
+    src = (_BENCH / "gold_delta_rederive.py").read_text()
+    assert "rubric identity" not in src
+    assert "unwitnessed revision is not load-bearing" not in src
+
+
+def test_a_differing_answer_aborts(tmp_path):
     r = _run(tmp_path, _flat({t: 4 for t in GOLD}), mutate=_corrupt("answer", "REWRITTEN"))
     assert r.returncode == 3
     assert "4.3 answer identity" in r.stdout
+    assert "not a re-generated answer" in r.stdout
 
 
 def test_an_unreadable_row_aborts(tmp_path):

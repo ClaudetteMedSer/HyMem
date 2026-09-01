@@ -108,6 +108,20 @@ def refuse_void(tag, meta):
         sys.exit(4)
 
 
+def judged_gold(row):
+    """The text the judge actually read, under either of its two names.
+
+    `judge_ideal_used` has been written by the rejudge path since 90ced81 --
+    before the gold-delta phase began. `judged_ideal` was added to BOTH paths
+    by 4d9906b, which is where SS10 concluded the existing arms "cannot be
+    retrofitted". They can: the field was there the whole time, under the
+    older name."""
+    for f in ("judged_ideal", "judge_ideal_used"):
+        if f in row:
+            return row[f]
+    return None
+
+
 def e1(keys, arms, gold_tags, centre):
     """SS6.1 E1 with Satterthwaite df.
 
@@ -177,23 +191,63 @@ def main():
         abort(f"4.1 row identity: {len(keys)} rows, expected 160")
     print(f"  4.1 row identity: {len(keys)}/160 keys identical across five arms")
 
+    # SS4.2 GOLD IDENTITY, rewritten -- see the protocol's SS10 and SS11.
+    # The original compared `ideal_answer`/`gold_kind`, which every rejudge arm
+    # INHERITS from anchor A (`out = dict(r)`). Four copies of one field agree
+    # by construction, so its passing said nothing about what each arm
+    # reparsed. The field with power is the one each arm computes fresh from
+    # its OWN reparse: the text the judge actually read.
+    judged = {t: {k: judged_gold(arms[t][k]) for k in keys} for t in gold_tags}
+    missing = [(t, k) for t in gold_tags for k in keys if judged[t][k] is None]
+    if missing:
+        abort(f"4.2 gold identity: {len(missing)} arm-rows record neither "
+              f"'judged_ideal' nor 'judge_ideal_used'; e.g. {missing[0][0]} "
+              f"{missing[0][1]}. Without what the judge read there is nothing "
+              f"here that could fail, and SS4.2 must not run.")
+    vals = [str(judged[t][k]) for t in gold_tags for k in keys]
+    distinct = len(set(vals))
+    # SS10.3 turned on this check itself: absent, empty or constant all report
+    # agreement identically to a comparison that measured something.
+    if distinct < 2 or all(not v.strip() for v in vals):
+        abort(f"4.2 power: the judged-gold field takes {distinct} distinct "
+              f"value(s) over {len(vals)} arm-rows; identity across arms is "
+              f"then automatic and carries no information")
+    bad = [k for k in keys
+           if len({json.dumps(judged[t][k], sort_keys=True)
+                   for t in gold_tags}) != 1]
+    if bad:
+        abort(f"4.2 gold identity: {len(bad)} rows differ in the text the "
+              f"judge READ across the four arms; e.g. {bad[0]}. The arms "
+              f"reparsed different gold and B's unwitnessed dataset revision "
+              f"is load-bearing after all.")
+    print(f"  4.2 gold identity: the text the judge READ is byte-identical "
+          f"across B,C1,C2,B2c on {len(keys)}/160 rows "
+          f"({distinct} distinct values, so the check could have failed) "
+          f"-> the four reparses agree, measured rather than inferred")
+
+    # SS4.2b -- the inherited fields, kept and relabelled. A difference here
+    # cannot mean an arm reparsed differently, because no arm computes these;
+    # it means one of the five files is not a rejudge of this anchor.
     for field in ("rubric", "ideal_answer", "gold_kind"):
         bad = [k for k in keys
                if len({json.dumps(arms[t][k].get(field), sort_keys=True)
                        for t in gold_tags}) != 1]
         if bad:
-            abort(f"4.2 rubric identity: {len(bad)} rows differ in {field!r} "
-                  f"across the four gold arms; e.g. {bad[0]}. The arms are not "
-                  f"measuring the same thing and B's unwitnessed dataset "
-                  f"revision is load-bearing after all.")
-    print("  4.2 rubric identity: rubric/ideal_answer/gold_kind byte-identical "
-          "across B,C1,C2,B2c -> B's unwitnessed revision is not load-bearing")
+            abort(f"4.2b inherited-field identity: {len(bad)} rows differ in "
+                  f"{field!r}; e.g. {bad[0]}. Every arm inherits this field "
+                  f"from A, so a difference means these are not four rejudges "
+                  f"of one anchor -- check which file was passed.")
+    print("  4.2b inherited fields (rubric/ideal_answer/gold_kind) agree "
+          "-- guaranteed by inheritance; detects a swapped file, nothing more")
 
     bad = [k for k in keys
            if len({arms[t][k].get("answer") for t in tags}) != 1]
     if bad:
-        abort(f"4.3 answer identity: {len(bad)} rows re-generated their answer")
-    print("  4.3 answer identity: answers byte-identical across A and all four arms")
+        abort(f"4.3 answer identity: {len(bad)} rows differ in 'answer' across "
+              f"A and the four arms. Also inherited, so this too means a file "
+              f"that is not a rejudge of A -- not a re-generated answer.")
+    print("  4.3 answer identity: answers byte-identical across A and all four "
+          "arms (inherited; a swapped-file check)")
 
     for tag in tags:
         unreadable = [k for k in keys
