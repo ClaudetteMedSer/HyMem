@@ -285,6 +285,62 @@ a capability given up, recorded here rather than rediscovered as a surprise.
 - Step 1 changes no code. If it fails, nothing has been spent but ten minutes
   and the finding is itself the deliverable.
 
-## 8. Executed results
+## 8. Executed results — Step 1 (2026-09-01)
 
-(empty — nothing has been run under this pre-registration)
+Artifacts, all in `/home/node/hymem_beam/`:
+- **B** `results_20260831T165039Z-rejudged-deepseek-chat-20260831T200531Z.json`
+- **C1** `...-rejudged-deepseek-v4-flash-20260901T055638Z.json`
+- **C2** `...-rejudged-deepseek-v4-flash-20260901T055957Z.json`
+
+C1 and C2 both record `prereg.blob` 86f0a91c315d, `prereg.code_commit`
+b4f4350e, `dataset_revisions` {Mohammadta/BEAM: 3205395e...}. The scorer
+(`benchmarks/step1_pin_compare.py`) was committed at **32e81ee before any
+C1-vs-B comparison was computed** — both arms existed and had passed their
+gates, no pre-registered statistic had been read.
+
+**Gate (§4.4): PASSED.** C1 and C2 each 0/160 silent-0 and 0/160 explicit
+`[LLM_ERROR`, matching B's rates. Canary OK on both runs — 217 chars of content
+on the full judge prompt at max_tokens=512, on the pinned model that returns
+`""` without the flag. 198s and 194s; 161 judge calls each (160 rows + 1
+canary, counted separately from `judge_calls`).
+
+**D_self (read first, per §5) = 7/160.** SD_self = 0.081355 → band =
+2·SD_self/√160 = **±1.2863pp**. By arm: control ABS/CR 1/32 (SD 0.044194),
+pool 6/128 (SD 0.088287).
+
+**D_pin = 3/160. δ̄_pin = −0.3646pp.**
+
+**VERDICT: PASS**, via the second branch — |δ̄_pin| 0.3646pp ≤ band 1.2863pp,
+and D_pin 3 ≤ D_self 7. C1's distance from B is inside the pin's own
+run-to-run churn, so the difference is not attributable to model identity.
+Per §1 this is weak positive evidence, as pre-registered: it confirms the
+migration doc's claim held, it does not establish that anything was learned.
+
+Per-ability (descriptive only, n=16 each): pool B 0.5247 → C1 0.5201
+(−0.46pp); control ABS/CR 0.5859 → 0.5859 (+0.00pp); overall 0.5369 → 0.5333
+(−0.36pp).
+
+### 8.1 The unanticipated finding: the pinned judge is not deterministic
+
+**This was not a question Step 1 was designed to ask, and it is the most
+consequential thing the run produced.** 7/160 rows (4.375%) move between two
+byte-identical invocations of the pinned judge at temperature 0.0.
+
+The gold-delta phase recorded the opposite for the alias — "Control arm ABS/CR:
+32/32 per-row identical (SD_ctl = 0.0000). The judge is SCORE-DETERMINISTIC at
+temp 0.0 on byte-identical prompts", plus 4/4 fresh re-judges reproducing — and
+built a **zero-width band** on that zero. Its primary then read δ̄ = −0.582pp as
+OUTSIDE that band, which is what produced **REBASE REQUIRED**; the companion
+was INSIDE, and that pre-registration states plainly that the OR fired on the
+zero-width primary alone.
+
+Under a churn estimate taken from 160 rows rather than 32, ±1.2863pp, the same
+−0.582pp effect would be **INSIDE**.
+
+**Interpretation is deliberately not recorded here yet.** The measured churn is
+the PIN's; the gold-delta band was the ALIAS's, and Step 1's PASS establishes
+that the two graders agree on SCORES, not that they share a CHURN RATE. Reading
+this as "the alias was never deterministic either" requires a transfer
+assumption this pre-registration does not license. The direct measurement — a
+second alias rejudge, giving D_self for the alias — has not been run and is not
+authorised under this spec.
