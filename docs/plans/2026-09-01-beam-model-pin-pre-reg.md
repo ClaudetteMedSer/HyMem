@@ -334,13 +334,40 @@ OUTSIDE that band, which is what produced **REBASE REQUIRED**; the companion
 was INSIDE, and that pre-registration states plainly that the OR fired on the
 zero-width primary alone.
 
-Under a churn estimate taken from 160 rows rather than 32, ±1.2863pp, the same
-−0.582pp effect would be **INSIDE**.
+Recomputed under **§8's own formula** (`SE = SD_ctl/√128`, `band = 2·SE`, with
+SD_ctl the SD of the 32 control-arm deltas — not Step 1's `2·SD/√160`, which is
+a different quantity), substituting the pin's control-arm SD 0.044194 for the
+alias's recorded zero: **band = ±0.7812pp, and |−0.582pp| is INSIDE it.** It is
+inside on every candidate substitution — pin all-row ±1.4382pp, pin pool
+±1.5607pp. The primary does not survive any realistic variance estimate.
 
-**Interpretation is deliberately not recorded here yet.** The measured churn is
-the PIN's; the gold-delta band was the ALIAS's, and Step 1's PASS establishes
-that the two graders agree on SCORES, not that they share a CHURN RATE. Reading
-this as "the alias was never deterministic either" requires a transfer
-assumption this pre-registration does not license. The direct measurement — a
-second alias rejudge, giving D_self for the alias — has not been run and is not
-authorised under this spec.
+Sharper still: the SD_ctl at which −0.582pp is exactly borderline is 0.032923,
+which for 32 rows where one moves and the rest do not is **one control row
+moving by 0.1862**. The pin moved one control row (CR) by 0.25. A single
+quarter-point move in 32 rows is the entire distance between REBASE REQUIRED
+and H0 holding.
+
+**Interpretation is deliberately withheld, because Step 1 cannot support it.**
+The measured churn is the PIN's; the gold-delta band was the ALIAS's, and this
+run establishes that the two graders agree on SCORES, not that they share a
+CHURN RATE. Step 1's PASS is compatible with two opposite worlds and is blind
+between them:
+
+- **World 1** — the alias churns too, §8's 0/32 was a small-sample draw
+  (P(0 in 32) = 0.239 at the pin's rate; P(0 in 36) = 0.200, so its evidence
+  could not have distinguished determinism from 4.4% churn), and the gold-delta
+  verdict is band-dependent.
+- **World 2** — the alias really is deterministic and the pin is the noisier
+  instrument. Scores agree, which is why the PASS fired, but the pin would then
+  buy witnessability at a measured cost in reproducibility, and the migration
+  doc's byte-path-equivalence headline would be false on the sampling axis.
+
+Evidence pointing at World 2, recorded so the convenient reading is not banked
+by default: A→B was a 3.17h gap on the alias with 0/32 control movement; C1→C2
+was 5 minutes on the pin with 1/32. If both names reached the same servable
+configuration, the longer gap should expose at least as much drift, not less.
+
+The discriminating measurement is one alias re-run at n=160, where
+P(0 | pin's rate) = 0.00078. It is pre-registered separately in
+`2026-09-01-alias-churn-b2-pre-reg.md` and is **not authorised under this
+spec**. Nothing here should be read as having decided between the two worlds.
