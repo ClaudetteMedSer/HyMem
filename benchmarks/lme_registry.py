@@ -12,6 +12,7 @@ Usage:
   lme_registry.py ingest [FILE ...]      Add runs from JSON files (default: all archives)
   lme_registry.py list [--limit N] [--flag COL]   Print table
   lme_registry.py query "SQL"            Raw query against the DB
+  lme_registry.py audit [--strict]       Date-check the aggregation label
 
 Flags are recorded exactly as they appear in each run's config block.
 If a key is absent (e.g. older format, or a lever that was not recorded),
@@ -431,6 +432,153 @@ def cmd_backfill(bench_dir=None):
     return len(unreachable)
 
 
+
+# ---------------------------------------------------------------- audit ----
+#
+# The date-check this module's docstring promises ("done on top of NULLs, not
+# inside them"). It exists because `aggregation_nodes_enabled = 0` in this DB
+# is not one claim but three, and only one of them is a measurement:
+#
+#   RECORDED  the run's own config block carried the key (post-6543ee6).
+#   ASSERTED  an analyst supplied it with `--set` after the fact.
+#   ABSENT    NULL -- nothing recorded it at all.
+#
+# An ASSERTED or ABSENT 0 is a statement about what the operator MEANT. Whether
+# the run actually had the layer off depends on the code that ran, and for four
+# days it did not follow the intent:
+#
+#   2026-08-26T16:26:57Z  52adfe5  library default aggregation_nodes_enabled
+#                                  False -> True (G-FLIP PASS)
+#   2026-08-30T20:50:00Z  2247074  longmemeval_adapter pins the lever BOTH ways
+#
+# Between those two commits the adapter set only the True leg, so an
+# un-flagged run inherited the library's new True. Any row in that window
+# labelled 0 is contradicted by the code that produced it, however the label
+# got there. Outside it the label is honoured: before, the default agreed with
+# it; after, the pin enforces it.
+#
+# `run_date` is the END of the run -- the archive stamp is written when the
+# file is. A run that ENDED after the pin may have STARTED before it, so the
+# window test uses `run_date - elapsed_s` where elapsed_s is known. On the two
+# 2026-08-30/31 guard arms that is the difference between a 26-minute margin
+# and no margin at all, and the conservative reading is the only safe one.
+AGGREGATION_DEFAULT_FLIP = "2026-08-26T16:26:57Z"   # 52adfe5
+AGGREGATION_ADAPTER_PIN = "2026-08-30T20:50:00Z"    # 2247074
+# Before this commit `--episode-granularity` did not exist, so no run through
+# this adapter could have had it on, whatever a later --set says.
+EPISODE_GRANULARITY_LEVER = "2026-08-30T20:50:00Z"  # 2247074, same commit
+
+
+def _iso_z(ts):
+    """Normalise the registry's several stamp spellings to a sortable Z form."""
+    if not ts:
+        return None
+    t = str(ts).strip().replace(" ", "T")
+    if t.endswith("Z"):
+        t = t[:-1]
+    if "+" in t[10:]:
+        t = t[:10] + t[10:].split("+")[0]
+    return t[:19] + "Z"
+
+
+def _minus_seconds(iso, seconds):
+    """`iso` less `seconds`, as a Z string. Used to turn a run's END stamp into
+    its START, because that is the instant the code version is decided."""
+    import datetime as _dt
+    if iso is None or not seconds:
+        return iso
+    t = _dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
+    return (t - _dt.timedelta(seconds=float(seconds))).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def label_source(provenance, column, value):
+    """Where this row's value for `column` came from -- not what it says."""
+    if value is None:
+        return "ABSENT"
+    if provenance and f"analyst:{column}=" in provenance:
+        return "ASSERTED"
+    return "RECORDED"
+
+
+def audit_row(run_date, elapsed_s, aggr, epg, provenance):
+    """Verdict for one row. Returns (start, verdict, note).
+
+    CONTRADICTED is the only failing verdict, and it is reserved for a claim
+    the code of the day could not have honoured."""
+    end = _iso_z(run_date)
+    start = _minus_seconds(end, elapsed_s)
+    src_a = label_source(provenance, "aggregation_nodes_enabled", aggr)
+    src_e = label_source(provenance, "episode_granularity_enabled", epg)
+
+    if epg == 1 and start is not None and start < EPISODE_GRANULARITY_LEVER:
+        return start, "CONTRADICTED", (
+            f"episode_granularity_enabled=1 ({src_e}) on a run that started "
+            f"{start}, before the lever existed ({EPISODE_GRANULARITY_LEVER}, "
+            f"2247074) -- no run through this adapter could have had it on")
+
+    if start is None:
+        return start, "UNKNOWN", "no run_date, so no window can be decided"
+    in_window = AGGREGATION_DEFAULT_FLIP <= start < AGGREGATION_ADAPTER_PIN
+    if not in_window:
+        side = "pre-flip" if start < AGGREGATION_DEFAULT_FLIP else "post-pin"
+        return start, "OK", f"{side}; aggregation label {src_a} and honoured"
+    if aggr == 0:
+        return start, "CONTRADICTED", (
+            f"aggregation_nodes_enabled=0 ({src_a}) on a run that started "
+            f"{start}, inside the unpinned window -- the adapter set only the "
+            f"True leg, so the layer was ON regardless of the label")
+    if aggr is None:
+        return start, "CONTRADICTED", (
+            "aggregation_nodes_enabled is ABSENT on a run inside the unpinned "
+            f"window (started {start}) -- it inherited the library's True, so "
+            "this row is an aggregation-ON run and must not read as unknown")
+    return start, "OK", f"in-window but labelled ON ({src_a}); no conflict"
+
+
+def cmd_audit(strict=False):
+    con = connect()
+    rows = con.execute(
+        "SELECT id, archive, kind, run_date, elapsed_s, "
+        "aggregation_nodes_enabled, episode_granularity_enabled, "
+        "flags_provenance FROM runs ORDER BY run_date, id").fetchall()
+    results = []
+    for _id, archive, kind, rd, es, aggr, epg, prov in rows:
+        if kind == "doc":
+            continue
+        start, verdict, note = audit_row(rd, es, aggr, epg, prov)
+        results.append((_id, archive, start, verdict, note))
+
+    window = [r for r in results
+              if r[2] is not None
+              and AGGREGATION_DEFAULT_FLIP <= r[2] < AGGREGATION_ADAPTER_PIN]
+    bad = [r for r in results if r[3] == "CONTRADICTED"]
+    unknown = [r for r in results if r[3] == "UNKNOWN"]
+
+    print(f"\n=== aggregation-label audit — {len(results)} run(s) ===")
+    print(f"  unpinned window: [{AGGREGATION_DEFAULT_FLIP}, "
+          f"{AGGREGATION_ADAPTER_PIN})  (52adfe5 → 2247074)")
+    # A window with nothing in it is the outcome that most resembles a pass, so
+    # it is stated as a count rather than left to be inferred from silence. The
+    # check having no work to do is a finding about the ledger, not a clean
+    # bill of health for a check that ran.
+    print(f"  runs whose execution overlapped that window: {len(window)}")
+    if not window:
+        print("  → the contamination has no victims in this ledger: every run "
+              "either predates the\n    default flip or postdates the adapter "
+              "pin. Nothing here was silently aggregation-ON.")
+    for _id, archive, start, verdict, note in results:
+        if verdict == "OK" and not strict:
+            continue
+        print(f"  [{verdict}] id={_id} {archive}\n      started {start}: {note}")
+    print(f"\n  CONTRADICTED {len(bad)}   UNKNOWN {len(unknown)}   "
+          f"OK {len(results) - len(bad) - len(unknown)}")
+    if bad:
+        print("  → these rows must NOT be used as an aggregation-OFF baseline "
+              "for the episode-granularity flip.")
+    return len(bad)
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -461,6 +609,9 @@ def main():
         cmd_list(a.limit, a.flag)
     elif cmd == "query":
         cmd_query(" ".join(sys.argv[2:]))
+    elif cmd == "audit":
+        if cmd_audit(strict="--strict" in sys.argv[2:]):
+            sys.exit(1)   # a contradicted label is a hard failure, not a note
     else:
         print(__doc__)
         sys.exit(1)

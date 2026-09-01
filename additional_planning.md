@@ -892,6 +892,54 @@ review)*
 > a finding about the layer, and it should be settled by checking dates before
 > any of them is used as a baseline for the flip.
 
+> **SETTLED 2026-09-01 — the contamination has NO victims, and the check that
+> says so is now in the ledger rather than in this paragraph.** The window is
+> bounded by two commits: `52adfe5` (2026-08-26T16:26:57Z, library default
+> False -> True) and `2247074` (2026-08-30T20:50:00Z, the adapter pins the
+> lever both ways). **Zero of the 74 rows in `lme_runs.db` overlap it.** Every
+> LME run either predates the flip or postdates the pin; nothing in the ledger
+> was silently aggregation-ON.
+>
+> The two rows that could have been are the flip's own guard arms, and they
+> clear the pin by **26 minutes** — which is only knowable because the check
+> does not use `run_date`. That stamp is written when the archive is, i.e. at
+> the END of the run; the version of the code that executed is decided at the
+> START. `guard-epg-off` ends 2026-08-30T23:59:24Z after 9,807s, so it started
+> 21:15:56Z — 26 minutes after `2247074`. (`guard-epg-on` started 00:04:33Z,
+> five minutes after the OFF arm finished, which independently confirms the
+> stamp is an end stamp: read as start stamps the two arms would overlap.) A
+> check keyed on `run_date` would have returned the same verdict here for the
+> wrong reason, and the wrong verdict on the first run that straddles a commit.
+>
+> **`lme_registry.py audit`** is the build. It exists because
+> `aggregation_nodes_enabled = 0` in this DB is three claims wearing one value
+> — RECORDED by the run's config block, ASSERTED afterwards via `--set`, or
+> ABSENT — and only the first is a measurement. The other two state intent, and
+> inside the window the code did not follow intent. All three are therefore
+> CONTRADICTED in-window, ABSENT included: NULL there is not missing
+> information, because the library default supplies it, and reporting UNKNOWN
+> would leave a known aggregation-ON run available as an OFF baseline on the
+> grounds that nobody wrote it down. Exit 1 on any contradicted row.
+>
+> **The empty window is reported as a count, not as silence** — "runs whose
+> execution overlapped that window: 0". A clean audit and an audit that is not
+> wired up print the same thing otherwise, which is the §10.3 shape from the
+> gold-delta protocol. For the same reason the 15 tests are led by the ones
+> that put a row INSIDE the window and require it to fire; four mutations were
+> checked and each is caught by its intended test (collapse the window to a
+> point: 7 fail; key the test on the end stamp: the straddling-run test fails;
+> read an in-window ABSENT as UNKNOWN: 1; let an analyst-set on any column
+> taint every column: 1).
+>
+> **The adapter-count claim is also now checked against the code rather than
+> against itself**, which is what the paragraph above says was never done.
+> `beam_adapter.py:1125` and `msc_adapter.py:271` both pin unconditionally;
+> `longmemeval_adapter.py:545` does since `2247074`. The fourth entry point,
+> `locomo_adapter.py`, contains no mention of the lever — and is NOT a fourth
+> gap: it constructs `MSCAdapter` (`locomo_adapter.py:513`) and inherits that
+> pin. All LoCoMo runs are covered by the MSC pin. Offline, no spend. Suite
+> 1644 passed (+15).
+
 ### Motivation
 
 - **BEAM floor post-mortem** (benchmarks/beam_investigation_notes.md): EO/SUM
