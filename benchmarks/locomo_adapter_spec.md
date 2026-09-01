@@ -572,7 +572,12 @@ Consequences, all load-bearing:
   the same judge, no ingest and no re-answering, and writes a flip-compatible
   copy. Every flip it reports is judge nondeterminism with the reader held
   byte-identical; `locomo_flip.py` detects that case and relabels its
-  "dilution" line accordingly. If the judge owns most of the floor, majority-of-3
+  "dilution" line accordingly. That detector compared `ai_answer` to
+  `ai_answer` until 2026-09-01, so a pair recording the answer under any other
+  name compared `None` to `None` on every row and was announced as a re-judge
+  of itself -- printing "JUDGE churn" over the entire dilution signature. It
+  now reads the answer under any of the four adapter names, and reports
+  `[unclassified]` rather than agreement when a row records none. If the judge owns most of the floor, majority-of-3
   judging shrinks it for all three benchmarks at once. Cat-5 golds round-trip
   through `_gold_for_judge()` (shared with the live path) so the re-judge sees
   the same abstention explanation, not a reconstruction — otherwise the run would

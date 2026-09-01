@@ -9,8 +9,15 @@ The rejudge path is worse. It reparses gold fresh, judges against that, and
 writes back the row's INHERITED `ideal_answer` from the source artifact. Four
 rejudge arms of one anchor therefore agree on `ideal_answer` by construction,
 which is why the re-derivation protocol's §4.2 "gold identity" precondition was
-vacuous: it compared four copies of one field. That check is retracted in the
-protocol's §10, and these tests are what stop it being written again.
+vacuous: it compared four copies of one field. That form of the check is
+retracted in the protocol's §10, and these tests are what stop it being written
+again.
+
+§11 then found that §10's consolation was wrong. The arms had recorded what the
+judge actually read all along, under the older name `judge_ideal_used` -- since
+90ced81, before the gold-delta phase began. §4.2 is now a comparison of THAT
+field, which can disagree and is checked for power before it is read; the field
+this module is about is what makes that possible.
 """
 from __future__ import annotations
 

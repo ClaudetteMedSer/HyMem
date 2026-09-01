@@ -566,3 +566,53 @@ The follow-on is narrower and more useful: **before believing an identity check,
 ask which arm computed the field.** Three of five preconditions here compared
 fields no arm computed, and each carried a sentence about what its passing
 proved.
+
+### 11.6 The rule, run against the rest of the instruments
+
+§11.5 is worth what it catches elsewhere, so it was run against the other
+comparison scorers the same day. It caught one, and not a cosmetic one.
+
+`locomo_flip.py` classifies a pair as a re-judge — reader held byte-identical,
+so every flip is judge nondeterminism — with
+
+```python
+judge_only = all(a_rows[i].get("ai_answer") == b_rows[i].get("ai_answer")
+                 for i in shared)
+```
+
+That flag decides a single label, on the one line the script exists to print:
+reader-side regressions are reported as `← dilution` or as `← JUDGE churn`.
+Dilution is the signature no aggregate in the adapter report can show; JUDGE
+churn is the label that says stop looking.
+
+The `.get()` is the defect. `facts_ab.py:51` already documents that the adapters
+disagree about what the answer is called — LoCoMo and MSC write `ai_answer`, LME
+writes `hypothesis` — and keeps a four-name list for exactly that reason. On a
+pair naming it anything else, every row compares `None` to `None`, `all()`
+returns `True`, and the run is announced as a re-judge of itself. Measured on a
+constructed pair whose ten answers differ in every row:
+
+```
+OLD  [judge-only] every shared answer is byte-identical — B is a re-judge of A.
+                  All flips below are JUDGE churn; the reader never moved.
+     reader-side (evidence reached reader in BOTH, now wrong):  3  ← JUDGE churn
+NEW  reader-side (evidence reached reader in BOTH, now wrong):  3  ← dilution
+```
+
+A −30pp reader-side regression, reported as noise. This is the §10.3 shape with
+the sign flipped: not a gate that silently passes, but a gate whose vacuous pass
+is *printed as a finding*, over precisely the rows that carried the signal.
+
+Three changes, none of which touch the classification when it was already right:
+
+1. The answer is read under any of the four adapter names.
+2. **Absence is a third outcome, not agreement.** If any shared row records no
+   answer in either arm, the pair is `[unclassified]` and the label falls back
+   to `dilution` — between the two, the one an analyst can go and check.
+3. `judge_only` and `unanswered` are in the `--json` payload. They were not, so
+   `dilution_regressions` named rows the printed report may have just relabelled
+   churn, and a consumer reading only the JSON could not tell.
+
+The audit found nothing else live. `digest_squeeze_dump.py:322` and
+`digest_squeeze_probe.py:289` both compare fields no arm computes — and both
+already say so in the output, which is the whole ask.

@@ -210,7 +210,7 @@ All read-only, no model calls.
 | `benchmarks/judge_audit.py --verify-parse` | parse-rule flip check, with the vacuity denominator |
 | `benchmarks/judge_audit.py --verify-recitation` | `recites_gold` v1↔v2 diff, both ceilings, shuffled-gold control arm |
 | `benchmarks/facts_ab.py` | McNemar on the FIRED subset, with the NOT-FIRED subset as a built-in negative control |
-| `benchmarks/locomo_flip.py` | paired flip classifier; drops an unscored row from **both** arms or neither |
+| `benchmarks/locomo_flip.py` | paired flip classifier; drops an unscored row from **both** arms or neither; refuses to call a pair a re-judge when neither arm recorded a reader answer |
 
 ---
 
