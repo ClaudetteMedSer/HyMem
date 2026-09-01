@@ -448,3 +448,77 @@ a property of the pipeline.
 
 **No re-run on an unwelcome number.** If the run completes and passes §9.3, it
 is the canonical, whatever it says.
+
+### 9.5 Executed — Step 2 (2026-09-01): the canonical
+
+Artifact **`/home/node/hymem_beam/results_20260901T171245Z.json`**.
+Prereg blob `bebffed…` @ `75838d76`, dataset `3205395e…`, elapsed **5599s
+(93 min)** against the 91 predicted from A's 5471.6s.
+
+**Pinned end to end, and the artifact says so:** `answer_model` and
+`judge_model` both `deepseek-v4-flash`, both `extra_body`
+`{"thinking": {"type": "disabled"}}`, `extra_body_defaulted: []` — the operator
+passed them, `1bc9c15`'s default did not fire, exactly as §9.1 intended.
+`sample 8`, `top_k 10`, `context_memories 30`: the anchor's configuration.
+
+**Pre-run gate (§9.2): PASSED.** Gold coverage **16/16 on all ten abilities**
+(IF/PF via `compliance_spec`, SUM via `summary`, the rest via `response`).
+**CANARY OK (answer)** 32 chars and **CANARY OK (judge)** 161 chars, both on the
+real paths. 160 answer + 160 judge calls, plus one canary each.
+
+**Validity (§9.3): VALID.**
+
+| class | count |
+|---|---|
+| plumbing (silent-0 / `[LLM_ERROR`) | **0/160** |
+| unreadable (parse sentinel) | **0/160** |
+| truncation | **0/160** |
+| empty answers | **0/160** |
+
+**This is now the canonical.** A retires as a comparison point.
+
+`100K`, gold-on, both models pinned:
+
+| | ABS | CR | EO | IE | IF | KU | MR | PF | SUM | TR | **OVERALL** |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| | 75.00 | 42.19 | 26.46 | 45.83 | 59.38 | 75.00 | 45.73 | 81.25 | 36.41 | 43.75 | **53.10** |
+
+**Per §9.4 the difference against A is not reported here and no headline number
+is derived from it.** A was judged gold-off on the alias with four months of
+different code; the gap confounds gold-on judging, the model pin and code drift,
+and there is no arm that separates them. The number above is a new baseline,
+not a result.
+
+### 9.6 Two witnessing defects in this artifact, found while validating it
+
+Neither voids the run. Both are recorded because the artifact is now the
+canonical and will be read by people who were not here.
+
+1. **`judge_gold` is absent from the metadata.** The rejudge path has recorded
+   it since the gold-delta phase; the main path never did. So the canonical
+   cannot witness its own gold setting from its own metadata. **It is witnessed
+   anyway** — it pins `prereg.blob bebffed…`, and that spec's §9.1 states the
+   invocation including `--judge-gold`, which is precisely the mechanism this
+   series built the pre-registration gate for. Corroborated by the log's
+   16/16 gold-coverage table, which only prints under gold resolution.
+2. **`ideal_answer` is the dataset field, not what the judge read.** Under
+   `--judge-gold` the judge scored against the resolved `gold_text`; for IF/PF
+   that is the compliance spec, a different kind of thing entirely. The row
+   records the field the judge did *not* read.
+
+Both fixed in **`4d9906b`** for future runs: `judge_gold` on the main path,
+`judged_ideal` on both, and `select_judge_ideal()` shared by the canary, the
+main run and the rejudge. **The fixes postdate this run and cannot be
+retrofitted into this artifact** — the same ordering the B2 series had to state,
+and stating it is the point.
+
+Defect 2 also invalidated a precondition in the re-derivation protocol; see that
+document's **§10**, which retracts it and records the evidence that does bear on
+the question.
+
+### 9.7 Not done, and deliberately
+
+- **`beam_runs.db` ingestion** of this artifact: §7 excluded it and this run
+  does not change that.
+- **No re-run.** The run completed, the gate passed, and §9.4's rule stands
+  whatever the numbers say.
