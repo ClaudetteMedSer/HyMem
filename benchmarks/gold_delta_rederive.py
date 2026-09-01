@@ -374,14 +374,18 @@ def main():
 
     # ---- SS6.6 per-ability -------------------------------------------------
     print("\n=== SS6.6 PER-ABILITY (descriptive only; n=16, one flip = 6.25pp) ===")
+    over = 0
     for ab in POOL:
         ks = [k for k in pool if k[0] == ab]
         means = [statistics.fmean(d(t, k) for k in ks) * 100 for t in gold_tags]
+        over += abs(statistics.fmean(means)) > 6.25
         c, sd = statistics.fmean(means), statistics.stdev(means)
         print(f"  {ab:4s} {ci(c, T3 * sd / 2)}   "
               f"A={statistics.fmean(arms['A'][k]['score'] for k in ks) * 100:.2f}")
-    print("  The original SS8's heterogeneity argument is NOT re-banked: every one "
-          "of those deltas sits at or below the one-flip resolution floor.")
+    print(f"  {over}/8 exceed the 6.25pp one-flip floor. The original SS8's "
+          f"heterogeneity argument is still NOT re-banked -- these are n=16 "
+          f"estimates, and SS6.7, not SS6.6, is what constrains the verdict's "
+          f"wording.")
 
     print(f"\nVERDICT: {verdict}")
     return 0
