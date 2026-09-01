@@ -354,6 +354,25 @@ def resolve_answer_provider(spec: str, deepseek_key: str):
 THINKING_DISABLED = {"thinking": {"type": "disabled"}}
 
 
+def select_judge_ideal(judge_gold: bool, gold_text: str | None,
+                       ideal_answer: str | None) -> str:
+    """The text actually sent to the judge as the ideal answer.
+
+    Extracted because both call sites had it inline and NEITHER recorded the
+    result. Step 2's artifact stored `ideal_answer` — the dataset field — while
+    the judge had scored against `gold_text`, and under `--judge-gold` those
+    differ (IF/PF resolve gold from `compliance_spec`). An artifact that records
+    a field the judge did not read, under a name that says it did, is the exact
+    defect this series retired the June record for.
+
+    The rejudge path is worse: it reparses gold fresh, judges against that, and
+    writes back the row's INHERITED `ideal_answer` from the source artifact. So
+    comparing `ideal_answer` across rejudge arms compares four copies of one
+    field and can never disagree — which is why the re-derivation protocol's
+    §4.2 check was vacuous. See that protocol's §10."""
+    return ((gold_text or "") if judge_gold else (ideal_answer or ""))
+
+
 def apply_thinking_default(role: str, model: str, provider: str,
                            absent: bool, obj: dict) -> tuple[dict, bool]:
     """Model-pin pre-reg §6: default v4-flash to thinking-disabled when the
@@ -547,7 +566,7 @@ def build_canary_messages(conversations: dict, scales: list, judge_gold: bool) -
     real run reached this line, after ingestion had already been paid for.
     """
     q = pick_canary_question(conversations, scales)
-    ideal = q.get("gold_text", "") if judge_gold else q["ideal_answer"]
+    ideal = select_judge_ideal(judge_gold, q.get("gold_text"), q["ideal_answer"])
     return {
         "ability": q["ability_short"],
         "answer": [
@@ -1634,7 +1653,8 @@ def evaluate_conversation(judge_gold: bool, llm: LLMClient, judge_llm: LLMClient
         # changes what the score MEANS, so post-flip runs need a fresh baseline
         # and the old canonical retires as a comparison point rather than
         # reading as a regression or an improvement.
-        _judge_ideal = q.get("gold_text", "") if judge_gold else q["ideal_answer"]
+        _judge_ideal = select_judge_ideal(judge_gold, q.get("gold_text"),
+                                          q["ideal_answer"])
         judge_result = judge_answer(judge_llm, question, _judge_ideal, q["rubric"], answer)
         print(f"      Score: {judge_result['score']:.2f}")
 
@@ -1643,6 +1663,11 @@ def evaluate_conversation(judge_gold: bool, llm: LLMClient, judge_llm: LLMClient
             "question": question,
             "answer": answer,
             "ideal_answer": q["ideal_answer"],
+            # What the judge actually read. Under --judge-gold this is the
+            # resolved gold, which differs from `ideal_answer` — for IF/PF it
+            # is the compliance_spec. Step 2 recorded only the field the judge
+            # did NOT read.
+            "judged_ideal": _judge_ideal,
             "rubric": q["rubric"],
             "score": judge_result["score"],
             "scores": judge_result["scores"],
@@ -1793,7 +1818,12 @@ def _rejudge_run(args, api_key: str) -> None:
     t0 = time.time()
     for i, r in enumerate(rows):
         gold = gold_rows[r["ability"]][r["question"]]
-        ideal = gold["gold_text"] if args.judge_gold else r.get("ideal_answer", "")
+        ideal = select_judge_ideal(args.judge_gold, gold.get("gold_text"),
+                                   r.get("ideal_answer"))
+        # What the judge actually read, beside the inherited field that says it
+        # did. Without this, an arm comparison reads `ideal_answer` and learns
+        # only that four rows were copied from the same source.
+        r["judged_ideal"] = ideal
         jr = judge_answer(judge_llm, r["question"], ideal, r["rubric"], r["answer"],
                           return_raw=True)
         raw = jr.get("judge_raw", "")
@@ -2341,6 +2371,12 @@ def main():
             "date": datetime.now(timezone.utc).isoformat(),
             "answer_model": args.answer_model,
             "judge_model": args.judge_model,
+            # Recorded on the rejudge path since the gold-delta phase and NOT
+            # here, so Step 2's canonical could not witness its own gold
+            # setting from its metadata — only from the pre-registration blob
+            # it pins. The blob is a real witness; a missing field is not a
+            # good reason to rely on it.
+            "judge_gold": bool(args.judge_gold),
             "scales": scales,
             "sample": max_conv,
             "top_k": top_k,
