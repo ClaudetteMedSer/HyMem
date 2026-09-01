@@ -1469,6 +1469,64 @@ def _judge_messages(question: str, ideal: str, rubric: list, ai_answer: str) -> 
     ]
 
 
+def extract_judge_json(raw: str) -> tuple[dict | None, str]:
+    r"""The judge's verdict object, and how hard it was to get.
+
+    Returns (obj, how) where how is "ok" | "recovered" | "unreadable".
+
+    `re.search(r'\{[^}]+\}')` stops at the FIRST `}`. When an explanation
+    quotes text containing a brace -- code, JSON, a `${template}` literal --
+    the match ends mid-string, json.loads raises, and the caller emits a
+    sentinel 0.0 that is indistinguishable in the score column from a real 0.0.
+    Observed on a complete, valid, finish_reason="stop" reply in which the
+    judge had written `scores: [1]`: the answer under grading contained
+    `${response.status}`, so a 1.0 was recorded as 0.0.
+
+    So: brace-match, tracking string literals and escapes, and return the first
+    complete top-level object. Strictly MORE PERMISSIVE than the regex, never
+    different -- anything the regex parsed must parse identically here, which
+    is pinned by test rather than by inspection. A reply neither can read still
+    returns None, so an unreadable judge stays unreadable.
+    """
+    if not raw:
+        return None, "unreadable"
+    flat = raw.replace("\n", " ")
+    naive = re.search(r"\{[^}]+\}", flat)
+    if naive:
+        try:
+            return json.loads(naive.group()), "ok"
+        except Exception:
+            pass
+    depth = 0
+    start = None
+    in_str = False
+    esc = False
+    for i, ch in enumerate(flat):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    return json.loads(flat[start:i + 1]), "recovered"
+                except Exception:
+                    start = None
+    return None, "unreadable"
+
+
 def _finish_reason(llm) -> str | None:
     """Why the last call ended, for any object that plays the LLM's part.
 
@@ -1488,23 +1546,17 @@ def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_ans
     messages = _judge_messages(question, ideal, rubric, ai_answer)
 
     raw = llm.chat(messages, temperature=0.0, max_tokens=512)
-    try:
-        json_match = re.search(r'\{[^}]+\}', raw.replace('\n', ' '))
-        if json_match:
-            result = json.loads(json_match.group())
-            scores = result.get("scores", [])
-            total = sum(scores) / len(scores) if scores else 0.0
-            out = {"score": total, "scores": scores}
-            if return_raw:
-                out["judge_raw"] = raw
-                out["judge_finish_reason"] = _finish_reason(llm)
-            return out
-    except Exception:
-        pass
-    out = {"score": 0.0, "scores": []}
+    result, how = extract_judge_json(raw)
+    if result is not None:
+        scores = result.get("scores", [])
+        total = sum(scores) / len(scores) if scores else 0.0
+        out = {"score": total, "scores": scores}
+    else:
+        out = {"score": 0.0, "scores": []}
     if return_raw:
         out["judge_raw"] = raw
         out["judge_finish_reason"] = _finish_reason(llm)
+        out["judge_parse"] = how
     return out
 
 
@@ -1760,6 +1812,7 @@ def _rejudge_run(args, api_key: str) -> None:
         out["judge_error"] = bool(raw) and raw.startswith("[LLM_ERROR")
         out["judge_finish_reason"] = jr.get("judge_finish_reason")
         out["judge_truncated"] = is_truncation(raw, jr.get("judge_finish_reason"))
+        out["judge_parse"] = jr.get("judge_parse")
         out["_rejudged"] = judged
         out["judge_ideal_used"] = ideal
         new_questions.append(out)
