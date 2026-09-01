@@ -374,7 +374,7 @@ def _git(*args: str) -> str | None:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def resolve_prereg(path: str | None, allow_dirty: bool) -> dict | None:
+def resolve_prereg(path: str | None) -> dict | None:
     """Pin an artifact to the spec that authorised it, or refuse to run.
 
     "A verdict whose spec-hash post-dates its artifact is void by
@@ -388,6 +388,20 @@ def resolve_prereg(path: str | None, allow_dirty: bool) -> dict | None:
     explicit --no-prereg escape for exploratory runs; it returns None, which
     the artifact records as `prereg: null` -- an exploratory run should be
     identifiable as one, not silently indistinguishable from a canonical.
+
+    The three hashes are not interchangeable, and writing comparison logic on
+    the wrong one gives a wrong answer:
+
+    - `blob` is the SPEC'S CONTENT identity and the only equality key. Two runs
+      under an unedited spec share it however far the repo has moved; any edit
+      changes it. This is the field that makes "spec edited to fit the numbers"
+      a visible mismatch.
+    - `commit` is provenance: the last commit that touched the SPEC PATH, not
+      HEAD. Checking it out does not reproduce the run.
+    - `code_commit` is HEAD -- the tree to check out to reproduce. It is only
+      meaningful because a dirty tree is refused outright (below); recording
+      HEAD beside an uncommitted diff would name a tree that never produced
+      the artifact, which is worse than recording nothing.
     """
     if path is None:
         return None
@@ -412,11 +426,19 @@ def resolve_prereg(path: str | None, allow_dirty: bool) -> dict | None:
     if not commit:
         print(f"ERROR: {rel!r} has no commit touching it; git cannot date the spec.")
         sys.exit(2)
-    code_dirty = bool(_git("status", "--porcelain", "--untracked-files=no"))
-    if code_dirty and not allow_dirty:
-        print("ERROR: tracked files are modified, so the code that produced this "
-              "artifact has no commit to name. Commit, stash, or pass --allow-dirty "
-              "(which records the fact in the artifact).")
+    # No escape hatch, deliberately. An --allow-dirty flag would let the run
+    # record code_commit = HEAD while the tree was HEAD plus an uncommitted
+    # diff that nothing captures: not an incomplete field but a WRONG one, and
+    # a reader who checks that commit out and re-runs gets a different result.
+    # A dirty tree already has an honest path -- --no-prereg, which records
+    # prereg: null. If a run is worth banking as canonical, its code is worth
+    # committing; if it is not, it is exploratory and should say so.
+    if _git("status", "--porcelain", "--untracked-files=no"):
+        print("ERROR: tracked files are modified, so no commit names the code that "
+              "would produce this artifact. Commit or stash them, or run with "
+              "--no-prereg if this is exploratory (recorded as prereg: null). "
+              "Untracked files are fine -- only modified tracked files are the "
+              "problem, because only they change behaviour without changing HEAD.")
         sys.exit(2)
     return {
         "path": rel,
@@ -424,7 +446,6 @@ def resolve_prereg(path: str | None, allow_dirty: bool) -> dict | None:
         "blob": _git("rev-parse", f"HEAD:{rel}"),
         "committed_at": _git("log", "-1", "--format=%cI", "--", rel),
         "code_commit": _git("rev-parse", "HEAD"),
-        "code_dirty": code_dirty,
     }
 
 
@@ -826,14 +847,54 @@ def print_episode_probe(all_results: list[dict]) -> None:
 
 # ── BEAM Dataset Loader ───────────────────────────────────────────────
 
-def load_beam_conversations(scales: list[str], max_conv: int = None) -> dict:
+# The 10M scale lives in its own HF repo; everything else shares one.
+BEAM_REPO_10M = "Mohammadta/BEAM-10M"
+BEAM_REPO = "Mohammadta/BEAM"
+
+
+def beam_repo(scale: str) -> str:
+    return BEAM_REPO_10M if scale == "10M" else BEAM_REPO
+
+
+def resolve_dataset_revisions(scales: list[str], pin: str | None = None) -> dict:
+    """Record WHICH dataset a run read, not merely its name.
+
+    `load_dataset("Mohammadta/BEAM")` names a moving target in exactly the way
+    `deepseek-chat` does: the host can change what the name resolves to, and
+    nothing in the artifact would show it. The rejudge path is already covered
+    -- its 160/160 reparse guard aborts if the gold moved -- but a full run has
+    no stored baseline to diff against, so for the canonical this is the one
+    input nothing witnesses. A revision that cannot be resolved is recorded as
+    null rather than omitted: "we do not know" is itself a fact about the run.
+    """
+    out = {}
+    for scale in scales:
+        repo = beam_repo(scale)
+        if repo in out:
+            continue
+        if pin:
+            out[repo] = pin
+            continue
+        try:
+            from huggingface_hub import HfApi
+            out[repo] = HfApi().dataset_info(repo).sha
+        except Exception as e:
+            out[repo] = None
+            print(f"  WARNING: could not resolve {repo} revision "
+                  f"({type(e).__name__}: {e}); recorded as null — this artifact "
+                  "cannot witness the dataset it was scored on.", flush=True)
+    return out
+
+
+def load_beam_conversations(scales: list[str], max_conv: int = None,
+                            revision: str | None = None) -> dict:
     from datasets import load_dataset
 
     data = {}
     for scale in scales:
         print(f"  Loading BEAM {scale}...", flush=True)
         if scale == "10M":
-            ds = load_dataset("Mohammadta/BEAM-10M", streaming=True)
+            ds = load_dataset(BEAM_REPO_10M, streaming=True, revision=revision)
             split_name = list(ds.keys())[0]
             conversations = []
             for i, sample in enumerate(ds[split_name]):
@@ -842,7 +903,7 @@ def load_beam_conversations(scales: list[str], max_conv: int = None) -> dict:
                 conversations.append(_parse_sample(sample, scale, i))
             data[scale] = conversations
         else:
-            ds = load_dataset("Mohammadta/BEAM", streaming=False)
+            ds = load_dataset(BEAM_REPO, streaming=False, revision=revision)
             if scale not in ds:
                 continue
             conversations = []
@@ -1578,7 +1639,10 @@ def _rejudge_run(args, api_key: str) -> None:
     judge_llm = LLMClient(args.judge_model, api_key, extra_body=judge_extra)
 
     # ── gold reparse (before canary: canary uses a real row's gold) ────────
-    data = load_beam_conversations(["100K"], max_conv=8)
+    dataset_revisions = resolve_dataset_revisions(["100K"], args.dataset_revision)
+    print(f"  dataset revisions: {dataset_revisions}", flush=True)
+    data = load_beam_conversations(["100K"], max_conv=8,
+                                   revision=args.dataset_revision)
     convs = data["100K"]
     gold_map, gold_rows = _rejudge_gold_map(run, convs=convs, rows=rows)
     cover = sum(len(v) for v in gold_rows.values())
@@ -1698,6 +1762,7 @@ def _rejudge_run(args, api_key: str) -> None:
         # Overwrites any prereg inherited from the source artifact: this run is
         # authorised by its own spec, not by the one that authorised A.
         "prereg": args.prereg_obj,
+        "dataset_revisions": dataset_revisions,
     })
     out = {"metadata": meta, "summary": {sc: {ab: d["avg"] for ab, d in abils.items()}
                                          for sc, abils in summary.items()},
@@ -1852,6 +1917,10 @@ def main():
                         help="JSON merged into every JUDGE request body. Same "
                              "thinking-disabled requirement for v4-flash. Applies "
                              "to --rejudge too.")
+    parser.add_argument("--dataset-revision", default=None,
+                        help="Pin the BEAM dataset to a git revision on the Hub. "
+                             "Unset resolves and records whatever the name points "
+                             "at now; either way the artifact carries the sha.")
     parser.add_argument("--prereg", default=None,
                         help="Path to the pre-registration authorising this run. It "
                              "must be committed and unmodified; its commit and blob "
@@ -1861,9 +1930,6 @@ def main():
                         help="Exploratory run with no pre-registration. Recorded as "
                              "prereg: null in the artifact, so such a run stays "
                              "distinguishable from a canonical one.")
-    parser.add_argument("--allow-dirty", action="store_true",
-                        help="Permit a run with modified tracked files. Recorded as "
-                             "prereg.code_dirty = true.")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
                         help="E1 narrative-facts READ side (cfg.facts_enabled). None = "
@@ -1913,8 +1979,7 @@ def main():
     if bool(args.prereg) == bool(args.no_prereg):
         print("ERROR: pass exactly one of --prereg <path> or --no-prereg.")
         sys.exit(2)
-    args.prereg_obj = resolve_prereg(None if args.no_prereg else args.prereg,
-                                     args.allow_dirty)
+    args.prereg_obj = resolve_prereg(None if args.no_prereg else args.prereg)
     if args.prereg_obj:
         print(f"pre-registration: {args.prereg_obj['path']} @ "
               f"{args.prereg_obj['commit'][:8]} (committed {args.prereg_obj['committed_at']})")
@@ -1977,7 +2042,10 @@ def main():
 
     # Load data
     print("Loading BEAM dataset...", flush=True)
-    conversations = load_beam_conversations(scales, max_conv)
+    dataset_revisions = resolve_dataset_revisions(scales, args.dataset_revision)
+    print(f"  dataset revisions: {dataset_revisions}", flush=True)
+    conversations = load_beam_conversations(scales, max_conv,
+                                            revision=args.dataset_revision)
     total_convs = sum(len(v) for v in conversations.values())
     total_questions = sum(len(c["questions"]) for v in conversations.values() for c in v)
     print(f"  Total: {total_convs} conversations, {total_questions} questions")
@@ -2060,6 +2128,7 @@ def main():
             "answer_extra_body": args.answer_extra_body_obj,
             "judge_extra_body": args.judge_extra_body_obj,
             "prereg": args.prereg_obj,
+            "dataset_revisions": dataset_revisions,
         },
         "summary": {scale: {ab: data["avg"] for ab, data in abilities.items()}
                      for scale, abilities in summary.items()},

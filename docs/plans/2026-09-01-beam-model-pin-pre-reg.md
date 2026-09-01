@@ -61,7 +61,8 @@ ten minutes and would not be worth ninety.
   `--rejudge results_20260831T165039Z.json --judge-gold
    --judge-model deepseek-v4-flash
    --judge-extra-body '{"thinking": {"type": "disabled"}}'
-   --prereg docs/plans/2026-09-01-beam-model-pin-pre-reg.md`
+   --prereg docs/plans/2026-09-01-beam-model-pin-pre-reg.md
+   --dataset-revision 3205395e897e7318c7b094ef4e6047b9b82dbb03`
 - **C2** = C1 repeated, unchanged. This is not redundancy: it measures the
   PINNED judge's own churn, without which a C1≠B difference cannot be
   attributed between "different model" and "non-deterministic model".
@@ -139,6 +140,19 @@ as regression or improvement.
   about the ALIAS, and C2 exists because it may not hold for the pin.
 - Cost anchors, measured not estimated: B = 290.9s for 161 judge calls. A (full
   run, answers + judge + ingestion) = 5471.6s / 160 answer + 160 judge calls.
+- **The dataset was the one input nothing witnessed.**
+  `load_dataset("Mohammadta/BEAM")` carried no revision, which is the
+  `deepseek-chat` hazard on the data axis: a name whose referent the host can
+  move with no artifact showing it. The rejudge path was already covered by its
+  160/160 reparse guard (it aborts if the gold moved, and never regenerates
+  answers), but a full run has no stored baseline to diff against. Since
+  abd692c's follow-up the revision is resolved, recorded, and pinnable.
+  Resolved live 2026-09-01 under the run interpreter
+  (`/home/node/hymem-env/bin/python` — the one with `datasets`, NOT the
+  `.venv` the suite runs in): `Mohammadta/BEAM` =
+  `3205395e897e7318c7b094ef4e6047b9b82dbb03`, `Mohammadta/BEAM-10M` =
+  `9b2096193fe74e2837e4713e483351e19817773c`, both last modified
+  2026-01-30 — stable for seven months, so this is insurance, not a live fire.
 
 ## 4. Procedure
 
@@ -161,6 +175,11 @@ as regression or improvement.
 5. Compute the statistics in §5 and record them in §8.
 6. Only if Step 1 PASSES: land the default flip (§6), then request approval for
    Step 2 separately.
+7. **Step 2 pins `--dataset-revision` to the SAME sha C1/C2 recorded.** Approval
+   for Step 2 may arrive days after Step 1, and an unpinned canonical scored on
+   a dataset that moved in between would be incomparable to the very arms that
+   authorised it — silently, since only the artifact's revision field would
+   differ. Pinning turns that into a no-op instead of a discovery.
 
 ## 5. Read protocol (fixed before counts)
 
