@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 import os
 import re
@@ -42,8 +43,8 @@ MAX_CONTEXT_CHARS = 8000
 # DeepSeek API
 DEEPSEEK_API_KEY = ""
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-ANSWER_MODEL = "deepseek-chat"
-JUDGE_MODEL = "deepseek-chat"
+ANSWER_MODEL = "deepseek-v4-flash"
+JUDGE_MODEL = "deepseek-v4-flash"
 
 # Recency-conflict resolution — imported from the LME adapter's dating fix.
 # When a fact was UPDATED over time, the model can prefer the newest *value-bearing*
@@ -351,6 +352,30 @@ def resolve_answer_provider(spec: str, deepseek_key: str):
 
 
 THINKING_DISABLED = {"thinking": {"type": "disabled"}}
+
+
+def apply_thinking_default(role: str, model: str, provider: str,
+                           absent: bool, obj: dict) -> tuple[dict, bool]:
+    """Model-pin pre-reg §6: default v4-flash to thinking-disabled when the
+    operator passed no flag at all.
+
+    The match term is `"v4-flash" in model`, NOT `"deepseek" in model`. The
+    latter is the library client's gate (`hymem/contrib/openai_client.py:81-86`)
+    and it would also fire on `deepseek-chat`, silently adding the flag to the
+    alias path, changing A/B byte-identity and retiring the comparator without
+    anyone deciding to. The v4-flash term cannot fire on the alias: it fires
+    only where the alternative is a run `check_model_pin` refuses, so no
+    artifact worth comparing to was ever produced by the path it changes.
+
+    ABSENT is not EMPTY. `--{role}-extra-body ''` or `'{}'` is the operator
+    explicitly asking for no extra body, and a convenience must never override
+    an explicit statement -- so those keep `{}` and the guard then refuses the
+    run, which is the correct outcome for a request that cannot work."""
+    if not absent or provider != "deepseek" or "v4-flash" not in model:
+        return obj, False
+    # Deep, not `dict(...)`: a shallow copy shares the nested dict, so one
+    # run mutating its own extra_body would edit every later run's default.
+    return copy.deepcopy(THINKING_DISABLED), True
 
 
 def check_model_pin(role: str, model: str, provider: str, extra_body: dict) -> None:
@@ -1882,6 +1907,9 @@ def _rejudge_run(args, api_key: str) -> None:
         "rejudge_original_judge": orig_judge,
         "judge_model": args.judge_model,
         "judge_extra_body": judge_extra,
+        # Whether the operator or §6 chose that body. An artifact that records
+        # only the value cannot answer which, and they are different runs.
+        "extra_body_defaulted": list(getattr(args, "extra_body_defaulted", [])),
         # Overwrites any prereg inherited from the source artifact: this run is
         # authorised by its own spec, not by the one that authorised A.
         "prereg": args.prereg_obj,
@@ -2093,12 +2121,12 @@ def main():
                         help="Answerer spec 'provider:model' (e.g. gemini:gemini-2.5-flash) "
                              "or a bare DeepSeek model. Env: BEAM_ANSWER_MODEL.")
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
-    parser.add_argument("--answer-extra-body", default="",
+    parser.add_argument("--answer-extra-body", default=None,
                         help="JSON merged into every ANSWER request body. Required "
                              "as '{\"thinking\": {\"type\": \"disabled\"}}' when the "
                              "answerer is a DeepSeek v4-flash model; rejected for "
                              "non-DeepSeek providers, which 400 on that key.")
-    parser.add_argument("--judge-extra-body", default="",
+    parser.add_argument("--judge-extra-body", default=None,
                         help="JSON merged into every JUDGE request body. Same "
                              "thinking-disabled requirement for v4-flash. Applies "
                              "to --rejudge too.")
@@ -2158,6 +2186,20 @@ def main():
             print(f"ERROR: --{role}-extra-body must be a JSON object, got {type(obj).__name__}.")
             sys.exit(2)
         setattr(args, f"{role}_extra_body_obj", obj)
+        setattr(args, f"{role}_extra_body_absent", raw is None)
+
+    # §6, and the ordering is load-bearing: strictly BETWEEN the parse loop and
+    # check_model_pin. Applied after the guard, a bare v4-flash run is refused
+    # before the default can fire and §6 silently does nothing. The answer role
+    # is defaulted further down, where its provider is finally resolved.
+    args.extra_body_defaulted = []
+    args.judge_extra_body_obj, _judge_defaulted = apply_thinking_default(
+        "judge", args.judge_model, "deepseek",
+        args.judge_extra_body_absent, args.judge_extra_body_obj)
+    if _judge_defaulted:
+        args.extra_body_defaulted.append("judge")
+        print(f"judge extra_body DEFAULTED to {args.judge_extra_body_obj} "
+              f"(v4-flash, no --judge-extra-body passed)")
 
     # Pin the spec before the money. Requiring one of the two flags is the
     # point: a default would let a canonical run be produced by forgetting.
@@ -2201,6 +2243,13 @@ def main():
     print(f"  Max conversations: {max_conv or 'all'}")
     print(f"  Top-K: {top_k}")
     ans_model, ans_base, ans_key, ans_provider = resolve_answer_provider(args.answer_model, DEEPSEEK_API_KEY)
+    args.answer_extra_body_obj, _answer_defaulted = apply_thinking_default(
+        "answer", ans_model, ans_provider,
+        args.answer_extra_body_absent, args.answer_extra_body_obj)
+    if _answer_defaulted:
+        args.extra_body_defaulted.append("answer")
+        print(f"answer extra_body DEFAULTED to {args.answer_extra_body_obj} "
+              f"(v4-flash, no --answer-extra-body passed)")
     check_model_pin("answer", ans_model, ans_provider, args.answer_extra_body_obj)
     check_model_pin("judge", args.judge_model, "deepseek", args.judge_extra_body_obj)
     print(f"  Answer model: {ans_model} (provider={ans_provider}, base={ans_base}, "
@@ -2312,6 +2361,7 @@ def main():
             # is exactly the kind of thing artifacts exist to stop.
             "answer_extra_body": args.answer_extra_body_obj,
             "judge_extra_body": args.judge_extra_body_obj,
+            "extra_body_defaulted": list(args.extra_body_defaulted),
             "prereg": args.prereg_obj,
             "dataset_revisions": dataset_revisions,
         },
