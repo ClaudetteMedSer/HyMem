@@ -1228,6 +1228,32 @@ because the lever is write-side. **Before it spends, check the aggregation
 contamination above: the OFF arm must be built by the same pinned adapter, and
 any pre-existing post-2026-08-26 run must not be reused as its baseline.**
 
+**Gate status 2026-09-01 (supersedes the block above).** Three of the flip's
+five gates are now settled and two need spend, so the flip is decidable only
+behind a spend decision that is the user's to make.
+
+| gate | state |
+|---|---|
+| 1. mechanical pytest | **PASS** — 31 offline tests, unchanged |
+| 2. qualitative box gate (G-EP1) | **PASS** — faithfulness 0.98, all five criteria |
+| 3. `episode_coverage_probe` before/after | **RETIRED — no population.** `dreamed_zero_long` is 0 on prod and on all ten LME stores; the bucket a better episode prompt could fix does not exist. The gate cannot discriminate and must not be counted as passed |
+| 4. LME full guard (non-regression) | **OPEN.** Already RUN 2026-08-30/31 (71.0 vs 71.0, clearing 70.0 / MS 51.9) but UNEVIDENCED — the arms cannot show which arm they were. Post-`6543ee6` a repeat pair is self-evidencing; that is ~1,000 reader calls |
+| 5. dream cost watch | **OPEN, needs one dream.** Baseline banked (dreams 1342/1343, 47s/58s, reuse 91-100%); the "after" leg is a re-digest under the granular prompt, which is LLM spend |
+| no-overlap ordering rule | **DISCHARGED** (#1317); a post-flip reuse re-verify is still owed AFTER the flip lands |
+
+**Gate 3's retirement is the one that changes the argument, not just the
+scoreboard.** It was the only gate that would have shown the flip DOING
+something rather than not breaking something — 2 and 4 are a faithfulness bar
+and a non-regression bar, both satisfiable by a change with no effect at all.
+With 3 retired, nothing on this list can distinguish "granularity helps" from
+"granularity is inert", and the LME coverage finding above says the lever can
+reach at most ~22% of that corpus anyway. **A flip decision taken on gates
+1/2/4/5 alone would be a decision that the feature is harmless, not that it is
+worth having**, and this plan's own standing contract is mechanism > score.
+Whoever takes it next should either design a gate with a live population or
+flip it on the honest ground that it is a shape improvement whose benchmark
+effect is below what this harness can resolve.
+
 1. ~~**RUN, box-side:** `benchmarks/fact_probe.py` faithfulness.~~ **RAN
    2026-08-30 — G-F1 PASS on v4-flash at full source, faithfulness 1.00
    (98/98).** It closed the `[:4000]` open item outright (see the G-F1b block)
