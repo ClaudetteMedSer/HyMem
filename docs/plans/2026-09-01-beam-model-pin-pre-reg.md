@@ -60,7 +60,8 @@ ten minutes and would not be worth ninety.
 - **C1** = the same rejudge of the same A, gold on, judge pinned:
   `--rejudge results_20260831T165039Z.json --judge-gold
    --judge-model deepseek-v4-flash
-   --judge-extra-body '{"thinking": {"type": "disabled"}}'`
+   --judge-extra-body '{"thinking": {"type": "disabled"}}'
+   --prereg docs/plans/2026-09-01-beam-model-pin-pre-reg.md`
 - **C2** = C1 repeated, unchanged. This is not redundancy: it measures the
   PINNED judge's own churn, without which a C1≠B difference cannot be
   attributed between "different model" and "non-deterministic model".
@@ -145,6 +146,11 @@ as regression or improvement.
    pre-registration's commit hash in the metadata of every artifact produced
    under it, alongside `judge_gold` and `gap_hours`. A verdict whose spec-hash
    post-dates its artifact is void by construction.
+   **Enforced, not merely asked for, since abd692c:** every invocation below
+   passes `--prereg docs/plans/2026-09-01-beam-model-pin-pre-reg.md`, which
+   refuses to run unless this file is committed and unmodified and unless the
+   tracked code is clean, and writes `prereg.commit` / `prereg.blob` /
+   `prereg.code_commit` into the artifact. Plumbing: e3313c0. Spec: 3924ed8.
 2. Run C1. The canary must pass on the pinned judge — it is the first real
    evidence that the pin returns content at all on this path.
 3. Run C2, identical invocation. Do not look at C1's scores first.
