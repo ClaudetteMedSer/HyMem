@@ -21,6 +21,7 @@ import statistics
 import sys
 
 CONTROL = {"ABS", "CR"}
+TRUNCATION_CEILING = 8         # v0.2 §3, 5% of 160
 GOLD_DELTA_EFFECT = -0.00582   # the §8 primary, -0.582pp
 PIN_D_SELF = 7                 # Step 1, for the descriptive comparison
 
@@ -60,20 +61,37 @@ def main():
 
     for tag, m in (("B", b_meta), ("B2", n_meta)):
         refuse_void(tag, m)
-    print("\n=== GATE (before any comparison) ===")
-    s0 = [k for k, q in B2.items() if q.get("rubric") and q.get("scores") == []]
-    er = [k for k, q in B2.items()
-          if q.get("judge_error") or str(q.get("judge_raw", "")).startswith("[LLM_ERROR")]
-    print(f"  B2: {len(B2)} rows, silent-0 {len(s0)}/{len(B2)}, LLM_ERROR {len(er)}/{len(B2)}")
-    keys = sorted(set(B) & set(B2))
-    print(f"  rows matched: {len(keys)}")
-    if s0 or er:
-        print("  GATE FAILED - no churn reading is interpretable.")
-        return 2
-    if len(keys) != len(B):
-        print(f"  ABORT: {len(B)} rows in B, {len(keys)} matched.")
+    print("\n=== GATE / comparison set (v0.2 §3, three classes) ===")
+    all_keys = sorted(set(B) & set(B2))
+    if len(all_keys) != len(B):
+        print(f"  ABORT: {len(B)} rows in B, {len(all_keys)} matched.")
         return 3
-    print("  GATE PASSED.")
+
+    trunc = [k for k in all_keys if B2[k].get("judge_truncated")]
+    err = [k for k in all_keys
+           if B2[k].get("judge_error")
+           or str(B2[k].get("judge_raw", "")).startswith("[LLM_ERROR")]
+    # Plumbing: a sentinel score that truncation does NOT explain. The adapter
+    # voids the artifact on these, so reaching one here means either an older
+    # artifact or a rule drift; either way it is not comparable.
+    plumbing = [k for k in all_keys
+                if B2[k].get("rubric") and B2[k].get("scores") == []
+                and k not in trunc and k not in err]
+    print(f"  truncated (excluded, prior kept): {len(trunc)}/{len(all_keys)}  "
+          f"ceiling {TRUNCATION_CEILING}")
+    print(f"  explicit errors (excluded):       {len(err)}/{len(all_keys)}")
+    print(f"  plumbing silent-0 (voids):        {len(plumbing)}/{len(all_keys)}")
+    if plumbing:
+        print("  GATE FAILED - unexplained sentinel scores; not interpretable.")
+        return 2
+    if len(trunc) > TRUNCATION_CEILING:
+        print(f"  INVALID - truncation above the {TRUNCATION_CEILING}-row ceiling. "
+              "Too much of the sample is unreadable to speak for the rest.")
+        return 2
+
+    # The denominator was fixed in the pre-registration, not chosen here.
+    keys = [k for k in all_keys if k not in trunc and k not in err]
+    print(f"  GATE PASSED. Comparison set = {len(keys)} READABLE rows.")
 
     deltas = [B2[k]["score"] - B[k]["score"] for k in keys]
     moved = [k for k, d in zip(keys, deltas) if d != 0]
@@ -83,7 +101,7 @@ def main():
     D_ctl = sum(1 for d in ctl_d if d != 0)
 
     print("\n=== D_alias - does the alias reproduce itself? ===")
-    print(f"  D_alias = {D_alias}/{len(keys)} rows differ between B and B2")
+    print(f"  D_alias = {D_alias}/{len(keys)} READABLE rows differ between B and B2")
     print(f"  control arm ABS/CR: {D_ctl}/{len(ctl)}")
     if moved:
         print("  rows that moved:")
