@@ -133,6 +133,74 @@ judge sees.
   with churn, so both of §8's supports are churn-ambiguous, not just the
   zero-width primary.
 
-## 7. Executed results
+## 7. Executed results — B2 (2026-09-01): GATE FAILED, verdict VOID
 
-(empty — nothing has been run under this pre-registration)
+Run under `--prereg` at a330fec8. Canary OK (217 chars). All 160 rows judged,
+161 judge calls, 219s. Then:
+
+    VOID: 1 silent-0 parse failures (A had 0/160; B rate must be <= A)
+      IF | What are some common responses when something goes wrong wit
+         | raw='{"scores": [1], "total_score": 1.0, "explanation": "The
+            response includes numeric error status codes'
+
+**Per §4.3 of this pre-registration, the churn reading is void. D_alias is NOT
+computed and World 1 vs World 2 is NOT decided.** The gate said a nonzero
+silent-0 rate means no churn reading is interpretable, and that rule was fixed
+before the run. It is honoured here.
+
+### 7.1 What the failure was — and it is not what the gate assumed
+
+The judge did not refuse, error, or return empty. **It scored the row 1.0**,
+wrote a long explanation, and hit `max_tokens=512` mid-sentence.
+`judge_answer`'s `re.search(r'{...}')` needs a complete JSON object, found
+none, took the except path, and returned `{"score": 0.0, "scores": []}`.
+
+**A row the judge scored 1.0 was recorded as 0.0 because its explanation ran
+long.** This is a latent defect on every run ever scored by this path, not a
+property of B2 — and it is exactly the failure class this campaign exists to
+catch: a number indistinguishable in the score column from a real 0.0.
+
+It is deliberately not fixed yet. Changing the regex or the token ceiling
+changes what a score means, retroactively, which is a pre-registered decision
+and not a bug fix to slip in beside another change.
+
+### 7.2 An observation, explicitly NOT the pre-registered statistic
+
+B and B2 send byte-identical judge prompts. That row parsed in B (B was
+0/160) and did not parse in B2. So the alias returned materially different
+text for the same input on two runs.
+
+That is a direct observation of alias non-determinism, and by the §5 letter
+(`World 1 ⇔ D_alias ≥ 1`) it would decide the question — the row's score
+differs between the two runs. **It is not being read that way**, because §4.3
+voided the reading first and the two rules were fixed together. Reading past a
+gate because the result on the other side is interesting is precisely the
+post-hoc move this document exists to prevent. Recorded as an observation,
+carrying no verdict.
+
+It also implies B's own 0/160 silent-0 was a draw, not a property: at the one
+observed occurrence per 160 rows, P(0 in 160) ≈ 0.366.
+
+## 8. What this pre-registration got wrong
+
+The §4.3 gate was ported from the gold-delta phase, where a silent-0 meant
+**the plumbing was broken** — a mis-pinned model returning unparseable output.
+Here the plumbing is fine and the silent-0 is **the phenomenon under study
+manifesting**: the judge's own run-to-run variation, surfacing as a parse
+outcome instead of a score change.
+
+The gate therefore voids on exactly the evidence B2 was commissioned to
+collect. That is a defect in this spec, not in the run, and naming it is
+cheaper than routing around it.
+
+**A superseding B2 v0.2 needs a gate that separates the two**, e.g.: a silent-0
+whose `judge_raw` is empty or `[LLM_ERROR`-prefixed is plumbing and still
+voids; a silent-0 whose raw contains a truncated but well-formed scoring
+attempt is judge variation, is counted into D_alias as a changed row, and does
+not void. That distinction has to be written down before the re-run, not
+after, and the re-run is now non-destructive: since 0adcd2c a voided run
+persists its rows marked `void`, so the evidence survives even if the gate
+fires again.
+
+**Not authorised under this spec.** B2 v0.2 is a new pre-registration and a new
+run.
