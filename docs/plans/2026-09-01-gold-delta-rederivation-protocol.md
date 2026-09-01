@@ -488,3 +488,81 @@ its commit message. A gate that cannot fail reports success indistinguishably
 from a gate that passed, and nothing in the output tells them apart. The tests
 in `tests/test_beam_judged_ideal.py` exist because that is not a thing to
 rediscover.
+
+## 11. Correction to §10 — the field §4.2 needed was already in the artifacts
+
+Found on 2026-09-01, auditing §10.3's lesson across the rest of the preconditions.
+
+**§10's retraction was right. Its consolation was wrong.** §10.2 said "the four
+existing rejudge arms cannot be retrofitted. For them, §10.1 is the evidence,
+and it is external to the artifacts by necessity."
+
+There was no necessity. `judge_ideal_used` — the text the judge actually read,
+computed fresh in each arm from **its own reparse** — has been written by
+`_rejudge_run` since **90ced81**, the commit that introduced the rejudge path,
+before the gold-delta phase began. It is present on **160/160 rows of all four
+arms**. `4d9906b` then added `judged_ideal` alongside it, fixing a real gap on
+the *main* path while duplicating, on the rejudge path, a field that had been
+there for weeks.
+
+### 11.1 The measurement §4.2 was meant to be
+
+Run on the five locked artifacts, scorer committed at `0f3d8f1` before its
+output was read:
+
+**0 of 160 rows differ in `judge_ideal_used` across B, C1, C2 and B2c**, over
+**156 distinct values**, 0 empty. The four reparses produced byte-identical
+gold. B's unwitnessed dataset revision is now a **measured** fact about these
+artifacts, not an inference from `Mohammadta/BEAM`'s commit history.
+
+§10.1's external evidence stands and still agrees. It is no longer the only
+evidence, and it was never the best available.
+
+### 11.2 The sharper version of what went wrong
+
+`judge_ideal_used` equals `ideal_answer` on exactly **32** rows — and those 32
+are ABS and CR, the control abilities. On **all 128 pool rows** — every row the
+verdict is computed from — **the judge read something other than the field
+§4.2 compared.** §10 described the check as comparing a field that agreed by
+construction. It was worse: on the rows that carry the result, it compared a
+field that was not what the judge read at all.
+
+### 11.3 What changed
+
+- **§4.2** now compares what the judge read, under either name, and **refuses
+  to run** if that field is absent, empty, or constant across arm-rows. §10.3's
+  lesson turned on §4.2 itself: a comparison over a degenerate field reports
+  agreement identically to one that measured something.
+- **§4.2b** keeps the inherited comparison (`rubric`, `ideal_answer`,
+  `gold_kind`) and states what it is: a check that one of the five files is not
+  a rejudge of this anchor. A swapped-file check, which is all it ever was.
+- **§4.3** is corrected the same way. "N rows re-generated their answer" was
+  never a thing it could detect — `answer` is inherited too.
+- **§4.1** and **§4.4/§4.5** are unchanged. Row identity is a swapped-file
+  check and reads as one; void and readability are computed fresh per arm and
+  have always had power.
+- The retracted sentence is now **unwritable**: a test asserts the scorer's
+  source contains neither `"rubric identity"` nor `"unwitnessed revision is not
+  load-bearing"`.
+
+### 11.4 What this does not change
+
+**Nothing in §9.** The re-run at `0f3d8f1` reproduces every number: gate
++0.391pp ± 0.718, E1 [−1.404, −0.482] at ν_eff 16.6, E2 [−1.331, −0.555],
+exchangeability +0.267pp against ±0.995pp, process question [−2.406, +0.520]
+still including zero, and **CONFIRMED, carried by EO/PF/SUM**. §5.1 still binds.
+
+### 11.5 The generalisation worth keeping
+
+Every rejudge arm is `out = dict(r)` over the anchor's row, plus a fixed list of
+overwrites. That list — `score`, `scores`, `score_original`, `judge_raw`,
+`judge_error`, `judge_finish_reason`, `judge_truncated`, `judge_parse`,
+`_rejudged`, `judge_ideal_used`, `judged_ideal` — is **exactly** the set of
+fields an arm can disagree on. Everything else is inherited, and a check over an
+inherited field can only ever detect that the wrong file was passed.
+
+§10.3 said a gate that cannot fail is indistinguishable from one that passed.
+The follow-on is narrower and more useful: **before believing an identity check,
+ask which arm computed the field.** Three of five preconditions here compared
+fields no arm computed, and each carried a sentence about what its passing
+proved.
