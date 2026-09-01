@@ -1711,6 +1711,7 @@ def _rejudge_run(args, api_key: str) -> None:
     # ── judge every row ────────────────────────────────────────────────────
     new_questions = []
     silent0 = []
+    truncated = []
     explicit_err = []
     t0 = time.time()
     for i, r in enumerate(rows):
@@ -1729,9 +1730,21 @@ def _rejudge_run(args, api_key: str) -> None:
                 explicit_err.append((r["ability"], r["question"], raw[:80]))
                 judged = False
                 new_score, new_scores = r["score"], r["scores"]
+            elif is_truncation(raw, jr.get("judge_finish_reason")):
+                # TRUNCATION (B2 v0.2 §3). The judge scored the row and then ran
+                # out of tokens mid-explanation, so the regex found no closing
+                # brace. The PLUMBING IS FINE -- this must not void the run --
+                # but the 0.0 it produced is FABRICATED, neither the judge's
+                # actual score nor a real 0.0, so it must not be counted either.
+                # Keep prior, exclude, report the rate: the explicit_err shape.
+                truncated.append((r["ability"], r["question"], raw[:120],
+                                  jr.get("judge_finish_reason")))
+                judged = False
+                new_score, new_scores = r["score"], r["scores"]
             else:
-                # silent-0: parse-fail / empty content / nested JSON — all
-                # indistinguishable from a real 0.0 without raw. ABORT.
+                # silent-0 with the plumbing implicated: empty raw, or a parse
+                # failure that truncation does not explain. Indistinguishable
+                # from a real 0.0 without the raw. VOID.
                 silent0.append((r["ability"], r["question"], raw[:120],
                                 jr.get("judge_finish_reason")))
                 judged = False
@@ -1746,6 +1759,7 @@ def _rejudge_run(args, api_key: str) -> None:
         out["judge_raw"] = raw
         out["judge_error"] = bool(raw) and raw.startswith("[LLM_ERROR")
         out["judge_finish_reason"] = jr.get("judge_finish_reason")
+        out["judge_truncated"] = is_truncation(raw, jr.get("judge_finish_reason"))
         out["_rejudged"] = judged
         out["judge_ideal_used"] = ideal
         new_questions.append(out)
@@ -1762,7 +1776,23 @@ def _rejudge_run(args, api_key: str) -> None:
     # defect wearing the first one's clothes. The artifact is now written,
     # marked void in its metadata and in its FILENAME, and the exit code is
     # unchanged so nothing automated can mistake it for a verdict.
+    if truncated:
+        print(f"  ⚠ {len(truncated)} TRUNCATED judge replies — excluded from the "
+              f"statistic, prior kept (B2 v0.2 §3). Ceiling {TRUNCATION_CEILING}:")
+        for ab, qu, raw, fin in truncated[:10]:
+            print(f"    {ab} | {qu[:60]} | finish={fin!r} | raw={raw[:80]!r}")
+
     void = None
+    if len(truncated) > TRUNCATION_CEILING:
+        # Not a plumbing failure, but too much of the sample is unreadable to
+        # say anything about the rest. Report the rate, do not interpret.
+        print(f"  VOID: {len(truncated)} truncated replies exceeds the "
+              f"{TRUNCATION_CEILING}-row ceiling; the run is invalid for the falsifier.")
+        void = {"reason": "truncation rate above ceiling",
+                "rule": f"B2 v0.2 §3: truncation must not exceed {TRUNCATION_CEILING}/160",
+                "n_truncated": len(truncated),
+                "rows": [{"ability": ab, "question": qu, "judge_raw_head": raw,
+                          "finish_reason": fin} for ab, qu, raw, fin in truncated]}
     if silent0:
         print(f"  VOID: {len(silent0)} silent-0 parse failures (A had 0/160; "
               f"B rate must be <= A). First rows:")
@@ -1814,7 +1844,8 @@ def _rejudge_run(args, api_key: str) -> None:
     with open(dest, "w") as f:
         json.dump(out, f, indent=2, default=str)
     print(f"\n  Archived → {dest.name}")
-    print(f"  {len(silent0)} silent-0 / {len(explicit_err)} explicit / "
+    print(f"  {len(silent0)} silent-0 / {len(truncated)} truncated / "
+          f"{len(explicit_err)} explicit / "
           f"{sum(1 for q in new_questions if q['_rejudged'])} rejudged of {n_rows}")
 
     if void:
@@ -1824,6 +1855,31 @@ def _rejudge_run(args, api_key: str) -> None:
 
     # ── readout (pre-registered §5 — formulas fixed before counts) ─────────
     _rejudge_readout(run, new_questions, meta=meta)
+
+
+# B2 v0.2 §3: above this many unreadable-by-truncation rows, too much of the
+# sample is missing to say anything about the rest. 5% of 160.
+TRUNCATION_CEILING = 8
+
+
+def is_truncation(raw: str, finish_reason: str | None) -> bool:
+    """Did the judge run out of tokens mid-answer, rather than fail?
+
+    The separator is a CONJUNCTION, not `finish_reason` alone, because both
+    failure shapes carry "length":
+
+      - the v4-flash trap is EMPTY content + length. It never reaches here:
+        the falsy-content raise turns it into "[LLM_ERROR: empty content ...",
+        which the caller routes to the explicit bucket.
+      - truncation is NON-EMPTY content + length, with the parse failing for
+        want of a closing brace. Nothing else catches it.
+
+    Gating on "length" alone would merge the two and call a broken pin a long
+    explanation. Callers must have established the parse failure already; this
+    answers only "was it truncation".
+    """
+    return finish_reason == "length" and bool(raw) and bool(raw.strip()) \
+        and not raw.startswith("[LLM_ERROR")
 
 
 def void_record(silent0: list) -> dict | None:
