@@ -25,7 +25,8 @@ sys.path.insert(0, str(_BENCH))
 import beam_adapter as ba  # noqa: E402
 
 SILENT0 = [("IF", "What are some common responses when something goes wrong",
-            '{"scores": [1], "total_score": 1.0, "explanation": "The response inclu')]
+            '{"scores": [1], "total_score": 1.0, "explanation": "The response inclu',
+            "length")]
 
 
 def test_a_clean_run_records_void_as_null_not_as_an_absent_key():
@@ -49,6 +50,9 @@ def test_the_offending_judge_output_is_preserved_for_diagnosis():
     v = ba.void_record(SILENT0)
     assert '"scores": [1]' in v["rows"][0]["judge_raw_head"]
     assert v["rows"][0]["ability"] == "IF"
+    # The structural half of the same fact: "length" says the judge ran out of
+    # tokens, without anyone having to read the prose to work that out.
+    assert v["rows"][0]["finish_reason"] == "length"
 
 
 def test_voidness_is_in_the_filename_not_only_the_metadata():

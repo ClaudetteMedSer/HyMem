@@ -246,8 +246,20 @@ class LLMClient:
         # hymem/contrib/openai_client.py:81-86 uses for the library client --
         # a benchmark cannot afford a request-body change it did not ask for.
         self.extra_body = dict(extra_body or {})
+        # Why the response ENDED, kept from the last call. B2 (2026-09-01) hit
+        # a silent-0 whose cause -- the judge scoring 1.0 and then running out
+        # of tokens mid-explanation -- was only recoverable by eyeballing the
+        # raw text. finish_reason == "length" says the same thing structurally,
+        # which is what a gate needs if it is to separate "the plumbing broke"
+        # from "the judge ran long" without a human reading prose. Purely
+        # additive: it records why a call ended and changes no score and no
+        # request byte. Single-threaded client, so plain attribute state.
+        self.last_finish_reason = None
 
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
+        # Cleared per call, so a stale value from an earlier row can never be
+        # read as this row's -- absence must look like absence.
+        self.last_finish_reason = None
         last_error = None
         for attempt in range(3):
             try:
@@ -278,6 +290,10 @@ class LLMClient:
         data = resp.json()
         self.call_count += 1
         choice = data["choices"][0]
+        # Set BEFORE the empty-content check: the trap's whole signature is
+        # content == "" together with finish_reason == "length", so the field
+        # has to survive the raise that the empty content triggers.
+        self.last_finish_reason = choice.get("finish_reason")
         content = choice["message"].get("content")
         if not (content or "").strip():
             # LME (:384) raises on content IS NONE. Beam raises on EMPTY too,
@@ -1453,6 +1469,17 @@ def _judge_messages(question: str, ideal: str, rubric: list, ai_answer: str) -> 
     ]
 
 
+def _finish_reason(llm) -> str | None:
+    """Why the last call ended, for any object that plays the LLM's part.
+
+    judge_answer is duck-typed -- tests and callers pass stubs exposing only
+    chat() -- so reading the attribute directly would narrow the contract from
+    "anything with chat()" to "an LLMClient" and break them. Missing reads as
+    None, which is the honest value: nothing told us why the call ended.
+    """
+    return getattr(llm, "last_finish_reason", None)
+
+
 def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_answer: str,
                  return_raw: bool = False) -> dict:
     if not rubric:
@@ -1470,12 +1497,14 @@ def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_ans
             out = {"score": total, "scores": scores}
             if return_raw:
                 out["judge_raw"] = raw
+                out["judge_finish_reason"] = _finish_reason(llm)
             return out
     except Exception:
         pass
     out = {"score": 0.0, "scores": []}
     if return_raw:
         out["judge_raw"] = raw
+        out["judge_finish_reason"] = _finish_reason(llm)
     return out
 
 
@@ -1703,7 +1732,8 @@ def _rejudge_run(args, api_key: str) -> None:
             else:
                 # silent-0: parse-fail / empty content / nested JSON — all
                 # indistinguishable from a real 0.0 without raw. ABORT.
-                silent0.append((r["ability"], r["question"], raw[:120]))
+                silent0.append((r["ability"], r["question"], raw[:120],
+                                jr.get("judge_finish_reason")))
                 judged = False
                 new_score, new_scores = r["score"], r["scores"]
         else:
@@ -1715,6 +1745,7 @@ def _rejudge_run(args, api_key: str) -> None:
         out["score_original"] = r["score"]
         out["judge_raw"] = raw
         out["judge_error"] = bool(raw) and raw.startswith("[LLM_ERROR")
+        out["judge_finish_reason"] = jr.get("judge_finish_reason")
         out["_rejudged"] = judged
         out["judge_ideal_used"] = ideal
         new_questions.append(out)
@@ -1735,8 +1766,8 @@ def _rejudge_run(args, api_key: str) -> None:
     if silent0:
         print(f"  VOID: {len(silent0)} silent-0 parse failures (A had 0/160; "
               f"B rate must be <= A). First rows:")
-        for ab, qu, raw in silent0[:10]:
-            print(f"    {ab} | {qu[:60]} | raw={raw[:100]!r}")
+        for ab, qu, raw, fin in silent0[:10]:
+            print(f"    {ab} | {qu[:60]} | finish={fin!r} | raw={raw[:100]!r}")
         void = void_record(silent0)
         print("  Verdict void. Rows ARE written, marked void, for characterisation.")
     if explicit_err:
@@ -1807,8 +1838,8 @@ def void_record(silent0: list) -> dict | None:
     return {"reason": "silent-0 parse failures",
             "rule": "gold-delta pre-reg §4.7(a): B's silent-0 rate must be <= A's",
             "n_silent0": len(silent0),
-            "rows": [{"ability": ab, "question": qu, "judge_raw_head": raw}
-                     for ab, qu, raw in silent0]}
+            "rows": [{"ability": ab, "question": qu, "judge_raw_head": raw,
+                      "finish_reason": fin} for ab, qu, raw, fin in silent0]}
 
 
 def rejudge_dest(src: Path, judge_model: str, stamp: str, void: dict | None) -> Path:

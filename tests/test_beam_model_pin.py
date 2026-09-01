@@ -274,3 +274,90 @@ def test_canary_judge_prompt_follows_the_runs_own_gold_choice():
     assert "real gold for TR" in json.dumps(gold_on)
     assert "legacy ideal for TR" in json.dumps(gold_off)
     assert gold_on != gold_off
+
+
+# ── finish_reason as structural evidence ──────────────────────────────────
+# B2 (2026-09-01) voided on a silent-0 whose cause -- the judge scoring the row
+# 1.0 and then running out of tokens mid-explanation -- was recoverable only by
+# reading the raw text. A gate that must separate "the plumbing broke" from
+# "the judge ran long" cannot rest on prose inspection, so the reason the
+# response ended is recorded alongside it.
+
+def _reply(content, finish):
+    return {"choices": [{"message": {"content": content}, "finish_reason": finish}]}
+
+
+def test_finish_reason_is_recorded_from_the_response(captured):
+    captured["reply"] = _reply("ok", "stop")
+    c = ba.LLMClient("m", "k")
+    c._call([], 0.0, 512)
+    assert c.last_finish_reason == "stop"
+
+
+def test_finish_reason_survives_the_empty_content_raise(captured, monkeypatch):
+    """The trap's signature is content == "" AND finish_reason == "length", so
+    the field has to outlive the exception the empty content triggers."""
+    monkeypatch.setattr(ba.time, "sleep", lambda *_: None)
+    captured["reply"] = _reply("", "length")
+    c = ba.LLMClient("deepseek-v4-flash", "k")
+    assert c.chat([]).startswith("[LLM_ERROR")
+    assert c.last_finish_reason == "length"
+
+
+def test_finish_reason_is_cleared_per_call_so_it_cannot_go_stale(captured):
+    """A value left over from an earlier row read as this row's would be worse
+    than no value at all: absence must look like absence."""
+    c = ba.LLMClient("m", "k")
+    captured["reply"] = _reply("ok", "length")
+    c.chat([])
+    assert c.last_finish_reason == "length"
+
+    def boom(*a, **k):
+        raise OSError("network down")
+
+    captured["reply"] = _reply("ok", "stop")
+    import beam_adapter
+    orig = beam_adapter.http.post
+    beam_adapter.http.post = boom
+    try:
+        c.chat([])
+    finally:
+        beam_adapter.http.post = orig
+    assert c.last_finish_reason is None
+
+
+def test_a_truncated_judge_reply_scores_zero_but_says_why(captured):
+    """The B2 row, reproduced. The judge scored it 1.0; the regex needs a
+    complete {...} and the reply has no closing brace, so the score is 0.0 --
+    indistinguishable from a real 0.0 in the score column alone. The recorded
+    finish_reason is what makes it distinguishable."""
+    truncated = ('{"scores": [1], "total_score": 1.0, "explanation": "The response '
+                 'includes numeric error status codes')
+    captured["reply"] = _reply(truncated, "length")
+    llm = ba.LLMClient("deepseek-chat", "k")
+    out = ba.judge_answer(llm, "q", "ideal", ["states the code"], "an answer",
+                          return_raw=True)
+    assert out["score"] == 0.0 and out["scores"] == []
+    assert out["judge_finish_reason"] == "length"
+    assert '"scores": [1]' in out["judge_raw"]
+
+
+def test_a_complete_judge_reply_is_parsed_and_also_carries_its_finish(captured):
+    captured["reply"] = _reply('{"scores": [1, 0], "total_score": 0.5}', "stop")
+    llm = ba.LLMClient("deepseek-chat", "k")
+    out = ba.judge_answer(llm, "q", "ideal", ["a", "b"], "ans", return_raw=True)
+    assert out["score"] == 0.5 and out["scores"] == [1, 0]
+    assert out["judge_finish_reason"] == "stop"
+
+
+def test_judge_answer_still_accepts_a_bare_stub():
+    """judge_answer is duck-typed: callers and tests pass objects exposing only
+    chat(). Recording finish_reason must not narrow that contract from
+    "anything with chat()" to "an LLMClient"."""
+    class Stub:
+        def chat(self, messages, temperature=None, max_tokens=None):
+            return '{"scores": [1], "total_score": 1.0}'
+
+    out = ba.judge_answer(Stub(), "q", "i", ["r"], "a", return_raw=True)
+    assert out["score"] == 1.0
+    assert out["judge_finish_reason"] is None
