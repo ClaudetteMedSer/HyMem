@@ -371,3 +371,80 @@ The discriminating measurement is one alias re-run at n=160, where
 P(0 | pin's rate) = 0.00078. It is pre-registered separately in
 `2026-09-01-alias-churn-b2-pre-reg.md` and is **not authorised under this
 spec**. Nothing here should be read as having decided between the two worlds.
+
+## 9. Step 2 — authorised, and its gate fixed before the spend
+
+**Authorised by Atta, 2026-09-01 ("Hit it").** ~160 answer + ~160 judge calls,
+ingestion and dream, **~91 minutes**. This is the expensive one.
+
+Prerequisite discharged: §4.6 required the **default flip** to land before Step
+2 was requested. It did not exist when Step 2 was authorised — `ANSWER_MODEL`
+and `JUDGE_MODEL` were still `deepseek-chat`. It landed in **`1bc9c15`** before
+this run started, in the pre-registered order, and it is not a formality: it
+changes the `--{role}-extra-body` argparse default from `""` to `None`, which
+is the very flag this run passes.
+
+### 9.1 Invocation
+
+```
+--scales 100K --sample 8 --top-k 10 --judge-gold
+--answer-model deepseek-v4-flash --judge-model deepseek-v4-flash
+--answer-extra-body '{"thinking": {"type": "disabled"}}'
+--judge-extra-body  '{"thinking": {"type": "disabled"}}'
+--dataset-revision 3205395e897e7318c7b094ef4e6047b9b82dbb03
+--prereg docs/plans/2026-09-01-beam-model-pin-pre-reg.md
+```
+
+`--sample 8` is passed explicitly: `DEFAULT_SAMPLE` is **3**, and the anchor ran
+at 8. Taking the default would have produced a canonical at a different sample
+size than every arm that authorised it, and only the artifact's metadata would
+have said so.
+
+`--dataset-revision` is pinned to the sha C1/C2 recorded, per §4.7. Approval
+arrived after Step 1, and an unpinned canonical scored on a dataset that moved
+in between would be incomparable to the arms that authorised it — silently.
+
+**The extra bodies are passed EXPLICITLY even though `1bc9c15` would now supply
+them.** A canonical should not be the first real exercise of a default that
+landed minutes earlier; the flip is covered by tests, and this run does not need
+to be the one that discovers a defect in it. The artifact will record
+`extra_body_defaulted: []`, which is the honest statement that the operator
+chose these values.
+
+### 9.2 Pre-run gate (fixed here, before any call)
+
+- **Canary on BOTH clients** — a real prompt at the real ceiling returning
+  non-empty content, per §3. Failure → abort before the spend.
+- **`check_model_pin` on both roles** — already unavoidable given §6.
+- The run must reach 160/160 answered and 160/160 judged.
+
+### 9.3 Validity of the artifact (fixed here, so it cannot be chosen after)
+
+Using the classes this series settled in the B2 line:
+
+| class | rule |
+|---|---|
+| **plumbing** | any silent-0 (rubric present, `scores == []`) or `[LLM_ERROR`-prefixed row → **VOID** |
+| **unreadable** | any row still failing `extract_judge_json` after brace-matching → **VOID** |
+| **truncation** | `finish_reason == "length"` with non-empty raw → excluded and **reported**; above **8/160 (5%)** the run is **INVALID** |
+
+A voided run keeps its rows (`0adcd2c`). They are evidence and not a canonical.
+
+### 9.4 What this run may and may not be read as
+
+It becomes **the canonical**. A retires as a comparison point.
+
+**The Step-2-minus-A difference must NOT be reported as a HyMem improvement or
+regression, and no headline number may be derived from it.** It confounds at
+least three changes at once: gold-on judging, the model pin, and the code drift
+between the anchor and today. §2 already retires A; this states the specific
+misreading that retirement forbids, because "new canonical scores N points above
+the old one" is the sentence that will otherwise write itself.
+
+The re-derivation protocol (`2026-09-01-gold-delta-rederivation-protocol.md`
+§9.4) constrains the same boundary from the other side: what is established is
+that *the old record differs from gold-on judging*, not that a gold-on effect is
+a property of the pipeline.
+
+**No re-run on an unwelcome number.** If the run completes and passes §9.3, it
+is the canonical, whatever it says.
