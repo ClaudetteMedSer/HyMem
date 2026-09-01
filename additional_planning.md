@@ -3891,7 +3891,7 @@ to be guarded all along.
 | **`recites_gold` gate** | **CLOSED — R2 FAIL.** Ran free on Afrodite the same day; 2 FP against a bar of ≤1. Alias stays v1, rule not re-tuned. See "A5 RAN" below. |
 | **C4 arm asymmetry** | Still blocked on the old pair; **unblocked for the next one** now that `judge_raw` is persisted. |
 | **D3 visibility** | **CLOSED.** |
-| **E6, Grove E3/E4, digest staleness** | Unchanged. Note Grove E3's measured population is ~2 rows on the box and 0 on conv-26, and nothing consumes `retraction_history` — the shape that closed Grove E2 FAIL-mechanism. |
+| **E6, Grove E3/E4, digest staleness** | **Grove E4 CLOSED 2026-09-01, FAIL-mechanism** — its specified null leaves the gated statistic invariant (one distinct value over 2000 permutations), and against a null that reaches it the box store sits below chance (9 vs 19.74). **Digest staleness (G-DS1) re-measured 2026-09-01: still not runnable**, 28 active profile rows vs cap 20 (22 → 23 → 28). E6 and Grove E3 unchanged; Grove E3's measured population is ~2 rows on the box and 0 on conv-26, and nothing consumes `retraction_history` — the shape that closed Grove E2 FAIL-mechanism. |
 | **`main`** | Now 214 commits behind `Beam-optimisation` and 4 ahead: a real merge, not a fast-forward. |
 
 ### A5 RAN — `recites_gold` v2 CLOSED, R2 FAIL (2026-08-26, Afrodite)
