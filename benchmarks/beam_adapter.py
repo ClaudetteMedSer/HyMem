@@ -16,6 +16,7 @@ import ast
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -361,6 +362,70 @@ def check_model_pin(role: str, model: str, provider: str, extra_body: dict) -> N
               "Without it the model writes to reasoning_content, this client reads "
               "content, and every empty read scores 0.")
         sys.exit(2)
+
+
+def _git(*args: str) -> str | None:
+    """Run git inside the repo; stripped stdout, or None if it failed."""
+    try:
+        r = subprocess.run(("git", "-C", str(_repo_root)) + args,
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def resolve_prereg(path: str | None, allow_dirty: bool) -> dict | None:
+    """Pin an artifact to the spec that authorised it, or refuse to run.
+
+    "A verdict whose spec-hash post-dates its artifact is void by
+    construction." That only bites if the check happens BEFORE the spend: a
+    spec edited afterwards to fit the numbers no longer matches the hash its
+    artifact recorded, and the mismatch is visible to anyone who looks. A spec
+    merely *cited* by filename gives none of that, because the file is
+    mutable and the citation is not.
+
+    So the spec must be committed and clean at run start. `path=None` is the
+    explicit --no-prereg escape for exploratory runs; it returns None, which
+    the artifact records as `prereg: null` -- an exploratory run should be
+    identifiable as one, not silently indistinguishable from a canonical.
+    """
+    if path is None:
+        return None
+    if _git("rev-parse", "--git-dir") is None:
+        print("ERROR: --prereg needs a git repo; run with --no-prereg to opt out.")
+        sys.exit(2)
+    abs_path = Path(path) if os.path.isabs(path) else (_repo_root / path)
+    if not abs_path.exists():
+        print(f"ERROR: pre-registration {path!r} does not exist.")
+        sys.exit(2)
+    try:
+        rel = str(abs_path.resolve().relative_to(_repo_root))
+    except ValueError:
+        print(f"ERROR: pre-registration {path!r} is outside the repo, so it cannot be "
+              "committed with the code it authorises.")
+        sys.exit(2)
+    if _git("status", "--porcelain", "--", rel):
+        print(f"ERROR: pre-registration {rel!r} is uncommitted or modified. Commit it "
+              "BEFORE the run -- a spec that can still change is not a pre-registration.")
+        sys.exit(2)
+    commit = _git("log", "-1", "--format=%H", "--", rel)
+    if not commit:
+        print(f"ERROR: {rel!r} has no commit touching it; git cannot date the spec.")
+        sys.exit(2)
+    code_dirty = bool(_git("status", "--porcelain", "--untracked-files=no"))
+    if code_dirty and not allow_dirty:
+        print("ERROR: tracked files are modified, so the code that produced this "
+              "artifact has no commit to name. Commit, stash, or pass --allow-dirty "
+              "(which records the fact in the artifact).")
+        sys.exit(2)
+    return {
+        "path": rel,
+        "commit": commit,
+        "blob": _git("rev-parse", f"HEAD:{rel}"),
+        "committed_at": _git("log", "-1", "--format=%cI", "--", rel),
+        "code_commit": _git("rev-parse", "HEAD"),
+        "code_dirty": code_dirty,
+    }
 
 
 # Preference order for the canary's question. The trap only reproduces when
@@ -1630,6 +1695,9 @@ def _rejudge_run(args, api_key: str) -> None:
         "rejudge_original_judge": orig_judge,
         "judge_model": args.judge_model,
         "judge_extra_body": judge_extra,
+        # Overwrites any prereg inherited from the source artifact: this run is
+        # authorised by its own spec, not by the one that authorised A.
+        "prereg": args.prereg_obj,
     })
     out = {"metadata": meta, "summary": {sc: {ab: d["avg"] for ab, d in abils.items()}
                                          for sc, abils in summary.items()},
@@ -1784,6 +1852,18 @@ def main():
                         help="JSON merged into every JUDGE request body. Same "
                              "thinking-disabled requirement for v4-flash. Applies "
                              "to --rejudge too.")
+    parser.add_argument("--prereg", default=None,
+                        help="Path to the pre-registration authorising this run. It "
+                             "must be committed and unmodified; its commit and blob "
+                             "hashes are recorded in the artifact. Required unless "
+                             "--no-prereg.")
+    parser.add_argument("--no-prereg", action="store_true",
+                        help="Exploratory run with no pre-registration. Recorded as "
+                             "prereg: null in the artifact, so such a run stays "
+                             "distinguishable from a canonical one.")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="Permit a run with modified tracked files. Recorded as "
+                             "prereg.code_dirty = true.")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
                         help="E1 narrative-facts READ side (cfg.facts_enabled). None = "
@@ -1827,6 +1907,19 @@ def main():
             print(f"ERROR: --{role}-extra-body must be a JSON object, got {type(obj).__name__}.")
             sys.exit(2)
         setattr(args, f"{role}_extra_body_obj", obj)
+
+    # Pin the spec before the money. Requiring one of the two flags is the
+    # point: a default would let a canonical run be produced by forgetting.
+    if bool(args.prereg) == bool(args.no_prereg):
+        print("ERROR: pass exactly one of --prereg <path> or --no-prereg.")
+        sys.exit(2)
+    args.prereg_obj = resolve_prereg(None if args.no_prereg else args.prereg,
+                                     args.allow_dirty)
+    if args.prereg_obj:
+        print(f"pre-registration: {args.prereg_obj['path']} @ "
+              f"{args.prereg_obj['commit'][:8]} (committed {args.prereg_obj['committed_at']})")
+    else:
+        print("pre-registration: NONE (--no-prereg) — this run is exploratory.")
 
     # Resolve API key
     DEEPSEEK_API_KEY = args.api_key or os.environ.get("HYMEM_LLM_API_KEY", "")
@@ -1966,6 +2059,7 @@ def main():
             # is exactly the kind of thing artifacts exist to stop.
             "answer_extra_body": args.answer_extra_body_obj,
             "judge_extra_body": args.judge_extra_body_obj,
+            "prereg": args.prereg_obj,
         },
         "summary": {scale: {ab: data["avg"] for ab, data in abilities.items()}
                      for scale, abilities in summary.items()},
