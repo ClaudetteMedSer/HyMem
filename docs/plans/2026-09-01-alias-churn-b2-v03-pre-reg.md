@@ -119,6 +119,76 @@ It must **not** be excluded. Excluding rows because their handling improved
 would bias the churn estimate toward zero, by dropping exactly the rows where
 the judge's real verdict was hardest to obtain.
 
-## 8. Executed results
+## 8. Executed results — B2c (2026-09-01): WORLD 1
 
-(empty — nothing has been run under this pre-registration)
+Artifact `results_20260831T165039Z-rejudged-deepseek-chat-20260901T110546Z.json`,
+prereg blob 29cc7dedf8cb @ 93038fac, dataset 3205395e. 161 judge calls, 200s,
+canary OK. **0 silent-0 / 0 truncated / 0 explicit / 160 rejudged of 160** —
+the third attempt and the first clean one.
+
+`judge_parse`: 159 `ok`, **1 `recovered`** — an IF row that every prior run
+would have scored 0.0. It scored **1.0**, which is exactly what B scored it, so
+the row did **not** move. The parser fix agreed with the old parser wherever
+the old parser worked, and read one row it could not.
+
+**D_alias = 4/160** (control arm 1/32): CR 0→0.25, EO 0.3333→0, PF 0.5→0,
+SUM 0→0.25. SD_alias_ctl = 0.044194.
+
+**VERDICT: WORLD 1.** The alias churns. The gold-delta phase's `SD_ctl = 0.0000`
+was a small-sample draw, not determinism — as suspected, and now measured
+rather than inferred from the pin.
+
+**World 2 is refuted, and with it the worry that the pin is a worse
+instrument:** alias 4/160 against pin 7/160 are not distinguishable at these
+counts. The pin costs no measurable reproducibility, so its witnessability is
+free. **Step 1's PASS can now be read as a clean adoption case.**
+
+### 8.1 The pre-registered CONSEQUENCE was mis-specified, and its output is wrong
+
+§6 said: recompute the primary in §8's own formula and "report inside/outside
+**for the −0.582pp effect**." The scorer did exactly that, and printed
+*REBASE REQUIRED is NOT supported at the measured variance*.
+
+**That output should not be believed, and the fault is in the rule I wrote.**
+It holds the EFFECT fixed at B's single-arm estimate while taking the BAND from
+a different arm. Mixing arms that way is not a variance correction; it pairs the
+lowest available effect estimate with a newly non-zero band and calls the result
+a collapse.
+
+The effect is not a constant. It is an estimate, and it varies run to run for
+exactly the reason this whole run was commissioned to establish.
+
+### 8.2 What four arms say (POST-HOC — not a pre-registered verdict)
+
+There are now four independent gold-on rejudges of the same anchor A:
+
+| arm | judge | pool δ̄ |
+|---|---|---|
+| B | alias | −0.582pp |
+| B2c | alias | −1.037pp |
+| C1 | pin | −1.037pp |
+| C2 | pin | −1.115pp |
+
+mean **−0.943pp**, between-run SD 0.244pp, SE 0.122pp, ±2SE →
+**[−1.187, −0.699]pp, excluding zero.**
+
+**So the gold delta is real, it is about −0.94pp, and B's −0.582pp was the low
+outlier.** Three of the four arms sit outside the ±0.781pp band that a genuine
+control SD produces. **REBASE REQUIRED survives** — and on far firmer ground
+than the zero-width band that originally produced it, which was correct in its
+conclusion and indefensible in its construction.
+
+**This analysis is POST-HOC and is recorded as such.** It was not
+pre-registered, it uses arms produced for other questions, and it must not be
+banked as a verdict. What it establishes is that the §8 re-derivation is now
+*worth doing properly*: the between-arm spread is a direct estimate of the
+quantity §8 approximated with a single control arm, and it needs its own
+pre-registration before anything is concluded from it.
+
+### 8.3 Standing corrected, twice, in the same direction
+
+I twice treated one arm's δ̄ as "the" effect — first arguing the verdict
+collapsed, then encoding that into §6's rule. Both times the error was the
+same shape: **taking a noisy single-run estimate for a fixed quantity, which is
+precisely the error §8 made with `SD_ctl = 0` and which this campaign exists to
+catch.** The four-arm view was available for free the whole time.
