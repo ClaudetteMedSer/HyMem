@@ -3261,6 +3261,25 @@ probes have no such coupling (the Stage 0 probe imports production
 
 #### G-DS1 — digest-staleness gate, PRE-REGISTERED 2026-08-26, **CONDITIONAL / not runnable on the box today**
 
+> **RE-MEASURED 2026-09-01 (free, read-only): still not runnable, and moving
+> further away.** `digest_squeeze_probe.py` on the box store reads **28 active
+> profile rows** against cap 20 → `remaining = 0` → **edge budget 0**, so
+> G-DS1's population condition (c) `edge_budget > 0` is empty. The three
+> readings taken so far are 22 (probe docstring), 23 (this pre-registration,
+> 2026-08-26) and 28 (today) — which **confirms the banked mechanism
+> longitudinally rather than by argument**: `SINGLE_VALUED_SLOTS` does not
+> bound the accumulating slots, so "once a store's active profile crosses the
+> cap it never comes back" is now an observed trend over ~a week, not a
+> prediction.
+>
+> Same run, for the record: **9,536 eligible edges** (of 10,071 active
+> non-derived) and **zero** reach the digest anchor; the separate-budget
+> counterfactual would restore 20 of them; and 8 profile rows are additionally
+> dropped by `load_profile`'s own tail cap — the separate, still-open defect the
+> fix would not repair. S1-C1's refusal (2/10 vs a bar of >=3/10) is untouched
+> by this; what has changed is only that the population it was refused over has
+> grown by five rows.
+
 Written before any fix exists, so it can never be shaped around one. Filed
 **blocked**, not open: with F1 refused, F2 dead and F3 (below) incoherent, there
 is currently no live fix for it to accept and no population on the box to run it
