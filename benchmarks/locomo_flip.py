@@ -31,6 +31,24 @@ BUCKETS = ["correct", "retrieval", "ranking", "budget", "synthesis"]
 _CATNAME = {1: "multi-hop", 2: "temporal", 3: "open-domain", 4: "single-hop",
             5: "adversarial"}
 
+# The adapters disagree on what the model's answer is called (`facts_ab.py:51`
+# carries the same list, for the same reason). Reading only `ai_answer` does not
+# fail loudly on a file that names it something else: absent on both sides, the
+# judge-only test below compares None to None on every row and passes.
+_ANSWER_KEYS = ("ai_answer", "hypothesis", "prediction", "response")
+
+
+def answer_text(row: dict) -> str | None:
+    """What the reader said, under whichever name this adapter used.
+
+    None means the row records no answer at all -- which is NOT the same as the
+    two arms agreeing, and must never be read as agreement."""
+    for k in _ANSWER_KEYS:
+        v = row.get(k)
+        if v:
+            return v
+    return None
+
 
 def bucket(r: dict) -> str:
     """Where this question died. `gold_in_topk` is absent in runs made before the
@@ -111,9 +129,26 @@ def main() -> None:
     # A --rejudge pair holds the reader byte-identical, so nothing that moves can
     # be dilution — it is judge nondeterminism by construction. Detect it rather
     # than trusting the caller to remember which pair they are looking at.
-    judge_only = all(a_rows[i].get("ai_answer") == b_rows[i].get("ai_answer")
-                     for i in shared)
-    if judge_only:
+    #
+    # This decides the label on the reader-side regression count below, so a
+    # wrong answer here is not a cosmetic one: it prints "JUDGE churn" over the
+    # exact rows that carry the dilution signature. It must therefore be able to
+    # come out FALSE. Comparing `.get("ai_answer")` could not: on a pair that
+    # records the answer under another name, or records none, every row compares
+    # None to None and the run is declared a re-judge of itself. Absence is not
+    # agreement, so it is a third outcome, not a pass.
+    unanswered = [i for i in shared
+                  if answer_text(a_rows[i]) is None or answer_text(b_rows[i]) is None]
+    judge_only = (not unanswered and
+                  all(answer_text(a_rows[i]) == answer_text(b_rows[i])
+                      for i in shared))
+    if unanswered:
+        print(f"  [unclassified] {len(unanswered)}/{len(shared)} shared row(s) "
+              f"record no reader answer under any of {', '.join(_ANSWER_KEYS)},\n"
+              f"                 so whether B re-judged A cannot be read off "
+              f"these files. The regression\n                 cause below is "
+              f"labelled DILUTION, which is the assumption that can be checked.")
+    elif judge_only:
         print("  [judge-only] every shared answer is byte-identical — B is a "
               "re-judge of A.\n               All flips below are JUDGE churn; "
               "the reader never moved.")
@@ -192,12 +227,16 @@ def main() -> None:
                       f"  {bucket(a)} → {bucket(b)}")
                 print(f"      Q: {a.get('question', '')[:150]}")
                 print(f"      gold: {str(a.get('answer'))[:110]}")
-                print(f"      B answered: {str(b.get('ai_answer'))[:110]}")
+                print(f"      B answered: {str(answer_text(b))[:110]}")
 
     if args.json:
         print(json.dumps({
             "n_shared": len(shared), "a_accuracy": a_acc, "b_accuracy": b_acc,
             "fixed": gains, "broken": regressions,
+            # Without this the JSON and the printed report disagree about what
+            # the same rows mean: `dilution_regressions` names rows the text
+            # above may have just relabelled JUDGE churn.
+            "judge_only": judge_only, "unanswered": len(unanswered),
             "dilution_regressions": [i for i in regressions
                                      if a_rows[i].get("gold_in_context")
                                      and b_rows[i].get("gold_in_context")],
