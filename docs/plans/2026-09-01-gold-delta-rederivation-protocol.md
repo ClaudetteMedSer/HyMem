@@ -304,3 +304,127 @@ post-hoc move, and §0 already concedes enough ground without adding that.
   systematic-difference probe, which is a *future* target and not this one.
 - **No arm may be added after §6 is computed.** A fifth arm run because four
   gave an unwelcome answer would destroy the only discipline this campaign has.
+
+## 9. Executed results — 2026-09-01
+
+Protocol blob `f0d0005bd48b` @ `4b91b733`, code `bc0ead5c`. Zero API calls.
+Re-run after the §6.6 wording fix (`d81bf068`) reproduced every number.
+
+### 9.1 Preconditions — all pass
+
+160/160 keys identical across five arms; **rubric, ideal_answer and gold_kind
+byte-identical across B, C1, C2, B2c**; answers byte-identical across all five;
+160/160 readable in every arm; no arm void. `judge_parse` recovered: B 0, C1 0,
+C2 0, **B2c 1**.
+
+**§4.2 did the work it was written for.** B carries no `dataset_revisions` and
+no `prereg`, and a rejudge reparses the dataset for gold — but the gold material
+is byte-identical across all four arms, so **B's unwitnessed revision is not
+load-bearing.** That is now measured rather than assumed.
+
+### 9.2 Gate, primary, exchangeability
+
+| | value |
+|---|---|
+| per-arm control δ̄ | B `+0.000` (0/32), C1 `+0.000` (0/32), C2 `+0.781` (1/32), B2c `+0.781` (1/32) |
+| **§6.0 GATE** | mean `+0.391pp ± 0.718` → contains 0 → **PASSES** |
+| point estimate | **δ̄ = −0.943pp** |
+| **E1** row-level | σ̂_churn 0.04935, SE 0.2181pp, **ν_eff 16.6** (t 2.114) → **[−1.404, −0.482]** |
+| **E2** arm-level | SD_arm 0.2437pp, SE 0.1218pp, ν 3 (t 3.182) → **[−1.331, −0.555]** |
+| **§6.1** | **both exclude 0**; E1 is the wider |
+| **§6.2** | contrast `+0.267pp`, band `±0.995pp` → PASSES (weak, 2 df) |
+
+**The Satterthwaite correction mattered.** ν_eff is **16.6**, not the 384 the
+draft claimed — 128 rows contributing three degrees of freedom each, when nearly
+all of them are rows every arm agrees on and contribute a structural zero. The
+honest df widens E1 from `±0.429` to `±0.461` and makes it the wider interval,
+so **the estimator I expected to be decorative is the one that governs.**
+
+### 9.3 VERDICT: **CONFIRMED, carried by EO/PF/SUM**
+
+The pool gold-delta is real at the four-arm variance. **REBASE REQUIRED stands,
+re-derived on a measured variance rather than a zero-width band** — and it
+survives an intersection–union rule, a t₃ where I previously used 2, and a
+control gate that could have voided it.
+
+**But three of the eight abilities are individually load-bearing**, so §6.7
+binds and the words *pool-wide* and *broad* are not available:
+
+| ability | contribution to δ̄ | drop it → |
+|---|---|---|
+| **EO** | **−1.102pp** | `+0.182 ± 0.476` — **includes 0** |
+| **PF** | **−0.586pp** | `−0.408 ± 0.455` — **includes 0** |
+| **SUM** | **−0.361pp** | `−0.665 ± 0.693` — **includes 0** |
+| MR | −0.391pp | `−0.631 ± 0.527` — excludes 0 |
+| TR | +0.000pp | `−1.078 ± 0.527` — excludes 0 |
+| IE | +0.033pp | `−1.115 ± 0.479` — excludes 0 |
+| IF | +0.684pp | `−1.859 ± 0.491` — excludes 0 |
+| KU | +0.781pp | `−1.970 ± 0.527` — excludes 0 |
+
+Strip EO and the pool mean flips sign to `+0.182pp`. The record is not
+uniformly degraded: **EO/PF/SUM/MR move down while IF/KU move up**, and the net
+is negative. That heterogeneity is what the original §8 flagged and what §6.6
+still refuses to re-bank at n=16 — but §6.7 makes it bind on the wording, which
+is where a verdict does its damage.
+
+### 9.4 §5.1 BINDS — the record question confirms, the process question does not
+
+`§6.5: −0.943pp ± 1.463 → [−2.406, +0.520]` — **includes zero.**
+
+So the reportable sentence is ***"this record differs from what gold-on judging
+yields"***. **Not** *"the gold effect is established"*.
+
+**This retracts the sentence I sent Atta.** I wrote that four arms show
+"REBASE REQUIRED survives — the gold delta is real at about −0.94pp". That
+argued from the arms as samples of a *process*, which is §6.5's quantity, and
+§6.5 does not confirm. The verdict that survives is the *record* one. It is
+sufficient for the rebase decision — rebasing is about this record — but it is a
+narrower claim than the one I made, and the migration between the two is exactly
+what §5.1 was written to stop. That is the **third** correction in this series,
+and unlike the first two it is a correction of scope rather than of arithmetic.
+
+### 9.5 Companion (descriptive; did not vote)
+
+`D` = 12, 12, 11, 13; net `−6, −6, −7, −7`; four-arm `−5.078pp ± 0.718`,
+excluding zero — where the original's binomial band (`2√D = 6.93`) put it
+**inside**. The data did not change; the band construction did. Recorded because
+it points the same way as the primary, and **not banked**, because §6.4 removed
+its vote before any of these numbers existed.
+
+### 9.6 The review's claims, checked
+
+Verified against the artifacts, since the reviewer's first parse of them was
+wrong:
+
+- **Held exactly:** the per-ability table (EO −8.82, IE +0.26, IF +5.47,
+  KU +6.25, MR −3.12, PF −4.69, SUM −2.89, TR 0.00); EO's contribution −1.10pp;
+  §4.2/§4.3 passing with zero differing rows; **§6.5 including zero**; and
+  **E1 being the wider interval — against my explicit prediction that it would
+  not be.**
+- **Held in substance:** "strip EO and it lands at +0.15pp" (actual `+0.182`);
+  "~24 effective df, not 384" (actual **16.6** — right that the df was grossly
+  overstated, and the true figure is lower still).
+- **Overreached:** *"the pool mean's sign is one ability."* Three abilities are
+  individually load-bearing, not one. The finding is real and it is why §6.7
+  exists, but "it is EO" is too strong.
+- **Wrong:** `score`/`scores` are not strings; they are floats and ints in all
+  five artifacts. Its arithmetic was right anyway — but this is why the numbers
+  were re-derived here rather than quoted.
+
+### 9.7 Corrections to the scorer made after the run
+
+`d81bf068` replaced a §6.6 line that printed "every one of those deltas sits at
+or below the one-flip resolution floor" — false for EO (−8.82pp against a 6.25pp
+floor) and for KU (exactly at it), and it would have printed under the very run
+that falsified it. Wording only; the re-run reproduced every number.
+
+### 9.8 What this does and does not license
+
+- **Does:** the rebase decision has a defended basis — this record differs from
+  gold-on judging by −0.943pp [−1.404, −0.482], driven by EO/PF/SUM.
+- **Does not:** any claim that the gold-on effect is established as a property
+  of the pipeline (§9.4), or any description of the shift as pool-wide (§9.3).
+- **Still unauthorised:** Step 2. It needs Atta, it costs ~91 minutes, and
+  nothing here changes that.
+- **No arm may be added.** Four arms answered; a fifth would only be run
+  because these four gave an answer someone disliked.
