@@ -428,3 +428,63 @@ that falsified it. Wording only; the re-run reproduced every number.
   nothing here changes that.
 - **No arm may be added.** Four arms answered; a fifth would only be run
   because these four gave an answer someone disliked.
+
+## 10. Retraction — §4.2 could not have failed
+
+Found on 2026-09-01 while validating Step 2's canonical, after §9 was committed.
+
+**§4.2 checked `rubric`, `ideal_answer` and `gold_kind` for byte-identity across
+the four rejudge arms, and reported that this converted B's unwitnessed dataset
+revision into a measured fact. It did not, and could not.**
+
+The rejudge path (`_rejudge_run`) reparses the dataset for gold, judges against
+`gold["gold_text"]`, and then writes back the row it inherited from the source
+artifact — including that row's `ideal_answer` and `gold_kind`. All four arms
+inherit those fields from the same anchor A. **Four copies of one field agree by
+construction.** The check had no power to fail, so its passing carried no
+information about what gold each arm actually reparsed.
+
+`rubric` is the exception and is unaffected: the rejudge genuinely judges with
+the inherited `r["rubric"]`, so identity across arms is both true and meaningful
+there.
+
+### 10.1 The check that does bear on it
+
+The question §4.2 meant to answer is whether B's unpinned reparse resolved to
+the same dataset content the other three pinned. That is answerable from the
+dataset's history rather than from the artifacts:
+
+`Mohammadta/BEAM` `main` has been at **`3205395e`** since **2026-01-30**. Its
+eight commits are `initial commit`, `Upload dataset`, and six `Update README.md`
+— **no data commit since 2025-11-11.** B ran on **2026-08-31**, seven months
+after the last change to `main`, so an unpinned `load_dataset` at that moment
+necessarily resolved to `3205395e`: the sha C1, C2 and B2c pinned.
+
+**So the conclusion of §4.2 survives — the four arms judged against the same
+gold — and the evidence I gave for it was wrong.** The distinction matters
+because the original claim would have held for any dataset with any history,
+which is what a check that cannot fail always looks like from the inside.
+
+### 10.2 What this does and does not change
+
+- **§9's verdict stands.** `CONFIRMED, carried by EO/PF/SUM`, the intervals, the
+  gate and the concentration rule are untouched: they read `score`, and every
+  arm's scores are its own.
+- **§9.1's sentence "§4.2 did the work it was written for" is withdrawn.** It
+  did not.
+- **Future arms are witnessed properly.** `4d9906b` records `judged_ideal` — the
+  text the judge actually read — on both paths, and `judge_gold` on the main
+  path. A future §4.2 over post-`4d9906b` artifacts compares what was judged
+  rather than what was copied.
+- The four existing rejudge arms cannot be retrofitted. For them, §10.1 is the
+  evidence, and it is external to the artifacts by necessity.
+
+### 10.3 Why this one is worth reading twice
+
+The protocol's §0 said its remaining protections were the harsher rules and the
+hash-locking. It did not occur to me that a **precondition** could be the weak
+point — I had treated §4.2 as the strongest part of the document and said so in
+its commit message. A gate that cannot fail reports success indistinguishably
+from a gate that passed, and nothing in the output tells them apart. The tests
+in `tests/test_beam_judged_ideal.py` exist because that is not a thing to
+rediscover.
