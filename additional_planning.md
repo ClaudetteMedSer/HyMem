@@ -3419,6 +3419,61 @@ decision (same dependency as Plan C).
 - Verdicts: PASS → flip gate on; FAIL-mechanism → close; UNMEASURED → keep
   shadow.
 
+#### STATUS 2026-09-01 — front-run RAN (free, read-only), **FAIL-mechanism on two counts**
+
+The RAPTOR sequence tie is discharged (Stage 3c flipped 2026-08-26), and E4 is
+"statistical, offline, LLM-free", so its front-run cost nothing.
+`benchmarks/consolidation_null_probe.py` on the box store, 70 eligible
+`depends_on` edges, 49 subjects, 58 objects, **9 observed hubs**.
+
+**1. The proposed null cannot move the statistic.** E4 specifies "domain-label
+shuffling (episode/domain membership permuted)". The hub rule is `GROUP BY
+object_canonical HAVING COUNT(*) >= 2` — a function of the OBJECT degree
+distribution and nothing else. Permuting subject or domain labels rearranges
+who sits under each object and leaves every degree exactly where it was. Over
+**2000 permutations the statistic takes one distinct value: {9}**. A gate
+calibrated on that null accepts and rejects precisely what it would have
+without one, and prints a calibrated-looking α while doing it. Measured rather
+than argued, because that is the difference between this and the retracted §4.2
+in the gold-delta protocol.
+
+**2. Against a null that DOES reach the statistic, the graph is below it.**
+Reassigning each edge's object uniformly over the observed vocabulary, 20,000
+trials: null mean **19.74**, p05/median/p95 **17/20/23**, observed **9**,
+P(null ≤ observed) = 0.0000. The store is *more dispersed* than chance — most
+objects are named once. There is no excess of shared dependencies for a
+false-discovery gate to filter, and suppressing at α = 0.05 would delete all
+nine candidates, the real ones included. **The premise E4 imports — "coincidence
+grows superlinearly with corpus size" — describes a regime this corpus is not
+in.**
+
+**And a finding about the detector itself, which outlives E4.** "Objects with
+≥ 2 edges" is not a concentration measure, though "hub" invites reading it as
+one. It peaks at an even 2-pairing and falls off on both sides (60-63 edges,
+3000 trials): a star of 3 objects scores 3 against a null of 6.00; a 2-regular
+graph scores 30 against 17.90; a matching scores 0 against 15.80. **A genuine
+hub — one object everything depends on — makes this statistic SMALLER.** So
+EXCESS here would mean "more evenly paired than chance", not "more clustered
+than chance", which is a mismatch with the coincidental-*cluster* framing E4
+was built on. Pinned by a test, because the verdict cannot be read correctly
+without it.
+
+**Verdict: FAIL-mechanism → CLOSE.** Not "no effect measured" — the specified
+null is inert by construction and the corpus is on the wrong side of a null
+that works. Revival needs a new statistic (distinct-subject counts, or a real
+concentration measure) and a corpus where the deficit has reversed, argued in a
+fresh pre-registration. C2/C3/C4 were never reached and are not evidence of
+anything. The probe stays as the instrument that would notice the reversal.
+
+*(Also pinned, latent on the box today: `COUNT(*) >= 2` counts EDGES, so one
+subject with two edges to the same object renders as "a shared dependency of:
+X, X". All nine current hubs have distinct subjects, so this is not biting —
+the test exists so a future store that hits it is not read as a real hub.)*
+
+This is the third Grove item to close FAIL-mechanism on its own front-run (E2
+2026-08-25, E3 on population, E4 today), which is the borrow discipline working
+rather than failing.
+
 **Rejected Grove items (recorded 2026-08-18, do not revisit without new
 evidence):** dual-space structural-signature distillation (protocol
 unpublished, quality ceiling unproven at scale — the paper's own limitation;
