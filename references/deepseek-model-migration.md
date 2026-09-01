@@ -30,11 +30,26 @@ extra_body). The `deepseek-chat` alias path is the currently-working choice.
 (judge-only rejudge, gold-reparse guarded, canary + silent-0 abort + ABS/CR gate); NO
 extra_body plumbing still, so the v4-flash-pin trap rule above is unchanged.)
 
+**UPDATE 2026-09-01 (Phase 2 plumbing landed): the trap rule above is now ENFORCED, not
+just documented.** `beam_adapter` has `--answer-extra-body` / `--judge-extra-body`;
+`LLMClient` takes `extra_body` and merges it last; `_call` raises on FALSY content, not
+merely null, because empty is the shape the trap actually takes. `check_model_pin()` runs
+on both clients in `main()` and in `_rejudge_run`: a DeepSeek `v4-flash` model without
+`thinking:disabled` exits 2, and a `thinking` key aimed at OpenAI/Gemini (a 400) exits 2.
+A real-prompt canary now runs on BOTH clients at each path's own `max_tokens` ceiling
+before the run spends anything — previously only the rejudge judge was canaried, and the
+expensive answer path had no guard at all. Artifacts record `answer_extra_body` /
+`judge_extra_body`, so a reader no longer has to infer from the code whether thinking was
+disabled. **Defaults are unchanged**: `extra_body` is empty unless a flag sets it, so an
+unflagged run sends the same four body keys it always sent and prior artifacts stay
+comparable. `ANSWER_MODEL`/`JUDGE_MODEL` are still `deepseek-chat` — the flip is the
+pre-registered decision, not a plumbing detail.
+
 | File | What |
 |---|---|
 | `hymem/contrib/openai_client.py:51` | Default fallback → `deepseek-v4-flash` |
 | `hymem/bootstrap.py:23` | `DEFAULT_LLM_MODEL` → `deepseek-v4-flash` |
-| `benchmarks/longmemeval_adapter.py:183-184`, `:340` | `ANSWER_MODEL`/`JUDGE_MODEL`; three-way fallback `content or reasoning or reasoning_content` |
+| `benchmarks/longmemeval_adapter.py:183-184`, `:340` | `ANSWER_MODEL`/`JUDGE_MODEL`. **CORRECTED 2026-09-01: LME has NO three-way fallback.** `_call` (`:384-392`) raises only on `content is None`; the trap shape is `content == ""` with `finish_reason=length`, which that check lets through untouched. LME's protection is the `extra_body` flag plus its canary, not the client. The row previously listed a recommendation as landed code. |
 | `benchmarks/beam_adapter.py:44-45` | Constants → `deepseek-v4-flash` |
 | `~/.agent37/hooks/post-restart.sh` | `HYMEM_LLM_MODEL` → `deepseek-v4-flash` |
 | `~/.hermes/bin/hymem-server-wrapper` | `HYMEM_LLM_MODEL` — the SINGLE source for MCP-server env; was the LAST live `deepseek-chat` reference (2026-08-07). After patching, kill the `hymem-server` CHILDREN only — watchdogs respawn them with the new env; verify `/proc/<pid>/environ`. Killing the watchdogs kills the bridge. |

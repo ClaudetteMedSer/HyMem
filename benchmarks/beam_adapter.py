@@ -231,11 +231,20 @@ PUBLISHED_SOTA = {
 # ── LLM Client ────────────────────────────────────────────────────────────
 
 class LLMClient:
-    def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL):
+    def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
+                 extra_body: dict | None = None):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.call_count = 0
+        # Provider-specific request fields (DeepSeek's `thinking` switch is the
+        # only one in use). EMPTY BY DEFAULT and only ever set from an explicit
+        # flag: an unflagged run must send the same bytes it sent before this
+        # plumbing existed, or every prior artifact silently stops being a
+        # comparator. That is why this is not the `auto` host-substring gate
+        # hymem/contrib/openai_client.py:81-86 uses for the library client --
+        # a benchmark cannot afford a request-body change it did not ask for.
+        self.extra_body = dict(extra_body or {})
 
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
         last_error = None
@@ -253,16 +262,36 @@ class LLMClient:
         return f"[LLM_ERROR: {last_error[:100]}]"
 
     def _call(self, messages: list, temperature: float, max_tokens: int) -> str:
+        body = {"model": self.model, "messages": messages,
+                "temperature": temperature, "max_tokens": max_tokens}
+        # Merge last so a caller can force provider-specific fields; collisions
+        # with the four keys above are the caller's (mirrors LME :373).
+        body.update(self.extra_body)
         resp = http.post(
             f"{self.base_url}/chat/completions",
-            json={"model": self.model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens},
+            json=body,
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             timeout=120,
         )
         resp.raise_for_status()
         data = resp.json()
         self.call_count += 1
-        return data["choices"][0]["message"].get("content", "")
+        choice = data["choices"][0]
+        content = choice["message"].get("content")
+        if not (content or "").strip():
+            # LME (:384) raises on content IS NONE. Beam raises on EMPTY too,
+            # because empty is the shape the trap actually takes: a reasoning
+            # model spends max_tokens in reasoning_content and returns
+            # content="" with finish_reason="length" -- an HTTP 200, not an
+            # error. Returned as-is it reached judge_answer, missed the regex,
+            # took the except path, and scored 0.0 indistinguishably from a
+            # real 0.0 (lme_runs.db id=53: 0.6% without extra_body vs id=54:
+            # 69.8% same day with it). Raising makes it explicit and countable:
+            # chat() retries, then surfaces "[LLM_ERROR: empty content ...]".
+            raise RuntimeError(
+                f"empty content (finish={choice.get('finish_reason')}, "
+                f"reasoning={len(choice['message'].get('reasoning_content') or '')} chars)")
+        return content
 
 
 # ── Answer-model provider registry ────────────────────────────────────────
@@ -302,6 +331,112 @@ def resolve_answer_provider(spec: str, deepseek_key: str):
             print(f"ERROR: answer provider '{provider}' needs one of {key_envs} set.", flush=True)
             sys.exit(1)
     return model, base_url, api_key, provider
+
+
+THINKING_DISABLED = {"thinking": {"type": "disabled"}}
+
+
+def check_model_pin(role: str, model: str, provider: str, extra_body: dict) -> None:
+    """Refuse the two ways a model pin turns into silent empty completions.
+
+    (1) A v4-flash DeepSeek model WITHOUT thinking disabled answers in
+        `reasoning_content` and leaves `content` empty. `_rejudge_run` has
+        aborted on this since the gold-delta pre-registration, but the normal
+        answer/judge path had no guard at all -- a bare
+        `--answer-model deepseek-v4-flash` ran straight into it and the run
+        looked like a capability result.
+    (2) DeepSeek's `thinking` key sent to OpenAI/Gemini is a 400. The ANSWERER
+        is provider-swappable (ANSWER_PROVIDERS), so this is reachable by flag
+        combination; the judge is DeepSeek-only and cannot hit it.
+    """
+    thinking = extra_body.get("thinking")
+    if provider != "deepseek" and thinking is not None:
+        print(f"ERROR: {role} provider {provider!r} rejects DeepSeek's `thinking` key "
+              f"(HTTP 400). Drop it from --{role}-extra-body.")
+        sys.exit(2)
+    if provider == "deepseek" and "v4-flash" in model and \
+            (thinking or {}).get("type") != "disabled":
+        print(f"ERROR: {role} model {model!r} requires "
+              f"--{role}-extra-body '{{\"thinking\": {{\"type\": \"disabled\"}}}}'. "
+              "Without it the model writes to reasoning_content, this client reads "
+              "content, and every empty read scores 0.")
+        sys.exit(2)
+
+
+# Preference order for the canary's question. The trap only reproduces when
+# the model burns its whole budget reasoning before writing content, so an
+# easy question is a canary that passes for the wrong reason. These four
+# abilities are the ones that demand multi-step reasoning; the canary picks
+# the first question it finds in this order and only falls back to "whatever
+# is first" if a sample somehow contains none of them.
+CANARY_ABILITIES = ("TR", "MR", "EO", "SUM")
+
+
+def pick_canary_question(conversations: dict, scales: list) -> dict:
+    """The hardest-reasoning question available, not an arbitrary one."""
+    questions = [q for sc in scales for conv in conversations.get(sc, [])
+                 for q in conv["questions"]]
+    if not questions:
+        print("ERROR: no questions loaded; nothing to canary.")
+        sys.exit(2)
+    by_ability = {}
+    for q in questions:
+        by_ability.setdefault(q["ability_short"], q)
+    for ability in CANARY_ABILITIES:
+        if ability in by_ability:
+            return by_ability[ability]
+    return questions[0]
+
+
+def run_canary(role: str, llm: LLMClient, messages: list, max_tokens: int) -> str:
+    """One real-shaped call per client, before the run spends anything.
+
+    A trivial 'say OK' prompt cannot reproduce the trap: the model has to burn
+    its whole budget on reasoning before it would have written content. So the
+    canary sends a REAL prompt at the path's own max_tokens ceiling, which is
+    the same reasoning the rejudge canary was built on -- generalised here from
+    the judge to both clients, because both are pinnable.
+    """
+    raw = llm.chat(messages, temperature=0.0, max_tokens=max_tokens)
+    if raw.startswith("[LLM_ERROR"):
+        print(f"  CANARY FAILED ({role}): {raw[:200]}")
+        sys.exit(1)
+    if not raw.strip():
+        # Unreachable while _call raises on empty, kept so the canary stays
+        # correct on its own terms if that ever loosens.
+        print(f"  CANARY FAILED ({role}): empty content. Raw repr: {raw!r}")
+        sys.exit(1)
+    print(f"  CANARY OK ({role}): {len(raw)} chars on the real {role} path.")
+    return raw
+
+
+def build_canary_messages(conversations: dict, scales: list, judge_gold: bool) -> dict:
+    """Assemble both canary prompts without calling anything.
+
+    Split out of main() so the ASSEMBLY is testable. Stubbing chat() -- which
+    is how run_canary's own unit tests work -- exercises the send and the
+    verdict but never the construction, so a wrong constant name or a question
+    key that does not exist would survive a green suite and only surface when a
+    real run reached this line, after ingestion had already been paid for.
+    """
+    q = pick_canary_question(conversations, scales)
+    ideal = q.get("gold_text", "") if judge_gold else q["ideal_answer"]
+    return {
+        "ability": q["ability_short"],
+        "answer": [
+            {"role": "system",
+             "content": ANSWERING_PROMPTS.get(q["ability_short"], ANSWERING_SYSTEM_PROMPT)},
+            # No retrieved memories: retrieval needs ingestion, which is the
+            # expensive half. The trap does not depend on context -- a
+            # reasoning model burns its budget on the QUESTION -- which is why
+            # pick_canary_question insists on a reasoning-heavy ability rather
+            # than trusting whichever question happened to be parsed first.
+            {"role": "user",
+             "content": f"CONTEXT:\n(canary: no retrieved memories)"
+                        f"\n\nQUESTION: {q['question']}\n\nANSWER:"},
+        ],
+        "judge": lambda ai_answer: _judge_messages(q["question"], ideal, q["rubric"], ai_answer),
+    }
 
 
 # ── Episode-tier answer-bearing probe (Plan C pre-check) ──────────
@@ -1368,14 +1503,14 @@ def _rejudge_run(args, api_key: str) -> None:
     print(f"\n=== REJUDGE {src.name} ===")
     print(f"  rows: {n_rows}   original judge: {orig_judge}   new judge: {args.judge_model}")
 
-    # Guardrail ported from LME :2327-2329: extra_body does not exist on beam,
-    # so a bare v4-flash judge would hit the thinking-token trap. ABORT.
-    if "v4-flash" in args.judge_model and not getattr(args, "judge_extra_body_obj", None):
-        print("  ERROR: v4-flash judge without --judge-extra-body is not supported on beam "
-              "(no extra_body plumbing here). Forbidden by the pre-registration.")
-        sys.exit(2)
+    # Was an unconditional ABORT while beam had no extra_body plumbing (the
+    # gold-delta phase explicitly deferred it). The plumbing exists now, so the
+    # same trap is a GUARD: v4-flash is allowed here once thinking is disabled,
+    # and still refused when it is not. The judge is DeepSeek-only.
+    judge_extra = getattr(args, "judge_extra_body_obj", None) or {}
+    check_model_pin("judge", args.judge_model, "deepseek", judge_extra)
 
-    judge_llm = LLMClient(args.judge_model, api_key)
+    judge_llm = LLMClient(args.judge_model, api_key, extra_body=judge_extra)
 
     # ── gold reparse (before canary: canary uses a real row's gold) ────────
     data = load_beam_conversations(["100K"], max_conv=8)
@@ -1494,6 +1629,7 @@ def _rejudge_run(args, api_key: str) -> None:
         "rejudged_from": src.name,
         "rejudge_original_judge": orig_judge,
         "judge_model": args.judge_model,
+        "judge_extra_body": judge_extra,
     })
     out = {"metadata": meta, "summary": {sc: {ab: d["avg"] for ab, d in abils.items()}
                                          for sc, abils in summary.items()},
@@ -1639,6 +1775,15 @@ def main():
                         help="Answerer spec 'provider:model' (e.g. gemini:gemini-2.5-flash) "
                              "or a bare DeepSeek model. Env: BEAM_ANSWER_MODEL.")
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
+    parser.add_argument("--answer-extra-body", default="",
+                        help="JSON merged into every ANSWER request body. Required "
+                             "as '{\"thinking\": {\"type\": \"disabled\"}}' when the "
+                             "answerer is a DeepSeek v4-flash model; rejected for "
+                             "non-DeepSeek providers, which 400 on that key.")
+    parser.add_argument("--judge-extra-body", default="",
+                        help="JSON merged into every JUDGE request body. Same "
+                             "thinking-disabled requirement for v4-flash. Applies "
+                             "to --rejudge too.")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
                         help="E1 narrative-facts READ side (cfg.facts_enabled). None = "
@@ -1667,6 +1812,21 @@ def main():
                              "real gold instead of the legacy IDEAL ANSWER.")
     parser.add_argument("--keep-db", action="store_true")
     args = parser.parse_args()
+
+    # Parse the extra-body flags into the *_obj attrs the guards and clients
+    # read. Done before anything spends money: a typo'd JSON should cost a
+    # syntax error, not a partial run.
+    for role in ("answer", "judge"):
+        raw = getattr(args, f"{role}_extra_body")
+        try:
+            obj = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as e:
+            print(f"ERROR: --{role}-extra-body is not valid JSON: {e}")
+            sys.exit(2)
+        if not isinstance(obj, dict):
+            print(f"ERROR: --{role}-extra-body must be a JSON object, got {type(obj).__name__}.")
+            sys.exit(2)
+        setattr(args, f"{role}_extra_body_obj", obj)
 
     # Resolve API key
     DEEPSEEK_API_KEY = args.api_key or os.environ.get("HYMEM_LLM_API_KEY", "")
@@ -1698,8 +1858,12 @@ def main():
     print(f"  Max conversations: {max_conv or 'all'}")
     print(f"  Top-K: {top_k}")
     ans_model, ans_base, ans_key, ans_provider = resolve_answer_provider(args.answer_model, DEEPSEEK_API_KEY)
-    print(f"  Answer model: {ans_model} (provider={ans_provider}, base={ans_base})")
-    print(f"  Judge model: {args.judge_model} (provider=deepseek)")
+    check_model_pin("answer", ans_model, ans_provider, args.answer_extra_body_obj)
+    check_model_pin("judge", args.judge_model, "deepseek", args.judge_extra_body_obj)
+    print(f"  Answer model: {ans_model} (provider={ans_provider}, base={ans_base}, "
+          f"extra_body={args.answer_extra_body_obj or '{}'})")
+    print(f"  Judge model: {args.judge_model} (provider=deepseek, "
+          f"extra_body={args.judge_extra_body_obj or '{}'})")
 
     # Temp DB
     tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-beam-"))
@@ -1713,8 +1877,10 @@ def main():
     hy.open()
 
     # LLM clients
-    answer_llm = LLMClient(ans_model, ans_key, base_url=ans_base)
-    judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY)
+    answer_llm = LLMClient(ans_model, ans_key, base_url=ans_base,
+                           extra_body=args.answer_extra_body_obj)
+    judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY,
+                          extra_body=args.judge_extra_body_obj)
 
     # Load data
     print("Loading BEAM dataset...", flush=True)
@@ -1723,6 +1889,24 @@ def main():
     total_questions = sum(len(c["questions"]) for v in conversations.values() for c in v)
     print(f"  Total: {total_convs} conversations, {total_questions} questions")
     print_gold_audit(conversations)
+
+    # ── CANARY: both live clients, real prompts, before the run spends ─────
+    # The rejudge path has canaried its judge since the gold-delta phase; the
+    # main path -- the one that makes the expensive ANSWER calls -- had no such
+    # check, so a pin landing in reasoning_content would have surfaced as a
+    # suspiciously low score hours later, if at all.
+    canary_msgs = build_canary_messages(conversations, scales, args.judge_gold)
+    print(f"  canary question ability: {canary_msgs['ability']}")
+    canary_answer = run_canary("answer", answer_llm, canary_msgs["answer"], 1024)
+    run_canary("judge", judge_llm,
+               canary_msgs["judge"](canary_answer), 512)
+    # Counted separately, NOT folded into answer_calls/judge_calls. The rejudge
+    # artifact set the opposite precedent (judge_calls=161 for 160 rows), but
+    # that is a wart to stop repeating rather than a convention to cement: a
+    # column named answer_calls should equal the number of questions scored, so
+    # that "calls != rows" stays readable as a defect.
+    canary_calls = {"canary_answer_calls": answer_llm.call_count,
+                    "canary_judge_calls": judge_llm.call_count}
 
     # Evaluate
     all_results = []
@@ -1770,8 +1954,18 @@ def main():
             # without any record of it in run output.
             "context_memories": top_k * 3,
             "elapsed_s": elapsed,
-            "answer_calls": answer_llm.call_count,
-            "judge_calls": judge_llm.call_count,
+            "answer_calls": answer_llm.call_count - canary_calls["canary_answer_calls"],
+            "judge_calls": judge_llm.call_count - canary_calls["canary_judge_calls"],
+            **canary_calls,
+            # WHAT WAS SENT, not what the guard would have permitted. A reader
+            # of answer_model="deepseek-v4-flash" cannot otherwise tell whether
+            # thinking was disabled -- and that single field is the difference
+            # between a capability number and a plumbing failure (lme_runs.db
+            # id=53 0.6% vs id=54 69.8%). Inferring it from check_model_pin's
+            # rules is an inference about the code that scored the run, which
+            # is exactly the kind of thing artifacts exist to stop.
+            "answer_extra_body": args.answer_extra_body_obj,
+            "judge_extra_body": args.judge_extra_body_obj,
         },
         "summary": {scale: {ab: data["avg"] for ab, data in abilities.items()}
                      for scale, abilities in summary.items()},
