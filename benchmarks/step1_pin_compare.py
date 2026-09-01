@@ -39,6 +39,20 @@ def gate(name, rs):
     return silent0, errs
 
 
+def refuse_void(tag, meta):
+    """A void artifact holds rows worth characterising and a verdict worth
+    nothing. Preserving the evidence only helps if reading it as a result
+    stays impossible -- otherwise the fix that saved the data becomes the
+    reason someone quotes it."""
+    v = meta.get("void")
+    if v:
+        print(f"REFUSING: {tag} is VOID - {v.get('reason')} "
+              f"({v.get('n_silent0')} rows). Rule: {v.get('rule')}")
+        print("Its rows are evidence. They are not a verdict and are not "
+              "comparable to a clean arm.")
+        sys.exit(4)
+
+
 def main():
     b_meta, B = rows(sys.argv[1])
     c1_meta, C1 = rows(sys.argv[2])
@@ -53,6 +67,8 @@ def main():
         print(f"     prereg={str(pr.get('blob'))[:12]} code={str(pr.get('code_commit'))[:8]} "
               f"dataset={m.get('dataset_revisions')}")
 
+    for tag, m in (("B", b_meta), ("C1", c1_meta), ("C2", c2_meta)):
+        refuse_void(tag, m)
     print("\n=== GATE (before any score is compared) ===")
     bad = False
     for name, rs in (("C1", C1), ("C2", C2)):

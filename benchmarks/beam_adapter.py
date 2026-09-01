@@ -1723,13 +1723,22 @@ def _rejudge_run(args, api_key: str) -> None:
 
     elapsed = time.time() - t0
     print(f"\n  judge calls: {judge_llm.call_count} (+1 canary)   elapsed: {elapsed:.0f}s")
+    # A silent-0 voids the VERDICT. It must not also destroy the EVIDENCE.
+    # This branch used to sys.exit(3) here, before the artifact was written --
+    # so a run that had already paid for all 160 judge calls threw the rows
+    # away, and the only way to look at what the judge actually said was to
+    # buy them again. The refusal is right; discarding the data was a second
+    # defect wearing the first one's clothes. The artifact is now written,
+    # marked void in its metadata and in its FILENAME, and the exit code is
+    # unchanged so nothing automated can mistake it for a verdict.
+    void = None
     if silent0:
-        print(f"  ABORT: {len(silent0)} silent-0 parse failures (A had 0/160; "
+        print(f"  VOID: {len(silent0)} silent-0 parse failures (A had 0/160; "
               f"B rate must be <= A). First rows:")
         for ab, qu, raw in silent0[:10]:
             print(f"    {ab} | {qu[:60]} | raw={raw[:100]!r}")
-        print("  Run void per pre-registration §4.7. No verdict artifact written.")
-        sys.exit(3)
+        void = void_record(silent0)
+        print("  Verdict void. Rows ARE written, marked void, for characterisation.")
     if explicit_err:
         print(f"  ⚠ {len(explicit_err)} explicit judge errors kept as prior (excluded from falsifier):")
         for ab, qu, raw in explicit_err[:10]:
@@ -1763,19 +1772,55 @@ def _rejudge_run(args, api_key: str) -> None:
         # authorised by its own spec, not by the one that authorised A.
         "prereg": args.prereg_obj,
         "dataset_revisions": dataset_revisions,
+        # Present and null on a good run, so "void" is a field a reader can
+        # test rather than an absence they have to notice.
+        "void": void,
     })
     out = {"metadata": meta, "summary": {sc: {ab: d["avg"] for ab, d in abils.items()}
                                          for sc, abils in summary.items()},
            "conversations": new_convs}
-    dest = src.with_name(f"{src.stem}-rejudged-{args.judge_model.replace('/', '_')}-{stamp}.json")
+    dest = rejudge_dest(src, args.judge_model, stamp, void)
     with open(dest, "w") as f:
         json.dump(out, f, indent=2, default=str)
     print(f"\n  Archived → {dest.name}")
     print(f"  {len(silent0)} silent-0 / {len(explicit_err)} explicit / "
           f"{sum(1 for q in new_questions if q['_rejudged'])} rejudged of {n_rows}")
 
+    if void:
+        # No readout: the readout IS the verdict, and the verdict is void.
+        print("  No readout printed — the rows are evidence, not a result.")
+        sys.exit(3)
+
     # ── readout (pre-registered §5 — formulas fixed before counts) ─────────
     _rejudge_readout(run, new_questions, meta=meta)
+
+
+def void_record(silent0: list) -> dict | None:
+    """The void marker for a run whose verdict is refused but whose rows stand.
+
+    None when the run is clean, so `metadata["void"]` is a field a reader can
+    TEST rather than an absence they have to notice -- an artifact predating
+    this field and a void artifact must not look alike.
+    """
+    if not silent0:
+        return None
+    return {"reason": "silent-0 parse failures",
+            "rule": "gold-delta pre-reg §4.7(a): B's silent-0 rate must be <= A's",
+            "n_silent0": len(silent0),
+            "rows": [{"ability": ab, "question": qu, "judge_raw_head": raw}
+                     for ab, qu, raw in silent0]}
+
+
+def rejudge_dest(src: Path, judge_model: str, stamp: str, void: dict | None) -> Path:
+    """Void-ness belongs in the FILENAME, not only the metadata.
+
+    Artifacts get quoted by name in commit messages, pre-registrations and
+    chat. A name that reads like every other result is how a voided run gets
+    cited as one two weeks later by someone who never opened it.
+    """
+    tag = "-VOID" if void else ""
+    return src.with_name(
+        f"{src.stem}-rejudged-{judge_model.replace('/', '_')}-{stamp}{tag}.json")
 
 
 def _rejudge_gold_map(run: dict, convs: list = None, rows: list = None) -> tuple:
