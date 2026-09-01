@@ -164,22 +164,61 @@ It is deliberately not fixed yet. Changing the regex or the token ceiling
 changes what a score means, retroactively, which is a pre-registered decision
 and not a bug fix to slip in beside another change.
 
-### 7.2 An observation, explicitly NOT the pre-registered statistic
+### 7.2 B2's rows were DESTROYED, and the fix does not cover the run it is named for
 
-B and B2 send byte-identical judge prompts. That row parsed in B (B was
-0/160) and did not parse in B2. So the alias returned materially different
-text for the same input on two runs.
+B2 ran under `bb16b60`, where the silent-0 branch called `sys.exit(3)`
+**before** the write block. `0adcd2c` — which makes a voided run persist its
+rows — landed 3h23m later. **No B2 artifact exists.** There is no `-VOID` file
+anywhere on the box and no third `deepseek-chat` rejudge in `hymem_beam/`; the
+newest artifacts are C1 and C2.
 
-That is a direct observation of alias non-determinism, and by the §5 letter
-(`World 1 ⇔ D_alias ≥ 1`) it would decide the question — the row's score
-differs between the two runs. **It is not being read that way**, because §4.3
-voided the reading first and the two rules were fixed together. Reading past a
-gate because the result on the other side is interesting is precisely the
-post-hoc move this document exists to prevent. Recorded as an observation,
-carrying no verdict.
+So the raw quoted in §7.1 is a **stdout fragment** (`raw[:100]` from the abort
+printer), not a persisted row. The 160 judged rows are gone and cannot be
+re-read at any price short of buying them again. The fix is correct and
+forward-looking; it did not protect the run that exposed the need for it.
 
-It also implies B's own 0/160 silent-0 was a draw, not a property: at the one
+### 7.3 An observation, and why it does NOT decide the question
+
+B and B2 send byte-identical judge prompts. That row parsed in B (0/160) and
+did not in B2, so the alias returned materially different **text** for the same
+input across two runs.
+
+An earlier draft of this section claimed that by §5's letter
+(`World 1 ⇔ D_alias ≥ 1`) this would decide the question, and that only the
+§4.3 gate prevented reading it that way. **That was wrong, and the correct
+reason is stronger.**
+
+D_alias counts rows where B2 ≠ B, which requires **a valid score on both
+sides**. B2's row has no valid score: `judge_answer`'s parse failure returns
+the sentinel `{"score": 0.0, "scores": []}`, and that 0.0 is *fabricated* — it
+is neither the judge's actual 1.0 nor a real 0.0. So the comparison for that
+row is **undefined, not "differs."** Refusing to read it is not discipline
+overriding a result; there is no result to read. Declining to fabricate one is
+the whole of it.
+
+And "different text" does not entail "different score." It is a fact about the
+alias's output-length distribution, not about its score determinism, and the
+World 1 falsifier is about scores. The observation is real, it carries no
+verdict, and it does not carry World 1 either.
+
+It does imply B's own 0/160 silent-0 was a draw rather than a property: at one
 observed occurrence per 160 rows, P(0 in 160) ≈ 0.366.
+
+### 7.4 Step 1 is uncontaminated (checked, because it was reachable)
+
+If truncation can fabricate a 0.0, the obvious worry is that Step 1's
+D_self = 7/160 is partly parse artifact. It is not. C1, C2 and B all predate
+`finish_reason` capture, so the check is structural — a truncated reply has no
+complete `{...}` for the regex to match:
+
+- **B, C1, C2: 0/160 unparseable raws and 0/160 sentinels each.** Longest reply
+  879 chars, far below the ceiling that truncated B2's row.
+- Every one of the 7 D_self rows and 3 D_pin rows carries a genuine `scores`
+  list on **both** sides — e.g. the churning IE row is `[0,1]` vs `[0,0]`, real
+  judge disagreement, not a parse failure.
+
+**D_self = 7/160 stands as a clean measurement of the pin's churn**, which
+matters because it is the number Step 2's risk assessment rests on.
 
 ## 8. What this pre-registration got wrong
 
@@ -193,14 +232,37 @@ The gate therefore voids on exactly the evidence B2 was commissioned to
 collect. That is a defect in this spec, not in the run, and naming it is
 cheaper than routing around it.
 
-**A superseding B2 v0.2 needs a gate that separates the two**, e.g.: a silent-0
-whose `judge_raw` is empty or `[LLM_ERROR`-prefixed is plumbing and still
-voids; a silent-0 whose raw contains a truncated but well-formed scoring
-attempt is judge variation, is counted into D_alias as a changed row, and does
-not void. That distinction has to be written down before the re-run, not
-after, and the re-run is now non-destructive: since 0adcd2c a voided run
-persists its rows marked `void`, so the evidence survives even if the gate
-fires again.
+**A superseding B2 v0.2 needs a gate that separates the two.** A first draft of
+that rule said: a truncated-but-well-formed scoring attempt is judge variation,
+so count it into D_alias as a changed row. **That draft was wrong and would
+have re-imported the exact defect this campaign exists to eliminate.**
+
+The truncated row has no valid score. `judge_answer` returns the sentinel
+`{"score": 0.0, "scores": []}`, a *fabricated* 0.0. Counting it into D_alias
+compares that fabrication against B's real score and calls the difference
+churn. That is a parse artifact entering the statistic as a measurement — the
+same class as the silent-0 the gate was built to keep out, arriving through the
+back door with the gate's own blessing.
+
+**The correct treatment: exclude, do not void, do not count.** Truncation means
+the plumbing is fine (so it must not void) *and* the row is unreadable (so it
+must not count). That is precisely the shape of the existing `explicit_err`
+bucket — keep prior, exclude from the statistic, report the rate separately.
+
+**And the separator is a conjunction, not `finish_reason` alone.** Both failure
+shapes carry `finish_reason == "length"`:
+
+| shape | content | caught? |
+|---|---|---|
+| the v4-flash trap | **empty** + length | yes — the falsy raise, rerouted to `[LLM_ERROR` |
+| B2's truncation | **non-empty** + length + parse-fail | **no** — nothing catches it |
+
+Gating on `length` alone would mis-split them again. The rule needs all three
+of: `finish_reason == "length"`, non-empty content, and parse failure. Since
+1d80f33 that field is recorded per row, so v0.2's discriminator is structural
+and fixable in advance rather than a judgement call made with the answer
+already visible.
 
 **Not authorised under this spec.** B2 v0.2 is a new pre-registration and a new
-run.
+run. It is now non-destructive — since 0adcd2c a voided run persists its rows
+— but that is a property of the NEXT run, not a recovery of this one.
