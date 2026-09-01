@@ -148,12 +148,35 @@ computed and World 1 vs World 2 is NOT decided.** The gate said a nonzero
 silent-0 rate means no churn reading is interpretable, and that rule was fixed
 before the run. It is honoured here.
 
-### 7.1 What the failure was — and it is not what the gate assumed
+### 7.1 What the failure was — CORRECTED 2026-09-01 after B2 v0.2
 
-The judge did not refuse, error, or return empty. **It scored the row 1.0**,
-wrote a long explanation, and hit `max_tokens=512` mid-sentence.
-`judge_answer`'s `re.search(r'{...}')` needs a complete JSON object, found
-none, took the except path, and returned `{"score": 0.0, "scores": []}`.
+**This section originally said the judge "hit `max_tokens=512` mid-sentence."
+That was wrong, and the error was mine.** The abort printer emits `raw[:100]`,
+so the log line was cut off by the PRINTER, and I read a display truncation as
+a model truncation. I then built a truncation gate on that reading.
+
+B2 v0.2 hit the same row and, because `finish_reason` was by then recorded and
+the artifact preserved, the actual reply is on disk: **230 characters,
+`finish_reason: "stop"` — complete and valid JSON.**
+
+    {"scores": [1], "total_score": 1.0, "explanation": "The response includes
+    numeric status codes in the example 'Error ${response.status}:
+    ${response.statusText}' and mentions status codes in the summary,
+    satisfying the criterion."}
+
+`judge_answer`'s `re.search(r'\{[^}]+\}')` stops at the FIRST `}` — the one
+inside `${response.status}`. It matched a fragment ending mid-string,
+`json.loads` raised *Unterminated string*, the except path returned
+`{"score": 0.0, "scores": []}`.
+
+**A row the judge scored 1.0 was recorded as 0.0 because the answer being
+graded contained a brace.** Not truncation: a naive regex meeting a `}` inside
+a string literal.
+
+Worse for my credit: **this was already documented.** The gold-delta
+pre-registration §3 records that this regex "cannot match nested JSON". The
+hazard was known and written down in this campaign's own spec, and I attributed
+its symptom to something else.
 
 **A row the judge scored 1.0 was recorded as 0.0 because its explanation ran
 long.** This is a latent defect on every run ever scored by this path, not a

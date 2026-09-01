@@ -29,10 +29,19 @@ pin is the wrong instrument.
 
 **(a) The gate voided on the evidence it was commissioned to collect.** §4.3
 was ported from the gold-delta phase, where a silent-0 meant broken PLUMBING.
-In v0.1's run the plumbing was fine: the judge scored a row 1.0, wrote a long
-explanation, and hit `max_tokens=512` mid-sentence, so `judge_answer`'s
-`re.search(r'\{[^}]+\}')` found no closing brace and returned the sentinel
-`{"score": 0.0, "scores": []}`.
+In v0.1's run the plumbing was fine.
+
+**CORRECTED after the v0.2 run: the cause was NOT truncation.** v0.1's abort
+printer emitted `raw[:100]`, so the log line was cut off by the printer and I
+read a display truncation as a model truncation. The v0.2 run hit the same row
+with `finish_reason` recorded and the artifact preserved: the reply was 230
+characters, `finish_reason: "stop"`, complete and valid JSON. The regex
+`re.search(r'\{[^}]+\}')` stops at the first `}`, which was inside a
+`${response.status}` template literal the judge had quoted from the answer, so
+`json.loads` raised *Unterminated string* and the except path returned the
+sentinel. A row scored 1.0 by the judge was recorded 0.0 because the answer
+contained a brace — a hazard the gold-delta pre-registration §3 had already
+documented ("cannot match nested JSON") and which I mis-attributed.
 
 **(b) The refusal destroyed the evidence.** The silent-0 branch called
 `sys.exit(3)` before the artifact write, so 160 judged rows — already paid for
@@ -77,6 +86,20 @@ shapes carry `length`:
 Gating on `length` alone would merge them. Since 1d80f33 `finish_reason` is
 recorded per row, so this discriminator is structural and fixed in advance
 rather than a judgement call made with the answer visible.
+
+**A FOURTH class, found by the v0.2 run itself and not anticipated here:**
+
+| class | signature | void? | counts? |
+|---|---|---|---|
+| **parse defect** | `finish_reason == "stop"`, complete reply, naive regex fails, a brace-matching parse RECOVERS a scores list | should not | not until fixed |
+
+This is neither plumbing nor truncation: the judge answered, completely and
+correctly, and the reader dropped it. The v0.2 gate as implemented classes it
+under *plumbing* and voids — which is wrong in its reason though conservative
+in its effect. **It is not patched here.** The right answer is to fix the
+parser rather than to add a class excusing its failures, and that is its own
+pre-registration because it changes what a score means. Until then this spec's
+gate over-voids, and that is the safe direction.
 
 **Ceiling:** if truncation exceeds **8/160 (5%)** the run is INVALID for the
 falsifier — too much of the sample is unreadable to say anything about the
@@ -129,6 +152,63 @@ The fix is **not** in scope here: changing the regex or the token ceiling
 changes what a score means retroactively, across every historical artifact.
 It needs its own pre-registration.
 
-## 7. Executed results
+## 7. Executed results — B2b (2026-09-01): VOID again, and the cause is now known
 
-(empty — nothing has been run under this pre-registration)
+Artifact **preserved this time**:
+`results_20260831T165039Z-rejudged-deepseek-chat-20260901T104602Z-VOID.json`.
+161 judge calls, 224s, canary OK. Counts: **1 silent-0 / 0 truncated / 0
+explicit / 159 rejudged of 160.**
+
+The truncation gate did not fire, correctly: `finish_reason` was `"stop"`. The
+row fell through to *plumbing* and voided. That classification is wrong in its
+reason — see §2(a) as corrected — but conservative in its effect.
+
+**The fix from 0adcd2c paid for itself on its first exercise.** v0.1's identical
+failure destroyed its 160 rows and left only a printer-truncated log line, from
+which I drew the wrong conclusion. This run kept the rows, so the true cause was
+readable from disk in one query instead of inferred from a fragment.
+
+### 7.1 Free audit of every artifact that stores `judge_raw`
+
+Because the raws are stored, the historical reach of this defect costs **zero
+API calls** to measure. Comparing the naive regex against a brace-matching
+parser that respects string literals:
+
+| artifact | rows w/ raw | naive fails | recoverable |
+|---|---|---|---|
+| B (alias, 20260831T200531Z) | 160 | 0 | 0 |
+| C1 (pin) | 160 | 0 | 0 |
+| C2 (pin) | 160 | 0 | 0 |
+| **B2b (alias, VOID)** | 160 | **1** | **1** — judge said `[1]`, recorded `0.0` |
+
+**1 in 640 judged rows, and fully recoverable from data already on disk.**
+
+**The more serious half: `results_20260831T165039Z.json` (A, the anchor) and the
+two earlier runs store NO `judge_raw` at all.** Their exposure to this defect is
+not merely unknown, it is **unmeasurable** — and A is the June-comparable anchor
+the whole campaign is built on. The rejudge path stores raws; the main run path
+does not.
+
+### 7.2 What this does to the B2 question
+
+**Still unanswered.** D_alias is uncomputed after two runs. But the reason is
+now understood rather than mysterious, and it is not judge instability: the same
+row failed in both attempts because the judge quoted a brace-bearing snippet
+both times, while B happened not to. The parse defect is deterministic given the
+reply; the reply text is what varies.
+
+A third run would probably succeed, and would be luck. **The parse fix is now a
+precondition for B2 being answerable rather than an improvement to it**, and it
+is pre-registered separately.
+
+### 7.3 Why this matters more than B2 does
+
+The defect is **content-dependent, not random**: it fires when a judge
+explanation contains `}`. That correlates with answers containing code, JSON or
+template literals — which concentrates in IF and PF, the two
+`compliance_spec` abilities about API behaviour. So the bias is
+**ability-correlated**, not uniform noise, and it silently deflates exactly the
+abilities most likely to quote code.
+
+Every score this path has ever produced carries it, and for the runs without
+stored raws it cannot be audited even in principle.
