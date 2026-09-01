@@ -1006,6 +1006,63 @@ review)*
 > regression — but gate 4 stays OPEN, and the flip still needs it. Offline, no
 > spend. Suite 1655 passed (+11).
 
+> **STATUS 2026-09-01 — gate 3 RAN, free, on both corpora, and it cannot be
+> moved by this flip.** `episode_coverage_probe.py` is read-only and LLM-less,
+> so the "before" half of gate 3 cost nothing. It was never going to say what
+> the gate expected.
+>
+> | store | sessions | with ≥1 episode | coverage | never_dreamed | dreamed_zero_short | dreamed_zero_long |
+> |---|---|---|---|---|---|---|
+> | prod `~/.hermes/hymem.sqlite` | 110 | 86 | **78.2%** | 9 | 15 | **0** |
+> | 10 surviving LME stores | 476 | 105 | **22.1%** | dominant (97.3% on the store audited in full) | 1 | **0** |
+>
+> **`dreamed_zero_long` is ZERO on both.** That bucket is the extraction-recall
+> problem — a substantial session the extractor read and returned nothing for —
+> and it is the only one a better episode prompt could fix. It has no
+> population. On prod every uncovered session is either a test stub
+> (`final-upload-test`, `ws:smoke-test`, `verify-redact`, …) or literally empty:
+> all 9 `never_dreamed` sessions hold **zero messages**, so no prompt and no
+> scheduler can create an episode from them.
+>
+> **On LME the gap is real and it is not the prompt's.** 371 of 476 sessions —
+> holding **3,902 of 4,986 messages** — carry no digest at all. The reason is in
+> `dream_runs`: exactly **one cycle** per store, `chunks_processed 29 / 56`,
+> `sessions_processed 14`. HyMem's dream is incremental by design — each cycle
+> spends a chunk budget (`dream_budget = 50`, `dream_baseline_budget = 10`) on
+> the most salient candidates and leaves the rest for the next cycle. Every
+> benchmark adapter bulk-ingests a haystack and then dreams **once**. The
+> undigested tail is the designed shape of that harness, not a runner bug, and
+> re-cutting the episode prompt cannot reach a session the dream never opened.
+>
+> **This is the larger finding, and it is not about Plan C.** Every
+> episode-, digest- and aggregation-dependent result ever measured on LME was
+> measured over roughly **a fifth of the corpus**. It also bounds the guard
+> above independently of the arm-evidence problem: even had the ON arm
+> demonstrably run granular, the lever could only touch the ~22% of sessions
+> that were digested at all, so 71.0 vs 71.0 is the expected reading rather
+> than an informative null. Recorded here, not acted on — widening the dream
+> budget or dreaming to convergence changes what every banked LME number means
+> and needs its own pre-registration, not a drive-by.
+>
+> **Built:** the probe now reads `dream_runs` and prints which of the two
+> readings of `never_dreamed` the evidence supports — NOT A GAP (every such
+> session is empty; the prod answer), ONE CYCLE OVER A BULK INGEST (the LME
+> answer), RUNNER GAP (many cycles and content still undigested; the
+> mechanical fix the verdict guide currently offers as the only reading),
+> NEVER RAN, or UNAVAILABLE on a store predating the table. It deliberately
+> reports **no chunk ratio**: `chunks_seen` is the candidate pool re-counted
+> every cycle, so on prod the sum reads `425/330255` and
+> `processed/seen` looks like a coverage fraction while being nothing of the
+> kind. A caveat does not survive being quoted, so the number is not produced.
+>
+> One process note worth keeping. The first cut of the test pinning that
+> absence ran against the `probe_store` fixture, which has never dreamed —
+> `dream_history` returns None there, the assertions were skipped, and the test
+> **passed against the mutation that put the ratio back**. It was caught by
+> mutation-checking rather than by review: a vacuous test for a vacuity check,
+> found the only way that shape ever is. Four mutations now, each caught.
+> Offline, no spend. Suite 1667 passed (+12).
+
 ### Motivation
 
 - **BEAM floor post-mortem** (benchmarks/beam_investigation_notes.md): EO/SUM
@@ -1059,7 +1116,10 @@ cannot see this change. Gates, in order:
    values; (c) session coverage. `HyMem.ask()` doubles as a cheap spot-check
    harness here.
 3. **`benchmarks/episode_coverage_probe.py`** before/after — coverage should
-   rise from the ~42% gap.
+   rise from the ~42% gap. **RAN 2026-09-01 (free): the gate cannot move.**
+   `dreamed_zero_long` — the only bucket a better episode prompt can fix — is
+   ZERO on prod and on all ten surviving LME stores. See the STATUS 2026-09-01
+   block above.
 4. **LME full guard as NON-REGRESSION only** (canonical 70.0 full-dream, MS
    floor 51.9). Not a tuning signal.
 5. **Cost watch**: more episodes ⇒ more `vec_episodes` embeddings + a larger

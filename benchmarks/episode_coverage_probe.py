@@ -89,6 +89,84 @@ def open_store_readonly(path: str | Path) -> sqlite3.Connection:
 # the logic a build would reuse is a plain importable function).
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def dream_history(conn: sqlite3.Connection) -> dict | None:
+    """What the dream runner has actually done on this store, from `dream_runs`.
+
+    Reports CYCLES, and deliberately not a chunk ratio. `chunks_seen` is the
+    size of the candidate pool the cycle considered, re-counted from scratch
+    every cycle -- on the prod store each of the last cycles saw ~330 chunks and
+    processed 0-2, because there was nothing new. Summed across cycles it reads
+    425/330255, and `chunks_processed / chunks_seen` looks like a coverage
+    fraction while being nothing of the kind. The number is not reported rather
+    than reported with a caveat, because a caveat does not survive being quoted.
+
+    Returns None on a store whose schema predates `dream_runs`; the caller then
+    says the reading is unavailable rather than assuming either answer."""
+    try:
+        rows = conn.execute(
+            "SELECT id, sessions_processed, chunks_seen, chunks_processed, "
+            "episodes_created, digest_failures FROM dream_runs ORDER BY id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        return {"cycles": 0, "episodes_created": 0, "digest_failures": 0,
+                "last": None}
+    last = rows[-1]
+    return {
+        "cycles": len(rows),
+        "episodes_created": sum(r["episodes_created"] or 0 for r in rows),
+        "digest_failures": sum(r["digest_failures"] or 0 for r in rows),
+        "last": {
+            "id": last["id"],
+            "sessions_processed": last["sessions_processed"],
+            "chunks_seen": last["chunks_seen"],
+            "chunks_processed": last["chunks_processed"],
+        },
+    }
+
+
+def never_dreamed_reading(history: dict | None, never_dreamed: list[dict]) -> str:
+    """Which reading of `never_dreamed` the evidence supports.
+
+    The bucket alone cannot tell a runner that FAILED to reach a session from
+    one that has not reached it YET, and the two have different fixes -- the
+    verdict guide below offers only the first. HyMem's dream is incremental by
+    design: each cycle spends a chunk budget on the most salient candidates and
+    leaves the rest. Over a long-lived store that converges; over a BULK INGEST
+    followed by exactly one cycle, which is what every benchmark adapter does,
+    it does not."""
+    if not never_dreamed:
+        return "no never_dreamed sessions, so this reading has nothing to decide"
+    with_content = [r for r in never_dreamed if r["n_messages"] > 0]
+    if not with_content:
+        return (f"NOT A GAP — all {len(never_dreamed)} never_dreamed session(s) "
+                f"hold zero messages. There is nothing in them to extract, and "
+                f"no prompt or scheduler change can create an episode from an "
+                f"empty session.")
+    msgs = sum(r["n_messages"] for r in with_content)
+    if history is None:
+        return ("UNAVAILABLE — this store has no `dream_runs` table, so the "
+                "runner's own record cannot be read and neither reading is "
+                "supported")
+    if history["cycles"] == 0:
+        return (f"NEVER RAN — `dream_runs` is empty. {len(with_content)} "
+                f"session(s) holding {msgs} message(s) are un-digested for the "
+                f"most mundane reason there is.")
+    if history["cycles"] == 1:
+        return (f"ONE CYCLE OVER A BULK INGEST — {len(with_content)} session(s) "
+                f"holding {msgs} message(s) carry no digest after a single "
+                f"dream. The per-cycle chunk budget makes that the EXPECTED "
+                f"shape, not a runner bug: prompt work cannot reach these "
+                f"sessions, and further cycles can. Read any episode-quality "
+                f"result on this store as bounded to the digested fraction.")
+    return (f"RUNNER GAP — {history['cycles']} dream cycles have run and "
+            f"{len(with_content)} session(s) holding {msgs} message(s) still "
+            f"carry no digest. Repeated cycles rule out the per-cycle budget, "
+            f"so this is the mechanical scheduler reading.")
+
+
 def characterize_coverage(
     conn: sqlite3.Connection,
     short_max_messages: int = 4,
@@ -154,7 +232,11 @@ def characterize_coverage(
             "bucket": bucket,
         })
 
+    history = dream_history(conn)
     return {
+        "dream_history": history,
+        "never_dreamed_reading": never_dreamed_reading(
+            history, [u for u in uncovered if u["bucket"] == "never_dreamed"]),
         "total_sessions": total,
         "covered_sessions": covered,
         "uncovered_sessions": total - covered,
@@ -179,7 +261,21 @@ def _print_report(result: dict) -> None:
     print(f"  Sessions: {total}   with ≥1 episode: {covered}   "
           f"coverage: {100 * result['coverage_fraction']:.1f}%")
     print(f"  Short/long boundary: ≤{result['short_max_messages']} messages "
-          f"OR ≤{result['short_max_chars']} user+assistant chars\n")
+          f"OR ≤{result['short_max_chars']} user+assistant chars")
+    h = result.get("dream_history")
+    if h is None:
+        print("  Dream history: UNAVAILABLE (no `dream_runs` table in this store)")
+    elif h["cycles"] == 0:
+        print("  Dream history: 0 cycles — the dream never ran here")
+    else:
+        last = h["last"]
+        print(f"  Dream history: {h['cycles']} cycle(s), "
+              f"{h['episodes_created']} episodes created, "
+              f"{h['digest_failures']} digest failures; last cycle #{last['id']} "
+              f"processed {last['chunks_processed']} of "
+              f"{last['chunks_seen']} candidate chunks over "
+              f"{last['sessions_processed']} session(s)")
+    print()
 
     if not uncovered:
         print("  No uncovered sessions — nothing to bucket. Stage 2 is a no-op.")
@@ -239,6 +335,8 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json).write_text(json.dumps(result, indent=2))
         print(f"\nPer-session records written to {args.json}")
 
+    print(f"\n  never_dreamed reading (from the runner's own record):"
+          f"\n    {result['never_dreamed_reading']}")
     print("\nVERDICT GUIDE (dominant bucket → Stage-2 fix):")
     print("  never_dreamed dominates")
     print("      → scheduler/runner bug — sessions the dream loop never digested;")
