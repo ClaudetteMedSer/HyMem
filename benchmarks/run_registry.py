@@ -169,6 +169,61 @@ def iso_ts(ts) -> str | None:
 #   gap_note     - SQL condition counted for the print-time NOTE
 
 
+# ----------------------------------------------------------- arm evidence ---
+#
+# An A/B is two artifacts and a claim that they differ in one lever. The claim
+# has to come from somewhere, and a filename is not somewhere: `guard-epg-on`
+# and `guard-epg-off` are the operator's memory of what they typed, written
+# into a stem. Neither is a `--set` in this registry -- that is the same memory,
+# recorded later, by the same person.
+#
+# The 2026-08-30/31 episode-granularity guard is the worked example. Both arms
+# ran BEFORE 6543ee6 taught the adapter to write the lever into its config
+# block, so the two blocks are byte-identical except `elapsed_s`, and nothing
+# inside either file says which arm it is. The scores came out 71.0 and 71.0.
+# That is exactly what a real null looks like -- and exactly what two runs of
+# the SAME configuration look like. The artifacts cannot separate the two
+# readings, so the pair cannot discharge a non-regression gate on that lever
+# however clean the numbers are.
+#
+# This is the unreachable-code-path shape from docs/diagnostic_controls.md,
+# arriving one level up: not an instrument that never touched the lever, but a
+# pair of results that cannot show whether it did.
+
+ARM_EVIDENCED = "EVIDENCED"      # both blocks record the lever, and they differ
+ARM_SAME = "SAME_ARM"            # both record it, and they agree
+ARM_UNEVIDENCED = "UNEVIDENCED"  # at least one block does not record it
+
+
+def arm_evidence(cfg_a, cfg_b, lever, ignore=("elapsed_s", "total_tokens")):
+    """Can these two config blocks evidence that they are opposite arms?
+
+    Returns (verdict, note, confounds) where `confounds` lists the OTHER keys
+    that also differ -- an evidenced contrast is still not a clean one if the
+    arms moved more than one lever.
+
+    Deliberately reads only the artifacts. Anything an analyst can supply after
+    the fact is the claim under test, not evidence for it."""
+    a, b = dict(cfg_a or {}), dict(cfg_b or {})
+    missing = [n for n, c in (("A", a), ("B", b)) if lever not in c]
+    confounds = sorted(
+        k for k in set(a) | set(b)
+        if k != lever and k not in ignore and a.get(k) != b.get(k))
+    if missing:
+        return ARM_UNEVIDENCED, (
+            f"{lever!r} is absent from the config block of arm(s) "
+            f"{', '.join(missing)}, so neither file states which arm it is; "
+            f"a stem or a --set is the operator's recollection, not a record "
+            f"of what ran"), confounds
+    if a[lever] == b[lever]:
+        return ARM_SAME, (
+            f"both arms recorded {lever}={a[lever]!r} -- this pair is not an "
+            f"A/B on that lever, whatever it is named"), confounds
+    return ARM_EVIDENCED, (
+        f"{lever}: A={a[lever]!r} B={b[lever]!r}, recorded in both blocks"
+    ), confounds
+
+
 def _to_int(v):
     if v is None:
         return None

@@ -940,6 +940,72 @@ review)*
 > pin. All LoCoMo runs are covered by the MSC pin. Offline, no spend. Suite
 > 1644 passed (+15).
 
+> **STATUS 2026-09-01 — the LME full guard HAS ALREADY BEEN RUN, and this
+> document does not record it.** Everything above prices the guard as an
+> unspent ~1,000-reader-call, 2-3h job. Both arms are on the box and have been
+> since 2026-08-31: `guard-epg-off-20260830T235924Z.json` (500 answer + 500
+> judge calls, 9,807s) and `guard-epg-on-20260831T031130Z.json` (11,216s),
+> sequential, deepseek-v4-flash both sides, `sample=0` full 500.
+>
+> | | OVERALL | KU | MS | SSA | SSP | SSU | TR |
+> |---|---|---|---|---|---|---|---|
+> | OFF | **71.0** | 74.4 | 53.4 | 67.9 | 73.3 | 94.3 | 75.2 |
+> | ON | **71.0** | 73.1 | 54.1 | 66.1 | 83.3 | 97.1 | 72.2 |
+>
+> Against gate 4 as pre-registered ("LME full guard as NON-REGRESSION only
+> (canonical 70.0 full-dream, MS floor 51.9). Not a tuning signal.") the ON arm
+> clears both: 71.0 >= 70.0 and MS 54.1 >= 51.9. Comparability to the canonical
+> is established rather than assumed — the audit above puts both arms
+> post-`2247074`, aggregation pinned OFF, which is the same layer state as the
+> pre-flip baseline.
+>
+> **And the gate is NOT discharged, because the pair cannot evidence its own
+> contrast.** Both arms ran BEFORE `6543ee6` (2026-08-31T06:48:34Z) taught the
+> adapter to write the levers into the config block. The two blocks are
+> byte-identical except `elapsed_s` and `total_tokens`; the registry's 0/1 is an
+> analyst `--set`; the stems are what the operator remembers typing. Nothing
+> inside either file says which arm it is.
+>
+> Everything else in the artifacts was checked and none of it separates the
+> readings:
+>
+> * `num_memories` differs on 120/500 rows — but it is **capped at 45 and
+>   saturated on 352/500 rows in BOTH arms**, so on 70% of the sample it cannot
+>   move however many episodes the dream cut. The 120 differing rows are
+>   symmetric (51 up, 69 down, mean −0.05, z = −0.62), which is what two
+>   `--fresh` re-dreams of ONE prompt also look like.
+> * `num_sessions`, `num_messages`, `recall_ceiling`, `n_facts`,
+>   `gold_in_facts`, `detected_ability`: identical on all 500 by construction.
+> * 331/500 answers differ and 52 questions flip — reader/judge churn at this
+>   model's known rate, and equally consistent with either reading.
+>
+> **71.0 vs 71.0 is what a real null looks like. It is also what two runs of the
+> same arm look like.** The artifacts cannot tell them apart, so this pair
+> cannot discharge a non-regression gate on the granularity lever however clean
+> the numbers are. That is the unreachable-code-path shape from
+> `docs/diagnostic_controls.md` one level up: not an instrument that never
+> touched the lever, but a pair of results that cannot show whether it did —
+> the precise hazard named when `--episode-granularity` was built ("a clean null
+> produced by an instrument that never touched the lever").
+>
+> **Built, so the next pair is checked before its scores are read:**
+> `run_registry.arm_evidence()` (shared core, so BEAM and LoCoMo get it too)
+> and `lme_registry.py arms A.json B.json --lever K`. Three outcomes —
+> EVIDENCED (both blocks record the lever and differ), SAME_ARM (both record
+> it and agree), UNEVIDENCED (either block is silent) — plus the confounds, the
+> other keys that also moved, because an evidenced contrast is still not a clean
+> one. It reads artifacts only: a stem or a `--set` is the claim under test, not
+> evidence for it. Run on the real pair it returns UNEVIDENCED and exit 1.
+> 11 tests, 3 mutations checked (treat an absent lever as a difference: 4 fail;
+> report SAME_ARM as EVIDENCED: 1; stop ignoring the timing keys: 1).
+>
+> **What this costs to fix is a re-run, and that is the user's call, not this
+> document's.** Post-`6543ee6` the config block records the lever, so a repeat
+> pair would be self-evidencing. The banked reading until then: the guard's
+> numbers are recorded above and are *encouraging* — nothing suggests a
+> regression — but gate 4 stays OPEN, and the flip still needs it. Offline, no
+> spend. Suite 1655 passed (+11).
+
 ### Motivation
 
 - **BEAM floor post-mortem** (benchmarks/beam_investigation_notes.md): EO/SUM
@@ -1093,7 +1159,10 @@ owed AFTER the granularity flip lands). Dream cost watch: BASELINE READY (dreams
 1342/1343 at 47s/58s wall clock, input 1167→1168, reuse 91-100%, 0 fusion
 failures) — the watch is one-time re-digest cost plus steady-state delta,
 measurable before/after, free. LME full guard: was BLOCKED ON A MISSING LEVER,
-now UNBLOCKED — `--episode-granularity` exists as of this entry. The guard is
+then UNBLOCKED — `--episode-granularity` exists as of this entry. **Superseded
+2026-09-01: the guard was RUN on 2026-08-30/31 (both arms, 71.0 vs 71.0) and
+the gate is still OPEN, because the pair cannot evidence which arm was which.
+See the STATUS 2026-09-01 block in Plan C.** The guard is
 ~1,000 reader calls plus dream calls, ~2-3h, and both arms must be `--fresh`
 because the lever is write-side. **Before it spends, check the aggregation
 contamination above: the OFF arm must be built by the same pinned adapter, and

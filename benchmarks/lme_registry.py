@@ -13,6 +13,7 @@ Usage:
   lme_registry.py list [--limit N] [--flag COL]   Print table
   lme_registry.py query "SQL"            Raw query against the DB
   lme_registry.py audit [--strict]       Date-check the aggregation label
+  lme_registry.py arms A.json B.json --lever K   Can this pair evidence its A/B?
 
 Flags are recorded exactly as they appear in each run's config block.
 If a key is absent (e.g. older format, or a lever that was not recorded),
@@ -579,6 +580,32 @@ def cmd_audit(strict=False):
     return len(bad)
 
 
+
+def cmd_arms(path_a, path_b, lever):
+    """Ask whether a claimed A/B pair can evidence its own contrast.
+
+    Run BEFORE reading the two scores, for the same reason a pre-registration is
+    written before a run: once the numbers are in, an unevidenced pair reads as
+    a result rather than as a question."""
+    a = json.loads(Path(path_a).read_text(encoding="utf-8"))
+    b = json.loads(Path(path_b).read_text(encoding="utf-8"))
+    verdict, note, confounds = rr.arm_evidence(
+        a.get("config"), b.get("config"), lever)
+    print(f"\n=== arm evidence — {lever} ===")
+    print(f"  A  {Path(path_a).name}")
+    print(f"  B  {Path(path_b).name}")
+    print(f"  [{verdict}] {note}")
+    if confounds:
+        print(f"  confounded on {len(confounds)} other key(s): "
+              f"{', '.join(confounds)}")
+    if verdict != rr.ARM_EVIDENCED:
+        print("  → this pair cannot discharge a gate on that lever. The scores "
+              "may still be\n    correct; what is missing is any way to tell a "
+              "real null from two runs of one arm.")
+        return 1
+    return 0
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -609,6 +636,15 @@ def main():
         cmd_list(a.limit, a.flag)
     elif cmd == "query":
         cmd_query(" ".join(sys.argv[2:]))
+    elif cmd == "arms":
+        import argparse
+        p = argparse.ArgumentParser(prog="lme_registry.py arms")
+        p.add_argument("a")
+        p.add_argument("b")
+        p.add_argument("--lever", required=True)
+        a = p.parse_args(sys.argv[2:])
+        if cmd_arms(a.a, a.b, a.lever):
+            sys.exit(1)
     elif cmd == "audit":
         if cmd_audit(strict="--strict" in sys.argv[2:]):
             sys.exit(1)   # a contradicted label is a hard failure, not a note
