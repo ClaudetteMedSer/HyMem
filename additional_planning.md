@@ -4235,3 +4235,89 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > This does not make gate 4 cheaper — still two arms of 500 — and it does not
 > make the flip motivated. It makes a gate 4 result mean something when it
 > arrives, which the pre-registered version would not have.
+
+> **CHURN DECOMPOSITION 2026-09-03 — there is no churn fix, and the one I
+> recommended does not exist. Offline, no spend.**
+> `benchmarks/churn_decompose.py`, 53 tests, 11 mutations checked.
+>
+> The re-baselining above closed with "the only lever on resolution is the
+> 8.4% verdict churn itself (greedy decoding, a deterministic judge, or
+> judging twice and keeping agreement)". Two of those three were already in
+> place and the third is worthless. **That recommendation is retracted, on a
+> measurement rather than an argument.**
+>
+> The two same-arm artifacts record the answer text and the raw judge reply
+> per question, so the churn splits offline and free.
+>
+> **Stage 1 — the judge is not the problem.** On **181** of 500 questions the
+> two runs produced byte-identical answer text. The judge changed its mind on
+> **none** of them. All 42 flips had different answer text.
+>
+> | | same answer | different answer |
+> |---|---|---|
+> | verdict held (458) | 181 | 277 |
+> | verdict flipped (42) | **0** | 42 |
+>
+> The power check is what makes that readable: answer identity runs at 40%
+> among concordant questions and 0% among discordant, so it is strongly
+> associated with the flip rather than uninformative. Zero out of 181 is
+> reported as an interval, not a rate — Clopper-Pearson one-sided 95% puts
+> the judge's flip rate at **≤ 1.6%**, which is the honest claim. Judging
+> twice and keeping agreement would buy nothing measurable, and the reader
+> and judge already run at `temperature=0.0`.
+>
+> **Stage 2 — nor is it our retrieval.** Splitting the 42 by whether the
+> reader's recorded context also moved: **11 moved, 31 did not.** The raw
+> count invites "retrieval churn is ours, go fix it". The matched control
+> refuses it. Against **non-flips whose answer text also moved** — where the
+> reader's output moved and the verdict held anyway — a moved fingerprint
+> runs at **35%**, against **26%** among the flips. Retrieval movement is if
+> anything *under*-represented among flips. Retrieval churn is real and is
+> not what flips verdicts.
+>
+> Using *all* concordant questions as the control would have read 65%
+> identical and made retrieval look guilty; it is the wrong denominator,
+> because it includes the stable questions where retrieval is stable for the
+> same reason the answer is.
+>
+> **So the residue is provider-side non-determinism at temperature=0.0,
+> which no flag of ours removes.** MDE **2.54pp** is a property of this
+> harness, not a tuning parameter. LME-S caps n at 500, so it cannot be
+> bought down with more questions either. Any plan that needs to resolve a
+> sub-2.5pp effect on LME-S needs a different instrument, not a better run.
+>
+> **One gap closed for next time.** Stage 2's split is a pair of bounds, not
+> a partition, because the artifact records COUNTS (`n_episodes`, `n_facts`,
+> `ability_used`) and two runs can hand the reader the same NUMBER of
+> different episodes — the same lower-bound caveat `guard_score.fired_subset`
+> carries. `context_sha` (commit `5acedf7`) hashes the rendered reader prompt
+> onto every row at no extra call, so a future paired run answers this
+> exactly. `churn_decompose` reads it when both runs carry it and **refuses**
+> a pair where only one does: every fingerprint would differ and the split
+> would describe the two schemas rather than the two runs.
+
+> **STATUS 2026-09-03 — gate 4's scorer is now the paired one. Offline, no
+> spend.** `benchmarks/guard_score.py`, 48 tests, 16 mutations checked.
+>
+> The replacement pre-registered above is built. `CANONICAL_OVERALL` and
+> `MS_FLOOR` are deleted; the contrast is exact McNemar against the OFF arm
+> of the same session; REGRESSION requires ON to be worse **and** the test to
+> reject; and the negative verdict reports **"no regression larger than X
+> pp"** with X computed from the run in hand.
+>
+> Two things the absolute bars were hiding:
+>
+> 1. A moved `answer_model`, `judge_model`, `scale`, `sample` or `seed` is
+>    now **INCOMPLETE**, not a noted confound. Paired scoring assumes the
+>    arms differ in the lever alone; two answer models is a different
+>    experiment, and no verdict is computed.
+> 2. **The multi-session subset resolves only 6.3pp** (n=121, 15 discordant)
+>    against OVERALL's 2.5pp. The retired 51.9 floor was being read on a
+>    subset that cannot see a 5pp regression, and said nothing about it.
+>
+> Verified end to end: the real same-arm pair still reads INCOMPLETE/exit 2,
+> and under an injected lever label that known-null pair reads NO REGRESSION
+> DETECTED at exactly the 2.54pp `lme_noise_model` derives independently.
+>
+> **Gate 4 remains OPEN and un-run.** What changed is that a result would now
+> mean something; the spend is still two arms of 500 and still unauthorised.
