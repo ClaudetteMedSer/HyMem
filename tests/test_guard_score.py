@@ -19,15 +19,25 @@ import guard_score as gs  # noqa: E402
 
 
 def artifact(*, lever=None, overall=71.0, ms=53.4, n=6, episodes=None,
-             correct_from=0):
-    """One arm. `lever=None` omits the key entirely (the pre-6543ee6 shape)."""
+             correct_from=0, correct=None, qtype="multi-session",
+             qtypes=None, cfg_extra=None):
+    """One arm. `lever=None` omits the key entirely (the pre-6543ee6 shape).
+
+    `correct` gives the per-question outcomes explicitly. The gate is paired
+    now, so it reads those and not the headline `overall` -- an arm whose
+    summary says 60.0 while every question matches the other arm has not
+    regressed by anything this test can see, and that is the point."""
     cfg = {"scale": "S", "sample": 0, "workers": 8}
     if lever is not None:
         cfg[gs.LEVER] = lever
+    cfg.update(cfg_extra or {})
+    if correct is not None:
+        n = len(correct)
     pq = []
     for i in range(n):
-        row = {"question_id": f"q{i}", "correct": i >= correct_from,
-               "question_type": "multi-session"}
+        row = {"question_id": f"q{i}",
+               "correct": correct[i] if correct is not None else i >= correct_from,
+               "question_type": qtypes[i] if qtypes is not None else qtype}
         if episodes is not None:
             row["n_episodes"] = episodes[i]
         pq.append(row)
@@ -76,30 +86,49 @@ def test_an_evidenced_pair_that_clears_the_bar_passes():
     assert "OVERALL" in text
 
 
-def test_an_overall_below_the_canonical_fails():
-    v, _, _ = run(artifact(lever=False), artifact(lever=True, overall=69.0))
+# 20 questions ON lost and none it gained: p = 2^-19, unmistakably a
+# regression. 20 the other way is the mirror image and must NOT be one.
+_OFF_ALL_RIGHT = [True] * 20 + [True] * 10
+_ON_LOST_20 = [False] * 20 + [True] * 10
+_OFF_LOST_20 = [False] * 20 + [True] * 10
+_ON_ALL_RIGHT = [True] * 20 + [True] * 10
+
+
+def test_a_significant_paired_loss_is_a_REGRESSION():
+    v, d, text = run(artifact(lever=False, correct=_OFF_ALL_RIGHT),
+                     artifact(lever=True, correct=_ON_LOST_20))
     assert v == "FAIL"
+    assert "REGRESSION" in text
+    assert d["paired"]["OVERALL"]["regressed"] == 20
 
 
-def test_an_ms_below_the_floor_fails():
-    v, _, _ = run(artifact(lever=False), artifact(lever=True, ms=50.0))
-    assert v == "FAIL"
+def test_a_headline_gap_with_no_paired_loss_is_not_a_regression():
+    """The defect the old bars had, inverted into a test. Two arms that agree
+    on every single question cannot have regressed, whatever their recorded
+    summaries say -- and under `OVERALL >= 70.0` the second one FAILED."""
+    v, _, _ = run(artifact(lever=False, overall=75.0, correct=_OFF_ALL_RIGHT),
+                  artifact(lever=True, overall=60.0, correct=_OFF_ALL_RIGHT))
+    assert v == "PASS"
 
 
-def test_the_bar_is_read_on_the_ON_arm_not_the_OFF_arm():
-    """A regression on ON must fail even when OFF is healthy."""
-    v, _, _ = run(artifact(lever=False, overall=75.0),
-                  artifact(lever=True, overall=60.0))
-    assert v == "FAIL"
+def test_an_improvement_is_not_read_as_a_regression():
+    """Direction is half the verdict: McNemar rejects on either tail."""
+    v, _, text = run(artifact(lever=False, correct=_OFF_LOST_20),
+                     artifact(lever=True, correct=_ON_ALL_RIGHT))
+    assert v == "PASS"
+    assert "NO REGRESSION DETECTED" in text
 
 
 def test_the_arms_are_oriented_by_the_config_block_not_by_argv_order():
-    """Passing ON first must not silently score the OFF arm against the bar."""
-    v1, _, _ = run(artifact(lever=False, overall=75.0),
-                   artifact(lever=True, overall=60.0))
-    v2, _, _ = run(artifact(lever=True, overall=60.0),
-                   artifact(lever=False, overall=75.0))
+    """Orientation matters MORE under a paired test than under a bar: swap
+    the arms and a regression reads as an improvement, which passes."""
+    v1, d1, _ = run(artifact(lever=False, correct=_OFF_ALL_RIGHT),
+                    artifact(lever=True, correct=_ON_LOST_20))
+    v2, d2, _ = run(artifact(lever=True, correct=_ON_LOST_20),
+                    artifact(lever=False, correct=_OFF_ALL_RIGHT))
     assert v1 == v2 == "FAIL"
+    assert d1["paired"]["OVERALL"]["regressed"] == \
+        d2["paired"]["OVERALL"]["regressed"] == 20
 
 
 # --------------------------------------------------------------- fired subset
@@ -160,3 +189,124 @@ def test_episode_totals_are_reported_for_both_arms():
 ])
 def test_accuracy_handles_the_empty_subset(rows, expected):
     assert gs.accuracy(rows) == expected
+
+
+# ------------------------------------------------- the paired design's own rules
+
+def test_a_negative_verdict_never_says_bare_no_regression():
+    """The load-bearing sentence. "No regression" is a claim the instrument
+    cannot support; "no regression larger than Xpp" is the one it can. The
+    old gate said the first, which is how a null at 2.5pp resolution got read
+    as evidence the lever was harmless."""
+    _, _, text = run(artifact(lever=False, correct=[True] * 10 + [False] * 10),
+                     artifact(lever=True, correct=[True] * 9 + [False] * 11))
+    assert "NO REGRESSION DETECTED" in text
+    assert "NO REGRESSION LARGER THAN" in text
+    assert "Not 'no regression'." in text
+
+
+def test_a_PASS_states_the_resolution_it_passed_at():
+    _, _, text = run(artifact(lever=False, correct=[True] * 10 + [False] * 10),
+                     artifact(lever=True, correct=[True] * 9 + [False] * 11))
+    assert "VERDICT: PASS" in text
+    assert "no regression larger than" in text
+    assert "a PASS is not evidence the lever is" in text
+
+
+def test_two_arms_that_never_disagree_are_not_reported_as_a_clean_null():
+    """Zero discordant questions has no MDE to quote, and it is also exactly
+    what two runs of ONE arm look like. It must not print as the strongest
+    possible pass."""
+    same = [True] * 15 + [False] * 5
+    v, _, text = run(artifact(lever=False, correct=same),
+                     artifact(lever=True, correct=same))
+    assert v == "PASS"
+    assert "agreed on every scored question" in text
+    assert "two runs of ONE arm" in text
+
+
+def test_a_moved_answer_model_is_INCOMPLETE_and_prints_no_score():
+    """A paired test assumes the arms differ in the lever only. Two answer
+    models is not a footnote — it is a different experiment, and the pairing
+    that makes the gate readable does not survive it."""
+    v, d, text = run(
+        artifact(lever=False, correct=[True] * 20,
+                 cfg_extra={"answer_model": "deepseek-v4-flash"}),
+        artifact(lever=True, correct=[False] * 20,
+                 cfg_extra={"answer_model": "deepseek-chat"}))
+    assert v == "INCOMPLETE"
+    assert d["fatal"] == ["answer_model"]
+    assert "REGRESSION" not in text, "no verdict may be computed"
+
+
+def test_an_ordinary_confound_is_noted_but_does_not_stop_the_read():
+    """Only the confounds that break PAIRING are fatal. Refusing on any
+    difference at all would make the gate unrunnable, and a gate that never
+    runs is not a stricter gate."""
+    v, _, text = run(artifact(lever=False, correct=[True] * 20,
+                              cfg_extra={"workers": 4}),
+                     artifact(lever=True, correct=[True] * 20,
+                              cfg_extra={"workers": 8}))
+    assert v == "PASS"
+    assert "workers" in text
+
+
+def test_unscored_rows_are_excluded_from_the_pairing():
+    """D3. A judge that never answered has no outcome to pair, and counting
+    it as a miss on both arms pads the concordant cell — the one that carries
+    no information but does divide the net."""
+    off = artifact(lever=False, correct=[True] * 4)
+    on = artifact(lever=True, correct=[True] * 4)
+    off["per_question"][0]["correct"] = None
+    on["per_question"][1]["correct"] = None
+    _, d, _ = run(off, on)
+    assert d["paired"]["OVERALL"]["n"] == 2
+
+
+def test_the_MS_subset_is_only_the_multi_session_questions():
+    types = ["multi-session"] * 10 + ["single-session-user"] * 10
+    off = artifact(lever=False, correct=[True] * 20, qtypes=types)
+    on = artifact(lever=True, correct=[True] * 20, qtypes=types)
+    _, d, _ = run(off, on)
+    assert d["paired"]["OVERALL"]["n"] == 20
+    assert d["paired"][gs.MS_KEY]["n"] == 10
+
+
+@pytest.mark.parametrize("drifts", ["off", "on"])
+def test_a_question_labelled_MS_on_only_one_arm_leaves_the_subset(drifts):
+    """Reading one arm's label would let the denominator move between arms,
+    which is a difference in WHICH questions were scored dressed up as a
+    difference in how they scored.
+
+    Both directions, because either arm alone catches only the drift in the
+    other one -- a single-direction fixture passes against a scorer that
+    reads exactly one label, which is the bug."""
+    mixed = ["multi-session"] * 3 + ["temporal-reasoning"]
+    pure = ["multi-session"] * 4
+    off = artifact(lever=False, correct=[True] * 4,
+                   qtypes=mixed if drifts == "off" else pure)
+    on = artifact(lever=True, correct=[True] * 4,
+                  qtypes=mixed if drifts == "on" else pure)
+    _, d, _ = run(off, on)
+    assert d["paired"][gs.MS_KEY]["n"] == 3
+
+
+def test_the_MS_subset_reports_its_coarser_resolution():
+    """A null on a tenth of the questions is a much weaker claim, and the old
+    absolute MS floor said nothing about that at all."""
+    types = ["multi-session"] * 6 + ["single-session-user"] * 40
+    off = artifact(lever=False, correct=[True] * 3 + [False] * 3 + [True] * 20 + [False] * 20,
+                   qtypes=types)
+    on = artifact(lever=True, correct=[False] * 3 + [True] * 3 + [False] * 20 + [True] * 20,
+                  qtypes=types)
+    _, _, text = run(off, on)
+    assert "resolves only" in text
+    assert "smaller sample of the same" in text
+
+
+def test_a_question_only_one_arm_answered_is_not_paired():
+    off = artifact(lever=False, correct=[True] * 5)
+    on = artifact(lever=True, correct=[True] * 5)
+    on["per_question"] = on["per_question"][:3]
+    _, d, _ = run(off, on)
+    assert d["paired"]["OVERALL"]["n"] == 3

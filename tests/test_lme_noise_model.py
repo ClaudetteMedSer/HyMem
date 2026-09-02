@@ -114,3 +114,56 @@ def test_a_single_era_run_reports_no_spread_rather_than_zero():
     assert res["era"]["sd"] is None
     assert "no spread" in "\n".join(lines)
     assert "MIS-CALIBRATED" not in "\n".join(lines)
+
+
+# ------------------------------------------------------------ McNemar, exact
+
+def test_a_perfectly_split_discordance_is_the_null():
+    assert nm.mcnemar_exact_p(21, 21) == pytest.approx(1.0)
+
+
+def test_no_discordance_at_all_is_p_one_not_p_zero():
+    """Two arms that never disagree are not significantly different. Reading
+    0/0 as a rejection would make an identical pair the strongest result the
+    test can produce."""
+    assert nm.mcnemar_exact_p(0, 0) == 1.0
+
+
+def test_a_lopsided_discordance_rejects():
+    assert nm.mcnemar_exact_p(30, 12) == pytest.approx(0.00785, abs=1e-4)
+    assert nm.mcnemar_exact_p(35, 7) < 0.001
+
+
+def test_the_test_is_two_sided():
+    """Either tail rejects. The DIRECTION is guard_score's to check; a
+    one-sided p here would silently halve the alpha of every other caller."""
+    assert nm.mcnemar_exact_p(30, 12) == nm.mcnemar_exact_p(12, 30)
+
+
+def test_a_single_discordant_question_cannot_reject():
+    """b=1, c=0 is one coin flip. If this ever returned < .05 the gate would
+    fire on any arm that moved exactly one question."""
+    assert nm.mcnemar_exact_p(1, 0) == 1.0
+    assert nm.mcnemar_exact_p(4, 0) > 0.05
+
+
+def test_the_smallest_rejecting_shutout_is_five_questions():
+    """2 * 0.5^5 = 0.0625 > .05; 2 * 0.5^6 = 0.03125. So five is not enough
+    and six is -- pinned because it is the floor on what the gate can see
+    when every discordant question moves the same way."""
+    assert nm.mcnemar_exact_p(5, 0) > 0.05
+    assert nm.mcnemar_exact_p(6, 0) < 0.05
+
+
+def test_p_never_exceeds_one():
+    """2 * tail overshoots at small n if it is not clamped."""
+    for b in range(6):
+        for c in range(6):
+            assert 0.0 <= nm.mcnemar_exact_p(b, c) <= 1.0
+
+
+def test_the_concordant_count_does_not_enter_the_p_value():
+    """The signature cannot even accept it, which is the point: n=500 buys no
+    resolution the discordant cells do not already contain."""
+    import inspect
+    assert list(inspect.signature(nm.mcnemar_exact_p).parameters) == ["b", "c"]

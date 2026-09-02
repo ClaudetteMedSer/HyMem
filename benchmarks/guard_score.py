@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan C gate 4 — score the LME full guard, in the order gate 4 requires.
+"""Plan C gate 4 — score the LME full guard PAIRED, in the order it requires.
 
 The 2026-08-30/31 guard pair produced clean numbers (71.0 vs 71.0) that could
 not be read, because neither artifact recorded which arm it was. The scores
@@ -25,26 +25,65 @@ LOWER BOUND on the questions the lever touched, not the set of them, and a null
 on it is correspondingly weaker evidence than a null on a real fired-indicator.
 It is reported, never gated.
 
+THE BAR IS NOT A CONSTANT. It used to be: `OVERALL >= 70.0` with an MS floor
+of 51.9, both from ONE 2026-06-10 run taken on `deepseek-chat` for answer AND
+judge -- a model hard-deprecated 2026-07-24, so the canonical could not be
+reproduced at all. Measured against nine comparable runs, 70.0 sat +0.23 SD
+from the centre of its own era: an arm that does nothing whatsoever failed it
+41% of the time, and jointly the two bars failed an inert lever about half the
+time. That is the same defect as gate 3 and the 71.0-vs-71.0 guard pair in a
+third form -- not a bar a no-effect change passes, but one it fails at random,
+which is worse only because it invites a re-run.
+
+So the contrast is PAIRED against the OFF arm of the same session, which both
+arms already are. McNemar on the shared per-question outcomes, exact rather
+than chi-square, and REGRESSION only when ON is worse AND the test rejects.
+
+AND THE NEGATIVE VERDICT CARRIES ITS OWN RESOLUTION. Only the discordant
+questions inform McNemar, so 500 questions at 8.4% churn resolve 2.54pp and no
+more; the concordant 458 buy nothing. The gate therefore never reports "no
+regression" -- it reports "no regression larger than X pp", with X computed
+from the run in hand. A gate that cannot state what it would have missed is
+how a null at 2.5pp resolution came to be read as evidence a lever was
+harmless.
+
 Offline: reads two artifacts, makes no call.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
 _BENCH = Path(__file__).resolve().parent
 sys.path.insert(0, str(_BENCH))
+from lme_noise_model import Z95, mcnemar_exact_p  # noqa: E402
 from run_registry import ARM_EVIDENCED, arm_evidence  # noqa: E402
 
 # ------------------------------------------------------------- pre-registered
-# Gate 4 is NON-REGRESSION ONLY, against the canonical full-dream baseline.
-# Not a tuning signal: a change with no effect clears this bar too.
-CANONICAL_OVERALL = 70.0
-MS_FLOOR = 51.9
+# Gate 4 is NON-REGRESSION ONLY. Not a tuning signal: a change with no effect
+# clears it too.
+#
+# It is scored PAIRED, against the OFF arm of the same session -- never
+# against a historical constant. The constants it used to carry,
+# `OVERALL >= 70.0` and an MS floor of 51.9, both came from ONE run
+# (longmemeval-v2-hymem-20260610T094858Z-seed0, 2026-06-10) taken on
+# `deepseek-chat` for BOTH answer and judge, a model hard-deprecated
+# 2026-07-24. They were not reproducible, and 70.0 sat +0.23 SD from the
+# centre of the era it was floored against: an arm that does nothing at all
+# failed that bar 41% of the time. See the RE-BASELINING block in
+# additional_planning.md and `benchmarks/lme_noise_model.py`.
+ALPHA = 0.05
 MS_KEY = "multi-session"
 LEVER = "episode_granularity_enabled"
+
+# Confounds that break the pairing outright rather than merely muddying it.
+# A paired test assumes the two arms differ in the lever and the lever only;
+# two different answer models is not a confound to note in passing, it is a
+# different experiment.
+FATAL_CONFOUNDS = ("answer_model", "judge_model", "scale", "sample", "seed")
 
 
 def accuracy(rows) -> float | None:
@@ -87,16 +126,72 @@ def fired_subset(a_rows: dict, b_rows: dict) -> dict:
     }
 
 
-def bar_check(on_scores: dict) -> list[tuple[str, bool, str]]:
-    out = []
-    ov = on_scores.get("OVERALL", {}).get("accuracy")
-    out.append((f"OVERALL >= {CANONICAL_OVERALL} (canonical full-dream)",
-                ov is not None and ov >= CANONICAL_OVERALL,
-                f"{ov}"))
-    ms = on_scores.get(MS_KEY, {}).get("accuracy")
-    out.append((f"{MS_KEY} >= {MS_FLOOR} (MS floor)",
-                ms is not None and ms >= MS_FLOOR, f"{ms}"))
-    return out
+def is_scored(r: dict) -> bool:
+    """D3: a judge that never answered is UNSCORED, not wrong.
+
+    `accuracy` above reads a None verdict as falsy, which is right for a
+    headline rate. It is wrong here: an unscored row has no outcome to pair,
+    and treating it as a miss on both arms would pad the CONCORDANT count --
+    the one that carries no information but does divide the net."""
+    return r.get("correct") is not None
+
+
+def paired_test(off_rows: dict, on_rows: dict, subset=None) -> dict:
+    """McNemar, ON against the contemporaneous OFF arm, on shared questions.
+
+    `regressed` counts questions OFF got right and ON got wrong; `gained` the
+    reverse. Only those two cells enter the test -- which is why the MDE
+    below is set by the churn and not by n, and why it must be reported
+    whatever the verdict."""
+    shared = sorted(q for q in set(off_rows) & set(on_rows)
+                    if is_scored(off_rows[q]) and is_scored(on_rows[q])
+                    and (subset is None or subset(off_rows[q], on_rows[q])))
+    regressed = sum(1 for q in shared
+                    if off_rows[q]["correct"] and not on_rows[q]["correct"])
+    gained = sum(1 for q in shared
+                 if on_rows[q]["correct"] and not off_rows[q]["correct"])
+    n = len(shared)
+    disc = regressed + gained
+    return {
+        "n": n,
+        "regressed": regressed,
+        "gained": gained,
+        "discordant": disc,
+        "net_pp": 100.0 * (gained - regressed) / n if n else None,
+        "p": mcnemar_exact_p(regressed, gained),
+        # |b-c| must exceed 1.96*sqrt(disc) for the test to reject. Below this
+        # a PASS and a FAIL are the same measurement.
+        "mde_pp": 100.0 * Z95 * math.sqrt(disc) / n if disc and n else None,
+    }
+
+
+def paired_verdict(t: dict) -> tuple[str, str]:
+    """(verdict, sentence). REGRESSION only when ON is worse AND it rejects.
+
+    Requiring the direction as well as the p-value makes this a one-sided
+    test at alpha/2, which is conservative in the direction a non-regression
+    gate should be conservative in.
+
+    The negative verdict NEVER says "no regression". It says no regression
+    LARGER THAN the MDE, because that is the only thing the instrument can
+    support -- a gate that cannot state its own resolution is how 71.0 vs
+    71.0 came to be read as evidence."""
+    if t["n"] == 0:
+        return "INCOMPLETE", "no shared, scored questions to pair"
+    mde = t["mde_pp"]
+    if t["net_pp"] < 0 and t["p"] < ALPHA:
+        return "REGRESSION", (
+            f"ON is worse by {abs(t['net_pp']):.1f}pp "
+            f"(p={t['p']:.4f}, {t['regressed']} lost / {t['gained']} gained)")
+    if mde is None:
+        return "NO REGRESSION DETECTED", (
+            "the two arms agreed on every scored question — which bounds the "
+            "effect at 0pp and is also what two runs of ONE arm would look "
+            "like; read it with the arm evidence above, not alone")
+    return "NO REGRESSION DETECTED", (
+        f"net {t['net_pp']:+.1f}pp, p={t['p']:.3f} — i.e. NO REGRESSION "
+        f"LARGER THAN {mde:.1f}pp, which is all {t['discordant']} discordant "
+        f"questions can support. Not 'no regression'.")
 
 
 def report(a: dict, b: dict, lever: str = LEVER, out=print) -> tuple[str, dict]:
@@ -110,6 +205,18 @@ def report(a: dict, b: dict, lever: str = LEVER, out=print) -> tuple[str, dict]:
     out(f"  [{verdict_arm}] {note}")
     if confounds:
         out(f"  confounds (other keys that also moved): {', '.join(confounds)}")
+    fatal = [k for k in confounds if k in FATAL_CONFOUNDS]
+    if fatal and verdict_arm == ARM_EVIDENCED:
+        out("")
+        out(f"  INCOMPLETE — the scores are NOT read. {', '.join(fatal)} "
+            "also moved.")
+        out("  A paired test assumes the arms differ in the lever and the")
+        out("  lever only. Two answer models, or two question samples, is")
+        out("  not a confound to note in passing — it is a different")
+        out("  experiment, and the pairing that makes this gate readable")
+        out("  does not hold across it.")
+        return "INCOMPLETE", {"arm": verdict_arm, "confounds": confounds,
+                              "fatal": fatal}
     if verdict_arm != ARM_EVIDENCED:
         out("")
         out("  INCOMPLETE — the scores are NOT read.")
@@ -137,11 +244,38 @@ def report(a: dict, b: dict, lever: str = LEVER, out=print) -> tuple[str, dict]:
         out(f"  {k:<28} {av if av is not None else '—':>7} "
             f"{bv if bv is not None else '—':>7} {d:>7}  {n}")
 
-    checks = bar_check(b_s)
     out("")
-    out("=== gate 4 bar (NON-REGRESSION ONLY, on the ON arm) ===")
-    for name, ok, detail in checks:
-        out(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+    out("=== gate 4 — PAIRED, ON vs the contemporaneous OFF arm ===")
+    out("  No historical constant is read. The bars this replaces (OVERALL")
+    out("  >= 70.0, MS >= 51.9) came from one 2026-06-10 run on a model")
+    out("  deprecated in July, and an inert arm failed them about half the")
+    out("  time. See lme_noise_model.py.")
+    overall = paired_test(a_rows, b_rows)
+    # BOTH arms must call the question multi-session. Reading one arm's
+    # label would let a question drift into or out of the subset between the
+    # arms, which is a difference in the denominator masquerading as one in
+    # the outcome.
+    ms = paired_test(a_rows, b_rows,
+                     subset=lambda ra, rb: ra.get("question_type") == MS_KEY
+                     == rb.get("question_type"))
+    results = [("OVERALL", overall), (MS_KEY, ms)]
+    checks: list[tuple[str, bool, str]] = []
+    for name, t in results:
+        v, sentence = paired_verdict(t)
+        checks.append((name, v != "REGRESSION", f"{v} — {sentence}"))
+        out("")
+        out(f"  {name}: n={t['n']}  discordant={t['discordant']} "
+            f"({t['regressed']} lost / {t['gained']} gained)")
+        out(f"    [{'PASS' if v != 'REGRESSION' else 'FAIL'}] {v}")
+        out(f"    {sentence}")
+    if ms["discordant"] and overall["discordant"] and \
+            ms["mde_pp"] > overall["mde_pp"]:
+        out("")
+        out(f"  The {MS_KEY} subset resolves only {ms['mde_pp']:.1f}pp, "
+            f"against OVERALL's {overall['mde_pp']:.1f}pp:")
+        out("  a smaller sample of the same churn. A null there is")
+        out("  correspondingly weaker, and it is NOT the absolute MS floor it")
+        out("  replaces — that floor never said what it would have missed.")
 
     fs = fired_subset(a_rows, b_rows)
     out("")
@@ -168,7 +302,13 @@ def report(a: dict, b: dict, lever: str = LEVER, out=print) -> tuple[str, dict]:
     verdict = "PASS" if all(ok for _, ok, _ in checks) else "FAIL"
     out("")
     out(f"  VERDICT: {verdict}")
-    return verdict, {"arm": verdict_arm, "checks": checks, "fired": fs}
+    if verdict == "PASS" and overall["mde_pp"] is not None:
+        out(f"  Read as: no regression larger than {overall['mde_pp']:.1f}pp. "
+            "The gate cannot")
+        out("  see a smaller one, so a PASS is not evidence the lever is "
+            "inert.")
+    return verdict, {"arm": verdict_arm, "checks": checks, "fired": fs,
+                     "paired": {"OVERALL": overall, MS_KEY: ms}}
 
 
 def main() -> int:

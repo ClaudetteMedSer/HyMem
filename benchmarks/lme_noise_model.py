@@ -74,6 +74,29 @@ def paired_discordance(a: dict, b: dict) -> dict:
     }
 
 
+def mcnemar_exact_p(b: int, c: int) -> float:
+    """Two-sided exact binomial p for McNemar's test.
+
+    Exact rather than the chi-square approximation because the discordant
+    count is what it is -- 42 in the calibration pair, and far smaller on any
+    per-ability subset, where the approximation is worst exactly when the
+    claim rests on it most.
+
+    Under the null the discordant questions split 50/50, so this is a sign
+    test on b vs c and the CONCORDANT questions carry no information at all.
+    That is the whole reason n=500 does not buy the resolution it looks like
+    it buys."""
+    n = b + c
+    if n == 0:
+        # Two arms that never disagree on any question. No evidence of a
+        # difference, and equally no evidence of none -- p=1 says the first,
+        # and the MDE beside it has to say the second.
+        return 1.0
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / (2.0 ** n)
+    return min(1.0, 2.0 * tail)
+
+
 def era_spread(values: list[float]) -> dict:
     if len(values) < 2:
         return {"n": len(values), "mean": values[0] if values else None,
