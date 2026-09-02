@@ -4012,3 +4012,35 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > `digested_prompt_version` but are no longer digestible. They were digested
 > when they had content and no longer yield a chunk or a fallback. That is
 > recorded in the census as `digested` and gated on nothing.
+>
+> **ADDENDUM, same day, still before the run — gate 4's scorer now exists and
+> enforces the order.** `benchmarks/guard_score.py`. The block above fixed the
+> reading order in prose ("`arm_evidence` first, scores second"); prose is what
+> the last pair also had. `report()` now asks `arm_evidence()` and RETURNS
+> before computing any accuracy when the pair is UNEVIDENCED or SAME_ARM, so
+> the refusal is structural rather than a discipline. Run against the
+> 2026-08-30/31 pair it prints INCOMPLETE and exit 2, and **71.0 does not
+> appear in its output at all** — which is the property, since a number
+> already seen cannot be un-seen, and one step for the numbers plus a separate
+> step for provenance is exactly how that pair came to be quoted in three
+> documents before anyone asked which arm it was.
+>
+> It also reports what the previous guard structurally could not: the FIRED
+> subset, using the per-question `n_episodes` that `6543ee6` added. The E1
+> lesson is the reason — all-800 net read NULL there while the subset where
+> the tier reached the reader read -2.9pp (p=0.024), so an unconditional
+> all-500 net is not evidence of no effect unless the tier can be shown to
+> have reached the reader.
+>
+> **The subset's limit is stated in the instrument and printed on every run,
+> because it is weaker than it looks.** `n_episodes` counts episodes handed to
+> the reader, and this lever changes how episodes are CUT — so two arms can
+> hand over the same NUMBER of different episodes. The subset is a LOWER BOUND
+> on the questions the lever touched, not the set of them. It is reported and
+> never gated, and the caveat prints loudest in the case that most invites
+> over-reading: an EMPTY fired subset, which is equally consistent with "the
+> lever changed nothing" and "the lever re-cut every episode without moving a
+> single count". 16 tests, 9 mutations checked (score anyway after warning: 3
+> fail; treat SAME_ARM as evidenced: 3; orient by argv order: 1; read the bar
+> on the OFF arm: 4; drop either bar: 3 and 1; read a missing n_episodes as no
+> effect: 6; define fired as counts that MATCH: 2; drop the caveat: 2).
