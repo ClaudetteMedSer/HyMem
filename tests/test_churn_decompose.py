@@ -161,3 +161,105 @@ def test_report_warns_when_the_parser_looks_non_deterministic():
     lines: list[str] = []
     cd.report(cd.decompose(a, b), out=lines.append)
     assert "not readable" in "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Stage 2: answer-side churn split by whether the reader's INPUT also moved,
+# and the interval that must be attached to a judge flip count of zero.
+# --------------------------------------------------------------------------
+
+
+def test_a_flip_whose_retrieval_also_moved_counts_as_retrieval_side():
+    d = cd.decompose(art(row("q1", True, "a", n_episodes=3), row("q2", True, "k")),
+                     art(row("q1", False, "b", raw="no", n_episodes=9),
+                         row("q2", True, "k")))
+    assert d["retrieval_side_min"] == 1 and d["decoder_side_max"] == 0
+
+
+def test_a_flip_on_an_unchanged_fingerprint_counts_as_decoder_side():
+    d = cd.decompose(art(row("q1", True, "a", n_episodes=3), row("q2", True, "k")),
+                     art(row("q1", False, "b", raw="no", n_episodes=3),
+                         row("q2", True, "k")))
+    assert d["decoder_side_max"] == 1 and d["retrieval_side_min"] == 0
+
+
+def test_a_judge_side_flip_is_not_also_counted_in_the_context_split():
+    """The two stages must not double-count the same flipped question."""
+    d = cd.decompose(art(row("q1", True, "same", n_episodes=3)),
+                     art(row("q1", False, "same", raw="no", n_episodes=9)))
+    assert d["judge_side"] == 1
+    assert d["retrieval_side_min"] == 0 and d["decoder_side_max"] == 0
+
+
+def test_every_fingerprint_differing_makes_the_context_split_UNAVAILABLE():
+    """Same guard as stage 1: a key that never repeats explains nothing."""
+    a = art(row("q1", True, "a", n_episodes=1), row("q2", True, "c", n_episodes=2))
+    b = art(row("q1", False, "b", raw="no", n_episodes=3),
+            row("q2", True, "d", n_episodes=4))
+    d = cd.decompose(a, b)
+    assert d["context_available"] is False
+    assert d["retrieval_side_min"] == 1, "the count exists but must not be read"
+
+
+def test_the_concordant_fingerprint_rate_is_the_control_for_stage_2():
+    a = art(row("q1", True, "x", n_episodes=1), row("q2", True, "y", n_episodes=2))
+    b = art(row("q1", True, "x", n_episodes=1), row("q2", True, "y", n_episodes=8))
+    d = cd.decompose(a, b)
+    assert d["context_identical_rate_concordant"] == pytest.approx(0.5)
+
+
+def test_ability_and_recall_tier_are_part_of_the_fingerprint():
+    """A different route to the answer is a different context even when the
+    pool sizes coincide."""
+    a = art(row("q1", True, "a", n_episodes=3, ability_used="single-session"))
+    b = art(row("q1", False, "b", raw="no", n_episodes=3, ability_used="multi-session"))
+    d = cd.decompose(a, b)
+    assert d["retrieval_side_min"] == 1
+
+
+def test_zero_judge_flips_is_an_interval_not_a_zero_rate():
+    """The load-bearing one. 0/181 must not be reported as 0%: the honest
+    claim is the rule-of-three bound, ~1.6%."""
+    assert cd.binomial_upper_95(0, 181) == pytest.approx(3.0 / 181, abs=3e-4)
+    assert cd.binomial_upper_95(0, 181) > 0.0
+
+
+def test_the_bound_loosens_as_the_sample_shrinks():
+    assert cd.binomial_upper_95(0, 10) > cd.binomial_upper_95(0, 100)
+
+
+def test_the_bound_is_undefined_with_no_sample_rather_than_zero():
+    assert cd.binomial_upper_95(0, 0) is None
+
+
+def test_the_bound_exceeds_the_point_estimate():
+    d = cd.decompose(art(row("q1", True, "same"), row("q2", True, "s2")),
+                     art(row("q1", False, "same", raw="no"), row("q2", True, "s2")))
+    assert d["judge_flip_rate"] == pytest.approx(0.5)
+    assert d["judge_flip_upper_95"] > d["judge_flip_rate"]
+
+
+def test_report_states_the_bound_and_refuses_the_word_deterministic():
+    a = art(row("q1", True, "same"), row("q2", True, "s2"))
+    b = art(row("q1", True, "same"), row("q2", False, "other", raw="no"))
+    lines: list[str] = []
+    cd.report(cd.decompose(a, b), out=lines.append)
+    text = "\n".join(lines)
+    assert "one-sided 95%" in text
+    assert "deterministic" not in text.replace("NOT 'the judge is deterministic'", "")
+
+
+def test_report_on_an_unavailable_context_split_prints_no_bounds():
+    """The fixture has to clear stage 1 to reach stage 2 at all: q1 repeats
+    its answer, so hypothesis identity varies, while no fingerprint ever
+    repeats. A fixture that fails stage 1 returns before stage 2 and tests
+    nothing -- which is how the first version of this test passed against a
+    mutation that deleted the branch it names."""
+    a = art(row("q1", True, "same", n_episodes=1), row("q2", True, "c", n_episodes=2))
+    b = art(row("q1", True, "same", n_episodes=7),
+            row("q2", False, "d", raw="no", n_episodes=4))
+    lines: list[str] = []
+    cd.report(cd.decompose(a, b), out=lines.append)
+    text = "\n".join(lines)
+    assert "UNAVAILABLE" in text
+    assert "retrieval moved too" not in text

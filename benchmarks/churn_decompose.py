@@ -51,6 +51,56 @@ def norm_hypothesis(s) -> str:
     return " ".join(str(s or "").split())
 
 
+def binomial_upper_95(k: int, n: int) -> float | None:
+    """One-sided 95% upper bound on a rate, exact (Clopper-Pearson).
+
+    Solved by bisection on the binomial CDF rather than pulled from scipy,
+    which is not a dependency of this repo. At k=0 it reduces to the familiar
+    rule of three: 0/181 flips bounds the judge's flip rate at ~1.6%, which is
+    what may honestly be claimed -- not "the judge is deterministic"."""
+    if n <= 0:
+        return None
+    if k >= n:
+        return 1.0
+
+    def cdf(p: float) -> float:
+        return sum(math.comb(n, i) * p ** i * (1.0 - p) ** (n - i)
+                   for i in range(k + 1))
+
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if cdf(mid) > 0.05:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+# The fields describing what the reader was HANDED, as recorded per question.
+# Counts, not content -- see `context_fingerprint`.
+CONTEXT_FIELDS = (
+    "n_episodes", "n_facts", "n_procedures", "n_agg_nodes", "num_memories",
+    "ability_used", "recall_tier", "gold_in_episodes", "gold_in_facts",
+    "distill_fired", "distill_kept",
+)
+
+
+def context_fingerprint(r: dict) -> tuple:
+    """What the reader saw, to the resolution the artifact records.
+
+    READ THE LIMIT. These are COUNTS and flags, not the retrieved text: two
+    runs can hand the reader the same NUMBER of different episodes. So a
+    fingerprint that MATCHES is weak evidence the context was identical,
+    while one that DIFFERS is strong evidence it was not. That asymmetry is
+    why the split below is reported as a lower bound on retrieval churn and
+    an upper bound on decoder churn, never as a partition.
+
+    It is the same lower-bound caveat `guard_score.fired_subset` carries, for
+    the same reason, and it must not be quietly dropped here."""
+    return tuple(r.get(k) for k in CONTEXT_FIELDS)
+
+
 def is_scored(r: dict) -> bool:
     """D3: a judge that never answered is UNSCORED, not wrong.
 
@@ -70,6 +120,9 @@ def decompose(a: dict, b: dict) -> dict:
     usable = [q for q in shared if q not in set(unscored)]
 
     judge_side, answer_side, conc_same, conc_diff = [], [], [], []
+    # Answer-side flips split by whether the reader's INPUT also moved.
+    ctx_same, ctx_diff = [], []
+    conc_ctx_same = 0
     exact_same = 0
     impossible = []
     for q in usable:
@@ -89,10 +142,15 @@ def decompose(a: dict, b: dict) -> dict:
                 impossible.append(q)
         elif flipped:
             answer_side.append(q)
-        elif same_hyp:
-            conc_same.append(q)
+            (ctx_same if context_fingerprint(ra) == context_fingerprint(rb)
+             else ctx_diff).append(q)
         else:
-            conc_diff.append(q)
+            if context_fingerprint(ra) == context_fingerprint(rb):
+                conc_ctx_same += 1
+            if same_hyp:
+                conc_same.append(q)
+            else:
+                conc_diff.append(q)
 
     n = len(usable)
     disc = len(judge_side) + len(answer_side)
@@ -122,6 +180,21 @@ def decompose(a: dict, b: dict) -> dict:
         "mde_pp": 100.0 * Z95 * math.sqrt(disc) / n if disc and n else None,
         "mde_pp_judge_free": (100.0 * Z95 * math.sqrt(len(answer_side)) / n
                               if len(answer_side) and n else None),
+        # Answer-side churn, split by whether the retrieved context moved
+        # too. Lower/upper bounds, not a partition -- see context_fingerprint.
+        "retrieval_side_min": len(ctx_diff),
+        "decoder_side_max": len(ctx_same),
+        "context_identical_rate_concordant": (conc_ctx_same / conc
+                                              if conc else None),
+        "context_available": (len(ctx_same) + conc_ctx_same) > 0,
+        # A judge that saw byte-identical text twice and did not change its
+        # mind. Zero flips out of a finite sample is NOT a zero rate, and
+        # reporting it as one is the same overclaim as a bar with no interval.
+        "judge_identical_pairs": len(judge_side) + len(conc_same),
+        "judge_flip_rate": (len(judge_side) / (len(judge_side) + len(conc_same))
+                            if (len(judge_side) + len(conc_same)) else None),
+        "judge_flip_upper_95": binomial_upper_95(
+            len(judge_side), len(judge_side) + len(conc_same)),
         "judge_side_ids": judge_side,
         "answer_side_ids": answer_side,
     }
@@ -166,6 +239,14 @@ def report(d: dict, out=print) -> dict:
     out("")
     out("=== what a perfect judge would buy ===")
     out(f"  judge-side share of churn: {d['judge_share']:.0%}")
+    out(f"  judge saw byte-identical text twice on "
+        f"{d['judge_identical_pairs']} questions "
+        f"and changed its mind on {d['judge_side']}")
+    if d["judge_flip_upper_95"] is not None:
+        out(f"  judge flip rate <= {d['judge_flip_upper_95']:.1%} "
+            "(one-sided 95%, Clopper-Pearson)")
+        out("  NOT 'the judge is deterministic' — a rate of zero out of a")
+        out("  finite sample is an interval, and that is the interval.")
     out(f"  MDE now:                       {d['mde_pp']:.2f}pp")
     if d["mde_pp_judge_free"] is None:
         out("  MDE with judge churn removed:  0.00pp (no answer-side churn "
@@ -175,6 +256,32 @@ def report(d: dict, out=print) -> dict:
             f"{d['mde_pp_judge_free']:.2f}pp")
     out("  That is a FLOOR, not a forecast: majority voting reduces judge")
     out("  churn, it does not abolish it.")
+    out("")
+
+    out("=== answer-side churn: our retrieval, or the provider's decoder? ===")
+    if not d["context_available"]:
+        out("  UNAVAILABLE — no two runs ever handed the reader a matching")
+        out("  context fingerprint, so the fingerprint is constant and cannot")
+        out("  separate the two. A limit of the comparison, not a finding.")
+        return d
+    out(f"  retrieval moved too (>= this many):  {d['retrieval_side_min']}")
+    out(f"  context fingerprint matched (<= this many, decoder): "
+        f"{d['decoder_side_max']}")
+    out(f"  fingerprint identical among CONCORDANT: "
+        f"{d['context_identical_rate_concordant']:.0%}")
+    out("  BOUNDS, NOT A PARTITION. The fingerprint is counts and flags, not")
+    out("  the retrieved text: two runs can hand the reader the same NUMBER")
+    out("  of different episodes. A fingerprint that DIFFERS proves the input")
+    out("  moved; one that MATCHES does not prove it did not. So retrieval is")
+    out("  a lower bound and the decoder an upper bound.")
+    out("")
+    if d["retrieval_side_min"]:
+        out("  Retrieval churn is OURS and is the only side a flag of ours can")
+        out("  reach — the reader already runs at temperature=0.0.")
+    else:
+        out("  No flip carried a moved fingerprint: nothing here points at our")
+        out("  retrieval, and the residue is provider-side non-determinism at")
+        out("  temperature=0.0, which no flag of ours removes.")
     return d
 
 
