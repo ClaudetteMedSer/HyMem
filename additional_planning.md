@@ -4173,3 +4173,65 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > mutation that deletes the restore. It uses a sentinel now. Third time this
 > shape has been caught by mutation-checking rather than by reading, and the
 > second time inside a module written to prevent it.
+
+> **RE-BASELINING 2026-09-02 — gate 4's bar is a coin flip, and both of its
+> constants come from a model that no longer exists. Offline, no spend.**
+> `benchmarks/lme_noise_model.py`, 13 tests, 7 mutations checked.
+>
+> **Provenance first.** Gate 4 is pre-registered as `OVERALL >= 70.0` with an
+> `MS floor 51.9`. Both numbers come from **one run** —
+> `longmemeval-v2-hymem-20260610T094858Z-seed0.json`, 2026-06-10, `deepseek-chat`
+> for BOTH answer and judge. `deepseek-chat` was **hard-deprecated 2026-07-24**
+> (`hymem/bootstrap.py:23`). The canonical is not reproducible, and it is being
+> used as a floor for runs on a different model.
+>
+> **Two independent noise estimates, which agree.** The failed run's accident
+> supplied what the project never had: two runs of an IDENTICAL arm over the
+> same 500 questions.
+>
+> | estimate | basis | SD of one run |
+> |---|---|---|
+> | PAIRED | 42/500 discordant questions, one same-arm pair | **0.92pp** |
+> | ERA | 9 comparable full-500 v4-flash runs, 2026-07-27 → 09-02 | **1.17pp** |
+>
+> ERA is the larger, as it must be — it contains real drift as well as churn.
+>
+> **How the bars behave against a change that does nothing:**
+>
+> | bar | era mean (n=9) | position | P(inert arm FAILS) |
+> |---|---|---|---|
+> | OVERALL >= 70.0 | 70.27, SD 1.17 | **+0.23 SD — dead centre** | **41%** |
+> | MS >= 51.9 | 54.30, SD 2.41 | −1.00 SD | 16% |
+>
+> Jointly, **an inert lever fails gate 4 about half the time.** A central
+> estimate is being used as a floor. That is the same defect as gate 3 and the
+> guard pair, in its third form: not a bar a no-effect change passes, but a bar
+> a no-effect change fails at random — equally uninformative, and more
+> expensive, because it invites a re-run.
+>
+> **The harness's resolution, which no re-baselining can fix.** McNemar on the
+> paired null: 42 discordant, so |b−c| must exceed 1.96·√42 ≈ 12.7 questions to
+> reject at α=.05 — **a minimum detectable effect of 2.54pp**. Gate 4 cannot
+> distinguish a 2pp regression from nothing, however the bar is set, and this
+> is set by CHURN, not sample size: LME-S has only 500 questions, so n cannot
+> be raised. **The only lever on resolution is the 8.4% verdict churn itself**
+> (greedy decoding, a deterministic judge, or judging twice and keeping
+> agreement). That would buy more than any bar change.
+>
+> **Proposed replacement, to be pre-registered before any re-run.** Drop both
+> absolute constants; both arms already run contemporaneously and share all
+> 500 ids, so the comparison should be PAIRED:
+>
+> 1. Score by McNemar on paired per-question outcomes, ON vs the OFF arm of
+>    the SAME session — never against a historical constant.
+> 2. **REGRESSION** iff ON is worse and the test rejects at α=.05.
+> 3. Otherwise **NO REGRESSION DETECTED, and the MDE is reported in the
+>    verdict** — the claim is "no regression larger than 2.5pp", never "no
+>    regression". A gate that cannot state its own resolution is how "71.0 vs
+>    71.0" became evidence in the first place.
+> 4. MS keeps a floor only as the same paired test on the MS subset; the
+>    absolute 51.9 goes, having no reproducible basis.
+>
+> This does not make gate 4 cheaper — still two arms of 500 — and it does not
+> make the flip motivated. It makes a gate 4 result mean something when it
+> arrives, which the pre-registered version would not have.
