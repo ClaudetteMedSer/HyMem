@@ -123,6 +123,7 @@ def decompose(a: dict, b: dict) -> dict:
     # Answer-side flips split by whether the reader's INPUT also moved.
     ctx_same, ctx_diff = [], []
     conc_ctx_same = 0
+    conc_diff_ctx_moved = 0
     exact_same = 0
     impossible = []
     for q in usable:
@@ -151,6 +152,11 @@ def decompose(a: dict, b: dict) -> dict:
                 conc_same.append(q)
             else:
                 conc_diff.append(q)
+                # The MATCHED control: the reader's text moved here too, and
+                # the verdict did not. Fingerprint movement in this group is
+                # movement that demonstrably did NOT cause a flip.
+                if context_fingerprint(ra) != context_fingerprint(rb):
+                    conc_diff_ctx_moved += 1
 
     n = len(usable)
     disc = len(judge_side) + len(answer_side)
@@ -186,6 +192,14 @@ def decompose(a: dict, b: dict) -> dict:
         "decoder_side_max": len(ctx_same),
         "context_identical_rate_concordant": (conc_ctx_same / conc
                                               if conc else None),
+        # Fingerprint-moved rate among DISCORDANT, against the matched group:
+        # concordant questions whose answer text also moved. If these agree,
+        # retrieval movement does not predict a flip and the count above is
+        # an association that is not there.
+        "ctx_moved_rate_discordant": (len(ctx_diff) / (len(ctx_diff) + len(ctx_same))
+                                      if (len(ctx_diff) + len(ctx_same)) else None),
+        "ctx_moved_rate_concordant_moved_answer": (
+            conc_diff_ctx_moved / len(conc_diff) if conc_diff else None),
         "context_available": (len(ctx_same) + conc_ctx_same) > 0,
         # A judge that saw byte-identical text twice and did not change its
         # mind. Zero flips out of a finite sample is NOT a zero rate, and
@@ -267,17 +281,37 @@ def report(d: dict, out=print) -> dict:
     out(f"  retrieval moved too (>= this many):  {d['retrieval_side_min']}")
     out(f"  context fingerprint matched (<= this many, decoder): "
         f"{d['decoder_side_max']}")
-    out(f"  fingerprint identical among CONCORDANT: "
-        f"{d['context_identical_rate_concordant']:.0%}")
+    out("")
+    out("  power check — does a moved fingerprint predict a flip?")
+    r_d = d["ctx_moved_rate_discordant"]
+    r_c = d["ctx_moved_rate_concordant_moved_answer"]
+    out(f"    fingerprint moved, among answer-side FLIPS:        "
+        f"{'—' if r_d is None else format(r_d, '.0%')}")
+    out(f"    fingerprint moved, among NON-flips whose answer also moved: "
+        f"{'—' if r_c is None else format(r_c, '.0%')}")
+    out("    That second group is the matched control: the reader's text")
+    out("    moved there too and the verdict held. If the two rates agree,")
+    out("    retrieval movement does not predict a flip, and the count above")
+    out("    is an association that is not present.")
     out("  BOUNDS, NOT A PARTITION. The fingerprint is counts and flags, not")
     out("  the retrieved text: two runs can hand the reader the same NUMBER")
     out("  of different episodes. A fingerprint that DIFFERS proves the input")
     out("  moved; one that MATCHES does not prove it did not. So retrieval is")
     out("  a lower bound and the decoder an upper bound.")
     out("")
-    if d["retrieval_side_min"]:
-        out("  Retrieval churn is OURS and is the only side a flag of ours can")
-        out("  reach — the reader already runs at temperature=0.0.")
+    out("")
+    if r_d is not None and r_c is not None and r_d > r_c:
+        out("  Moved retrieval is OVER-represented among flips, so some of")
+        out("  this churn is OURS and a flag of ours could reach it — the")
+        out("  reader already runs at temperature=0.0.")
+    elif r_d is not None and r_c is not None:
+        out("  Moved retrieval is NOT over-represented among flips: it is at")
+        out("  least as common where the verdict held. Retrieval churn is real")
+        out("  but is not what is flipping verdicts, and 'fix retrieval' does")
+        out("  not follow from these counts.")
+    elif d["retrieval_side_min"]:
+        out("  Moved retrieval seen, but with no matched control there is")
+        out("  nothing to compare it against.")
     else:
         out("  No flip carried a moved fingerprint: nothing here points at our")
         out("  retrieval, and the residue is provider-side non-determinism at")

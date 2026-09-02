@@ -263,3 +263,80 @@ def test_report_on_an_unavailable_context_split_prints_no_bounds():
     text = "\n".join(lines)
     assert "UNAVAILABLE" in text
     assert "retrieval moved too" not in text
+
+
+# --------------------------------------------------------------------------
+# The matched control for stage 2. Counting flips whose retrieval also moved
+# says nothing on its own: retrieval moves constantly on questions whose
+# verdict holds. Only the comparison licenses "fix retrieval".
+# --------------------------------------------------------------------------
+
+
+def test_the_matched_control_is_non_flips_whose_answer_also_moved():
+    """Not all concordant questions -- those include the stable ones, where
+    retrieval is stable for the same reason the answer is, which biases the
+    control down and makes retrieval look guilty."""
+    a = art(row("q1", True, "a", n_episodes=1),      # flip, ctx moved
+            row("q2", True, "b", n_episodes=1),      # holds, answer+ctx moved
+            row("q3", True, "same", n_episodes=1))   # holds, nothing moved
+    b = art(row("q1", False, "z", raw="no", n_episodes=9),
+            row("q2", True, "c", n_episodes=9),
+            row("q3", True, "same", n_episodes=1))
+    d = cd.decompose(a, b)
+    assert d["ctx_moved_rate_discordant"] == pytest.approx(1.0)
+    assert d["ctx_moved_rate_concordant_moved_answer"] == pytest.approx(1.0), \
+        "q2 is the matched control; q3 must not dilute it"
+
+
+def test_equal_rates_are_reported_as_no_association():
+    a = art(row("q1", True, "a", n_episodes=1), row("q2", True, "b", n_episodes=1),
+            row("q3", True, "keep"))
+    b = art(row("q1", False, "z", raw="no", n_episodes=9),
+            row("q2", True, "c", n_episodes=9), row("q3", True, "keep"))
+    lines: list[str] = []
+    cd.report(cd.decompose(a, b), out=lines.append)
+    text = "\n".join(lines)
+    assert "NOT over-represented" in text
+    assert "does\n  not follow" in text
+
+
+def test_over_representation_is_reported_as_ours_to_fix():
+    a = art(row("q1", True, "a", n_episodes=1), row("q2", True, "b", n_episodes=1),
+            row("q3", True, "keep"))
+    b = art(row("q1", False, "z", raw="no", n_episodes=9),
+            row("q2", True, "c", n_episodes=1),   # answer moved, ctx did not
+            row("q3", True, "keep"))
+    lines: list[str] = []
+    cd.report(cd.decompose(a, b), out=lines.append)
+    text = "\n".join(lines)
+    assert "OVER-represented" in text
+    assert "a flag of ours could reach it" in text
+
+
+def test_the_verdict_sentence_follows_the_control_not_the_raw_count():
+    """A non-zero retrieval count with a control that matches it must NOT
+    read as 'retrieval churn is ours to fix'. That inference is the whole
+    thing this control exists to block."""
+    a = art(row("q1", True, "a", n_episodes=1), row("q2", True, "b", n_episodes=1),
+            row("q3", True, "keep"))
+    b = art(row("q1", False, "z", raw="no", n_episodes=9),
+            row("q2", True, "c", n_episodes=9), row("q3", True, "keep"))
+    d = cd.decompose(a, b)
+    assert d["retrieval_side_min"] == 1, "the raw count is non-zero"
+    lines: list[str] = []
+    cd.report(d, out=lines.append)
+    assert "a flag of ours could reach it" not in "\n".join(lines)
+
+
+def test_the_matched_control_rate_is_printed_not_merely_computed():
+    """A verdict sentence derived from a number the reader never sees is a
+    number they cannot check. Both rates go on the page."""
+    a = art(row("q1", True, "a", n_episodes=1), row("q2", True, "b", n_episodes=1),
+            row("q3", True, "keep"))
+    b = art(row("q1", False, "z", raw="no", n_episodes=9),
+            row("q2", True, "c", n_episodes=9), row("q3", True, "keep"))
+    lines: list[str] = []
+    cd.report(cd.decompose(a, b), out=lines.append)
+    text = "\n".join(lines)
+    assert "among NON-flips whose answer also moved" in text
+    assert "among answer-side FLIPS" in text
