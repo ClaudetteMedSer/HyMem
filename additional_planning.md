@@ -4101,3 +4101,75 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > have gone on happening unobserved. `chunk_extraction_failures` is in-memory
 > and NOT persisted to `dream_runs` by design, so nothing on the box records
 > that this content was dropped. Worth its own item.
+
+> **STATUS 2026-09-02 — gate 4 DID NOT RUN. Both arms were the OFF arm. The
+> cost was 5.5h and ~2,000 reader calls, and the cause was a bug in the runner
+> script, not in the adapter or the lever.**
+>
+> `guard2_rerun.sh` defined `run_arm () { label="$1"; shift; ... "$@"; }` and
+> called `run_arm on`. `on` was consumed as the label, `shift` left `"$@"`
+> empty, and `--episode-granularity` was never passed. Both artifacts record
+> `episode_granularity_enabled=False`
+> (`…20260902T125748Z…`, `…20260902T154415Z…`; 9,850s and 9,986s, 500 answer
+> calls each).
+>
+> **The pre-flight did not catch it because the pre-flight tested the wrong
+> thing.** It drove the real parser with both command lines and proved they
+> differed in exactly `episode_granularity` — the command lines *intended*.
+> Nothing checked the argv the *script* built. That gap is the whole defect:
+> "the command I designed" and "the command the harness constructs" are
+> different objects, and only the second one spends money.
+>
+> **`guard_score.py` did exactly what it was built for**, one day after being
+> built for it: `[SAME_ARM] both arms recorded episode_granularity_enabled=False
+> -- this pair is not an A/B on that lever, whatever it is named`, INCOMPLETE,
+> exit 2, no accuracy computed. Without it this would have been read as a
+> null on the lever and very likely banked as gate 4 PASS: two arms named
+> off/on, 500 questions each, plausible scores, and a bar it clears.
+>
+> **What the spend did buy — the harness's test-retest floor at n=500, which
+> the project has never measured.** Two runs of the IDENTICAL arm:
+>
+> | | KU | MS | SSA | SSP | SSU | TR | **OVERALL** |
+> |---|---|---|---|---|---|---|---|
+> | run 1 | 70.5 | 53.4 | 64.3 | 66.7 | 94.3 | 71.4 | **68.6** |
+> | run 2 | 69.2 | 53.4 | 62.5 | 70.0 | 92.9 | 74.4 | **69.0** |
+> | delta | −1.3 | 0.0 | −1.8 | **+3.3** | −1.4 | **+3.0** | +0.4 |
+>
+> **42 of 500 questions (8.4%) flip verdict between two runs of the same arm**
+> (20 correct→wrong, 22 wrong→correct). Per-ability swings of ±3pp are pure
+> noise on n=30-133 cells. Read every past per-ability A/B claim in this
+> document against that: a ±3pp per-ability movement is not a finding, and
+> several banked ones are that size. OVERALL is far steadier (+0.4).
+>
+> **This also retires the last excuse for the 2026-08-30 pair.** Its 71.0 vs
+> 71.0 was tight enough to look like a clean null; two runs of one arm differ
+> by 0.4 and flip 8.4% of questions, so exact agreement was luck, and the
+> pair was uninformative for a second, independent reason.
+>
+> **AND IT RAISES A GATE-4 PROBLEM THAT MUST BE SETTLED BEFORE ANY RE-RUN.**
+> Gate 4's bar is the canonical **70.0 OVERALL**. Today's OFF arm — the
+> baseline, the same configuration — scores **68.6 and 69.0. The baseline no
+> longer clears the bar the ON arm is required to clear.** MS is 53.4 in both
+> and still clears its 51.9 floor, so the problem is OVERALL specifically.
+> Either the canonical has drifted (model, endpoint, or dataset-side) or 70.0
+> was always inside the noise band of a run that happened to land high. A
+> re-run of gate 4 against an unreachable bar would fail for reasons that have
+> nothing to do with episode granularity, and would cost another 5.5h to say
+> so. **Gate 4 must be re-baselined before it is re-run.** The two OFF arms
+> above are, unintentionally, most of the material for doing that offline.
+>
+> **Fixed: `benchmarks/assert_arm.py`** — parses the argv the runner is about
+> to execute with the adapter's OWN parser and fails if the lever does not
+> match the arm's label. It is `arm_evidence` moved from after the run to
+> before it: one reads the config block a run wrote, the other the argv a run
+> is about to use. `guard2_rerun.sh` now builds the argv ONCE into an array,
+> asserts it, and executes that same array. Run against the argv that cost
+> this run it exits 1. 20 tests, 5 mutations checked.
+>
+> One of those tests was itself vacuous and green: it captured ambient
+> `sys.argv` as its "before", and an earlier test in the same file had already
+> leaked, so the captured value WAS the leaked value. It passed against the
+> mutation that deletes the restore. It uses a sentinel now. Third time this
+> shape has been caught by mutation-checking rather than by reading, and the
+> second time inside a module written to prevent it.
