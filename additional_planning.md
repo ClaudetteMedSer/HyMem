@@ -4044,3 +4044,60 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > fail; treat SAME_ARM as evidenced: 3; orient by argv order: 1; read the bar
 > on the OFF arm: 4; drop either bar: 3 and 1; read a missing n_episodes as no
 > effect: 6; define fired as counts that MATCH: 2; drop the caveat: 2).
+
+> **STATUS 2026-09-02 — gate 5 RAN and PASSED, 10:01-10:13Z, all seven
+> criteria.** Four legs on a sqlite-backup snapshot of the production store
+> (110 sessions, 101 digested, 1218 episodes at snapshot time).
+>
+> | leg | granular | elapsed | calls | digest blob/gran | episodes |
+> |---|---|---|---|---|---|
+> | settle | False | 263.9s | 9 | 0/0 | 1218 |
+> | before | False | 163.6s | 5 | 0/0 | 1218 |
+> | migrate | True | 289.7s | 90 | **0/39** | 1239 |
+> | after | True | **34.4s** | 1 | **0/0** | 1239 |
+>
+> **The architectural claim the gate exists to test holds exactly.** Flipping
+> the lever re-digests each session once and then returns to zero tail calls:
+> `after` made 0 digest calls against `before`'s 0, and ran in 34.4s against
+> 163.6s. The steady state is not merely bounded, it is cheaper than the
+> baseline cycle. One-time migration cost: **39 digest calls, 290s, 566,189
+> prompt chars** — the whole price of the flip on this store.
+>
+> The migrate leg sent 39 granular digest prompts and **zero blob ones**, and
+> 39 new stamps landed for 39 calls. Both stamp criteria are tight (100.0%,
+> and no stamp without a call). Zero digest failures, zero fusion failures on
+> both granular legs.
+>
+> **What the run does NOT establish, stated because the number invites the
+> error.** `migrate` created 112 episodes across 39 sessions (2.87 per
+> session) while the store's total moved only 1218 → 1239 (+21): supersession
+> replaced roughly 91 rows. On those 39 sessions the count went 240 → 261.
+> **240 is accumulated state, not one blob pass's output** — the store has
+> been dreaming under the blob prompt for months — so no per-pass blob rate
+> can be read off it, and the tempting "blob makes 6.15/session, granular
+> makes 6.69" comparison is between two different kinds of number. The
+> measurement that would settle it is a blob re-digest of the same 39 sessions
+> on a fresh snapshot (~39 digest calls); it was not run.
+>
+> **What it does establish, and it bears on the flip decision.** Per-session
+> episode counts on those 39 sessions moved median **3.0 → 5.0** (mean 6.15 →
+> 6.69). Both medians sit inside G-EP1's criterion 2 band, "median episodes per
+> substantive session in [3, 8] **on the target arm**". That criterion was
+> pre-registered against the target arm alone with no baseline arm measured —
+> so on this corpus it is satisfied by the store's blob-era shape as well, and
+> its PASS is not by itself evidence that granularity changed the shape. Same
+> defect class as gate 3 and as the 2026-08-30 guard pair: a bar that a
+> no-effect change also clears. It does not retract G-EP1's PASS, which was
+> measured elsewhere and included a faithfulness hand-score that this does not
+> touch; it says criterion 2 specifically cannot carry the discrimination
+> weight the flip argument has been putting on it.
+>
+> **Unrelated finding, banked separately because it is about the live store
+> and not about Plan C.** The blob legs logged 11 `chunk_extraction.parse_failure`
+> events and **2 chunks abandoned after 3 attempts with `content_lost=1`**
+> (`chk_c7aaa821…`, `chk_9a7e13b7…`), on raw payloads of 24-28KB. Both
+> occurred on `settle`/`before`, i.e. the OFF arm, so the granularity lever did
+> not cause them; they are the production store's existing condition and would
+> have gone on happening unobserved. `chunk_extraction_failures` is in-memory
+> and NOT persisted to `dream_runs` by design, so nothing on the box records
+> that this content was dropped. Worth its own item.
