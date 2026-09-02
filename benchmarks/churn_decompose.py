@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Where does the 8.4% verdict churn live -- the reader, or the judge?
+
+`lme_noise_model.py` established that gate 4's resolution is set by churn and
+not by sample size: 42 of 500 paired questions flipped between two runs of an
+IDENTICAL arm, so the minimum detectable effect is 2.54pp however the bar is
+drawn. LME-S has only 500 questions, so n cannot be raised. The only lever is
+the churn itself -- and which fix to reach for depends entirely on which side
+of the pipeline produces it:
+
+  * JUDGE-SIDE churn -- the two runs produced the SAME answer text and the
+    judge scored it differently. Cheap to attack: the judge call is
+    max_tokens=10, so majority-of-three costs two extra tiny calls per
+    question against a reader call carrying the whole episode pool.
+  * ANSWER-SIDE churn -- the reader produced different text. Attacking that
+    means touching retrieval or decoding, and it is already temperature=0.0
+    (`longmemeval_adapter.py:1099`); the residue is provider-side
+    non-determinism, which no flag of ours removes.
+
+So the split decides whether judge-voting is worth building or is theatre.
+
+WHAT MAKES THIS INSTRUMENT NON-VACUOUS. Hypothesis identity is only evidence
+about a flip if it VARIES. If no two runs ever produce the same answer string,
+"0% judge-side" is a fact about exact string comparison, not about the judge,
+and this module says UNAVAILABLE rather than reporting a zero. It therefore
+always prints the identical-hypothesis rate among CONCORDANT questions as the
+control: the decomposition carries information only to the extent that rate
+differs from the discordant one.
+
+Offline: reads two artifacts of the same arm, makes no call.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+
+# 1.96 sigma, two-sided alpha = 0.05 -- the same convention as lme_noise_model.
+Z95 = 1.959963985
+
+
+def norm_hypothesis(s) -> str:
+    """Whitespace-insensitive answer identity.
+
+    A reply that differs only in wrapping is not a different answer, and
+    counting it as reader churn would inflate the side of the split that is
+    expensive to fix. The exact-match count is reported alongside so the
+    choice is visible rather than buried."""
+    return " ".join(str(s or "").split())
+
+
+def is_scored(r: dict) -> bool:
+    """D3: a judge that never answered is UNSCORED, not wrong.
+
+    Such a row has no verdict to flip, so counting it as concordant would
+    dilute the churn rate with rows the judge never read."""
+    return r.get("correct") is not None and not r.get("judge_error")
+
+
+def decompose(a: dict, b: dict) -> dict:
+    ar = {r["question_id"]: r for r in a.get("per_question", [])}
+    br = {r["question_id"]: r for r in b.get("per_question", [])}
+    shared = sorted(set(ar) & set(br))
+    if not shared:
+        raise ValueError("the two runs share no question ids")
+
+    unscored = [q for q in shared if not (is_scored(ar[q]) and is_scored(br[q]))]
+    usable = [q for q in shared if q not in set(unscored)]
+
+    judge_side, answer_side, conc_same, conc_diff = [], [], [], []
+    exact_same = 0
+    impossible = []
+    for q in usable:
+        ra, rb = ar[q], br[q]
+        same_hyp = norm_hypothesis(ra.get("hypothesis")) == \
+            norm_hypothesis(rb.get("hypothesis"))
+        if str(ra.get("hypothesis") or "") == str(rb.get("hypothesis") or ""):
+            exact_same += 1
+        flipped = bool(ra.get("correct")) != bool(rb.get("correct"))
+        if flipped and same_hyp:
+            judge_side.append(q)
+            # Same answer AND the same raw judge reply, yet a different
+            # verdict, would mean the PARSER is non-deterministic. It is pure
+            # string logic, so this set must be empty; if it is not, the
+            # artifact is lying and the split cannot be read.
+            if str(ra.get("judge_raw") or "") == str(rb.get("judge_raw") or ""):
+                impossible.append(q)
+        elif flipped:
+            answer_side.append(q)
+        elif same_hyp:
+            conc_same.append(q)
+        else:
+            conc_diff.append(q)
+
+    n = len(usable)
+    disc = len(judge_side) + len(answer_side)
+    conc = len(conc_same) + len(conc_diff)
+    ident_disc = len(judge_side) / disc if disc else None
+    ident_conc = len(conc_same) / conc if conc else None
+    return {
+        "shared": len(shared),
+        "unscored": len(unscored),
+        "n": n,
+        "discordant": disc,
+        "judge_side": len(judge_side),
+        "answer_side": len(answer_side),
+        "concordant_same_hyp": len(conc_same),
+        "concordant_diff_hyp": len(conc_diff),
+        "exact_same_hypothesis": exact_same,
+        "identical_rate_discordant": ident_disc,
+        "identical_rate_concordant": ident_conc,
+        # No question anywhere repeated its answer -> hypothesis identity is
+        # constant, and a constant cannot explain a difference.
+        "available": (len(judge_side) + len(conc_same)) > 0,
+        "parser_impossible": impossible,
+        "judge_share": (len(judge_side) / disc) if disc else None,
+        # What the MDE would become if judge-side churn were eliminated
+        # outright. The floor a perfect judge buys -- not a promise that
+        # majority voting reaches it.
+        "mde_pp": 100.0 * Z95 * math.sqrt(disc) / n if disc and n else None,
+        "mde_pp_judge_free": (100.0 * Z95 * math.sqrt(len(answer_side)) / n
+                              if len(answer_side) and n else None),
+        "judge_side_ids": judge_side,
+        "answer_side_ids": answer_side,
+    }
+
+
+def report(d: dict, out=print) -> dict:
+    out("=== churn decomposition (two runs of ONE arm) ===")
+    out(f"  shared questions: {d['shared']}   unscored (judge error): "
+        f"{d['unscored']}   usable: {d['n']}")
+    out("")
+    if not d["available"]:
+        out("  UNAVAILABLE — no question produced the same answer text twice,")
+        out("  so hypothesis identity is constant and cannot explain a flip.")
+        out("  This is a limit of exact-text comparison, NOT a finding that")
+        out("  the judge is stable.")
+        return d
+    if d["parser_impossible"]:
+        out(f"  ⚠ {len(d['parser_impossible'])} rows have the same answer AND "
+            "the same raw judge reply")
+        out("    but different verdicts. The parser is pure string logic, so "
+            "that cannot")
+        out("    happen: the artifact is inconsistent and the split below is "
+            "not readable.")
+        out(f"    ids: {', '.join(d['parser_impossible'][:5])}")
+        out("")
+    out(f"  discordant: {d['discordant']}/{d['n']} "
+        f"({100.0 * d['discordant'] / d['n']:.1f}%)")
+    out(f"    judge-side  (same answer, different verdict): {d['judge_side']}")
+    out(f"    answer-side (different answer):               {d['answer_side']}")
+    out(f"  concordant: {d['concordant_same_hyp'] + d['concordant_diff_hyp']}"
+        f"  [same answer {d['concordant_same_hyp']}, "
+        f"different {d['concordant_diff_hyp']}]")
+    out("")
+    out("=== power check — does answer identity carry information? ===")
+    out(f"  same answer, among DISCORDANT: "
+        f"{d['identical_rate_discordant']:.0%}")
+    out(f"  same answer, among CONCORDANT: "
+        f"{d['identical_rate_concordant']:.0%}")
+    out("  The split is informative only insofar as these differ. If they")
+    out("  match, answer identity predicts nothing about a flip and the")
+    out("  judge/reader attribution below is not supported.")
+    out("")
+    out("=== what a perfect judge would buy ===")
+    out(f"  judge-side share of churn: {d['judge_share']:.0%}")
+    out(f"  MDE now:                       {d['mde_pp']:.2f}pp")
+    if d["mde_pp_judge_free"] is None:
+        out("  MDE with judge churn removed:  0.00pp (no answer-side churn "
+            "at all)")
+    else:
+        out(f"  MDE with judge churn removed:  "
+            f"{d['mde_pp_judge_free']:.2f}pp")
+    out("  That is a FLOOR, not a forecast: majority voting reduces judge")
+    out("  churn, it does not abolish it.")
+    return d
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("a")
+    p.add_argument("b")
+    args = p.parse_args()
+    a = json.loads(Path(args.a).read_text())
+    b = json.loads(Path(args.b).read_text())
+    report(decompose(a, b))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
