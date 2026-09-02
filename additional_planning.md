@@ -3937,3 +3937,78 @@ prose arm (≈10/12 precision overall vs 1/3 there)? Do not answer it by moving
 
 Also fixed: `judge_scored`'s docstring said five call sites (six), and
 `judge_audit.py` said four `recites_gold` callers (three).
+
+> **PRE-REGISTRATION 2026-09-02 — gates 4 and 5 run at 10:01Z, and this block
+> is committed before they do.** The user authorized the spend for both. What
+> follows is fixed before any number exists; the scorers are committed with it.
+>
+> **Gate 4 — the LME full guard, re-run so it can evidence itself.** Two arms,
+> sequential, identical but for one flag:
+>
+> ```
+> --scales S --sample 0 --seed 0 --workers 8 --top-k 15 --auto-ability
+> --permissive-default --answer-model deepseek-v4-flash
+> --answer-base-url https://api.deepseek.com
+> --answer-extra-body '{"thinking":{"type":"disabled"}}'
+> --judge-model deepseek-v4-flash
+> --judge-extra-body '{"thinking":{"type":"disabled"}}'
+> ```
+>
+> plus `--episode-granularity` on the ON arm and nothing else. That reproduces
+> the 2026-08-30/31 pair's config exactly (`workers: 8`, `sample: 0`, full 500)
+> so the new numbers are comparable to the old ones, and to the canonical.
+>
+> **The pre-flight was run offline and is the reason this spends at all.** The
+> real parser was driven with both command lines and the namespaces diffed:
+> they differ in exactly `episode_granularity` and nothing else, and
+> `run_registry.arm_evidence()` on the config blocks those args produce returns
+> **EVIDENCED, confounds []**. So the failure that voided the last pair is
+> excluded *before* the API time, not diagnosed after it. Nothing about the
+> scores was pre-flighted, and nothing could be.
+>
+> **The bar is unchanged and is NON-REGRESSION ONLY** — canonical 70.0 OVERALL,
+> MS floor 51.9. Order of reading is fixed here: `arm_evidence` first, scores
+> second. If the pair reads UNEVIDENCED or SAME_ARM the run is INCOMPLETE and
+> the scores are not read at all, because a number that cannot say which arm
+> produced it is the thing this re-run exists to stop. A PASS discharges gate 4
+> and nothing else; it remains a bar a change with no effect also clears, which
+> is the point gate 3's retirement made and this run does not alter.
+>
+> **Gate 5 — the dream cost watch, on a SNAPSHOT.** `benchmarks/
+> dream_cost_watch.py`, four legs against one sqlite-backup copy of the
+> production store: `settle` (OFF, bring to steady state), `before` (OFF, the
+> baseline), `migrate` (ON, the one-time re-digest), `after` (ON, the steady
+> state under test). The gated comparison is `after` vs `before`; `migrate` is
+> reported, not gated, because a one-off is a price and not a regression.
+>
+> It runs on a copy because the production store dreams on a schedule (rows
+> 1394-1397 all landed 2026-09-01). Flipping the lever on it would rewrite live
+> episode rows to take a reading, and let the scheduled dreamer interleave with
+> the measurement — mutating the user's memory AND getting a worse number for
+> it.
+>
+> Criteria live in `dream_cost_watch.evaluate` and are committed with this
+> block: the migrate leg must have sent the GRANULAR digest prompt and no blob
+> one (attributed by prompt identity at the call, never by the `granularity`
+> field the runner wrote — gate 4's lesson, applied before it could recur);
+> new stamps/granular calls in [0.90, 1.0]; `after` digest calls <= `before`
+> + 5; `after` wall clock within max(2x, +60s) of `before`; zero digest and
+> fusion failures on both granular legs. 19 tests, 12 mutations checked.
+>
+> **Two things the pre-flight found that would have made the run lie.** A dress
+> rehearsal with a stub LLM (no network, no spend) digested **40 of 110
+> sessions**, not 110: `run_dreaming` mints no fallback chunk for a session
+> with no user/assistant content and `continue`s before the digest, so 70 empty
+> stubs can never carry a stamp however the lever is set. The first cut of the
+> stamp criterion was keyed on the session count and would have read FAIL at
+> 36% coverage — charging the flip for the store's own shape. The denominator
+> is now granular calls SENT. Separately, the first cut of the two stamp
+> criteria was one inequality written twice with different constants; no test
+> could distinguish them and deleting either changed nothing. Mutation-checking
+> found it, not review, and it is now a genuine two-sided bound (calls that
+> land no stamp; stamps with no call behind them) with a test for each side.
+>
+> A third fact worth banking regardless of the gate: 61 sessions carry a
+> `digested_prompt_version` but are no longer digestible. They were digested
+> when they had content and no longer yield a chunk or a fallback. That is
+> recorded in the census as `digested` and gated on nothing.
