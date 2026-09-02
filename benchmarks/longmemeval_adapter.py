@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ast
 import gc
+import hashlib
 import json
 import os
 import re
@@ -1028,14 +1029,59 @@ def _render_answer_context(memories: list[dict], ability: str | None,
     return "\n".join(parts) if parts else "No relevant memories found."
 
 
-def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str = None,
-                    total_matches: int = 0, graph_count=None, temporal_events: list | None = None,
-                    aggregation_nodes: list | None = None,
-                    question_date: str = "", permissive_default: bool = False,
-                    distilled: list[str] | None = None,
-                    extra_system: str | None = None,
-                    narrative_facts: list[str] | None = None) -> str:
-    """Ask LLM to answer based on retrieved memories.
+def context_sha(messages: list[dict]) -> str:
+    """A fingerprint of exactly what the reader was handed.
+
+    `churn_decompose` had to attribute run-to-run answer churn using the COUNT
+    fields the artifact records (n_episodes, n_facts, ability_used, ...), which
+    cannot tell "the same 15 episodes" from "15 different episodes". That made
+    its retrieval/decoder split a pair of bounds rather than a partition, and
+    the same lower-bound caveat sits on `guard_score.fired_subset`.
+
+    Hashing the rendered prompt closes the gap for every future run at zero
+    cost: two runs whose context_sha AGREE handed the reader byte-identical
+    input, so any difference in the answer is the provider's decoder and
+    nothing of ours. It is 64 hex chars per question and no extra call.
+
+    The system prompt is included deliberately -- the MR branch swaps both the
+    prompt and the memory list, and a fingerprint that missed that would call
+    two different reader configurations identical.
+
+    Fields are LENGTH-PREFIXED, not separated by a delimiter. A delimiter is
+    only injective while no field contains it, and retrieved turns are
+    arbitrary text: under `role + NUL + content + NUL`, the two-message list
+    [("a","b"), ("c","d")] and the one-message list [("a\x00b","c\x00d")]
+    hash identically. Two different reader inputs that collide is precisely
+    the failure this fingerprint exists to make impossible."""
+    h = hashlib.sha256()
+    for m in messages:
+        for field in (m.get("role", ""), m.get("content", "")):
+            raw = field.encode()
+            h.update(str(len(raw)).encode())
+            h.update(b":")
+            h.update(raw)
+    return h.hexdigest()
+
+
+def answer_question(*args, **kwargs) -> str:
+    """`answer_question_raw`, dropping the context fingerprint.
+
+    Byte-identical in behaviour and signature to the function three other
+    adapters (beam, locomo, msc) already import, which is why the split is
+    shaped this way rather than by changing every caller -- the same pattern
+    `judge_answer` uses over `judge_answer_raw`, for the same reason."""
+    return answer_question_raw(*args, **kwargs)[0]
+
+
+def answer_question_raw(llm: LLMClient, memories: list[dict], question: str,
+                        ability: str = None, total_matches: int = 0,
+                        graph_count=None, temporal_events: list | None = None,
+                        aggregation_nodes: list | None = None,
+                        question_date: str = "", permissive_default: bool = False,
+                        distilled: list[str] | None = None,
+                        extra_system: str | None = None,
+                        narrative_facts: list[str] | None = None) -> tuple[str, str]:
+    """Ask LLM to answer based on retrieved memories. Returns (answer, sha).
 
     Uses ability-aware prompts and expanded context for multi-session
     and temporal reasoning questions that need more cross-session data.
@@ -1096,7 +1142,8 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         {"role": "user", "content": f"{today_line}CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
-    return llm.chat(messages, temperature=0.0, max_tokens=1024)
+    return llm.chat(messages, temperature=0.0, max_tokens=1024), \
+        context_sha(messages)
 
 
 def get_judge_prompt(question_type: str, question: str, answer: str, response: str) -> str:
@@ -1472,12 +1519,13 @@ def evaluate_question(
               f"{len(distilled_lines)} lines kept", flush=True)
 
     # Answer
-    ai_answer = answer_question(llm, memories, question, ability=ability, total_matches=total_matches,
-                                 graph_count=graph_count, temporal_events=temporal_events,
-                                 aggregation_nodes=aggregation_nodes,
-                                 question_date=question_date, permissive_default=permissive_default,
-                                 distilled=distilled_lines,
-                                 narrative_facts=narrative_facts)
+    ai_answer, ctx_sha = answer_question_raw(
+        llm, memories, question, ability=ability, total_matches=total_matches,
+        graph_count=graph_count, temporal_events=temporal_events,
+        aggregation_nodes=aggregation_nodes,
+        question_date=question_date, permissive_default=permissive_default,
+        distilled=distilled_lines,
+        narrative_facts=narrative_facts)
 
     _ep_texts = [m["content"] for m in memories
                  if isinstance(m, dict) and m.get("type") == "episode"]
@@ -1503,6 +1551,11 @@ def evaluate_question(
         # rows to measure a rate that had already been produced once. ~10 tokens.
         "judge_raw": judge_raw,
         "judge_error": correct is None,
+        # What the reader was HANDED, hashed. Two runs that agree here gave
+        # the reader byte-identical input, so a differing answer is the
+        # provider's decoder and nothing of ours -- which is the distinction
+        # `churn_decompose` can currently only bound. See `context_sha`.
+        "context_sha": ctx_sha,
         "num_sessions": stats["sessions"],
         "num_messages": stats["messages"],
         "num_memories": len(memories),

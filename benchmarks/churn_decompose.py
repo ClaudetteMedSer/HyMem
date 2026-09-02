@@ -86,7 +86,20 @@ CONTEXT_FIELDS = (
 )
 
 
-def context_fingerprint(r: dict) -> tuple:
+def fingerprint_mode(rows) -> str:
+    """"exact" if every row carries `context_sha`, "counts" if none do.
+
+    "mixed" is the case that matters. An artifact predating `context_sha`
+    compared against one that has it would find NO fingerprint ever matching
+    and read as "every flip moved retrieval" -- a fact about the two schemas,
+    not about the runs. The comparison is refused rather than reported."""
+    have = sum(1 for r in rows if r.get("context_sha"))
+    if have == 0:
+        return "counts"
+    return "exact" if have == len(rows) else "mixed"
+
+
+def context_fingerprint(r: dict, mode: str = "counts") -> tuple:
     """What the reader saw, to the resolution the artifact records.
 
     READ THE LIMIT. These are COUNTS and flags, not the retrieved text: two
@@ -97,8 +110,14 @@ def context_fingerprint(r: dict) -> tuple:
     an upper bound on decoder churn, never as a partition.
 
     It is the same lower-bound caveat `guard_score.fired_subset` carries, for
-    the same reason, and it must not be quietly dropped here."""
-    return tuple(r.get(k) for k in CONTEXT_FIELDS)
+    the same reason, and it must not be quietly dropped here.
+
+    Under mode="exact" the row carries `context_sha` -- a hash of the rendered
+    reader prompt, added to the adapter for exactly this -- and the caveat
+    lifts: the split becomes a partition rather than a pair of bounds."""
+    if mode == "exact":
+        return ("sha", r.get("context_sha"))
+    return ("counts",) + tuple(r.get(k) for k in CONTEXT_FIELDS)
 
 
 def is_scored(r: dict) -> bool:
@@ -118,6 +137,18 @@ def decompose(a: dict, b: dict) -> dict:
 
     unscored = [q for q in shared if not (is_scored(ar[q]) and is_scored(br[q]))]
     usable = [q for q in shared if q not in set(unscored)]
+
+    modes = {fingerprint_mode([ar[q] for q in usable]),
+             fingerprint_mode([br[q] for q in usable])}
+    fp_mode = modes.pop() if len(modes) == 1 else "mixed"
+    if fp_mode == "mixed":
+        raise ValueError(
+            "one run records context_sha and the other does not; every "
+            "fingerprint would differ and the split would describe the two "
+            "schemas rather than the two runs")
+
+    def fp(r):
+        return context_fingerprint(r, fp_mode)
 
     judge_side, answer_side, conc_same, conc_diff = [], [], [], []
     # Answer-side flips split by whether the reader's INPUT also moved.
@@ -143,10 +174,10 @@ def decompose(a: dict, b: dict) -> dict:
                 impossible.append(q)
         elif flipped:
             answer_side.append(q)
-            (ctx_same if context_fingerprint(ra) == context_fingerprint(rb)
+            (ctx_same if fp(ra) == fp(rb)
              else ctx_diff).append(q)
         else:
-            if context_fingerprint(ra) == context_fingerprint(rb):
+            if fp(ra) == fp(rb):
                 conc_ctx_same += 1
             if same_hyp:
                 conc_same.append(q)
@@ -155,7 +186,7 @@ def decompose(a: dict, b: dict) -> dict:
                 # The MATCHED control: the reader's text moved here too, and
                 # the verdict did not. Fingerprint movement in this group is
                 # movement that demonstrably did NOT cause a flip.
-                if context_fingerprint(ra) != context_fingerprint(rb):
+                if fp(ra) != fp(rb):
                     conc_diff_ctx_moved += 1
 
     n = len(usable)
@@ -201,6 +232,7 @@ def decompose(a: dict, b: dict) -> dict:
         "ctx_moved_rate_concordant_moved_answer": (
             conc_diff_ctx_moved / len(conc_diff) if conc_diff else None),
         "context_available": (len(ctx_same) + conc_ctx_same) > 0,
+        "fingerprint_mode": fp_mode,
         # A judge that saw byte-identical text twice and did not change its
         # mind. Zero flips out of a finite sample is NOT a zero rate, and
         # reporting it as one is the same overclaim as a bar with no interval.
@@ -278,9 +310,14 @@ def report(d: dict, out=print) -> dict:
         out("  context fingerprint, so the fingerprint is constant and cannot")
         out("  separate the two. A limit of the comparison, not a finding.")
         return d
-    out(f"  retrieval moved too (>= this many):  {d['retrieval_side_min']}")
-    out(f"  context fingerprint matched (<= this many, decoder): "
-        f"{d['decoder_side_max']}")
+    exact = d["fingerprint_mode"] == "exact"
+    out(f"  fingerprint: {d['fingerprint_mode']}"
+        + ("  (context_sha — the rendered reader prompt, hashed)" if exact
+           else "  (counts and flags, not content)"))
+    out(f"  retrieval moved too: "
+        f"{d['retrieval_side_min']}" + ("" if exact else " (>= this many)"))
+    out(f"  fingerprint matched, so decoder-side: "
+        f"{d['decoder_side_max']}" + ("" if exact else " (<= this many)"))
     out("")
     out("  power check — does a moved fingerprint predict a flip?")
     r_d = d["ctx_moved_rate_discordant"]
@@ -293,12 +330,19 @@ def report(d: dict, out=print) -> dict:
     out("    moved there too and the verdict held. If the two rates agree,")
     out("    retrieval movement does not predict a flip, and the count above")
     out("    is an association that is not present.")
-    out("  BOUNDS, NOT A PARTITION. The fingerprint is counts and flags, not")
-    out("  the retrieved text: two runs can hand the reader the same NUMBER")
-    out("  of different episodes. A fingerprint that DIFFERS proves the input")
-    out("  moved; one that MATCHES does not prove it did not. So retrieval is")
-    out("  a lower bound and the decoder an upper bound.")
     out("")
+    if exact:
+        out("  A PARTITION. The fingerprint is the rendered reader prompt,")
+        out("  hashed, so the decoder-side questions were handed")
+        out("  byte-identical text and nothing of ours produced the")
+        out("  difference there.")
+    else:
+        out("  BOUNDS, NOT A PARTITION. The fingerprint is counts and flags,")
+        out("  not the retrieved text: two runs can hand the reader the same")
+        out("  NUMBER of different episodes. A fingerprint that DIFFERS proves")
+        out("  the input moved; one that MATCHES does not prove it did not. So")
+        out("  retrieval is a lower bound and the decoder an upper bound.")
+        out("  Runs carrying `context_sha` lift this caveat.")
     out("")
     if r_d is not None and r_c is not None and r_d > r_c:
         out("  Moved retrieval is OVER-represented among flips, so some of")

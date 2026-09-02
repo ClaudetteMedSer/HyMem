@@ -340,3 +340,114 @@ def test_the_matched_control_rate_is_printed_not_merely_computed():
     text = "\n".join(lines)
     assert "among NON-flips whose answer also moved" in text
     assert "among answer-side FLIPS" in text
+
+
+# --------------------------------------------------------------------------
+# `context_sha` mode. Runs recording the hashed reader prompt turn the
+# retrieval/decoder bounds into a partition -- but only if the two runs speak
+# the same schema.
+# --------------------------------------------------------------------------
+
+
+def test_a_sha_pair_is_read_in_exact_mode():
+    d = cd.decompose(
+        art(row("q1", True, "a", context_sha="X"), row("q2", True, "k", context_sha="Y")),
+        art(row("q1", False, "b", raw="no", context_sha="X"),
+            row("q2", True, "k", context_sha="Y")))
+    assert d["fingerprint_mode"] == "exact"
+    assert d["decoder_side_max"] == 1, "same prompt, different answer"
+
+
+def test_exact_mode_ignores_the_count_fields():
+    """Under a hash the counts are redundant, and letting them vote would
+    reintroduce the resolution problem the hash exists to remove."""
+    d = cd.decompose(
+        art(row("q1", True, "a", context_sha="X", n_episodes=3),
+            row("q2", True, "k", context_sha="Y")),
+        art(row("q1", False, "b", raw="no", context_sha="X", n_episodes=99),
+            row("q2", True, "k", context_sha="Y")))
+    assert d["decoder_side_max"] == 1 and d["retrieval_side_min"] == 0
+
+
+def test_a_moved_sha_is_retrieval_side():
+    d = cd.decompose(
+        art(row("q1", True, "a", context_sha="X"), row("q2", True, "k", context_sha="Y")),
+        art(row("q1", False, "b", raw="no", context_sha="Z"),
+            row("q2", True, "k", context_sha="Y")))
+    assert d["retrieval_side_min"] == 1 and d["decoder_side_max"] == 0
+
+
+def test_one_run_with_sha_and_one_without_is_REFUSED():
+    """The load-bearing guard. An artifact predating `context_sha` compared
+    against one that has it would match no fingerprint anywhere and read as
+    'every flip moved retrieval' -- a fact about the two schemas, not the two
+    runs, and it would look exactly like a real finding."""
+    with pytest.raises(ValueError, match="schemas"):
+        cd.decompose(art(row("q1", True, "a", context_sha="X"),
+                         row("q2", True, "k", context_sha="Y")),
+                     art(row("q1", False, "b", raw="no"), row("q2", True, "k")))
+
+
+def test_a_partly_stamped_run_is_REFUSED_not_read_as_counts():
+    """Half the rows carrying a sha is neither mode, and silently falling
+    back to counts would score half the run on a fingerprint the other half
+    does not use."""
+    with pytest.raises(ValueError, match="schemas"):
+        cd.decompose(art(row("q1", True, "a", context_sha="X"), row("q2", True, "k")),
+                     art(row("q1", False, "b", raw="no"), row("q2", True, "k")))
+
+
+def test_two_runs_BOTH_partly_stamped_are_refused_too():
+    """The pair looks self-consistent -- both runs are stamped the same way --
+    so a mode check that only compares the two runs to each other passes it
+    through. `fingerprint_mode` has to reject a single run that is partly
+    stamped, not merely a pair that disagrees.
+
+    Found by a mutation that called any stamped row "exact" and survived: the
+    fixture above makes the PAIR mixed, so it could never have caught it."""
+    with pytest.raises(ValueError, match="schemas"):
+        cd.decompose(
+            art(row("q1", True, "a", context_sha="X"), row("q2", True, "k")),
+            art(row("q1", False, "b", raw="no", context_sha="X"),
+                row("q2", True, "k")))
+
+
+def test_fingerprint_mode_rejects_a_partly_stamped_run_on_its_own():
+    assert cd.fingerprint_mode([{"context_sha": "X"}, {}]) == "mixed"
+    assert cd.fingerprint_mode([{"context_sha": "X"}]) == "exact"
+    assert cd.fingerprint_mode([{}, {}]) == "counts"
+
+
+def test_a_legacy_pair_still_reads_in_counts_mode():
+    d = cd.decompose(art(row("q1", True, "a", n_episodes=1), row("q2", True, "k")),
+                     art(row("q1", False, "b", raw="no", n_episodes=1),
+                         row("q2", True, "k")))
+    assert d["fingerprint_mode"] == "counts"
+
+
+def test_the_report_says_which_fingerprint_it_used():
+    """A reader who cannot tell counts-mode from exact-mode cannot tell a
+    bound from a partition."""
+    lines: list[str] = []
+    cd.report(cd.decompose(
+        art(row("q1", True, "a", context_sha="X"), row("q2", True, "k", context_sha="Y")),
+        art(row("q1", False, "b", raw="no", context_sha="X"),
+            row("q2", True, "k", context_sha="Y"))), out=lines.append)
+    text = "\n".join(lines)
+    assert "A PARTITION" in text and "BOUNDS, NOT A PARTITION" not in text
+    # The MODE ITSELF, not just the explanatory suffix beside it: a report
+    # that drops the word is one a reader cannot check the partition claim
+    # against.
+    assert "fingerprint: exact" in text
+
+
+def test_the_counts_report_still_carries_the_bounds_caveat():
+    lines: list[str] = []
+    cd.report(cd.decompose(
+        art(row("q1", True, "a", n_episodes=1), row("q2", True, "k")),
+        art(row("q1", False, "b", raw="no", n_episodes=1), row("q2", True, "k"))),
+        out=lines.append)
+    text = "\n".join(lines)
+    assert "BOUNDS, NOT A PARTITION" in text
+    assert "A PARTITION. The fingerprint is the rendered" not in text
+    assert "fingerprint: counts" in text
