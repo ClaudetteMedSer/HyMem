@@ -4546,3 +4546,64 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > **Gate: a re-run is new spend and is NOT authorised by the original
 > approval.** The probe must be re-run from scratch — both arms — to produce
 > the f the pre-registration asks for.
+
+> **RESULT 2026-09-03 — f = 94%. Gate 4 cannot be rescued for this lever.**
+> Two 50-question `--retrieval-only` arms, 12:38–12:56Z. Read against the
+> decision rule pre-registered at `aeb0b24`, unmodified.
+>
+> **f = 47/50 = 94% (Wilson 95% CI 84%–98%).** The interval lies entirely
+> above 0.75, so by rule 1: **BROAD**.
+>
+> | | |
+> |---|---|
+> | concentration gain | **1.03x** |
+> | MDE 2.54pp would become | **2.46pp** |
+> | break-even leakage | 3% |
+>
+> Subset-scoring gate 4 buys **8 hundredths of a percentage point**. The last
+> lever on this gate's resolution is spent.
+>
+> **Run integrity.** `assert_arm` passed both dests on both arms before either
+> spent; each artifact was verified against its arm label rather than picked by
+> `ls -1t`; safety dumps written on both; arm evidence EVIDENCED (A=False,
+> B=True); 50 rows and 50 `context_sha` on each side; **0 answer calls, 0 judge
+> calls, 0 distill calls, 0 tokens**. Elapsed 0.28h and 0.29h against a 0.28h
+> estimate — the cost model was right.
+>
+> **The saturation finding, confirmed on a real A/B.** On this pair:
+>
+> | indicator | fires on |
+> |---|---|
+> | `context_sha` (the rendered prompt, hashed) | **47/50 = 94%** |
+> | `n_episodes` differs (what `guard_score.fired_subset` uses) | 9/50 = 18% |
+> | both arms pinned at the cap of 10 episodes | 40/50 = 80% |
+>
+> The count indicator misses **83% of the fired set**. The lever changes what
+> the episodes CONTAIN, not how many are handed over, and the count saturates
+> at the retrieval cap on 80% of questions here (84% predicted from the
+> 2026-09-02 runs). Had f been measured with the count indicator it would have
+> read 18% — squarely in the "NARROW, concentrate, buy the 5.5h run" band, and
+> wrong. `context_sha` is what makes the difference between the two.
+>
+> **WHERE THIS LEAVES GATE 4.** Every lever on its resolution is now measured
+> and exhausted: the bars were miscalibrated (an inert arm failed them ~50% of
+> the time); MDE 2.54pp is set by churn, not n; the churn is not the judge
+> (<=1.6%) and not our retrieval (under-represented among flips), leaving
+> provider-side non-determinism at temperature 0; LME-S caps n at 500; and
+> concentration buys 1.03x. **LME-S cannot resolve an episode-granularity
+> effect smaller than ~2.5pp, at any price.**
+>
+> That is not the same as "gate 4 is worthless". As a NON-REGRESSION gate it
+> can still answer one question honestly: *is there a regression larger than
+> 2.5pp?* If that is the question, one paired run answers it and the paired
+> scorer now reports the resolution alongside the verdict. What it can never be
+> is a tuning signal, or a warrant for "granularity is harmless".
+>
+> **RECOMMENDATION: retire gate 4 as a decision gate for episode granularity.**
+> Run it once if a >2.5pp blow-up is the worry; do not run it to decide whether
+> the feature helps, because it cannot. Deciding that needs a different
+> instrument, and f=94% says the lever is a broad intervention, so an
+> instrument that can see broad effects is the thing to look for.
+>
+> **What f does NOT establish**, restated because it is the easiest thing to
+> over-read: 94% of prompts moved. Not one answer, and not one verdict.
