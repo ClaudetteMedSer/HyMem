@@ -1106,6 +1106,17 @@ class PoisonLLM:
     makes the guarantee structural: retrieval-only cannot answer a question,
     because there is nothing there to answer with."""
 
+    # The counters the run summary reads off whatever client it was handed.
+    # Present and ZERO, because that is the truth: this client made no call.
+    #
+    # They are attributes rather than something the summary guards with
+    # getattr, because the 2026-09-03 f probe died on exactly that -- one call
+    # site was guarded, a second was not, and the crash landed AFTER 50
+    # questions had been dreamed and BEFORE the artifact was written. A
+    # stand-in that is not a drop-in just relocates the failure.
+    call_count = 0
+    total_tokens = 0
+
     def __init__(self, which: str):
         self._which = which
 
@@ -1668,7 +1679,12 @@ def evaluate_question(
         # un-clipped: a discarded reply is why judge_audit had to re-judge 500
         # rows to measure a rate that had already been produced once. ~10 tokens.
         "judge_raw": judge_raw,
-        "judge_error": correct is None,
+        # A judge that was never CALLED did not error. Under --retrieval-only
+        # every row has correct=None by design, and flagging 50 "judge errors"
+        # on a run that made zero judge calls is the same vacuity as "0 judge
+        # errors" over a run that made none: a count whose denominator is not
+        # what the reader assumes.
+        "judge_error": (correct is None) and not retrieval_only,
         # What the reader was HANDED, hashed. Two runs that agree here gave
         # the reader byte-identical input, so a differing answer is the
         # provider's decoder and nothing of ours -- which is the distinction
@@ -3009,6 +3025,14 @@ def main():
 
     def _progress(done: int):
         elapsed = time.time() - start_time
+        suffix_w = f" (×{args.workers} workers)" if args.workers > 1 else ""
+        if args.retrieval_only:
+            # No verdicts exist. "Acc: 0.0%" here is not a low score, it is a
+            # measurement that was never taken.
+            print(f"  ── Progress: {done}/{total} | retrieval-only (no "
+                  f"verdicts) | Elapsed: {elapsed:.0f}s | "
+                  f"Avg: {elapsed/max(1, done):.0f}s/q{suffix_w}", flush=True)
+            return
         acc = accuracy(all_results)
         n_err = len(judge_error_rows(all_results))
         suffix = f" (×{args.workers} workers)" if args.workers > 1 else ""
@@ -3052,6 +3076,44 @@ def main():
                 _progress(qi + 1)
 
     elapsed = time.time() - start_time
+
+    # ---- SAFETY DUMP -----------------------------------------------------
+    # Written BEFORE any reporting touches these rows, because everything
+    # expensive has already happened and everything after this line is
+    # presentation. On 2026-09-03 the f probe dreamed 50 questions in 876s and
+    # then died in the summary `print` on an attribute the stand-in client did
+    # not carry: the run was complete, and the result was destroyed by a
+    # formatting statement. Five diagnostic passes sit between here and the
+    # real artifact; any of them can raise, and none of them is worth the
+    # compute above.
+    #
+    # Deliberately minimal and deliberately NOT named like a real artifact, so
+    # nothing globbing `longmemeval-v2-hymem-*` picks it up by accident.
+    try:
+        _safety = Path("/home/node/.hermes/benchmarks") / (
+            f"partial-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            f"-seed{args.seed}.json")
+        _safety.write_text(json.dumps({
+            "partial": True,
+            "note": "written before reporting; carries the rows, not the "
+                    "summary",
+            "config": {
+                "retrieval_only": bool(args.retrieval_only),
+                "episode_granularity_enabled": bool(
+                    getattr(args, "episode_granularity", False)),
+                "seed": args.seed,
+                "sample": args.sample,
+                "scale": args.scales,
+                "answer_model": args.answer_model,
+                "judge_model": args.judge_model,
+                "elapsed_s": elapsed,
+            },
+            "per_question": all_results,
+        }))
+        print(f"  safety dump: {_safety}", flush=True)
+    except Exception as _e:                      # never let the guard be the
+        print(f"  ⚠ safety dump failed: {_e}", flush=True)   # thing that fails
+
     total_calls = answer_llm.call_count + judge_llm.call_count
     print(f"\nEvaluation complete in {elapsed:.0f}s")
     print(f"  Answer calls: {answer_llm.call_count}, Judge calls: {judge_llm.call_count}")
@@ -3148,13 +3210,9 @@ def main():
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
             "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix, recall-ceiling instrumentation (retrieval-vs-ranking miss split), ability-router shadow/auto measurement (detect_ability vs oracle)",
             "elapsed_s": elapsed,
-            # PoisonLLM stands in for the judge under --retrieval-only and
-            # has no counters, by design: it exists to raise. 0 is the truth
-            # there, not a missing measurement.
-            "answer_calls": getattr(answer_llm, "call_count", 0),
-            "judge_calls": getattr(judge_llm, "call_count", 0),
-            "total_tokens": (getattr(answer_llm, "total_tokens", 0)
-                             + getattr(judge_llm, "total_tokens", 0)),
+            "answer_calls": answer_llm.call_count,
+            "judge_calls": judge_llm.call_count,
+            "total_tokens": answer_llm.total_tokens + judge_llm.total_tokens,
         },
         "scores": {qtype: {
             "accuracy": round(data["accuracy"] * 100, 1),

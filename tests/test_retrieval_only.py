@@ -219,3 +219,92 @@ def test_churn_decompose_refuses_a_retrieval_only_artifact():
     a, b = _ro_pair()
     with pytest.raises(ValueError, match="no verdicts"):
         cd.decompose(a, b)
+
+
+# ---------------------------------- what the 2026-09-03 f probe crash taught
+
+def test_the_poison_client_carries_the_counters_the_summary_reads():
+    """The crash. `answer_llm.call_count` is read in the run summary, and a
+    stand-in that raises AttributeError there kills the process AFTER every
+    question has been dreamed and BEFORE the artifact is written.
+
+    Present and zero is the truth: this client made no call. Guarding one
+    call site with getattr and missing another is what actually happened, so
+    the fix is that it is a drop-in, not that the readers are careful."""
+    p = lme.PoisonLLM("judge")
+    assert p.call_count == 0
+    assert p.total_tokens == 0
+    with pytest.raises(AssertionError):
+        p.chat([])
+
+
+def test_every_counter_the_summary_reads_exists_on_the_poison_client():
+    """Pins the whole class rather than the one attribute that bit. If a
+    later summary line reads a new counter off the client, this fails before
+    a run does."""
+    import re
+    src = (_BENCH / "longmemeval_adapter.py").read_text()
+    attrs = set(re.findall(r"\b(?:answer_llm|judge_llm)\.([a-z_]+)", src))
+    attrs -= {"chat"}
+    poison = lme.PoisonLLM("judge")
+    missing = [a for a in sorted(attrs) if not hasattr(poison, a)]
+    assert not missing, f"PoisonLLM lacks {missing}, read off the client in main()"
+
+
+def test_a_row_from_a_run_with_no_judge_is_not_a_judge_ERROR():
+    """The probe's log said "⚠ UNSCORED (judge error): 50" for a run that
+    made zero judge calls. A judge that was never called did not error, and
+    an alarm whose denominator is not what the reader assumes is the same
+    vacuity this repo keeps finding."""
+    src = (_BENCH / "longmemeval_adapter.py").read_text()
+    assert '"judge_error": (correct is None) and not retrieval_only,' in src
+
+
+def test_the_progress_line_reports_no_accuracy_under_retrieval_only():
+    """"Acc: 0.0%" is not a low score there, it is a measurement never taken."""
+    src = (_BENCH / "longmemeval_adapter.py").read_text()
+    assert 'retrieval-only (no ' in src
+    i = src.index("def _progress(done: int):")
+    body = src[i:i + 900]
+    assert body.index("if args.retrieval_only:") < body.index("acc = accuracy(")
+
+
+def test_the_rows_are_dumped_before_any_reporting_runs():
+    """Everything expensive happens before the summary; everything after it
+    is presentation. Five diagnostic passes sit between the loop and the real
+    artifact, and the probe lost 876s of dreaming to a print statement."""
+    src = (_BENCH / "longmemeval_adapter.py").read_text()
+    dump = src.index("# ---- SAFETY DUMP")
+    assert dump < src.index("total_calls = answer_llm.call_count")
+    assert dump < src.index("scores = compute_scores(all_results)")
+    assert dump < src.index('results_dir = Path("/home/node/.hermes/benchmarks")')
+
+
+def test_the_safety_dump_cannot_itself_kill_the_run():
+    src = (_BENCH / "longmemeval_adapter.py").read_text()
+    i = src.index("# ---- SAFETY DUMP")
+    assert "except Exception as _e:" in src[i:i + 2000]
+
+
+def test_the_safety_dump_is_not_named_like_a_real_artifact():
+    """The runner picks its arm's artifact with `ls -1t
+    longmemeval-v2-hymem-*`. A partial dump matching that glob would be
+    selected as the run's result."""
+    src = (_BENCH / "longmemeval_adapter.py").read_text()
+    i = src.index("# ---- SAFETY DUMP")
+    block = src[i:i + 2000]
+    # The filename EXPRESSION, not the surrounding prose -- the comment right
+    # above it names the glob it must avoid.
+    expr = block[block.index("_safety = Path("):block.index("_safety.write_text")]
+    assert 'f"partial-{' in expr
+    assert "longmemeval-v2-hymem" not in expr
+
+
+def test_the_safety_dump_carries_what_a_scorer_needs_to_pair_the_arms():
+    """A dump that cannot evidence its own arm is a dump nobody can use."""
+    src = (_BENCH / "longmemeval_adapter.py").read_text()
+    i = src.index("# ---- SAFETY DUMP")
+    block = src[i:i + 2000]
+    for key in ('"retrieval_only"', '"episode_granularity_enabled"',
+                '"seed"', '"per_question"'):
+        assert key in block, key

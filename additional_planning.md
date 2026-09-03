@@ -4484,3 +4484,65 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > is dream-dominated: ~2.74h per 500 dreamed questions scales to **~0.28h per
 > arm, ~0.55h total**. The measured `retrieval_cost` block and elapsed_s will
 > be checked against this, and a large miss is itself a finding.
+
+> **INCIDENT 2026-09-03 — the f probe ran, completed its retrieval, and was
+> destroyed by a print statement. My defect; no result.**
+>
+> Arm OFF dreamed and fingerprinted all 50 questions in **876s** (against a
+> ~0.28h estimate, so the cost model was right), then died in the run summary:
+>
+>     AttributeError: 'PoisonLLM' object has no attribute 'call_count'
+>
+> `main()` reads `answer_llm.call_count` in two places. I guarded the artifact
+> block with `getattr` and missed the summary print. `set -e` then aborted
+> before arm ON started. **No artifact was written and the run produced
+> nothing.** The dream tokens are spent and unrecoverable.
+>
+> **Four fixes, all of which the incident earned:**
+>
+> 1. `PoisonLLM` now carries `call_count = 0` and `total_tokens = 0`. A
+>    stand-in that is not a drop-in only relocates the failure; guarding one
+>    reader and missing another is precisely what happened. A test now
+>    extracts every `answer_llm.<attr>` / `judge_llm.<attr>` read in the module
+>    and asserts the stand-in has each, so the class is pinned, not the
+>    instance.
+> 2. **A SAFETY DUMP before any reporting.** Everything expensive happens in
+>    the loop; everything after it is presentation, and five diagnostic passes
+>    sat between the loop and the artifact write. The rows are now dumped to
+>    `partial-<stamp>-seed<n>.json` immediately, carrying the config keys a
+>    scorer needs to pair the arms. 876s of dreaming should not be lost to a
+>    format string.
+> 3. `judge_error` is False under `--retrieval-only`. The log said
+>    "⚠ UNSCORED (judge error): 50" for a run that made **zero judge calls** —
+>    a judge never called did not error, and that is the same vacuity as
+>    "0 judge errors" over a run that made none.
+> 4. The progress line reports no accuracy under the flag. "Acc: 0.0%" there
+>    is not a low score; it is a measurement never taken.
+>
+> **A SEPARATE AND WORSE FINDING — my mutation harness was poisoning the
+> bytecode cache.** Chasing an impossible test failure (`all()` evaluating
+> False while the function returned True) showed the container executing a
+> `.pyc` whose `is_retrieval_only` called `any`, not `all`. The sweep writes a
+> mutant, imports it, then restores the original; `any(` and `all(` are the
+> **same length**, so when the restore lands in the same second Python's
+> mtime+size check passes and the stale mutant bytecode survives the sweep.
+>
+> Every result run after such a mutation was therefore suspect, including a
+> "1891 passed" suite and one sweep's clean bill. All caches were purged, every
+> harness now runs under `PYTHONDONTWRITEBYTECODE=1`, and **all seven sweeps
+> and the full suite were re-run clean**: 1891 passed, 1 skipped, no survivors.
+> Three sweeps had also gone stale against later refactors and were
+> re-anchored rather than left claiming coverage they no longer checked.
+>
+> This is the session's defect class turned on my own tooling: a verification
+> step that silently stopped verifying.
+>
+> **Verified without spending.** A one-question `--no-dream --retrieval-only`
+> run exercises all of `main()` and makes **zero API calls**. It now completes:
+> artifact written, `retrieval_cost` all zeros, 0 judge-error flags (was 50),
+> every row carrying a `context_sha`, and the safety dump present. That check
+> is free and should have been run before 10:01Z.
+>
+> **Gate: a re-run is new spend and is NOT authorised by the original
+> approval.** The probe must be re-run from scratch — both arms — to produce
+> the f the pre-registration asks for.
