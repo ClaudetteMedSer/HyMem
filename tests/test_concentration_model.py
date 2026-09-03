@@ -182,7 +182,8 @@ def test_the_null_firing_rate_is_reported_as_contamination():
     subset with churn and no signal, and the rate is the floor on that."""
     a, b = pair(100, 4, 16, 20)
     _, text = run(a, b)
-    assert "contamination floor" in text
+    assert "CONTAMINATION FLOOR" in text
+    assert "THIS IS NOT f" in text
     # The COUNT, not a bare "20%" -- the retained-discordance line happens to
     # print 20% too, so a looser assertion passes with this line deleted.
     assert "fires on 20/100 questions" in text
@@ -204,3 +205,114 @@ def test_the_sha_indicator_needs_both_sides_to_carry_one():
                                         {"context_sha": "Y"})
     assert not cm.INDICATORS["context_sha"]({"context_sha": "X"},
                                             {"context_sha": "X"})
+
+
+
+# ------------------------------------------- the curve, and its denominator
+
+def test_the_gain_curve_is_one_over_root_f():
+    assert cm.gain_curve(0.25)["gain"] == pytest.approx(2.0)
+    assert cm.gain_curve(1.0)["gain"] == pytest.approx(1.0)
+
+
+def test_break_even_leakage_falls_as_the_lever_touches_more():
+    """A lever that moves the whole run cannot be concentrated at all, and a
+    subset that keeps everything tolerates no leakage because it buys
+    nothing."""
+    assert cm.gain_curve(1.0)["breakeven_leakage"] == pytest.approx(0.0)
+    assert cm.gain_curve(0.25)["breakeven_leakage"] == pytest.approx(0.5)
+
+
+def test_an_impossible_fraction_has_no_curve_point():
+    assert cm.gain_curve(0.0)["available"] is False
+    assert cm.gain_curve(1.5)["available"] is False
+
+
+def test_the_report_leads_with_the_curve_not_the_null_firing_rate():
+    """The correction this module needed. The null pair's firing rate is what
+    the indicator does with NO lever set; reading it as f quotes the gain
+    from the wrong population, and for an episode-count indicator on a
+    granularity lever it is wrong by a lot."""
+    a, b = pair(100, 4, 16, 20)
+    _, text = run(a, b)
+    assert "as a function of what the lever touches" in text
+    curve_at = text.index("as a function of what the lever touches")
+    assert curve_at < text.index("=== indicator:")
+    # The ROWS, not just the header: a curve nobody can read is not a curve.
+    # 1/sqrt(.25) = 2.00 and 1/sqrt(.50) = 1.41.
+    assert "2.00x" in text and "1.41x" in text
+
+
+def test_a_noisier_subset_is_flagged_as_breaking_the_curves_assumption():
+    """The curve assumes a subset holds its share of the discordance. An
+    indicator that selects unusually noisy questions does not, and the gain
+    is then an upper bound rather than an estimate."""
+    a, b = pair(100, 16, 4, 20)   # churn 80% inside, 5% outside
+    _, text = run(a, b)
+    assert "churn is NOT uniform here" in text
+    assert "upper bound on the gain" in text
+
+
+def test_uniform_churn_is_not_flagged():
+    a, b = pair(100, 4, 16, 20)   # 20% inside, 20% outside
+    _, text = run(a, b)
+    assert "churn is NOT uniform" not in text
+
+
+# --------------------------------------------------------------- saturation
+
+def saturated_pair(n, n_at_ceiling, ceiling=10):
+    """Both arms pinned at the ceiling on the first `n_at_ceiling` questions,
+    so the episode-count indicator cannot fire there whatever the lever does."""
+    a, b = [], []
+    for i in range(n):
+        pinned = i < n_at_ceiling
+        a.append({"question_id": f"q{i}", "correct": True,
+                  "n_episodes": ceiling if pinned else 3})
+        b.append({"question_id": f"q{i}", "correct": i % 7 != 0,
+                  "n_episodes": ceiling if pinned else 5})
+    return artifact(a), artifact(b)
+
+
+def test_a_saturated_indicator_is_flagged():
+    """The finding that motivated this check: n_episodes is clamped at 10 on
+    84% of the real run, so the indicator is a CONSTANT there. A constant
+    cannot indicate anything, and a subset built from it selects questions
+    that fell below the retrieval cap rather than questions the lever moved."""
+    a, b = saturated_pair(100, 84)
+    _, text = run(a, b)
+    assert "SATURATED" in text
+    assert "84/100" in text
+    assert "ceiling of 10" in text
+
+
+def test_an_unsaturated_indicator_is_not_flagged():
+    a, b = saturated_pair(100, 5)
+    _, text = run(a, b)
+    assert "SATURATED" not in text
+
+
+def test_the_ceiling_is_read_from_the_data_not_hardcoded():
+    """A later change to retrieval depth must not silently disable the check."""
+    a, b = saturated_pair(100, 84, ceiling=25)
+    _, text = run(a, b)
+    assert "ceiling of 25" in text
+
+
+def test_saturation_needs_BOTH_arms_at_the_ceiling():
+    """One arm at the cap and the other below it is the indicator firing,
+    which is the opposite of blind."""
+    a, b = saturated_pair(100, 0)
+    for r in a["per_question"]:
+        r["n_episodes"] = 10
+    _, text = run(a, b)
+    assert "SATURATED" not in text
+
+
+def test_an_indicator_with_no_ceiling_check_is_not_flagged():
+    """Only `episode_count` registers a saturation check; the others must not
+    silently reuse it and report a ceiling they never measured."""
+    assert set(cm.BLIND) == {"episode_count"}
+    a, b = saturated_pair(100, 84)
+    _, text = run(a, b)
+    assert text.count("SATURATED") == 1

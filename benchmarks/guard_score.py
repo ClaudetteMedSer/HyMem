@@ -294,10 +294,11 @@ def report(a: dict, b: dict, lever: str = LEVER, out=print) -> tuple[str, dict]:
         if fs["shared"] - fs["fired"]:
             out(f"    on the rest: OFF {fs['a_same']:.1f} → ON {fs['b_same']:.1f} "
                 f"({fs['b_same'] - fs['a_same']:+.1f}pp)")
-        out("  LOWER BOUND: a re-cut that yields the same COUNT of different")
-        out("  episodes is invisible here, so this undercounts what the lever")
-        out("  touched. A null on it is weaker evidence than a null on a true")
-        out("  fired-indicator.")
+        out("  LOWER BOUND, AND A WEAK ONE: a re-cut that yields the same")
+        out("  COUNT of different episodes is invisible here, and the count")
+        out("  saturates at the retrieval cap on ~84% of questions, where it")
+        out("  can never move at all. This is not a null on the fired set.")
+        out("  Runs carrying context_sha do not have the problem.")
 
     verdict = "PASS" if all(ok for _, ok, _ in checks) else "FAIL"
     out("")

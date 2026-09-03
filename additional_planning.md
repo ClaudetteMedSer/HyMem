@@ -4321,3 +4321,55 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 >
 > **Gate 4 remains OPEN and un-run.** What changed is that a result would now
 > mean something; the spend is still two arms of 500 and still unauthorised.
+
+> **CONCENTRATION WORK-UP 2026-09-03 — the fired-indicator gate 4 already uses
+> is blind on 84% of the run. Offline, no spend.**
+> `benchmarks/concentration_model.py`, 27 tests, 20 mutations checked.
+>
+> Churn cannot be reduced and LME-S caps n at 500, so the last lever on gate
+> 4's resolution is spending the 500 questions better. McNemar rejects when
+> the net questions moved exceeds `Z*sqrt(D)`, and D counts only DISCORDANT
+> questions — so if the lever's effect sits inside a subset S, scoring S
+> keeps the whole numerator and discards the churn outside it:
+>
+>     gain = sqrt(D_all / D_S) ≈ 1/sqrt(f),   break-even leakage = 1 - sqrt(f)
+>
+> where **f is the fraction of the run the lever actually moves**. Churn is
+> near-uniform on the calibration pair (7.8% inside the fired subset vs 8.5%
+> outside), which is the warrant for the proportionality.
+>
+> | f | MDE | gain | break-even leakage |
+> |---|---|---|---|
+> | 5% | 0.57pp | 4.47x | 78% |
+> | 25% | 1.27pp | 2.00x | 50% |
+> | 50% | 1.80pp | 1.41x | 29% |
+> | 100% | 2.54pp | 1.00x | 0% |
+>
+> **`f` is a property of the LEVER and no same-arm pair can measure it.** The
+> null pair's firing rate is what the indicator does with NO lever set — the
+> contamination floor, not f. An earlier draft of this module quoted the gain
+> off that rate, which reads the denominator from the wrong population; the
+> output is a curve for that reason.
+>
+> **THE FINDING. `n_episodes` saturates.** 421 of 500 questions sit at exactly
+> **10** episodes — the retrieval cap. On **84%** of the run the indicator
+> `guard_score.fired_subset` uses is a CONSTANT and can never fire, however
+> the lever cuts episodes. Its subset is not "the questions the lever touched"
+> but "the questions that fell below the retrieval cap", which is a fact about
+> retrieval depth. The existing LOWER BOUND caveat badly understated this and
+> has been rewritten in `guard_score.py`.
+>
+> Corroborating, weakly: the one granularity=True artifact
+> (`20260831T101051Z`, 10 questions) shares all 10 ids with the OFF arm and
+> `n_episodes` differs on **0 of 10** — eight of them pinned at 10. It is a
+> 10-question probe with `sample` and `workers` also moved, so it evidences
+> nothing about the lever; it is quoted only as a second sighting of the cap.
+>
+> **What this means for gate 4.** Concentration is real and worth up to 4x,
+> but only for a NARROW lever (f <= 25%), and it cannot be applied to episode
+> granularity today because there is no usable fired-indicator for it: the
+> count-based one is blind on five-sixths of the run and `context_sha` did not
+> exist when these runs were taken. **Do not buy a subset-scored gate-4 re-run
+> expecting better resolution.** The first run carrying `context_sha` (5acedf7)
+> gets a true fired set for free, and this module then measures the gain
+> instead of projecting it.

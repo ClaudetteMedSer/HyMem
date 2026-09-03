@@ -68,6 +68,29 @@ def _any_context_field(ra, rb):
     return any(ra.get(k) != rb.get(k) for k in CONTEXT_FIELDS)
 
 
+def _episode_blind(a_rows: dict, b_rows: dict, shared) -> dict:
+    """Questions where `n_episodes` CANNOT differ, because both arms are at
+    the ceiling the retrieval imposes.
+
+    On the 2026-09-02 runs 421 of 500 questions sit at exactly 10 episodes.
+    An indicator watching that count is not a weak fired-indicator on those
+    questions -- it is a constant, and a constant cannot indicate anything. A
+    subset built from it is not "the questions the lever touched" but "the
+    questions that happened to fall below the cap", which is a fact about
+    retrieval depth and not about the lever."""
+    vals = [r.get("n_episodes") for r in list(a_rows.values()) + list(b_rows.values())
+            if r.get("n_episodes") is not None]
+    if not vals:
+        return {"available": False}
+    ceiling = max(vals)
+    blind = [q for q in shared
+             if a_rows[q].get("n_episodes") == ceiling
+             and b_rows[q].get("n_episodes") == ceiling]
+    return {"available": True, "ceiling": ceiling, "blind": len(blind),
+            "n": len(shared),
+            "rate": len(blind) / len(shared) if shared else None}
+
+
 # Candidate fired-indicators, weakest first. `episode_count` is what
 # `guard_score.fired_subset` uses today and is a LOWER BOUND on what the lever
 # touched: a re-cut yielding the same NUMBER of different episodes is invisible
@@ -77,6 +100,9 @@ INDICATORS = {
     "any_context_field": _any_context_field,
     "context_sha": _context_sha,
 }
+
+# Indicators whose underlying quantity can SATURATE, and the check for it.
+BLIND = {"episode_count": _episode_blind}
 
 
 def subset_stats(a_rows: dict, b_rows: dict, fires) -> dict:
@@ -147,6 +173,27 @@ def projection(s: dict, n_total: int) -> dict:
     }
 
 
+def gain_curve(f: float) -> dict:
+    """What concentration buys when the lever touches fraction `f` of the run.
+
+    Churn is roughly uniform across questions (this module measures that and
+    says so), so a subset holding fraction f of the questions holds about
+    fraction f of the discordance, and
+
+        gain = sqrt(D_all / D_S) = 1 / sqrt(f)
+        break-even leakage = 1 - sqrt(f)
+
+    `f` is a property of the LEVER, not of the noise, and no same-arm pair can
+    measure it. That is why this is a curve and not a number: the null pair's
+    firing rate is what the indicator does with NO lever set, which is the
+    contamination floor, and reading it as f would quote the gain from the
+    wrong population entirely."""
+    if not 0.0 < f <= 1.0:
+        return {"f": f, "available": False}
+    return {"f": f, "available": True, "gain": 1.0 / math.sqrt(f),
+            "breakeven_leakage": 1.0 - math.sqrt(f)}
+
+
 def report(a: dict, b: dict, lever: str = LEVER, out=print) -> dict:
     verdict_arm, note, _ = arm_evidence(
         a.get("config", {}), b.get("config", {}), lever)
@@ -168,8 +215,24 @@ def report(a: dict, b: dict, lever: str = LEVER, out=print) -> dict:
     out(f"  shared, scored questions: {base['n']}   "
         f"discordant: {base['d_all']} "
         f"({100.0 * base['d_all'] / base['n']:.1f}%, all of it churn)")
-    out(f"  full-500 MDE: "
-        f"{100.0 * Z95 * math.sqrt(base['d_all']) / base['n']:.2f}pp")
+    mde_full = 100.0 * Z95 * math.sqrt(base["d_all"]) / base["n"]
+    out(f"  full-500 MDE: {mde_full:.2f}pp")
+    out("")
+    out("=== what concentration buys, as a function of what the lever "
+        "touches ===")
+    out("  f is the fraction of the 500 the lever ACTUALLY moves. It is a")
+    out("  property of the lever; no same-arm pair can measure it, so this")
+    out("  is a curve and not a number.")
+    out(f"  {'f':>6} {'MDE':>8} {'gain':>7} {'break-even leakage':>20}")
+    curve = {}
+    for f in (0.05, 0.10, 0.25, 0.50, 0.75, 1.00):
+        g = gain_curve(f)
+        curve[f] = g
+        out(f"  {f:>6.0%} {mde_full * math.sqrt(f):>7.2f}pp "
+            f"{g['gain']:>6.2f}x {g['breakeven_leakage']:>19.0%}")
+    out("  Read the last column as the cost of a leaky indicator: if more")
+    out("  than that share of the effect lands outside the subset, scoring")
+    out("  the subset is WORSE than scoring all 500.")
 
     for name, fires in INDICATORS.items():
         s = subset_stats(ar, br, fires)
@@ -180,28 +243,52 @@ def report(a: dict, b: dict, lever: str = LEVER, out=print) -> dict:
         if not s["n_in"]:
             out("  fires on nothing here — no projection.")
             continue
+        blind = BLIND.get(name, lambda *a: {"available": False})(
+            ar, br, sorted(set(ar) & set(br)))
+        if blind.get("available") and blind["rate"] > 0.5:
+            out(f"  ⚠ SATURATED. {blind['blind']}/{blind['n']} "
+                f"({blind['rate']:.0%}) of questions sit at the ceiling of "
+                f"{blind['ceiling']}")
+            out("  in BOTH arms, where this indicator is a constant and can")
+            out("  never fire however the lever cuts episodes. Its subset is")
+            out("  not 'the questions the lever touched' — it is 'the")
+            out("  questions that fell below the retrieval cap', which is a")
+            out("  fact about retrieval depth. Everything below is computed")
+            out(f"  on the {blind['n'] - blind['blind']} questions where it "
+                "can move at all.")
         out(f"  fires on {s['n_in']}/{s['n']} questions "
-            f"({s['fire_rate']:.0%}) with NO lever set: that is the")
-        out("  contamination floor — questions that would join the subset")
-        out("  carrying churn and no signal.")
+            f"({s['fire_rate']:.0%}) with NO lever set.")
+        out("  THIS IS NOT f. It is the CONTAMINATION FLOOR — questions that")
+        out("  join the subset carrying churn and no signal. Under a real")
+        out("  lever the subset is the true fired set PLUS roughly these, so")
+        out("  it is larger than this and the gain is smaller than the row")
+        out("  below. Read the curve above at the f you believe, not here.")
         out(f"  churn inside {s['churn_in']:.1%} vs outside "
             f"{s['churn_out']:.1%}" if s["churn_out"] is not None
             else f"  churn inside {s['churn_in']:.1%}")
+        if s["churn_out"] is not None and s["churn_in"] is not None:
+            ratio = (s["churn_in"] / s["churn_out"]) if s["churn_out"] else None
+            if ratio is not None and not 0.5 <= ratio <= 2.0:
+                out(f"  ⚠ churn is NOT uniform here (inside/outside = "
+                    f"{ratio:.2f}x). The curve above assumes a subset holds")
+                out("  its share of the discordance; this indicator selects "
+                    "questions")
+                out("  that are unusually noisy or unusually stable, so read "
+                    "the curve")
+                out("  as an upper bound on the gain.")
         if not p["available"]:
             out(f"  NO PROJECTION — {p['reason']}.")
             continue
         out(f"  discordance retained: {p['retained_discordance']:.0%} "
             f"of {s['d_all']}")
-        out(f"  projected MDE if the gate scored this subset: "
-            f"{p['mde_sub']:.2f}pp  (vs {p['mde_all']:.2f}pp)")
-        out(f"  gain: {p['gain']:.2f}x")
-        out(f"  BREAK-EVEN LEAKAGE: {p['breakeven_leakage']:.0%}. If more "
-            "than that share of the")
-        out("  lever's effect lands OUTSIDE this subset, scoring the subset "
-            "is WORSE")
-        out("  than scoring all 500. No same-arm pair can measure it — it is "
-            "a fact")
-        out("  about the lever, not about the noise.")
+        out(f"  IF the lever touched exactly these {s['n_in']} questions "
+            "and no others,")
+        out(f"  projected MDE {p['mde_sub']:.2f}pp vs {p['mde_all']:.2f}pp — "
+            f"gain: {p['gain']:.2f}x")
+        out("  That premise is false for any lever whose fired set differs")
+        out("  from this one; the curve above is the honest reading.")
+        out(f"  break-even leakage at that size: "
+            f"{p['breakeven_leakage']:.0%}")
     return results
 
 
