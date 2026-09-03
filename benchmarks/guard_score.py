@@ -60,7 +60,8 @@ from pathlib import Path
 _BENCH = Path(__file__).resolve().parent
 sys.path.insert(0, str(_BENCH))
 from lme_noise_model import Z95, mcnemar_exact_p  # noqa: E402
-from run_registry import ARM_EVIDENCED, arm_evidence  # noqa: E402
+from run_registry import (ARM_EVIDENCED, arm_evidence,  # noqa: E402
+                          is_retrieval_only)
 
 # ------------------------------------------------------------- pre-registered
 # Gate 4 is NON-REGRESSION ONLY. Not a tuning signal: a change with no effect
@@ -199,6 +200,16 @@ def report(a: dict, b: dict, lever: str = LEVER, out=print) -> tuple[str, dict]:
 
     Verdict INCOMPLETE means the pair cannot evidence its own contrast, and in
     that case NO accuracy is computed or printed -- see the module docstring."""
+    ro = [n for n, art in (("A", a), ("B", b)) if is_retrieval_only(art)]
+    if ro:
+        out(f"=== gate 4 — REFUSED ===")
+        out(f"  arm(s) {', '.join(ro)} were run with --retrieval-only: they")
+        out("  made no answer call and no judge call, so they carry no")
+        out("  verdicts to compare. Scoring them would read every row as")
+        out("  unscored and print a 0% arm, which beside a real arm looks")
+        out("  like a catastrophic regression rather than a category error.")
+        return "INCOMPLETE", {"retrieval_only": ro}
+
     verdict_arm, note, confounds = arm_evidence(
         a.get("config", {}), b.get("config", {}), lever)
     out(f"=== arm evidence — {lever} ===")

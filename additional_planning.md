@@ -4373,3 +4373,54 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > expecting better resolution.** The first run carrying `context_sha` (5acedf7)
 > gets a true fired set for free, and this module then measures the gain
 > instead of projecting it.
+
+> **RETRIEVAL-ONLY MODE 2026-09-03 — measure `f` without the reader, and a
+> correction to what that saves. Offline build, no spend.**
+> `--retrieval-only`, `benchmarks/fired_fraction.py`, 35 new tests, 20
+> mutations checked.
+>
+> `concentration_model` left one number undetermined and decisive: **f**, the
+> fraction of questions the lever moves. At f <= 25% a subset-scored gate 4
+> resolves twice as finely and is worth buying; at f >= 75% it resolves no
+> better and gate 4 should be retired rather than re-run. f is a property of
+> RETRIEVAL — it does not depend on what the reader says or how the judge
+> scores it — so it can be measured without either.
+>
+> **The mode.** `--retrieval-only` retrieves, builds the reader's prompt,
+> hashes it, and sends nothing. Two guarantees are structural rather than
+> branch-deep: the reader and judge become `PoisonLLM` objects that RAISE if
+> reached, and distillation (which is part of retrieval and genuinely fires)
+> gets its own counted client so the reader's can be poisoned. The prompt is
+> rendered in exactly one place, so the cheap run fingerprints byte-identically
+> what the expensive one would have sent — tested across every branch that
+> swaps the system prompt or the memory list.
+>
+> The artifact carries `retrieval_only` and a measured `retrieval_cost` block,
+> and **every scorer refuses it**: `guard_score`, `concentration_model` and
+> `churn_decompose` all reject a verdict-free artifact rather than reading
+> `correct: None` as a miss. A 0% arm beside a 69% arm looks like a
+> catastrophic regression rather than a category error, and the refusal is
+> what stops that. (Three refusals were written with no test; the mutation
+> sweep found all three.)
+>
+> **THE CORRECTION. It is not nearly free, and I said it would be.** The mode
+> skips the reader and the judge — but not the DREAM, and episode granularity
+> is a **dream-time** lever, so the dream is the one thing that cannot be
+> skipped when measuring its f. From the archive: no-dream 500-question runs
+> take **~0.2h**, dreamed ones **2.2–2.8h**, and the no-dream runs already
+> include all 500 answer and 500 judge calls. **Dreaming is ~93% of the wall
+> clock.** Dropping the reader and judge saves ~7% of a run, not 90%.
+> (`distill` is False in the gate-4 config, so that caveat at least does not
+> apply: the mode makes literally zero API calls of its own.)
+>
+> **The saving is in `n`, not in the mode.** f is a proportion and the
+> decision it feeds is coarse, so `fired_fraction` reports a **Wilson
+> interval** rather than a point: run the smallest n whose interval clears the
+> threshold and escalate only if it straddles. **50 questions per arm is ~4%
+> of a full gate-4 pair** and separates f=10% from f=80% decisively.
+>
+> **Recommended next step, when spend is authorised:** two 50-question
+> `--retrieval-only` arms (~0.5h total). If f is broad, gate 4 cannot resolve
+> this lever at any price and should be retired; if narrow, a subset-scored
+> gate 4 is worth the 5.5h. Either way the 5.5h is only spent once the cheap
+> measurement says it would mean something.

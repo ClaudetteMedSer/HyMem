@@ -1073,15 +1073,98 @@ def answer_question(*args, **kwargs) -> str:
     return answer_question_raw(*args, **kwargs)[0]
 
 
+class CountingLLM:
+    """Counts what retrieval actually spends, rather than asserting it is free.
+
+    `--retrieval-only` skips the reader and the judge, which is where the
+    tokens are. It does NOT skip distillation, which fires inside the
+    retrieval path on MR/TR and wide retrievals, and it cannot vouch for what
+    reranking does inside the store. So the mode measures its own cost and
+    puts it in the artifact: a pre-flight estimate nobody checked is how a
+    5.5-hour run came to be described as cheap."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+        self.prompt_chars = 0
+
+    def chat(self, messages, temperature=None, max_tokens=None):
+        self.calls += 1
+        self.prompt_chars += sum(len(m.get("content", "")) for m in messages)
+        return self._inner.chat(messages, temperature=temperature,
+                                max_tokens=max_tokens)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class PoisonLLM:
+    """Raises if the reader or judge is reached under `--retrieval-only`.
+
+    A flag that merely skips a branch can be defeated by a later refactor
+    routing round it, and the failure would be silent and expensive. This
+    makes the guarantee structural: retrieval-only cannot answer a question,
+    because there is nothing there to answer with."""
+
+    def __init__(self, which: str):
+        self._which = which
+
+    def chat(self, *a, **kw):
+        raise AssertionError(
+            f"--retrieval-only reached the {self._which} path; the mode "
+            f"exists precisely so that call is never made")
+
+
+def build_answer_messages(memories: list[dict], question: str,
+                          ability: str = None, total_matches: int = 0,
+                          graph_count=None, temporal_events: list | None = None,
+                          aggregation_nodes: list | None = None,
+                          question_date: str = "",
+                          permissive_default: bool = False,
+                          distilled: list[str] | None = None,
+                          extra_system: str | None = None,
+                          narrative_facts: list[str] | None = None) -> list[dict]:
+    """The reader's prompt, built and not sent.
+
+    Split out of `answer_question_raw` so `--retrieval-only` can fingerprint
+    what the reader WOULD have been handed without paying for the answer.
+    That mode exists to measure `f` -- the fraction of questions a lever
+    actually moves -- which sets what a subset-scored gate 4 could resolve
+    (`benchmarks/concentration_model.py`), and `f` is a property of retrieval
+    alone.
+
+    The split is load-bearing in one specific way: a retrieval-only run and a
+    full run must produce the SAME `context_sha` for the same retrieval, or
+    the cheap measurement does not describe the expensive one. Re-deriving the
+    prompt in a second place is exactly how that drifts, so there is only one
+    place."""
+    return _answer_messages(
+        memories, question, ability, total_matches, graph_count,
+        temporal_events, aggregation_nodes, question_date, permissive_default,
+        distilled, extra_system, narrative_facts)
+
+
 def answer_question_raw(llm: LLMClient, memories: list[dict], question: str,
-                        ability: str = None, total_matches: int = 0,
-                        graph_count=None, temporal_events: list | None = None,
-                        aggregation_nodes: list | None = None,
-                        question_date: str = "", permissive_default: bool = False,
-                        distilled: list[str] | None = None,
-                        extra_system: str | None = None,
-                        narrative_facts: list[str] | None = None) -> tuple[str, str]:
-    """Ask LLM to answer based on retrieved memories. Returns (answer, sha).
+                        *args, **kwargs) -> tuple[str, str]:
+    """`answer_question`, plus the context fingerprint it would otherwise drop.
+
+    Prompt construction lives in `build_answer_messages` and happens in ONE
+    place, so a `--retrieval-only` run fingerprints exactly the prompt a full
+    run would have sent."""
+    messages = build_answer_messages(memories, question, *args, **kwargs)
+    return llm.chat(messages, temperature=0.0, max_tokens=1024), \
+        context_sha(messages)
+
+
+def _answer_messages(memories: list[dict], question: str,
+                     ability: str = None, total_matches: int = 0,
+                     graph_count=None, temporal_events: list | None = None,
+                     aggregation_nodes: list | None = None,
+                     question_date: str = "", permissive_default: bool = False,
+                     distilled: list[str] | None = None,
+                     extra_system: str | None = None,
+                     narrative_facts: list[str] | None = None) -> list[dict]:
+    """Render the reader's prompt. The only place it is built.
 
     Uses ability-aware prompts and expanded context for multi-session
     and temporal reasoning questions that need more cross-session data.
@@ -1142,8 +1225,7 @@ def answer_question_raw(llm: LLMClient, memories: list[dict], question: str,
         {"role": "user", "content": f"{today_line}CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
-    return llm.chat(messages, temperature=0.0, max_tokens=1024), \
-        context_sha(messages)
+    return messages
 
 
 def get_judge_prompt(question_type: str, question: str, answer: str, response: str) -> str:
@@ -1377,6 +1459,14 @@ def is_scored(row: dict) -> bool:
     return row.get("correct") is not None
 
 
+def is_retrieval_only(artifact: dict) -> bool:
+    """See `run_registry.is_retrieval_only` -- one definition, re-exported so
+    the adapter and the scorers cannot drift on what counts as a run with no
+    verdicts."""
+    from run_registry import is_retrieval_only as _impl
+    return _impl(artifact)
+
+
 def scored(rows: list[dict]) -> list[dict]:
     return [r for r in rows if is_scored(r)]
 
@@ -1428,8 +1518,16 @@ def evaluate_question(
     permissive_default: bool = False,
     distill: bool = False,
     distill_prompt_version: str = DEFAULT_DISTILL_PROMPT_VERSION,
+    retrieval_only: bool = False,
+    distill_llm: LLMClient | None = None,
 ) -> dict:
-    """Evaluate a single LongMemEval question."""
+    """Evaluate a single LongMemEval question.
+
+    Under `retrieval_only` the reader and judge are never called: the row
+    carries the context fingerprint and the retrieval counts, and `correct`
+    is None. Such a row has no verdict and every scorer must refuse it -- see
+    `is_retrieval_only` and the guards in guard_score / churn_decompose /
+    concentration_model."""
     question_id = q_data["question_id"]
     question_type = q_data["question_type"]
     question = q_data["question"]
@@ -1513,28 +1611,48 @@ def evaluate_question(
     distilled_lines, distill_calls, distill_fired = None, 0, False
     if distill and distill_should_fire(ability, memories):
         distill_fired = True
+        # Distillation is part of RETRIEVAL and still runs under
+        # --retrieval-only, so it needs its own client: `llm` is a PoisonLLM
+        # there, which is what makes "the reader is never called" structural
+        # rather than a property of the branch below.
         distilled_lines, distill_calls = distill_memories(
-            llm, question, memories, prompt_version=distill_prompt_version)
+            distill_llm or llm, question, memories,
+            prompt_version=distill_prompt_version)
         print(f"    Distill[{distill_prompt_version}]: {distill_calls} calls → "
               f"{len(distilled_lines)} lines kept", flush=True)
 
-    # Answer
-    ai_answer, ctx_sha = answer_question_raw(
-        llm, memories, question, ability=ability, total_matches=total_matches,
+    _answer_kw = dict(
+        ability=ability, total_matches=total_matches,
         graph_count=graph_count, temporal_events=temporal_events,
         aggregation_nodes=aggregation_nodes,
         question_date=question_date, permissive_default=permissive_default,
         distilled=distilled_lines,
         narrative_facts=narrative_facts)
+    if retrieval_only:
+        # Build the prompt, fingerprint it, send nothing. `f` -- the fraction
+        # of questions a lever moves -- is a property of retrieval, so it can
+        # be measured without paying for 500 reader calls and 500 judge calls.
+        ctx_sha = context_sha(build_answer_messages(memories, question,
+                                                   **_answer_kw))
+        ai_answer = ""
+    else:
+        ai_answer, ctx_sha = answer_question_raw(
+            llm, memories, question, **_answer_kw)
 
     _ep_texts = [m["content"] for m in memories
                  if isinstance(m, dict) and m.get("type") == "episode"]
 
     # Judge (binary yes/no, or None when the JUDGE itself errored — D3)
-    correct, judge_raw = judge_scored(judge_llm, question_type, question,
-                                      answer, ai_answer)
-    print(f"    Correct: {correct if correct is not None else 'UNSCORED (judge error)'}"
-          f" | Answer: {ai_answer[:120]}...", flush=True)
+    if retrieval_only:
+        correct, judge_raw = None, ""
+        print(f"    retrieval-only: ctx={ctx_sha[:12]} "
+              f"episodes={len(_ep_texts)} distill_calls={distill_calls}",
+              flush=True)
+    else:
+        correct, judge_raw = judge_scored(judge_llm, question_type, question,
+                                          answer, ai_answer)
+        print(f"    Correct: {correct if correct is not None else 'UNSCORED (judge error)'}"
+              f" | Answer: {ai_answer[:120]}...", flush=True)
 
     return {
         "question_id": question_id,
@@ -1556,6 +1674,9 @@ def evaluate_question(
         # provider's decoder and nothing of ours -- which is the distinction
         # `churn_decompose` can currently only bound. See `context_sha`.
         "context_sha": ctx_sha,
+        # No verdict was produced. Scorers must refuse this row rather than
+        # read `correct: None` as a miss -- see `is_retrieval_only`.
+        "retrieval_only": bool(retrieval_only),
         "num_sessions": stats["sessions"],
         "num_messages": stats["messages"],
         "num_memories": len(memories),
@@ -1890,7 +2011,8 @@ def print_report(scores: dict, metadata: dict):
 
 # ── Per-question worker ─────────────────────────────────────────────
 
-def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_key):
+def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
+                           api_key, distill_llm=None):
     """Full lifecycle for one question: fresh temp DB → open → evaluate → cleanup.
 
     Self-contained so it can run in a worker thread. Each question gets its own
@@ -1929,6 +2051,8 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm, api_k
             permissive_default=args.permissive_default,
             distill=args.distill,
             distill_prompt_version=args.distill_prompt_version,
+            retrieval_only=getattr(args, "retrieval_only", False),
+            distill_llm=distill_llm,
         )
     except Exception as e:
         print(f"    ERROR: {e}", flush=True)
@@ -2479,6 +2603,13 @@ def main():
     parser.add_argument("--scales", default=DEFAULT_SCALE)
     parser.add_argument("--sample", type=int, default=DEFAULT_SAMPLE,
                         help="questions to evaluate; 0 = full set (no sampling variance)")
+    parser.add_argument("--retrieval-only", action="store_true",
+                        help="Retrieve and fingerprint the reader's prompt, but "
+                             "make NO answer or judge call. Produces rows with "
+                             "correct=None and a context_sha, for measuring how "
+                             "many questions a lever actually moves (`f`) "
+                             "without paying for the reader. Every scorer "
+                             "REFUSES the resulting artifact.")
     parser.add_argument("--seed", type=int, default=0,
                         help="RNG seed for stratified sampling; fixed so runs are paired/comparable")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
@@ -2851,10 +2982,23 @@ def main():
     # deepseek-chat deprecation it must be deepseek-v4-flash + --judge-extra-body
     # '{"thinking":{"type":"disabled"}}' to keep the yes/no parse clean.
     answer_api_key = args.answer_api_key or DEEPSEEK_API_KEY
+    # Under --retrieval-only the reader and judge are never reached, and the
+    # clients enforce that rather than trusting the branch: PoisonLLM raises,
+    # CountingLLM records what distillation and the store actually spend.
     answer_llm = LLMClient(args.answer_model, answer_api_key, base_url=args.answer_base_url,
                            extra_body=args.answer_extra_body_obj)
     judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY,
                           extra_body=args.judge_extra_body_obj)
+    retrieval_counter = None
+    distill_llm = None
+    if args.retrieval_only:
+        # The reader and the judge become unreachable OBJECTS, not skipped
+        # branches. Distillation keeps a real (counted) client because it is
+        # part of retrieval and genuinely fires.
+        retrieval_counter = CountingLLM(answer_llm)
+        distill_llm = retrieval_counter
+        answer_llm = PoisonLLM("reader")
+        judge_llm = PoisonLLM("judge")
 
     # Evaluate each question. Questions are fully independent (own temp DB +
     # HyMem instance), so --workers > 1 fans them across a thread pool — the work
@@ -2886,7 +3030,7 @@ def main():
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
                 pool.submit(_evaluate_one_question, qi, total, q_data, args,
-                            answer_llm, judge_llm, DEEPSEEK_API_KEY): qi
+                            answer_llm, judge_llm, DEEPSEEK_API_KEY, distill_llm): qi
                 for qi, q_data in enumerate(questions)
             }
             for fut in as_completed(futures):
@@ -2901,7 +3045,8 @@ def main():
         for qi, q_data in enumerate(questions):
             all_results.append(
                 _evaluate_one_question(qi, total, q_data, args,
-                                       answer_llm, judge_llm, DEEPSEEK_API_KEY)
+                                       answer_llm, judge_llm, DEEPSEEK_API_KEY,
+                                       distill_llm)
             )
             if (qi + 1) % 10 == 0:
                 _progress(qi + 1)
@@ -2951,6 +3096,7 @@ def main():
             "scale": scale,
             "sample": args.sample,
             "seed": args.seed,
+            "retrieval_only": bool(args.retrieval_only),
             "top_k": args.top_k,
             "auto_ability": args.auto_ability,
             "workers": args.workers,
@@ -3002,9 +3148,13 @@ def main():
             "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
             "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix, recall-ceiling instrumentation (retrieval-vs-ranking miss split), ability-router shadow/auto measurement (detect_ability vs oracle)",
             "elapsed_s": elapsed,
-            "answer_calls": answer_llm.call_count,
-            "judge_calls": judge_llm.call_count,
-            "total_tokens": answer_llm.total_tokens + judge_llm.total_tokens,
+            # PoisonLLM stands in for the judge under --retrieval-only and
+            # has no counters, by design: it exists to raise. 0 is the truth
+            # there, not a missing measurement.
+            "answer_calls": getattr(answer_llm, "call_count", 0),
+            "judge_calls": getattr(judge_llm, "call_count", 0),
+            "total_tokens": (getattr(answer_llm, "total_tokens", 0)
+                             + getattr(judge_llm, "total_tokens", 0)),
         },
         "scores": {qtype: {
             "accuracy": round(data["accuracy"] * 100, 1),
@@ -3015,6 +3165,19 @@ def main():
         "router_diagnostics": router_diag,
         "per_question": all_results,
     }
+    if args.retrieval_only:
+        # What the mode ACTUALLY spent, measured rather than assumed. It skips
+        # the reader and the judge; it does not skip distillation, and it
+        # cannot vouch for what reranking does inside the store.
+        output["retrieval_cost"] = {
+            "llm_calls": retrieval_counter.calls if retrieval_counter else None,
+            "prompt_chars": (retrieval_counter.prompt_chars
+                             if retrieval_counter else None),
+            "answer_calls": 0,
+            "judge_calls": 0,
+            "distill_calls": sum(r.get("distill_calls") or 0
+                                 for r in all_results),
+        }
 
     # Canonical "latest" pointer (stable filename other tools read)...
     results_path = results_dir / "longmemeval-v2-hymem.json"

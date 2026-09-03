@@ -49,7 +49,7 @@ _BENCH = Path(__file__).resolve().parent
 sys.path.insert(0, str(_BENCH))
 from churn_decompose import CONTEXT_FIELDS, is_scored  # noqa: E402
 from lme_noise_model import Z95  # noqa: E402
-from run_registry import ARM_SAME, arm_evidence  # noqa: E402
+from run_registry import ARM_SAME, arm_evidence, is_retrieval_only  # noqa: E402
 
 LEVER = "episode_granularity_enabled"
 
@@ -195,6 +195,14 @@ def gain_curve(f: float) -> dict:
 
 
 def report(a: dict, b: dict, lever: str = LEVER, out=print) -> dict:
+    ro = [n for n, art in (("A", a), ("B", b)) if is_retrieval_only(art)]
+    if ro:
+        out("=== calibration pair ===")
+        out(f"  REFUSED — arm(s) {', '.join(ro)} are --retrieval-only and")
+        out("  carry no verdicts. Churn is measured from discordant")
+        out("  questions, and a run with no verdicts has none.")
+        return {"refused": True, "retrieval_only": ro}
+
     verdict_arm, note, _ = arm_evidence(
         a.get("config", {}), b.get("config", {}), lever)
     out("=== calibration pair ===")

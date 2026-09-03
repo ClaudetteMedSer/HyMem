@@ -190,6 +190,26 @@ def iso_ts(ts) -> str | None:
 # arriving one level up: not an instrument that never touched the lever, but a
 # pair of results that cannot show whether it did.
 
+def is_retrieval_only(artifact) -> bool:
+    """Did this run make no answer or judge call?
+
+    `--retrieval-only` produces an artifact with a full complement of rows and
+    NO verdicts, so that `f` -- the fraction of questions a lever moves -- can
+    be measured without paying for the reader. Every scorer must REFUSE such an
+    artifact rather than caveat it: `accuracy` reads `correct: None` as
+    unscored and returns 0.0 on an empty denominator, which prints as a real
+    number, and a 0% arm beside a 69% arm looks like a catastrophic regression
+    rather than a category error.
+
+    Reads the config first and falls back to the rows, so an artifact written
+    before the flag existed -- or hand-edited -- still cannot slip through."""
+    artifact = artifact or {}
+    if (artifact.get("config") or {}).get("retrieval_only"):
+        return True
+    rows = artifact.get("per_question") or []
+    return bool(rows) and all(r.get("retrieval_only") for r in rows)
+
+
 ARM_EVIDENCED = "EVIDENCED"      # both blocks record the lever, and they differ
 ARM_SAME = "SAME_ARM"            # both record it, and they agree
 ARM_UNEVIDENCED = "UNEVIDENCED"  # at least one block does not record it

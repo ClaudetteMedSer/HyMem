@@ -41,6 +41,15 @@ from pathlib import Path
 Z95 = 1.959963985
 
 
+def _reject_retrieval_only(*artifacts):
+    from run_registry import is_retrieval_only
+    bad = [i for i, art in enumerate(artifacts) if is_retrieval_only(art)]
+    if bad:
+        raise ValueError(
+            "a --retrieval-only artifact has no verdicts to be discordant "
+            "about; churn cannot be measured from it")
+
+
 def norm_hypothesis(s) -> str:
     """Whitespace-insensitive answer identity.
 
@@ -129,6 +138,7 @@ def is_scored(r: dict) -> bool:
 
 
 def decompose(a: dict, b: dict) -> dict:
+    _reject_retrieval_only(a, b)
     ar = {r["question_id"]: r for r in a.get("per_question", [])}
     br = {r["question_id"]: r for r in b.get("per_question", [])}
     shared = sorted(set(ar) & set(br))
