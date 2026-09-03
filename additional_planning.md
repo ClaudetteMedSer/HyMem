@@ -4424,3 +4424,63 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > this lever at any price and should be retired; if narrow, a subset-scored
 > gate 4 is worth the 5.5h. Either way the 5.5h is only spent once the cheap
 > measurement says it would mean something.
+
+> **PRE-REGISTRATION 2026-09-03 — the f probe. Authorised spend; written and
+> committed BEFORE the run.**
+>
+> **Question.** What fraction of questions does `--episode-granularity`
+> actually move? Everything downstream turns on it: at f <= 25% a
+> subset-scored gate 4 resolves ~2x more finely and is worth its 5.5h; at
+> f >= 75% it resolves no better and gate 4 should be RETIRED for this lever
+> rather than re-run.
+>
+> **Design.** Two arms, `--retrieval-only`, 50 questions, seed 0. Verified
+> offline before scheduling: the loader draws the same 50 ids on both arms
+> (identical across two loads, 50 unique, stratified 5 each across 10 types).
+> Both arms dream — `--no-dream` is NOT set, and must not be: episode
+> granularity is a dream-time lever, so skipping the dream would measure
+> nothing. `distill` is False, so the arms make **zero API calls of their own**.
+>
+> Argv, identical but for the last flag, built once into an array and asserted
+> against its own label before anything spends:
+>
+>     --scales S --sample 50 --seed 0 --workers 8 --top-k 15
+>     --auto-ability --permissive-default --retrieval-only
+>     --answer-model deepseek-v4-flash
+>     --answer-base-url https://api.deepseek.com
+>     --answer-extra-body '{"thinking":{"type":"disabled"}}'
+>     --judge-model deepseek-v4-flash
+>     --judge-extra-body '{"thinking":{"type":"disabled"}}'
+>     --data-dir /home/node/.hermes/benchmarks
+>     [ARM ON ONLY: --episode-granularity]
+>
+> Asserted through the adapter's OWN parser, on the array the runner executes:
+> `retrieval_only=True` on both, `episode_granularity` False/True, and
+> `sample=50 seed=0 workers=8 top_k=15 no_dream=False distill=False`. Both
+> passed at 06:58Z, ~3h before the run.
+>
+> **Scorer.** `benchmarks/fired_fraction.py`, committed at `88c32fc` before
+> any of this was scheduled. It refuses a non-retrieval-only artifact, refuses
+> a pair that cannot evidence its arms, and refuses to fall back to the count
+> fields when `context_sha` is absent.
+>
+> **DECISION RULE, fixed in advance.** Read the Wilson 95% interval, not the
+> point:
+>
+> 1. interval entirely **>= 0.75** -> **BROAD**. Concentration buys nothing;
+>    recommend retiring gate 4 for this lever rather than re-running it.
+> 2. interval entirely **<= 0.25** -> **NARROW**. A subset-scored gate 4 is
+>    worth the 5.5h, and `concentration_model` then measures the gain instead
+>    of projecting it.
+> 3. otherwise -> **INCONCLUSIVE AT n=50**. Escalate n or accept a middling
+>    gain; do NOT read the point estimate as if it had settled it.
+>
+> **What this cannot establish.** That the lever moved the reader's input on a
+> question is not evidence it moved the ANSWER, still less the verdict. f
+> bounds what a subset-scored gate could SEE. A result here is never a result
+> about whether episode granularity helps.
+>
+> **Expected cost.** 0 answer calls, 0 judge calls, 0 distill calls. Wall clock
+> is dream-dominated: ~2.74h per 500 dreamed questions scales to **~0.28h per
+> arm, ~0.55h total**. The measured `retrieval_cost` block and elapsed_s will
+> be checked against this, and a large miss is itself a finding.
