@@ -45,6 +45,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from hymem import HyMemConfig  # noqa: E402
+from hymem.core.time import register_sqlite_time_functions  # noqa: E402
 
 LOCAL_EMBED_BASE_URL = "http://localhost:8766/v1"
 LOCAL_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -58,6 +59,7 @@ _BUDGET_MAX_TOKENS = 400
 def _open_readonly(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row  # augment/_fts_search index columns by name
+    register_sqlite_time_functions(conn)
     return conn
 
 

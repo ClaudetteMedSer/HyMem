@@ -1,4 +1,4 @@
-"""Tests for the E1 narrative-facts tier (schema v26).
+"""Tests for the authoritative narrative-facts tier (schema v46).
 
 Facts are a THIRD granularity next to graph triples and episode summaries: one
 self-contained sentence per thing that happened, extracted at dream time and
@@ -7,13 +7,10 @@ served as an additive retrieval tier plus the lead evidence block in `ask()`.
 The properties that make the tier safe to ship while other Campaign E items are
 still gated are the ones under test here:
 
-  * **Append-only.** Fact text is immutable; a re-dream never rewrites a stored
-    fact, and a prompt bump extracts FORWARD ONLY, so every row stays
-    attributable to the prompt version that produced it.
-  * **Watermarked coverage** (`sessions.facts_message_id`, the v24 pattern in
-    its own column): a quiescent store costs zero extraction calls, a parse
-    failure holds the watermark so the slice retries, and coverage never goes
-    backwards.
+  * **Lifecycle authority.** Fact payload rows are immutable, while successful
+    replay publishes a revision and retracts/resurrects the exact result set.
+  * **Lossless cursor coverage.** Oversized messages resume by exact character
+    offset; malformed or lossy replies durably retry without advancing.
   * **Additive retrieval.** Turning the tier on cannot change what the
     message/chunk/episode/graph tiers return — the invariant that lets the tier
     default ON without a benchmark rebaseline.
@@ -23,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -33,6 +31,7 @@ from hymem.dreaming import facts as facts_mod
 from hymem.extraction.llm import StubLLMClient
 from hymem.query.ask import render_context
 from hymem.query.augment import AugmentedContext, FactHit, MessageHit
+from hymem.query.fusion import SourceOccurrence
 from hymem.rules import Rule
 
 # The unique closer of FACTS_USER_TEMPLATE — routes stubs and counts calls
@@ -141,7 +140,10 @@ def test_extraction_persists_facts_with_canonical_entities_and_watermark(cfg):
         # Entities are stored canonical (the store speaks canonical ids), not
         # as the verbatim surface forms the extractor emitted.
         assert json.loads(rows[0]["entities"]) == ["med_flow", "fly_io"]
-        assert all(r["prompt_version"] == facts_mod.FACTS_PROMPT_VERSION for r in rows)
+        assert all(
+            r["prompt_version"] == facts_mod.facts_config_version(hy.config)
+            for r in rows
+        )
 
         # An explicit date is kept; a null date stays null (never a
         # session-date fallback — the G-F1 date lesson).
@@ -228,13 +230,11 @@ def test_redream_of_quiescent_session_costs_nothing(cfg):
         hy.close()
 
 
-# --- 4. forward-only prompt versioning --------------------------------------
+# --- 4. authoritative prompt replay -----------------------------------------
 
 
-def test_prompt_version_bump_extracts_forward_only(cfg, monkeypatch):
-    """A FACTS_PROMPT_VERSION bump tags NEW ranges with the new version and
-    leaves covered ranges untouched — no re-extraction, no rewrite. This is
-    what lets the prompt evolve without disturbing stored evidence."""
+def test_prompt_version_bump_replays_then_extracts_new_tail(cfg, monkeypatch):
+    """A prompt bump replays exact old units before extracting a new tail."""
     llm = _facts_llm(extra={"helm rollback": json.dumps(_FACTS_B)})
     hy = HyMem(cfg, llm=llm)
     try:
@@ -246,18 +246,22 @@ def test_prompt_version_bump_extracts_forward_only(cfg, monkeypatch):
 
         monkeypatch.setattr(facts_mod, "FACTS_PROMPT_VERSION", "facts.v3")
 
-        # A bump ALONE re-extracts nothing: the watermark, not a version stamp,
-        # is the facts skip-guard (deliberately unlike digest/profile).
         hy.dream()
-        assert len(_fact_calls(llm)) == calls
+        assert len(_fact_calls(llm)) == calls + 1
         assert _rows(hy) == before
+
+        # Completed replay is idempotent and incurs no second model call.
+        hy.dream()
+        assert len(_fact_calls(llm)) == calls + 1
 
         _seed_session(hy, sid, _MORE_TURNS)
         hy.dream()
         after = _rows(hy)
 
         assert after[: len(before)] == before
-        assert [r["prompt_version"] for r in after[len(before):]] == ["facts.v3"]
+        assert [r["prompt_version"] for r in after[len(before):]] == [
+            facts_mod.facts_config_version(hy.config)
+        ]
     finally:
         hy.close()
 
@@ -294,10 +298,7 @@ def test_parse_failure_holds_the_watermark_and_retries(cfg):
 
 
 def test_an_oversized_turn_is_covered_rather_than_re_read_forever(cfg):
-    """A single turn longer than the char cap is truncated, stored, and
-    COVERED. Truncation keeps the head, so no later dream could read more of
-    it — holding the watermark would re-spend the call every dream forever and
-    store nothing."""
+    """A turn longer than the cap is consumed by resumable exact slices."""
     llm = _facts_llm()
     small = dataclasses.replace(cfg, dream_digest_max_chars=200)
     hy = HyMem(small, llm=llm)
@@ -306,22 +307,36 @@ def test_an_oversized_turn_is_covered_rather_than_re_read_forever(cfg):
         _seed_session(hy, sid, [("user", "I shipped it. " + "filler words " * 200)])
         report = hy.dream()
 
-        assert report.facts_extracted == 2, "the truncated turn still yields facts"
-        assert _watermark(hy, sid) is not None, "coverage must advance"
+        assert report.facts_extracted == 2
+        assert report.budget_exhausted is True
+        cursor = hy.conn.execute(
+            "SELECT facts_cursor_message_id,facts_cursor_partial_message_id,"
+            "facts_cursor_offset FROM sessions WHERE id=?", (sid,),
+        ).fetchone()
+        assert cursor["facts_cursor_message_id"] is None
+        assert cursor["facts_cursor_partial_message_id"] is not None
+        assert cursor["facts_cursor_offset"] > 0
 
         calls = len(_fact_calls(llm))
-        hy.dream()
-        assert len(_fact_calls(llm)) == calls, "the oversized turn is not re-read"
+        while report.budget_exhausted:
+            report = hy.dream()
+        assert len(_fact_calls(llm)) > calls
+        assert _watermark(hy, sid) is not None
+        final_cursor = hy.conn.execute(
+            "SELECT facts_cursor_partial_message_id,facts_cursor_offset "
+            "FROM sessions WHERE id=?", (sid,),
+        ).fetchone()
+        assert final_cursor["facts_cursor_partial_message_id"] is None
+        assert final_cursor["facts_cursor_offset"] == 0
     finally:
         hy.close()
 
 
-# --- 6. UNIQUE dedup --------------------------------------------------------
+# --- 6. authoritative idempotence ------------------------------------------
 
 
 def test_resubmitting_the_same_range_inserts_nothing(cfg):
-    """The UNIQUE (session_id, start_message_id, text) key is the idempotency
-    backstop under the watermark: a replayed extraction no-ops row by row."""
+    """The exact slice/result generation is the idempotency backstop."""
     llm = _facts_llm()
     hy = HyMem(cfg, llm=llm)
     try:
@@ -350,7 +365,7 @@ def test_tier_surfaces_matches_skips_non_matches_and_hides_superseded(cfg):
     """The tier returns matching facts, stays empty for an unrelated query, and
     drops a superseded fact (invalid_at set) while KEEPING its row for audit."""
     llm = _facts_llm()
-    hy = HyMem(dataclasses.replace(cfg, facts_enabled=True), llm=llm)  # default OFF post-E1; pin on
+    hy = HyMem(cfg, llm=llm)
     try:
         sid = "s_tier"
         _seed_session(hy, sid, _TURNS)
@@ -365,13 +380,23 @@ def test_tier_surfaces_matches_skips_non_matches_and_hides_superseded(cfg):
 
         assert hy.augment("kayaking in Patagonia").facts == []
 
-        # E6's write, simulated: close the validity interval on the top fact.
+        # Direct projection mutation is forbidden. A successful authoritative
+        # empty replay closes the unit while retaining its audit row.
         fact_id = hits[0].fact_id
-        with core_db.transaction(hy.conn):
+        with pytest.raises(sqlite3.DatabaseError):
             hy.conn.execute(
                 "UPDATE narrative_facts SET invalid_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (fact_id,),
             )
+        slice_key = hy.conn.execute(
+            "SELECT source_outcome_key FROM narrative_facts WHERE id=?", (fact_id,)
+        ).fetchone()["source_outcome_key"]
+        replay = facts_mod.reextract_fact_outcome(
+            hy.conn, slice_key, _facts_llm("[]"), hy.config
+        )
+        replay.publication_version = "facts.v3"
+        with core_db.transaction(hy.conn):
+            facts_mod.persist_facts(hy.conn, sid, replay)
 
         after = hy.augment("what happened with the MedFlow deploy?").facts
         assert fact_id not in [h.fact_id for h in after], "superseded facts leave the tier"
@@ -387,8 +412,7 @@ def test_facts_are_embedded_once_and_reach_the_vec_arm(cfg, embed_stub):
     them, and a re-dream re-embeds nothing — fact text is immutable, so a
     stored vector can never be stale."""
     llm = _facts_llm()
-    hy = HyMem(dataclasses.replace(cfg, facts_enabled=True), llm=llm,
-               embedding_client=embed_stub)  # default OFF post-E1; pin on
+    hy = HyMem(cfg, llm=llm, embedding_client=embed_stub)
     try:
         sid = "s_embed"
         _seed_session(hy, sid, _TURNS)
@@ -420,7 +444,7 @@ def test_facts_tier_does_not_disturb_any_other_tier(cfg):
     """The control that lets this tier default ON: with facts present, every
     other tier returns exactly what it returns with `facts_enabled=False`."""
     llm = _facts_llm()
-    on_cfg = dataclasses.replace(cfg, facts_enabled=True)  # read-side default is OFF post-E1; pin on for the invariant test
+    on_cfg = dataclasses.replace(cfg, facts_enabled=True)
     hy = HyMem(on_cfg, llm=llm)
     query = "what happened with the MedFlow deploy?"
     try:
@@ -447,26 +471,37 @@ def test_facts_tier_does_not_disturb_any_other_tier(cfg):
     assert on.matched_entities == off.matched_entities
 
 
-# --- 9. pre-v26 degradation -------------------------------------------------
+# --- 9. pre-v46 degradation -------------------------------------------------
 
 
-def test_pre_v26_store_degrades_to_an_empty_tier_and_skips_extraction(cfg):
-    """A store that never got migration 026 must not crash: the tier is empty
+def test_pre_v46_store_degrades_to_an_empty_tier_and_skips_extraction(cfg):
+    """A store without fact objects must not crash: the tier is empty
     and extraction is skipped, both on the missing-object path."""
     llm = _facts_llm()
     hy = HyMem(cfg, llm=llm)
     try:
         sid = "s_pre26"
         _seed_session(hy, sid, _TURNS)
-        # Strip the v26 objects to simulate a store the migration never
+        # Strip the fact objects to simulate a store the migration never
         # reached. The watermark column is RENAMED rather than dropped: SQLite
         # rewrites the stored CREATE TABLE text on DROP COLUMN, and this
         # table's inline comment block would leave a dangling comma behind.
         # Either way the runtime sees "no such column: facts_message_id".
         with core_db.transaction(hy.conn):
+            # A genuine old store cannot contain the v46 authority guards.
+            triggers = hy.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND lower(sql) LIKE '%fact%'"
+            ).fetchall()
+            for trigger in triggers:
+                hy.conn.execute(f'DROP TRIGGER IF EXISTS "{trigger["name"]}"')
             hy.conn.execute("DROP TABLE IF EXISTS narrative_facts_fts")
             hy.conn.execute("DROP TABLE IF EXISTS narrative_fact_embeddings")
+            hy.conn.execute("DROP TABLE IF EXISTS narrative_fact_lifecycle")
+            hy.conn.execute("DROP TABLE IF EXISTS fact_extraction_revisions")
+            hy.conn.execute("DROP TABLE IF EXISTS fact_extraction_source_occurrences")
             hy.conn.execute("DROP TABLE IF EXISTS narrative_facts")
+            hy.conn.execute("DROP TABLE IF EXISTS fact_extraction_outcomes")
             hy.conn.execute(
                 "ALTER TABLE sessions RENAME COLUMN facts_message_id TO _gone"
             )
@@ -475,7 +510,7 @@ def test_pre_v26_store_degrades_to_an_empty_tier_and_skips_extraction(cfg):
 
         report = hy.dream()
         assert report.facts_extracted == 0
-        assert report.fact_failures == 0
+        assert report.fact_failures == 1
         assert _fact_calls(llm) == [], "no extraction call without a watermark column"
     finally:
         hy.close()
@@ -495,6 +530,8 @@ def _ctx_for_render() -> AugmentedContext:
                 entities=["med_flow"],
                 session_id="s",
                 score=1.0,
+                source_occurrences=(SourceOccurrence("s", 7),),
+                source_provenance_complete=True,
             ),
             FactHit(
                 fact_id=2,
@@ -503,6 +540,8 @@ def _ctx_for_render() -> AugmentedContext:
                 entities=[],
                 session_id="s",
                 score=0.5,
+                source_occurrences=(SourceOccurrence("s", 8),),
+                source_provenance_complete=True,
             ),
         ],
         message_hits=[
@@ -554,7 +593,7 @@ def test_truncation_sheds_facts_before_standing_rules():
 
 def test_ask_sends_the_facts_block_to_the_synthesis_call(cfg):
     """The one-call endpoint really carries facts into the prompt."""
-    cfg = dataclasses.replace(cfg, facts_enabled=True)  # read-side default is OFF post-E1; pin on for the render-path test
+    cfg = dataclasses.replace(cfg, facts_enabled=True)
     llm = _facts_llm()
     hy = HyMem(cfg, llm=llm)
     try:
@@ -608,14 +647,14 @@ def test_facts_top_k_zero_disables_retrieval_but_not_extraction(cfg):
         hy.close()
 
 
-# --- 13. migration 026 ------------------------------------------------------
+# --- 13. migration 026 through authoritative v46 ---------------------------
 
 
 def _cols(conn, table: str) -> set[str]:
     return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def test_v26_adds_facts_table_watermark_and_dream_run_columns(tmp_path: Path):
+def test_v26_store_upgrades_through_authoritative_v46(tmp_path: Path):
     """Migration 026 against a v25-shaped DB: the new objects appear and the
     existing rows are untouched. `CREATE TABLE IF NOT EXISTS` in schema.sql
     no-ops on the pre-existing tables, so the columns can only come from the
@@ -648,12 +687,14 @@ def test_v26_adds_facts_table_watermark_and_dream_run_columns(tmp_path: Path):
 
     core_db.initialize(conn)
 
-    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 35
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
     assert "facts_message_id" in _cols(conn, "sessions")
     assert {"facts_extracted", "fact_failures"} <= _cols(conn, "dream_runs")
     assert _cols(conn, "narrative_facts") >= {
         "id", "session_id", "start_message_id", "end_message_id", "text",
         "fact_date", "entities", "prompt_version", "valid_at", "invalid_at",
+        "source_outcome_key", "fact_key", "current_generation",
+        "lifecycle_status",
     }
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='narrative_facts_fts'"
@@ -698,18 +739,17 @@ def test_validator_distinguishes_unparseable_from_empty():
     assert facts_mod.validate_fact_items("[]", max_items=8) == []
 
 
-def test_validator_drops_a_malformed_date_but_keeps_the_fact():
-    """The date is metadata, the text is the evidence."""
+def test_validator_rejects_a_malformed_date_without_advancing():
     items = facts_mod.validate_fact_items(
         json.dumps([{"text": "Atta shipped it.", "date": "last tuesday", "entities": []}]),
         max_items=8,
     )
-    assert items == [{"text": "Atta shipped it.", "date": None, "entities": []}]
+    assert items is None
 
 
 def test_validator_caps_facts_per_session():
     raw = json.dumps([{"text": f"fact {i}", "date": None, "entities": []} for i in range(20)])
-    assert len(facts_mod.validate_fact_items(raw, max_items=8)) == 8
+    assert facts_mod.validate_fact_items(raw, max_items=8) is None
 
 
 def test_validator_tolerates_a_fenced_array():
@@ -726,7 +766,7 @@ _ONE_FACT = '{"text": "Atta shipped it.", "entities": []}'
 @pytest.mark.parametrize("raw, expected", [
     (f"[{_ONE_FACT}]", 1),                                    # bare array
     (f"```json\n[{_ONE_FACT}]\n```", 1),                      # fenced array
-    (f"Here:\n```json\n[{_ONE_FACT}]\n```\nDone.", 1),        # prose + fence
+    (f"Here:\n```json\n[{_ONE_FACT}]\n```\nDone.", None),     # prose is ambiguous
     ('{"facts": [%s]}' % _ONE_FACT, 1),                       # bare envelope
     ('```json\n{"facts": [%s]}\n```' % _ONE_FACT, 1),         # fenced envelope
     ("I could not extract any facts.", None),                 # refusal

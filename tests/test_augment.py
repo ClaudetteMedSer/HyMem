@@ -23,13 +23,20 @@ def test_augment_returns_user_md_memory_md_and_graph_facts(hy):
 
     assert "Behavioral Profile" in ctx.user_md
     assert "Project Insights" in ctx.memory_md
-    assert "docker" in ctx.matched_entities
+    assert "docker" not in ctx.matched_entities
 
-    # Graph facts should surface the rejection / negative evidence.
+    # Current graph facts deliberately exclude a negative-only, retracted edge;
+    # the rejection remains durable in the evidence ledger for explanation and
+    # conflict/history APIs.
     facts_by_obj = {(f.subject, f.object): f for f in ctx.graph_facts}
-    assert ("local_dev", "docker") in facts_by_obj
-    docker_fact = facts_by_obj[("local_dev", "docker")]
-    assert docker_fact.neg_evidence >= 1
+    assert ("local_dev", "docker") not in facts_by_obj
+    assert ("local_dev", "uv") in facts_by_obj
+    docker_edge = hy.conn.execute(
+        "SELECT status, neg_evidence FROM knowledge_graph "
+        "WHERE subject_canonical='local_dev' AND object_canonical='docker'"
+    ).fetchone()
+    assert docker_edge["status"] == "retracted"
+    assert docker_edge["neg_evidence"] >= 1
 
 
 def test_augment_without_dreaming_still_returns_empty_context(hy):

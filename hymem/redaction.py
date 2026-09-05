@@ -76,3 +76,80 @@ def redact(text: str) -> str:
     for pattern, replacement in _PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def _changed_span(match: re.Match[str], replacement: str) -> tuple[int, int]:
+    """Return the part of one match changed by its normal replacement.
+
+    Several rules intentionally preserve structural prefixes (``Bearer ``, an
+    assignment name, or a URL username). Longest common prefix/suffix isolates
+    only the secret-bearing middle instead of masking that benign structure.
+    """
+
+    original = match.group(0)
+    expanded = match.expand(replacement)
+    prefix = 0
+    limit = min(len(original), len(expanded))
+    while prefix < limit and original[prefix] == expanded[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < len(original) - prefix
+        and suffix < len(expanded) - prefix
+        and original[len(original) - suffix - 1]
+        == expanded[len(expanded) - suffix - 1]
+    ):
+        suffix += 1
+    return prefix, len(original) - suffix
+
+
+def redact_preserving_length(text: str) -> str:
+    """Mask only recognised sensitive spans without changing character offsets.
+
+    This is for exact source artifacts whose published cursors may point inside
+    the content. Ordinary ingest/export should prefer :func:`redact`, whose
+    visible markers are more useful to humans.
+    """
+
+    if not text:
+        return text
+    for pattern, replacement in _PATTERNS:
+        def mask(match: re.Match[str], replacement: str = replacement) -> str:
+            start, end = _changed_span(match, replacement)
+            original = match.group(0)
+            candidate = (
+                original[:start] + ("*" * (end - start)) + original[end:]
+            )
+            # The URL-credential rule deliberately accepts almost every
+            # non-whitespace password character, including ``*``.  Fall back
+            # to same-width spaces when the rule would otherwise recognise
+            # its own mask; this keeps both coordinates and redaction fixed.
+            if pattern.search(candidate) is not None:
+                candidate = (
+                    original[:start] + (" " * (end - start)) + original[end:]
+                )
+            return candidate
+
+        text = pattern.sub(mask, text)
+    return text
+
+
+def sensitive_fragments(text: str) -> tuple[str, ...]:
+    """Return the exact secret-bearing fragments recognized in ``text``.
+
+    The values are intended only for in-memory identity rebinding during a
+    redacted export; callers must never persist or log them.
+    """
+
+    if not text:
+        return ()
+    found: list[str] = []
+    seen: set[str] = set()
+    for pattern, replacement in _PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = _changed_span(match, replacement)
+            fragment = match.group(0)[start:end]
+            if fragment and fragment not in seen:
+                seen.add(fragment)
+                found.append(fragment)
+    return tuple(found)

@@ -1,3 +1,13 @@
+# Archived Honcho digest-injection notes
+
+> **Do not apply this legacy patch to the current server.** It predates
+> workspace/peer provenance binding and routed process-global `USER.md`,
+> `MEMORY.md`, and the root digest through Honcho peer fields. Current Honcho
+> reads deliberately exclude those unowned artifacts to preserve tenant and
+> directional peer isolation. Use the native HyMem/MCP digest interface when a
+> host intentionally wants process-global memory. The material below is kept
+> only as historical context for pre-2026-09-04 deployments.
+
 # Standing Digest in Hermes Auto-Injected Context — Operator Runbook
 
 Runbook for a Hermes instance that wants HyMem's cross-session RAPTOR digest —

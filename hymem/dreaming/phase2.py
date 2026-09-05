@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from hymem.config import HyMemConfig
+from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.core import markdown_io
 
 log = logging.getLogger("hymem.dreaming.phase2")
@@ -90,14 +91,13 @@ def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
     # Hubs: objects depended-on by 2+ subjects with non-trivial confidence.
     hub_rows = conn.execute(
-        """
+        f"""
         SELECT object_canonical AS obj,
                GROUP_CONCAT(subject_canonical, ', ') AS subjects,
                COUNT(*) AS cnt
         FROM knowledge_graph
         WHERE predicate = 'depends_on'
-           AND status = 'active'
-           AND derived = 0
+           AND {live_edge_predicate()}
            AND (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) > 0.6
         GROUP BY object_canonical
         HAVING cnt >= 2
@@ -113,15 +113,15 @@ def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
     # Strong tool preferences and rejections.
     pref_rows = conn.execute(
-        """
+        f"""
         SELECT predicate, subject_canonical AS s, object_canonical AS o,
                pos_evidence AS pos, neg_evidence AS neg, last_reinforced
         FROM knowledge_graph
         WHERE predicate IN ('prefers','rejects','avoids')
-           AND status = 'active'
-           AND derived = 0
+           AND {live_edge_predicate()}
            AND (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) > 0.7
-        ORDER BY pos_evidence DESC, last_reinforced DESC
+        ORDER BY pos_evidence DESC,
+                 {graph_clock_order_sql('last_reinforced')}, id
         LIMIT ?
         """,
         (cfg.insights_max_entries,),
@@ -132,11 +132,12 @@ def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
     # Contradictions: an edge with both significant pos and neg evidence.
     contradiction_rows = conn.execute(
-        """
+        f"""
         SELECT subject_canonical AS s, predicate AS p, object_canonical AS o,
                pos_evidence AS pos, neg_evidence AS neg
         FROM knowledge_graph
-        WHERE pos_evidence >= 1 AND neg_evidence >= 1 AND status = 'active' AND derived = 0
+        WHERE pos_evidence >= 1 AND neg_evidence >= 1
+          AND {live_edge_predicate()}
         ORDER BY (pos_evidence + neg_evidence) DESC
         LIMIT 5
         """

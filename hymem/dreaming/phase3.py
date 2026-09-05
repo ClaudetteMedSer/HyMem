@@ -5,27 +5,18 @@ import sqlite3
 
 from hymem.config import HyMemConfig
 from hymem.core.db import backfill_entity_mentions
-from hymem.dreaming import bitemporal
+from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
+from hymem.dreaming import evidence
 
 log = logging.getLogger("hymem.dreaming.phase3")
-
-
-def _chunk_first_message_role(conn: sqlite3.Connection, chunk_id: str) -> str | None:
-    """Role of the chunk's first message — the author signal for speaker-
-    weighted reinforcement. None if the chunk or message is gone."""
-    row = conn.execute(
-        "SELECT m.role FROM chunks c JOIN messages m ON m.id = c.start_message_id "
-        "WHERE c.id = ?",
-        (chunk_id,),
-    ).fetchone()
-    return row["role"] if row else None
 
 
 def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
     """Co-occurrence-aware decay + negative-dominance retraction.
 
     Two retraction paths:
-      1. Topic re-mentioned without reinforcement -> bump neg_evidence, then
+      1. Topic re-mentioned without reinforcement -> record soft-negative
+         evidence, then
          retract if smoothed confidence falls below cfg.retract_threshold.
       2. neg_evidence >= 2*pos_evidence + cfg.zombie_neg_threshold -> retract
          immediately. Catches edges where negatives clearly dominate but the
@@ -47,8 +38,8 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
     active_predicates = [
         r["predicate"]
         for r in conn.execute(
-            "SELECT DISTINCT predicate FROM knowledge_graph "
-            "WHERE status = 'active' AND derived = 0"
+            f"SELECT DISTINCT predicate FROM knowledge_graph kg "
+            f"WHERE {live_edge_predicate('kg')}"
         ).fetchall()
     ]
 
@@ -57,13 +48,16 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         elig_cutoff = f"-{elig_window} days"
 
         rows = conn.execute(
-            """
-            SELECT id, subject_canonical, object_canonical
-            FROM knowledge_graph
-            WHERE status = 'active'
-              AND derived = 0
-              AND predicate = ?
-              AND (last_reinforced IS NULL OR last_reinforced < datetime('now', ?))
+            f"""
+            SELECT kg.id, kg.subject_canonical, kg.object_canonical
+            FROM knowledge_graph kg
+            WHERE {live_edge_predicate('kg')}
+              AND kg.predicate = ?
+              AND (kg.last_reinforced IS NULL
+                   OR hymem_timestamp_at_or_before(
+                        kg.last_reinforced,
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)
+                      ) = 1)
             """,
             (predicate, elig_cutoff),
         ).fetchall()
@@ -75,13 +69,26 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
             recent_mention = conn.execute(
                 """
-                SELECT 1 FROM entity_mentions em
+                SELECT em.chunk_id AS chunk_id FROM entity_mentions em
                 JOIN chunks c ON c.id = em.chunk_id
                 WHERE em.entity_canonical IN (?, ?)
-                  AND c.created_at >= datetime('now', ?)
-                  AND em.chunk_id NOT IN (
-                      SELECT chunk_id FROM kg_evidence WHERE edge_id = ?
+                  AND hymem_timestamp_at_or_before(
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now', ?),
+                        c.created_at
+                      ) = 1
+                  AND hymem_timestamp_at_or_before(
+                        c.created_at,
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now','+300 seconds')
+                      ) = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM kg_evidence ev
+                      WHERE ev.edge_id = ? AND ev.chunk_id = em.chunk_id
+                        AND ev.is_current = 1
+                        AND ev.evidence_kind <> 'decay'
                   )
+                ORDER BY c.end_message_id DESC,
+                         hymem_normalize_iso_timestamp(c.created_at) DESC,
+                         em.chunk_id DESC
                 LIMIT 1
                 """,
                 (subj, obj, mention_cutoff, edge_id),
@@ -90,10 +97,18 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
             if not recent_mention:
                 continue
 
-            # Topic discussed without reinforcement → treat as soft contradiction.
-            conn.execute(
-                "UPDATE knowledge_graph SET neg_evidence = neg_evidence + 1 WHERE id = ?",
-                (edge_id,),
+            # Topic discussed without reinforcement → one soft-negative
+            # observation for this exact source chunk.  The ledger row is the
+            # idempotency key, so unchanged dream cycles cannot repeatedly tax
+            # the edge for the same conversation.
+            evidence.record_chunk_evidence(
+                conn,
+                edge_id=edge_id,
+                chunk_id=recent_mention["chunk_id"],
+                evidence_kind="decay",
+                polarity=-1,
+                evidence_weight=1,
+                weight_source="fixed_soft_decay:1",
             )
 
     # Find every edge that will be retracted this pass — either by smoothed
@@ -105,52 +120,113 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
     # `hook uses nohup` +1/-4 that the smoothed-confidence rule misses).
     # We select first so we can log feedback before flipping status.
     to_retract = conn.execute(
-        """
-        SELECT id, subject_canonical, predicate, object_canonical
-        FROM knowledge_graph
-        WHERE status = 'active'
-          AND derived = 0
+        f"""
+        SELECT kg.id, kg.subject_canonical, kg.predicate, kg.object_canonical
+        FROM knowledge_graph kg
+        WHERE {live_edge_predicate('kg', require_positive_majority=False)}
           AND (
-              (pos_evidence + 1.0) / (pos_evidence + neg_evidence + 2.0) < ?
-              OR neg_evidence >= 2 * pos_evidence + ?
+              (kg.pos_evidence + 1.0)
+                / (kg.pos_evidence + kg.neg_evidence + 2.0) < ?
+              OR kg.neg_evidence >= 2 * kg.pos_evidence + ?
           )
         """,
         (cfg.retract_threshold, cfg.zombie_neg_threshold),
     ).fetchall()
 
+    retracted_edges: list[sqlite3.Row] = []
     for edge in to_retract:
-        _record_retraction_feedback(conn, edge)
+        positive = conn.execute(
+            """
+            SELECT MAX(hymem_normalize_iso_timestamp(source_event_at)) AS positive_at
+            FROM kg_evidence
+            WHERE edge_id = ? AND is_current = 1 AND polarity = 1
+              AND provenance_status = 'canonical'
+              AND hymem_normalize_iso_timestamp(source_event_at) IS NOT NULL
+            """,
+            (edge["id"],),
+        ).fetchone()
+        causes = conn.execute(
+            """
+            SELECT id, provenance_status, source_session_id,
+                   source_message_id, evidence_kind, revision, chunk_id
+            FROM kg_evidence
+            WHERE edge_id = ? AND is_current = 1 AND polarity = -1
+              AND hymem_timestamp_at_or_before(
+                    extracted_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now','+300 seconds')
+                  ) = 1
+              AND (
+                provenance_status <> 'canonical'
+                OR (
+                  hymem_event_clock_is_valid(source_event_at,extracted_at)=1
+                  AND hymem_timestamp_at_or_before(
+                        published_at,
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now','+300 seconds')
+                      )=1
+                )
+              )
+            ORDER BY provenance_status, source_session_id,
+                     source_message_id, evidence_kind, revision, chunk_id
+            """,
+            (edge["id"],),
+        ).fetchall()
+        if not causes:
+            continue
+        from hymem.dreaming.bitemporal import evidence_event_at
 
-    if to_retract:
-        ids = [e["id"] for e in to_retract]
-        placeholders = ",".join("?" * len(ids))
-        conn.execute(
-            f"UPDATE knowledge_graph SET status = 'retracted' WHERE id IN ({placeholders})",
-            ids,
+        cause_coordinates = {
+            int(row["id"]): evidence_event_at(conn, int(row["id"]))
+            for row in causes
+        }
+        positive_at = positive["positive_at"]
+        close_at = max(cause_coordinates.values())
+        if positive_at is not None and close_at < positive_at:
+            # Accumulated but older contradictions cannot close a newer
+            # assertion merely because their rows arrived later.
+            continue
+        from hymem.dreaming.bitemporal import record_lifecycle_event
+
+        record_lifecycle_event(
+            conn,
+            edge_id=int(edge["id"]),
+            event_key=evidence.phase3_retraction_event_key(
+                conn, [int(row["id"]) for row in causes]
+            ),
+            event_kind="phase3_retraction",
+            direction=-1,
+            event_at=close_at,
+            dependency_evidence_ids=[int(row["id"]) for row in causes],
+            details="confidence_or_negative_dominance",
         )
-        # Close the validity interval: these facts were superseded by the
-        # contradicting evidence that drove the decay (schema v15 valid time).
-        bitemporal.stamp_invalidation(conn, ids)
+        state = conn.execute(
+            "SELECT status, invalid_at FROM knowledge_graph WHERE id = ?",
+            (edge["id"],),
+        ).fetchone()
+        if state is not None and state["status"] == "retracted" \
+                and state["invalid_at"] is not None:
+            _record_retraction_feedback(conn, edge)
+            retracted_edges.append(edge)
+
+    if retracted_edges:
+        log.info("phase3.retracted edges=%d", len(retracted_edges))
 
 
 def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
     """Soft positive reinforcement from co-mention.
 
-    Mirror of decay: if a chunk in the reinforcement window mentions BOTH
-    subject and object of an active edge — and that chunk hasn't already
-    produced a kg_evidence row for the edge — bump pos_evidence by 1. The
-    bump is capped at one per edge per cycle (we don't iterate all matching
-    chunks). Co-occurrence is weak evidence, but it's how singleton edges
-    (60% of the graph) ever get a second positive.
+    Mirror of decay: the newest eligible chunk in the reinforcement window that
+    mentions BOTH endpoints contributes one source-keyed positive observation.
+    Re-running against the same newest chunk is a no-op; a genuinely newer
+    co-mention can contribute once. Co-occurrence is weak evidence, but it's how
+    singleton edges (60% of the graph) ever get a second positive.
     """
     cutoff_arg = f"-{int(cfg.reinforce_window_days)} days"
 
     rows = conn.execute(
-        """
-        SELECT id, subject_canonical, object_canonical
-        FROM knowledge_graph
-        WHERE status = 'active'
-          AND derived = 0
+        f"""
+        SELECT kg.id, kg.subject_canonical, kg.object_canonical
+        FROM knowledge_graph kg
+        WHERE {live_edge_predicate('kg')}
         """
     ).fetchall()
 
@@ -169,10 +245,23 @@ def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
             JOIN chunks c ON c.id = em_s.chunk_id
             WHERE em_s.entity_canonical = ?
               AND em_o.entity_canonical = ?
-              AND c.created_at >= datetime('now', ?)
-              AND em_s.chunk_id NOT IN (
-                  SELECT chunk_id FROM kg_evidence WHERE edge_id = ?
+              AND hymem_timestamp_at_or_before(
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now', ?),
+                    c.created_at
+                  ) = 1
+              AND hymem_timestamp_at_or_before(
+                    c.created_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now','+300 seconds')
+                  ) = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM kg_evidence ev
+                  WHERE ev.edge_id = ? AND ev.chunk_id = em_s.chunk_id
+                    AND ev.is_current = 1
+                    AND ev.evidence_kind <> 'reinforcement'
               )
+            ORDER BY c.end_message_id DESC,
+                     hymem_normalize_iso_timestamp(c.created_at) DESC,
+                     em_s.chunk_id DESC
             LIMIT 1
             """,
             (subj, obj, cutoff_arg, edge_id),
@@ -181,21 +270,27 @@ def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         if not comention:
             continue
 
-        # Speaker-weighted reinforcement: a co-mention in a user-opened chunk
-        # counts more than one prefixed by (possibly confabulated) assistant
-        # context. Defaults to weight 1 for assistant-prefixed chunks.
-        role = _chunk_first_message_role(conn, comention["chunk_id"])
-        weight = cfg.evidence_role_weights.get(role, 1) if role else 1
-
-        conn.execute(
-            "UPDATE knowledge_graph "
-            "SET pos_evidence = pos_evidence + ?, "
-            "    last_reinforced = CURRENT_TIMESTAMP, "
-            "    invalid_at = NULL "
-            "WHERE id = ?",
-            (weight, edge_id),
+        # Co-mention is a synthetic signal, not a quoted claim. It therefore
+        # stays explicitly unattributed at fixed weak weight instead of
+        # borrowing the first speaker of a mixed-role chunk.
+        mutation = evidence.record_chunk_evidence(
+            conn,
+            edge_id=edge_id,
+            chunk_id=comention["chunk_id"],
+            evidence_kind="reinforcement",
+            polarity=1,
+            evidence_weight=1,
+            weight_source="fixed_unattributed_comention:1",
         )
-        bumped += 1
+        if mutation.contribution_changed:
+            conn.execute(
+                "UPDATE knowledge_graph "
+                "SET last_reinforced = CURRENT_TIMESTAMP, "
+                "    invalid_at = NULL "
+                "WHERE id = ?",
+                (edge_id,),
+            )
+            bumped += 1
 
     if bumped:
         log.info("phase3.reinforce edges_bumped=%d", bumped)
@@ -209,10 +304,11 @@ def _record_retraction_feedback(conn: sqlite3.Connection, edge: sqlite3.Row) -> 
     extraction_feedback permanently empty for the most useful negative cases.
     """
     evidence = conn.execute(
-        """
+        f"""
         SELECT chunk_id FROM kg_evidence
-        WHERE edge_id = ?
-        ORDER BY polarity DESC, extracted_at DESC LIMIT 1
+        WHERE edge_id = ? AND is_current = 1
+        ORDER BY polarity DESC, {graph_clock_order_sql('extracted_at')}, id
+        LIMIT 1
         """,
         (edge["id"],),
     ).fetchone()

@@ -1697,22 +1697,15 @@ def _row(qtype="single-session-user", correct=True, **kw):
     return r
 
 
-def test_an_unscored_row_leaves_the_accuracy_denominator():
-    """The D3 policy, stated as arithmetic.
-
-    Three rows, two right, one the judge never answered. Accuracy is 2/2, not
-    2/3. The `expected_if_counted_wrong` line is a NEGATIVE CONTROL: it is the
-    number the old behaviour produced, and asserting the two differ is what
-    stops this test passing vacuously on a fixture where exclusion and
-    deflation happen to agree."""
+def test_a_judge_failure_stays_in_strict_accuracy_and_conditional_is_named():
+    """Headline accuracy keeps the expected denominator; judged-only is explicit."""
     from longmemeval_adapter import accuracy, scored
 
     rows = [_row(qid="a"), _row(qid="b"),
             _row(qid="c", correct=None, judge_error=True)]
     assert len(scored(rows)) == 2
-    assert accuracy(rows) == 1.0
-    expected_if_counted_wrong = 2 / 3
-    assert accuracy(rows) != expected_if_counted_wrong
+    assert accuracy(rows) == 2 / 3
+    assert accuracy(scored(rows)) == 1.0
 
 
 def test_the_accuracy_helper_does_not_TypeError_on_an_unscored_row():
@@ -1728,7 +1721,7 @@ def test_the_accuracy_helper_does_not_TypeError_on_an_unscored_row():
     rows = [_row(qid="a"), _row(qid="c", correct=None, judge_error=True)]
     with pytest.raises(TypeError):
         sum(r["correct"] for r in rows) / len(rows)
-    assert accuracy(rows) == 1.0
+    assert accuracy(rows) == 0.5
 
 
 def test_compute_scores_is_INERT_on_a_run_with_no_judge_errors():
@@ -1748,17 +1741,19 @@ def test_compute_scores_is_INERT_on_a_run_with_no_judge_errors():
     assert scores["single-session-user"]["count"] == 2
 
 
-def test_an_unscored_row_changes_only_the_denominator_it_leaves():
-    """Adding an outage row must not move any OTHER row's number.
-
-    The failure this guards against is a filter applied in one summary and not
-    another, so a category table and the overall line disagree about which run
-    they describe."""
+def test_a_judge_failure_changes_every_strict_denominator_consistently():
+    """Category and overall headline scores use the same complete denominator."""
     from longmemeval_adapter import compute_scores
 
     clean = [_row(qid="a"), _row(qid="b", correct=False)]
     with_outage = clean + [_row(qid="c", correct=None, judge_error=True)]
-    assert compute_scores(clean) == compute_scores(with_outage)
+    assert compute_scores(clean)["OVERALL"] == {"accuracy": 0.5, "count": 2}
+    assert compute_scores(with_outage)["OVERALL"] == {
+        "accuracy": 1 / 3, "count": 3
+    }
+    assert compute_scores(with_outage)["single-session-user"] == {
+        "accuracy": 1 / 3, "count": 3
+    }
 
 
 def test_judge_error_note_states_the_denominator_when_the_count_is_zero():
@@ -1776,8 +1771,9 @@ def test_judge_error_note_states_the_denominator_when_the_count_is_zero():
 
     dirty = judge_error_note([_row(qid="a"),
                               _row(qid="c", correct=None, judge_error=True)])
-    assert "UNSCORED" in dirty and "NOT counted wrong" in dirty
-    assert "1-row accuracy denominator" in dirty
+    assert "counts WRONG" in dirty
+    assert "strict 2-row denominator" in dirty
+    assert "Conditional judged-only n=1" in dirty
 
 
 def test_diag_only_rows_are_unscored_but_are_NOT_judge_errors():
@@ -1876,10 +1872,15 @@ def test_recall_diagnostics_does_not_count_an_unscored_row_as_a_MISS():
                                 recall_ceiling=False, recall_tier="none")]
     d_clean = compute_recall_diagnostics(clean)
     d_outage = compute_recall_diagnostics(with_outage)
-    assert d_clean == d_outage, (
-        "an unscored row moved the miss decomposition — a judge outage would "
-        "be reported as a retrieval loss"
-    )
+    clean_cat = d_clean["single-session-user"]
+    outage_cat = d_outage["single-session-user"]
+    for key in (
+        "known", "unknown", "ceiling_rate", "misses", "miss_retrieval",
+        "miss_ranking", "miss_unknown",
+    ):
+        assert outage_cat[key] == clean_cat[key]
+    assert outage_cat["benchmark_failures_excluded"] == 1
+    assert d_outage["_tiers"] == d_clean["_tiers"]
 
 
 def test_abstention_scores_do_not_count_an_unscored_row_as_a_FAILED_abstention():
@@ -1893,17 +1894,22 @@ def test_abstention_scores_do_not_count_an_unscored_row_as_a_FAILED_abstention()
     exists to make, so a defect that biases only one arm does not cancel."""
     from longmemeval_adapter import compute_abstention_scores
 
+    # The pinned evaluator derives abstention from substring membership in the
+    # question ID.  The source question_type remains one of the six base types.
     clean = [_row(qid="a"),
-             _row(qid="x", qtype="single-session-user_abs"),
-             _row(qid="y", qtype="single-session-user_abs")]
-    with_outage = clean + [_row(qid="z", qtype="single-session-user_abs",
+             _row(qid="x_abs", qtype="single-session-user"),
+             _row(qid="y_abs", qtype="single-session-user")]
+    with_outage = clean + [_row(qid="z_abs", qtype="single-session-user",
                                 correct=None, judge_error=True)]
-    assert compute_abstention_scores(clean)["abstention"] == {
-        "accuracy": 1.0, "count": 2}
-    assert compute_abstention_scores(clean) == compute_abstention_scores(with_outage), (
-        "an unscored row moved the abstention rate — a judge outage would be "
-        "reported as a hallucination"
-    )
+    clean_abs = compute_abstention_scores(clean)["abstention"]
+    outage_abs = compute_abstention_scores(with_outage)["abstention"]
+    assert clean_abs["accuracy"] == 1.0 and clean_abs["count"] == 2
+    assert clean_abs["benchmark_failures"] == 0
+    assert outage_abs["accuracy"] == 2 / 3
+    assert outage_abs["count"] == 3
+    assert outage_abs["benchmark_failures"] == 1
+    assert outage_abs["conditional_valid_accuracy"] == 1.0
+    assert outage_abs["conditional_valid_count"] == 2
 
 
 def test_the_run_file_instruments_also_refuse_to_score_an_unscored_row():

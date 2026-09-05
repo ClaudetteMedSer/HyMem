@@ -67,6 +67,7 @@ import sqlite3
 from collections import defaultdict
 
 from hymem.config import HyMemConfig
+from hymem.core.graph import live_edge_predicate
 
 log = logging.getLogger(__name__)
 
@@ -162,19 +163,79 @@ def supersede_competing_values(conn: sqlite3.Connection, cfg: HyMemConfig) -> in
     ``invalid_at`` closed at the winner's ``valid_at``. Ties on ``valid_at`` are
     left untouched (no temporal basis to order them).
     """
+    event_at_sql = """
+        CASE WHEN ev.provenance_status = 'canonical'
+             THEN hymem_normalize_iso_timestamp(ev.source_event_at)
+             ELSE COALESCE(
+               hymem_normalize_iso_timestamp(ev.extracted_at),
+               '0001-01-01T00:00:00.000Z'
+             )
+        END
+    """
     rows = conn.execute(
-        """
+        f"""
         SELECT kg.id AS id,
                kg.subject_canonical AS subj,
                kg.predicate AS pred,
                kg.object_canonical AS obj,
-               kg.valid_at AS valid_at,
-               MIN(ev.value_unit) AS ev_unit,
-               MAX(CASE WHEN ev.value_numeric IS NOT NULL THEN 1 ELSE 0 END) AS has_numeric
+               (
+                   SELECT {event_at_sql}
+                   FROM kg_evidence ev
+                   WHERE ev.edge_id = kg.id AND ev.polarity = 1
+                     AND ev.is_current = 1
+                     AND (ev.provenance_status <> 'canonical'
+                          OR hymem_normalize_iso_timestamp(
+                               ev.source_event_at) IS NOT NULL)
+                   ORDER BY (ev.provenance_status = 'canonical') DESC,
+                            {event_at_sql} DESC,
+                            hymem_normalize_iso_timestamp(ev.extracted_at) DESC,
+                            ev.revision DESC, ev.id DESC
+                   LIMIT 1
+               ) AS valid_at,
+               (
+                   SELECT ev.value_unit FROM kg_evidence ev
+                   WHERE ev.edge_id = kg.id AND ev.polarity = 1
+                     AND ev.is_current = 1
+                     AND (ev.provenance_status <> 'canonical'
+                          OR hymem_normalize_iso_timestamp(
+                               ev.source_event_at) IS NOT NULL)
+                   ORDER BY (ev.provenance_status = 'canonical') DESC,
+                            {event_at_sql} DESC,
+                            hymem_normalize_iso_timestamp(ev.extracted_at) DESC,
+                            ev.revision DESC, ev.id DESC
+                   LIMIT 1
+               ) AS ev_unit,
+               EXISTS(
+                   SELECT 1 FROM kg_evidence ev
+                   WHERE ev.edge_id = kg.id AND ev.polarity = 1
+                     AND ev.is_current = 1 AND ev.value_numeric IS NOT NULL
+                     AND (ev.provenance_status <> 'canonical'
+                          OR hymem_normalize_iso_timestamp(
+                               ev.source_event_at) IS NOT NULL)
+               ) AS has_numeric,
+               (
+                   SELECT ev.id FROM kg_evidence ev
+                   WHERE ev.edge_id = kg.id AND ev.polarity = 1
+                     AND ev.is_current = 1
+                     AND (ev.provenance_status <> 'canonical'
+                          OR hymem_normalize_iso_timestamp(
+                               ev.source_event_at) IS NOT NULL)
+                   ORDER BY (ev.provenance_status = 'canonical') DESC,
+                            {event_at_sql} DESC,
+                            hymem_normalize_iso_timestamp(ev.extracted_at) DESC,
+                            ev.revision DESC, ev.id DESC
+                   LIMIT 1
+               ) AS evidence_id
         FROM knowledge_graph kg
-        JOIN kg_evidence ev ON ev.edge_id = kg.id AND ev.polarity = 1
-        WHERE kg.status = 'active' AND kg.derived = 0 AND kg.valid_at IS NOT NULL
-        GROUP BY kg.id
+        WHERE {live_edge_predicate('kg')} AND kg.valid_at IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM kg_evidence ev
+              WHERE ev.edge_id = kg.id AND ev.polarity = 1
+                AND ev.is_current = 1
+                AND (ev.provenance_status <> 'canonical'
+                     OR hymem_normalize_iso_timestamp(
+                          ev.source_event_at) IS NOT NULL)
+          )
         """
     ).fetchall()
 
@@ -199,7 +260,7 @@ def supersede_competing_values(conn: sqlite3.Connection, cfg: HyMemConfig) -> in
             unit = _norm_unit(r["ev_unit"])
         groups[(r["subj"], r["pred"], kind, unit)].append(r)
 
-    to_retract: list[tuple[int, str]] = []  # (older_edge_id, invalid_at)
+    to_retract: list[tuple[int, str, int, str, str, str]] = []
     for (subj, pred, kind, unit), edges in groups.items():
         if len(edges) < 2:
             continue
@@ -213,7 +274,12 @@ def supersede_competing_values(conn: sqlite3.Connection, cfg: HyMemConfig) -> in
                 continue  # same value, just reinforced at an earlier date
             if e["valid_at"] >= winner["valid_at"]:
                 continue  # tie / not strictly older — no temporal basis to order
-            to_retract.append((e["id"], winner["valid_at"]))
+            to_retract.append(
+                (
+                    e["id"], winner["valid_at"], winner["evidence_id"],
+                    subj, pred, winner["obj"],
+                )
+            )
             # Per-supersession audit line: a free collateral check across a whole
             # dream run, independent of downstream scoring. A clean log is all
             # value updates; a `prefers`/multi-valued row here flags a false hit.
@@ -224,20 +290,32 @@ def supersede_competing_values(conn: sqlite3.Connection, cfg: HyMemConfig) -> in
                 e["valid_at"], winner["valid_at"], kind, unit,
             )
 
-    for edge_id, invalid_at in to_retract:
+    for edge_id, invalid_at, winner_evidence_id, subj, pred, winner_obj in to_retract:
         # Retract removes the stale value from `status='active'` retrieval; the
         # COALESCE keeps any existing invalid_at (idempotent) and otherwise closes
         # the interval at the world date the new value took over. Not routed
         # through bitemporal.stamp_invalidation: there is no negative evidence
         # here, so the supersession date is the winner's valid_at, not a flip time.
-        conn.execute(
-            """
-            UPDATE knowledge_graph
-            SET status = 'retracted',
-                invalid_at = COALESCE(invalid_at, ?)
-            WHERE id = ? AND status = 'active'
-            """,
-            (invalid_at, edge_id),
+        from hymem.dreaming.bitemporal import record_lifecycle_event
+        from hymem.dreaming.evidence import value_supersession_event_key
+
+        record_lifecycle_event(
+            conn,
+            edge_id=edge_id,
+            event_key=value_supersession_event_key(
+                conn,
+                loser_edge_id=edge_id,
+                winner_evidence_id=int(winner_evidence_id),
+                event_at=invalid_at,
+            ),
+            event_kind="value_supersession",
+            direction=-1,
+            event_at=invalid_at,
+            dependency_evidence_ids=[int(winner_evidence_id)],
+            details="newer typed value superseded this edge",
         )
+        # record_lifecycle_event() is the sole state materializer. A second
+        # imperative status write can invert an interval when a previously old
+        # value was reaffirmed after the competing value.
 
     return len(to_retract)

@@ -76,19 +76,22 @@ def _persist(hy, chunk, triples, embedder, in_cycle_edges):
     shared same-wave pool threaded in."""
     ext = ChunkExtraction(triples=list(triples), markers=[])
     dedup_vectors = phase1.prepare_dedup_vectors(hy.conn, ext, hy.config, embedder)
+    staged = None
     with core_db.transaction(hy.conn):
-        phase1.persist_chunk_results(
+        staged = phase1.persist_chunk_results(
             hy.conn, chunk, ext,
             prompt_version=hy.config.prompt_version,
             cfg=hy.config, embedding_client=embedder,
             dedup_vectors=dedup_vectors,
             in_cycle_edges=in_cycle_edges,
         )
+    if staged is not None:
+        in_cycle_edges[:] = staged
 
 
 def test_samewave_same_chunk_collapses(cfg):
     """Two phrasal-variant triples in the SAME chunk (no prior edge) collapse to
-    one edge; pos_evidence reflects BOTH occurrences."""
+    one edge; their shared source chunk remains one independent proof."""
     hy = HyMem(cfg)
     try:
         chunk = _seed_chunk(hy, "c1")
@@ -110,11 +113,14 @@ def test_samewave_same_chunk_collapses(cfg):
             "SELECT COUNT(*) AS c FROM knowledge_graph "
             "WHERE subject_canonical='app' AND predicate='prefers'"
         ).fetchone()["c"] == 1
-        # That single edge carries evidence for BOTH occurrences.
+        # Two variants from one source must not manufacture two proofs.
         assert hy.conn.execute(
             "SELECT pos_evidence FROM knowledge_graph "
             "WHERE subject_canonical='app' AND predicate='prefers'"
-        ).fetchone()["pos_evidence"] == 2
+        ).fetchone()["pos_evidence"] == 1
+        assert hy.conn.execute(
+            "SELECT COUNT(*) AS c FROM kg_evidence"
+        ).fetchone()["c"] == 1
     finally:
         hy.close()
 

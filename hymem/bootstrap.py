@@ -21,7 +21,12 @@ log = logging.getLogger("hymem.bootstrap")
 DEFAULT_ROOT = Path.home() / ".hermes"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_LLM_MODEL = "deepseek-v4-flash"  # deepseek-chat hard-deprecated 2026-07-24
-DEFAULT_EMBEDDING_MODEL = "deepseek-embedding"
+DEFAULT_EMBEDDING_BASE_URL = "local://feature-hash"
+DEFAULT_EMBEDDING_MODEL = "hymem-local-feature-hash-v1"
+DEFAULT_EMBEDDING_DIM = 384
+DEFAULT_REMOTE_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_REMOTE_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_REMOTE_EMBEDDING_DIM = 1536
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,9 @@ class EnvConfig:
     embedding_api_key: str | None
     embedding_base_url: str
     embedding_model: str
+    embedding_dim: int
+    embedding_backend: str
+    embedding_fallback_reason: str | None
     # None = env var unset → fall back to the HyMemConfig dataclass default
     # (don't hard-code it here, so a future default change stays authoritative).
     aggregation_nodes_enabled: bool | None
@@ -47,6 +55,22 @@ class EnvConfig:
     @property
     def has_embedding_key(self) -> bool:
         return bool(self.embedding_api_key)
+
+    @property
+    def has_embedding_client(self) -> bool:
+        return self.embedding_backend == "local_feature_hash" or self.has_embedding_key
+
+    @property
+    def embedding_identity(self) -> str:
+        """Exact durable vector-space identity expected from this config."""
+        if self.embedding_backend != "openai_compatible":
+            return self.embedding_model
+        from hymem.contrib.openai_embedding_client import (
+            openai_compatible_embedding_identity,
+        )
+        return openai_compatible_embedding_identity(
+            self.embedding_base_url, self.embedding_model
+        )
 
 
 def _env_flag(name: str) -> bool | None:
@@ -61,6 +85,17 @@ def _env_flag(name: str) -> bool | None:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 def resolve_env() -> EnvConfig:
     """Resolve all HyMem configuration from the environment.
 
@@ -69,20 +104,85 @@ def resolve_env() -> EnvConfig:
     """
     env = os.environ.get
     llm_key = env("HYMEM_LLM_API_KEY") or env("DEEPSEEK_API_KEY") or env("OPENAI_API_KEY")
-    embedding_key = (
-        env("HYMEM_EMBEDDING_API_KEY")
-        or env("HYMEM_LLM_API_KEY")
-        or env("DEEPSEEK_API_KEY")
-        or env("OPENAI_API_KEY")
+    explicit_embedding = any(
+        env(name)
+        for name in (
+            "HYMEM_EMBEDDING_API_KEY", "HYMEM_EMBEDDING_BASE_URL",
+            "HYMEM_EMBEDDING_MODEL", "HYMEM_EMBEDDING_DIM",
+        )
     )
+    embedding_key: str | None = None
+    embedding_fallback_reason: str | None = None
+    if explicit_embedding:
+        from hymem.contrib.openai_embedding_client import (
+            is_loopback_embedding_url,
+            is_official_openai_embedding_url,
+            validate_embedding_base_url,
+        )
+
+        requested_base = env(
+            "HYMEM_EMBEDDING_BASE_URL", DEFAULT_REMOTE_EMBEDDING_BASE_URL
+        )
+        requested_model = env(
+            "HYMEM_EMBEDDING_MODEL", DEFAULT_REMOTE_EMBEDDING_MODEL
+        )
+        requested_dim = _env_positive_int(
+            "HYMEM_EMBEDDING_DIM", DEFAULT_REMOTE_EMBEDDING_DIM
+        )
+        try:
+            validate_embedding_base_url(requested_base)
+        except (TypeError, ValueError):
+            endpoint_valid = False
+            embedding_fallback_reason = "remote_embedding_endpoint_rejected"
+        else:
+            endpoint_valid = True
+        embedding_key = env("HYMEM_EMBEDDING_API_KEY")
+        if (
+            not embedding_key
+            and endpoint_valid
+            and is_official_openai_embedding_url(requested_base)
+        ):
+            embedding_key = env("OPENAI_API_KEY")
+        if (
+            not embedding_key
+            and endpoint_valid
+            and is_loopback_embedding_url(requested_base)
+        ):
+            embedding_key = "local"
+        if embedding_key and endpoint_valid:
+            embedding_base_url = requested_base
+            embedding_model = requested_model
+            embedding_dim = requested_dim
+            embedding_backend = "openai_compatible"
+        else:
+            # An incomplete remote configuration must not instantiate a client
+            # that is guaranteed to fail. Keep vector tiers alive in a separate,
+            # explicitly lower-quality local vector space.
+            embedding_base_url = DEFAULT_EMBEDDING_BASE_URL
+            embedding_model = DEFAULT_EMBEDDING_MODEL
+            embedding_dim = DEFAULT_EMBEDDING_DIM
+            embedding_backend = "local_feature_hash"
+            if embedding_fallback_reason is None:
+                embedding_fallback_reason = "remote_embedding_credentials_missing"
+    else:
+        # In particular, a DeepSeek-only LLM environment lands here. DeepSeek
+        # does not expose the old fictional `deepseek-embedding` model, so its
+        # key is never silently reused for embeddings.
+        embedding_base_url = DEFAULT_EMBEDDING_BASE_URL
+        embedding_model = DEFAULT_EMBEDDING_MODEL
+        embedding_dim = DEFAULT_EMBEDDING_DIM
+        embedding_backend = "local_feature_hash"
     return EnvConfig(
         root=Path(env("HYMEM_ROOT", str(DEFAULT_ROOT))),
         llm_api_key=llm_key,
         llm_base_url=env("HYMEM_LLM_BASE_URL", DEFAULT_BASE_URL),
         llm_model=env("HYMEM_LLM_MODEL", DEFAULT_LLM_MODEL),
         embedding_api_key=embedding_key,
-        embedding_base_url=env("HYMEM_EMBEDDING_BASE_URL", DEFAULT_BASE_URL),
-        embedding_model=env("HYMEM_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
+        embedding_base_url=embedding_base_url,
+        embedding_model=embedding_model,
+        embedding_dim=embedding_dim,
+        embedding_backend=embedding_backend,
+        embedding_fallback_reason=embedding_fallback_reason,
         aggregation_nodes_enabled=_env_flag("HYMEM_AGGREGATION_NODES_ENABLED"),
         aggregation_digest_enabled=_env_flag("HYMEM_AGGREGATION_DIGEST_ENABLED"),
     )
@@ -93,8 +193,8 @@ def build_from_env() -> HyMem:
 
     Fails fast with a clear, actionable error if the extraction LLM key is
     missing — instead of raising deep inside the first dream cycle. The
-    embedding client is optional: when its key is absent the server logs a
-    warning and falls back to FTS-only retrieval.
+    Embeddings default to a deterministic dependency-free local feature hash.
+    An OpenAI-compatible endpoint is used only when explicitly configured.
     """
     from hymem.contrib.openai_client import OpenAICompatibleClient
     from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
@@ -115,23 +215,47 @@ def build_from_env() -> HyMem:
         model=cfg.llm_model,
     )
 
-    embedder = None
-    if cfg.has_embedding_key:
+    from hymem.extraction.embeddings import (
+        CachedEmbeddingClient,
+        LocalHashEmbeddingClient,
+    )
+
+    if cfg.embedding_backend == "openai_compatible":
         try:
-            from hymem.extraction.embeddings import CachedEmbeddingClient
             embedder = CachedEmbeddingClient(
                 OpenAICompatibleEmbeddingClient(
                     api_key=cfg.embedding_api_key,
                     base_url=cfg.embedding_base_url,
                     model=cfg.embedding_model,
+                    dim=cfg.embedding_dim,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - degrade gracefully
-            log.warning("embeddings disabled (FTS-only retrieval): %s", exc)
+            from hymem.contrib.openai_embedding_client import (
+                safe_embedding_base_url,
+            )
+            log.warning(
+                "configured embedding client unavailable at %s (%s); using "
+                "deterministic local lexical fallback",
+                safe_embedding_base_url(cfg.embedding_base_url),
+                type(exc).__name__,
+            )
+            embedder = CachedEmbeddingClient(LocalHashEmbeddingClient(
+                fallback_reason="remote_embedding_client_unavailable",
+            ))
     else:
-        log.warning(
-            "no embedding API key found — FTS-only retrieval "
-            "(set HYMEM_EMBEDDING_API_KEY to enable vector search)"
+        embedder = CachedEmbeddingClient(LocalHashEmbeddingClient(
+            dim_value=cfg.embedding_dim,
+            model_name=cfg.embedding_model,
+            fallback_reason=cfg.embedding_fallback_reason,
+        ))
+        log.info(
+            "embeddings backend=%s model=%s dim=%d quality=lexical network=none%s",
+            cfg.embedding_backend, cfg.embedding_model, cfg.embedding_dim,
+            (
+                f" fallback_reason={cfg.embedding_fallback_reason}"
+                if cfg.embedding_fallback_reason else ""
+            ),
         )
 
     # Only env vars that were actually set override the dataclass defaults, so

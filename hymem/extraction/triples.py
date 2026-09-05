@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 from hymem.extraction.jsonio import loads_lenient
@@ -24,6 +25,10 @@ class Triple:
     value_numeric: float | None = None
     value_unit: str | None = None
     temporal_scope: str | None = None
+    # Exact message cited by the extractor.  Standalone/legacy parsing leaves
+    # this unset; the production combined extractor requires and validates it
+    # against the tagged records actually present in that request.
+    source_message_id: int | None = None
 
 
 def extract_triples(
@@ -63,8 +68,85 @@ _VALID_TYPES = frozenset({
     "file", "environment", "protocol", "container", "package_manager",
     "api", "platform", "config_file", "testing_framework", "ci_tool",
     "monitoring_tool", "identity_provider", "message_broker",
-    "person", "team", "project", "codebase", "or_other_tool",
+    "person", "team", "project", "codebase", "place", "organization",
+    "product", "vehicle", "activity", "event", "document",
+    "or_other_entity",
 })
+
+_COMBINED_REQUIRED_KEYS = frozenset({"subject", "predicate", "object", "polarity"})
+_COMBINED_OPTIONAL_KEYS = frozenset({
+    "value_text", "value_numeric", "value_unit", "temporal_scope",
+    "subject_type", "object_type", "subject_properties", "object_properties",
+    "source_message_id",
+})
+
+
+def combined_triple_item_is_valid(
+    item: object, *, require_source_message_id: bool = False
+) -> bool:
+    """Exact item contract for the cursor-authorizing combined extractor."""
+    if not isinstance(item, dict):
+        return False
+    keys = set(item)
+    if not _COMBINED_REQUIRED_KEYS <= keys:
+        return False
+    if keys - _COMBINED_REQUIRED_KEYS - _COMBINED_OPTIONAL_KEYS:
+        return False
+    if not all(
+        isinstance(item[key], str) and bool(item[key].strip())
+        for key in ("subject", "predicate", "object")
+    ):
+        return False
+    if item["predicate"] not in ALLOWED_PREDICATES:
+        return False
+    polarity = item["polarity"]
+    if isinstance(polarity, bool) or not isinstance(polarity, int) or polarity not in (1, -1):
+        return False
+    source_message_id = item.get("source_message_id")
+    if require_source_message_id and "source_message_id" not in item:
+        return False
+    if source_message_id is not None and (
+        isinstance(source_message_id, bool)
+        or not isinstance(source_message_id, int)
+        or source_message_id < 1
+    ):
+        return False
+    for key in ("value_text", "value_unit", "temporal_scope"):
+        if key in item and not isinstance(item[key], str):
+            return False
+    if "value_numeric" in item:
+        number = item["value_numeric"]
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            return False
+        try:
+            finite = math.isfinite(float(number))
+        except (OverflowError, ValueError):
+            return False
+        if not finite:
+            return False
+    for key in ("subject_type", "object_type"):
+        if key in item and (
+            not isinstance(item[key], str) or item[key] not in _VALID_TYPES
+        ):
+            return False
+    for key in ("subject_properties", "object_properties"):
+        if key not in item:
+            continue
+        props = item[key]
+        if not isinstance(props, dict) or len(props) > 4:
+            return False
+        for prop_key, prop_value in props.items():
+            if (
+                not isinstance(prop_key, str)
+                or not isinstance(prop_value, str)
+                or not prop_key.strip()
+                or prop_key != prop_key.strip().lower()
+                or not prop_value.strip()
+                or len(prop_key) > _MAX_PROP_KEY_LEN
+                or len(prop_value) > _MAX_PROP_VALUE_LEN
+            ):
+                return False
+    return True
 
 
 # Caps on per-entity property metadata. The LLM is occasionally chatty;
@@ -198,7 +280,7 @@ def triples_from_list(data: list) -> list[Triple]:
             continue
         if predicate not in ALLOWED_PREDICATES:
             continue
-        if polarity not in (1, -1):
+        if isinstance(polarity, bool) or polarity not in (1, -1):
             continue
         if not subject.strip() or not obj.strip():
             continue
@@ -206,6 +288,24 @@ def triples_from_list(data: list) -> list[Triple]:
         value_numeric = item.get("value_numeric")
         value_unit = item.get("value_unit")
         temporal_scope = item.get("temporal_scope")
+        source_message_id = item.get("source_message_id")
+        if value_text is not None and not isinstance(value_text, str):
+            continue
+        if value_numeric is not None and (
+            isinstance(value_numeric, bool)
+            or not isinstance(value_numeric, (int, float))
+        ):
+            continue
+        if value_unit is not None and not isinstance(value_unit, str):
+            continue
+        if temporal_scope is not None and not isinstance(temporal_scope, str):
+            continue
+        if source_message_id is not None and (
+            isinstance(source_message_id, bool)
+            or not isinstance(source_message_id, int)
+            or source_message_id < 1
+        ):
+            continue
         triples.append(
             Triple(
                 subject=subject.strip(),
@@ -213,9 +313,15 @@ def triples_from_list(data: list) -> list[Triple]:
                 object=obj.strip(),
                 polarity=polarity,
                 value_text=value_text.strip() if isinstance(value_text, str) and value_text.strip() else None,
-                value_numeric=float(value_numeric) if isinstance(value_numeric, (int, float)) else None,
+                value_numeric=(
+                    float(value_numeric)
+                    if isinstance(value_numeric, (int, float))
+                    and not isinstance(value_numeric, bool)
+                    else None
+                ),
                 value_unit=value_unit.strip() if isinstance(value_unit, str) and value_unit.strip() else None,
                 temporal_scope=temporal_scope.strip() if isinstance(temporal_scope, str) and temporal_scope.strip() else None,
+                source_message_id=source_message_id,
             )
         )
     return triples

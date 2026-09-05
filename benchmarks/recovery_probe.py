@@ -106,6 +106,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from hymem.core.time import register_sqlite_time_functions  # noqa: E402
 from hymem.dreaming.user_profile import load_profile  # noqa: E402
 
 BUCKETS = ("evidence_backed", "value_oscillation", "no_negative_evidence", "unordered")
@@ -137,6 +138,10 @@ def open_store_readonly(path: str | Path) -> sqlite3.Connection:
         raise FileNotFoundError(f"store not found: {p}")
     conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    # Temporal graph predicates use HyMem's strict timestamp grammar rather
+    # than SQLite's permissive date parser.  SQLite UDFs are connection-local,
+    # so read-only consumers must install them just like core_db.connect().
+    register_sqlite_time_functions(conn)
     return conn
 
 

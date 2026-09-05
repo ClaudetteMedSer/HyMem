@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -7,7 +10,16 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 import hymem.honcho.app as hsrv
+import hymem.server as mcp_server
 from hymem.honcho.adapters import infer_role
+from hymem.query.augment import GraphFact, MessageHit
+from hymem.query.fusion import (
+    FusedEvidence,
+    RetrievalProvenance,
+    SourceOccurrence,
+    estimate_tokens,
+)
+from hymem.query.graph_state import GraphEvidenceCitation
 from tests.conftest import make_routed_llm, seed_edge
 
 
@@ -20,7 +32,110 @@ def client(hy_with_embed):
         hsrv._scheduler.stop()
         hsrv.set_scheduler(None)
     with TestClient(hsrv.app) as c:
+        for peer_id in ("user-1", "agent-main"):
+            assert c.post(
+                "/v3/workspaces/hermes/peers", json={"id": peer_id}
+            ).status_code == 201
         yield c
+
+
+def _open_external_session(hy, session_id: str) -> None:
+    hy.open_session(session_id, source_workspace_id="hermes")
+
+
+def _log_external(
+    hy,
+    session_id: str,
+    role: str,
+    content: str,
+    *,
+    peer_id: str | None = None,
+) -> int:
+    exact_peer = peer_id or ("agent-main" if role == "assistant" else "user-alice")
+    return hy.log_message(
+        session_id,
+        role,
+        content,
+        source_peer_id=exact_peer,
+        source_workspace_id="hermes",
+    )
+
+
+def _citation(**changes) -> GraphEvidenceCitation:
+    citation = GraphEvidenceCitation(
+        evidence_id=11,
+        evidence_kind="triple_extraction",
+        source_role="user",
+        source_session_id="real-session",
+        source_message_id=101,
+        source_event_at="2024-02-01T09:00:00.000Z",
+        source_created_at="2024-02-01T09:00:00Z",
+        temporal_scope=None,
+        recorded_at="2024-02-02T00:00:00Z",
+        coverage_chunk_id="coverage:real-session:101",
+        coverage_version="v1",
+        extraction_chunk_id="extract-1",
+        currently_authoritative=True,
+        authoritative_at_recorded_time=True,
+        provenance_status="canonical",
+    )
+    return replace(citation, **changes)
+
+
+def test_graph_fact_message_never_turns_a_role_into_a_peer_identity():
+    citations = [
+        _citation(),
+        _citation(
+            evidence_id=12,
+            source_role="assistant",
+            source_session_id="second-session",
+            source_message_id=202,
+            source_event_at="2024-03-01T10:00:00.000Z",
+            source_created_at="2024-03-01T10:00:00Z",
+        ),
+    ]
+    fact = GraphFact(
+        "app", "uses", "redis", 0.9, 3, 0,
+        edge_id=77,
+        valid_at="2024-02-01T09:00:00.000Z",
+        citations=citations,
+    )
+    shaped = hsrv._graph_fact_message(fact, "workspace")
+    assert shaped is None
+    assert hsrv._graph_fact_message(
+        GraphFact("manual", "uses", "sqlite", 1.0, 1, 0, edge_id=78),
+        "workspace",
+    ) is None
+
+
+def test_graph_fact_message_exposes_only_individually_validated_citations(monkeypatch):
+    valid = _citation(
+        evidence_id=1, source_peer_id="alice", source_workspace_id="workspace",
+    )
+    forged = _citation(
+        evidence_id=2, source_peer_id="alice", source_workspace_id="workspace",
+        source_message_id=202,
+    )
+    proof = SimpleNamespace(
+        message_id=101, content="exact authored content", source_peer_id="alice",
+        session_id="real-session", source_created_at="2024-02-01T09:00:00Z",
+    )
+    monkeypatch.setattr(
+        hsrv,
+        "_validated_message_occurrence",
+        lambda **kwargs: proof if kwargs["message_id"] == 101 else None,
+    )
+    shaped = hsrv._graph_fact_message(
+        GraphFact(
+            "app", "uses", "redis", .9, 2, 0, edge_id=7,
+            citations=[valid, forged],
+        ),
+        "workspace",
+        peer_id="alice",
+    )
+    assert shaped is not None
+    assert shaped["content"] == "exact authored content"
+    assert [item["evidence_id"] for item in shaped["metadata"]["citations"]] == [1]
 
 
 def test_health_endpoint(client):
@@ -74,15 +189,66 @@ def test_add_messages_logs_and_returns_message_objects(client, hy_with_embed):
     ]
 
 
+def test_search_returns_full_exact_message_and_does_not_apply_token_excerpts(client):
+    content = ("long authored prefix " * 100) + "rare-search-tail"
+    created = client.post(
+        "/v3/workspaces/hermes/sessions/exact-search/messages",
+        json={"messages": [{"content": content, "peer_id": "user-1"}]},
+    )
+    assert created.status_code == 201
+    response = client.post(
+        "/v3/workspaces/hermes/sessions/exact-search/search",
+        # ``tokens`` is a future/unknown SDK extra. Search is item-limited and
+        # must never change exact Message identity/content based on it.
+        json={"query": "rare-search-tail", "limit": 1, "tokens": 1},
+    )
+    assert response.status_code == 200
+    assert response.json()[0]["id"] == created.json()[0]["id"]
+    assert response.json()[0]["content"] == content
+
+
+@pytest.mark.parametrize("payload", [
+    {"query": "", "limit": 1},
+    {"query": "needle", "limit": 101},
+])
+def test_search_validates_query_and_limit(client, payload):
+    response = client.post(
+        "/v3/workspaces/hermes/sessions/validation/search", json=payload
+    )
+    # Session ownership is created before request body use only on message
+    # routes, so make it explicit then re-run the actual validation probe.
+    if response.status_code == 404:
+        client.post(
+            "/v3/workspaces/hermes/sessions/validation/messages",
+            json={"messages": [{"content": "needle", "peer_id": "user-1"}]},
+        )
+        response = client.post(
+            "/v3/workspaces/hermes/sessions/validation/search", json=payload
+        )
+    assert response.status_code == 422
+
+
+def test_search_rejects_nonempty_filters(client):
+    client.post(
+        "/v3/workspaces/hermes/sessions/filter-search/messages",
+        json={"messages": [{"content": "needle", "peer_id": "user-1"}]},
+    )
+    response = client.post(
+        "/v3/workspaces/hermes/sessions/filter-search/search",
+        json={"query": "needle", "filters": {"peer_id": "user-1"}},
+    )
+    assert response.status_code == 422
+
+
 def test_add_messages_persists_supplied_created_at(client, hy_with_embed):
-    # A caller-supplied created_at must reach the DB row (event time), not be
-    # silently replaced by ingestion time — chronological retrieval depends on it.
+    # A caller-supplied event time is preserved by instant and returned in the
+    # same canonical UTC-millisecond form used by chronological retrieval.
     r = client.post(
         "/v3/workspaces/hermes/sessions/sess-ts/messages",
         json={
             "messages": [
-                {"content": "earlier", "peer_id": "user-1", "created_at": "2024-02-15T09:00:00Z"},
-                {"content": "later", "peer_id": "user-1", "created_at": "2024-03-01T09:00:00Z"},
+                {"content": "earlier", "peer_id": "user-1", "created_at": "2024-02-15T10:00:00.0009+01:00"},
+                {"content": "later", "peer_id": "user-1", "created_at": "2024-03-01T09:00:00.9995Z"},
                 {"content": "no timestamp", "peer_id": "user-1"},
             ]
         },
@@ -93,13 +259,72 @@ def test_add_messages_persists_supplied_created_at(client, hy_with_embed):
         "SELECT content, created_at FROM messages WHERE session_id='sess-ts' ORDER BY id"
     ).fetchall()
     by_content = {r["content"]: r["created_at"] for r in rows}
-    assert by_content["earlier"] == "2024-02-15T09:00:00Z"
-    assert by_content["later"] == "2024-03-01T09:00:00Z"
+    assert by_content["earlier"] == "2024-02-15T09:00:00.000Z"
+    assert by_content["later"] == "2024-03-01T09:00:00.999Z"
     # Omitted created_at falls back to the DB default, not a blank string.
     assert by_content["no timestamp"]
+    posted = {item["content"]: item["created_at"] for item in r.json()}
+    assert posted == by_content
+    listed_response = client.post(
+        "/v3/workspaces/hermes/sessions/sess-ts/messages/list",
+        json={"page": 1, "size": 10},
+    )
+    assert listed_response.status_code == 200
+    listed = {
+        item["content"]: item["created_at"]
+        for item in listed_response.json()["items"]
+    }
+    assert listed == by_content
+
+
+def test_add_messages_rejects_future_time_and_rolls_back_batch(
+    client, hy_with_embed
+):
+    response = client.post(
+        "/v3/workspaces/hermes/sessions/future-batch/messages",
+        json={
+            "messages": [
+                {
+                    "content": "valid first",
+                    "peer_id": "user-alice",
+                    "created_at": "2024-01-01T00:00:00Z",
+                },
+                {
+                    "content": "poison second",
+                    "peer_id": "user-alice",
+                    "created_at": "2100-01-01T00:00:00Z",
+                },
+            ]
+        },
+    )
+    assert response.status_code == 422
+    assert "message source" in response.json()["detail"]
+    assert hy_with_embed.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='future-batch'"
+    ).fetchone()[0] == 0
+    assert hy_with_embed.conn.execute(
+        "SELECT COUNT(*) FROM message_retention_coverage coverage "
+        "JOIN messages message ON message.id=coverage.message_id "
+        "WHERE message.session_id='future-batch'"
+    ).fetchone()[0] == 0
+
+
+def test_upload_rejects_future_time_without_writing_source(client, hy_with_embed):
+    response = client.post(
+        "/v3/workspaces/hermes/sessions/future-upload/messages/upload",
+        data={"peer_id": "user-alice", "created_at": "2100-01-01T00:00:00Z"},
+        files={"file": ("memory.txt", b"future poison", "text/plain")},
+    )
+    assert response.status_code == 422
+    assert hy_with_embed.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='future-upload'"
+    ).fetchone()[0] == 0
 
 
 def test_search_returns_empty_for_unknown_query(client):
+    assert client.post(
+        "/v3/workspaces/hermes/sessions", json={"id": "s"}
+    ).status_code == 201
     r = client.post(
         "/v3/workspaces/hermes/sessions/s/search",
         json={"query": "totally unknown topic xyz"},
@@ -108,11 +333,37 @@ def test_search_returns_empty_for_unknown_query(client):
     assert r.json() == []
 
 
-def test_search_returns_graph_facts_after_dream(client, hy_with_embed):
+def test_uncited_fact_stays_native_but_is_omitted_from_message_search(
+    client, hy_with_embed
+):
+    seed_edge(hy_with_embed.conn, "manual_app", "uses", "manual_db")
+    native = hy_with_embed.augment("manual app uses manual db")
+    manual = next(
+        fact for fact in native.graph_facts
+        if fact.subject == "manual_app" and fact.object == "manual_db"
+    )
+    assert manual.citations == []
+
+    assert client.post(
+        "/v3/workspaces/hermes/sessions", json={"id": "any"}
+    ).status_code == 201
+    response = client.post(
+        "/v3/workspaces/hermes/sessions/any/search",
+        json={"query": "manual app uses manual db"},
+    )
+    assert response.status_code == 200
+    assert not any(
+        item["metadata"].get("type") == "graph_fact"
+        for item in response.json()
+    )
+
+
+def test_search_does_not_fabricate_graph_fact_peer_identity(client, hy_with_embed):
     sid = "s-search"
-    hy_with_embed.open_session(sid)
-    hy_with_embed.log_message(sid, "assistant", "We could try Docker for the local dev environment.")
-    hy_with_embed.log_message(
+    _open_external_session(hy_with_embed, sid)
+    _log_external(hy_with_embed, sid, "assistant", "We could try Docker for the local dev environment.")
+    _log_external(
+        hy_with_embed,
         sid, "user",
         "No, we use uv and system Python for local dev. Don't suggest Docker.",
     )
@@ -130,7 +381,10 @@ def test_search_returns_graph_facts_after_dream(client, hy_with_embed):
     )
     assert r.status_code == 200
     body = r.json()
-    assert any(item["peer_id"] == "hymem-kg" for item in body)
+    kg = [item for item in body if item["metadata"].get("type") == "graph_fact"]
+    assert kg
+    assert all(item["peer_id"] in {"user-alice", "agent-main"} for item in kg)
+    assert not any(item["peer_id"] == "hymem-kg" for item in body)
     assert any("docker" in item["content"].lower() for item in body)
 
 
@@ -145,11 +399,14 @@ def test_peer_search_returns_empty_for_unknown_query(client):
     assert r.json() == []
 
 
-def test_peer_search_returns_graph_facts_after_dream(client, hy_with_embed):
+def test_peer_search_does_not_fabricate_graph_fact_peer_identity(
+    client, hy_with_embed
+):
     sid = "s-peersearch"
-    hy_with_embed.open_session(sid)
-    hy_with_embed.log_message(sid, "assistant", "We could try Docker for the local dev environment.")
-    hy_with_embed.log_message(
+    _open_external_session(hy_with_embed, sid)
+    _log_external(hy_with_embed, sid, "assistant", "We could try Docker for the local dev environment.")
+    _log_external(
+        hy_with_embed,
         sid, "user",
         "No, we use uv and system Python for local dev. Don't suggest Docker.",
     )
@@ -167,19 +424,17 @@ def test_peer_search_returns_graph_facts_after_dream(client, hy_with_embed):
     )
     assert r.status_code == 200
     body = r.json()
-    assert any(item["peer_id"] == "hymem-kg" for item in body)
+    kg = [item for item in body if item["metadata"].get("type") == "graph_fact"]
+    assert kg == []
+    assert not any(item["peer_id"] == "hymem-kg" for item in body)
     assert any("docker" in item["content"].lower() for item in body)
-    # Peer-scoped search spans sessions — graph-fact pseudo-messages carry no
-    # single session id.
-    kg = [m for m in body if m["peer_id"] == "hymem-kg"]
-    assert kg and all(m["session_id"] == "" for m in kg)
 
 
 def test_context_returns_summary_messages_peers(client, hy_with_embed):
     sid = "s-ctx"
-    hy_with_embed.open_session(sid)
-    hy_with_embed.log_message(sid, "user", "first message")
-    hy_with_embed.log_message(sid, "assistant", "second message")
+    _open_external_session(hy_with_embed, sid)
+    _log_external(hy_with_embed, sid, "user", "first message")
+    _log_external(hy_with_embed, sid, "assistant", "second message")
     hy_with_embed.close_session(sid)
 
     r = client.get(f"/v3/workspaces/hermes/sessions/{sid}/context")
@@ -212,7 +467,7 @@ def test_add_peers_persists_role_mapping(client, hy_with_embed):
     assert by_id["agent-bob"] == "assistant"
 
 
-def test_peer_card_returns_user_md_content(client, hy_with_embed):
+def test_peer_card_does_not_return_unowned_user_md_content(client, hy_with_embed):
     hy_with_embed.config.user_md_path.write_text(
         "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
     )
@@ -220,13 +475,11 @@ def test_peer_card_returns_user_md_content(client, hy_with_embed):
     assert r.status_code == 200
     body = r.json()
     assert body["id"] == "user-1"
-    assert "Behavioral Profile" in body["content"]
-    assert "prefers uv" in body["content"]
+    assert body["content"] == ""
 
 
 def _seed_root_digest(hy):
-    """A root aggregation node, inserted directly: the representation surfaces
-    only read it via load_digest(), no aggregation build needed."""
+    """Insert a deliberately unowned native digest isolation sentinel."""
     hy.conn.execute(
         "INSERT INTO aggregation_nodes "
         "(id, title, summary, member_episode_ids, session_ids, "
@@ -237,9 +490,7 @@ def _seed_root_digest(hy):
     hy.conn.commit()
 
 
-def test_peer_card_prepends_digest_when_built(client, hy_with_embed):
-    # Stage 5: the digest is the Honcho-analogue of the dialectic user model,
-    # so the card carries it ABOVE the USER.md behavioral profile.
+def test_peer_card_omits_unowned_digest_and_profile(client, hy_with_embed):
     hy_with_embed.config.user_md_path.write_text(
         "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
     )
@@ -247,13 +498,10 @@ def test_peer_card_prepends_digest_when_built(client, hy_with_embed):
     r = client.get("/v3/workspaces/hermes/peers/user-1/card")
     assert r.status_code == 200
     content = r.json()["content"]
-    assert "Works on HyMem and Hermes." in content
-    assert "Memory digest covering 3 of" in content  # staleness footer
-    assert "prefers uv" in content
-    assert content.index("Works on HyMem and Hermes.") < content.index("prefers uv")
+    assert content == ""
 
 
-def test_peer_context_representation_includes_digest(client, hy_with_embed):
+def test_peer_context_representation_omits_unowned_digest(client, hy_with_embed):
     hy_with_embed.config.user_md_path.write_text(
         "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
     )
@@ -261,44 +509,38 @@ def test_peer_context_representation_includes_digest(client, hy_with_embed):
     r = client.get("/v3/workspaces/hermes/peers/user-1/context")
     assert r.status_code == 200
     rep = r.json()["peer_representation"]
-    assert "Works on HyMem and Hermes." in rep
-    assert "prefers uv" in rep
+    assert rep == ""
     # honcho-ai's PeerContextResponse expects `representation` (it has no
     # alias for `peer_representation`), so the route sends both names.
     assert r.json()["representation"] == rep
 
 
-def test_session_context_representation_includes_digest(client, hy_with_embed):
-    # The session-scoped context endpoint carries the same digest + USER.md
-    # representation as the peer routes, so harnesses that auto-inject from
-    # session context get the standing digest without an explicit call.
+def test_untargeted_session_context_has_no_cross_session_representation(
+    client, hy_with_embed
+):
     hy_with_embed.config.user_md_path.write_text(
         "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
     )
     _seed_root_digest(hy_with_embed)
     sid = "s-ctx-digest"
-    hy_with_embed.open_session(sid)
-    hy_with_embed.log_message(sid, "user", "hello")
+    _open_external_session(hy_with_embed, sid)
+    _log_external(hy_with_embed, sid, "user", "hello")
     hy_with_embed.close_session(sid)
 
     r = client.get(f"/v3/workspaces/hermes/sessions/{sid}/context")
     assert r.status_code == 200
     rep = r.json()["peer_representation"]
-    assert "Works on HyMem and Hermes." in rep
-    assert "prefers uv" in rep
-    assert rep.index("Works on HyMem and Hermes.") < rep.index("prefers uv")
+    assert rep == ""
 
 
-def test_peer_representation_plain_user_md_without_digest(client, hy_with_embed):
-    # No digest built → today's behavior: USER.md verbatim, no digest block.
+def test_peer_representation_never_uses_process_global_user_md(client, hy_with_embed):
     hy_with_embed.config.user_md_path.write_text(
         "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
     )
     r = client.get("/v3/workspaces/hermes/peers/user-1/context")
     assert r.status_code == 200
     rep = r.json()["peer_representation"]
-    assert "prefers uv" in rep
-    assert "Memory digest" not in rep
+    assert rep == ""
 
 
 def test_peer_chat_returns_response_for_query(client, hy_with_embed):
@@ -489,9 +731,9 @@ def test_get_session_round_trip_and_404(client, hy_with_embed):
 
 def test_list_messages_paginates(client, hy_with_embed):
     sid = "sess-list"
-    hy_with_embed.open_session(sid)
+    _open_external_session(hy_with_embed, sid)
     for i in range(5):
-        hy_with_embed.log_message(sid, "user", f"msg-{i}")
+        _log_external(hy_with_embed, sid, "user", f"msg-{i}")
 
     r = client.post(
         f"/v3/workspaces/hermes/sessions/{sid}/messages/list",
@@ -514,7 +756,7 @@ def test_list_messages_paginates(client, hy_with_embed):
 
 
 def test_list_messages_empty_session(client, hy_with_embed):
-    hy_with_embed.open_session("empty-sid")
+    _open_external_session(hy_with_embed, "empty-sid")
     r = client.post(
         "/v3/workspaces/hermes/sessions/empty-sid/messages/list",
         json={},
@@ -525,7 +767,7 @@ def test_list_messages_empty_session(client, hy_with_embed):
 
 def test_list_messages_rejects_zero_size(client, hy_with_embed):
     # size=0 would divide-by-zero in page-count math — must be a clean 422.
-    hy_with_embed.open_session("zero-sid")
+    _open_external_session(hy_with_embed, "zero-sid")
     r = client.post(
         "/v3/workspaces/hermes/sessions/zero-sid/messages/list",
         json={"size": 0},
@@ -538,8 +780,9 @@ def test_list_messages_rejects_zero_size(client, hy_with_embed):
 
 def _seed_dreamed_graph(hy_with_embed):
     sid = "s-why"
-    hy_with_embed.open_session(sid)
-    hy_with_embed.log_message(
+    _open_external_session(hy_with_embed, sid)
+    _log_external(
+        hy_with_embed,
         sid, "user", "We use fast_api for the backend service."
     )
     hy_with_embed.close_session(sid)
@@ -550,23 +793,50 @@ def _seed_dreamed_graph(hy_with_embed):
     hy_with_embed.dream()
 
 
-def test_search_graph_fact_metadata_includes_why(client, hy_with_embed):
+def test_registered_user_alice_is_never_collapsed_to_role_peer_id(
+    client, hy_with_embed
+):
+    registered = client.post(
+        "/v3/workspaces/hermes/peers", json={"id": "user-alice"}
+    )
+    assert registered.status_code == 201
     _seed_dreamed_graph(hy_with_embed)
+    native = hy_with_embed.augment("what technologies does the backend use")
+    fact = native.graph_facts[0]
+    assert fact.citations[0].source_role == "user"
+    assert fact.citations[0].source_peer_id == "user-alice"
+    assert hsrv._graph_fact_message(fact, "hermes")["peer_id"] == "user-alice"
+
+    result = client.post(
+        "/v3/workspaces/hermes/sessions/s-why/search",
+        json={"query": "what technologies does the backend use"},
+    ).json()
+    graph_messages = [
+        item for item in result
+        if item["metadata"].get("type") == "graph_fact"
+    ]
+    assert graph_messages
+    assert {item["peer_id"] for item in graph_messages} == {"user-alice"}
+
+
+def test_search_preserves_cited_graph_fact_exact_peer_id(client, hy_with_embed):
+    _seed_dreamed_graph(hy_with_embed)
+    native = hy_with_embed.augment("what technologies does the backend use")
+    assert native.graph_facts
+    assert native.graph_facts[0].why_retrieved
+    assert native.graph_facts[0].citations
     r = client.post(
         "/v3/workspaces/hermes/sessions/s-why/search",
         json={"query": "what technologies does the backend use"},
     )
     assert r.status_code == 200
     body = r.json()
-    kg_items = [m for m in body if m["peer_id"] == "hymem-kg"]
-    assert kg_items, "expected at least one graph_fact in search results"
-    for item in kg_items:
-        assert "why" in item["metadata"]
-        assert isinstance(item["metadata"]["why"], list)
-        assert item["metadata"]["why"], "why_retrieved should be non-empty"
+    kg_items = [m for m in body if m["metadata"].get("type") == "graph_fact"]
+    assert kg_items
+    assert {item["peer_id"] for item in kg_items} == {"user-alice"}
 
 
-def test_peer_context_graph_fact_metadata_includes_why(client, hy_with_embed):
+def test_peer_context_omits_graph_fact_without_exact_peer_id(client, hy_with_embed):
     _seed_dreamed_graph(hy_with_embed)
     r = client.get(
         "/v3/workspaces/hermes/peers/agent-main/context",
@@ -574,30 +844,45 @@ def test_peer_context_graph_fact_metadata_includes_why(client, hy_with_embed):
     )
     assert r.status_code == 200
     body = r.json()
-    kg_items = [m for m in body["messages"] if m["peer_id"] == "hymem-kg"]
-    assert kg_items, "expected at least one graph_fact in peer-context messages"
-    for item in kg_items:
-        assert "why" in item["metadata"]
-        assert isinstance(item["metadata"]["why"], list)
-        assert item["metadata"]["why"], "why_retrieved should be non-empty"
+    kg_items = [
+        m for m in body["messages"]
+        if m["metadata"].get("type") == "graph_fact"
+    ]
+    assert kg_items == []
 
 
-def test_peer_chat_returns_structured_facts_with_why(client, hy_with_embed):
+def test_peer_chat_returns_exact_peer_scoped_structured_facts(client, hy_with_embed):
     _seed_dreamed_graph(hy_with_embed)
     r = client.post(
-        "/v3/workspaces/hermes/peers/agent-main/chat",
+        "/v3/workspaces/hermes/peers/user-alice/chat",
         json={"query": "what technologies does the backend use"},
     )
     assert r.status_code == 200
     body = r.json()
-    # Prose response stays clean — no reason-code leakage into the text.
+    # Prose keeps retrieval reason codes out but carries exact source labels.
     assert "fallback:" not in body["response"]
     assert "semantic_" not in body["response"]
-    # Structured facts carry why_retrieved alongside the prose.
+    assert "[edge " in body["response"]
+    assert "role=user, session=s-why, message=" in body["response"]
+    # Scoped output carries only the exact citations, never global confidence
+    # or evidence totals influenced by another workspace/peer.
     assert "facts" in body and body["facts"], "facts should accompany prose response"
     for fact in body["facts"]:
-        assert {"subject", "predicate", "object", "confidence", "why"} <= fact.keys()
-        assert isinstance(fact["why"], list) and fact["why"]
+        assert {"subject", "predicate", "object", "edge_id", "citations"} <= fact.keys()
+        assert "confidence" not in fact and "why" not in fact
+        assert fact["edge_id"] is not None
+        assert fact["citations"]
+        assert {c["source_peer_id"] for c in fact["citations"]} == {"user-alice"}
+
+
+def test_mcp_augment_renders_stable_edge_and_exact_sources(client, hy_with_embed):
+    _seed_dreamed_graph(hy_with_embed)
+    mcp_server.set_hy(hy_with_embed)
+    rendered = mcp_server._do_augment("what technologies does the backend use")
+    assert "[edge " in rendered
+    assert "role=user, session=s-why, message=" in rendered
+    assert "event=" in rendered
+    assert "hymem-kg" not in rendered
 
 
 def test_peer_chat_exposes_content_field_for_sdk(client, hy_with_embed):
@@ -607,7 +892,7 @@ def test_peer_chat_exposes_content_field_for_sdk(client, hy_with_embed):
     # silently comes back empty — the bug this guards against.
     _seed_dreamed_graph(hy_with_embed)
     r = client.post(
-        "/v3/workspaces/hermes/peers/agent-main/chat",
+        "/v3/workspaces/hermes/peers/user-alice/chat",
         json={"query": "what technologies does the backend use"},
     )
     assert r.status_code == 200
@@ -621,42 +906,35 @@ def test_peer_chat_exposes_content_field_for_sdk(client, hy_with_embed):
 # ── /conflicts endpoint ──────────────────────────────────────────────────────
 
 
-def test_list_conflicts_returns_empty_on_clean_graph(client):
+def test_workspace_conflicts_explicitly_rejects_unpartitioned_graph(client):
     r = client.get("/v3/workspaces/hermes/conflicts")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["workspace_id"] == "hermes"
-    assert body["conflicts"] == []
+    assert r.status_code == 501
+    assert "workspace-scoped" in r.json()["detail"]
 
 
-def test_list_conflicts_surfaces_competing_object(client, hy_with_embed):
+def test_workspace_conflicts_never_relabels_global_competing_objects(
+    client, hy_with_embed
+):
     conn = hy_with_embed.conn
     # `runs_on` is functional; multiple runtimes for one service is a true conflict.
     seed_edge(conn, "service_a", "runs_on", "python3")
     seed_edge(conn, "service_a", "runs_on", "python2")
 
     r = client.get("/v3/workspaces/hermes/conflicts")
-    assert r.status_code == 200
-    body = r.json()
-    assert len(body["conflicts"]) == 1
-    c = body["conflicts"][0]
-    assert c["kind"] == "competing_object"
-    assert c["subject"] == "service_a"
-    assert set(c["edge_a"]) >= {"service_a", "runs_on"}
-    assert set(c["edge_b"]) >= {"service_a", "runs_on"}
-    assert "detail" in c and c["detail"]
+    assert r.status_code == 501
+    assert "service_a" not in r.text
 
 
-def test_list_conflicts_surfaces_opposing_predicate(client, hy_with_embed):
+def test_workspace_conflicts_never_relabels_global_opposing_edges(
+    client, hy_with_embed
+):
     conn = hy_with_embed.conn
     seed_edge(conn, "team", "prefers", "docker")
     seed_edge(conn, "team", "rejects", "docker")
 
     r = client.get("/v3/workspaces/hermes/conflicts")
-    assert r.status_code == 200
-    body = r.json()
-    assert len(body["conflicts"]) == 1
-    assert body["conflicts"][0]["kind"] == "opposing_predicate"
+    assert r.status_code == 501
+    assert "docker" not in r.text
 
 
 # ── route-registration contract ──────────────────────────────────────────────
@@ -709,8 +987,7 @@ def test_every_supported_sdk_route_is_registered():
     assert not missing, f"SDK routes not registered (path+method): {missing}"
 
 
-def test_context_summary_leads_with_rules(client, hy_with_embed):
-    """A standing rule rides in the session context summary, ahead of MEMORY.md."""
+def test_context_does_not_expose_unowned_global_rules(client, hy_with_embed):
     hy_with_embed.add_rule("never suggest docker")
     client.post(
         "/v3/workspaces/hermes/sessions/s-rules/messages",
@@ -719,12 +996,162 @@ def test_context_summary_leads_with_rules(client, hy_with_embed):
     r = client.get("/v3/workspaces/hermes/sessions/s-rules/context")
     assert r.status_code == 200
     summary = r.json()["summary"]
-    assert summary and "STANDING RULES" in summary["content"]
-    assert "never suggest docker" in summary["content"]
+    assert summary is None
 
 
-def test_peer_card_leads_with_rules(client, hy_with_embed):
-    """The peer card representation leads with rules, ahead of the USER.md profile."""
+def test_context_summary_false_does_not_expose_unowned_rules(client, hy_with_embed):
+    hy_with_embed.add_rule("always preserve the complete rule")
+    client.post(
+        "/v3/workspaces/hermes/sessions/rules-no-summary/messages",
+        json={"messages": [{"content": "hello", "peer_id": "user-1"}]},
+    )
+    enough = client.get(
+        "/v3/workspaces/hermes/sessions/rules-no-summary/context"
+        "?summary=false&tokens=500"
+    )
+    assert enough.status_code == 200
+    assert enough.json()["peer_representation"] == ""
+    too_small = client.get(
+        "/v3/workspaces/hermes/sessions/rules-no-summary/context"
+        "?summary=false&tokens=1"
+    )
+    assert too_small.status_code == 200
+    assert too_small.json()["peer_representation"] == ""
+
+
+def test_context_budget_changes_output_skips_oversized_and_reads_beyond_20(
+    client,
+):
+    compact = [f"compact history {index}" for index in range(35)]
+    response = client.post(
+        "/v3/workspaces/hermes/sessions/token-history/messages",
+        json={"messages": [
+            *({"content": content, "peer_id": "user-1"} for content in compact),
+            {"content": "oversized " * 1000, "peer_id": "user-1"},
+        ]},
+    )
+    assert response.status_code == 201
+    wide = client.get(
+        "/v3/workspaces/hermes/sessions/token-history/context"
+        "?summary=false&tokens=5000"
+    )
+    tight = client.get(
+        "/v3/workspaces/hermes/sessions/token-history/context"
+        "?summary=false&tokens=250"
+    )
+    assert wide.status_code == tight.status_code == 200
+    assert [item["content"] for item in wide.json()["messages"]] == compact
+    assert len(tight.json()["messages"]) < len(wide.json()["messages"])
+    for result, budget in ((wide.json(), 5000), (tight.json(), 250)):
+        assert result["context_token_count"] <= budget
+        assert all(item["content"] != "oversized " * 1000 for item in result["messages"])
+        assert result["context_truncated"]
+
+
+def test_context_counts_long_peer_name_and_actual_openai_wrapper(client):
+    peer_id = "user-" + ("x" * 600)
+    assert client.post(
+        "/v3/workspaces/hermes/peers", json={"id": peer_id}
+    ).status_code == 201
+    assert client.post(
+        "/v3/workspaces/hermes/sessions/long-peer-budget/messages",
+        json={"messages": [{"content": "資料庫🙂", "peer_id": peer_id}]},
+    ).status_code == 201
+    tight = client.get(
+        "/v3/workspaces/hermes/sessions/long-peer-budget/context"
+        "?summary=false&tokens=200"
+    )
+    wide = client.get(
+        "/v3/workspaces/hermes/sessions/long-peer-budget/context"
+        "?summary=false&tokens=1000"
+    )
+    assert tight.status_code == wide.status_code == 200
+    assert tight.json()["messages"] == []
+    assert len(wide.json()["messages"]) == 1
+
+    # Build the SDK object and inspect its real to_openai() shape. The server's
+    # conservative accounting must bound every role/name/content/framing token.
+    from honcho.api_types import MessageResponse
+    from honcho.message import Message as HonchoMessage
+    from honcho.session_context import SessionContext
+
+    data = wide.json()
+    sdk_context = SessionContext(
+        session_id="long-peer-budget",
+        messages=[
+            HonchoMessage.from_api_response(MessageResponse.model_validate(item))
+            for item in data["messages"]
+        ],
+        summary=None,
+        peer_representation=data.get("peer_representation") or None,
+    )
+    openai_messages = sdk_context.to_openai(assistant="agent-main")
+    visible_cost = 0
+    for message in openai_messages:
+        serialized = f"role:{message['role']}\n"
+        if "name" in message:
+            serialized += f"name:{message['name']}\n"
+        serialized += f"content:{message['content']}"
+        visible_cost += estimate_tokens(serialized) + 4
+    assert visible_cost <= 1000
+    assert data["context_token_count"] >= visible_cost
+
+
+@pytest.mark.parametrize("graph_first", [False, True])
+def test_search_occurrence_dedup_merges_later_provenance_after_limit(
+    monkeypatch, graph_first
+):
+    occurrence = SourceOccurrence("s", 1, "p", "w")
+    raw_hit = MessageHit(
+        1, "s", "user", "exact", -10, source_peer_id="p",
+        source_workspace_id="w", source_occurrences=(occurrence,),
+    )
+    raw = FusedEvidence(
+        "message:1", "message", raw_hit, .8, False, (occurrence,),
+        (occurrence,),
+        (RetrievalProvenance("message", "1", 1, -10, "coverage_lexical"),),
+        ("message",),
+    )
+    graph = FusedEvidence(
+        "graph:7", "graph", object(), .7, False, (occurrence,), (),
+        (RetrievalProvenance("graph", "7", 2, .4, "rrf", ("graph",)),),
+        ("graph",),
+    )
+
+    class FakeHy:
+        def augment(self, *args, **kwargs):
+            return SimpleNamespace(
+                fused_evidence=[graph, raw] if graph_first else [raw, graph]
+            )
+
+    monkeypatch.setattr(hsrv, "_get_hy", lambda: FakeHy())
+    monkeypatch.setattr(
+        hsrv,
+        "_graph_fact_message",
+        lambda *args, **kwargs: {
+            "id": "msg_1", "content": "exact", "peer_id": "p",
+            "session_id": "s", "workspace_id": "w", "created_at": "now",
+            "token_count": 1,
+            "metadata": {
+                "type": "graph_fact", "edge_id": 7,
+                "graph_claim": {"subject": "a", "predicate": "uses", "object": "b"},
+                "citations": [{"evidence_id": 4, "source_session_id": "s",
+                               "source_message_id": 1, "source_peer_id": "p",
+                               "source_workspace_id": "w"}],
+            },
+        },
+    )
+    result = hsrv._augment_messages("q", 1, "w", session_id="s")[0]
+    assert set(result["metadata"]["source_tiers"]) == {"message", "graph"}
+    assert {item["tier"] for item in result["metadata"]["retrieval_provenance"]} == {
+        "message", "graph",
+    }
+    assert result["metadata"]["graph_claims"] == [
+        {"subject": "a", "predicate": "uses", "object": "b"}
+    ]
+
+
+def test_peer_card_does_not_expose_unowned_rules_or_profile(client, hy_with_embed):
     hy_with_embed.config.user_md_path.write_text(
         "# Profile\n\n- prefers uv\n", encoding="utf-8"
     )
@@ -732,5 +1159,4 @@ def test_peer_card_leads_with_rules(client, hy_with_embed):
     r = client.get("/v3/workspaces/hermes/peers/user-1/card")
     assert r.status_code == 200
     content = r.json()["content"]
-    assert "STANDING RULES" in content and "always run tests before pushing" in content
-    assert content.index("STANDING RULES") < content.index("prefers uv")
+    assert content == ""

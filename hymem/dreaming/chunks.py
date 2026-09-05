@@ -47,6 +47,9 @@ class Chunk:
     end_message_id: int
     salience_reason: str
     text: str
+    # Exact ordered source membership for claim extraction. Empty means the
+    # legacy chunk has no proven manifest and must not authorize new claims.
+    source_message_ids: tuple[int, ...] = ()
 
 
 def extract_high_salience_chunks(
@@ -101,6 +104,9 @@ def extract_high_salience_chunks(
                 end_message_id=end_id,
                 salience_reason=reason,
                 text=text,
+                source_message_ids=tuple(
+                    [int(last_assistant["id"])] if last_assistant is not None else []
+                ) + (int(row["id"]),),
             )
         )
 
@@ -114,6 +120,8 @@ def extract_baseline_chunks(
     prompt_version: str,
     limit: int,
     min_chars: int,
+    max_attempts: int = 0,
+    exclude_ids: set[str] | None = None,
 ) -> list[Chunk]:
     """Build chunks from any user turn (no salience filter) that hasn't been
     processed under the current prompt_version. Newest first.
@@ -151,6 +159,10 @@ def extract_baseline_chunks(
             pieces.append(f"assistant: {last_assistant['content']}")
         pieces.append(f"user: {content}")
         text = "\n".join(pieces)
+        is_trigger = bool(
+            _CORRECTION_PATTERNS.search(content)
+            or _PREFERENCE_PATTERNS.search(content)
+        )
 
         candidates.append(
             Chunk(
@@ -158,8 +170,18 @@ def extract_baseline_chunks(
                 session_id=session_id,
                 start_message_id=start_id,
                 end_message_id=end_id,
-                salience_reason="baseline_backstop",
+                # Chunk identity is source-range based, so every producer must
+                # materialize identical durable metadata for that range.  The
+                # salience tier can have persisted this same chunk earlier in
+                # the cycle (or in another cycle while ingestion continues).
+                salience_reason=(
+                    "correction_or_preference_trigger"
+                    if is_trigger else "long_user_turn"
+                ),
                 text=text,
+                source_message_ids=tuple(
+                    [int(last_assistant["id"])] if last_assistant is not None else []
+                ) + (int(row["id"]),),
             )
         )
 
@@ -167,15 +189,138 @@ def extract_baseline_chunks(
     candidates.reverse()
     result: list[Chunk] = []
     for chunk in candidates:
+        if chunk.id in (exclude_ids or ()):
+            continue
         already = conn.execute(
             "SELECT 1 FROM processed_chunks WHERE chunk_id = ? AND prompt_version = ?",
             (chunk.id, prompt_version),
         ).fetchone()
         if already:
             continue
+        if chunk_extraction_is_quarantined(
+            conn,
+            chunk.id,
+            prompt_version=prompt_version,
+            max_attempts=max_attempts,
+        ):
+            continue
         result.append(chunk)
         if len(result) >= limit:
             break
+    return result
+
+
+def chunk_extraction_is_quarantined(
+    conn: sqlite3.Connection,
+    chunk_id: str,
+    *,
+    prompt_version: str,
+    max_attempts: int,
+) -> bool:
+    """Whether a failed chunk has exhausted the current retry policy.
+
+    Quarantine is derived from the auditable attempt row instead of being
+    represented by a false ``processed_chunks`` success. Changing the prompt
+    version, raising the bound, or setting it to zero immediately makes the
+    chunk eligible again without destructive bookkeeping.
+    """
+    if max_attempts <= 0:
+        return False
+    row = conn.execute(
+        "SELECT attempts FROM chunk_extraction_attempts "
+        "WHERE chunk_id = ? AND prompt_version = ?",
+        (chunk_id, prompt_version),
+    ).fetchone()
+    return bool(row is not None and int(row["attempts"]) >= int(max_attempts))
+
+
+def load_pending_persisted_chunks(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    prompt_version: str,
+    limit: int,
+    max_attempts: int = 0,
+    exclude_ids: set[str] | None = None,
+) -> list[Chunk]:
+    """Load already-durable extraction chunks still owed this prompt salt.
+
+    Rebuilding candidates exclusively from ``messages`` made a prompt bump
+    impossible to replay after opt-in raw retention. This backlog reader uses
+    the stored extraction artifact itself, excludes coverage storage and
+    quarantined failures, and lets the runner bound work with its normal
+    budget.
+    """
+    if limit <= 0:
+        return []
+    # Pre-v40/unmigrated stores have no exact extraction-input membership.
+    # Chunk prose is not a trustworthy substitute for the published source
+    # manifest, so fail closed instead of returning unverifiable backlog.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='chunk_message_sources'"
+    ).fetchone() is None:
+        return []
+    excluded = tuple(sorted(exclude_ids or ()))
+    exclusion = ""
+    params: list[object] = [session_id, prompt_version]
+    if excluded:
+        exclusion = f"AND c.id NOT IN ({','.join('?' * len(excluded))})"
+        params.extend(excluded)
+    quarantine = ""
+    if max_attempts > 0:
+        quarantine = (
+            "AND NOT EXISTS ("
+            " SELECT 1 FROM chunk_extraction_attempts a"
+            " WHERE a.chunk_id = c.id AND a.prompt_version = ?"
+            "   AND a.attempts >= ?"
+            ")"
+        )
+        params.extend((prompt_version, int(max_attempts)))
+    params.append(int(limit))
+    rows = conn.execute(
+        f"""
+        SELECT c.id, c.session_id, c.start_message_id, c.end_message_id,
+               c.salience_reason, c.text
+        FROM chunks c
+        WHERE c.session_id = ?
+          AND c.chunk_kind = 'extraction'
+          AND COALESCE(c.salience_reason, '') <> 'short_session_fallback'
+          AND NOT EXISTS (
+              SELECT 1 FROM processed_chunks pc
+              WHERE pc.chunk_id = c.id AND pc.prompt_version = ?
+          )
+          {exclusion}
+          {quarantine}
+        ORDER BY c.created_at, c.id
+        LIMIT ?
+        """,
+        tuple(params),
+    ).fetchall()
+    result: list[Chunk] = []
+    for row in rows:
+        manifest = conn.execute(
+            "SELECT source_message_id FROM chunk_message_sources "
+            "WHERE chunk_id = ? ORDER BY ordinal",
+            (row["id"],),
+        ).fetchall()
+        result.append(Chunk(
+            id=row["id"],
+            session_id=row["session_id"],
+            start_message_id=(
+                int(row["start_message_id"])
+                if row["start_message_id"] is not None
+                else -1
+            ),
+            end_message_id=(
+                int(row["end_message_id"])
+                if row["end_message_id"] is not None
+                else -1
+            ),
+            salience_reason=row["salience_reason"] or "persisted_backlog",
+            text=row["text"] or "",
+            source_message_ids=tuple(int(item["source_message_id"]) for item in manifest),
+        ))
     return result
 
 
@@ -227,10 +372,14 @@ def extract_fallback_chunk(
         end_message_id=end_id,
         salience_reason="short_session_fallback",
         text=text,
+        source_message_ids=tuple(int(row["id"]) for row in rows),
     )
 
 
 def persist_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
+    from hymem.dreaming.lossless import validate_message_coverage_artifact
+    from hymem.dreaming.message_coverage import LOSSLESS_COVERAGE_VERSION
+
     for c in chunks:
         conn.execute(
             """
@@ -238,6 +387,82 @@ def persist_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (c.id, c.session_id, c.start_message_id, c.end_message_id, c.salience_reason, c.text),
+        )
+        stored_chunk = conn.execute(
+            "SELECT session_id, start_message_id, end_message_id, "
+            "text, chunk_kind FROM chunks WHERE id = ?",
+            (c.id,),
+        ).fetchone()
+        if stored_chunk is None or tuple(stored_chunk) != (
+            c.session_id, c.start_message_id, c.end_message_id,
+            c.text, "extraction",
+        ):
+            raise RuntimeError("chunk identity collision")
+        if not c.source_message_ids:
+            continue
+        if (
+            len(set(c.source_message_ids)) != len(c.source_message_ids)
+            or c.source_message_ids[0] != c.start_message_id
+            or c.source_message_ids[-1] != c.end_message_id
+        ):
+            raise ValueError("chunk source manifest does not match its boundaries")
+        expected: list[tuple[int, int, str, str, str]] = []
+        for ordinal, message_id in enumerate(c.source_message_ids):
+            row = conn.execute(
+                """
+                SELECT chunk_id FROM message_retention_coverage
+                WHERE message_id = ? AND source_session_id = ?
+                  AND coverage_version = ?
+                """,
+                (message_id, c.session_id, LOSSLESS_COVERAGE_VERSION),
+            ).fetchone()
+            if row is None:
+                raise ValueError("chunk source lacks ordered coverage")
+            frontier = conn.execute(
+                "SELECT coverage_message_id FROM sessions WHERE id = ?",
+                (c.session_id,),
+            ).fetchone()
+            if (
+                frontier is None
+                or frontier["coverage_message_id"] is None
+                or message_id > int(frontier["coverage_message_id"])
+            ):
+                raise ValueError("chunk source exceeds the producer frontier")
+            proof = validate_message_coverage_artifact(
+                conn, message_id=message_id, chunk_id=row["chunk_id"],
+                coverage_version=LOSSLESS_COVERAGE_VERSION,
+            )
+            if proof.session_id != c.session_id:
+                raise ValueError("chunk source belongs to another session")
+            expected.append((
+                ordinal, message_id, c.session_id, proof.chunk_id,
+                LOSSLESS_COVERAGE_VERSION,
+            ))
+        existing = conn.execute(
+            """
+            SELECT ordinal, source_message_id, source_session_id,
+                   source_coverage_chunk_id, source_coverage_version
+            FROM chunk_message_sources WHERE chunk_id = ? ORDER BY ordinal
+            """,
+            (c.id,),
+        ).fetchall()
+        expected_tuples = [tuple(item) for item in expected]
+        if existing and [tuple(row) for row in existing] != expected_tuples:
+            raise RuntimeError("chunk source manifest identity collision")
+        if not existing:
+            conn.executemany(
+                """
+                INSERT INTO chunk_message_sources(
+                    ordinal, source_message_id, source_session_id,
+                    source_coverage_chunk_id, source_coverage_version, chunk_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [(*item, c.id) for item in expected],
+            )
+        conn.execute(
+            "UPDATE chunks SET source_manifest_version = ?, "
+            "source_manifest_count = ? WHERE id = ?",
+            ("claim-source-manifest-v1", len(expected), c.id),
         )
 
 

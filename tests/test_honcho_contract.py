@@ -133,18 +133,26 @@ def test_session_add_peers(honcho):
 
 def test_peer_chat_parses(honcho):
     peer = honcho.peer("user-1")
+    session = honcho.session("sess-chat")
+    session.add_peers([peer])
+    session.add_messages([peer.message("preferred tooling is uv")])
     answer = peer.chat("what tooling do I prefer?")
-    # chat returns `str | None`; either is a valid parse.
-    assert answer is None or isinstance(answer, str)
+    assert isinstance(answer, str) and answer
+    assert "uv" in answer.lower()
 
 
 def test_peer_card_parses(honcho, hy_with_embed):
-    hy_with_embed.config.user_md_path.write_text(
-        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
-    )
     peer = honcho.peer("user-1")
+    session = honcho.session("sess-card")
+    session.add_peers([peer])
+    session.add_messages([peer.message("peer-owned card sentinel: uv")])
+    hy_with_embed.config.user_md_path.write_text(
+        "GLOBAL PROFILE SECRET", encoding="utf-8"
+    )
     card = peer.get_card()
-    assert card is None or isinstance(card, list)
+    assert isinstance(card, list) and card
+    assert "peer-owned card sentinel: uv" in card[0]
+    assert "GLOBAL PROFILE SECRET" not in card[0]
 
 
 def test_peer_context_representation_reaches_sdk(honcho, hy_with_embed):
@@ -153,26 +161,141 @@ def test_peer_context_representation_reaches_sdk(honcho, hy_with_embed):
     as `representation` with no alias — Pydantic silently dropped the value, so
     SDK consumers (e.g. the Hermes harness prefetch path) saw an empty
     representation on this route every time. The route now sends both names;
-    the *parsed model* must carry the digest + USER.md content.
+    the parsed model must carry only workspace/peer-authorized evidence.
     """
+    observer = honcho.peer("agent-main")
+    target = honcho.peer("user-1")
+    session = honcho.session("sess-peer-context")
+    session.add_peers([observer, target])
+    session.add_messages([target.message("SCOPED CONTEXT SENTINEL: uses uv")])
     hy_with_embed.config.user_md_path.write_text(
-        "# Behavioral Profile\n\n- prefers uv\n", encoding="utf-8"
+        "GLOBAL USER SECRET", encoding="utf-8"
     )
-    # A root aggregation node, inserted directly: the representation surfaces
-    # only read it via load_digest(), no aggregation build needed.
-    hy_with_embed.conn.execute(
-        "INSERT INTO aggregation_nodes "
-        "(id, title, summary, member_episode_ids, session_ids, "
-        " n_members, n_sessions, level, is_root) "
-        "VALUES ('root-test', 'User digest', 'Works on HyMem and Hermes.', "
-        " '[]', '[]', 3, 3, 1, 1)"
+    hy_with_embed.config.memory_md_path.write_text(
+        "GLOBAL MEMORY SECRET", encoding="utf-8"
     )
-    hy_with_embed.conn.commit()
 
-    ctx = honcho.peer("user-1").context()
+    ctx = observer.context(target=target)
     assert ctx.representation, "SDK dropped the representation field"
-    assert "Works on HyMem and Hermes." in ctx.representation
-    assert "prefers uv" in ctx.representation
+    assert "SCOPED CONTEXT SENTINEL" in ctx.representation
+    assert "GLOBAL USER SECRET" not in ctx.representation
+    assert "GLOBAL MEMORY SECRET" not in ctx.representation
+
+
+def test_sdk_peer_and_session_representations_are_directional(honcho):
+    observer_a = honcho.peer("observer-a")
+    observer_b = honcho.peer("observer-b")
+    target = honcho.peer("target")
+    session_a = honcho.session("direction-a")
+    session_b = honcho.session("direction-b")
+    session_a.add_peers([observer_a, target])
+    session_b.add_peers([observer_b, target])
+    session_a.add_messages([
+        target.message("shared-a sentinel; favorite editor is helix"),
+    ])
+    session_b.add_messages([target.message("private-b sentinel")])
+
+    a = observer_a.representation(target=target)
+    b = observer_b.representation(target=target)
+    own = target.representation()
+    local = session_a.representation(observer_a, target=target)
+    directional_card = observer_a.get_card(target=target)
+    untargeted_context = session_a.context(tokens=10_000)
+    directional_context = session_a.context(
+        tokens=10_000,
+        peer_target=target.id,
+        peer_perspective=observer_a.id,
+    )
+    local_omniscient_context = session_a.context(
+        tokens=10_000,
+        peer_target=target.id,
+        limit_to_session=True,
+    )
+
+    assert isinstance(a, str) and "shared-a sentinel" in a
+    assert "private-b sentinel" not in a
+    assert isinstance(b, str) and "private-b sentinel" in b
+    assert "shared-a sentinel" not in b
+    assert "shared-a sentinel" in own and "private-b sentinel" in own
+    assert "shared-a sentinel" in local and "private-b sentinel" not in local
+    assert directional_card and "shared-a sentinel" in directional_card[0]
+    assert "private-b sentinel" not in directional_card[0]
+    assert untargeted_context.peer_representation is None
+    assert untargeted_context.peer_card is None
+    assert directional_context.peer_representation
+    assert "shared-a sentinel" in directional_context.peer_representation
+    assert "private-b sentinel" not in directional_context.peer_representation
+    assert directional_context.peer_card
+    assert "shared-a sentinel" in directional_context.peer_card[0]
+    assert "private-b sentinel" not in directional_context.peer_card[0]
+    assert local_omniscient_context.peer_representation
+    assert "shared-a sentinel" in local_omniscient_context.peer_representation
+    assert "private-b sentinel" not in local_omniscient_context.peer_representation
+    assert local_omniscient_context.peer_card
+    assert "shared-a sentinel" in local_omniscient_context.peer_card[0]
+    assert "private-b sentinel" in local_omniscient_context.peer_card[0]
+
+
+def test_sdk_context_card_is_independent_of_representation_filters(honcho):
+    observer = honcho.peer("card-observer")
+    target = honcho.peer("card-target")
+    current = honcho.session("card-current")
+    other = honcho.session("card-other")
+    current.add_peers([observer, target])
+    other.add_peers([observer, target])
+    current.add_messages([
+        target.message(f"current card item {index}") for index in range(30)
+    ])
+    other.add_messages([target.message("outside-session card sentinel")])
+
+    card = observer.get_card(target=target)
+    context = current.context(
+        tokens=100_000,
+        peer_target=target.id,
+        peer_perspective=observer.id,
+        limit_to_session=True,
+        search_query="current card item 29",
+        search_top_k=1,
+        max_conclusions=1,
+    )
+    peer_context = observer.context(
+        target=target,
+        search_query="current card item 29",
+        search_top_k=1,
+        max_conclusions=1,
+    )
+
+    assert card and context.peer_card == card
+    assert "outside-session card sentinel" in card[0]
+    assert context.peer_representation
+    assert "outside-session card sentinel" not in context.peer_representation
+    assert context.peer_representation.count("message=msg_") == 1
+    assert context.peer_representation != card[0]
+    assert peer_context.peer_card == card
+    assert peer_context.representation
+    assert peer_context.representation.count("message=msg_") == 1
+    assert peer_context.representation != card[0]
+
+
+def test_sdk_chat_stream_consumes_sse_for_directional_session(honcho):
+    observer = honcho.peer("observer-stream")
+    target = honcho.peer("target-stream")
+    session = honcho.session("stream-session")
+    session.add_peers([observer, target])
+    session.add_messages([target.message("favorite editor is helix")])
+
+    stream = observer.chat_stream(
+        "favorite editor?",
+        target=target,
+        session=session,
+        reasoning_level="minimal",
+    )
+    chunks = list(stream)
+    assert chunks and all(isinstance(chunk, str) for chunk in chunks)
+    content = "".join(chunks)
+    assert "helix" in content.lower()
+    assert stream.is_complete
+    assert stream.get_final_response() == {"content": content}
 
 
 def _seed_docker_graph(honcho, hy_with_embed):
@@ -250,5 +373,12 @@ def test_all_supported_sdk_methods_round_trip(honcho, hy_with_embed):
     peer_ctx = user.context()
     assert peer_ctx.peer_id == "user-1"
     assert isinstance(user.search("docker"), list)
+    assert isinstance(user.representation(), str)
+    assert isinstance(session.representation(user), str)
     chat = user.chat("should we use docker for dev?")
-    assert chat is None or isinstance(chat, str)
+    assert isinstance(chat, str) and chat
+    stream = user.chat_stream(
+        "should we use docker for dev?", session=session,
+        reasoning_level="minimal",
+    )
+    assert "".join(stream)

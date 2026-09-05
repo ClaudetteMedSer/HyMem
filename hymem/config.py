@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+MAX_FACTS_PER_EXTRACTION_UNIT = 256
+
+
 def _default_evidence_role_weights() -> dict[str, int]:
     # Weight a positive evidence row by the role of its chunk's first message.
     # The chunker prefixes a user turn with the preceding assistant turn, so an
@@ -41,6 +44,17 @@ class HyMemConfig:
     root: Path
     """Directory holding hymem.sqlite, MEMORY.md, USER.md."""
 
+    def __post_init__(self) -> None:
+        value = self.dream_max_facts_per_session
+        if (
+            not isinstance(value, int) or isinstance(value, bool)
+            or not 1 <= value <= MAX_FACTS_PER_EXTRACTION_UNIT
+        ):
+            raise ValueError(
+                "dream_max_facts_per_session must be between 1 and "
+                f"{MAX_FACTS_PER_EXTRACTION_UNIT}"
+            )
+
     salience_min_chars: int = 30
     """Minimum chunk size before extraction is attempted."""
 
@@ -69,12 +83,11 @@ class HyMemConfig:
     fts_top_k: int = 5
 
     message_fts_top_k: int = 5
-    """Number of raw-message keyword hits augment() returns in `message_hits`,
-    via a direct FTS5 path over the `messages` table (user/assistant turns
-    only). Complements `fts_top_k`, which searches dreamed *chunks*: raw turns
-    are searchable the moment they are logged, so facts are recallable across
-    sessions and before any dream consolidates them — the gap chunk-FTS leaves.
-    0 disables the path."""
+    """Number of raw-message lexical + semantic hits augment() returns in
+    `message_hits`. The semantic path is bound to exact durable user/assistant
+    coverage, so it spans sessions, recovers paraphrases, and survives raw
+    pruning. Complements `fts_top_k`, which searches dreamed chunks. 0 disables
+    the path."""
 
     message_fts_aggregate_cap: int = 50
     """Counting path for `ability="MR"` ("how many X across all my requests?").
@@ -289,9 +302,9 @@ class HyMemConfig:
     benchmarks/raptor_digest_plan.md Stage 1; profile.v1 had FAILED it at ~8%,
     which kept this False until the v2 re-gate). Any material prompt change
     re-enters the same gate: bump PROFILE_PROMPT_VERSION, flip this False,
-    re-score ≥0.9 on the box, then re-enable. When True, dreaming runs one
-    extra LLM call per
-    dreamed session over the session's USER turns only, extracting facts into
+    re-score ≥0.9 on the box, then re-enable. When True, dreaming runs at most
+    one extra LLM call per session per cycle over a bounded, independently
+    resumable stream of USER turns only, extracting facts into
     the CLOSED slot vocabulary (role, name, employer, location, language,
     relationship(person), possession, age_birthday, health_condition,
     recurring_activity — enforced by validation AND a table CHECK, so the LLM
@@ -307,10 +320,18 @@ class HyMemConfig:
     and an always-empty augment tier."""
 
     profile_max_items_per_session: int = 16
-    """Cap on validated profile items accepted from one per-session extraction
-    call. A runaway response (the LLM tagging every sentence as a fact) is
-    truncated here before any row is written; 16 comfortably covers a genuine
-    identity-dense session."""
+    """Maximum profile items accepted from one bounded extraction call. A
+    response above the cap fails atomically and is retried on a smaller exact
+    input slice; it is never silently truncated. 16 comfortably covers a
+    genuine identity-dense slice."""
+
+    profile_extraction_max_attempts: int = 6
+    """Failed profile slices are retried with progressively smaller exact input
+    windows. After this many consecutive failures the session is quarantined
+    without advancing its cursor or publishing partial output; a prompt/config
+    change starts a fresh walk. Set to 0 to retry forever. The quarantine is
+    persisted on ``sessions`` and every failed attempt is counted in
+    ``dream_runs.profile_failures``."""
 
     profile_context_cap: int = 24
     """Max ACTIVE profile rows augment() returns in `ctx.user_profile`. The
@@ -367,30 +388,23 @@ class HyMemConfig:
     (deepseek-v4-flash: 100% at 10, 0% at 111), so a dream's markers are judged in
     sub-batches of this size. Lower if a weaker judge still collapses."""
 
-    facts_enabled: bool = False
-    """Campaign E / E1 master switch (read side): surface the narrative-facts
-    tier in `ctx.facts` — self-contained one-sentence statements extracted at
-    dream time (schema v26), the middle granularity between a knowledge-graph
-    triple and an episode summary. ADDITIVE like the profile/rules tiers: its
-    own FTS/vec SELECT over `narrative_facts`, never a slot from any other
-    tier's budget, so a populated facts store cannot crowd gold turns out of
-    message/chunk/episode retrieval. Superseded facts (invalid_at set — E6's
-    job) leave the tier but stay in the DB for audit. Degrades to [] on a
-    pre-v26 store. False → the tier is always empty; extraction is governed
-    separately by `facts_extraction_enabled`."""
+    facts_enabled: bool = True
+    """Read-side narrative-facts tier. It is additive (its own FTS/vector
+    budget) and exposes only lifecycle-current facts whose exact occurrence
+    manifest still validates against lossless storage. Default True matches the
+    default-on extractor, avoiding paid-for hidden memory. False hides the tier
+    without disabling extraction."""
 
     facts_extraction_enabled: bool = True
-    """Campaign E / E1 write side: during dreaming, run ONE extra LLM call per
-    session tail extracting narrative facts (`hymem/dreaming/facts.py`),
-    append-only under the `facts.v2` prompt that cleared the G-F1b
-    extraction-faithfulness gate (2026-08-02, 123/123 strict — the gate that
-    kept this tier unbuilt while deepseek-v4-flash scored 0.55-0.76). Coverage
-    follows the v24 watermark pattern with its own column
-    (`sessions.facts_message_id`): steady-state re-dreams of unchanged
-    sessions cost zero calls, a parse failure holds the watermark and retries,
-    and a FACTS_PROMPT_VERSION bump extracts forward only (covered ranges are
-    never re-extracted). Any material prompt change re-enters the
-    `benchmarks/fact_probe.py` gate at ≥0.90 before this stays True."""
+    """Dream-time write side under the gated `facts.v2` prompt. One bounded
+    lossless-source slice is processed per session/dream and oversized turns
+    resume by exact character offset. Valid empty output advances; malformed,
+    lossy, or over-cap output holds and durably retries. Successful replay of
+    a source unit authoritatively replaces its fact set and records immutable
+    lifecycle history. A prompt/config change first replays every committed
+    source unit on its original exact boundaries and input bytes; only after
+    that authoritative walk completes may the new version append tail units.
+    A changed character cap governs new units but never repartitions history."""
 
     facts_top_k: int = 8
     """Max FactHits `augment()` returns in `ctx.facts` (0 disables the tier's
@@ -399,10 +413,16 @@ class HyMemConfig:
 
     dream_max_facts_per_session: int = 8
     """Cap on validated facts accepted from one per-session-tail extraction
-    call; a runaway reply is truncated here before any row is written. 8 is
+    call (1..256). An over-cap reply is rejected atomically and its exact
+    source cursor is held for adaptive retry; it is never truncated. 8 is
     the G-F1b density gate's criterion-3 threshold (median facts/session ≤8,
     measured median 7.0-8.0), so the cap and the gate agree on what a
     reasonable session yields."""
+
+    facts_extraction_max_attempts: int = 6
+    """Held failures allowed at one authoritative facts cursor before that
+    source position is quarantined. Zero means unbounded retries. A valid empty
+    result is success; malformed, lossy, or over-cap output never advances."""
 
     episode_granularity_enabled: bool = False
     """Plan C stage 1: cut the per-session digest's episodes at DECISION
@@ -483,7 +503,13 @@ class HyMemConfig:
     embedding_max_scan: int = 5000
 
     graph_semantic_top_k: int = 10
-    """KNN candidates pulled from vec_edges during semantic graph lookup."""
+    """Enable semantic graph lookup when positive (0 disables it).
+
+    The historical name is retained for configuration compatibility. Current
+    graph ranking evaluates every compatible semantic edge before the shared
+    confidence/recency score, because a semantic-only pre-limit can discard
+    the actual final winner.
+    """
 
     graph_predicate_top_k: int = 10
     """Edges pulled per predicate-routed query."""
@@ -603,7 +629,13 @@ class HyMemConfig:
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    prompt_version: str = "v9"
+    # v13 adds exact source_message_id citations to every Phase-1 graph claim.
+    # Re-offer v12 chunks so message-level provenance is populated from their
+    # durable source manifests instead of preserving chunk-first attribution.
+    # after a malformed optional hint or an assertion split exactly at the
+    # retry midpoint. The v39 validator and overlap semantics must replay old
+    # extraction chunks too, including after raw-message pruning.
+    prompt_version: str = "v13"
 
     dream_budget: int = 50
     """Maximum number of chunks to process per dreaming cycle."""
@@ -614,12 +646,12 @@ class HyMemConfig:
     eventually flows through extraction even if it didn't trip the regexes."""
 
     chunk_extraction_max_attempts: int = 3
-    """Consecutive failed extractions before a chunk is given up on and marked
-    done anyway. A failed extraction is held for retry rather than marked, and
-    the runner spends a budget slot on a chunk BEFORE knowing whether it will
-    fail — so without a bound, a permanently-broken chunk consumes one of
-    `dream_budget`'s slots on every dream forever, starving new chunks. Giving
-    up logs at WARNING with the attempt count; set to 0 to retry indefinitely."""
+    """Consecutive failures before an extraction chunk is quarantined.
+    Quarantine never creates a ``processed_chunks`` success marker and does not
+    consume later dream budgets, so malformed provider output is visible
+    without permanently starving healthy work or becoming a silent memory
+    hole. A prompt-version/retry-policy change reopens it; set to 0 to retry
+    indefinitely."""
 
     dream_digest_max_tokens: int = 3072
     """max_tokens for the batched per-session digest call (episodes + summary +
@@ -627,11 +659,20 @@ class HyMemConfig:
     because the combined output is roughly three responses' worth."""
 
     dream_digest_max_chars: int = 12000
-    """Char cap on the session text fed to the digest call (the larger of the
-    pre-batching episode/procedure caps)."""
+    """Maximum characters in one resumable session-digest input window.
+    Messages larger than the window are sliced at exact character offsets;
+    successful calls persist the offset and no source characters are dropped."""
+
+    digest_extraction_max_attempts: int = 6
+    """Consecutive failures of one digest cursor position before that session
+    is quarantined without advancing or publishing partial output. Retries use
+    progressively smaller exact input windows. A prompt/framing/retry-policy
+    change reopens the work; values <= 0 retry indefinitely."""
 
     max_chunks: int = 50000
-    """Soft cap on total stored chunks. Excess unreferenced chunks are pruned."""
+    """Soft cap on retrieval/extraction chunks. Exact per-message coverage
+    artifacts do not enter retrieval and are not counted or pruned by this cap;
+    they deliberately grow with the durable message stream."""
 
     retention_days: int = 90
     """Chunks newer than this are always kept regardless of graph references.
@@ -645,16 +686,18 @@ class HyMemConfig:
     this is decoupled from retention_days. Set to a positive number of days to
     restore age-based pruning."""
 
-    message_retention_days: int = 90
-    """Raw messages of a session are pruned once the session is older than this
-    AND carries a non-null summary. The summary gate means this is a no-op in
-    stub/no-LLM deployments where summaries are never generated, so the only
-    copy of unreconstructable data is never destroyed."""
+    message_retention_days: int = 0
+    """Opt-in age window for pruning raw messages; values <= 0 (the shipped
+    default) retain them indefinitely. When enabled, only old messages from an
+    ended session are eligible, and each message must have a current, lossless
+    ``message_retention_coverage`` record backed by a surviving chunk. A digest
+    watermark or session summary is deliberately not sufficient."""
 
-    tombstone_retention_days: int = 30
-    """Retracted knowledge_graph edges (and their cascaded kg_evidence) are
-    hard-deleted once last_seen is older than this. Active/derived edges are
-    untouched (derived edges are rebuilt each cycle)."""
+    tombstone_retention_days: int = 0
+    """Opt-in age window for hard-deleting retracted knowledge-graph history.
+    Values <= 0 (the shipped default) keep edge/evidence/lifecycle history
+    forever so ``facts_at()`` remains complete. A positive value restores the
+    destructive tombstone cascade; active/derived edges remain untouched."""
 
     dream_runs_keep: int = 500
     """Max dream_runs rows retained; older rows are pruned (newest kept)."""
@@ -691,7 +734,7 @@ class HyMemConfig:
     """HuggingFace model id used when ``rerank_model="cross-encoder"``."""
 
     rerank_message_hits: bool = True
-    """Also rerank the raw-message keyword tier (`message_hits`), not just the
+    """Also rerank the raw-message hybrid tier (`message_hits`), not just the
     chunk tier (`fts_hits`). When True, augment() pulls a `rerank_top_k`-wide
     BM25 candidate pool from the `messages` table and reranks it down to
     `message_fts_top_k`, so a semantically-relevant turn sitting in the BM25
@@ -766,6 +809,12 @@ class HyMemConfig:
     a later re-extraction starts from a discounted prior rather than 1.0.
     Procedures rot faster than triples — a stale runbook is actively
     misleading — so the signal is retained even after the row is hidden."""
+
+    ask_max_context_tokens: int = 8000
+    """Conservative estimated-token ceiling for the memory block sent by
+    ``HyMem.ask()``. Applied together with ``ask_max_context_chars`` at whole
+    item boundaries; 0 disables only this ceiling. Appended for positional
+    dataclass compatibility with releases that predate token-aware packing."""
 
     @property
     def db_path(self) -> Path:

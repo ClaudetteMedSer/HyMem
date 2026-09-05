@@ -19,6 +19,8 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from hymem.core.graph import live_edge_predicate
+
 # Predicates where a single subject pointing at multiple objects is contradictory.
 _EXCLUSIVE_PREDICATES = ("runs_on", "requires_version", "deploys_to")
 
@@ -67,8 +69,8 @@ def _competing_objects(conn: sqlite3.Connection) -> list[Conflict]:
           ON a.subject_canonical = b.subject_canonical
          AND a.predicate = b.predicate
          AND a.object_canonical < b.object_canonical
-        WHERE a.status = 'active' AND b.status = 'active'
-          AND a.derived = 0 AND b.derived = 0
+        WHERE {live_edge_predicate('a')}
+          AND {live_edge_predicate('b')}
           AND a.predicate IN ({placeholders})
         """,
         _EXCLUSIVE_PREDICATES,
@@ -94,7 +96,7 @@ def _competing_objects(conn: sqlite3.Connection) -> list[Conflict]:
 
 def _opposing_predicates(conn: sqlite3.Connection) -> list[Conflict]:
     rows = conn.execute(
-        """
+        f"""
         SELECT a.subject_canonical AS subj, a.object_canonical AS obj,
                a.predicate AS pred_a, b.predicate AS pred_b,
                a.pos_evidence AS pos_a, a.neg_evidence AS neg_a,
@@ -104,8 +106,8 @@ def _opposing_predicates(conn: sqlite3.Connection) -> list[Conflict]:
           ON a.subject_canonical = b.subject_canonical
          AND a.object_canonical = b.object_canonical
          AND a.predicate < b.predicate
-        WHERE a.status = 'active' AND b.status = 'active'
-          AND a.derived = 0 AND b.derived = 0
+        WHERE {live_edge_predicate('a')}
+          AND {live_edge_predicate('b')}
         """
     ).fetchall()
 

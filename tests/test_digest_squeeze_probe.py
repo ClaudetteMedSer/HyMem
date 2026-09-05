@@ -31,6 +31,7 @@ import pytest
 from hymem import HyMem, StubEmbeddingClient
 from hymem.core import db as core_db
 from hymem.dreaming.aggregate import _anchor_facts
+from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.extraction.llm import StubLLMClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
@@ -51,10 +52,36 @@ from digest_squeeze_probe import (  # noqa: E402
 
 def _seed_profile(conn, slot: str, value: str, *, slot_key: str | None = None,
                   invalid_at: str | None = None) -> None:
+    session_id = "digest-squeeze-profile-source"
+    conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES (?)", (session_id,))
+    source = conn.execute(
+        "SELECT id, created_at FROM messages WHERE session_id = ? "
+        "ORDER BY id LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if source is None:
+        source_id = conn.execute(
+            "INSERT INTO messages(session_id, role, content) VALUES (?, 'user', ?)",
+            (session_id, "Durable source for digest-squeeze profile fixtures."),
+        ).lastrowid
+        source = conn.execute(
+            "SELECT id, created_at FROM messages WHERE id = ?", (source_id,)
+        ).fetchone()
+    materialize_message_coverage(conn, session_id)
     conn.execute(
-        "INSERT INTO user_profile(slot, slot_key, value, confidence, invalid_at) "
-        "VALUES (?, ?, ?, 1.0, ?)",
-        (slot, slot_key, value, invalid_at),
+        "INSERT INTO user_profile(slot, slot_key, value, evidence_message_id, "
+        "source_message_id, source_session_id, source_created_at, confidence, "
+        "invalid_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1.0, ?)",
+        (
+            slot,
+            slot_key,
+            value,
+            source["id"],
+            source["id"],
+            session_id,
+            source["created_at"],
+            invalid_at,
+        ),
     )
 
 

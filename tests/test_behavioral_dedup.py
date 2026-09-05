@@ -1,4 +1,4 @@
-"""Dry-run report for retroactive behavioral-edge dedup.
+"""Report and apply paths for retroactive behavioral-edge dedup.
 
 Behavioral edges (`prefers` / `avoids` / `rejects`) minted before same-wave
 collapse existed don't retroactively merge. `behavioral_duplicate_report` is a
@@ -127,7 +127,7 @@ def test_threshold_controls_aggressiveness(tmp_path):
 
 
 def test_apply_merges_evidence_and_retracts_members(tmp_path):
-    """apply_behavioral_merges: survivor gets summed evidence, members retracted."""
+    """The survivor gets summed evidence and collapsed members are removed."""
     from hymem.core import db as core_db
     from hymem.dreaming.behavioral_dedup import (
         find_behavioral_duplicates,
@@ -158,11 +158,15 @@ def test_apply_merges_evidence_and_retracts_members(tmp_path):
     assert survivor["neg_evidence"] == 1  # 1 + 0
     assert survivor["status"] == "active"
 
-    # Member retracted.
+    # The alias preserves resolution; an authority-free direct tombstone would
+    # be unportable and is therefore removed.
     member = conn.execute(
         "SELECT status FROM knowledge_graph WHERE id = ?", (m_id,)
     ).fetchone()
-    assert member["status"] == "retracted"
+    assert member is None
+    assert conn.execute(
+        "SELECT canonical FROM entity_aliases WHERE alias='concise_mode'"
+    ).fetchone()[0] == "concise"
 
     hy.close()
 
@@ -248,10 +252,12 @@ def test_apply_reassigns_kg_evidence(tmp_path):
     )
 
     m_id = _edge(conn, "atta", "prefers", "concise_mode", [0.99, 0.01, 0.0, 0.0], pos=2)
-    conn.execute(
-        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, 'c1', 1)",
-        (m_id,),
-    )
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) "
+            "VALUES (?, 'c1', 1)",
+            (m_id,),
+        )
     s_id = _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5)
 
     proposals = find_behavioral_duplicates(conn, cosine_threshold=0.9)
@@ -293,11 +299,13 @@ def test_apply_via_hy_api(tmp_path):
     assert result["edges_retracted"] == 1
     assert result["survivors_updated"] == 1
 
-    # Verify member is retracted.
-    status = conn.execute(
-        "SELECT status FROM knowledge_graph WHERE object_canonical = 'concise_mode'"
-    ).fetchone()["status"]
-    assert status == "retracted"
+    # Verify the collapsed identity is represented only by its alias.
+    assert conn.execute(
+        "SELECT 1 FROM knowledge_graph WHERE object_canonical = 'concise_mode'"
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT canonical FROM entity_aliases WHERE alias='concise_mode'"
+    ).fetchone()[0] == "concise"
 
     hy.close()
 
@@ -326,10 +334,12 @@ def test_apply_records_extraction_feedback(tmp_path):
     s_id = _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5)
     m_id = _edge(conn, "atta", "prefers", "concise_mode", [0.99, 0.01, 0.0, 0.0], pos=2)
     # Attach evidence to the member edge.
-    conn.execute(
-        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, 'c1', 1)",
-        (m_id,),
-    )
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) "
+            "VALUES (?, 'c1', 1)",
+            (m_id,),
+        )
 
     proposals = find_behavioral_duplicates(conn, cosine_threshold=0.9)
 

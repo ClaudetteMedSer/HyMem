@@ -1,15 +1,37 @@
 from __future__ import annotations
 
+import dataclasses
+import json
 import math
 
 import pytest
 
 from hymem.core import db as core_db
 from hymem.dreaming.canonicalize import register_alias
-from hymem.query.augment import _expand_entities_by_token_overlap
+from hymem.dreaming.embeddings import fetch_edge_embeddings
+from hymem.query.augment import (
+    AugmentedContext,
+    _expand_entities_by_token_overlap,
+    _graph_lookup,
+    _python_cosine_edge_search,
+    _semantic_edge_hits,
+)
 from hymem.query.conflicts import find_conflicts
 from hymem.query.predicate_routing import route_predicates
 from tests.conftest import make_routed_llm, seed_edge
+
+
+class _MappingEmbedder:
+    model = "mapping-v1"
+    dim = 2
+
+    def __init__(self, vectors=None):
+        self.vectors = vectors or {}
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return [list(self.vectors.get(text, [1.0, 0.0])) for text in texts]
 
 
 # --- schema migration v6 ----------------------------------------------------
@@ -70,7 +92,9 @@ def test_embed_pending_edges_idempotent(hy_with_embed, embed_stub):
 
 def test_graph_facts_carry_why_retrieved(hy_with_embed):
     _dream_with_edges(hy_with_embed)
-    ctx = hy_with_embed.augment("what technologies does the backend use")
+    # Exact edge text guarantees a genuinely positive cosine under the hash
+    # stub; orthogonal/negative vectors are intentionally not semantic signal.
+    ctx = hy_with_embed.augment("backend uses fast_api")
     assert ctx.graph_facts
     for fact in ctx.graph_facts:
         assert fact.why_retrieved, f"{fact} has no reason codes"
@@ -152,7 +176,7 @@ def test_no_predicate_no_entities_uses_semantic_branch(hy_with_embed, monkeypatc
     from hymem.query import augment as augment_mod
     monkeypatch.setattr(
         augment_mod, "_semantic_edge_hits",
-        lambda conn, cfg, embedder, query: [(edge_id, 1.0)],
+        lambda conn, cfg, embedder, query, **kwargs: [(edge_id, 1.0)],
     )
 
     query = "hello world generic phrase"
@@ -467,6 +491,308 @@ def test_semantic_fallback_without_sqlite_vec(hy_with_embed, monkeypatch):
     ctx = hy_with_embed.augment("what technologies does the backend use")
     assert ctx.graph_facts
     assert calls, "python-cosine edge search should run when vec extension is off"
+
+
+def _store_edge_vector(conn, edge_id, vector, *, model="mapping-v1", dim=2):
+    edge = conn.execute(
+        "SELECT subject_canonical,predicate,object_canonical "
+        "FROM knowledge_graph WHERE id=?", (edge_id,),
+    ).fetchone()
+    text = f"{edge['subject_canonical']} {edge['predicate']} {edge['object_canonical']}"
+    conn.execute(
+        "INSERT OR REPLACE INTO edge_embeddings(edge_text,vector_json,model,dim) "
+        "VALUES (?,?,?,?)",
+        (text, json.dumps(vector), model, dim),
+    )
+
+
+def test_augmented_context_declares_graph_facts_contract():
+    ctx = AugmentedContext()
+    assert ctx.graph_facts == []
+    assert "graph_facts" in {field.name for field in dataclasses.fields(ctx)}
+    assert dataclasses.asdict(ctx)["graph_facts"] == []
+
+
+def test_entity_and_predicate_candidate_caps_do_not_pretruncate_shared_ranker(hy, cfg):
+    for index in range(4):
+        seed_edge(hy.conn, "project", "uses", f"tool_{index}")
+    uncapped_after_scoring = dataclasses.replace(
+        cfg,
+        graph_top_k=4,
+        graph_top_k_per_entity=1,
+        graph_predicate_top_k=1,
+    )
+    by_entity = _graph_lookup(
+        hy.conn, uncapped_after_scoring, "project", ["project"], {}, frozenset()
+    )
+    by_predicate = _graph_lookup(
+        hy.conn, uncapped_after_scoring, "what tools do we use", [], {},
+        frozenset({"uses"}),
+    )
+    assert len(by_entity) == 4
+    assert len(by_predicate) == 4
+
+
+def test_semantic_candidate_cap_cannot_hide_final_confidence_recency_winner(hy, cfg):
+    seed_edge(hy.conn, "nearest_old", "part_of", "archive", days_ago=400)
+    seed_edge(hy.conn, "strong_recent", "part_of", "platform", pos=100)
+    rows = hy.conn.execute(
+        "SELECT id,subject_canonical FROM knowledge_graph"
+    ).fetchall()
+    ids = {row["subject_canonical"]: int(row["id"]) for row in rows}
+    _store_edge_vector(hy.conn, ids["nearest_old"], [1.0, 0.0])
+    _store_edge_vector(hy.conn, ids["strong_recent"], [0.8, 0.6])
+    embedder = _MappingEmbedder()
+    facts = _graph_lookup(
+        hy.conn,
+        dataclasses.replace(cfg, graph_semantic_top_k=1, graph_top_k=1),
+        "unanchored semantic query", [], {}, frozenset(),
+        embedding_client=embedder,
+    )
+    assert facts[0].subject == "strong_recent"
+    assert len(embedder.calls) == 1
+
+
+def test_routed_semantic_evidence_is_additive_not_a_penalty(hy, cfg):
+    seed_edge(hy.conn, "alpha_relevant", "uses", "redis")
+    seed_edge(hy.conn, "beta_unembedded", "uses", "redis")
+    edge_id = int(hy.conn.execute(
+        "SELECT id FROM knowledge_graph WHERE subject_canonical='alpha_relevant'"
+    ).fetchone()[0])
+    _store_edge_vector(hy.conn, edge_id, [0.9, math.sqrt(1.0 - 0.9**2)])
+    facts = _graph_lookup(
+        hy.conn, dataclasses.replace(cfg, graph_top_k=1),
+        "what do we use", [], {}, frozenset({"uses"}),
+        embedding_client=_MappingEmbedder(),
+    )
+    assert facts[0].subject == "alpha_relevant"
+    assert any(chip.startswith("score:semantic(+") for chip in facts[0].why_retrieved)
+
+
+def test_python_semantic_scan_does_not_prelimit_by_recency(hy):
+    seed_edge(hy.conn, "recent_noise", "part_of", "noise")
+    seed_edge(hy.conn, "old_target", "part_of", "target", days_ago=400)
+    rows = hy.conn.execute(
+        "SELECT id,subject_canonical FROM knowledge_graph"
+    ).fetchall()
+    ids = {row["subject_canonical"]: int(row["id"]) for row in rows}
+    _store_edge_vector(hy.conn, ids["recent_noise"], [0.0, 1.0])
+    _store_edge_vector(hy.conn, ids["old_target"], [1.0, 0.0])
+    hits = _python_cosine_edge_search(
+        hy.conn, _MappingEmbedder(), "target query", top_k=1, max_scan=1
+    )
+    assert hits == [(ids["old_target"], pytest.approx(1.0))]
+
+
+def test_edge_lookup_filters_wrong_model_and_fetch_refreshes_it(hy):
+    seed_edge(hy.conn, "service", "uses", "redis")
+    edge_id = int(hy.conn.execute("SELECT id FROM knowledge_graph").fetchone()[0])
+    _store_edge_vector(hy.conn, edge_id, [1.0, 0.0], model="old-model")
+    embedder = _MappingEmbedder()
+    assert _python_cosine_edge_search(
+        hy.conn, embedder, "service", top_k=5, max_scan=5
+    ) == []
+    pending = fetch_edge_embeddings(hy.conn, embedder)
+    assert pending is not None
+    assert pending.new_text_vectors == {"service uses redis": [1.0, 0.0]}
+
+
+def test_matching_metadata_with_corrupt_vector_is_refreshed(hy):
+    seed_edge(hy.conn, "service", "uses", "redis")
+    edge_id = int(hy.conn.execute("SELECT id FROM knowledge_graph").fetchone()[0])
+    _store_edge_vector(hy.conn, edge_id, [float("nan"), 0.0])
+    pending = fetch_edge_embeddings(hy.conn, _MappingEmbedder())
+    assert pending is not None
+    assert pending.new_text_vectors == {"service uses redis": [1.0, 0.0]}
+
+
+def test_malformed_packed_edge_vector_fails_closed_and_refreshes(hy):
+    seed_edge(hy.conn, "service", "uses", "redis")
+    edge_id = int(hy.conn.execute("SELECT id FROM knowledge_graph").fetchone()[0])
+    edge_text = "service uses redis"
+    hy.conn.execute(
+        "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+        "VALUES (?,?,?,2)",
+        (edge_text, "b64f32:notbase64", "mapping-v1"),
+    )
+    embedder = _MappingEmbedder()
+    assert _python_cosine_edge_search(
+        hy.conn, embedder, "service", top_k=5, max_scan=5
+    ) == []
+    pending = fetch_edge_embeddings(hy.conn, embedder)
+    assert pending is not None
+    assert pending.new_text_vectors == {edge_text: [1.0, 0.0]}
+
+
+def test_vec_edge_backfill_rejects_non_sequence_json(hy_with_embed):
+    seed_edge(hy_with_embed.conn, "service", "uses", "redis")
+    edge_id = int(hy_with_embed.conn.execute(
+        "SELECT id FROM knowledge_graph"
+    ).fetchone()[0])
+    hy_with_embed.conn.execute(
+        "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+        "VALUES ('service uses redis', ?, 'mapping-v1', 2)",
+        (json.dumps({"0": 1.0, "1": 0.0}),),
+    )
+    core_db.ensure_vec_table(hy_with_embed.conn, 2)
+    if core_db.has_vec_table(hy_with_embed.conn, table="vec_edges"):
+        assert hy_with_embed.conn.execute(
+            "SELECT COUNT(*) FROM vec_edges WHERE rowid=?", (edge_id,)
+        ).fetchone()[0] == 0
+
+
+def test_nonpositive_and_nonfinite_cosines_are_not_semantic_evidence(hy, cfg):
+    seed_edge(hy.conn, "opposite", "part_of", "x")
+    seed_edge(hy.conn, "malformed", "part_of", "y")
+    rows = hy.conn.execute(
+        "SELECT id,subject_canonical FROM knowledge_graph"
+    ).fetchall()
+    ids = {row["subject_canonical"]: int(row["id"]) for row in rows}
+    _store_edge_vector(hy.conn, ids["opposite"], [-1.0, 0.0])
+    _store_edge_vector(hy.conn, ids["malformed"], [float("nan"), 0.0])
+    assert _semantic_edge_hits(
+        hy.conn, cfg, _MappingEmbedder(), "query"
+    ) == []
+    facts = _graph_lookup(
+        hy.conn, cfg, "query", [], {}, frozenset(),
+        embedding_client=_MappingEmbedder(),
+    )
+    assert facts
+    assert all(math.isfinite(fact.score) for fact in facts)
+    assert all(
+        not any(chip.startswith("semantic_") for chip in fact.why_retrieved)
+        for fact in facts
+    )
+
+
+def test_stale_sqlite_vec_hit_cannot_crowd_out_live_durable_hit(
+    hy_with_embed, monkeypatch
+):
+    seed_edge(hy_with_embed.conn, "stale", "part_of", "old", status="retracted")
+    seed_edge(hy_with_embed.conn, "live_target", "part_of", "current")
+    rows = hy_with_embed.conn.execute(
+        "SELECT id,subject_canonical FROM knowledge_graph"
+    ).fetchall()
+    ids = {row["subject_canonical"]: int(row["id"]) for row in rows}
+    _store_edge_vector(hy_with_embed.conn, ids["stale"], [1.0, 0.0])
+    _store_edge_vector(hy_with_embed.conn, ids["live_target"], [1.0, 0.0])
+    core_db.ensure_vec_table(hy_with_embed.conn, 2)
+    monkeypatch.setattr(
+        core_db, "vec_search",
+        lambda conn, query_vector, top_k, table="vec_edges": [(ids["stale"], 0.0)],
+    )
+    hits = _semantic_edge_hits(
+        hy_with_embed.conn,
+        dataclasses.replace(hy_with_embed.config, graph_semantic_top_k=1),
+        _MappingEmbedder(),
+        "query",
+    )
+    assert hits == [(ids["live_target"], pytest.approx(1.0))]
+
+
+@pytest.mark.parametrize("half_life", [0.0, -30.0, float("nan")])
+def test_invalid_graph_half_life_never_crashes_or_amplifies_old_edges(
+    hy, cfg, half_life
+):
+    seed_edge(hy.conn, "fresh", "part_of", "x")
+    seed_edge(hy.conn, "old", "part_of", "y", days_ago=400)
+    facts = _graph_lookup(
+        hy.conn,
+        dataclasses.replace(cfg, graph_recency_half_life_days=half_life),
+        "generic", [], {}, frozenset(),
+    )
+    scores = {fact.subject: fact.score for fact in facts}
+    assert all(math.isfinite(score) and score >= 0.0 for score in scores.values())
+    assert scores["old"] <= scores["fresh"]
+
+
+@pytest.mark.parametrize(
+    "invalid_limit", [True, 1.5, float("nan"), float("inf"), "3"]
+)
+def test_invalid_graph_top_k_disables_unscoped_lookup(hy, cfg, invalid_limit):
+    seed_edge(hy.conn, "service", "uses", "redis")
+    facts = _graph_lookup(
+        hy.conn, dataclasses.replace(cfg, graph_top_k=invalid_limit),
+        "service", ["service"], {}, frozenset(),
+    )
+    assert facts == []
+
+
+@pytest.mark.parametrize("recent_days", [float("nan"), float("inf"), -1.0])
+def test_invalid_recent_days_omits_reason_without_corrupting_score(
+    hy, cfg, recent_days
+):
+    seed_edge(hy.conn, "service", "uses", "redis")
+    [fact] = _graph_lookup(
+        hy.conn, dataclasses.replace(cfg, graph_recency_recent_days=recent_days),
+        "service", ["service"], {}, frozenset(),
+    )
+    assert math.isfinite(fact.score)
+    assert not any(chip.startswith("recency_") for chip in fact.why_retrieved)
+
+
+def test_unscoped_natural_tie_break_ignores_surrogate_edge_ids(tmp_path, stub_llm):
+    from hymem import HyMem, HyMemConfig
+
+    winners = []
+    for label, subjects in (
+        ("forward", ("alpha", "beta")),
+        ("reverse", ("beta", "alpha")),
+    ):
+        local = HyMem(
+            dataclasses.replace(HyMemConfig(root=tmp_path / label), graph_top_k=1),
+            llm=stub_llm,
+        )
+        try:
+            for subject in subjects:
+                seed_edge(local.conn, subject, "part_of", "platform")
+            winners.append(local.augment("generic").graph_facts[0].subject)
+        finally:
+            local.close()
+    assert winners == ["alpha", "alpha"]
+
+
+def test_corrupt_canonical_proof_suppresses_unscoped_fact(hy_with_embed):
+    _dream_with_edges(hy_with_embed)
+    message_id = int(hy_with_embed.conn.execute(
+        "SELECT source_message_id FROM kg_evidence "
+        "WHERE provenance_status='canonical' LIMIT 1"
+    ).fetchone()[0])
+    for row in hy_with_embed.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' "
+        "AND tbl_name='message_retention_coverage'"
+    ).fetchall():
+        hy_with_embed.conn.execute(f'DROP TRIGGER "{row[0]}"')
+    hy_with_embed.conn.execute(
+        "UPDATE message_retention_coverage SET message_content_hash=? "
+        "WHERE message_id=?", ("0" * 64, message_id),
+    )
+    assert hy_with_embed.augment("backend uses fast_api").graph_facts == []
+
+
+def test_malformed_global_lifecycle_cannot_emit_citationless_current_fact(
+    hy_with_embed,
+):
+    _dream_with_edges(hy_with_embed)
+    evidence = hy_with_embed.conn.execute(
+        "SELECT id,edge_id FROM kg_evidence WHERE polarity=1 LIMIT 1"
+    ).fetchone()
+    hy_with_embed.conn.execute("DROP TRIGGER kg_edge_lifecycle_insert_guard")
+    hy_with_embed.conn.execute(
+        "INSERT INTO kg_edge_lifecycle(edge_id,event_key,event_kind,direction,"
+        "event_at,source_evidence_id,dependency_count) VALUES "
+        "(?, 'malformed-global', 'claim_assertion', 1, 'not-a-time', ?, 0)",
+        (evidence["edge_id"], evidence["id"]),
+    )
+    facts = hy_with_embed.augment("backend uses fast_api").graph_facts
+    assert all(fact.edge_id != evidence["edge_id"] for fact in facts)
+
+
+def test_native_materialized_edge_is_explicitly_labeled_compatibility(hy):
+    seed_edge(hy.conn, "native", "uses", "sqlite")
+    [fact] = hy.augment("native").graph_facts
+    assert fact.citations == []
+    assert "compat:materialized_native" in fact.why_retrieved
 
 
 def test_recency_weight_math():

@@ -1,10 +1,9 @@
-"""Tests for speaker-weighted evidence (improv item D).
+"""Tests for exact-source speaker-weighted evidence (improv item D).
 
-A positive triple's `pos_evidence` bump is weighted by the role of the chunk's
-first message. The chunker prefixes a user turn with the preceding assistant
-turn, so assistant-prefixed chunks (the common case) keep weight 1, while a
-user-opened chunk — an unprompted assertion — counts double. The role is also
-recorded in `kg_evidence.source_role`.
+Evidence weight follows the role of the message cited by the extracted claim,
+not the first message in a mixed-role chunk.  Thus a USER assertion still gets
+USER weight when an ASSISTANT context turn precedes it.  The cited role is also
+recorded in ``kg_evidence.source_role``.
 """
 
 from __future__ import annotations
@@ -55,9 +54,8 @@ def test_user_opened_chunk_doubles_pos_evidence(cfg):
         hy.close()
 
 
-def test_assistant_prefixed_chunk_keeps_weight_one(cfg):
-    """An assistant turn precedes the user turn → first message is assistant →
-    weight 1 (unchanged from the historical +1)."""
+def test_assistant_context_does_not_steal_user_claim_weight(cfg):
+    """A preceding assistant turn cannot become the user's claim speaker."""
     hy = _dream_single_use_triple(
         cfg,
         [
@@ -68,8 +66,8 @@ def test_assistant_prefixed_chunk_keeps_weight_one(cfg):
     )
     try:
         pos, role = _edge(hy, "redis")
-        assert pos["pos_evidence"] == 1
-        assert role["source_role"] == "assistant"
+        assert pos["pos_evidence"] == 2
+        assert role["source_role"] == "user"
     finally:
         hy.close()
 

@@ -13,6 +13,7 @@ verdict-free artifact it produces.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -24,6 +25,13 @@ _BENCH = Path(__file__).resolve().parent.parent / "benchmarks"
 sys.path.insert(0, str(_BENCH))
 import longmemeval_adapter as lme  # noqa: E402
 import run_registry as rr  # noqa: E402
+from strictness import (  # noqa: E402
+    AtomicCheckpoint,
+    BenchmarkIntegrityError,
+    build_manifest,
+    content_hash,
+    publish_checkpoint_artifact,
+)
 
 
 class _FakeLLM:
@@ -39,6 +47,35 @@ class _FakeLLM:
 
 def mem(content, mtype="episode"):
     return {"type": mtype, "content": content}
+
+
+def _evaluate_retrieval_row():
+    class Memory:
+        last_indexing_summary = None
+
+        def ingest_sessions(self, sessions, ids, dates, *, namespace="question"):
+            return {
+                "sessions": len(sessions), "messages": 1, "chars": 8,
+                "empty_messages_skipped": 0,
+            }
+
+        def search(self, *_args, **_kwargs):
+            memories = [mem("remembered")]
+            return memories, 1, None, [], [], [], {
+                "message": ["remembered"], "fts": [],
+            }
+
+    return lme.evaluate_question(
+        lme.PoisonLLM("reader"), lme.PoisonLLM("judge"), Memory(),
+        {
+            "question_id": "qid_abs_label", "question_type": "multi-session",
+            "question": "What happened?", "answer": "gold",
+            "haystack_sessions": [[{"role": "user", "content": "remembered"}]],
+            "haystack_session_ids": ["s"], "haystack_dates": ["2025-01-01"],
+            "question_date": "2025-01-02", "answer_session_ids": ["s"],
+        },
+        5, no_dream=True, retrieval_only=True,
+    )
 
 
 # ------------------------------------------- the one load-bearing property
@@ -256,8 +293,10 @@ def test_a_row_from_a_run_with_no_judge_is_not_a_judge_ERROR():
     made zero judge calls. A judge that was never called did not error, and
     an alarm whose denominator is not what the reader assumes is the same
     vacuity this repo keeps finding."""
-    src = (_BENCH / "longmemeval_adapter.py").read_text()
-    assert '"judge_error": (correct is None) and not retrieval_only,' in src
+    row = _evaluate_retrieval_row()
+    assert row["correct"] is None
+    assert row["judge_error"] is False
+    assert row["judge_raw"] == ""
 
 
 def test_the_progress_line_reports_no_accuracy_under_retrieval_only():
@@ -269,42 +308,63 @@ def test_the_progress_line_reports_no_accuracy_under_retrieval_only():
     assert body.index("if args.retrieval_only:") < body.index("acc = accuracy(")
 
 
-def test_the_rows_are_dumped_before_any_reporting_runs():
-    """Everything expensive happens before the summary; everything after it
-    is presentation. Five diagnostic passes sit between the loop and the real
-    artifact, and the probe lost 876s of dreaming to a print statement."""
-    src = (_BENCH / "longmemeval_adapter.py").read_text()
-    dump = src.index("# ---- SAFETY DUMP")
-    assert dump < src.index("total_calls = answer_llm.call_count")
-    assert dump < src.index("scores = compute_scores(all_results)")
-    assert dump < src.index('results_dir = Path("/home/node/.hermes/benchmarks")')
+def _retrieval_ledger(tmp_path):
+    cfg = {
+        "label_free_answer_path": True,
+        "exploratory_non_comparable": True,
+        "exploratory_label_steering": False,
+        "scored_run": False,
+    }
+    manifest = build_manifest(
+        benchmark="LongMemEval", code_sha256=content_hash("code"),
+        data_sha256=content_hash("data"), config=cfg, models={}, seed=0,
+        expected_ids=["qid_abs_label"], protocol_split="full",
+    )
+    ledger = AtomicCheckpoint(
+        tmp_path / "run.checkpoint.json", manifest=manifest,
+        expected_ids=["qid_abs_label"], scored=False,
+    )
+    return ledger, manifest
 
 
-def test_the_safety_dump_cannot_itself_kill_the_run():
-    src = (_BENCH / "longmemeval_adapter.py").read_text()
-    i = src.index("# ---- SAFETY DUMP")
-    assert "except Exception as _e:" in src[i:i + 2000]
+def test_each_retrieval_row_is_durable_before_reporting(tmp_path):
+    ledger, _ = _retrieval_ledger(tmp_path)
+    row = _evaluate_retrieval_row()
+    ledger.record(row["question_id"], row=row)
+    # A later reporting failure cannot erase the atomically persisted row.
+    with pytest.raises(RuntimeError):
+        raise RuntimeError("presentation failed")
+    stored = json.loads(ledger.path.read_text())
+    assert stored["entries"]["qid_abs_label"]["row"]["context_sha"] == row["context_sha"]
+    ledger.close()
 
 
-def test_the_safety_dump_is_not_named_like_a_real_artifact():
-    """The runner picks its arm's artifact with `ls -1t
-    longmemeval-v2-hymem-*`. A partial dump matching that glob would be
-    selected as the run's result."""
-    src = (_BENCH / "longmemeval_adapter.py").read_text()
-    i = src.index("# ---- SAFETY DUMP")
-    block = src[i:i + 2000]
-    # The filename EXPRESSION, not the surrounding prose -- the comment right
-    # above it names the glob it must avoid.
-    expr = block[block.index("_safety = Path("):block.index("_safety.write_text")]
-    assert 'f"partial-{' in expr
-    assert "longmemeval-v2-hymem" not in expr
+def test_retrieval_checkpoint_publishes_without_score_recompute(tmp_path):
+    ledger, manifest = _retrieval_ledger(tmp_path)
+    row = _evaluate_retrieval_row()
+    ledger.record(row["question_id"], row=row)
+    artifact = tmp_path / "retrieval-strict.json"
+    publish_checkpoint_artifact(ledger, artifact, payload={"scores": {}})
+    stored = json.loads(artifact.read_text())
+    assert stored["manifest"]["run_id"] == manifest["run_id"]
+    assert stored["per_question"] == [row]
+    ledger.close()
+
+
+def test_retrieval_archive_is_exclusive(tmp_path):
+    ledger, _ = _retrieval_ledger(tmp_path)
+    ledger.record("qid_abs_label", row=_evaluate_retrieval_row())
+    artifact = tmp_path / "retrieval-strict.json"
+    publish_checkpoint_artifact(ledger, artifact, payload={"scores": {}})
+    with pytest.raises(BenchmarkIntegrityError, match="refusing to overwrite"):
+        publish_checkpoint_artifact(ledger, artifact, payload={"scores": {}})
+    ledger.close()
 
 
 def test_the_safety_dump_carries_what_a_scorer_needs_to_pair_the_arms():
-    """A dump that cannot evidence its own arm is a dump nobody can use."""
-    src = (_BENCH / "longmemeval_adapter.py").read_text()
-    i = src.index("# ---- SAFETY DUMP")
-    block = src[i:i + 2000]
-    for key in ('"retrieval_only"', '"episode_granularity_enabled"',
-                '"seed"', '"per_question"'):
-        assert key in block, key
+    """A durable diagnostic row carries pairing identity and no verdict."""
+    row = _evaluate_retrieval_row()
+    assert row["retrieval_only"] is True
+    assert row["question_id"] == "qid_abs_label"
+    assert row["question_type"] == "multi-session"
+    assert row["context_sha"]

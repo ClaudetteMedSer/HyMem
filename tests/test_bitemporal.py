@@ -9,6 +9,7 @@ back to transaction time. See hymem/dreaming/bitemporal.py.
 
 from __future__ import annotations
 
+from hymem.core import db as core_db
 from hymem.dreaming import bitemporal
 
 
@@ -49,10 +50,11 @@ def _seed_edge(conn, subject: str, predicate: str, obj: str, *,
 
 
 def _seed_evidence(conn, edge_id: int, chunk_id: str, polarity: int) -> None:
-    conn.execute(
-        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, ?, ?)",
-        (edge_id, chunk_id, polarity),
-    )
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, ?, ?)",
+            (edge_id, chunk_id, polarity),
+        )
 
 
 def _edge(conn, edge_id: int):
@@ -77,7 +79,7 @@ def test_stamp_validity_uses_positive_evidence_world_date(hy):
 
     assert n == 1
     # World date (message created_at), NOT the later transaction-time first_seen.
-    assert _edge(conn, eid)["valid_at"] == "2024-03-15 09:00:00"
+    assert _edge(conn, eid)["valid_at"] == "2024-03-15T09:00:00.000Z"
 
 
 def test_stamp_validity_takes_earliest_positive_evidence(hy):
@@ -94,7 +96,7 @@ def test_stamp_validity_takes_earliest_positive_evidence(hy):
     bitemporal.stamp_validity(conn)
 
     # Earliest of the two positive-evidence dates.
-    assert _edge(conn, eid)["valid_at"] == "2024-02-01 00:00:00"
+    assert _edge(conn, eid)["valid_at"] == "2024-02-01T00:00:00.000Z"
 
 
 def test_stamp_validity_falls_back_to_first_seen_without_evidence(hy):
@@ -118,7 +120,7 @@ def test_stamp_validity_is_write_once_idempotent(hy):
     assert bitemporal.stamp_validity(conn) == 1
     # Second run touches nothing (only NULL valid_at rows are stamped).
     assert bitemporal.stamp_validity(conn) == 0
-    assert _edge(conn, eid)["valid_at"] == "2024-03-15 09:00:00"
+    assert _edge(conn, eid)["valid_at"] == "2024-03-15T09:00:00.000Z"
 
 
 # --- invalid_at: closed on supersession ------------------------------------
@@ -138,7 +140,7 @@ def test_stamp_invalidation_uses_newest_negative_evidence(hy):
     bitemporal.stamp_invalidation(conn, [eid])
 
     # Newest contradicting-evidence world date = when the fact stopped holding.
-    assert _edge(conn, eid)["invalid_at"] == "2024-09-15 00:00:00"
+    assert _edge(conn, eid)["invalid_at"] == "2024-09-15T00:00:00.000Z"
 
 
 def test_stamp_invalidation_falls_back_to_now_without_dated_evidence(hy):
@@ -248,11 +250,8 @@ def test_negative_reassert_does_not_clear_invalid_at(hy):
     assert row["invalid_at"] == "2024-05-01 00:00:00"
 
 
-def test_reinforce_heals_active_with_stale_invalid_at(hy):
-    """phase3.reinforce bumps positive evidence on active rows; a row that is
-    active-with-stale-invalid_at must be healed there too, not re-bumped into
-    guaranteed invisibility. (Box evidence: edge 1872 was re-reinforced at
-    18:12:59 while corrupted.)"""
+def test_reinforce_ignores_active_row_with_closed_valid_interval(hy):
+    """A closed interval wins over a stale status flag in background reads."""
     conn = hy.conn
     _seed_session(conn)
     _seed_message(conn, 10, "2024-03-15 09:00:00")
@@ -271,7 +270,7 @@ def test_reinforce_heals_active_with_stale_invalid_at(hy):
     phase3.reinforce(conn, hy.config)
 
     row = _edge(conn, eid)
-    assert row["invalid_at"] is None
+    assert row["invalid_at"] == "2024-05-01 00:00:00"
 
 
 # --- end-to-end through the public retraction API --------------------------

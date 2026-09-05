@@ -107,16 +107,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hymem.config import HyMemConfig  # noqa: E402
 from hymem.core import db as core_db  # noqa: E402
-from hymem.dreaming.chunks import (  # noqa: E402
-    extract_baseline_chunks,
-    extract_fallback_chunk,
-    extract_high_salience_chunks,
-    persist_chunks,
-)
 from hymem.dreaming.digest import (  # noqa: E402
     EPISODE_GRANULAR_PROMPT_VERSION,
     extract_session_digest,
 )
+from hymem.dreaming.lossless import materialize_message_coverage  # noqa: E402
 from hymem.extraction.llm import LLMRequest  # noqa: E402
 
 # NOTE on imports: everything above is pure HyMem and pulls in no network stack.
@@ -302,7 +297,7 @@ def sim_backend(system: str, user: str) -> str:
     concreteness numbers are ARTIFACTS of the chunker and must never be read as
     evidence about the prompt.
     """
-    chunk_ids = re.findall(r"\[chunk (chk_[0-9a-f]+)\]", user)
+    chunk_ids = re.findall(r"\[chunk (msgcov_[0-9a-f]+)\]", user)
     episodes = [
         {
             "title": f"Sim episode {i + 1}",
@@ -318,16 +313,12 @@ def sim_backend(system: str, user: str) -> str:
 
 
 def build_store(path: Path, entries: list[dict], cfg: HyMemConfig):
-    """Ingest the selected sessions into a real HyMem store and chunk them.
+    """Ingest sessions and build production's exact lossless digest stream.
 
-    Chunking is LLM-free (regex salience tier + a length-based baseline backstop
-    + the short-session fallback), so the digest input this probe scores is the
-    one production builds — same `[chunk chk_...]` tagging, same `---` joins,
-    same `dream_digest_max_chars` truncation. The one honest approximation: the
-    runner spends a per-dream chunk budget across sessions and this ingests each
-    session's tiers in full, so a very long session is chunked here slightly more
-    completely than one dream would manage. That biases toward MORE input, never
-    less, and the digest's own char cap binds either way.
+    The probe uses the same canonical per-message artifacts and bounded v38
+    framing as the runner.  One probe extraction is still one production slice;
+    oversized-session continuation is measured by the pipeline tests rather
+    than silently replacing the actual input with a salience approximation.
     """
     conn = core_db.connect(path)
     core_db.initialize(conn)
@@ -347,21 +338,7 @@ def build_store(path: Path, entries: list[dict], cfg: HyMemConfig):
                 "INSERT INTO messages(session_id, role, content) VALUES (?,?,?)",
                 (sid, role, content),
             )
-        chunks = extract_high_salience_chunks(
-            conn, sid, min_chars=cfg.salience_min_chars)
-        seen = {c.id for c in chunks}
-        chunks += [
-            c for c in extract_baseline_chunks(
-                conn, sid, prompt_version=cfg.prompt_version,
-                limit=cfg.dream_baseline_budget, min_chars=cfg.salience_min_chars)
-            if c.id not in seen
-        ]
-        if not chunks:
-            fallback = extract_fallback_chunk(
-                conn, sid, max_chars=cfg.dream_digest_max_chars)
-            chunks = [fallback] if fallback is not None else []
-        if chunks:
-            persist_chunks(conn, chunks)
+        materialize_message_coverage(conn, sid)
     conn.commit()
     return conn
 

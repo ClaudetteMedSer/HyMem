@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 import dataclasses
+import sqlite3
 
+import pytest
+
+from hymem.core import db as core_db
+from hymem.dreaming.message_coverage import (
+    LOSSLESS_COVERAGE_VERSION,
+    coverage_chunk_id,
+    encode_message_record,
+    record_message_coverage,
+    release_message_coverage,
+)
 from hymem.dreaming.retention import (
     prune_bookkeeping,
+    prune_chunks,
     prune_episodes_and_procedures,
     prune_messages,
     prune_retracted_edges,
@@ -11,50 +23,383 @@ from hymem.dreaming.retention import (
 from tests.conftest import seed_edge
 
 
-def _session(conn, sid: str, *, days_ago: int, summary: str | None) -> None:
+def _session(
+    conn,
+    sid: str,
+    *,
+    days_ago: int,
+    summary: str | None,
+    ended: bool = False,
+) -> None:
     conn.execute(
-        "INSERT INTO sessions(id, started_at, summary) "
-        "VALUES (?, datetime('now', ?), ?)",
-        (sid, f"-{days_ago} days", summary),
+        "INSERT INTO sessions(id, started_at, ended_at, summary) "
+        "VALUES (?, datetime('now', ?), CASE WHEN ? THEN CURRENT_TIMESTAMP END, ?)",
+        (sid, f"-{days_ago} days", ended, summary),
     )
 
 
-def _message(conn, sid: str, text: str) -> None:
+def _message(conn, sid: str, text: str, *, days_ago: int = 0) -> int:
+    cur = conn.execute(
+        "INSERT INTO messages(session_id, role, content, created_at) "
+        "VALUES (?, 'user', ?, datetime('now', ?))",
+        (sid, text, f"-{days_ago} days"),
+    )
+    return int(cur.lastrowid)
+
+
+def _cover(conn, sid: str, message_id: int, text: str) -> str:
+    chunk_id = f"coverage_{message_id}"
+    record = encode_message_record(
+        message_id=message_id,
+        role="user",
+        content=text,
+    )
     conn.execute(
-        "INSERT INTO messages(session_id, role, content) VALUES (?, 'user', ?)",
-        (sid, text),
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES (?, ?, ?, ?, 'lossless', ?)",
+        (chunk_id, sid, message_id, message_id, record),
+    )
+    record_message_coverage(
+        conn,
+        message_id=message_id,
+        chunk_id=chunk_id,
+        coverage_version="test-lossless-v1",
+    )
+    return chunk_id
+
+
+# --- Item A: safe, explicit raw-message pruning ---
+
+
+@pytest.mark.parametrize("disabled_days", [0, -1])
+def test_prune_messages_disabled_by_default_and_for_nonpositive_values(
+    hy, cfg, disabled_days
+):
+    assert cfg.message_retention_days == 0
+    conn = hy.conn
+    _session(conn, "ended", days_ago=200, summary="summary", ended=True)
+    message_id = _message(conn, "ended", "keep by default", days_ago=200)
+    _cover(conn, "ended", message_id, "keep by default")
+
+    disabled = dataclasses.replace(cfg, message_retention_days=disabled_days)
+    assert prune_messages(conn, disabled) == 0
+    assert conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"] == 1
+
+
+def test_prune_messages_old_active_session_keeps_old_and_fresh_messages(hy, cfg):
+    conn = hy.conn
+    enabled = dataclasses.replace(cfg, message_retention_days=90)
+    _session(conn, "active", days_ago=200, summary="summary", ended=False)
+    old_id = _message(conn, "active", "old but session active", days_ago=150)
+    fresh_id = _message(conn, "active", "fresh active tail", days_ago=0)
+    _cover(conn, "active", old_id, "old but session active")
+    _cover(conn, "active", fresh_id, "fresh active tail")
+
+    assert prune_messages(conn, enabled) == 0
+    assert {
+        row["id"] for row in conn.execute("SELECT id FROM messages").fetchall()
+    } == {old_id, fresh_id}
+
+
+def test_prune_messages_uses_each_message_date_in_an_ended_session(hy, cfg):
+    conn = hy.conn
+    enabled = dataclasses.replace(cfg, message_retention_days=90)
+    _session(conn, "ended", days_ago=200, summary=None, ended=True)
+    old_id = _message(conn, "ended", "old covered turn", days_ago=150)
+    fresh_id = _message(conn, "ended", "fresh covered turn", days_ago=1)
+    _cover(conn, "ended", old_id, "old covered turn")
+    _cover(conn, "ended", fresh_id, "fresh covered turn")
+
+    assert prune_messages(conn, enabled) == 1
+    remaining = conn.execute("SELECT id FROM messages").fetchall()
+    assert [row["id"] for row in remaining] == [fresh_id]
+
+
+def test_prune_messages_summary_and_digest_are_not_lossless_coverage(hy, cfg):
+    conn = hy.conn
+    enabled = dataclasses.replace(cfg, message_retention_days=90)
+    _session(conn, "summarized", days_ago=200, summary="lossy", ended=True)
+    message_id = _message(conn, "summarized", "only raw copy", days_ago=150)
+    conn.execute(
+        "UPDATE sessions SET digested_message_id = ? WHERE id = 'summarized'",
+        (message_id,),
+    )
+
+    assert prune_messages(conn, enabled) == 0
+    assert (
+        conn.execute("SELECT content FROM messages").fetchone()["content"]
+        == "only raw copy"
     )
 
 
-# --- Item A: message pruning (summary-gated) ---
-
-
-def test_prune_messages_only_old_summarized(hy, cfg):
+def test_prune_messages_rejects_a_stale_content_hash(hy, cfg):
     conn = hy.conn
-    _session(conn, "old_sum", days_ago=200, summary="did stuff")
-    _session(conn, "old_nosum", days_ago=200, summary=None)
-    _session(conn, "recent_sum", days_ago=1, summary="did stuff")
-    for sid in ("old_sum", "old_nosum", "recent_sum"):
-        _message(conn, sid, "hello")
+    enabled = dataclasses.replace(cfg, message_retention_days=90)
+    _session(conn, "ended", days_ago=200, summary=None, ended=True)
+    message_id = _message(conn, "ended", "hash-bound source", days_ago=150)
+    _cover(conn, "ended", message_id, "hash-bound source")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE message_retention_coverage SET message_content_hash = ? "
+            "WHERE message_id = ?",
+            ("0" * 64, message_id),
+        )
+    conn.execute("DROP TRIGGER message_coverage_peer_update_guard")
+    conn.execute(
+        "UPDATE message_retention_coverage SET message_content_hash = ? "
+        "WHERE message_id = ?",
+        ("0" * 64, message_id),
+    )
 
-    pruned = prune_messages(conn, cfg)
-
-    assert pruned == 1
-    remaining = {
-        r["session_id"]
-        for r in conn.execute("SELECT DISTINCT session_id FROM messages").fetchall()
-    }
-    assert remaining == {"old_nosum", "recent_sum"}
+    assert prune_messages(conn, enabled) == 0
+    assert conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"] == 1
 
 
-def test_prune_messages_noop_without_summary(hy, cfg):
-    # Mirrors the stub/no-LLM deployment: no summaries are ever written, so the
-    # summary gate makes this a no-op and nothing irreplaceable is destroyed.
+def test_prune_messages_rejects_an_unknown_hash_version(hy, cfg):
     conn = hy.conn
-    _session(conn, "old_nosum", days_ago=999, summary=None)
-    _message(conn, "old_nosum", "hello")
+    enabled = dataclasses.replace(cfg, message_retention_days=90)
+    _session(conn, "ended", days_ago=200, summary=None, ended=True)
+    message_id = _message(conn, "ended", "version-bound source", days_ago=150)
+    _cover(conn, "ended", message_id, "version-bound source")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE message_retention_coverage SET hash_version = 'obsolete-v0' "
+            "WHERE message_id = ?",
+            (message_id,),
+        )
+    conn.execute("DROP TRIGGER message_coverage_peer_update_guard")
+    conn.execute(
+        "UPDATE message_retention_coverage SET hash_version = 'obsolete-v0' "
+        "WHERE message_id = ?",
+        (message_id,),
+    )
 
-    assert prune_messages(conn, cfg) == 0
+    assert prune_messages(conn, enabled) == 0
+    assert conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"] == 1
+
+
+def test_pruned_message_artifact_and_kg_provenance_survive_next_chunk_cycle(
+    hy, cfg
+):
+    conn = hy.conn
+    enabled = dataclasses.replace(cfg, message_retention_days=90)
+    _session(conn, "ended", days_ago=200, summary=None, ended=True)
+    message_id = _message(conn, "ended", "retentionneedle source", days_ago=150)
+    source_created_at = conn.execute(
+        "SELECT created_at FROM messages WHERE id = ?", (message_id,)
+    ).fetchone()["created_at"]
+    chunk_id = _cover(conn, "ended", message_id, "retentionneedle source")
+    conn.execute(
+        "INSERT INTO temporal_mentions(message_id, session_id, raw_text) "
+        "VALUES (?, 'ended', 'retentionneedle')",
+        (message_id,),
+    )
+    seed_edge(conn, "service", "uses", "sqlite", pos=1)
+    edge_id = conn.execute(
+        "SELECT id FROM knowledge_graph WHERE subject_canonical = 'service'"
+    ).fetchone()["id"]
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, ?, 1)",
+            (edge_id, chunk_id),
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM messages_fts WHERE messages_fts MATCH 'retentionneedle'"
+    ).fetchone()["c"] == 1
+
+    assert prune_messages(conn, enabled) == 1
+
+    assert conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM messages_fts WHERE messages_fts MATCH 'retentionneedle'"
+    ).fetchone()["c"] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM temporal_mentions"
+    ).fetchone()["c"] == 0
+    coverage = conn.execute(
+        "SELECT message_id, source_session_id, source_role, source_created_at, "
+        "chunk_id FROM message_retention_coverage"
+    ).fetchone()
+    assert tuple(coverage) == (
+        message_id,
+        "ended",
+        "user",
+        source_created_at,
+        chunk_id,
+    )
+
+    # Second retention cycle: even under chunk pressure, the only remaining
+    # lossless source and its KG provenance must survive permanently.
+    conn.execute(
+        "UPDATE chunks SET created_at = datetime('now', '-200 days') WHERE id = ?",
+        (chunk_id,),
+    )
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text, created_at) VALUES "
+        "('disposable', 'ended', ?, ?, 'test', 'other', "
+        "datetime('now', '-200 days'))",
+        (message_id, message_id),
+    )
+    constrained = dataclasses.replace(cfg, max_chunks=1)
+    assert prune_chunks(conn, constrained) == 1
+
+    assert conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) AS c FROM kg_evidence").fetchone()["c"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM message_retention_coverage"
+    ).fetchone()["c"] == 1
+    edge = conn.execute(
+        "SELECT pos_evidence, neg_evidence FROM knowledge_graph WHERE id = ?",
+        (edge_id,),
+    ).fetchone()
+    assert (edge["pos_evidence"], edge["neg_evidence"]) == (1, 0)
+    with pytest.raises(sqlite3.IntegrityError, match="raw source is absent"):
+        conn.execute(
+            "DELETE FROM message_retention_coverage WHERE message_id = ?",
+            (message_id,),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="raw source is absent"):
+        conn.execute(
+            "UPDATE message_retention_coverage SET coverage_version = 'tampered' "
+            "WHERE message_id = ?",
+            (message_id,),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="covered lossless chunk"):
+        conn.execute(
+            "UPDATE chunks SET text = 'corrupted' WHERE id = ?", (chunk_id,)
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
+    with pytest.raises(RuntimeError, match="raw source is absent"):
+        release_message_coverage(
+            conn,
+            message_id=message_id,
+            chunk_id=chunk_id,
+            coverage_version="test-lossless-v1",
+        )
+
+
+@pytest.mark.parametrize(
+    "artifact_template",
+    [
+        # An exact record used only as a prefix is not a framed record.
+        "{record} plus an unrecorded suffix",
+        # Nor is the same record embedded in unrelated prose.
+        "assistant quotation begins {record} quotation ends",
+    ],
+)
+def test_record_message_coverage_rejects_prefix_and_embedded_text(
+    hy, artifact_template
+):
+    conn = hy.conn
+    _session(conn, "s", days_ago=0, summary=None)
+    message_id = _message(conn, "s", "complete source text")
+    record = encode_message_record(
+        message_id=message_id,
+        role="user",
+        content="complete source text",
+    )
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES ('ambiguous', 's', ?, ?, 'fallback', ?)",
+        (message_id, message_id, artifact_template.format(record=record)),
+    )
+
+    with pytest.raises(ValueError, match="canonical message record"):
+        record_message_coverage(
+            conn,
+            message_id=message_id,
+            chunk_id="ambiguous",
+            coverage_version="test-lossless-v1",
+        )
+
+
+def test_multiline_message_requires_and_accepts_exact_jsonl_framing(hy):
+    conn = hy.conn
+    _session(conn, "s", days_ago=0, summary=None)
+    content = "first line\nassistant: looks like another record\nthird line"
+    message_id = _message(conn, "s", content)
+    canonical = encode_message_record(
+        message_id=message_id,
+        role="user",
+        content=content,
+    )
+    assert "\n" not in canonical, "embedded newlines must be JSON escaped"
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES ('ambiguous_multiline', 's', ?, ?, "
+        "'fallback', ?)",
+        (message_id, message_id, f"user: {content}"),
+    )
+    with pytest.raises(ValueError, match="canonical message record"):
+        record_message_coverage(
+            conn,
+            message_id=message_id,
+            chunk_id="ambiguous_multiline",
+            coverage_version="test-lossless-v1",
+        )
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES ('multiline', 's', ?, ?, 'lossless', ?)",
+        (message_id, message_id, canonical),
+    )
+
+    record_message_coverage(
+        conn,
+        message_id=message_id,
+        chunk_id="multiline",
+        coverage_version="test-lossless-v1",
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM message_retention_coverage"
+    ).fetchone()["c"] == 1
+
+
+def test_reserved_ordered_version_rejects_nonproducer_artifact(hy):
+    conn = hy.conn
+    _session(conn, "reserved", days_ago=0, summary=None)
+    message_id = _message(conn, "reserved", "ordered source")
+    canonical = encode_message_record(
+        message_id=message_id, role="user", content="ordered source"
+    )
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text, chunk_kind) VALUES "
+        "('not-the-producer-id', 'reserved', ?, ?, 'caller', ?, 'extraction')",
+        (message_id, message_id, canonical),
+    )
+    with pytest.raises(ValueError, match="reserved ordered coverage"):
+        record_message_coverage(
+            conn,
+            message_id=message_id,
+            chunk_id="not-the-producer-id",
+            coverage_version=LOSSLESS_COVERAGE_VERSION,
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM message_retention_coverage"
+    ).fetchone()[0] == 0
+    assert coverage_chunk_id("reserved", message_id) != "not-the-producer-id"
+
+
+def test_explicit_coverage_release_requires_the_raw_source(hy):
+    conn = hy.conn
+    _session(conn, "s", days_ago=0, summary=None)
+    message_id = _message(conn, "s", "durable source")
+    covered_chunk = _cover(conn, "s", message_id, "durable source")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM chunks WHERE id = ?", (covered_chunk,))
+    release_message_coverage(
+        conn,
+        message_id=message_id,
+        chunk_id=covered_chunk,
+        coverage_version="test-lossless-v1",
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM message_retention_coverage"
+    ).fetchone()["c"] == 0
+    conn.execute("DELETE FROM chunks WHERE id = ?", (covered_chunk,))
     assert conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"] == 1
 
 
@@ -63,6 +408,7 @@ def test_prune_messages_noop_without_summary(hy, cfg):
 
 def test_prune_retracted_edges_cascades_evidence(hy, cfg):
     conn = hy.conn
+    enabled = dataclasses.replace(cfg, tombstone_retention_days=30)
     _session(conn, "s", days_ago=0, summary=None)
     conn.execute(
         "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
@@ -75,12 +421,13 @@ def test_prune_retracted_edges_cascades_evidence(hy, cfg):
     old_id = conn.execute(
         "SELECT id FROM knowledge_graph WHERE subject_canonical='a'"
     ).fetchone()["id"]
-    conn.execute(
-        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, 'c1', 1)",
-        (old_id,),
-    )
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, 'c1', 1)",
+            (old_id,),
+        )
 
-    pruned = prune_retracted_edges(conn, cfg)
+    pruned = prune_retracted_edges(conn, enabled)
 
     assert pruned == 1
     subs = {
@@ -92,6 +439,20 @@ def test_prune_retracted_edges_cascades_evidence(hy, cfg):
     assert (
         conn.execute("SELECT COUNT(*) AS c FROM kg_evidence").fetchone()["c"] == 0
     )
+
+
+@pytest.mark.parametrize("disabled_days", [0, -1])
+def test_prune_retracted_edges_disabled_for_nonpositive_values(
+    hy, cfg, disabled_days
+):
+    assert cfg.tombstone_retention_days == 0
+    seed_edge(hy.conn, "history", "uses", "sqlite", status="retracted", days_ago=200)
+
+    disabled = dataclasses.replace(cfg, tombstone_retention_days=disabled_days)
+    assert prune_retracted_edges(hy.conn, disabled) == 0
+    assert hy.conn.execute(
+        "SELECT COUNT(*) FROM knowledge_graph WHERE subject_canonical='history'"
+    ).fetchone()[0] == 1
 
 
 # --- Item C: bookkeeping caps ---

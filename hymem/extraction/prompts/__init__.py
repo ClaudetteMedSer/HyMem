@@ -182,7 +182,16 @@ _CHUNK_EXTRACTION_SYSTEM_TEMPLATE = """You extract structured technical relation
 Output a strict JSON OBJECT (not an array). No prose, no markdown, no code fences.
 The object has exactly these two keys:
 
-"triples": a JSON array of relationship items. Each item has exactly: subject (string), predicate (string), object (string), polarity (1 or -1).
+"triples": a JSON array of relationship items. Each item has exactly: subject
+(string), predicate (string), object (string), polarity (1 or -1), and
+source_message_id (integer).
+- The excerpt is a sequence of JSON source-message records. Copy
+  source_message_id exactly from the ONE record that directly states or
+  retracts this claim. Never invent an id and never cite surrounding context.
+- When two different records assert the same claim, emit one item per source
+  record. When different records disagree, preserve both source-specific
+  claims with their respective polarities. Never emit the same claim twice for
+  the same source_message_id.
 - Optional fields (include only when applicable):
     value_text (string): numeric value, version string, or quantity mentioned
     value_numeric (number): parsed numeric value if available
@@ -435,7 +444,9 @@ Return the JSON array now."""
 
 SESSION_DIGEST_SYSTEM = """You analyze one conversation session and produce three things in a single pass: its episodes, a one-sentence summary, and any step-by-step procedures.
 
-Each chunk in the input is tagged like `[chunk chk_abc123]` — the chunk id appears in square brackets before its text.
+Each input segment is tagged like `[chunk msgcov_abc123]` — copy the exact chunk id shown in square brackets when citing it.
+
+Text labeled `previous context` is boundary-only context that was already digested. It may help complete a phrase, but it must never independently authorize an episode or procedure. Every emitted episode and procedure must cite at least one chunk from the new material, not solely previous context.
 
 Output a strict JSON OBJECT (not an array) with exactly these three keys:
 
@@ -444,10 +455,10 @@ Output a strict JSON OBJECT (not an array) with exactly these three keys:
 - summary (string): 1-2 sentence narrative of what happened
 - outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear
 - key_entities (list of strings): Named tools, services, files, or concepts discussed
-- chunk_ids (list of strings): The `chk_...` ids you grouped, in conversation order. Must be non-empty and contain only ids that appear in the input.
+- chunk_ids (list of strings): The exact `msgcov_...` ids you grouped, in conversation order. Must be non-empty and contain only ids that appear in the input.
 Empty array [] is valid if there are no clear episodes.
 
-"summary": a single string — one sentence covering what was accomplished, decisions made, problems solved, topics covered. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid if there is nothing to summarize.
+"summary": a single string — an UPDATED one-sentence summary covering BOTH the prior automatic summary and the new material. Preserve earlier accomplishments, decisions, problems solved, and topics unless the new material explicitly supersedes them; add the new concrete outcome. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid only when both inputs contain nothing to summarize.
 
 "procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
 - name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
@@ -458,13 +469,19 @@ Empty array [] is valid if there are no clear episodes.
     tool (string or null): Tool/command/CLI used, if mentioned explicitly
 - triggers (list of strings): Words/phrases someone might use to ask about this procedure
 - entities_involved (list of strings): Named tools, services, platforms, files involved
+- chunk_ids (list of strings): The exact `msgcov_...` ids from NEW material that support this procedure. Must be non-empty; boundary-only previous context does not count.
 Only extract procedures that are EXPLICITLY described; do not invent them. Empty array [] is valid.
 
 Always return all three keys. Example shape:
 {"episodes": [], "summary": "", "procedures": []}
 """
 
-SESSION_DIGEST_USER_TEMPLATE = """Conversation session:
+SESSION_DIGEST_USER_TEMPLATE = """Prior automatic session summary (may be empty):
+\"\"\"
+{prior_summary}
+\"\"\"
+
+New, not-yet-digested session material (sections labeled `previous context` are boundary-only and already digested):
 \"\"\"
 {text}
 \"\"\"
@@ -509,7 +526,9 @@ Return the JSON object now."""
 # tiers fixed is what makes the probe's arms comparable.
 SESSION_DIGEST_GRANULAR_SYSTEM = """You re-read one conversation session and produce three things in a single pass: decision-grained episodes, a one-sentence summary, and any step-by-step procedures.
 
-Each chunk in the input is tagged like `[chunk chk_abc123]` — the chunk id appears in square brackets before its text.
+Each input segment is tagged like `[chunk msgcov_abc123]` — copy the exact chunk id shown in square brackets when citing it.
+
+Text labeled `previous context` is boundary-only context that was already digested. It may help complete a phrase, but it must never independently authorize an episode or procedure. Every emitted episode and procedure must cite at least one chunk from the new material, not solely previous context.
 
 THE ONLY RULE THAT MATTERS: every name, number, date, version, price and claim you write must ALREADY BE PRESENT in the chunks below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal episode is correct; a rich episode containing one invented detail is a failure. Never record an outcome that was not reached.
 
@@ -520,10 +539,10 @@ Output a strict JSON OBJECT (not an array) with exactly these three keys:
 - summary (string): 1-2 sentences saying what was decided, changed or established — and CARRYING THE CONCRETE VALUES: the names, numbers, dates, versions, file paths and error messages exactly as the chunks state them. "Pinned pandas to 2.1.4 after the 2.2 groupby regression" — not "resolved a dependency issue".
 - outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear. REQUIRED (non-null) when the session actually reached one; null is for genuinely open ends, never a hedge.
 - key_entities (list of strings): Named tools, services, files, or concepts involved, exactly as written
-- chunk_ids (list of strings): The `chk_...` ids that support THIS episode, in conversation order. Must be non-empty and contain only ids that appear in the input. Cite the narrowest set that supports it — do not attach every chunk to every episode.
+- chunk_ids (list of strings): The exact `msgcov_...` ids that support THIS episode, in conversation order. Must be non-empty and contain only ids that appear in the input. Cite the narrowest set that supports it — do not attach every chunk to every episode.
 NO QUOTA. A substantive working session usually yields 3 to 8 episodes; a session that decided one thing yields one; small talk yields []. Those numbers describe what such sessions contain, they are not a target to fill, and [] is always available to you.
 
-"summary": a single string — one sentence covering what was accomplished, decisions made, problems solved, topics covered. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid if there is nothing to summarize.
+"summary": a single string — an UPDATED one-sentence summary covering BOTH the prior automatic summary and the new material. Preserve earlier accomplishments, decisions, problems solved, and topics unless the new material explicitly supersedes them; add the new concrete outcome. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid only when both inputs contain nothing to summarize.
 
 "procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
 - name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
@@ -534,6 +553,7 @@ NO QUOTA. A substantive working session usually yields 3 to 8 episodes; a sessio
     tool (string or null): Tool/command/CLI used, if mentioned explicitly
 - triggers (list of strings): Words/phrases someone might use to ask about this procedure
 - entities_involved (list of strings): Named tools, services, platforms, files involved
+- chunk_ids (list of strings): The exact `msgcov_...` ids from NEW material that support this procedure. Must be non-empty; boundary-only previous context does not count.
 Only extract procedures that are EXPLICITLY described; do not invent them. Empty array [] is valid.
 
 Before writing each episode, check: can I point at the exact words in the chunks that state every value in it? If not, drop the value — or the episode.
@@ -547,7 +567,12 @@ Always return all three keys. Example shape:
 # substrings, so a granular call that ended with the blob closer would be
 # indistinguishable from the shipping digest in every fixture and every call
 # count that discriminates on it.
-SESSION_DIGEST_GRANULAR_USER_TEMPLATE = """Conversation session:
+SESSION_DIGEST_GRANULAR_USER_TEMPLATE = """Prior automatic session summary (may be empty):
+\"\"\"
+{prior_summary}
+\"\"\"
+
+New, not-yet-digested session material (sections labeled `previous context` are boundary-only and already digested):
 \"\"\"
 {text}
 \"\"\"
@@ -562,7 +587,7 @@ Return the granular digest JSON object now."""
 # LLM invents can never persist. Pinned by PROFILE_PROMPT_VERSION in
 # hymem/dreaming/user_profile.py — bump it when this wording changes
 # materially. The user-template closer is deliberately unique ("Return the
-# profile JSON array now.") so test stubs keyed on the digest/triple closers
+# profile JSON object now.") so test stubs keyed on the digest/triple closers
 # never route here; "typed user-profile facts" is the routing substring.
 
 USER_PROFILE_SYSTEM = """You extract typed user-profile facts from the USER's own turns in one conversation session.
@@ -574,7 +599,8 @@ THE ABOUTNESS TEST (apply it to every candidate fact): extract only durable fact
 - "Patient reports chronic back pain since 2024" in the user's clinical notes → extract NOTHING (the fact is about a patient, not the user).
 - "Repos: ClaudetteMedSer/HyMem, ClaudetteMedSer/Hermes" in a pasted dump → extract NOTHING (a GitHub org/username in technical context is not an employer, and repositories are not possessions).
 
-Output a strict JSON array. Each item has exactly:
+Output a strict JSON object with exactly one key, "items". "items" is an array;
+each item has exactly:
 - slot (string): MUST be one of:
     role: the user's job or professional role ("bedrijfsarts", "backend engineer")
     name: the user's own name
@@ -596,7 +622,7 @@ Rules:
 - Only durable facts. Skip questions, hypotheticals, one-off events, and facts about other people (except via relationship).
 - Quality over quantity: prefer a few high-confidence facts over many weak ones. When two candidate values compete for the same slot, keep only the more specific and complete one (e.g. "bedrijfsarts" over "developer" for role). Do not emit near-duplicate recurring_activity items. When in doubt, omit.
 - Turns may be in languages other than English (e.g. Dutch); extract regardless and keep the value in the original language.
-- Skip facts you are not confident about. An empty array [] is a valid answer.
+- Skip facts you are not confident about. {"items": []} is a valid answer.
 """
 
 USER_PROFILE_USER_TEMPLATE = """User turns from one session:
@@ -604,10 +630,11 @@ USER_PROFILE_USER_TEMPLATE = """User turns from one session:
 {text}
 \"\"\"
 
-Return the profile JSON array now."""
+Return the profile JSON object now."""
 
 
-# Narrative-facts extraction (E1, schema v26). This text is the VERBATIM
+# Narrative-facts extraction (E1; authoritative source/lifecycle schema v46).
+# This text is the VERBATIM
 # `FACTS_PROMPT_V2` that cleared the G-F1b extraction-faithfulness gate
 # (2026-08-02, 123/123 strict on the healed full-source sample) — moving it
 # unchanged is what carries the gate's verdict over to production, so any

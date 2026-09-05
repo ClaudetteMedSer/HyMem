@@ -51,10 +51,10 @@ def test_judge_answer_default_callers_unchanged(fixture):
 
         class Stub:
             def chat(self, messages, temperature=None, max_tokens=None):
-                return '{"scores": [0, 1], "total_score": 0.5}'
+                return '{"scores": [1], "total_score": 1.0}'
 
         res = judge_answer(Stub(), inp["question"], inp["ideal"], inp["rubric"], inp["answer"])
-        assert res == {"score": 0.5, "scores": [0, 1]}, f"{item['label']}: default shape changed"
+        assert res == {"score": 1.0, "scores": [1]}, f"{item['label']}: default shape changed"
 
 
 def test_return_raw_adds_judge_raw(fixture):
@@ -63,12 +63,12 @@ def test_return_raw_adds_judge_raw(fixture):
 
     class Stub:
         def chat(self, messages, temperature=None, max_tokens=None):
-            return '{"scores": [0, 1], "total_score": 0.5}'
+            return '{"scores": [1], "total_score": 1.0}'
 
     res = judge_answer(Stub(), inp["question"], inp["ideal"], inp["rubric"], inp["answer"],
                        return_raw=True)
-    assert res["score"] == 0.5 and res["scores"] == [0, 1]
-    assert res["judge_raw"] == '{"scores": [0, 1], "total_score": 0.5}'
+    assert res["score"] == 1.0 and res["scores"] == [1]
+    assert res["judge_raw"] == '{"scores": [1], "total_score": 1.0}'
 
 
 def test_return_raw_on_parse_failure_keeps_signature(fixture):

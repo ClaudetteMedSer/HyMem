@@ -12,6 +12,17 @@ log = logging.getLogger("hymem.extraction.markers")
 _ALLOWED_KINDS = ("correction", "preference", "rejection", "style")
 
 
+def combined_marker_item_is_valid(item: object) -> bool:
+    """Exact marker-item shape for the combined cursor-authorizing reply."""
+    return bool(
+        isinstance(item, dict)
+        and set(item) == {"kind", "statement"}
+        and item.get("kind") in _ALLOWED_KINDS
+        and isinstance(item.get("statement"), str)
+        and item["statement"].strip()
+    )
+
+
 @dataclass(frozen=True)
 class Marker:
     kind: str

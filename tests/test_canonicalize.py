@@ -34,6 +34,10 @@ def test_match_known_entities_handles_accented_tokens(hy):
 
     conn = hy.conn
     register_alias(conn, "préfère-tool", "prefere_tool")
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,"
+        "pos_evidence) VALUES ('prefere_tool','uses','tooling',1)"
+    )
     # The accented mention must tokenize whole and resolve — not shred at the
     # accent (which the old [A-Za-z] tokenizer did).
     hits = match_known_entities(conn, "do we still use préfère-tool here?")
@@ -50,8 +54,8 @@ def test_match_known_entities_filters_one_off_object_gerund(hy):
     # `working` exists only as an object in one edge — no subject usage, no
     # entity_types row, no other edges. Should be filtered.
     conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
-        "VALUES ('deepseek', 'rejects', 'working')"
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical,"
+        "pos_evidence) VALUES ('deepseek', 'rejects', 'working', 1)"
     )
     hits = match_known_entities(conn, "is anything working here")
     assert "working" not in hits
@@ -62,12 +66,12 @@ def test_match_known_entities_keeps_object_with_multiple_edges(hy):
 
     conn = hy.conn
     conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
-        "VALUES ('backend', 'uses', 'postgres')"
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical,"
+        "pos_evidence) VALUES ('backend', 'uses', 'postgres', 1)"
     )
     conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
-        "VALUES ('worker', 'uses', 'postgres')"
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical,"
+        "pos_evidence) VALUES ('worker', 'uses', 'postgres', 1)"
     )
     hits = match_known_entities(conn, "what about postgres")
     assert "postgres" in hits
@@ -78,8 +82,8 @@ def test_match_known_entities_keeps_object_with_entity_type(hy):
 
     conn = hy.conn
     conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
-        "VALUES ('backend', 'uses', 'redis')"
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical,"
+        "pos_evidence) VALUES ('backend', 'uses', 'redis', 1)"
     )
     conn.execute(
         "INSERT INTO entity_types(entity_canonical, type, confidence) "
@@ -95,12 +99,12 @@ def test_match_known_entities_keeps_object_also_used_as_subject(hy):
     conn = hy.conn
     # `medflow` appears once as object, once as subject — entity-shaped.
     conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
-        "VALUES ('atta', 'part_of', 'medflow')"
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical,"
+        "pos_evidence) VALUES ('atta', 'part_of', 'medflow', 1)"
     )
     conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
-        "VALUES ('medflow', 'uses', 'fast_api')"
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical,"
+        "pos_evidence) VALUES ('medflow', 'uses', 'fast_api', 1)"
     )
     hits = match_known_entities(conn, "tell me about medflow")
     assert "medflow" in hits

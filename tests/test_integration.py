@@ -88,21 +88,41 @@ def test_retract_after_extraction_excludes_from_augment(hy):
 
 def test_decay_then_retract_workflow(hy):
     """An edge that decayed below threshold is retracted; explicit retract is idempotent."""
-    from hymem.dreaming import phase3
+    from hymem.dreaming import evidence, phase3
 
-    # Seed an old, low-confidence edge with a recent mention to trigger decay.
+    # Persist a real negative cause plus a distinct recent mention. Mutable KG
+    # counters alone are not lifecycle authority and must never trigger a
+    # source-less retraction.
     hy.conn.execute(
         "INSERT INTO sessions(id) VALUES ('decay-sess')"
     )
     hy.conn.execute(
         "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, salience_reason, text) "
-        "VALUES ('c-decay', 'decay-sess', 1, 1, 'long_user_turn', "
+        "VALUES ('c-negative', 'decay-sess', 1, 1, 'long_user_turn', "
+        "'the api does not use fastapi')"
+    )
+    hy.conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, salience_reason, text) "
+        "VALUES ('c-decay', 'decay-sess', 2, 2, 'long_user_turn', "
         "'we redesigned the api but didnt change the database choice')"
     )
     hy.conn.execute(
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
         "pos_evidence, neg_evidence, last_reinforced) "
-        "VALUES ('api', 'uses', 'fastapi', 0, 5, datetime('now', '-90 days'))"
+        "VALUES ('api', 'uses', 'fastapi', 0, 0, datetime('now', '-90 days'))"
+    )
+    edge_id = hy.conn.execute(
+        "SELECT id FROM knowledge_graph WHERE subject_canonical='api' "
+        "AND predicate='uses' AND object_canonical='fastapi'"
+    ).fetchone()[0]
+    evidence.record_chunk_evidence(
+        hy.conn,
+        edge_id=edge_id,
+        chunk_id="c-negative",
+        evidence_kind="extraction",
+        polarity=-1,
+        evidence_weight=5,
+        weight_source="integration_fixture:5",
     )
 
     phase3.decay(hy.conn, hy.config)

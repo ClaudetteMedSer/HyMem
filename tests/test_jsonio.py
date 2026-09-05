@@ -8,10 +8,40 @@ from __future__ import annotations
 
 import pytest
 
-from hymem.extraction.jsonio import loads_lenient
+from hymem.extraction.jsonio import loads_exact_or_fenced, loads_lenient
 
 _OBJ = '{"title": "t", "summary": "s"}'
 _EXPECTED = {"title": "t", "summary": "s"}
+
+
+@pytest.mark.parametrize("raw", [
+    _OBJ,
+    f"```json\n{_OBJ}\n```",
+    f"```JSON\n{_OBJ}\n```",
+    f"```\n{_OBJ}\n```",
+])
+def test_advancement_parser_accepts_only_exact_json_or_a_whole_fence(raw):
+    assert loads_exact_or_fenced(raw) == _EXPECTED
+
+
+@pytest.mark.parametrize("raw", [
+    f"I cannot comply. {_OBJ}",
+    f"Here is an example:\n```json\n{_OBJ}\n```",
+    f"```JSON\n{_OBJ}\n```\nHope that helps!",
+])
+def test_advancement_parser_never_salvages_json_from_prose(raw):
+    assert loads_exact_or_fenced(raw) is None
+
+
+@pytest.mark.parametrize("raw", [
+    '{"triples": [], "triples": [1], "markers": []}',
+    '{"outer": {"value": 1, "value": 2}}',
+    '{"value": NaN}',
+    '{"value": Infinity}',
+    '```JSON\n{"value": -Infinity}\n```',
+])
+def test_advancement_parser_rejects_ambiguous_or_nonstandard_json(raw):
+    assert loads_exact_or_fenced(raw) is None
 
 
 @pytest.mark.parametrize("raw", [

@@ -16,6 +16,7 @@ also packs `f`), so this does not lose precision relative to the search path.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import struct
 
@@ -35,7 +36,15 @@ def decode_vector(value: str | bytes) -> list[float]:
     if isinstance(value, (bytes, bytearray)):
         value = value.decode("ascii")
     if value.startswith(_PREFIX):
-        raw = base64.b64decode(value[len(_PREFIX) :])
+        try:
+            raw = base64.b64decode(value[len(_PREFIX) :], validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("malformed packed embedding vector") from exc
+        if len(raw) % 4:
+            raise ValueError("malformed packed embedding vector length")
         n = len(raw) // 4
-        return list(struct.unpack(f"<{n}f", raw))
+        try:
+            return list(struct.unpack(f"<{n}f", raw))
+        except struct.error as exc:
+            raise ValueError("malformed packed embedding vector") from exc
     return json.loads(value)

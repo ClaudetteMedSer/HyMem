@@ -132,11 +132,9 @@ def test_dream_embed_never_inside_write_lock(cfg):
             return super().embed(texts)
 
     embed = WatchingStub()
-    # A canned extraction that yields a near-duplicate of a pre-seeded edge.
-    llm = make_routed_llm(
-        [{"subject": "app", "predicate": "uses", "object": "uv_pip", "polarity": 1}],
-        [],
-    )
+    # The exact source id is only known after the messages are written. Start
+    # with an empty valid response, then install a source-citing response below.
+    llm = make_routed_llm([], [])
     hy = HyMem(cfg, llm=llm, embedding_client=embed)
     embed.conn = hy.conn
     try:
@@ -156,13 +154,21 @@ def test_dream_embed_never_inside_write_lock(cfg):
         hy.conn.commit()
 
         hy.open_session("s1")
+        user_message_ids = []
         for _ in range(2):
             hy.log_message("s1", "assistant", "anything here for context padding")
-            hy.log_message(
+            user_message_ids.append(hy.log_message(
                 "s1", "user",
                 "I really prefer the uv_pip tool for the local dev environment overall.",
-            )
+            ))
         hy.close_session("s1")
+        hy.set_llm(make_routed_llm(
+            [{
+                "subject": "app", "predicate": "uses", "object": "uv_pip",
+                "polarity": 1, "source_message_id": user_message_ids[-1],
+            }],
+            [],
+        ))
 
         hy.dream()
 

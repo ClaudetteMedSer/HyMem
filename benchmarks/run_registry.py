@@ -280,6 +280,19 @@ def _make_table(con, spec):
         f"CREATE TABLE IF NOT EXISTS runs (\n    {', '.join(typed)}\n);\n"
         "CREATE INDEX IF NOT EXISTS idx_run_date ON runs(run_date);\n"
     )
+    # Benchmark registries are long-lived.  CREATE TABLE IF NOT EXISTS does
+    # not evolve an existing table when a newly auditable field is added, so
+    # apply a narrow additive migration for every declared column.  Names and
+    # types come from the in-repository static spec, never from run artifacts.
+    existing = {
+        row[1] for row in con.execute("PRAGMA table_info(runs)").fetchall()
+    }
+    for name, typ in spec["columns"] + [
+        ("flags_provenance", "TEXT"), ("extras", "TEXT")
+    ]:
+        if name not in existing:
+            con.execute(f"ALTER TABLE runs ADD COLUMN {name} {typ}")
+            existing.add(name)
 
 
 def connect(spec, db_path: Path | None = None) -> sqlite3.Connection:

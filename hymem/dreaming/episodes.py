@@ -6,6 +6,12 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 
+from hymem.dreaming.aggregation_provenance import (
+    BoundSourceOccurrence,
+    persist_episode_source_manifest,
+    resolve_cited_episode_sources,
+    unpublish_episode_source_manifest,
+)
 from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import EPISODE_SYSTEM, EPISODE_USER_TEMPLATE
@@ -32,7 +38,8 @@ def extract_episodes_for_session(
     held; persist via persist_episodes inside one.
     """
     rows = conn.execute(
-        "SELECT id, text FROM chunks WHERE session_id = ? ORDER BY start_message_id",
+        "SELECT id, text FROM chunks WHERE session_id = ? "
+        "AND chunk_kind = 'extraction' ORDER BY start_message_id",
         (session_id,),
     ).fetchall()
     if not rows:
@@ -77,8 +84,12 @@ def validate_episode_items(
     """Validate raw LLM episode items into clean dicts ready to persist.
 
     Shared by the standalone episode call and the batched session digest. Drops
-    items missing title/summary and strips hallucinated chunk_ids not present in
-    the input. Returns [] for any non-list ``data``.
+    items missing title/summary.  For positional compatibility the standalone
+    result still exposes only recognized chunk ids, but a private marker records
+    that a non-empty citation claim was altered. Persistence rejects that item
+    transactionally; it must never turn a hallucinated proof into an
+    unattributed episode and advance a digest cursor. Returns [] for any
+    non-list ``data``.
 
     ``max_items`` (Plan C's ``dream_max_episodes_per_session``) truncates a
     runaway reply BEFORE any row is written — the profile/facts validator
@@ -101,14 +112,21 @@ def validate_episode_items(
         if not title.strip() or not summary.strip():
             continue
         raw_chunk_ids = item.get("chunk_ids", [])
+        citations_invalid = bool(raw_chunk_ids) and not isinstance(
+            raw_chunk_ids, list
+        )
         if not isinstance(raw_chunk_ids, list):
             raw_chunk_ids = []
         # Drop anything the LLM hallucinated that isn't in the input.
         chunk_ids = [c for c in raw_chunk_ids if isinstance(c, str) and c in valid_chunk_ids]
+        if raw_chunk_ids and len(chunk_ids) != len(raw_chunk_ids):
+            citations_invalid = True
         clean = dict(item)
         clean["title"] = title.strip()
         clean["summary"] = summary.strip()
         clean["chunk_ids"] = chunk_ids
+        if citations_invalid:
+            clean["_source_citations_invalid"] = True
         items.append(clean)
     return items
 
@@ -139,23 +157,46 @@ def _resolve_participants(
     start_msg: int | None,
     end_msg: int | None,
 ) -> list[str]:
-    """Distinct, sorted roles in the message range (e.g. ['assistant', 'user']).
-    Falls back to all session roles if the range is unknown."""
+    """Distinct speakers in the range, preferring exact external peer ids.
+
+    Native/legacy rows retain their role label. A workspace-qualified author
+    is never collapsed to that role, so two user peers remain two participants.
+    """
     if start_msg is None or end_msg is None:
         rows = conn.execute(
-            "SELECT DISTINCT role FROM messages WHERE session_id = ? ORDER BY role",
-            (session_id,),
+            """
+            SELECT COALESCE(source_peer_id, role) AS participant
+            FROM messages WHERE session_id = ?
+            UNION
+            SELECT COALESCE(source_peer_id, source_role) AS participant
+            FROM message_retention_coverage
+            WHERE source_session_id = ?
+            ORDER BY participant
+            """,
+            (session_id, session_id),
         ).fetchall()
     else:
         rows = conn.execute(
             """
-            SELECT DISTINCT role FROM messages
+            SELECT COALESCE(source_peer_id, role) AS participant FROM messages
             WHERE session_id = ? AND id BETWEEN ? AND ?
-            ORDER BY role
+            UNION
+            SELECT COALESCE(source_peer_id, source_role) AS participant
+            FROM message_retention_coverage
+            WHERE source_session_id = ? AND message_id BETWEEN ? AND ?
+            ORDER BY participant
             """,
-            (session_id, start_msg, end_msg),
+            (session_id, start_msg, end_msg, session_id, start_msg, end_msg),
         ).fetchall()
-    return [r["role"] for r in rows]
+    return [r["participant"] for r in rows]
+
+
+def _participants_from_sources(
+    occurrences: tuple[BoundSourceOccurrence, ...],
+) -> list[str]:
+    """Exact participants in stable lexical order, without range inference."""
+
+    return sorted({item.source_peer_id or item.role for item in occurrences})
 
 
 def _title_hash(session_id: str, title: str) -> str:
@@ -171,13 +212,20 @@ def _episode_id(
     title: str,
     *,
     granular: bool = False,
+    digest_slice_key: str | None = None,
+    digest_item_index: int | None = None,
+    digest_generation: str | None = None,
 ) -> str:
     """Stable id for an episode.
 
-    Prefers the message range — same range across re-dreams = same id, so an
-    UPSERT updates the title/summary in place. When the LLM didn't provide
-    chunk_ids (so range is unknown) we fall back to a content hash so the row
-    is still re-findable on the next run for the same content.
+    Standalone extraction prefers the message range — same range across
+    re-dreams = same id. Resumable digest extraction additionally keys on the
+    active build generation, stable slice, and response ordinal.  Several valid
+    blob episodes sharing one coverage range coexist, while retries inside one
+    build still UPSERT.  A replacement build receives distinct ids so it cannot
+    overwrite the last complete generation before reaching the tail. Granular
+    episodes retain range+title identity inside that build. When the LLM didn't
+    provide chunk_ids we use an equivalent slice/ordinal fallback.
 
     `granular` (Plan C) appends a title hash to the RANGE id, and the reason is
     the whole reason Plan C needs a persist change at all: at decision
@@ -189,10 +237,41 @@ def _episode_id(
     granularity change having done nothing. Same range + same title still means
     the same id, so re-dreams still UPSERT in place instead of duplicating.
     """
+    generation_part = ""
+    if digest_slice_key is not None and digest_generation is not None:
+        generation_hash = hashlib.sha256(
+            digest_generation.encode("utf-8")
+        ).hexdigest()[:16]
+        generation_part = f"~g{generation_hash}"
     if start_msg is not None and end_msg is not None:
-        base = f"{session_id}@{start_msg}-{end_msg}"
-        return f"{base}#{_title_hash(session_id, title)}" if granular else base
-    return f"{session_id}@h{_title_hash(session_id, title)}"
+        base = f"{session_id}@{start_msg}-{end_msg}{generation_part}"
+        if digest_slice_key is not None:
+            slice_hash = hashlib.sha1(digest_slice_key.encode("utf-8")).hexdigest()[:10]
+            base = f"{base}~{slice_hash}"
+        # Every resumable digest slice may legitimately emit several episodes
+        # over the same one-message coverage range.  The historical blob path
+        # collapsed those rows by range; adding title identity whenever a
+        # slice key is present prevents one valid item silently overwriting the
+        # next while preserving standalone/pre-v38 ids.
+        if granular:
+            return f"{base}#{_title_hash(session_id, title)}"
+        if digest_slice_key is not None:
+            # Blob episodes historically used range identity so a title edit
+            # UPSERTed in place.  Preserve that stability while allowing more
+            # than one episode from the same bounded window by adding its
+            # deterministic response ordinal, not its mutable title.
+            return f"{base}#i{int(digest_item_index or 0)}"
+        return base
+    base = f"{session_id}@h{_title_hash(session_id, title)}{generation_part}"
+    if digest_slice_key is not None:
+        slice_hash = hashlib.sha1(digest_slice_key.encode("utf-8")).hexdigest()[:10]
+        if granular:
+            return f"{base}~{slice_hash}"
+        return (
+            f"{session_id}@slice{generation_part}~{slice_hash}"
+            f"#i{int(digest_item_index or 0)}"
+        )
+    return base
 
 
 def persist_episodes(
@@ -202,6 +281,8 @@ def persist_episodes(
     *,
     granular: bool = False,
     supersede_window: tuple[int | None, int | None] | None = None,
+    digest_slice_key: str | None = None,
+    digest_generation: str | None = None,
 ) -> int:
     """Insert/UPSERT validated episodes. Caller wraps in core_db.transaction().
 
@@ -210,8 +291,8 @@ def persist_episodes(
     /key_entities/participants for re-dreams without reshuffling rowids —
     important for FTS and vec_episodes alignment.
 
-    ``granular`` (Plan C) selects the id shape — range+title instead of the bare
-    range — and nothing else about the row changes. Which prompt an episode came
+    ``granular`` (Plan C) selects the decision-grained range+title id shape;
+    resumable blob calls use range+slice+ordinal. Which prompt an episode came
     from is recorded once per extraction call, on
     ``sessions.episodes_prompt_version`` (schema v35), because the call is what
     has a prompt version; a per-row copy would be derived state that can
@@ -237,27 +318,50 @@ def persist_episodes(
     """
     written_ids: list[str] = []
     count = 0
-    for item in extraction.items:
+    for item_index, item in enumerate(extraction.items):
         title = item.get("title", "").strip()
         summary = item.get("summary", "").strip()
         if not title or not summary:
             continue
         chunk_ids = item.get("chunk_ids", []) or []
+        if item.get("_source_citations_invalid") is True:
+            raise ValueError("episode contains an invalid non-empty source citation")
+        # Resolve the exact citation set before writing any part of this item.
+        # Empty citations are a supported legacy/unattributed shape.  A non-empty
+        # but corrupt citation raises and rolls back the caller's episode + digest
+        # cursor transaction; silently downgrading it would make lost provenance
+        # permanent once the cursor advanced.
+        source_occurrences = resolve_cited_episode_sources(
+            conn, session_id, chunk_ids
+        )
         start_msg, end_msg = _resolve_message_range(conn, chunk_ids)
-        participants = _resolve_participants(conn, session_id, start_msg, end_msg)
+        participants = (
+            _participants_from_sources(source_occurrences)
+            if source_occurrences
+            else _resolve_participants(conn, session_id, start_msg, end_msg)
+        )
         outcome = item.get("outcome")
         outcome = outcome if outcome in _VALID_OUTCOMES else None
         key_entities = json.dumps(item.get("key_entities", []))
         episode_id = _episode_id(
-            session_id, start_msg, end_msg, title, granular=granular
+            session_id, start_msg, end_msg, title, granular=granular,
+            digest_slice_key=digest_slice_key,
+            digest_item_index=item_index,
+            digest_generation=digest_generation,
         )
 
+        # A published manifest binds title/summary as prompt inputs.  Unpublish
+        # it before the UPSERT so a same-id replay or in-place rewrite cannot
+        # momentarily pair old proof rows with new episode bytes.  The caller's
+        # transaction makes the replacement atomic to other connections.
+        unpublish_episode_source_manifest(conn, episode_id)
         conn.execute(
             """
             INSERT INTO episodes(
                 id, session_id, title, summary, participants,
-                start_message_id, end_message_id, outcome, key_entities
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                start_message_id, end_message_id, outcome, key_entities,
+                digest_slice_key, digest_generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 summary = excluded.summary,
@@ -265,19 +369,26 @@ def persist_episodes(
                 start_message_id = excluded.start_message_id,
                 end_message_id = excluded.end_message_id,
                 outcome = excluded.outcome,
-                key_entities = excluded.key_entities
+                key_entities = excluded.key_entities,
+                digest_slice_key = excluded.digest_slice_key,
+                digest_generation = excluded.digest_generation
             """,
             (
                 episode_id, session_id, title, summary,
                 json.dumps(participants),
-                start_msg, end_msg, outcome, key_entities,
+                start_msg, end_msg, outcome, key_entities, digest_slice_key,
+                digest_generation,
             ),
         )
+        persist_episode_source_manifest(conn, episode_id, source_occurrences)
         written_ids.append(episode_id)
         count += 1
 
     if supersede_window is not None:
-        _supersede_window(conn, session_id, supersede_window, written_ids)
+        _supersede_window(
+            conn, session_id, supersede_window, written_ids,
+            digest_slice_key=digest_slice_key,
+        )
 
     if count:
         log.debug("episodes.persisted session_id=%s count=%d", session_id, count)
@@ -289,6 +400,8 @@ def _supersede_window(
     session_id: str,
     window: tuple[int | None, int | None],
     keep_ids: list[str],
+    *,
+    digest_slice_key: str | None = None,
 ) -> int:
     """Delete this session's episodes that lie wholly inside ``window`` and were
     not just written. Returns the number deleted (0 on an unknown window).
@@ -315,6 +428,14 @@ def _supersede_window(
         # that a previous, successful extraction produced.
         return 0
     placeholders = ",".join("?" * len(keep_ids))
+    slice_clause = (
+        "AND digest_slice_key IS NULL"
+        if digest_slice_key is None
+        else "AND digest_slice_key = ?"
+    )
+    params: tuple = (session_id, start, end, *keep_ids)
+    if digest_slice_key is not None:
+        params = (*params, digest_slice_key)
     cur = conn.execute(
         f"""
         DELETE FROM episodes
@@ -324,8 +445,9 @@ def _supersede_window(
           AND start_message_id >= ?
           AND end_message_id <= ?
           AND id NOT IN ({placeholders})
+          {slice_clause}
         """,
-        (session_id, start, end, *keep_ids),
+        params,
     )
     deleted = cur.rowcount if cur.rowcount > 0 else 0
     if deleted:

@@ -138,6 +138,15 @@ def test_max_hops_below_two_disables(hy, cfg):
     assert _multihop_edges(hy.conn, _on(cfg, graph_multihop_max_hops=1), ["atta"]) == {}
 
 
+@pytest.mark.parametrize(
+    "invalid_hops", [True, 2.0, float("nan"), float("inf"), "3"]
+)
+def test_invalid_max_hops_fails_closed(hy, cfg, invalid_hops):
+    _seed_chain(hy.conn)
+    configured = _on(cfg, graph_multihop_max_hops=invalid_hops)
+    assert _multihop_edges(hy.conn, configured, ["atta"]) == {}
+
+
 def test_depth_control_two_vs_three(hy, cfg):
     """max_hops gates chain length: the hop-3 deep edge appears only at depth 3."""
     _seed_chain(hy.conn)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from hymem.extraction.chunk import extract_chunk
+from hymem.extraction.chunk import ChunkResult, _merge_results, extract_chunk
 from hymem.extraction.llm import StubLLMClient
 from hymem.extraction.markers import _parse as parse_markers
 from hymem.extraction.markers import extract_markers
@@ -12,6 +12,7 @@ from hymem.extraction.triples import (
     extract_entity_properties,
     extract_entity_types,
     extract_triples,
+    Triple,
 )
 
 
@@ -110,6 +111,78 @@ def test_extract_chunk_single_call_returns_both():
     assert result.markers[0].kind == "preference"
     assert result.entity_type_hints["service"] == "service"
     assert result.entity_property_hints["postgres"]["language"] == "sql"
+
+
+def test_extract_chunk_rejects_conflicting_entity_metadata_in_one_response():
+    base = {
+        "subject": "Postgres", "predicate": "uses", "object": "SQL",
+        "polarity": 1,
+    }
+    for conflicting in (
+        [
+            {**base, "subject_type": "database"},
+            {**base, "subject": " postgres ", "subject_type": "service"},
+        ],
+        [
+            {**base, "subject_properties": {"owner": "Platform"}},
+            {**base, "subject": " postgres ",
+             "subject_properties": {"owner": "Data"}},
+        ],
+    ):
+        result = extract_chunk(StubLLMClient(default=json.dumps({
+            "triples": conflicting, "markers": [],
+        })), "tiny")
+        assert result.failed is True
+        assert result.triples == []
+        assert result.entity_type_hints == {}
+        assert result.entity_property_hints == {}
+
+
+def test_extract_chunk_dedupes_consistent_repeated_metadata_and_claim():
+    item = {
+        "subject": "Postgres", "predicate": "uses", "object": "SQL",
+        "polarity": 1, "subject_type": "database",
+        "subject_properties": {"owner": "Platform"},
+    }
+    result = extract_chunk(StubLLMClient(default=json.dumps({
+        "triples": [item, {**item, "subject": " postgres "}], "markers": [],
+    })), "tiny")
+    assert result.failed is False
+    assert len(result.triples) == 1
+    assert set(result.entity_type_hints.values()) == {"database"}
+
+
+def test_extract_chunk_rejects_opposite_polarity_duplicates_in_either_order():
+    positive = {
+        "subject": "Postgres", "predicate": "uses", "object": "SQL",
+        "polarity": 1,
+    }
+    negative = {**positive, "subject": " postgres ", "polarity": -1}
+    for triples in ([positive, negative], [negative, positive]):
+        result = extract_chunk(StubLLMClient(default=json.dumps({
+            "triples": triples, "markers": [],
+        })), "tiny")
+        assert result.failed is True
+        assert result.triples == []
+
+
+def test_split_merge_rejects_opposite_polarity_in_either_half_order():
+    positive = Triple("App", "uses", "Postgres", 1)
+    negative = Triple(" app ", "uses", "postgres", -1)
+    for first, second in ((positive, negative), (negative, positive)):
+        merged = _merge_results(
+            ChunkResult(triples=[first]), ChunkResult(triples=[second])
+        )
+        assert merged.failed is True
+
+
+def test_split_merge_dedupes_equivalent_same_polarity_claims():
+    merged = _merge_results(
+        ChunkResult(triples=[Triple("App", "uses", "Postgres", 1)]),
+        ChunkResult(triples=[Triple(" app ", "uses", "postgres", 1)]),
+    )
+    assert merged.failed is False
+    assert len(merged.triples) == 1
 
 
 def test_extract_chunk_tolerates_malformed_output():
@@ -256,12 +329,11 @@ def test_extract_chunk_wrong_shape_is_empty_and_audible(caplog):
     assert any("chunk_extraction.shape_failure" in r.message for r in caplog.records)
 
 
-def test_extract_chunk_stays_quiet_on_the_stub_empty_array(caplog):
-    """`[]` is StubLLMClient's documented default and a routine "nothing here".
-    Warning on it would fire on every stub-configured call — the no-LLM default
-    this project ships — and drown the real signal."""
+def test_extract_chunk_rejects_and_logs_bare_empty_array(caplog):
+    """Only the named two-array object is an authoritative valid empty."""
     llm = StubLLMClient(default="[]")
     with caplog.at_level("WARNING"):
         result = extract_chunk(llm, "x")
     assert result.triples == [] and result.markers == []
-    assert not any("shape_failure" in r.message for r in caplog.records)
+    assert result.failed is True
+    assert any("shape_failure" in r.message for r in caplog.records)

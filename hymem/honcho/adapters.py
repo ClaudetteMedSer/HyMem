@@ -10,6 +10,8 @@ import datetime
 import re
 from typing import Any
 
+from hymem.query.fusion import estimate_tokens
+
 # ── peer role inference ──────────────────────────────────────────────────────
 
 _USER_RE = re.compile(r"(^user[-_]|human|client|telegram|discord|slack)", re.I)
@@ -51,7 +53,7 @@ def msg(
         "workspace_id": workspace_id,
         "metadata": metadata or {},
         "created_at": created_at or now(),
-        "token_count": max(1, len(content.split())),
+        "token_count": max(1, estimate_tokens(content)),
     }
 
 
@@ -103,12 +105,21 @@ def session_response(
     }
 
 
-def peer_card_response(peer_id: str, workspace_id: str, content: str) -> dict:
+def peer_card_response(
+    peer_id: str,
+    workspace_id: str,
+    content: str,
+    *,
+    updated_at: str | None = None,
+) -> dict:
     return {
         "id": peer_id,
         "workspace_id": workspace_id,
+        # honcho-ai 2.x validates only this field. Keep ``content`` as an
+        # additive compatibility alias for older direct HTTP consumers.
+        "peer_card": [content] if content else [],
         "content": content,
-        "updated_at": now(),
+        "updated_at": updated_at or now(),
     }
 
 
@@ -121,32 +132,52 @@ def summary_obj(
         "message_id": message_id,
         "summary_type": summary_type,
         "created_at": now(),
-        "token_count": max(1, len(content.split())),
+        "token_count": max(1, estimate_tokens(content)),
     }
 
 
 # ── request-shape normalization ──────────────────────────────────────────────
 
-def parse_add_peers(body: dict[str, Any]) -> list[tuple[str, dict]]:
-    """Normalize the two add_peers body shapes to ``(peer_id, metadata)`` pairs.
+def parse_add_peers(
+    body: dict[str, Any],
+) -> list[tuple[str, dict, dict]]:
+    """Normalize add-peers bodies to id, registry metadata, session config.
 
     Shape 1 (envelope):  {"peers": [{"id": "...", "metadata": {...}}, ...]}
     Shape 2 (bare map):  {peer_id: {"observe_me": bool, "observe_others": bool}}
 
-    The returned metadata dict is exactly what gets persisted and echoed back.
+    Registry metadata and per-session configuration are separate authority
+    domains. A bare map is the legacy configuration-only form.
     """
-    pairs: list[tuple[str, dict]] = []
+    if not isinstance(body, dict):
+        raise ValueError("add peers body must be an object")
+    pairs: list[tuple[str, dict, dict]] = []
     if "peers" in body:
-        for entry in body["peers"]:
-            pairs.append((entry["id"], entry.get("metadata") or {}))
+        entries = body["peers"]
+        if not isinstance(entries, list):
+            raise ValueError("peers must be a list")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("each peer must be an object")
+            peer_id = entry.get("id")
+            if not isinstance(peer_id, str) or not peer_id.strip():
+                raise ValueError("peer id must be non-empty")
+            metadata = entry.get("metadata")
+            configuration = entry.get("configuration")
+            if metadata is None:
+                metadata = {}
+            if configuration is None:
+                configuration = {}
+            if not isinstance(metadata, dict):
+                raise ValueError("peer metadata must be an object")
+            if not isinstance(configuration, dict):
+                raise ValueError("peer configuration must be an object")
+            pairs.append((peer_id, metadata, configuration))
     else:
         for peer_id, config in body.items():
-            cfg = config if isinstance(config, dict) else {}
-            pairs.append((
-                peer_id,
-                {
-                    "observe_me": cfg.get("observe_me", True),
-                    "observe_others": cfg.get("observe_others", True),
-                },
-            ))
+            if not isinstance(peer_id, str) or not peer_id.strip():
+                raise ValueError("peer id must be non-empty")
+            if config is not None and not isinstance(config, dict):
+                raise ValueError("peer configuration must be an object")
+            pairs.append((peer_id, {}, config or {}))
     return pairs

@@ -2,7 +2,7 @@
 
 Verifies that the environment is configured well enough to run the servers,
 and surfaces the silent failure modes (missing keys, unreachable endpoints,
-embedding-dimension drift) before they bite mid-request. Prints the *resolved*
+embedding model/dimension drift) before they bite mid-request. Prints the *resolved*
 configuration so there is no guessing about which provider/model is in use.
 
 Exit code 0 if every check passes (warnings allowed), 1 if any check fails.
@@ -73,33 +73,57 @@ def _check_llm(cfg: EnvConfig) -> _Result:
 
 def _check_embedding(cfg: EnvConfig) -> tuple[_Result, int | None]:
     """Returns the check result and the live embedding dimension (or None)."""
-    if not cfg.has_embedding_key:
-        return (
-            _Result(WARN, "embeddings",
-                    "no API key — FTS-only retrieval (vector search disabled)"),
-            None,
+    if cfg.embedding_backend == "local_feature_hash":
+        from hymem.extraction.embeddings import LocalHashEmbeddingClient
+        embedder = LocalHashEmbeddingClient(
+            dim_value=cfg.embedding_dim, model_name=cfg.embedding_model
         )
+        embedder.embed(["preflight probe"])
+        status = OK
+        if cfg.embedding_fallback_reason == "remote_embedding_credentials_missing":
+            status = WARN
+        elif cfg.embedding_fallback_reason == "remote_embedding_endpoint_rejected":
+            status = FAIL
+        fallback_detail = (
+            f", fallback_reason={cfg.embedding_fallback_reason}"
+            if cfg.embedding_fallback_reason else ""
+        )
+        return (
+            _Result(
+                status, "embeddings",
+                f"{cfg.embedding_model} (local deterministic lexical fallback, "
+                f"no network, dim={embedder.dim}{fallback_detail})",
+            ),
+            embedder.dim,
+        )
+    if not cfg.has_embedding_key:
+        return _Result(FAIL, "embeddings", "remote backend has no API key"), None
     try:
-        from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
+        from hymem.contrib.openai_embedding_client import (
+            OpenAICompatibleEmbeddingClient,
+            safe_embedding_base_url,
+        )
     except ImportError:
         return _Result(WARN, "embeddings", "key present; openai package not installed"), None
+    display_url = safe_embedding_base_url(cfg.embedding_base_url)
     try:
         embedder = OpenAICompatibleEmbeddingClient(
             api_key=cfg.embedding_api_key,
             base_url=cfg.embedding_base_url,
             model=cfg.embedding_model,
+            dim=cfg.embedding_dim,
         )
         embedder.embed(["preflight probe"])  # also resolves the true dimension
         return (
             _Result(OK, "embeddings",
-                    f"{cfg.embedding_model} @ {cfg.embedding_base_url} "
+                    f"{cfg.embedding_model} @ {display_url} "
                     f"(reachable, dim={embedder.dim})"),
             embedder.dim,
         )
     except Exception as exc:  # noqa: BLE001
         return _Result(FAIL, "embeddings",
-                       f"{cfg.embedding_model} @ {cfg.embedding_base_url} "
-                       f"unreachable: {exc}"), None
+                       f"{cfg.embedding_model} @ {display_url} "
+                       f"unreachable ({type(exc).__name__})"), None
 
 
 def _check_sqlite_vec() -> _Result:
@@ -107,17 +131,17 @@ def _check_sqlite_vec() -> _Result:
         import sqlite_vec  # noqa: F401
     except ImportError:
         return _Result(WARN, "sqlite-vec",
-                       "extension not installed — falls back to Python cosine search")
+                       "extension not installed — exact durable vector scoring remains available")
     import sqlite3
     try:
         conn = sqlite3.connect(":memory:")
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.close()
-        return _Result(OK, "sqlite-vec", "extension loads (native vector search available)")
+        return _Result(OK, "sqlite-vec", "extension loads (vector shadows available)")
     except Exception as exc:  # noqa: BLE001
         return _Result(WARN, "sqlite-vec",
-                       f"failed to load ({exc}) — falls back to Python cosine search")
+                       f"failed to load ({exc}) — exact durable vector scoring remains available")
 
 
 def _check_schema_and_dim(cfg: EnvConfig, live_dim: int | None) -> list[_Result]:
@@ -133,34 +157,83 @@ def _check_schema_and_dim(cfg: EnvConfig, live_dim: int | None) -> list[_Result]
         results.append(_Result(FAIL, "schema", f"initialize/migrate failed: {exc}"))
         return results
 
+    metadata_error: str | None = None
     try:
-        row = conn.execute(
+        dim_row = conn.execute(
             "SELECT value FROM schema_meta WHERE key = 'vec_dim'"
         ).fetchone()
-        stored_dim = int(row["value"]) if row else None
-    except Exception:  # noqa: BLE001
+        model_row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'vec_model'"
+        ).fetchone()
+        vec_tables = [
+            row["name"] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'vec_%' ORDER BY name"
+            ).fetchall()
+        ]
         stored_dim = None
+        if dim_row is not None:
+            try:
+                stored_dim = int(dim_row["value"])
+            except (TypeError, ValueError, OverflowError):
+                metadata_error = f"malformed vec_dim={dim_row['value']!r}"
+            else:
+                if stored_dim <= 0:
+                    metadata_error = f"invalid vec_dim={stored_dim!r}"
+        stored_model = model_row["value"] if model_row else None
+        if model_row is not None and (
+            not isinstance(stored_model, str) or not stored_model
+        ):
+            metadata_error = (
+                f"{metadata_error}; " if metadata_error else ""
+            ) + "malformed vec_model"
+    except Exception as exc:  # noqa: BLE001
+        stored_dim = None
+        stored_model = None
+        vec_tables = []
+        metadata_error = f"could not read vector metadata: {exc}"
     finally:
         conn.close()
 
-    if stored_dim is None:
+    if metadata_error is not None:
+        results.append(_Result(
+            FAIL, "embedding identity",
+            f"{metadata_error}; durable model/dimension filters remain safe, "
+            "but rebuild vector shadows with the configured embedder",
+        ))
+    elif stored_dim is None and (stored_model is not None or vec_tables):
+        results.append(_Result(
+            WARN, "embedding identity",
+            "vector shadow metadata is incomplete "
+            f"(vec_model={stored_model!r}, tables={vec_tables}); the next "
+            "embedding persist will rebuild it",
+        ))
+    elif stored_dim is None:
         results.append(_Result(OK, "embedding dimension",
                                "no vector table yet — will be created on first dream"))
-    elif live_dim is None:
-        results.append(_Result(WARN, "embedding dimension",
-                               f"stored dim={stored_dim}; embedding client not "
-                               "verified, cannot confirm a match"))
-    elif live_dim != stored_dim:
+    elif stored_model is None:
         results.append(_Result(
-            FAIL, "embedding dimension",
-            f"MISMATCH: configured model produces dim={live_dim} but the "
-            f"existing vector table is dim={stored_dim}. Vector search will "
-            f"silently return garbage. Re-embed (rebuild vec_chunks) or revert "
-            f"the embedding model.",
+            WARN, "embedding identity",
+            f"stored vec_dim={stored_dim} has no vec_model metadata; durable "
+            "model filters remain safe and the next embedding persist will rebuild shadows",
+        ))
+    elif live_dim is None:
+        results.append(_Result(WARN, "embedding identity",
+                               f"stored model={stored_model} dim={stored_dim}; "
+                               "embedding client not verified"))
+    elif live_dim != stored_dim or cfg.embedding_identity != stored_model:
+        results.append(_Result(
+            FAIL, "embedding identity",
+            f"MISMATCH: configured identity={cfg.embedding_identity} dim={live_dim}; "
+            f"stored vec model={stored_model} dim={stored_dim}. Retrieval skips "
+            "incompatible durable rows; run a dream to re-embed/rebuild shadows "
+            "or restore the prior model.",
         ))
     else:
-        results.append(_Result(OK, "embedding dimension",
-                               f"configured model matches stored table (dim={live_dim})"))
+        results.append(_Result(
+            OK, "embedding identity",
+            f"configured identity={cfg.embedding_identity} dim={live_dim} matches stored shadows",
+        ))
     return results
 
 
@@ -211,6 +284,8 @@ def repack_embeddings(conn: sqlite3.Connection) -> int:
         ("chunk_embeddings", ("chunk_id",)),
         ("edge_embeddings", ("edge_text",)),
         ("episode_embeddings", ("episode_id",)),
+        ("message_embeddings", ("message_id",)),
+        ("narrative_fact_embeddings", ("fact_id",)),
         ("embedding_cache", ("text_hash", "model")),
     ]
     repacked = 0
@@ -236,6 +311,7 @@ def repack_embeddings(conn: sqlite3.Connection) -> int:
 
 def run_doctor() -> int:
     cfg = resolve_env()
+    from hymem.contrib.openai_embedding_client import safe_embedding_base_url
 
     print("HyMem doctor — resolved configuration")
     print("─" * 60)
@@ -244,8 +320,10 @@ def run_doctor() -> int:
     print(f"  LLM base URL      : {cfg.llm_base_url}")
     print(f"  LLM API key       : {'set' if cfg.has_llm_key else 'MISSING'}")
     print(f"  embedding model   : {cfg.embedding_model}")
-    print(f"  embedding base URL: {cfg.embedding_base_url}")
-    print(f"  embedding API key : {'set' if cfg.has_embedding_key else 'missing (FTS-only)'}")
+    print(f"  embedding backend : {cfg.embedding_backend}")
+    print(f"  embedding base URL: {safe_embedding_base_url(cfg.embedding_base_url)}")
+    print(f"  embedding API key : {'set' if cfg.has_embedding_key else 'not needed'}")
+    print(f"  embedding fallback: {cfg.embedding_fallback_reason or 'none'}")
     print("─" * 60)
 
     results: list[_Result] = [_check_root(cfg), _check_llm(cfg), _check_sqlite_vec()]

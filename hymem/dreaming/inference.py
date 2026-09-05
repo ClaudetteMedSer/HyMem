@@ -5,8 +5,17 @@ import logging
 import sqlite3
 
 from hymem.config import HyMemConfig
+from hymem.core.graph import live_edge_predicate
 
 log = logging.getLogger("hymem.dreaming.inference")
+
+
+def _record_policy(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ("
+        "'derived_inference_import_policy',?)",
+        ("v1:retract_threshold=" + format(cfg.retract_threshold, ".17g"),),
+    )
 
 
 def infer_transitive_edges(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
@@ -29,22 +38,59 @@ def infer_transitive_edges(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
 
     Returns the total number of new derived edges inserted.
     """
-    conn.execute("DELETE FROM knowledge_graph WHERE derived = 1")
+    # Heal any row poisoned by an older build that attached observed provenance
+    # to an inferred edge. Such a row is direct knowledge now and must survive
+    # the derived-closure rebuild.
+    conn.execute(
+        """
+        UPDATE knowledge_graph SET derived = 0
+        WHERE derived = 1 AND (
+            EXISTS (SELECT 1 FROM kg_evidence ev
+                    WHERE ev.edge_id = knowledge_graph.id)
+            OR EXISTS (SELECT 1 FROM kg_claim_observations observation
+                       WHERE observation.edge_id = knowledge_graph.id)
+            OR EXISTS (SELECT 1 FROM kg_edge_lifecycle lifecycle
+                       WHERE lifecycle.edge_id = knowledge_graph.id)
+        )
+        """
+    )
+    derived_ids = [
+        int(row["id"])
+        for row in conn.execute(
+            "SELECT id FROM knowledge_graph WHERE derived = 1 ORDER BY id"
+        ).fetchall()
+    ]
+    if derived_ids:
+        import contextlib
+
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.executemany(
+                "DELETE FROM vec_edges WHERE rowid = ?",
+                [(edge_id,) for edge_id in derived_ids],
+            )
+        from hymem.core.db import evidence_mutation
+
+        with evidence_mutation(conn):
+            conn.executemany(
+                "DELETE FROM knowledge_graph WHERE id = ?",
+                [(edge_id,) for edge_id in derived_ids],
+            )
 
     depends_rows = conn.execute(
-        """SELECT subject_canonical AS s, object_canonical AS o,
+        f"""SELECT subject_canonical AS s, object_canonical AS o,
                   (pos_evidence + 1.0)/(pos_evidence + neg_evidence + 2.0) AS conf
            FROM knowledge_graph
-           WHERE predicate = 'depends_on' AND status = 'active' AND derived = 0"""
+           WHERE predicate = 'depends_on' AND {live_edge_predicate()}"""
     ).fetchall()
     uses_rows = conn.execute(
-        """SELECT subject_canonical AS s, object_canonical AS o,
+        f"""SELECT subject_canonical AS s, object_canonical AS o,
                   (pos_evidence + 1.0)/(pos_evidence + neg_evidence + 2.0) AS conf
            FROM knowledge_graph
-           WHERE predicate = 'uses' AND status = 'active' AND derived = 0"""
+           WHERE predicate = 'uses' AND {live_edge_predicate()}"""
     ).fetchall()
 
     if not depends_rows and not uses_rows:
+        _record_policy(conn, cfg)
         return 0
 
     depends_graph: dict[str, list[tuple[str, float]]] = {}
@@ -98,10 +144,11 @@ def infer_transitive_edges(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
     # participate as second hops here.
     refreshed_depends: dict[str, list[tuple[str, float]]] = {}
     for r in conn.execute(
-        """SELECT subject_canonical AS s, object_canonical AS o,
+        f"""SELECT subject_canonical AS s, object_canonical AS o,
                   (pos_evidence + 1.0)/(pos_evidence + neg_evidence + 2.0) AS conf
            FROM knowledge_graph
-           WHERE predicate = 'depends_on' AND status = 'active'"""
+           WHERE predicate = 'depends_on'
+             AND {live_edge_predicate(include_derived=True)}"""
     ).fetchall():
         refreshed_depends.setdefault(r["s"], []).append((r["o"], float(r["conf"])))
 
@@ -130,4 +177,5 @@ def infer_transitive_edges(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
 
     if derived_count:
         log.info("inference.derived count=%d", derived_count)
+    _record_policy(conn, cfg)
     return derived_count

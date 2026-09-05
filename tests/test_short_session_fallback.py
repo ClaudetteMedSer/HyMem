@@ -1,12 +1,12 @@
-"""Tests for the short-session fallback chunk (never-dreamed bug fix).
+"""Tests for short-session lossless coverage (never-dreamed bug fix).
 
 Both chunk tiers only mint chunks from USER turns that clear min_chars or a
 trigger regex, so a session whose user turns are all short (test/WebSocket/
 diagnostic sessions) used to produce zero chunks, skip the per-session tail,
-and leave ``sessions.digested_prompt_version`` NULL forever — the digest and
-aggregation layers could never cover it. The fix mints ONE fallback chunk
-(``salience_reason='short_session_fallback'``) spanning the whole session and
-lets the normal digest tail run; truly empty sessions still skip.
+and leave ``sessions.digested_prompt_version`` NULL forever.  The v38 fix gives
+every message an exact coverage artifact, independent of either extraction
+tier; truly empty sessions still skip.  Legacy fallback-builder unit tests stay
+below to pin compatibility, but the runner no longer needs to mint one.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import pytest
 from hymem import HyMem
 from hymem.core.db import connect, initialize
 from hymem.dreaming.chunks import _chunk_id, extract_fallback_chunk
+from hymem.dreaming.lossless import coverage_chunk_id
 from hymem.extraction.llm import StubLLMClient
 
 
@@ -75,6 +76,14 @@ def _fallback_rows(hy: HyMem, sid: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _coverage_rows(hy: HyMem, sid: str) -> list[sqlite3.Row]:
+    return hy.conn.execute(
+        "SELECT * FROM chunks WHERE session_id = ? AND chunk_kind = 'coverage' "
+        "ORDER BY start_message_id",
+        (sid,),
+    ).fetchall()
+
+
 def _digested_version(hy: HyMem, sid: str) -> str | None:
     return hy.conn.execute(
         "SELECT digested_prompt_version FROM sessions WHERE id = ?", (sid,)
@@ -84,9 +93,9 @@ def _digested_version(hy: HyMem, sid: str) -> str | None:
 # --- (a) short session gets a fallback chunk and a digest stamp -------------
 
 
-def test_short_session_gets_fallback_chunk_and_digest_stamp(cfg):
+def test_short_session_gets_exact_coverage_and_digest_stamp(cfg):
     """A session whose user turns are all short (no triggers) must still be
-    digested: a fallback chunk row exists and digested_prompt_version is set."""
+    digested: one exact artifact per message exists and the prompt is stamped."""
     llm = _digest_llm(summary="A short diagnostic ping-pong exchange.")
     hy = HyMem(cfg, llm=llm)
     try:
@@ -94,10 +103,10 @@ def test_short_session_gets_fallback_chunk_and_digest_stamp(cfg):
         _seed_session(hy, sid, _SHORT_TURNS)
         hy.dream()
 
-        rows = _fallback_rows(hy, sid)
-        assert len(rows) == 1, "exactly one fallback chunk per short session"
-        assert "user: ping" in rows[0]["text"]
-        assert "assistant: pong" in rows[0]["text"]
+        rows = _coverage_rows(hy, sid)
+        assert len(rows) == len(_SHORT_TURNS)
+        assert all(row["id"].startswith("msgcov_") for row in rows)
+        assert _fallback_rows(hy, sid) == []
 
         assert _digested_version(hy, sid) == hy.config.prompt_version
         assert len(_digest_calls(llm)) == 1
@@ -108,10 +117,8 @@ def test_short_session_gets_fallback_chunk_and_digest_stamp(cfg):
 # --- (b) episodes citing the fallback chunk persist -------------------------
 
 
-def test_episode_citing_fallback_chunk_persists(cfg):
-    """An episode whose evidence is the fallback chunk id survives validation
-    (the id is in the digest's valid_chunk_ids set) and persists with the
-    chunk's message range."""
+def test_episode_citing_coverage_chunks_persists(cfg):
+    """Digest episodes can cite exact message artifacts across a range."""
     llm = _digest_llm()  # fixture filled in below, once the chunk id is known
     hy = HyMem(cfg, llm=llm)
     try:
@@ -124,13 +131,13 @@ def test_episode_citing_fallback_chunk_persists(cfg):
                 "SELECT id FROM messages WHERE session_id = ? ORDER BY id", (sid,)
             )
         ]
-        fallback_id = _chunk_id(sid, ids[0], ids[-1])
+        coverage_ids = [coverage_chunk_id(sid, message_id) for message_id in ids]
         episode = {
             "title": "Diagnostic ping",
             "summary": "A connectivity check session.",
             "outcome": "resolved",
             "key_entities": [],
-            "chunk_ids": [fallback_id],
+            "chunk_ids": coverage_ids,
         }
         llm.fixtures["Return the JSON object now"] = json.dumps(
             {"episodes": [episode], "summary": "", "procedures": []}
@@ -187,7 +194,8 @@ def test_redream_short_session_makes_no_further_digest_calls(cfg):
 
         hy.dream()  # nothing changed
         assert len(_digest_calls(llm)) == after_first, "re-dream must skip the digest"
-        assert len(_fallback_rows(hy, sid)) == 1, "no duplicate fallback rows"
+        assert len(_coverage_rows(hy, sid)) == len(_SHORT_TURNS)
+        assert _fallback_rows(hy, sid) == []
     finally:
         hy.close()
 
@@ -214,7 +222,8 @@ def test_qualifying_session_gets_no_fallback_chunk(cfg):
 
         assert _fallback_rows(hy, sid) == []
         regular = hy.conn.execute(
-            "SELECT salience_reason FROM chunks WHERE session_id = ?", (sid,)
+            "SELECT salience_reason FROM chunks WHERE session_id = ? "
+            "AND chunk_kind = 'extraction'", (sid,)
         ).fetchall()
         assert regular, "the regular tiers must have minted chunks"
         assert _digested_version(hy, sid) == hy.config.prompt_version

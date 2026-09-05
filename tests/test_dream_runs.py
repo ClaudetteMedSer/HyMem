@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
+from hymem import HyMem, HyMemConfig
+from hymem.dreaming.lossless import coverage_chunk_id
 from hymem.extraction.llm import LLMRequest, StubLLMClient
 from tests.conftest import make_routed_llm
 
@@ -54,13 +58,16 @@ def test_dream_persists_digest_counters(hy):
     logs-and-continues past."""
     import json
 
-    _seed_session(hy)
+    sid = _seed_session(hy)
+    last_mid = hy.conn.execute(
+        "SELECT MAX(id) FROM messages WHERE session_id = ?", (sid,)
+    ).fetchone()[0]
     episode = {
         "title": "Dropped Docker for local dev",
         "summary": "Switched local development from Docker to uv and system Python.",
         "outcome": "resolved",
         "key_entities": ["uv", "docker"],
-        "chunk_ids": [],
+        "chunk_ids": [coverage_chunk_id(sid, last_mid)],
     }
     hy.set_llm(StubLLMClient(
         fixtures={"Return the JSON object now": json.dumps(
@@ -411,3 +418,51 @@ def test_dream_records_error(hy, monkeypatch):
     assert row["error"] is not None
     assert "boom_phase2_failure" in row["error"]
     assert row["ended_at"] is not None
+
+
+def test_corrupt_quarantine_flags_cannot_starve_digest_or_profile(tmp_path):
+    cfg = dataclasses.replace(
+        HyMemConfig(root=tmp_path / "retry-corruption"),
+        aggregation_nodes_enabled=False,
+        facts_extraction_enabled=False,
+        profile_extraction_enabled=True,
+    )
+    llm = StubLLMClient(
+        fixtures={
+            "typed user-profile facts": '{"items":[]}',
+            "New, not-yet-digested session material": (
+                '{"episodes":[],"summary":"","procedures":[]}'
+            ),
+        },
+        default='{"triples":[],"markers":[]}',
+    )
+    hy = HyMem(cfg, llm=llm)
+    try:
+        hy.log_message("poisoned", "user", "I enjoy ordinary walks.")
+        hy.close_session("poisoned")
+        hy.conn.execute(
+            "UPDATE sessions SET digest_retry_count = 0, "
+            "digest_retry_config_version = NULL, digest_quarantined = 1, "
+            "profile_retry_count = 0, profile_retry_config_version = NULL, "
+            "profile_quarantined = 1 WHERE id = 'poisoned'"
+        )
+        status = hy.dream_status()
+        assert status["quarantined_digests"] == 0
+        assert status["quarantined_profiles"] == 0
+
+        report = hy.dream()
+        assert report.digest_failures == 0
+        assert report.profile_failures == 0
+        assert any(
+            "New, not-yet-digested session material" in call.user
+            for call in llm.calls
+        )
+        assert any("typed user-profile facts" in call.system for call in llm.calls)
+        retry_state = hy.conn.execute(
+            "SELECT digest_retry_count, digest_quarantined, "
+            "profile_retry_count, profile_quarantined FROM sessions "
+            "WHERE id = 'poisoned'"
+        ).fetchone()
+        assert tuple(retry_state) == (0, 0, 0, 0)
+    finally:
+        hy.close()

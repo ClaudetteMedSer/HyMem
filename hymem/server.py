@@ -27,9 +27,13 @@ Key variables:
     HYMEM_LLM_API_KEY        API key for the extraction LLM (or DEEPSEEK_API_KEY)
     HYMEM_LLM_BASE_URL       Base URL (default: https://api.deepseek.com)
     HYMEM_LLM_MODEL          Model name (default: deepseek-v4-flash)
-    HYMEM_EMBEDDING_API_KEY  API key for embeddings (falls back to LLM key)
-    HYMEM_EMBEDDING_BASE_URL Embedding endpoint (default: https://api.deepseek.com)
-    HYMEM_EMBEDDING_MODEL    Embedding model (default: deepseek-embedding)
+    HYMEM_EMBEDDING_API_KEY  API key for an explicitly configured remote embedder
+                             (OPENAI_API_KEY is used only for api.openai.com)
+    HYMEM_EMBEDDING_BASE_URL HTTPS OpenAI-compatible endpoint (HTTP only loopback)
+    HYMEM_EMBEDDING_MODEL    Embedding model (with matching HYMEM_EMBEDDING_DIM)
+    HYMEM_EMBEDDING_DIM      Declared vector dimension
+    HYMEM_EMBEDDING_TIMEOUT_SECONDS
+                             Remote request timeout (default: 10; SDK retries off)
     HYMEM_ROOT               Directory for hymem.sqlite, MEMORY.md, USER.md
                              (default: ~/.hermes)
     HYMEM_AGGREGATION_NODES_ENABLED
@@ -42,9 +46,11 @@ Key variables:
                              on whenever aggregation is enabled). Set false to
                              measure level-0 node-build cost in isolation.
 
-If the embedding client cannot be constructed (e.g. API key absent), the server
-logs a warning and falls back to FTS-only retrieval — no other functionality
-is affected.
+With no embedding configuration, the server uses a deterministic, dependency-
+free local feature-hash backend (model identity and lexical quality are exposed
+in query status). An explicit localhost endpoint needs no real API key. An
+incomplete/unavailable remote configuration falls back without launching a
+service at import or construction time.
 """
 from __future__ import annotations
 
@@ -55,6 +61,7 @@ import os
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
 # Re-exported here under the historical names used by tests and tool helpers.
 from hymem.bootstrap import get_instance as _get_hy, set_instance as set_hy
+from hymem.query.augment import format_graph_fact_sources
 
 
 def _get_mcp():
@@ -134,11 +141,17 @@ def _do_augment(message: str) -> str:
     parts: list[str] = []
 
     if ctx.graph_facts:
-        lines = [
-            f"- {f.subject} {f.predicate} {f.object} (conf {f.confidence:.2f},"
-            f" +{f.pos_evidence}/-{f.neg_evidence})"
-            for f in ctx.graph_facts
-        ]
+        lines = []
+        for f in ctx.graph_facts:
+            line = (
+                f"- [edge {f.edge_id}] {f.subject} {f.predicate} {f.object} "
+                f"(conf {f.confidence:.2f}, +{f.pos_evidence}/-{f.neg_evidence}"
+            )
+            if f.valid_at:
+                line += f", valid since {f.valid_at}"
+            line += ")"
+            line += f" [sources: {format_graph_fact_sources(f)}]"
+            lines.append(line)
         parts.append("**Structured knowledge (knowledge graph):**\n" + "\n".join(lines))
 
     if ctx.facts:
@@ -150,11 +163,11 @@ def _do_augment(message: str) -> str:
 
     if ctx.fts_hits:
         snippets = [f"[{h.session_id}] {h.text[:300]}" for h in ctx.fts_hits]
-        parts.append("**Relevant past context (keyword search):**\n" + "\n".join(snippets))
+        parts.append("**Relevant past context (hybrid retrieval):**\n" + "\n".join(snippets))
 
     if ctx.message_hits:
         snippets = [f"[{h.session_id}/{h.role}] {h.text[:300]}" for h in ctx.message_hits]
-        parts.append("**Relevant raw turns (keyword search):**\n" + "\n".join(snippets))
+        parts.append("**Relevant raw turns (hybrid retrieval):**\n" + "\n".join(snippets))
 
     return "\n\n".join(parts) if parts else ""
 
@@ -284,8 +297,8 @@ def hymem_dream() -> str:
 def hymem_augment(message: str) -> str:
     """Return structured knowledge and relevant past context for a user message.
 
-    Performs a dictionary-based entity match against the knowledge graph and a
-    BM25 keyword search over past conversation chunks. No LLM call is made.
+    Performs entity/graph lookup plus lexical and semantic retrieval over past
+    chunks and durable message occurrences. No query-time LLM call is made.
     Returns an empty string if no relevant context exists yet.
     """
     return _do_augment(message)

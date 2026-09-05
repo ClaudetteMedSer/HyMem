@@ -42,6 +42,67 @@ def test_redact_leaves_ordinary_prose_untouched():
     assert redaction.redact(prose) == prose
 
 
+@pytest.mark.parametrize(("sensitive", "secret_fragment", "structure"), [
+    (
+        "Bearer abcdefabcdef1234567890",
+        "abcdefabcdef1234567890",
+        "Bearer ",
+    ),
+    (
+        "Basic abcdefabcdef1234567890",
+        "abcdefabcdef1234567890",
+        "Basic ",
+    ),
+    (
+        "https://alice:correct-horse-battery@example.com/path",
+        "correct-horse-battery",
+        "https://alice:",
+    ),
+    (
+        'api_key="abcdefgh12345678"',
+        "abcdefgh12345678",
+        "api_key=",
+    ),
+    (
+        "jane.private@example.com",
+        "jane.private@example.com",
+        "",
+    ),
+    (
+        "eyJabcdefgh.abcdefghijk.abcdefghijk",
+        "eyJabcdefgh.abcdefghijk.abcdefghijk",
+        "",
+    ),
+    (
+        "sk-ABCD1234efgh5678ijkl",
+        "sk-ABCD1234efgh5678ijkl",
+        "",
+    ),
+    (
+        "-----BEGIN PRIVATE KEY-----\nprivate-body\n"
+        "-----END PRIVATE KEY-----",
+        "private-body",
+        "",
+    ),
+])
+def test_offset_preserving_redaction_masks_only_sensitive_spans(
+    sensitive, secret_fragment, structure,
+):
+    text = f"benign prefix {sensitive} benign suffix"
+    safe = redaction.redact_preserving_length(text)
+
+    assert len(safe) == len(text)
+    assert safe.startswith("benign prefix ")
+    assert safe.endswith(" benign suffix")
+    assert secret_fragment not in safe
+    assert structure in safe
+    assert redaction.redact_preserving_length(safe) == safe
+    assert redaction.redact(safe) == safe
+    fragments = redaction.sensitive_fragments(text)
+    assert fragments
+    assert any(secret_fragment in fragment for fragment in fragments)
+
+
 def test_log_message_redacts_before_storage(tmp_path):
     hy = HyMem(HyMemConfig(root=tmp_path))
     hy.log_message("s1", "user", "my openai key is sk-ABCD1234efgh5678ijkl ok")

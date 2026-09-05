@@ -163,8 +163,8 @@ class _Info:
 class _Api:
     asked: list = []
 
-    def dataset_info(self, repo):
-        _Api.asked.append(repo)
+    def dataset_info(self, repo, revision=None):
+        _Api.asked.append((repo, revision))
         return _Info()
 
 
@@ -190,13 +190,26 @@ def test_the_10m_scale_is_a_different_repo_and_is_witnessed_separately(hub):
 
 def test_scales_sharing_a_repo_are_queried_once(hub):
     ba.resolve_dataset_revisions(["100K", "500K", "1M"])
-    assert _Api.asked == ["Mohammadta/BEAM"]
+    assert _Api.asked == [("Mohammadta/BEAM", None)]
 
 
-def test_an_explicit_pin_is_recorded_without_asking_the_hub(hub):
-    got = ba.resolve_dataset_revisions(["100K"], pin="deadbeef")
-    assert got == {"Mohammadta/BEAM": "deadbeef"}
+def test_an_explicit_ref_is_resolved_to_a_repo_specific_commit(hub):
+    got = ba.resolve_dataset_revisions(["100K"], pin="main")
+    assert got == {"Mohammadta/BEAM": _Info.sha}
+    assert _Api.asked == [("Mohammadta/BEAM", "main")]
+
+
+def test_scalar_revision_is_rejected_across_distinct_repositories(hub):
+    with pytest.raises(ba.BenchmarkIntegrityError, match="both BEAM repositories"):
+        ba.resolve_dataset_revisions(["100K", "10M"], pin="main")
     assert _Api.asked == []
+
+
+def test_canonical_revision_must_be_an_immutable_commit_sha():
+    with pytest.raises(ba.BenchmarkIntegrityError, match="requires resolved"):
+        ba.validate_dataset_revision_binding(
+            {ba.BEAM_REPO: "main"}, canonical=True
+        )
 
 
 def test_an_unresolvable_revision_is_recorded_as_null_not_omitted(monkeypatch):
@@ -220,3 +233,17 @@ def test_an_offline_hub_does_not_abort_the_run(monkeypatch):
     mod.HfApi = _Broken
     monkeypatch.setitem(sys.modules, "huggingface_hub", mod)
     assert ba.resolve_dataset_revisions(["100K"]) == {"Mohammadta/BEAM": None}
+
+
+def test_an_explicit_revision_resolution_failure_aborts_before_load(monkeypatch):
+    import types
+    mod = types.ModuleType("huggingface_hub")
+
+    class _Broken:
+        def dataset_info(self, repo, revision=None):
+            raise OSError("no route to host")
+
+    mod.HfApi = _Broken
+    monkeypatch.setitem(sys.modules, "huggingface_hub", mod)
+    with pytest.raises(ba.BenchmarkIntegrityError, match="explicit.*revision"):
+        ba.resolve_dataset_revisions(["100K"], pin="release-2026-09")

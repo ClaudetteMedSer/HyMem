@@ -103,6 +103,33 @@ def test_cross_encoder_falls_back_when_unavailable(monkeypatch):
     assert out[0].score_kind == "rrf"
 
 
+def test_llm_reranker_receives_query_centered_tail_excerpt():
+    text = ("database filler " * 100) + "actual answer duckdb"
+    llm = StubLLMClient(default="[]")
+    llm_rerank("which database uses duckdb", [_Hit(text=text)], llm, top_k=1)
+    assert "duckdb" in llm.calls[-1].user
+    assert len(llm.calls[-1].user) < len(text)
+
+
+def test_cross_encoder_receives_query_centered_tail_excerpt(monkeypatch):
+    class RecordingModel:
+        pairs = None
+
+        def predict(self, pairs):
+            self.pairs = pairs
+            return [1.0 for _ in pairs]
+
+    model = RecordingModel()
+    monkeypatch.setattr(rerank_mod, "_get_cross_encoder", lambda _name: model)
+    text = ("database filler " * 100) + "actual answer duckdb"
+    cross_encoder_rerank(
+        "which database uses duckdb", [_Hit(text=text)], top_k=1
+    )
+    assert model.pairs is not None
+    assert "duckdb" in model.pairs[0][1]
+    assert len(model.pairs[0][1]) <= 400
+
+
 def test_rerank_dispatch_cross_encoder_falls_back_to_llm(monkeypatch):
     """When cross-encoder is unavailable and an LLM is wired, dispatch
     should pick up the LLM path so the user still gets a reordered list."""

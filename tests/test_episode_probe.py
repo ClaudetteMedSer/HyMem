@@ -259,7 +259,7 @@ def test_sim_pipeline_extracts_through_the_production_digest(tmp_path):
     # The gated input shape: chunk-tagged, and carrying the granular closer
     # rather than the shipping one.
     src = rows[0]["extractor_input"]
-    assert "[chunk chk_" in src
+    assert "[chunk msgcov_" in src
     assert src.rstrip().endswith("Return the granular digest JSON object now.")
     # And the hash-verified length is the real one, not a rendering's.
     assert rows[0]["extractor_input_chars"] == len(src)

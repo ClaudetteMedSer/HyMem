@@ -22,6 +22,7 @@ date-check / provenance analysis is done on top of NULLs, not inside
 them.
 """
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -29,8 +30,14 @@ from pathlib import Path
 
 try:  # package import (tests): benchmarks.run_registry
     from . import run_registry as rr
+    from .strictness import (
+        BenchmarkIntegrityError, content_hash, read_artifact_or_pointer,
+    )
+    from .lme_protocol import strict_intent, validate_strict_artifact
 except (ImportError, ValueError):  # direct CLI: python benchmarks/lme_registry.py
     import run_registry as rr
+    from strictness import BenchmarkIntegrityError, content_hash, read_artifact_or_pointer
+    from lme_protocol import strict_intent, validate_strict_artifact
 
 DB = Path(os.environ.get("LME_REGISTRY_DB", "/home/node/.hermes/benchmarks/lme_runs.db"))
 BENCH_DIR = Path(os.environ.get("LME_BENCH_DIR", "/home/node/.hermes/benchmarks"))
@@ -116,15 +123,84 @@ CREATE TABLE IF NOT EXISTS runs (
     count                      INTEGER,
     answer_calls               INTEGER,
     judge_calls                INTEGER,
+    retrieval_calls            INTEGER,
     total_tokens               INTEGER,
     elapsed_s                  REAL,
     flags_provenance           TEXT,     -- how recorded + analyst-set flags were established
-    extras                     TEXT     -- JSON: full config block + scores, for anything unmodeled
+    extras                     TEXT,     -- JSON: full config block + scores, for anything unmodeled
+    -- strict-v1 evidence (additive; genuine legacy rows remain NULL)
+    run_id                     TEXT,
+    protocol                   TEXT,
+    protocol_split             TEXT,
+    calibration_receipt_hash   TEXT,
+    strict_validated           INTEGER,
+    official_comparable        INTEGER,
+    development_only           INTEGER,
+    official_denominator_validated INTEGER,
+    official_protocol_aligned  INTEGER,
+    official_scoring_semantics_aligned INTEGER,
+    scored_run                 INTEGER,
+    retrieval_only             INTEGER,
+    label_free_answer_path     INTEGER,
+    exploratory_non_comparable INTEGER,
+    abstention_count           INTEGER,
+    answerable_count           INTEGER,
+    abstention_accuracy        REAL,
+    answerable_accuracy        REAL,
+    pipeline_calls             INTEGER,
+    usage_exact                INTEGER,
+    dataset_revision           TEXT,
+    dataset_sha256             TEXT,
+    source_ids_hash            TEXT,
+    evaluator_commit           TEXT,
+    evaluator_sha256           TEXT,
+    reader_provider            TEXT,
+    reader_base_url            TEXT,
+    judge_provider             TEXT,
+    judge_base_url             TEXT,
+    pipeline_provider          TEXT,
+    pipeline_model             TEXT,
+    pipeline_base_url          TEXT,
+    embedding_backend          TEXT,
+    embedding_model            TEXT,
+    embedding_base_url         TEXT,
+    embedding_dimension        INTEGER,
+    embedding_quality          TEXT,
+    embedding_network_free     INTEGER,
+    preregistered              INTEGER,
+    result_digest              TEXT,
+    artifact_digest            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_date ON runs(run_date);
 CREATE INDEX IF NOT EXISTS idx_runs_flags ON runs(auto_ability, no_dream, permissive_default);
 CREATE INDEX IF NOT EXISTS idx_runs_aggr ON runs(aggregation_nodes_enabled);
 """
+
+ADDITIVE_COLUMNS = {
+    "run_id": "TEXT", "protocol": "TEXT", "strict_validated": "INTEGER",
+    "protocol_split": "TEXT", "calibration_receipt_hash": "TEXT",
+    "official_comparable": "INTEGER", "development_only": "INTEGER",
+    "official_denominator_validated": "INTEGER",
+    "official_protocol_aligned": "INTEGER", "scored_run": "INTEGER",
+    "official_scoring_semantics_aligned": "INTEGER",
+    "retrieval_only": "INTEGER", "label_free_answer_path": "INTEGER",
+    "exploratory_non_comparable": "INTEGER", "abstention_count": "INTEGER",
+    "answerable_count": "INTEGER", "abstention_accuracy": "REAL",
+    "answerable_accuracy": "REAL", "pipeline_calls": "INTEGER",
+    "usage_exact": "INTEGER", "dataset_revision": "TEXT",
+    "dataset_sha256": "TEXT", "source_ids_hash": "TEXT",
+    "evaluator_commit": "TEXT", "evaluator_sha256": "TEXT",
+    "reader_provider": "TEXT", "reader_base_url": "TEXT",
+    "judge_provider": "TEXT", "judge_base_url": "TEXT",
+    "pipeline_provider": "TEXT", "pipeline_model": "TEXT",
+    "pipeline_base_url": "TEXT",
+    "embedding_backend": "TEXT", "embedding_model": "TEXT",
+    "embedding_base_url": "TEXT",
+    "embedding_dimension": "INTEGER", "embedding_quality": "TEXT",
+    "embedding_network_free": "INTEGER", "preregistered": "INTEGER",
+    "retrieval_calls": "INTEGER", "result_digest": "TEXT",
+    "artifact_digest": "TEXT",
+}
 
 
 def connect():
@@ -138,9 +214,35 @@ def connect():
     if cols.get("source_date") and cols["source_date"][3]:  # notnull flag
         con.execute("ALTER TABLE runs RENAME TO runs_prestamp")
         con.executescript(SCHEMA)
-        con.execute("INSERT INTO runs SELECT * FROM runs_prestamp")
+        old_names = {
+            row[1] for row in con.execute("PRAGMA table_info(runs_prestamp)")
+        }
+        new_names = [
+            row[1] for row in con.execute("PRAGMA table_info(runs)")
+            if row[1] in old_names
+        ]
+        quoted = ", ".join(f'"{name}"' for name in new_names)
+        con.execute(
+            f"INSERT INTO runs ({quoted}) SELECT {quoted} FROM runs_prestamp"
+        )
         con.execute("DROP TABLE runs_prestamp")
+        con.executescript(SCHEMA)
         con.commit()
+    existing = {row[1] for row in con.execute("PRAGMA table_info(runs)")}
+    for name, sql_type in ADDITIVE_COLUMNS.items():
+        if name not in existing:
+            con.execute(f'ALTER TABLE runs ADD COLUMN "{name}" {sql_type}')
+    existing_digest_index = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_runs_artifact_digest'"
+    ).fetchone()
+    if existing_digest_index and "UNIQUE" not in (existing_digest_index[0] or "").upper():
+        con.execute("DROP INDEX idx_runs_artifact_digest")
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_artifact_digest "
+        "ON runs(artifact_digest) WHERE artifact_digest IS NOT NULL"
+    )
+    con.commit()
     return con
 
 
@@ -206,13 +308,174 @@ def _stamp_fields(kind: str, archive: str, data: dict, cfg: dict):
             cfg.get("total_tokens"), cfg.get("elapsed_s"))
 
 
+def _strict_execution(data: dict) -> tuple[dict, dict]:
+    """Read cumulative strict usage only when every segment is complete."""
+
+    execution = data.get("execution")
+    if not isinstance(execution, dict):
+        return {}, {"strict_execution": False}
+    segments = execution.get("segments")
+    disclosure = {
+        "strict_execution": True,
+        "segments_present": isinstance(segments, list),
+        "segments_complete": False,
+        "segment_count": len(segments) if isinstance(segments, list) else None,
+    }
+    if not isinstance(segments, list) or not segments:
+        return {}, disclosure
+    complete = all(
+        isinstance(segment, dict) and segment.get("status") == "complete"
+        for segment in segments
+    )
+    disclosure["segments_complete"] = complete
+
+    def number(value, *, integer=False):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+            or (integer and not float(value).is_integer())
+        ):
+            return None
+        return int(value) if integer else float(value)
+
+    def usage_sum(key: str, field: str, availability: str):
+        if not complete:
+            return None
+        values = []
+        for segment in segments:
+            usage = segment.get(key)
+            if not isinstance(usage, dict) or usage.get(availability) is not True:
+                return None
+            value = number(usage.get(field), integer=field != "latency_s")
+            if value is None:
+                return None
+            values.append(value)
+        return sum(values)
+
+    elapsed = None
+    if complete:
+        elapsed_values = [number(segment.get("elapsed_s")) for segment in segments]
+        if all(value is not None for value in elapsed_values):
+            elapsed = sum(elapsed_values)
+
+    models = data.get("models") if isinstance(data.get("models"), dict) else {}
+    required_usage = ["reader_usage", "judge_usage", "retrieval_usage"]
+    if "memory_pipeline" in models:
+        required_usage.append("memory_pipeline_usage")
+    tokens_available = complete
+    total_tokens = 0
+    for segment in segments:
+        if not tokens_available:
+            break
+        for key in required_usage:
+            usage = segment.get(key)
+            value = number(
+                usage.get("total_tokens") if isinstance(usage, dict) else None,
+                integer=True,
+            )
+            if (
+                not isinstance(usage, dict)
+                or usage.get("token_usage_available") is not True
+                or value is None
+            ):
+                tokens_available = False
+                break
+            total_tokens += value
+        embedding = segment.get("embedding_usage")
+        embedding_cfg = (data.get("config") or {}).get("embedding_runtime")
+        if (
+            tokens_available and isinstance(embedding_cfg, dict)
+            and embedding_cfg.get("configured")
+        ):
+            provider_value = number(
+                embedding.get("total_tokens")
+                if isinstance(embedding, dict) else None,
+                integer=True,
+            )
+            if (
+                not isinstance(embedding, dict)
+                or embedding.get("provider_token_usage_available") is not True
+                or provider_value is None
+            ):
+                tokens_available = False
+            else:
+                total_tokens += provider_value
+    disclosure["total_tokens_available"] = tokens_available
+    counts = execution.get("counts") if isinstance(execution.get("counts"), dict) else {}
+    return {
+        "count": number(counts.get("expected"), integer=True),
+        "answer_calls": usage_sum(
+            "reader_usage", "calls", "calls_available"
+        ),
+        "judge_calls": usage_sum(
+            "judge_usage", "calls", "calls_available"
+        ),
+        "retrieval_calls": usage_sum(
+            "retrieval_usage", "calls", "calls_available"
+        ),
+        "total_tokens": total_tokens if tokens_available else None,
+        "elapsed_s": elapsed,
+    }, disclosure
+
+
+def _load_registry_artifact(path: Path) -> tuple[dict, str, str, str]:
+    """Resolve a pointer to immutable evidence and return canonical identity.
+
+    Old two-field pointers remain readable because the shared reader validates
+    their target manifest/run id. New pointers additionally bind the exact
+    target artifact digest. Registry identity always uses the target basename,
+    never the mutable pointer's filename.
+    """
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BenchmarkIntegrityError(f"cannot read artifact {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise BenchmarkIntegrityError("artifact root must be an object")
+    pointer_keys = set(raw)
+    is_pointer = pointer_keys in (
+        {"archive", "run_id"},
+        {"archive", "run_id", "artifact_digest"},
+    )
+    if {"archive", "run_id"} <= pointer_keys and not is_pointer:
+        raise BenchmarkIntegrityError(
+            "artifact pointer has unexpected fields"
+        )
+    data = read_artifact_or_pointer(path)
+    archive = raw["archive"] if is_pointer else path.name
+    digest = content_hash(data)
+    if is_pointer and "artifact_digest" in raw:
+        compatibility = "pointer-target-digest-validated"
+    elif is_pointer:
+        compatibility = "legacy-pointer-run-id-validated-digest-computed"
+    else:
+        compatibility = "direct-immutable-artifact"
+    return data, archive, digest, compatibility
+
+
 def ingest_file(con, path: Path, overrides: dict | None = None):
     """Insert one run JSON. Returns 'inserted' | 'skipped' | 'error'."""
     overrides = overrides or {}
     try:
-        data = json.loads(path.read_text())
+        data, archive, artifact_digest, pointer_compatibility = (
+            _load_registry_artifact(path)
+        )
     except Exception as e:
         return f"error: {e}"
+    strict = strict_intent(data, path)
+    validated = None
+    if strict:
+        if overrides:
+            return "error: strict LongMemEval artifacts reject analyst overrides"
+        try:
+            validated = validate_strict_artifact(data, path=path)
+        except (BenchmarkIntegrityError, ValueError, TypeError) as exc:
+            # Strict intent is fail-closed: malformed evidence never falls back
+            # to permissive legacy parsing.
+            return f"error: strict LongMemEval validation failed: {exc}"
     cfg = dict(data.get("config") or {})
     # Recorded-absent levers: the adapter never wrote these into config,
     # even when active.  Fill only from explicit analyst overrides; the
@@ -220,7 +483,11 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
     for k, v in overrides.items():
         if k in OVERRIDE_COLUMNS:
             cfg[k] = v
-    scores = data.get("scores") or {}
+    legacy_retrieval_only = bool(not strict and rr.is_retrieval_only(data))
+    scores = (
+        validated["scores"] if validated is not None
+        else ({} if legacy_retrieval_only else (data.get("scores") or {}))
+    )
 
     def cat(name):
         v = scores.get(name)
@@ -229,10 +496,22 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
     overall = scores.get("OVERALL")
     overall_acc = round(overall["accuracy"], 3) if isinstance(overall, dict) else None
 
-    # sanity: overwrite only if identical file already in DB
-    archive = path.name
-    exists = con.execute("SELECT id FROM runs WHERE archive=?", (archive,)).fetchone()
-    if exists:
+    # Artifact identity, not config/run_id, governs deduplication. Legitimate
+    # repeat executions can share a run_id while producing different evidence.
+    same_name = con.execute(
+        "SELECT artifact_digest FROM runs WHERE archive=?", (archive,)
+    ).fetchone()
+    if same_name:
+        if same_name[0] == artifact_digest:
+            return "skipped"
+        return (
+            "error: archive basename collision with different artifact digest"
+        )
+    same_digest = con.execute(
+        "SELECT archive FROM runs WHERE artifact_digest=? LIMIT 1",
+        (artifact_digest,),
+    ).fetchone()
+    if same_digest:
         return "skipped"
 
     if "rejudged" in archive:
@@ -244,70 +523,214 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
 
     run_date, source_date, total_tokens, elapsed_s = _stamp_fields(
         kind, archive, data, cfg)
+    if strict and kind != "rejudge":
+        total_tokens = validated["total_tokens"]
+        elapsed_s = validated["elapsed_s"]
+
+    models = data.get("models") if isinstance(data.get("models"), dict) else {}
+    reader_model = models.get("reader") if isinstance(models.get("reader"), dict) else {}
+    judge_model = models.get("judge") if isinstance(models.get("judge"), dict) else {}
+    pipeline_model = (
+        models.get("memory_pipeline")
+        if isinstance(models.get("memory_pipeline"), dict) else {}
+    )
+    manifest = data.get("manifest") if isinstance(data.get("manifest"), dict) else {}
+    effective_hymem = (
+        cfg.get("effective_hymem_config")
+        if isinstance(cfg.get("effective_hymem_config"), dict) else {}
+    )
+    for key in (
+        "aggregation_nodes_enabled", "episode_granularity_enabled",
+        "value_supersession_enabled",
+    ):
+        if strict and key not in cfg and key in effective_hymem:
+            cfg[key] = effective_hymem[key]
+
+    embedding = models.get("embedding") if isinstance(
+        models.get("embedding"), dict
+    ) else {}
+    strict_count = validated["counts"]["expected"] if validated else None
+    abstention_count = validated.get("abstention_count") if validated else None
+    scored_run = bool(validated is not None and cfg.get("scored_run") is True)
+    retrieval_only = bool(
+        (validated is not None and cfg.get("retrieval_only") is True)
+        or legacy_retrieval_only
+    )
+    usage_exact = bool(
+        validated is not None
+        and all(validated.get(key) is not None for key in (
+            "answer_calls", "judge_calls", "retrieval_calls", "pipeline_calls",
+            "total_tokens", "elapsed_s",
+        ))
+    )
 
     extras = {
         "config": cfg,
         "scores": scores,
+        "models": data.get("models") if strict else None,
+        "execution": data.get("execution") if strict else None,
+        "strict_validation": (
+            {
+                "run_id": validated["run_id"],
+                "official_protocol_aligned": validated["official_protocol_aligned"],
+                "official_scoring_semantics_aligned": validated[
+                    "official_scoring_semantics_aligned"
+                ],
+                "official_denominator_validated": validated[
+                    "official_denominator_validated"
+                ],
+                "usage_exact": usage_exact,
+                "result_digest": data.get("result_digest"),
+                "artifact_digest": artifact_digest,
+            } if validated else None
+        ),
         "raw_json_keys": sorted(data.keys()),
+        "pointer_resolution": pointer_compatibility,
         "analyst_set": overrides,  # non-empty only when --set was used
     }
     proven = ["recorded" if k not in overrides else f"analyst:{k}={overrides[k]}" for k in overrides]
     prov = "recorded" if not overrides else "recorded + " + "; ".join(proven)
-    row = (archive,
-           kind,
-           run_date,
-           source_date,
-           _to_int(cfg.get("auto_ability")),
-           _to_int(cfg.get("no_dream")),
-           _to_int(cfg.get("permissive_default")),
-           _to_int(cfg.get("embeddings")),
-           _to_int(cfg.get("graph_facts_first")),
-           _to_int(cfg.get("graph_multihop")),
-           _to_int(cfg.get("distill")),
-           cfg.get("rerank_top_k"),
-           cfg.get("sample"),
-           cfg.get("scale"),
-           cfg.get("seed"),
-           cfg.get("workers"),
-           cfg.get("top_k"),
-           cfg.get("answer_model"),
-           cfg.get("judge_model"),
-           _to_int(cfg.get("mr_aggregate_additive")),
-           cfg.get("aggregation_nodes_enabled"),
-           cfg.get("episode_granularity_enabled"),
-           cfg.get("value_supersession_enabled"),
-           overall_acc,
-           cat("multi-session"),
-           cat("single-session-assistant"),
-           cat("single-session-preference"),
-           cat("single-session-user"),
-           cat("knowledge-update"),
-           cat("temporal-reasoning"),
-           _to_int(cfg.get("count")) or (overall.get("count") if isinstance(overall, dict) else None),
-           cfg.get("answer_calls"),
-           cfg.get("judge_calls"),
-           total_tokens,
-           elapsed_s,
-           prov,
-           json.dumps(extras, default=str),
-           )
-    try:  # row order must match INSERT: ..., elapsed_s, flags_provenance, extras
-        con.execute("""INSERT INTO runs (
-            archive, kind, run_date, source_date,
-            auto_ability, no_dream, permissive_default, embeddings,
-            graph_facts_first, graph_multihop, distill, rerank_top_k,
-            sample, scale, seed, workers, top_k, answer_model, judge_model,
-            mr_aggregate_additive,
-            aggregation_nodes_enabled, episode_granularity_enabled,
-            value_supersession_enabled,
-            overall, multi_session, single_session_assistant,
-            single_session_preference, single_session_user, knowledge_update,
-            temporal_reasoning, count, answer_calls, judge_calls,
-            total_tokens, elapsed_s, flags_provenance, extras)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", row)
+    row = {
+        "archive": archive, "kind": kind, "run_date": run_date,
+        "source_date": source_date,
+        "auto_ability": _to_int(cfg.get("auto_ability")),
+        "no_dream": _to_int(cfg.get("no_dream")),
+        "permissive_default": _to_int(cfg.get("permissive_default")),
+        "embeddings": _to_int(cfg.get("embeddings")),
+        "graph_facts_first": _to_int(cfg.get("graph_facts_first")),
+        "graph_multihop": _to_int(cfg.get("graph_multihop")),
+        "distill": _to_int(cfg.get("distill")),
+        "rerank_top_k": cfg.get("rerank_top_k"), "sample": cfg.get("sample"),
+        "scale": cfg.get("scale") or cfg.get("scales"), "seed": cfg.get("seed"),
+        "workers": cfg.get("workers"), "top_k": cfg.get("top_k"),
+        "answer_model": (
+            reader_model.get("model") if strict else cfg.get("answer_model")
+        ),
+        "judge_model": (
+            judge_model.get("model") if strict else cfg.get("judge_model")
+        ),
+        "mr_aggregate_additive": _to_int(cfg.get("mr_aggregate_additive")),
+        "aggregation_nodes_enabled": cfg.get("aggregation_nodes_enabled"),
+        "episode_granularity_enabled": cfg.get("episode_granularity_enabled"),
+        "value_supersession_enabled": cfg.get("value_supersession_enabled"),
+        "overall": overall_acc, "multi_session": cat("multi-session"),
+        "single_session_assistant": cat("single-session-assistant"),
+        "single_session_preference": cat("single-session-preference"),
+        "single_session_user": cat("single-session-user"),
+        "knowledge_update": cat("knowledge-update"),
+        "temporal_reasoning": cat("temporal-reasoning"),
+        "count": (
+            strict_count if strict else
+            (_to_int(cfg.get("count")) or (
+                overall.get("count") if isinstance(overall, dict) else None
+            ))
+        ),
+        "answer_calls": (
+            validated["answer_calls"] if validated else cfg.get("answer_calls")
+        ),
+        "judge_calls": (
+            validated["judge_calls"] if validated else cfg.get("judge_calls")
+        ),
+        "retrieval_calls": (
+            validated["retrieval_calls"] if validated else cfg.get("retrieval_calls")
+        ),
+        "total_tokens": total_tokens, "elapsed_s": elapsed_s,
+        "flags_provenance": (
+            "strict-v1 validated durable evidence" if strict else prov
+        ),
+        "extras": json.dumps(extras, default=str),
+        "run_id": validated.get("run_id") if validated else None,
+        "protocol": validated.get("judge_protocol") if validated else "legacy-unvalidated",
+        "protocol_split": manifest.get("protocol_split") if strict else None,
+        "calibration_receipt_hash": (
+            manifest.get("calibration_receipt_hash") if strict else None
+        ),
+        "strict_validated": int(strict),
+        "official_comparable": _to_int(
+            validated.get("official_comparable") if validated else None
+        ),
+        "development_only": _to_int(
+            validated.get("development_only") if validated else None
+        ),
+        "official_denominator_validated": _to_int(
+            validated.get("official_denominator_validated") if validated else None
+        ),
+        "official_protocol_aligned": _to_int(
+            validated.get("official_protocol_aligned") if validated else None
+        ),
+        "official_scoring_semantics_aligned": _to_int(
+            validated.get("official_scoring_semantics_aligned")
+            if validated else None
+        ),
+        "scored_run": int(scored_run) if strict else (0 if retrieval_only else None),
+        "retrieval_only": int(retrieval_only),
+        "label_free_answer_path": _to_int(
+            cfg.get("label_free_answer_path") if strict else None
+        ),
+        "exploratory_non_comparable": _to_int(
+            cfg.get("exploratory_non_comparable") if strict else None
+        ),
+        "abstention_count": abstention_count,
+        "answerable_count": (
+            strict_count - abstention_count
+            if strict_count is not None and abstention_count is not None else None
+        ),
+        "abstention_accuracy": (
+            validated.get("abstention_accuracy") if validated else None
+        ),
+        "answerable_accuracy": (
+            validated.get("answerable_accuracy") if validated else None
+        ),
+        "pipeline_calls": validated.get("pipeline_calls") if validated else None,
+        "usage_exact": int(usage_exact) if strict else None,
+        "dataset_revision": cfg.get("dataset_revision") if strict else None,
+        "dataset_sha256": cfg.get("dataset_sha256") if strict else None,
+        "source_ids_hash": cfg.get("source_ids_hash") if strict else None,
+        "evaluator_commit": cfg.get("evaluator_commit") if strict else None,
+        "evaluator_sha256": cfg.get("evaluator_sha256") if strict else None,
+        "reader_provider": reader_model.get("provider") if strict else None,
+        "reader_base_url": reader_model.get("base_url") if strict else None,
+        "judge_provider": judge_model.get("provider") if strict else None,
+        "judge_base_url": judge_model.get("base_url") if strict else None,
+        "pipeline_provider": pipeline_model.get("provider") if strict else None,
+        "pipeline_model": pipeline_model.get("model") if strict else None,
+        "pipeline_base_url": pipeline_model.get("base_url") if strict else None,
+        "embedding_backend": embedding.get("backend") if strict else None,
+        "embedding_model": embedding.get("model") if strict else None,
+        "embedding_base_url": embedding.get("base_url") if strict else None,
+        "embedding_dimension": embedding.get("dimension") if strict else None,
+        "embedding_quality": embedding.get("quality") if strict else None,
+        "embedding_network_free": _to_int(
+            embedding.get("network_free") if strict else None
+        ),
+        "preregistered": int(bool(cfg.get("prereg"))) if strict else None,
+        "result_digest": data.get("result_digest") if strict else None,
+        "artifact_digest": artifact_digest,
+    }
+    columns = list(row)
+    placeholders = ",".join("?" for _ in columns)
+    quoted_columns = ",".join(f'"{column}"' for column in columns)
+    try:
+        con.execute(
+            f"INSERT INTO runs ({quoted_columns}) VALUES ({placeholders})",
+            tuple(row[column] for column in columns),
+        )
         return "inserted"
-    except sqlite3.IntegrityError:
-        return "skipped"
+    except sqlite3.IntegrityError as exc:
+        same_name = con.execute(
+            "SELECT artifact_digest FROM runs WHERE archive=?", (archive,)
+        ).fetchone()
+        if same_name:
+            if same_name[0] == artifact_digest:
+                return "skipped"
+            return "error: archive basename collision with different artifact digest"
+        same_digest = con.execute(
+            "SELECT archive FROM runs WHERE artifact_digest=? LIMIT 1",
+            (artifact_digest,),
+        ).fetchone()
+        if same_digest:
+            return "skipped"
+        return f"error: registry integrity failure: {exc}"
 
 
 OVERRIDE_COLUMNS = {
@@ -607,6 +1030,9 @@ def cmd_arms(path_a, path_b, lever):
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] in {"-h", "--help"}:
+        print(__doc__)
+        return
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)

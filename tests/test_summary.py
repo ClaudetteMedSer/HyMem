@@ -4,8 +4,8 @@
     and rejects suspiciously short LLM outputs.
   * `persist_session_summary` writes to `sessions.summary` so the
     Honcho context endpoint can prefer it over the MEMORY.md dump.
-  * Quote-wrapped LLM output is stripped; long output is truncated to
-    500 characters.
+  * Quote-wrapped LLM output is stripped; over-cap output is held for retry
+  without advancing the durable digest cursor.
 """
 
 from __future__ import annotations
@@ -35,6 +35,25 @@ def _summary_llm(summary: str) -> StubLLMClient:
         fixtures={"Return the JSON object now": json.dumps(digest)},
         default="[]",
     )
+
+
+class _SequencedSummaryLLM:
+    def __init__(self, summaries: list[str]):
+        self.summaries = list(summaries)
+        self.calls = []
+
+    def complete(self, request) -> str:
+        import json
+
+        self.calls.append(request)
+        if "Return the JSON object now" not in request.user:
+            return "[]"
+        assert self.summaries, "unexpected extra digest retry"
+        return json.dumps({
+            "episodes": [],
+            "summary": self.summaries.pop(0),
+            "procedures": [],
+        })
 
 
 def _seed_session(hy: HyMem, sid: str, turns: list[tuple[str, str]]) -> None:
@@ -110,9 +129,7 @@ def test_existing_summary_is_not_overwritten(cfg, stub_llm):
 
 @pytest.mark.parametrize("raw", ["", "tiny", "  short  "])
 def test_short_llm_output_rejected(cfg, raw):
-    """The summarizer rejects outputs that are too short to be useful
-    (after stripping whitespace and surrounding quotes). After a dream
-    pass the sessions row carries no summary."""
+    """Only the explicit empty digest no-op advances; short prose is invalid."""
     hy = HyMem(cfg, llm=_summary_llm(raw))
     try:
         sid = "s_short"
@@ -124,7 +141,10 @@ def test_short_llm_output_rejected(cfg, raw):
         row = hy.conn.execute(
             "SELECT summary FROM sessions WHERE id = ?", (sid,),
         ).fetchone()
-        assert row["summary"] is None
+        if raw == "":
+            assert row["summary"] == ""
+        else:
+            assert row["summary"] is None
     finally:
         hy.close()
 
@@ -153,24 +173,42 @@ def test_quoted_summary_is_unwrapped(cfg):
         hy.close()
 
 
-def test_long_summary_is_truncated(cfg):
-    """The summarizer caps the persisted summary at 500 chars so an
-    overlong LLM response doesn't poison the context endpoint."""
+def test_long_summary_holds_cursor_and_heals_on_retry(cfg):
+    """An over-cap response is a failed outcome, never silent truncation."""
     long = "a" * 1200
-    hy = HyMem(cfg, llm=_summary_llm(long))
+    healed = "Reviewed the deployment runbook and recorded the exact outcome."
+    llm = _SequencedSummaryLLM([long, healed])
+    hy = HyMem(cfg, llm=llm)
     try:
         sid = "s_long"
         _seed_session(hy, sid, [
             ("assistant", "ok"),
             ("user", "A user turn long enough to clear the salience minimum threshold for chunking."),
         ])
-        hy.dream()
+        failed = hy.dream()
         row = hy.conn.execute(
-            "SELECT summary FROM sessions WHERE id = ?", (sid,),
+            "SELECT summary, digest_cursor_message_id, digest_retry_count, "
+            "digest_quarantined FROM sessions WHERE id = ?", (sid,),
         ).fetchone()
-        assert row["summary"] is not None
-        assert len(row["summary"]) == 500
-        assert set(row["summary"]) == {"a"}
+        assert row["summary"] is None
+        assert row["digest_cursor_message_id"] is None
+        assert row["digest_retry_count"] == 1
+        assert row["digest_quarantined"] == 0
+        assert failed.digest_failures == 1
+        assert failed.budget_exhausted is True
+
+        succeeded = hy.dream()
+        healed_row = hy.conn.execute(
+            "SELECT summary, coverage_message_id, digest_cursor_message_id, "
+            "digest_retry_count, digest_retry_config_version, digest_quarantined "
+            "FROM sessions WHERE id = ?", (sid,),
+        ).fetchone()
+        assert healed_row["summary"] == healed
+        assert healed_row["digest_cursor_message_id"] == healed_row["coverage_message_id"]
+        assert healed_row["digest_retry_count"] == 0
+        assert healed_row["digest_retry_config_version"] is None
+        assert healed_row["digest_quarantined"] == 0
+        assert succeeded.digest_failures == 0
     finally:
         hy.close()
 
@@ -222,8 +260,13 @@ def test_honcho_context_prefers_session_summary_over_memory_md(cfg, tmp_path):
     hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
     try:
         sid = "s_ctx"
-        hy.open_session(sid)
-        hy.log_message(sid, "user", "hello there")
+        hy.log_message(
+            sid,
+            "user",
+            "hello there",
+            source_peer_id="user",
+            source_workspace_id="hermes",
+        )
         with hy.conn:
             hy.conn.execute(
                 "UPDATE sessions SET summary = ? WHERE id = ?",

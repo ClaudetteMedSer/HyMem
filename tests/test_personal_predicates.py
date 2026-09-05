@@ -16,7 +16,7 @@ import json
 import pytest
 
 from hymem.extraction.prompts import ALLOWED_PREDICATES
-from hymem.extraction.llm import StubLLMClient
+from tests.conftest import PromptSourceAwareStub
 
 
 def _chunk(triples: list[dict]) -> str:
@@ -41,7 +41,7 @@ def test_personal_value_facts_mint_edges(hy):
     )
     hy.close_session(sid)
 
-    hy.set_llm(StubLLMClient(
+    hy.set_llm(PromptSourceAwareStub(
         fixtures={"Ford F-150": _chunk([
             {"subject": "user", "predicate": "owns", "object": "ford_f_150", "polarity": 1},
             {"subject": "user", "predicate": "located_in", "object": "austin", "polarity": 1},

@@ -1,5 +1,15 @@
 # LongMemEval / BEAM Retrieval Roadmap
 
+> **Historical development ledger.** Scores and gates below were produced under
+> superseded local/sample protocols and must not be presented as current,
+> official-comparable results. The strict adapter now pins the evaluator and S
+> dataset, keeps full-set work development-only, and fails closed on missing
+> rows, indexing health, identities, and usage. No replacement HyMem score has
+> been run yet. External figures are only orientation: Honcho vendor 90.4
+> (Haiku 4.5) / 92.6 (Gemini 3 Pro), Hindsight official March 2026 94.6
+> single-query, Mnemosyne 98.9 Recall@All@5 on 100 items (not end-to-end), and
+> BEAM-100K 65.2 on a separate workload.
+
 Single source of truth for HyMem retrieval-quality work against LongMemEval (LME)
 and BEAM. **Read this before proposing a change — most "obvious" ideas have already
 been tried; the dead-ends section says which and why.** Supersedes the original
@@ -29,21 +39,21 @@ lives on branch `Beam-optimisation`, uncommitted.
 | `mr_aggregate_additive` | `True` | MR layers a count on top of relevance retrieval (never replaces it) |
 | `message_fts_aggregate_cap` | `50` | exact count regardless of cap |
 | dream | **ON** | vindicated — net-neutral on LME overall, kept for the cross-session KG (product differentiator LME can't see) + the TR edge |
-| embedding_client | **NONE** by default; `--embeddings` wires it | semantic vec recall is score-neutral on LME (65.0→65.0, see L1) — wired for production faithfulness, not a score lever; off in the headline run |
+| embedding_client | **NONE** by default; `--embeddings` wires it | semantic vec recall was score-neutral on the historical LME run (65.0→65.0, see L1); off in that local snapshot |
 | adapter top_k overrides | `message_fts_top_k=15, fts_top_k=10, graph_top_k=10` | set in `HyMemAdapter.open()` |
 | reference-now | `question_date` prepended | `--now` source logged per run |
 
 **Run the baseline:**
 ```bash
-# Oracle (question_type drives shaping) — the headline number
-python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8
-# Production-truth (real detect_ability router drives shaping)
-python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 4 --auto-ability
+# Historical oracle-label diagnostic (exploratory)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8 --no-auto-ability --no-prereg
+# Label-free development run
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 4 --auto-ability --no-prereg
 ```
 `--auto-ability` OOMs at `--workers 8` (dual 50-session haystacks → ~16 concurrent
 dream cycles); use `--workers 4`.
 
-**Authoritative full-500 seed-0 matrix (default-flip live):**
+**Historical full-500 seed-0 matrix (superseded local protocol):**
 
 | Config | Overall | KU | MS | SS-A | SS-P | SS-U | TR |
 |---|---|---|---|---|---|---|---|
@@ -57,13 +67,13 @@ dream cycles); use `--workers 4`.
 **not** touch the MR/MS path (MS→MR ∈ TASK_RECALL → message-first in both columns).
 
 **How to read the two baselines:**
-- **65.0% (oracle)** is the headline / category-shaping ceiling.
-- **60.2% (auto-ability)** is the honest production number. The −4.8pp gap is **~77%
+- **65.0% (oracle)** was the exploratory category-shaping ceiling.
+- **60.2% (auto-ability)** was the label-free local result. The −4.8pp gap is **~77%
   the SS-P harness artifact** (30 Q × 61.6pp / 500 = 3.7pp). Net SS-P out and the
   production router matches oracle within noise. Do not quote −4.8pp as a retrieval
   regression — it isn't one (see dead-end D4).
-- Published SOTA for reference: Hindsight 89.4 / **HyMem 65.0** / Honcho 63.8 /
-  LIGHT 51.7 / RAG 48.5. The gap to Hindsight is concentrated in **MS** (multi-session).
+- Do not rank this matrix against current external results: its evaluator,
+  answer model, and evidence envelope differ from the strict protocol.
 
 ---
 
@@ -307,19 +317,12 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   (refusal→correct, all "I don't have enough information"→bridged), 0 T→F. Positive
   side-effects everywhere: KU +3.9, SS-A +3.6, SS-U +2.8 (92.9→95.7), MS +2.3, TR +0.7.**
   Clean win on the answerable axis; the abstention guard ("do not invent specific facts")
-  held (0 T→F on SS-P). **GATING CAVEAT — the abstention axis is UNMEASURED: the `_cleaned`
-  S dataset has ZERO `_abs` questions (all 500 answerable), so the answerable-vs-abstention
-  report shows n/a for abstention and CANNOT confirm the permissive default doesn't trade
-  refusals for hallucinations on unanswerable queries.** Since a permissive default's whole
-  risk lives on the abstention axis and production (Hermes) is full of unanswerable queries,
-  this is banked as an LME-ANSWERABLE win, NOT yet cleared to become a Hermes default.
-  **Loader hardened 2026-06-08:** `load_longmemeval_data` now derives the `_abs`
-  question_type from the official LongMemEval `question_id` suffix (official data flags
-  abstention on the id, not the type — judge + report key on the type), and the banner
-  prints whether abstention questions are present so a guard-rail-blind run is obvious.
-  **NEXT to actually clear it: re-run the A/B on an abstention-bearing dataset** (the
-  original/un-cleaned LongMemEval_S, or LongMemEval_M/oracle that retain `_abs`) and require
-  the abstention row to hold, not just answerable to lift.
+  held (0 T→F on SS-P). **Historical correction:** the pinned cleaned S source does
+  contain 30 IDs with `_abs`; the earlier “zero abstention” diagnosis and any gate
+  based on it are invalid. The strict loader now preserves the source's six base
+  `question_type` values and mirrors upstream by computing abstention separately as
+  `'_abs' in question_id`. That label is unavailable to sampling, retrieval, and the
+  reader; it is used only by the judge and post-answer diagnostics.
   **GATE CLEARED — MEASURED 2026-06-08 (abstention-bearing set, 500 incl. 30 `_abs`, seed 0,
   --auto-ability, strict vs permissive):** OVERALL 58.4 → 65.2 (+6.8pp). SS-P 13.3 → 56.7
   (+43.4pp, 14 F→T / 1 T→F = net +13). Answerable ALL 57.9 → 65.1. **Abstention ALL held
@@ -330,7 +333,7 @@ All landed on `Beam-optimisation`. Full suite green at each step (~470 tests).
   user-fact questions — where a hallucinated fact is most damaging); the one leak was on
   **multi-session synthesis**, the predictable soft spot (a permissive prompt licenses the
   cross-session bridging that MS over-extends into confabulation). **Verdict: cleared for
-  the LME headline; cleared-with-documented-caveat as a Hermes default — abstention guard is
+  the historical LME development score; cleared-with-documented-caveat as a Hermes default — abstention guard is
   tight on single-turn facts, leaky on multi-hop synthesis. Do NOT call the guard "perfectly
   tight"; the MS case forbids it. If shipped as Hermes default, either tighten the guard for
   the multi-hop case or accept MS abstention as the known monitored residual.**
@@ -741,7 +744,8 @@ lesson); nothing reads the oracle label. None re-chase D1–D9. Roughly EV-order
 
 - **P0 (measurement, run first). Reader-parity run.** One full-500 seed-0 run with a
   stronger answer model through the existing pluggable client — same config, same judge
-  posture. Decides how much of the 19pp gap to Hindsight (89.4) is reader strength vs
+  posture. Historically, this was framed as a 19pp gap to Hindsight's then-reported
+  89.4; that stale, protocol-mismatched figure is not a current comparison. The probe asks how much is reader strength vs
   architecture: even PERFECT MS only reaches ~82 from the 70.0 canonical baseline, so
   the gap is distributed and the reader is the dominant unmeasured variable (D2/D8/KU
   residual are all documented deepseek reader weaknesses). Report the reader alongside

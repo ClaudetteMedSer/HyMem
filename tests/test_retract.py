@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from hymem.core import db as core_db
+
 
 def _seed_edge(hy, subject: str, predicate: str, obj: str, pos: int = 3, neg: int = 0) -> int:
     cur = hy.conn.execute(
@@ -78,10 +80,11 @@ def test_retract_populates_extraction_feedback(hy):
         "'the api does NOT use docker, that was a misread of the dockerfile')"
     )
     edge_id = _seed_edge(hy, "api", "uses", "docker")
-    conn.execute(
-        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, 'c1', 1)",
-        (edge_id,),
-    )
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, 'c1', 1)",
+            (edge_id,),
+        )
 
     assert hy.retract_edge("api", "uses", "docker") is True
 

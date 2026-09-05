@@ -14,22 +14,52 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 # Add HyMem to path
 # Ensure the HyMem package is importable (repo root is two levels up from benchmarks/)
 _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root))
+
+from benchmarks.strictness import (
+    AtomicCheckpoint,
+    BenchmarkIntegrityError,
+    add_strict_run_arguments,
+    aggregate_embedding_usage_snapshots,
+    aggregate_usage_snapshots,
+    build_manifest,
+    code_hash,
+    converge_indexing,
+    content_hash,
+    dataclass_identity,
+    embedding_usage_snapshot,
+    freeze_calibration,
+    load_calibration,
+    resolve_checkpoint_path,
+    select_protocol_ids,
+    usage_snapshot,
+    validate_ids,
+    write_immutable_artifact,
+    write_latest_pointer,
+)
+from longmemeval_adapter import (
+    _detect_ability,
+    _detect_ability_safe,
+    _render_answer_context,
+)
 
 import requests as http
 
@@ -39,12 +69,112 @@ DEFAULT_SCALE = "100K"
 DEFAULT_SAMPLE = 3
 DEFAULT_TOP_K = 10
 MAX_CONTEXT_CHARS = 8000
+DEFAULT_MAX_INPUT_TOKENS = 16000
+DEFAULT_EMBEDDING_BACKEND = "local-hash"
+DEFAULT_LOCAL_EMBEDDING_MODEL = "hymem-local-feature-hash-v1"
+DEFAULT_LOCAL_EMBEDDING_DIM = 384
+DEFAULT_REMOTE_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_REMOTE_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_REMOTE_EMBEDDING_DIM = 1536
+VALID_BEAM_SCALES = ("100K", "500K", "1M", "10M")
+VALID_BEAM_MESSAGE_ROLES = frozenset({"user", "assistant"})
+RESERVED_CHAT_BODY_KEYS = frozenset({
+    "model", "messages", "temperature", "max_tokens",
+})
 
 # DeepSeek API
 DEEPSEEK_API_KEY = ""
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 ANSWER_MODEL = "deepseek-v4-flash"
 JUDGE_MODEL = "deepseek-v4-flash"
+OFFICIAL_JUDGE_SPEC = "openai:gpt-4.1-mini"
+BEAM_UPSTREAM_COMMIT = "b2da22eac88bb0874c64665f13457eb99835774a"
+BEAM_OFFICIAL_EVALUATOR_URL = (
+    "https://github.com/mohammadtavakoli78/BEAM/blob/"
+    f"{BEAM_UPSTREAM_COMMIT}/src/evaluation/compute_metrics.py#L339-L636"
+)
+BEAM_OFFICIAL_PROMPT_URL = (
+    "https://github.com/mohammadtavakoli78/BEAM/blob/"
+    f"{BEAM_UPSTREAM_COMMIT}/src/prompts.py#L11547-L11616"
+)
+
+# Vendored byte-for-byte from upstream ``unified_llm_judge_base_prompt`` at
+# BEAM_UPSTREAM_COMMIT. Upstream invokes this prompt once per rubric criterion
+# as a user message, with temperature 0 and gpt-4.1-mini. The probing question
+# argument is not substituted by the official evaluator.
+OFFICIAL_JUDGE_PROMPT = """
+You are an expert evaluator tasked with judging whether the LLM's response demonstrates compliance with the specified RUBRIC CRITERION.
+
+## EVALUATION INPUTS
+- RUBRIC CRITERION (what to check): <rubric_item>
+- RESPONSE TO EVALUATE: <llm_response>
+
+## EVALUATION RUBRIC:
+The rubric defines a specific requirement, constraint, or expected behavior that the LLM response should demonstrate. 
+
+**IMPORTANT**: Pay careful attention to whether the rubric specifies:
+- **Positive requirements** (things the response SHOULD include/do)
+- **Negative constraints** (things the response SHOULD NOT include/do, often indicated by "no", "not", "avoid", "absent")
+
+## RESPONSIVENESS REQUIREMENT
+A compliant response must be **on-topic** and attempt to answer it.
+- If the response does not address the QUESTION, score **0.0** and stop.
+- For negative constraints, both must hold: (a) the response is responsive to the QUESTION, and (b) the prohibited element is absent.
+
+## SEMANTIC TOLERANCE RULES:
+Judge by meaning, not exact wording.
+- Accept **paraphrases** and **synonyms** that preserve intent.
+- **Case/punctuation/whitespace** differences must be ignored.
+- **Numbers/currencies/dates** may appear in equivalent forms (e.g., “$68,000”, “68k”, “68,000 USD”, or “sixty-eight thousand dollars”). Treat them as equal when numerically equivalent.
+- If the rubric expects a number or duration, prefer **normalized comparison** (extract and compare values) over string matching.
+
+## STYLE NEUTRALITY (prevents style contamination):
+Ignore tone, politeness, length, and flourish unless the rubric explicitly requires a format/structure (e.g., “itemized list”, “no citations”, “one sentence”).
+- Do **not** penalize hedging, voice, or verbosity if content satisfies the rubric.
+- Only evaluate format when the rubric **explicitly** mandates it.
+
+## SCORING SCALE:
+- **1.0 (Complete Compliance)**: Fully complies with the rubric criterion.
+  - Positive: required element present, accurate, properly executed (allowing semantic equivalents).
+  - Negative: prohibited element **absent** AND response is **responsive**.
+  
+- **0.5 (Partial Compliance)**: Partially complies.
+  - Positive: element present but minor inaccuracies/incomplete execution.
+  - Negative: generally responsive and mostly avoids the prohibited element but with minor/edge violations.
+  
+- **0.0 (No Compliance)**: Fails to comply.
+  - Positive: required element missing or incorrect.
+  - Negative: prohibited element present **or** response is non-responsive/evasive even if the element is absent.
+
+## EVALUATION INSTRUCTIONS:
+1. **Understand the Requirement**: Determine if the rubric is asking for something to be present (positive) or absent (negative/constraint).
+
+2. **Parse Compound Statements**: If the rubric contains multiple elements connected by "and" or commas, evaluate whether:
+   - **All elements** must be present for full compliance (1.0)
+   - **Some elements** present indicates partial compliance (0.5)
+   - **No elements** present indicates no compliance (0.0)
+   
+3. **Check Compliance**: 
+   - For positive requirements: Look for the presence and quality of the required element
+   - For negative constraints: Look for the absence of the prohibited element
+
+4. **Assign Score**: Based on compliance with the specific rubric criterion according to the scoring scale above.
+
+5. **Provide Reasoning**: Explain whether the rubric criterion was satisfied and justify the score.
+
+## OUTPUT FORMAT:
+Return your evaluation in JSON format with two fields:
+
+{
+   "score": [your score: 1.0, 0.5, or 0.0],
+   "reason": "[detailed explanation of whether the rubric criterion was satisfied and why this justified the assigned score]"
+}
+
+NOTE: ONLY output the json object, without any explanation before or after that
+"""
+BEAM_OFFICIAL_JUDGE_PROMPT_HASH = (
+    "sha256:" + hashlib.sha256(OFFICIAL_JUDGE_PROMPT.encode("utf-8")).hexdigest()
+)
 
 # Recency-conflict resolution — imported from the LME adapter's dating fix.
 # When a fact was UPDATED over time, the model can prefer the newest *value-bearing*
@@ -193,6 +323,35 @@ _ALL_GOLD_KEYS = ("ideal_response", "ideal_answer", "answer", "ideal_summary",
 _gold_warnings: set = set()
 
 
+def _resolve_gold_with_metadata(
+    q: dict, ability: str,
+) -> tuple[str, str, str | None, str]:
+    """Resolve gold and report whether the canonical field matched exactly."""
+
+    field, kind = GOLD_FIELDS.get(ability, (None, None))
+    if field:
+        text = q.get(field)
+        if isinstance(text, (list, tuple)):
+            text = " ".join(str(t) for t in text)
+        if isinstance(text, str) and text.strip():
+            return text, kind, field, "exact"
+    present = [
+        key for key in _ALL_GOLD_KEYS
+        if isinstance(q.get(key), str) and q[key].strip()
+    ]
+    if present:
+        recovered_field = present[0]
+        _gold_warnings.add((ability, field, recovered_field))
+        print(
+            f"  WARN gold-field map miss: ability={ability!r} expected "
+            f"{field!r}, recovered from {recovered_field!r}. Update "
+            "GOLD_FIELDS -- a recovered field's KIND is a guess.",
+            flush=True,
+        )
+        return str(q[recovered_field]), (kind or "unknown"), recovered_field, "recovered"
+    return "", "none", None, "missing"
+
+
 def _resolve_gold(q: dict, ability: str) -> tuple[str, str]:
     """(text, kind) for one question, loudly rather than silently.
 
@@ -201,44 +360,30 @@ def _resolve_gold(q: dict, ability: str) -> tuple[str, str]:
     nothing returns kind "none", which is a value the probe and the gold audit
     both check for; it is never an empty string standing in for an answer.
     """
-    field, kind = GOLD_FIELDS.get(ability, (None, None))
-    if field:
-        text = (q.get(field) or "")
-        if isinstance(text, (list, tuple)):
-            text = " ".join(str(t) for t in text)
-        if str(text).strip():
-            return str(text), kind
-    present = [k for k in _ALL_GOLD_KEYS if str(q.get(k) or "").strip()]
-    if present:
-        recovered = str(q.get(present[0]))
-        warn = (ability, field, present[0])
-        if warn not in _gold_warnings:
-            _gold_warnings.add(warn)
-            print(f"  WARN gold-field map miss: ability={ability!r} expected "
-                  f"{field!r}, recovered from {present[0]!r}. Update "
-                  f"GOLD_FIELDS -- a recovered field's KIND is a guess.",
-                  flush=True)
-        return recovered, (kind or "unknown")
-    return "", "none"
-
-
-PUBLISHED_SOTA = {
-    "100K": {"Hindsight": 73.4, "Honcho": 63.0, "Mnemosyne v3": 65.2, "LIGHT": 35.8, "RAG": 32.3},
-    "500K": {"Hindsight": 71.1, "Honcho": 64.9, "LIGHT": 35.9, "RAG": 33.0},
-    "1M":   {"Hindsight": 73.9, "Honcho": 63.1, "LIGHT": 33.6, "RAG": 30.7},
-    "10M":  {"Hindsight": 64.1, "Honcho": 40.6, "LIGHT": 26.6, "RAG": 24.9},
-}
+    text, kind, _field, _resolution = _resolve_gold_with_metadata(q, ability)
+    return text, kind
 
 
 # ── LLM Client ────────────────────────────────────────────────────────────
 
 class LLMClient:
     def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
-                 extra_body: dict | None = None):
+                 extra_body: dict | None = None, token_counter=None):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.call_count = 0
+        self.request_attempts = 0
+        self.successful_responses = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.total_latency_s = 0.0
+        self.token_usage_available = False
+        self._usage_complete = True
+        if token_counter is not None and not callable(token_counter):
+            raise TypeError("token_counter must be callable or None")
+        self._token_counter = token_counter
         # Provider-specific request fields (DeepSeek's `thinking` switch is the
         # only one in use). EMPTY BY DEFAULT and only ever set from an explicit
         # flag: an unflagged run must send the same bytes it sent before this
@@ -246,7 +391,7 @@ class LLMClient:
         # comparator. That is why this is not the `auto` host-substring gate
         # hymem/contrib/openai_client.py:81-86 uses for the library client --
         # a benchmark cannot afford a request-body change it did not ask for.
-        self.extra_body = dict(extra_body or {})
+        self.extra_body = validate_request_extra_body(extra_body or {})
         # Why the response ENDED, kept from the last call. B2 (2026-09-01) hit
         # a silent-0 whose cause -- the judge scoring 1.0 and then running out
         # of tokens mid-explanation -- was only recoverable by eyeballing the
@@ -257,7 +402,15 @@ class LLMClient:
         # request byte. Single-threaded client, so plain attribute state.
         self.last_finish_reason = None
 
-    def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
+    def count_tokens(self, text: str) -> int:
+        if self._token_counter is None:
+            raise RuntimeError("no trusted tokenizer configured for this model")
+        return self._token_counter(text)
+
+    def chat(
+        self, messages: list, temperature: float = 0.1,
+        max_tokens: int | None = 1024,
+    ) -> str:
         # Cleared per call, so a stale value from an earlier row can never be
         # read as this row's -- absence must look like absence.
         self.last_finish_reason = None
@@ -267,6 +420,8 @@ class LLMClient:
                 return self._call(messages, temperature, max_tokens)
             except Exception as e:
                 last_error = str(e)
+                self._usage_complete = False
+                self.token_usage_available = False
                 if "429" in last_error or "rate" in last_error.lower():
                     time.sleep(15 * (attempt + 1))
                 elif attempt < 2:
@@ -275,21 +430,46 @@ class LLMClient:
                     break
         return f"[LLM_ERROR: {last_error[:100]}]"
 
-    def _call(self, messages: list, temperature: float, max_tokens: int) -> str:
-        body = {"model": self.model, "messages": messages,
-                "temperature": temperature, "max_tokens": max_tokens}
-        # Merge last so a caller can force provider-specific fields; collisions
-        # with the four keys above are the caller's (mirrors LME :373).
+    def _call(
+        self, messages: list, temperature: float, max_tokens: int | None,
+    ) -> str:
+        body = {
+            "model": self.model, "messages": messages,
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        # Only provider-specific extensions reach this merge. Core request
+        # identity is immutable and was rejected at construction if supplied.
         body.update(self.extra_body)
-        resp = http.post(
-            f"{self.base_url}/chat/completions",
-            json=body,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            timeout=120,
+        self.request_attempts += 1
+        started = time.monotonic()
+        try:
+            resp = http.post(
+                f"{self.base_url}/chat/completions",
+                json=body,
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        finally:
+            self.total_latency_s += time.monotonic() - started
+        usage = data.get("usage") if isinstance(data, dict) else None
+        required = ("prompt_tokens", "completion_tokens", "total_tokens")
+        valid_usage = isinstance(usage, dict) and all(
+            isinstance(usage.get(key), (int, float))
+            and not isinstance(usage.get(key), bool)
+            and math.isfinite(float(usage[key]))
+            and usage[key] >= 0
+            for key in required
         )
-        resp.raise_for_status()
-        data = resp.json()
-        self.call_count += 1
+        if valid_usage:
+            self.prompt_tokens += usage["prompt_tokens"]
+            self.completion_tokens += usage["completion_tokens"]
+            self.total_tokens += usage["total_tokens"]
+        else:
+            self._usage_complete = False
         choice = data["choices"][0]
         # Set BEFORE the empty-content check: the trap's whole signature is
         # content == "" together with finish_reason == "length", so the field
@@ -309,15 +489,20 @@ class LLMClient:
             raise RuntimeError(
                 f"empty content (finish={choice.get('finish_reason')}, "
                 f"reasoning={len(choice['message'].get('reasoning_content') or '')} chars)")
+        self.call_count += 1
+        self.successful_responses += 1
+        self.token_usage_available = (
+            self.successful_responses > 0 and self._usage_complete
+        )
         return content
 
 
 # ── Answer-model provider registry ────────────────────────────────────────
 # The BEAM ANSWERER is swappable to isolate the answer-side ceiling (KU/CR/EO
 # all fail on context that is already present, 2026-06) from extraction/assembly.
-# ONLY the answerer changes here: extraction + dream stay on DeepSeek
-# (HyMemAdapter, untouched), and the JUDGE stays DeepSeek always — swapping the
-# grader would move scores without moving capability, breaking the A/B. Each
+# ONLY the answerer changes here: extraction + dream use the separately
+# manifested HyMem pipeline, and the judge uses the selected protocol/provider.
+# Each
 # provider exposes an OpenAI-compatible /chat/completions endpoint, so the same
 # LLMClient payload works. Spec form is "provider:model"
 # (e.g. "gemini:gemini-2.5-flash"); a bare model name ("deepseek-chat") stays on
@@ -329,24 +514,65 @@ ANSWER_PROVIDERS = {
 }
 
 
-def resolve_answer_provider(spec: str, deepseek_key: str):
+def validate_request_extra_body(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Reject fields that could make the wire request disagree with manifest."""
+
+    if not isinstance(value, Mapping):
+        raise BenchmarkIntegrityError("request extra_body must be an object")
+    collisions = RESERVED_CHAT_BODY_KEYS & set(value)
+    if collisions:
+        raise BenchmarkIntegrityError(
+            "request extra_body cannot override core field(s): "
+            f"{sorted(collisions)}"
+        )
+    return dict(value)
+
+
+def parse_provider_spec(spec: str) -> tuple[str, str, str]:
+    """Resolve provider/model/base without reading credentials."""
+
+    if ":" in spec and spec.split(":", 1)[0] in ANSWER_PROVIDERS:
+        provider, model = spec.split(":", 1)
+    else:
+        provider, model = "deepseek", spec
+    if not model.strip():
+        raise BenchmarkIntegrityError("model spec must contain a model id")
+    return provider, model, ANSWER_PROVIDERS[provider][0]
+
+
+def is_official_judge_configuration(
+    *, protocol: str, provider: str, model: str, base_url: str,
+    extra_body: Mapping[str, Any],
+) -> bool:
+    return bool(
+        protocol == "official"
+        and provider == "openai"
+        and model == "gpt-4.1-mini"
+        and base_url.rstrip("/") == "https://api.openai.com/v1"
+        and not extra_body
+    )
+
+
+def resolve_answer_provider(
+    spec: str, deepseek_key: str, *, role: str = "answer",
+):
     """Map an answer-model spec to (model, base_url, api_key, provider).
 
     'provider:model' selects a provider and pulls its key from the first set
     env var in that provider's tuple; a bare model name stays on DeepSeek and
     reuses the already-resolved DeepSeek key. Exits if a non-DeepSeek provider
     is selected without its key set."""
-    if ":" in spec and spec.split(":", 1)[0] in ANSWER_PROVIDERS:
-        provider, model = spec.split(":", 1)
-    else:
-        provider, model = "deepseek", spec
-    base_url, key_envs = ANSWER_PROVIDERS[provider]
+    provider, model, base_url = parse_provider_spec(spec)
+    key_envs = ANSWER_PROVIDERS[provider][1]
     if provider == "deepseek":
         api_key = deepseek_key
     else:
         api_key = next((os.environ[e] for e in key_envs if os.environ.get(e)), "")
         if not api_key:
-            print(f"ERROR: answer provider '{provider}' needs one of {key_envs} set.", flush=True)
+            print(
+                f"ERROR: {role} provider '{provider}' needs one of "
+                f"{key_envs} set.", flush=True,
+            )
             sys.exit(1)
     return model, base_url, api_key, provider
 
@@ -534,7 +760,9 @@ def pick_canary_question(conversations: dict, scales: list) -> dict:
     return questions[0]
 
 
-def run_canary(role: str, llm: LLMClient, messages: list, max_tokens: int) -> str:
+def run_canary(
+    role: str, llm: LLMClient, messages: list, max_tokens: int | None,
+) -> str:
     """One real-shaped call per client, before the run spends anything.
 
     A trivial 'say OK' prompt cannot reproduce the trap: the model has to burn
@@ -556,7 +784,29 @@ def run_canary(role: str, llm: LLMClient, messages: list, max_tokens: int) -> st
     return raw
 
 
-def build_canary_messages(conversations: dict, scales: list, judge_gold: bool) -> dict:
+def _run_canary_with_checkpoint(
+    ledger: AtomicCheckpoint,
+    segment_id: str,
+    segment_snapshot,
+    role: str,
+    llm: LLMClient,
+    messages: list,
+    max_tokens: int | None,
+) -> str:
+    """Run a canary and durably persist its spend even when it aborts."""
+
+    try:
+        return run_canary(role, llm, messages, max_tokens)
+    finally:
+        ledger.update_execution_segment(
+            segment_id, segment_snapshot("running")
+        )
+
+
+def build_canary_messages(
+    conversations: dict, scales: list, judge_gold: bool,
+    judge_protocol: str = "legacy-custom",
+) -> dict:
     """Assemble both canary prompts without calling anything.
 
     Split out of main() so the ASSEMBLY is testable. Stubbing chat() -- which
@@ -567,6 +817,18 @@ def build_canary_messages(conversations: dict, scales: list, judge_gold: bool) -
     """
     q = pick_canary_question(conversations, scales)
     ideal = select_judge_ideal(judge_gold, q.get("gold_text"), q["ideal_answer"])
+    if judge_protocol == "official":
+        judge_messages = lambda ai_answer: _official_judge_messages(
+            q["rubric"][0], ai_answer
+        )
+    elif judge_protocol == "legacy-custom":
+        judge_messages = lambda ai_answer: _judge_messages(
+            q["question"], ideal, q["rubric"], ai_answer
+        )
+    else:
+        raise BenchmarkIntegrityError(
+            f"unknown BEAM judge protocol: {judge_protocol!r}"
+        )
     return {
         "ability": q["ability_short"],
         "answer": [
@@ -581,7 +843,7 @@ def build_canary_messages(conversations: dict, scales: list, judge_gold: bool) -
              "content": f"CONTEXT:\n(canary: no retrieved memories)"
                         f"\n\nQUESTION: {q['question']}\n\nANSWER:"},
         ],
-        "judge": lambda ai_answer: _judge_messages(q["question"], ideal, q["rubric"], ai_answer),
+        "judge": judge_messages,
     }
 
 
@@ -927,18 +1189,29 @@ def resolve_dataset_revisions(scales: list[str], pin: str | None = None) -> dict
     input nothing witnesses. A revision that cannot be resolved is recorded as
     null rather than omitted: "we do not know" is itself a fact about the run.
     """
+    repos = tuple(dict.fromkeys(beam_repo(scale) for scale in scales))
+    if pin and len(repos) > 1:
+        raise BenchmarkIntegrityError(
+            "one --dataset-revision cannot identify commits in both BEAM "
+            "repositories; run the repositories separately"
+        )
     out = {}
     for scale in scales:
         repo = beam_repo(scale)
         if repo in out:
             continue
-        if pin:
-            out[repo] = pin
-            continue
         try:
             from huggingface_hub import HfApi
-            out[repo] = HfApi().dataset_info(repo).sha
+            if pin:
+                out[repo] = HfApi().dataset_info(repo, revision=pin).sha
+            else:
+                out[repo] = HfApi().dataset_info(repo).sha
         except Exception as e:
+            if pin:
+                raise BenchmarkIntegrityError(
+                    "could not resolve explicit BEAM dataset revision "
+                    f"{pin!r} for {repo}: {type(e).__name__}: {e}"
+                ) from e
             out[repo] = None
             print(f"  WARNING: could not resolve {repo} revision "
                   f"({type(e).__name__}: {e}); recorded as null — this artifact "
@@ -946,40 +1219,141 @@ def resolve_dataset_revisions(scales: list[str], pin: str | None = None) -> dict
     return out
 
 
+def validate_dataset_revision_binding(
+    revisions: Mapping[str, str | None], *, canonical: bool,
+) -> tuple[str, ...]:
+    """Return unresolved repositories, rejecting them for canonical runs."""
+
+    unresolved = tuple(sorted(
+        repo for repo, revision in revisions.items()
+        if not isinstance(revision, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40,64}", revision.strip()) is None
+    ))
+    if unresolved and canonical:
+        raise BenchmarkIntegrityError(
+            "canonical BEAM run requires resolved dataset revisions; unresolved: "
+            f"{list(unresolved)}"
+        )
+    return unresolved
+
+
+def _label_blind_conversation_sample(
+    conversations: list[dict], max_conv: int | None, *, seed: int, scale: str,
+) -> list[dict]:
+    """Select conversations deterministically without inspecting QA labels."""
+
+    if max_conv is None or max_conv >= len(conversations):
+        return list(conversations)
+    if isinstance(max_conv, bool) or not isinstance(max_conv, int) or max_conv <= 0:
+        raise BenchmarkIntegrityError("BEAM sample size must be positive or None")
+    ranked = sorted(
+        enumerate(conversations),
+        key=lambda pair: content_hash({
+            "seed": seed,
+            "scale": scale,
+            "source_index": pair[0],
+            "conversation_id": pair[1].get("id"),
+        }),
+    )
+    chosen_indices = sorted(index for index, _conv in ranked[:max_conv])
+    return [conversations[index] for index in chosen_indices]
+
+
 def load_beam_conversations(scales: list[str], max_conv: int = None,
-                            revision: str | None = None) -> dict:
+                            revision: str | None = None,
+                            seed: int | None = None,
+                            revisions: Mapping[str, str | None] | None = None) -> dict:
     from datasets import load_dataset
 
     data = {}
     for scale in scales:
         print(f"  Loading BEAM {scale}...", flush=True)
+        repo = beam_repo(scale)
+        if revisions is not None and repo not in revisions:
+            raise BenchmarkIntegrityError(
+                f"BEAM revision binding is missing repository {repo}"
+            )
+        bound_revision = revisions[repo] if revisions is not None else revision
         if scale == "10M":
-            ds = load_dataset(BEAM_REPO_10M, streaming=True, revision=revision)
-            split_name = list(ds.keys())[0]
+            ds = load_dataset(
+                BEAM_REPO_10M, streaming=True, revision=bound_revision
+            )
+            if "10M" not in ds:
+                raise BenchmarkIntegrityError(
+                    "BEAM-10M dataset does not contain the requested 10M split"
+                )
+            split_name = "10M"
             conversations = []
             for i, sample in enumerate(ds[split_name]):
-                if max_conv and i >= max_conv:
+                if seed is None and max_conv and i >= max_conv:
                     break
                 conversations.append(_parse_sample(sample, scale, i))
-            data[scale] = conversations
         else:
-            ds = load_dataset(BEAM_REPO, streaming=False, revision=revision)
+            ds = load_dataset(
+                BEAM_REPO, streaming=False, revision=bound_revision
+            )
             if scale not in ds:
-                continue
+                raise BenchmarkIntegrityError(
+                    f"BEAM dataset does not contain requested split {scale!r}"
+                )
             conversations = []
             for i, sample in enumerate(ds[scale]):
-                if max_conv and i >= max_conv:
+                if seed is None and max_conv and i >= max_conv:
                     break
                 conversations.append(_parse_sample(sample, scale, i))
-            data[scale] = conversations
+        if seed is not None:
+            conversations = _label_blind_conversation_sample(
+                conversations, max_conv, seed=seed, scale=scale
+            )
+        data[scale] = conversations
         print(f"    Loaded {len(conversations)} conversations", flush=True)
     return data
 
 
+OFFICIAL_BEAM_DENOMINATORS = {
+    "100K": {"conversations": 20, "questions": 400},
+    "500K": {"conversations": 35, "questions": 700},
+    "1M": {"conversations": 35, "questions": 700},
+    "10M": {"conversations": 10, "questions": 200},
+}
+
+
+def validate_official_denominators(
+    conversations: Mapping[str, list[dict]], scales: list[str],
+) -> None:
+    """Reject silently shortened official BEAM scale loads."""
+
+    for scale in scales:
+        expected = OFFICIAL_BEAM_DENOMINATORS[scale]
+        rows = conversations.get(scale)
+        if rows is None:
+            raise BenchmarkIntegrityError(f"BEAM scale {scale} was not loaded")
+        questions = sum(len(conv.get("questions", ())) for conv in rows)
+        actual = {"conversations": len(rows), "questions": questions}
+        if actual != expected:
+            raise BenchmarkIntegrityError(
+                f"BEAM {scale} denominator mismatch: expected {expected}, got {actual}"
+            )
+        for conv in rows:
+            ability_counts = Counter(
+                q.get("ability_short") for q in conv.get("questions", ())
+            )
+            expected_abilities = {
+                ability: 2 for ability in ABILITY_MAP.values()
+            }
+            if ability_counts != expected_abilities:
+                raise BenchmarkIntegrityError(
+                    f"BEAM {scale}/{conv.get('id')} ability distribution "
+                    f"mismatch: expected {expected_abilities}, got "
+                    f"{dict(ability_counts)}"
+                )
+
+
 def _parse_time_anchor(raw: str | None) -> str | None:
     """BEAM stamps each session block's opening message with a time anchor
-    like 'March-15-2024' — the in-world date of that session. Returns an
-    ISO date, or None when absent/unparseable (→ ingestion-time fallback)."""
+    like 'March-15-2024' — the in-world date of that session. Invalid input
+    returns None so the canonical parser can reject it before ingestion;
+    scored runs never fall back to wall-clock time."""
     if not raw:
         return None
     for fmt in ("%B-%d-%Y", "%b-%d-%Y", "%B %d, %Y", "%Y-%m-%d"):
@@ -1029,46 +1403,175 @@ def print_gold_audit(conversations: dict) -> None:
 
 
 def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
+    if not isinstance(sample, dict):
+        raise BenchmarkIntegrityError(f"BEAM {scale}/{idx} sample must be an object")
+    source_conv_id = sample.get("conversation_id")
+    if source_conv_id is None:
+        source_conv_id = idx
+    if isinstance(source_conv_id, bool) or not isinstance(source_conv_id, (str, int)):
+        raise BenchmarkIntegrityError(
+            f"BEAM {scale}/{idx} conversation_id must be a string or integer"
+        )
+    conv_id = str(source_conv_id).strip()
+    if not conv_id:
+        raise BenchmarkIntegrityError(f"BEAM {scale}/{idx} conversation_id is empty")
     all_messages = []
-    chat = sample.get("chat", [])
-    for block in chat:
-        if isinstance(block, list):
-            # One anchor per session block (carried by its first message);
-            # it dates every turn of that session.
-            block_date = None
-            for msg in block:
-                if isinstance(msg, dict) and msg.get("time_anchor"):
-                    block_date = _parse_time_anchor(msg["time_anchor"])
-                    if block_date:
-                        break
-            for msg in block:
-                if isinstance(msg, dict):
-                    all_messages.append({
-                        "role": msg.get("role", "unknown"),
-                        "content": msg.get("content", ""),
-                        "date": block_date,
-                    })
+    chat = sample.get("chat")
+    if not isinstance(chat, list) or not chat:
+        raise BenchmarkIntegrityError(
+            f"BEAM {scale}/{conv_id} chat must be a non-empty list of session blocks"
+        )
+    for block_index, block in enumerate(chat):
+        if not isinstance(block, list) or not block:
+            raise BenchmarkIntegrityError(
+                f"BEAM {scale}/{conv_id} chat block {block_index} must be a non-empty list"
+            )
+        # One anchor per session block (carried by its first anchored message);
+        # it dates every turn of that session. A provided but unreadable anchor
+        # must never silently fall back to the wall clock.
+        block_date = None
+        anchor_count = 0
+        for message_index, msg in enumerate(block):
+            if not isinstance(msg, dict):
+                raise BenchmarkIntegrityError(
+                    f"BEAM {scale}/{conv_id} chat {block_index}/{message_index} "
+                    "must be an object"
+                )
+            role = msg.get("role")
+            content = msg.get("content")
+            if not isinstance(role, str) or not role.strip():
+                raise BenchmarkIntegrityError(
+                    f"BEAM {scale}/{conv_id} chat {block_index}/{message_index} "
+                    "has a malformed role"
+                )
+            normalized_role = role.strip()
+            if normalized_role not in VALID_BEAM_MESSAGE_ROLES:
+                raise BenchmarkIntegrityError(
+                    f"BEAM {scale}/{conv_id} chat {block_index}/{message_index} "
+                    f"has unsupported role {role!r}"
+                )
+            if not isinstance(content, str):
+                raise BenchmarkIntegrityError(
+                    f"BEAM {scale}/{conv_id} chat {block_index}/{message_index} "
+                    "has non-string content"
+                )
+            if "time_anchor" in msg and msg["time_anchor"] is not None:
+                anchor_count += 1
+                raw_anchor = msg["time_anchor"]
+                if not isinstance(raw_anchor, str) or not raw_anchor.strip():
+                    raise BenchmarkIntegrityError(
+                        f"BEAM {scale}/{conv_id} chat {block_index}/{message_index} "
+                        "has a malformed time_anchor"
+                    )
+                parsed_anchor = _parse_time_anchor(raw_anchor)
+                if parsed_anchor is None:
+                    raise BenchmarkIntegrityError(
+                        f"BEAM {scale}/{conv_id} chat {block_index}/{message_index} "
+                        f"has an unparseable time_anchor: {raw_anchor!r}"
+                    )
+                if block_date is not None and parsed_anchor != block_date:
+                    raise BenchmarkIntegrityError(
+                        f"BEAM {scale}/{conv_id} chat block {block_index} has "
+                        "conflicting time anchors"
+                    )
+                block_date = parsed_anchor
+        if anchor_count != 1 or block_date is None:
+            raise BenchmarkIntegrityError(
+                f"BEAM {scale}/{conv_id} chat block {block_index} must carry "
+                "exactly one parseable time_anchor"
+            )
+        for msg in block:
+            all_messages.append({
+                "role": msg["role"].strip(),
+                "content": msg["content"],
+                "date": block_date,
+            })
+    if not any(message["content"].strip() for message in all_messages):
+        raise BenchmarkIntegrityError(
+            f"BEAM {scale}/{conv_id} chat contains no message content"
+        )
 
     pq_raw = sample.get("probing_questions", "{}")
     if isinstance(pq_raw, str):
         try:
             probing = ast.literal_eval(pq_raw)
-        except Exception:
-            probing = {}
+        except Exception as exc:
+            raise BenchmarkIntegrityError(
+                f"BEAM {scale}/{conv_id} probing_questions is malformed: {exc}"
+            ) from exc
     else:
         probing = pq_raw
+    if not isinstance(probing, dict):
+        raise BenchmarkIntegrityError(
+            f"BEAM {scale}/{conv_id} probing_questions must be an object"
+        )
 
     all_questions = []
     for ability, questions in probing.items():
-        if isinstance(questions, list):
-            for q in questions:
-                if isinstance(q, dict):
-                    _gold = _resolve_gold(q, ability)
-                    all_questions.append({
+        if ability not in GOLD_FIELDS:
+            raise BenchmarkIntegrityError(
+                f"BEAM {scale}/{conv_id} has unknown ability key {ability!r}"
+            )
+        if not isinstance(questions, list):
+            raise BenchmarkIntegrityError(
+                f"BEAM {scale}/{conv_id}/{ability} questions must be a list"
+            )
+        for ability_index, q in enumerate(questions):
+            if not isinstance(q, dict):
+                raise BenchmarkIntegrityError(
+                    f"BEAM {scale}/{conv_id}/{ability}/{ability_index} is not an object"
+                )
+            question = q.get("question", "")
+            if not isinstance(question, str) or not question.strip():
+                raise BenchmarkIntegrityError(
+                    f"BEAM {scale}/{conv_id}/{ability}/{ability_index} has no question"
+                )
+            rubric = q.get("rubric", [])
+            if (
+                not isinstance(rubric, list)
+                or not rubric
+                or any(not isinstance(item, str) or not item.strip() for item in rubric)
+            ):
+                raise BenchmarkIntegrityError(
+                    f"BEAM {scale}/{conv_id}/{ability}/{ability_index} has malformed rubric"
+                )
+            gold_text, gold_kind, gold_field, gold_resolution = \
+                _resolve_gold_with_metadata(q, ability)
+            native_id = (
+                q.get("question_id")
+                if "question_id" in q else q.get("id")
+            )
+            if native_id is not None:
+                valid_native = (
+                    isinstance(native_id, str) and bool(native_id.strip())
+                ) or (
+                    isinstance(native_id, (int, float))
+                    and not isinstance(native_id, bool)
+                    and math.isfinite(float(native_id))
+                )
+                if not valid_native:
+                    raise BenchmarkIntegrityError(
+                        f"BEAM {scale}/{conv_id}/{ability}/{ability_index} "
+                        "has a malformed native question id"
+                    )
+                if isinstance(native_id, str):
+                    native_id = native_id.strip()
+            global_index = len(all_questions)
+            # Calibration assignment must not be a function of the oracle
+            # ability/category. Dataset-native ids take precedence; otherwise
+            # bind the global source ordinal to a hash of the question text.
+            stable_tail = (
+                f"native:{native_id}" if native_id is not None
+                else f"ordinal:{global_index}:{content_hash(question)[:20]}"
+            )
+            all_questions.append({
                         "ability": ability,
-                        "ability_short": ABILITY_MAP.get(ability, ability[:3].upper()),
-                        "question_id": q.get("question_id") or q.get("id") or "",
-                        "question": q.get("question", ""),
+                        "ability_short": ABILITY_MAP[ability],
+                        "question_id": (
+                            f"beam:{scale}:{conv_id}:{stable_tail}"
+                        ),
+                        "source_question_id": native_id,
+                        "question": question,
                         # `ideal_answer` intentionally keeps the ORIGINAL
                         # (mostly empty) parse, because it is what the judge
                         # reads: repointing the judge changes what every BEAM
@@ -1076,13 +1579,19 @@ def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
                         # (--judge-gold), not a side effect of fixing the probe.
                         "ideal_answer": q.get("ideal_response",
                                               q.get("ideal_answer", "")),
-                        "gold_text": _gold[0],
-                        "gold_kind": _gold[1],
-                        "rubric": q.get("rubric", []),
-                    })
+                        "gold_text": gold_text,
+                        "gold_kind": gold_kind,
+                        "gold_field": gold_field,
+                        "gold_resolution": gold_resolution,
+                        "rubric": rubric,
+            })
 
+    if not all_questions:
+        raise BenchmarkIntegrityError(
+            f"BEAM {scale}/{conv_id} has no probing questions"
+        )
     return {
-        "id": sample.get("conversation_id", str(idx)),
+        "id": conv_id,
         "messages": all_messages,
         "questions": all_questions,
         "scale": scale,
@@ -1091,30 +1600,359 @@ def _parse_sample(sample: dict, scale: str, idx: int) -> dict:
 
 # ── HyMem Integration ───────────────────────────────────────────────────────
 
+def resolve_embedding_config(
+    backend: str,
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    dimension: int | None = None,
+) -> dict[str, Any]:
+    """Resolve an embedding posture without ever including credentials."""
+
+    if backend not in {"local-hash", "openai-compatible", "none"}:
+        raise BenchmarkIntegrityError(f"unknown embedding backend: {backend!r}")
+    if dimension is not None and (
+        isinstance(dimension, bool)
+        or not isinstance(dimension, int)
+        or dimension <= 0
+    ):
+        raise BenchmarkIntegrityError("embedding dimension must be positive")
+    if backend == "none":
+        if model is not None or base_url is not None or dimension is not None:
+            raise BenchmarkIntegrityError(
+                "embedding overrides cannot be combined with backend none"
+            )
+        return {
+            "configured": False, "backend": "none", "model": None,
+            "base_url": None, "dimension": None, "quality": "none",
+            "network_free": True, "fallback_policy": "none",
+            "fallback_reason": None,
+        }
+    if backend == "local-hash":
+        if base_url not in (None, "local://feature-hash"):
+            raise BenchmarkIntegrityError(
+                "local-hash accepts only local://feature-hash as an endpoint label"
+            )
+        resolved_model = model or DEFAULT_LOCAL_EMBEDDING_MODEL
+        if not isinstance(resolved_model, str) or not resolved_model.strip():
+            raise BenchmarkIntegrityError("embedding model must be non-empty")
+        return {
+            "configured": True, "backend": "local-hash",
+            "model": resolved_model.strip(), "base_url": "local://feature-hash",
+            "dimension": dimension or DEFAULT_LOCAL_EMBEDDING_DIM,
+            "quality": "lexical-feature-hash", "network_free": True,
+            "fallback_policy": "none", "fallback_reason": None,
+        }
+
+    from hymem.contrib.openai_embedding_client import (
+        safe_embedding_base_url,
+        validate_embedding_base_url,
+    )
+    resolved_model = model or DEFAULT_REMOTE_EMBEDDING_MODEL
+    resolved_base = base_url or DEFAULT_REMOTE_EMBEDDING_BASE_URL
+    if not isinstance(resolved_model, str) or not resolved_model.strip():
+        raise BenchmarkIntegrityError("embedding model must be non-empty")
+    try:
+        validate_embedding_base_url(resolved_base)
+    except (TypeError, ValueError) as exc:
+        raise BenchmarkIntegrityError(str(exc)) from exc
+    parsed_base = urlsplit(resolved_base)
+    if parsed_base.username is not None or parsed_base.password is not None:
+        raise BenchmarkIntegrityError(
+            "embedding endpoint credentials must use --embedding-api-key, not URL userinfo"
+        )
+    if parsed_base.query:
+        raise BenchmarkIntegrityError(
+            "benchmark embedding endpoints must not contain query parameters; "
+            "put credentials in --embedding-api-key"
+        )
+    if parsed_base.fragment:
+        raise BenchmarkIntegrityError("embedding endpoint must not contain a fragment")
+    return {
+        "configured": True, "backend": "openai-compatible",
+        "model": resolved_model.strip(),
+        "base_url": safe_embedding_base_url(resolved_base),
+        # Kept only in process and removed before manifest construction.
+        "request_base_url": resolved_base,
+        "dimension": dimension or DEFAULT_REMOTE_EMBEDDING_DIM,
+        "quality": "semantic", "network_free": False,
+        "fallback_policy": "fail-closed", "fallback_reason": None,
+    }
+
+
+def public_embedding_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Manifest-safe exact embedding identity."""
+
+    return {
+        key: value for key, value in config.items()
+        if key != "request_base_url"
+    }
+
+
+class BenchmarkPinnedEmbeddingClient:
+    """Fail closed if a provider's observed vector identity drifts."""
+
+    def __init__(self, inner: object, *, expected_dimension: int) -> None:
+        self._inner = inner
+        self.expected_dimension = int(expected_dimension)
+        self._initial_model = getattr(inner, "model")
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    @property
+    def model(self):
+        return getattr(self._inner, "model")
+
+    @property
+    def dim(self):
+        return getattr(self._inner, "dim")
+
+    def embed(self, texts):
+        if self.model != self._initial_model or self.dim != self.expected_dimension:
+            raise BenchmarkIntegrityError(
+                "embedding client identity differs from manifested model/dimension"
+            )
+        vectors = self._inner.embed(texts)
+        if (
+            self.model != self._initial_model
+            or self.dim != self.expected_dimension
+            or any(
+                not isinstance(vector, (list, tuple))
+                or len(vector) != self.expected_dimension
+                for vector in vectors
+            )
+        ):
+            raise BenchmarkIntegrityError(
+                "embedding provider returned a dimension/identity that differs "
+                "from the benchmark manifest"
+            )
+        return vectors
+
+
+def build_embedding_client(
+    config: Mapping[str, Any], *, api_key: str = "",
+):
+    """Construct exactly the resolved backend; never silently fall back."""
+
+    backend = config.get("backend")
+    if backend == "none":
+        return None
+    from hymem.extraction.embeddings import (
+        CachedEmbeddingClient,
+        LocalHashEmbeddingClient,
+    )
+    if backend == "local-hash":
+        return BenchmarkPinnedEmbeddingClient(
+            CachedEmbeddingClient(LocalHashEmbeddingClient(
+                dim_value=int(config["dimension"]),
+                model_name=str(config["model"]),
+            )),
+            expected_dimension=int(config["dimension"]),
+        )
+    if backend != "openai-compatible":
+        raise BenchmarkIntegrityError(
+            f"invalid resolved embedding backend: {backend!r}"
+        )
+    from hymem.contrib.openai_embedding_client import (
+        OpenAICompatibleEmbeddingClient,
+    )
+    return BenchmarkPinnedEmbeddingClient(
+        CachedEmbeddingClient(OpenAICompatibleEmbeddingClient(
+            api_key=api_key or None,
+            base_url=str(config["request_base_url"]),
+            model=str(config["model"]),
+            dim=int(config["dimension"]),
+        )),
+        expected_dimension=int(config["dimension"]),
+    )
+
+
+def embedding_backlog_status(conn, client: object | None) -> dict[str, int]:
+    """Count absent/stale vector mirrors entirely inside SQLite.
+
+    This deliberately uses the lossless coverage stream rather than raw
+    messages, which may be pruned after their proof-valid mirrors exist. Each
+    query returns one integer; no 10M-scale vector corpus is materialized in
+    Python on every dream cycle.
+    """
+
+    if client is None:
+        return {
+            "pending_chunk_embeddings": 0,
+            "pending_message_embeddings": 0,
+            "pending_edge_embeddings": 0,
+            "pending_episode_embeddings": 0,
+            "pending_fact_embeddings": 0,
+        }
+    from hymem.core.graph import live_edge_predicate
+    from hymem.core.vectors import decode_vector
+    from hymem.extraction.embeddings import embedding_text_hash
+
+    model = getattr(client, "model", None)
+    dim = getattr(client, "dim", None)
+    if (
+        not isinstance(model, str) or not model
+        or isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
+    ):
+        raise BenchmarkIntegrityError("embedding client identity is invalid")
+
+    conn.create_function(
+        "hymem_benchmark_embedding_hash", 1,
+        lambda value: embedding_text_hash(str(value)), deterministic=True,
+    )
+    def valid_vector(value, expected_dim):
+        try:
+            vector = decode_vector(value)
+            return int(
+                len(vector) == int(expected_dim)
+                and all(math.isfinite(float(item)) for item in vector)
+                and math.sqrt(sum(float(item) ** 2 for item in vector)) > 0.0
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return 0
+
+    conn.create_function(
+        "hymem_benchmark_vector_valid", 2, valid_vector, deterministic=True,
+    )
+
+    def invalid_vector(alias: str) -> str:
+        return (
+            f"({alias}.vector_json IS NULL OR {alias}.model<>? OR {alias}.dim<>? "
+            f"OR hymem_benchmark_vector_valid({alias}.vector_json,?)<>1)"
+        )
+
+    def count(sql: str, params: tuple[Any, ...]) -> int:
+        row = conn.execute(sql, params).fetchone()
+        if row is None:
+            raise BenchmarkIntegrityError("embedding backlog query returned no row")
+        return int(row[0])
+
+    vector_params = (model, dim, dim)
+    pending_chunks = count(
+        "SELECT COUNT(*) FROM chunks c "
+        "LEFT JOIN chunk_embeddings e ON e.chunk_id=c.id "
+        "WHERE c.chunk_kind='extraction' AND (e.text_hash<>"
+        "hymem_benchmark_embedding_hash(c.text) OR e.text_hash IS NULL OR "
+        + invalid_vector("e") + ")",
+        vector_params,
+    )
+    pending_messages = count(
+        "SELECT COUNT(*) FROM message_retention_coverage mc "
+        "JOIN sessions s ON s.id=mc.source_session_id "
+        "JOIN chunks c ON c.id=mc.chunk_id "
+        "LEFT JOIN message_embeddings e ON e.message_id=mc.message_id "
+        "WHERE mc.coverage_version='dream-lossless-message-v1' "
+        "AND mc.source_role IN ('user','assistant') "
+        "AND s.coverage_message_id IS NOT NULL "
+        "AND typeof(mc.message_id)='integer' "
+        "AND mc.message_id<=s.coverage_message_id "
+        "AND c.session_id=mc.source_session_id "
+        "AND c.start_message_id=mc.message_id "
+        "AND c.end_message_id=mc.message_id AND c.chunk_kind='coverage' "
+        "AND hymem_message_record_proof_valid(c.text,mc.message_content_hash,"
+        "mc.hash_version,mc.record_version)=1 "
+        "AND (e.text_hash<>hymem_benchmark_embedding_hash("
+        "json_extract(c.text,'$.content')) OR e.text_hash IS NULL OR "
+        + invalid_vector("e") + ")",
+        vector_params,
+    )
+    edge_text = "(k.subject_canonical || ' ' || k.predicate || ' ' || k.object_canonical)"
+    pending_edges = count(
+        "SELECT COUNT(*) FROM knowledge_graph k "
+        f"LEFT JOIN edge_embeddings e ON e.edge_text={edge_text} "
+        f"WHERE {live_edge_predicate('k')} AND " + invalid_vector("e"),
+        vector_params,
+    )
+    pending_episodes = count(
+        "SELECT COUNT(*) FROM episodes ep JOIN sessions s ON s.id=ep.session_id "
+        "LEFT JOIN episode_embeddings e ON e.episode_id=ep.id "
+        "WHERE (ep.digest_generation IS NULL OR "
+        "ep.digest_generation=s.digest_published_generation) "
+        "AND (e.text_hash<>hymem_benchmark_embedding_hash("
+        "ep.title || char(10) || ep.summary) OR e.text_hash IS NULL OR "
+        + invalid_vector("e") + ")",
+        vector_params,
+    )
+    pending_facts = count(
+        "SELECT COUNT(*) FROM narrative_facts f "
+        "JOIN fact_extraction_outcomes o ON o.slice_key=f.source_outcome_key "
+        "LEFT JOIN narrative_fact_embeddings e ON e.fact_id=f.id "
+        "WHERE f.source_outcome_key IS NOT NULL "
+        "AND f.lifecycle_status='active' AND f.invalid_at IS NULL "
+        "AND o.outcome_status='success' AND o.source_manifest_complete=1 "
+        "AND o.source_manifest_version='fact-source-manifest-v1' "
+        "AND o.source_manifest_count>0 "
+        "AND (e.text_hash<>hymem_benchmark_embedding_hash(f.text) "
+        "OR e.text_hash IS NULL OR " + invalid_vector("e") + ")",
+        vector_params,
+    )
+
+    return {
+        "pending_chunk_embeddings": pending_chunks,
+        "pending_message_embeddings": pending_messages,
+        "pending_edge_embeddings": pending_edges,
+        "pending_episode_embeddings": pending_episodes,
+        "pending_fact_embeddings": pending_facts,
+    }
+
+
 class HyMemAdapter:
     """Direct HyMem Python API adapter with isolated temp DB."""
 
     def __init__(self, db_path: Path, api_key: str = "",
                  facts_enabled: bool | None = None,
-                 facts_extraction: bool | None = None):
+                 facts_extraction: bool | None = None,
+                 pipeline_model: str = "deepseek-chat",
+                 pipeline_base_url: str = DEEPSEEK_BASE_URL,
+                 pipeline_thinking: str = "off",
+                 embedding_backend: str = DEFAULT_EMBEDDING_BACKEND,
+                 embedding_model: str | None = None,
+                 embedding_base_url: str | None = None,
+                 embedding_dim: int | None = None,
+                 embedding_api_key: str = ""):
         self.db_path = db_path
         self.api_key = api_key
         self.facts_enabled = facts_enabled
         self.facts_extraction = facts_extraction
+        self.pipeline_model = pipeline_model
+        self.pipeline_base_url = pipeline_base_url
+        self.pipeline_thinking = pipeline_thinking
+        self.embedding_config = resolve_embedding_config(
+            embedding_backend, model=embedding_model,
+            base_url=embedding_base_url, dimension=embedding_dim,
+        )
+        self.embedding_api_key = embedding_api_key
         self.hy = None
+        self.pipeline_llm = None
+        self.embedding_client = None
+        self.last_indexing_summary = None
 
-    def open(self):
-        from hymem import HyMem, HyMemConfig
-        from hymem.contrib.openai_client import OpenAICompatibleClient
+    def build_config(self):
+        from hymem import HyMemConfig
 
-        # E1 narrative facts (schema v26). None = config default (both ON);
-        # --no-facts is the read-side control arm, --no-facts-extraction stops
-        # the dream spending a call per session tail (needs a fresh store).
         overrides = {}
         if self.facts_enabled is not None:
             overrides["facts_enabled"] = self.facts_enabled
         if self.facts_extraction is not None:
             overrides["facts_extraction_enabled"] = self.facts_extraction
+        overrides["aggregation_nodes_enabled"] = False
+        overrides["episode_granularity_enabled"] = False
+        return HyMemConfig(
+            root=self.db_path.parent,
+            message_fts_top_k=15,
+            fts_top_k=10,
+            graph_top_k=10,
+            **overrides,
+        )
+
+    def open(self):
+        from hymem import HyMem
+        from hymem.contrib.openai_client import OpenAICompatibleClient
+
+        # E1 narrative facts (schema v26). None = config default (both ON);
+        # --no-facts is the read-side control arm, --no-facts-extraction stops
+        # the dream spending a call per session tail (needs a fresh store).
         # RAPTOR aggregation layer: pinned OFF explicitly. The config default
         # flipped False -> True on 2026-08-26 (G-FLIP PASS); this benchmark was
         # a default-config consumer, so without the pin the flip would silently
@@ -1122,7 +1960,6 @@ class HyMemAdapter:
         # being comparable to every run behind it. Moving a benchmark onto the
         # shipped config is a pre-registered scored decision, not a side effect
         # of a default change.
-        overrides["aggregation_nodes_enabled"] = False
         # Same reasoning, one lever earlier: `episode_granularity_enabled`
         # is under active decision (Plan C) and this adapter was the last
         # unpinned default-config consumer of it. The pin matches the
@@ -1130,20 +1967,20 @@ class HyMemAdapter:
         # It means the pre-check below reads a KNOWN arm, and a future
         # default flip cannot silently move BEAM off its baseline the way
         # the aggregation flip nearly did.
-        overrides["episode_granularity_enabled"] = False
-        cfg = HyMemConfig(
-            root=self.db_path.parent,
-            message_fts_top_k=15,  # raw message keyword hits — critical for BEAM
-            fts_top_k=10,
-            graph_top_k=10,
-            **overrides,
-        )
+        cfg = self.build_config()
         llm = OpenAICompatibleClient(
             api_key=self.api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
-            base_url="https://api.deepseek.com",
-            model="deepseek-chat",
+            base_url=self.pipeline_base_url,
+            model=self.pipeline_model,
+            thinking=self.pipeline_thinking,
         )
-        self.hy = HyMem(cfg, llm=llm)
+        self.pipeline_llm = llm
+        self.embedding_client = build_embedding_client(
+            self.embedding_config, api_key=self.embedding_api_key,
+        )
+        self.hy = HyMem(
+            cfg, llm=llm, embedding_client=self.embedding_client,
+        )
 
     def close(self):
         if self.hy:
@@ -1175,16 +2012,47 @@ class HyMemAdapter:
 
         return {"total_msgs": len(messages), "total_chars": sum(len(m.get("content", "")) for m in messages)}
 
-    def dream_and_wait(self, timeout: int = 180):
-        """Run dream cycle and wait for completion."""
+    def dream_and_wait(
+        self, timeout: float = 3600, *, max_cycles: int = 100,
+        require_healthy: bool = True,
+    ):
+        """Run bounded dream cycles until indexing is complete and healthy."""
         start = time.time()
         dream_hy = self.hy.fork()
         try:
-            dream_hy.dream()
+            def durable_status():
+                current = dict(dream_hy.dream_status())
+                current["quarantined_facts"] = int(
+                    dream_hy.read_conn.execute(
+                        "SELECT COALESCE(SUM(facts_quarantined), 0) FROM sessions"
+                    ).fetchone()[0]
+                )
+                current.update(embedding_backlog_status(
+                    dream_hy.read_conn, self.embedding_client,
+                ))
+                return current
+
+            try:
+                self.last_indexing_summary = converge_indexing(
+                    dream_hy.dream,
+                    status=durable_status,
+                    max_cycles=max_cycles,
+                    timeout_s=timeout,
+                    require_healthy=require_healthy,
+                )
+            except Exception as exc:
+                if hasattr(exc, "summary"):
+                    self.last_indexing_summary = dict(exc.summary)
+                raise
         finally:
             dream_hy.close()
+        self.hy.invalidate_query_caches()
         elapsed = time.time() - start
-        print(f"      Dream completed in {elapsed:.0f}s", flush=True)
+        print(
+            f"      Dream converged in {elapsed:.0f}s across "
+            f"{self.last_indexing_summary['cycles']} cycle(s)", flush=True,
+        )
+        return self.last_indexing_summary
 
     def search(self, session_id: str, query: str, ability: str = None,
                top_k: int = 10) -> tuple[list[dict], int, list[str]]:
@@ -1198,11 +2066,89 @@ class HyMemAdapter:
         file undated facts among the "other" tail they were tuned to demote."""
         TASK_RECALL = {"IF", "MR", "EO", "SUM", "TR"}
 
-        try:
-            result = self.hy.augment(query, session_id=session_id, ability=ability)
-        except Exception as e:
-            print(f"    [DEBUG] augment error: {e}", flush=True)
-            return [], 0, []
+        result = self.hy.augment(
+            query,
+            session_id=session_id,
+            source_session_id=session_id,
+            ability=ability,
+        )
+
+        if self.embedding_config["configured"]:
+            semantic = getattr(result, "semantic_status", None)
+            expected_model = getattr(self.embedding_client, "model", None)
+            expected_dim = getattr(self.embedding_client, "dim", None)
+            if (
+                expected_dim != self.embedding_config["dimension"]
+                or semantic is None
+                or getattr(semantic, "configured", None) is not True
+                or getattr(semantic, "attempted", None) is not True
+                or getattr(semantic, "available", None) is not True
+                or getattr(semantic, "model", None) != expected_model
+                or getattr(semantic, "dim", None) != expected_dim
+            ):
+                reason = getattr(semantic, "reason", "missing_status")
+                raise BenchmarkIntegrityError(
+                    "configured embedding retrieval was unavailable or changed "
+                    f"identity (reason={reason})"
+                )
+
+        # A shared BEAM store contains many independent examples. The
+        # source-session boundary is therefore part of benchmark correctness,
+        # not merely a retrieval hint. Fail loudly if any tier violates it.
+        for tier in ("message_hits", "count_message_hits", "recent_turns"):
+            for hit in (getattr(result, tier, None) or []):
+                direct_session = getattr(hit, "session_id", None)
+                if not isinstance(direct_session, str) or direct_session != session_id:
+                    raise BenchmarkIntegrityError(
+                        f"BEAM source isolation violation in {tier}: "
+                        f"{direct_session!r} != {session_id!r}"
+                    )
+
+        # Summaries/chunks/facts are composites. A convenient direct
+        # ``session_id`` is descriptive, not proof that every source behind the
+        # rendered text belongs to this independent benchmark conversation.
+        for tier in ("fts_hits", "facts", "episodes", "aggregation_nodes"):
+            for hit in (getattr(result, tier, None) or []):
+                occurrences = getattr(hit, "source_occurrences", None) or ()
+                if (
+                    getattr(hit, "source_provenance_complete", None) is not True
+                    or not occurrences
+                ):
+                    raise BenchmarkIntegrityError(
+                        f"BEAM source isolation violation in {tier}: "
+                        "complete source provenance is absent"
+                    )
+                if any(
+                    getattr(occurrence, "session_id", None) != session_id
+                    for occurrence in occurrences
+                ):
+                    raise BenchmarkIntegrityError(
+                        f"BEAM source isolation violation in {tier} provenance"
+                    )
+
+        for fact in (getattr(result, "graph_facts", None) or []):
+            citations = getattr(fact, "citations", None) or ()
+            if not citations:
+                raise BenchmarkIntegrityError(
+                    "BEAM source isolation violation in graph_facts: "
+                    "citations are absent"
+                )
+            for citation in citations:
+                citation_session = getattr(citation, "source_session_id", None)
+                citation_message = getattr(citation, "source_message_id", None)
+                if (
+                    citation_session != session_id
+                    or isinstance(citation_message, bool)
+                    or not isinstance(citation_message, int)
+                ):
+                    raise BenchmarkIntegrityError(
+                        "BEAM source isolation violation in graph citation"
+                    )
+        for unsupported in ("procedures", "temporal_events", "user_profile"):
+            if getattr(result, unsupported, None):
+                raise BenchmarkIntegrityError(
+                    f"BEAM scoped retrieval returned unscoped tier {unsupported}"
+                )
 
         total_matches = getattr(result, "total_message_matches", 0)
 
@@ -1407,32 +2353,9 @@ def _log_context(question_id: str, ability: str, system_prompt: str,
 
 def answer_question(llm: LLMClient, memories: list[dict], question: str, ability: str,
                     total_matches: int = 0, question_id: str = "",
-                    narrative_facts: list[str] | None = None) -> str:
+                    narrative_facts: list[str] | None = None,
+                    max_input_tokens: int | None = DEFAULT_MAX_INPUT_TOKENS) -> str:
     """Ask LLM to answer based on retrieved memories."""
-    # Build context from memories
-    parts = []
-    total_chars = 0
-
-    # MR counting: HyMem already counted distinct user turns + deduped.
-    # total_message_matches is the candidate answer — LLM just verifies it.
-    if ability == "MR" and total_matches > 0:
-        parts.append(f"[HyMem counted {total_matches} distinct user messages "
-                      f"matching your question (assistant echoes excluded, "
-                      f"restatements deduped). Verify this count against the "
-                      f"evidence below and return the final number.]\n")
-
-    # E1 narrative facts: their own block above the raw turns, never a
-    # memories[:top_k] slot and never part of the EO/TR re-sort below. Facts
-    # lead, the raw turns stay beneath as the check (the tier's contract in
-    # ask(), and the Acme lesson — a summary is never the only copy).
-    if narrative_facts:
-        parts.append("[NARRATIVE FACTS — self-contained statements extracted "
-                     "from past sessions; a leading date is when the fact "
-                     "happened. Verify details against the memories below:]\n")
-        for nf in narrative_facts:
-            parts.append(f"  • {nf}\n")
-        parts.append("[END NARRATIVE FACTS]\n")
-
     # MR/TR: cross-session data is fractured; EO: full timeline must fit;
     # SUM: coverage-graded — all four get the doubled context budget.
     context_limit = MAX_CONTEXT_CHARS * 2 if ability in ("MR", "TR", "EO", "SUM") else MAX_CONTEXT_CHARS
@@ -1466,29 +2389,24 @@ def answer_question(llm: LLMClient, memories: list[dict], question: str, ability
         )
         memories = dated + [m for m in memories if not m.get("created_at")]
 
-    for m in memories:
-        content = m["content"]
-        if total_chars + len(content) > context_limit:
-            break
-        # Date-stamp raw turns (the only tier carrying created_at) so the recency-
-        # conflict clause can prefer the newest value-bearing statement. FACT/fts/
-        # episode tiers stay undated (graph dating deferred).
-        if m["type"] == "graph_fact":
-            tag = "[FACT]"
-        else:
-            date10 = (m.get("created_at") or "")[:10]
-            tag = f"[MEM {date10}]" if (m["type"] == "message_hit" and date10) else "[MEM]"
-        parts.append(f"{tag} {content}")
-        total_chars += len(content) + len(tag) + 2
-
-    context = "\n".join(parts) if parts else "No relevant memories found."
-
     # Ability-aware answering prompts
     system_prompt = ANSWERING_PROMPTS.get(ability, ANSWERING_SYSTEM_PROMPT)
+    user_prefix = "CONTEXT:\n"
+    user_suffix = f"\n\nQUESTION: {question}\n\nANSWER:"
+    counter = getattr(llm, "count_tokens", None)
+    context = _render_answer_context(
+        memories, ability, total_matches, None, None, None,
+        narrative_facts=narrative_facts,
+        max_context_chars=context_limit,
+        max_input_tokens=max_input_tokens,
+        token_counter=counter if callable(counter) else None,
+        prompt_prefix=f"system:{system_prompt}\nuser:{user_prefix}",
+        prompt_suffix=user_suffix,
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"},
+        {"role": "user", "content": f"{user_prefix}{context}{user_suffix}"},
     ]
 
     prediction = llm.chat(messages, temperature=0.0, max_tokens=1024)
@@ -1511,6 +2429,15 @@ def _judge_messages(question: str, ideal: str, rubric: list, ai_answer: str) -> 
             f"Return JSON with 'scores' list and 'total_score'."
         )},
     ]
+
+
+def _official_judge_messages(rubric_item: str, ai_answer: str) -> list[dict]:
+    """Exact upstream prompt construction: no question and no gold answer."""
+
+    prompt = OFFICIAL_JUDGE_PROMPT.replace(
+        "<rubric_item>", rubric_item
+    ).replace("<llm_response>", ai_answer)
+    return [{"role": "user", "content": prompt}]
 
 
 def extract_judge_json(raw: str) -> tuple[dict | None, str]:
@@ -1582,21 +2509,112 @@ def _finish_reason(llm) -> str | None:
     return getattr(llm, "last_finish_reason", None)
 
 
+def official_judge_answer(
+    llm: LLMClient, rubric: list[str], ai_answer: str,
+) -> dict:
+    """Run BEAM's upstream rubric-by-rubric ternary judge protocol.
+
+    Every criterion is a separate temperature-zero call. Any transport,
+    parsing, score-domain, or reason failure invalidates the whole row rather
+    than manufacturing a semantic zero from an infrastructure failure.
+    """
+
+    if (
+        not isinstance(rubric, list)
+        or not rubric
+        or any(not isinstance(item, str) or not item.strip() for item in rubric)
+    ):
+        return {
+            "score": 0.0, "llm_judge_score": 0.0, "scores": [],
+            "criterion_results": [], "judge_parse": "missing_rubric",
+        }
+    criterion_results: list[dict] = []
+    scores: list[float] = []
+    for index, item in enumerate(rubric):
+        raw = llm.chat(
+            _official_judge_messages(item, ai_answer),
+            temperature=0.0,
+            max_tokens=None,
+        )
+        finish_reason = _finish_reason(llm)
+        parsed, parse_kind = extract_judge_json(raw)
+        score = parsed.get("score") if isinstance(parsed, dict) else None
+        reason = parsed.get("reason") if isinstance(parsed, dict) else None
+        valid_score = bool(
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and math.isfinite(float(score))
+            and float(score) in {0.0, 0.5, 1.0}
+        )
+        valid_reason = isinstance(reason, str) and bool(reason.strip())
+        transport_error = isinstance(raw, str) and raw.startswith("[LLM_ERROR")
+        criterion = {
+            "criterion_index": index,
+            "rubric_item": item,
+            "raw": raw,
+            "finish_reason": finish_reason,
+            "parse": parse_kind,
+            "score": float(score) if valid_score else None,
+            "reason": reason if valid_reason else None,
+        }
+        criterion_results.append(criterion)
+        if transport_error:
+            failure = f"criterion_{index}_transport"
+        elif parsed is None:
+            failure = f"criterion_{index}_unreadable"
+        elif not valid_score:
+            failure = f"criterion_{index}_invalid_score"
+        elif not valid_reason:
+            failure = f"criterion_{index}_invalid_reason"
+        else:
+            failure = None
+        if failure is not None:
+            return {
+                "score": 0.0, "llm_judge_score": 0.0, "scores": [],
+                "criterion_results": criterion_results,
+                "judge_parse": failure,
+            }
+        scores.append(float(score))
+    mean_score = sum(scores) / len(scores)
+    return {
+        "score": mean_score,
+        "llm_judge_score": mean_score,
+        "scores": scores,
+        "criterion_results": criterion_results,
+        "judge_parse": "ok",
+    }
+
+
 def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_answer: str,
                  return_raw: bool = False) -> dict:
     if not rubric:
-        return {"score": 0.0, "scores": []}
+        out = {"score": 0.0, "scores": [], "judge_parse": "missing_rubric"}
+        if return_raw:
+            out.update({"judge_raw": "", "judge_finish_reason": None})
+        return out
 
     messages = _judge_messages(question, ideal, rubric, ai_answer)
 
     raw = llm.chat(messages, temperature=0.0, max_tokens=512)
     result, how = extract_judge_json(raw)
-    if result is not None:
-        scores = result.get("scores", [])
-        total = sum(scores) / len(scores) if scores else 0.0
+    scores = result.get("scores", []) if isinstance(result, dict) else []
+    valid_scores = bool(
+        isinstance(scores, list)
+        and len(scores) == len(rubric)
+        and all(
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and math.isfinite(float(score))
+            and 0.0 <= float(score) <= 1.0
+            for score in scores
+        )
+    )
+    if result is not None and valid_scores:
+        total = sum(float(score) for score in scores) / len(scores)
         out = {"score": total, "scores": scores}
     else:
         out = {"score": 0.0, "scores": []}
+        how = "malformed" if result is not None else how
     if return_raw:
         out["judge_raw"] = raw
         out["judge_finish_reason"] = _finish_reason(llm)
@@ -1606,8 +2624,136 @@ def judge_answer(llm: LLMClient, question: str, ideal: str, rubric: list, ai_ans
 
 # ── Evaluation ───────────────────────────────────────────────────────
 
-def evaluate_conversation(judge_gold: bool, llm: LLMClient, judge_llm: LLMClient, hy: HyMemAdapter,
-                          conv: dict, top_k: int) -> dict:
+def _evaluate_beam_question(
+    judge_gold: bool,
+    llm: LLMClient,
+    judge_llm: LLMClient,
+    hy: HyMemAdapter,
+    conv: dict,
+    q: dict,
+    qi: int,
+    top_k: int,
+    *,
+    oracle_ability: bool,
+    judge_protocol: str = "official",
+    max_input_tokens: int | None = DEFAULT_MAX_INPUT_TOKENS,
+) -> dict:
+    oracle = q["ability_short"]
+    question = q["question"]
+    detected = (
+        _detect_ability_safe(question) if oracle_ability
+        else _detect_ability(question)
+    )
+    ability_used = oracle if oracle_ability else detected
+    print(f"    [{qi+1}/{len(conv['questions'])}] {oracle}: "
+          f"{question[:100]}...", flush=True)
+
+    memories, total_matches, narrative_facts = hy.search(
+        f"beam-{conv['scale']}-{conv['id']}", question,
+        ability=ability_used, top_k=top_k * 3,
+    )
+    print(f"      {len(memories)} memories", end="")
+    if total_matches > 0:
+        print(f" (total matches: {total_matches})", end="")
+    if narrative_facts:
+        print(f" (facts: {len(narrative_facts)})", end="")
+    print()
+
+    answer = answer_question(
+        llm, memories, question, ability_used, total_matches,
+        question_id=q["question_id"], narrative_facts=narrative_facts,
+        max_input_tokens=max_input_tokens,
+    )
+    base = {
+        "question_id": q["question_id"],
+        "scale": conv["scale"],
+        "conv_id": conv["id"],
+        "ability": oracle,
+        "oracle_ability": oracle,
+        "detected_ability": detected,
+        "ability_used": ability_used,
+        "question": question,
+        "answer": answer,
+        "ideal_answer": q["ideal_answer"],
+        "rubric": q["rubric"],
+        "gold_kind": q.get("gold_kind", "none"),
+        "indexing": getattr(hy, "last_indexing_summary", None),
+    }
+    if (answer or "").startswith("[LLM_ERROR"):
+        return {
+            **base, "judged_ideal": None, "score": 0.0, "scores": [],
+            "llm_judge_score": 0.0, "judge_protocol": judge_protocol,
+            "result_valid": False, "correct": False, "judge_parse": "not_called",
+            "benchmark_failure": "reader_transport_or_content_failure",
+        }
+
+    if judge_protocol == "official":
+        _judge_ideal = None
+        judged = official_judge_answer(judge_llm, q["rubric"], answer)
+        parse_valid = judged.get("judge_parse") == "ok"
+    elif judge_protocol == "legacy-custom":
+        _judge_ideal = select_judge_ideal(
+            judge_gold, q.get("gold_text"), q["ideal_answer"]
+        )
+        judged = judge_answer(
+            judge_llm, question, _judge_ideal, q["rubric"], answer,
+            return_raw=True,
+        )
+        parse_valid = judged.get("judge_parse") in {"ok", "recovered"}
+    else:
+        raise BenchmarkIntegrityError(
+            f"unknown BEAM judge protocol: {judge_protocol!r}"
+        )
+    failure = None if parse_valid else f"judge_{judged.get('judge_parse', 'unreadable')}"
+    row = {
+        **base,
+        "judged_ideal": _judge_ideal,
+        "judge_protocol": judge_protocol,
+        "score": judged["score"] if parse_valid else 0.0,
+        "llm_judge_score": judged["score"] if parse_valid else 0.0,
+        "scores": judged["scores"] if parse_valid else [],
+        # Execution validity is separate from semantic quality. The continuous
+        # BEAM capability metric remains ``score``; ``correct`` means every
+        # rubric item passed, never merely that the judge response parsed.
+        "result_valid": bool(parse_valid),
+        "correct": bool(parse_valid and judged["score"] == 1.0),
+        "judge_raw": judged.get("judge_raw"),
+        "judge_finish_reason": judged.get("judge_finish_reason"),
+        "judge_parse": judged.get("judge_parse"),
+        "judge_criterion_results": judged.get("criterion_results"),
+        "benchmark_failure": failure,
+    }
+    try:
+        row["probe"] = episode_probe(
+            memories, question, _probe_gold(q),
+            _decoy_answer(conv["questions"], qi),
+        )
+        row["probe_error"] = None
+    except Exception as exc:
+        # Gold-derived probes are post-answer diagnostics. They may explain a
+        # result, but can never replace a valid reader/judge result with zero.
+        row["probe"] = None
+        row["probe_error"] = f"{type(exc).__name__}: {exc}"
+    print(f"      Score: {row['score']:.2f}")
+    return row
+
+
+def evaluate_conversation(
+    judge_gold: bool,
+    llm: LLMClient,
+    judge_llm: LLMClient,
+    hy: HyMemAdapter,
+    conv: dict,
+    top_k: int,
+    *,
+    oracle_ability: bool = False,
+    judge_protocol: str = "official",
+    pending_ids: set[str] | None = None,
+    on_result=None,
+    indexing_max_cycles: int | None = None,
+    indexing_timeout_s: float | None = None,
+    max_input_tokens: int | None = DEFAULT_MAX_INPUT_TOKENS,
+) -> dict:
     conv_id = conv["id"]
     scale = conv["scale"]
     session_id = f"beam-{scale}-{conv_id}"
@@ -1619,65 +2765,52 @@ def evaluate_conversation(judge_gold: bool, llm: LLMClient, judge_llm: LLMClient
 
     # Dream
     print(f"  Dreaming...", flush=True)
-    hy.dream_and_wait()
+    if indexing_max_cycles is None and indexing_timeout_s is None:
+        hy.dream_and_wait()
+    else:
+        hy.dream_and_wait(
+            max_cycles=indexing_max_cycles or 100,
+            timeout=indexing_timeout_s or 3600,
+            require_healthy=True,
+        )
 
-    # Evaluate each question
+    # Evaluate each question. Resume rebuilds/ingests the conversation but
+    # completed question ids are skipped before any reader/judge call.
     results = []
     for qi, q in enumerate(conv["questions"]):
-        ability = q["ability_short"]
-        question = q["question"]
-        print(f"    [{qi+1}/{len(conv['questions'])}] {ability}: {question[:100]}...", flush=True)
-
-        # Search. The ×3 widens the answer context to three times the per-run
-        # --top-k (30 memories at the default 10) — the v16 baseline width.
-        # dea8d94's rewrite of this loop silently dropped the multiplier; the
-        # 10-memory runs that followed scored ~11pp below the 30-memory ones
-        # (KU fell from 70-83% to 0-17%), so this width is load-bearing.
-        memories, total_matches, narrative_facts = hy.search(
-            session_id, question, ability=ability, top_k=top_k * 3)
-        print(f"      {len(memories)} memories", end="")
-        if total_matches > 0:
-            print(f" (total matches: {total_matches})", end="")
-        if narrative_facts:
-            print(f" (facts: {len(narrative_facts)})", end="")
-        print()
-
-        # Answer
-        answer = answer_question(llm, memories, question, ability, total_matches,
-                                 question_id=q.get("question_id", ""),
-                                 narrative_facts=narrative_facts)
-
-        # Judge
-        # Default keeps the ORIGINAL (mostly empty) gold so this run stays
-        # comparable to v13-v16. --judge-gold is the pre-registered switch: it
-        # changes what the score MEANS, so post-flip runs need a fresh baseline
-        # and the old canonical retires as a comparison point rather than
-        # reading as a regression or an improvement.
-        _judge_ideal = select_judge_ideal(judge_gold, q.get("gold_text"),
-                                          q["ideal_answer"])
-        judge_result = judge_answer(judge_llm, question, _judge_ideal, q["rubric"], answer)
-        print(f"      Score: {judge_result['score']:.2f}")
-
-        results.append({
-            "ability": ability,
-            "question": question,
-            "answer": answer,
-            "ideal_answer": q["ideal_answer"],
-            # What the judge actually read. Under --judge-gold this is the
-            # resolved gold, which differs from `ideal_answer` — for IF/PF it
-            # is the compliance_spec. Step 2 recorded only the field the judge
-            # did NOT read.
-            "judged_ideal": _judge_ideal,
-            "rubric": q["rubric"],
-            "score": judge_result["score"],
-            "scores": judge_result["scores"],
-            # Plan C pre-check. Additive record only -- computed from the
-            # already-returned `memories`, so it cannot affect the answer or
-            # the score, and it costs no extra call.
-            "gold_kind": q.get("gold_kind", "none"),
-            "probe": episode_probe(memories, question, _probe_gold(q),
-                                   _decoy_answer(conv["questions"], qi)),
-        })
+        if pending_ids is not None and q["question_id"] not in pending_ids:
+            continue
+        try:
+            row = _evaluate_beam_question(
+                judge_gold, llm, judge_llm, hy, conv, q, qi, top_k,
+                oracle_ability=oracle_ability,
+                judge_protocol=judge_protocol,
+                max_input_tokens=max_input_tokens,
+            )
+        except Exception as exc:
+            row = {
+                "question_id": q["question_id"],
+                "scale": scale,
+                "conv_id": conv_id,
+                "ability": q["ability_short"],
+                "oracle_ability": q["ability_short"],
+                "detected_ability": _detect_ability_safe(q.get("question", "")),
+                "ability_used": None,
+                "question": q.get("question", ""),
+                "score": 0.0,
+                "llm_judge_score": 0.0,
+                "scores": [],
+                "judge_protocol": judge_protocol,
+                "result_valid": False,
+                "correct": False,
+                "benchmark_failure": (
+                    f"execution_failure: {type(exc).__name__}: {exc}"
+                ),
+                "indexing": getattr(hy, "last_indexing_summary", None),
+            }
+        results.append(row)
+        if on_result is not None:
+            on_result(row)
 
     return {
         "conv_id": conv_id,
@@ -1705,6 +2838,88 @@ def compute_scores(all_results: list[dict]) -> dict:
     return summary
 
 
+def _strict_beam_payload(
+    ledger: AtomicCheckpoint,
+    selected_conversations: dict[str, list[dict]],
+    scales: list[str],
+    *,
+    label_free: bool,
+    judge_gold: bool,
+    official_judge_match: bool = False,
+    lifecycle_errors: list[str] | None = None,
+) -> tuple[dict, dict, list[dict]]:
+    """Build optional diagnostics without putting durable rows at risk."""
+
+    errors: list[str] = list(lifecycle_errors or ())
+    all_results: list[dict] = []
+    try:
+        reconciled = ledger.reconcile()
+        by_id = {row["question_id"]: dict(row) for row in reconciled.rows}
+        for scale in scales:
+            for conv in selected_conversations.get(scale, ()):
+                rows = []
+                for q in conv["questions"]:
+                    row = {
+                        "scale": scale,
+                        "conv_id": conv["id"],
+                        "ability": q["ability_short"],
+                        "score": 0.0,
+                        **by_id[q["question_id"]],
+                    }
+                    if row.get("benchmark_failure"):
+                        row["score"] = 0.0
+                        row["result_valid"] = False
+                        row["correct"] = False
+                    rows.append(row)
+                all_results.append({
+                    "conv_id": conv["id"], "scale": scale, "questions": rows,
+                })
+    except Exception as exc:
+        errors.append(f"result_reconstruction: {type(exc).__name__}: {exc}")
+        all_results = []
+
+    try:
+        summary = compute_scores(all_results) if all_results else {}
+    except Exception as exc:
+        errors.append(f"score_summary: {type(exc).__name__}: {exc}")
+        summary = {}
+
+    valid_scores = [
+        q["score"] for conv in all_results for q in conv.get("questions", ())
+        if q.get("result_valid") is True
+        and isinstance(q.get("score"), (int, float))
+        and not isinstance(q.get("score"), bool)
+    ]
+    payload = {
+        "benchmark": "BEAM",
+        "version": "strict-v1",
+        "date": datetime.now(timezone.utc).isoformat(),
+        "protocol_disclosure": (
+            "label-free routing with the pinned upstream BEAM rubric judge; "
+            "gold retained only as a post-answer diagnostic"
+            if label_free and judge_gold and official_judge_match
+            else "EXPLORATORY NON-COMPARABLE configuration"
+        ),
+        "summary": {
+            scale: {ability: data["avg"] for ability, data in abilities.items()}
+            for scale, abilities in summary.items()
+        },
+        "summary_counts": {
+            scale: {ability: data["count"] for ability, data in abilities.items()}
+            for scale, abilities in summary.items()
+        },
+        "conditional_valid_only": {
+            "mean_score": (
+                sum(valid_scores) / len(valid_scores) if valid_scores else None
+            ),
+            "count": len(valid_scores),
+        },
+        "diagnostic_errors": errors,
+        "conversations": all_results,
+    }
+    return payload, summary, all_results
+
+
 def print_report(summary: dict, config: dict):
     print()
     print("=" * 80)
@@ -1727,13 +2942,9 @@ def print_report(summary: dict, config: dict):
         ov = abilities["OVERALL"]["avg"]
         print("  " + " ".join(scores) + f"  {ov*100:>6.1f}%")
 
-    print(f"\n  SOTA Comparison:")
-    for scale in summary:
-        if scale in PUBLISHED_SOTA:
-            ours = summary[scale]["OVERALL"]["avg"] * 100
-            print(f"  {scale}:  HyMem {ours:.1f}%  |  ", end="")
-            sota_parts = [f"{name} {val}%" for name, val in PUBLISHED_SOTA[scale].items()]
-            print("  |  ".join(sota_parts))
+    print("\n  External vendor figures are intentionally not mixed into this "
+          "table; their models, judges, prompts, versions and sample sets are "
+          "not controlled here. See README.md for sourced limitations.")
 
 
 def _rejudge_run(args, api_key: str) -> None:
@@ -1772,8 +2983,9 @@ def _rejudge_run(args, api_key: str) -> None:
     # ── gold reparse (before canary: canary uses a real row's gold) ────────
     dataset_revisions = resolve_dataset_revisions(["100K"], args.dataset_revision)
     print(f"  dataset revisions: {dataset_revisions}", flush=True)
-    data = load_beam_conversations(["100K"], max_conv=8,
-                                   revision=args.dataset_revision)
+    data = load_beam_conversations(
+        ["100K"], max_conv=8, revisions=dataset_revisions
+    )
     convs = data["100K"]
     gold_map, gold_rows = _rejudge_gold_map(run, convs=convs, rows=rows)
     cover = sum(len(v) for v in gold_rows.values())
@@ -2140,17 +3352,75 @@ def _rejudge_readout(run: dict, new_questions: list, meta: dict) -> None:
         print(f"  {ab:<6} {a*100:>6.2f} {b*100:>6.2f} {(b-a)*100:>+6.2f} {fl:>5}")
 
 
-def main():
+def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     global DEEPSEEK_API_KEY
 
     parser = argparse.ArgumentParser(description="HyMem BEAM Benchmark (direct API)")
     parser.add_argument("--scales", default=DEFAULT_SCALE)
     parser.add_argument("--sample", type=int, default=DEFAULT_SAMPLE)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--max-input-tokens", type=int,
+                        default=DEFAULT_MAX_INPUT_TOKENS,
+                        help="Hard ceiling over the complete rendered reader input.")
+    parser.add_argument(
+        "--indexing-max-cycles", type=int, default=100,
+        help="Maximum dream cycles allowed while draining the indexing backlog.",
+    )
+    parser.add_argument(
+        "--indexing-timeout-s", type=float, default=3600.0,
+        help="Wall-clock limit for complete per-conversation indexing.",
+    )
+    parser.add_argument("--results-dir", default=str(_repo_root.parent / "hymem_beam"))
     parser.add_argument("--answer-model", default=os.environ.get("BEAM_ANSWER_MODEL", ANSWER_MODEL),
                         help="Answerer spec 'provider:model' (e.g. gemini:gemini-2.5-flash) "
                              "or a bare DeepSeek model. Env: BEAM_ANSWER_MODEL.")
-    parser.add_argument("--judge-model", default=JUDGE_MODEL)
+    parser.add_argument(
+        "--judge-protocol", choices=("official", "legacy-custom"),
+        default="official",
+        help=(
+            "official (default) mirrors upstream BEAM's one-call-per-rubric "
+            "ternary judge; legacy-custom is exploratory/non-comparable"
+        ),
+    )
+    parser.add_argument(
+        "--judge-model", default=None,
+        help=(
+            "Judge provider:model. Defaults to openai:gpt-4.1-mini for the "
+            "official protocol and the historical DeepSeek model for legacy-custom."
+        ),
+    )
+    parser.add_argument("--hymem-model", default="deepseek-chat",
+                        help="Model used by HyMem dream/extraction/rerank calls.")
+    parser.add_argument("--hymem-base-url", default=DEEPSEEK_BASE_URL)
+    parser.add_argument("--hymem-thinking", choices=("auto", "disabled", "off", "enabled"),
+                        default="off")
+    parser.add_argument(
+        "--embedding-backend",
+        choices=("local-hash", "openai-compatible", "none"),
+        default=DEFAULT_EMBEDDING_BACKEND,
+        help=(
+            "Embedding posture. local-hash is the shipped dependency-free "
+            "lexical vector default; openai-compatible is semantic; none "
+            "disables vector retrieval explicitly."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-model", default=None,
+        help="Embedding model/identity override for the selected backend.",
+    )
+    parser.add_argument(
+        "--embedding-base-url", default=None,
+        help="OpenAI-compatible embedding endpoint (or local://feature-hash label).",
+    )
+    parser.add_argument(
+        "--embedding-dim", type=int, default=None,
+        help="Declared embedding dimension (backend-specific default when omitted).",
+    )
+    parser.add_argument(
+        "--embedding-api-key", default="",
+        help="Embedding credential; never written to checkpoints or artifacts.",
+    )
     parser.add_argument("--answer-extra-body", default=None,
                         help="JSON merged into every ANSWER request body. Required "
                              "as '{\"thinking\": {\"type\": \"disabled\"}}' when the "
@@ -2184,14 +3454,13 @@ def main():
                         help="E1 WRITE side (cfg.facts_extraction_enabled). None = config "
                              "default (ON). Changes what the dream STORES, so it only "
                              "differs on a fresh store — not a read-side A/B knob.")
-    parser.add_argument("--judge-gold", action="store_true",
-                        help="Feed the judge the REAL per-ability gold answer "
-                             "(GOLD_FIELDS) instead of the legacy parse, which "
-                             "resolved for 2 of 10 abilities and sent an empty "
-                             "IDEAL ANSWER field for the rest from 145eff8 "
-                             "onward. This changes what every BEAM score means: "
-                             "runs with it on are NOT comparable to v13-v16 and "
-                             "need their own baseline.")
+    parser.add_argument("--judge-gold", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Use resolved official per-ability gold (default). "
+                             "--no-judge-gold is legacy exploratory/non-comparable.")
+    parser.add_argument("--oracle-ability", action="store_true",
+                        help="EXPLORATORY NON-COMPARABLE: route from the oracle "
+                             "ability label instead of production detection.")
     parser.add_argument("--rejudge", default="",
                         help="Judge-only rejudge of an existing results artifact "
                              "(B in the gold-delta plan). Answer bytes are fixed "
@@ -2200,7 +3469,32 @@ def main():
                              "160/160. Reads output with --judge-gold to feed "
                              "real gold instead of the legacy IDEAL ANSWER.")
     parser.add_argument("--keep-db", action="store_true")
+    add_strict_run_arguments(parser)
     args = parser.parse_args()
+    if args.sample < 0:
+        parser.error("--sample must be non-negative (0 means all conversations)")
+    if args.top_k <= 0:
+        parser.error("--top-k must be positive")
+    if args.max_input_tokens <= 0:
+        parser.error("--max-input-tokens must be positive")
+    if args.indexing_max_cycles <= 0:
+        parser.error("--indexing-max-cycles must be positive")
+    if not math.isfinite(args.indexing_timeout_s) or args.indexing_timeout_s <= 0:
+        parser.error("--indexing-timeout-s must be positive and finite")
+    try:
+        args.embedding_config = resolve_embedding_config(
+            args.embedding_backend, model=args.embedding_model,
+            base_url=args.embedding_base_url, dimension=args.embedding_dim,
+        )
+    except BenchmarkIntegrityError as exc:
+        parser.error(str(exc))
+    if args.judge_model is None:
+        args.judge_model = (
+            OFFICIAL_JUDGE_SPEC
+            if args.judge_protocol == "official"
+            else JUDGE_MODEL
+        )
+    judge_provider, judge_model, judge_base = parse_provider_spec(args.judge_model)
 
     # Parse the extra-body flags into the *_obj attrs the guards and clients
     # read. Done before anything spends money: a typo'd JSON should cost a
@@ -2215,6 +3509,10 @@ def main():
         if not isinstance(obj, dict):
             print(f"ERROR: --{role}-extra-body must be a JSON object, got {type(obj).__name__}.")
             sys.exit(2)
+        try:
+            obj = validate_request_extra_body(obj)
+        except BenchmarkIntegrityError as exc:
+            parser.error(f"--{role}-extra-body: {exc}")
         setattr(args, f"{role}_extra_body_obj", obj)
         setattr(args, f"{role}_extra_body_absent", raw is None)
 
@@ -2224,7 +3522,7 @@ def main():
     # is defaulted further down, where its provider is finally resolved.
     args.extra_body_defaulted = []
     args.judge_extra_body_obj, _judge_defaulted = apply_thinking_default(
-        "judge", args.judge_model, "deepseek",
+        "judge", judge_model, judge_provider,
         args.judge_extra_body_absent, args.judge_extra_body_obj)
     if _judge_defaulted:
         args.extra_body_defaulted.append("judge")
@@ -2243,36 +3541,50 @@ def main():
     else:
         print("pre-registration: NONE (--no-prereg) — this run is exploratory.")
 
-    # Resolve API key
-    DEEPSEEK_API_KEY = args.api_key or os.environ.get("HYMEM_LLM_API_KEY", "")
-    if not DEEPSEEK_API_KEY:
-        # Try config.yaml
-        config_path = Path("/home/node/.hermes/config.yaml")
-        if config_path.exists():
-            for line in config_path.read_text().split("\n"):
-                s = line.strip()
-                if s.startswith("HYMEM_LLM_API_KEY:"):
-                    DEEPSEEK_API_KEY = s.split(":", 1)[1].strip().strip('"').strip("'")
-                    break
-    if not DEEPSEEK_API_KEY:
-        print("ERROR: No API key. Set --api-key, HYMEM_LLM_API_KEY env var, or ensure config.yaml has it.")
-        sys.exit(1)
-
-    print(f"API key: ...{DEEPSEEK_API_KEY[-4:]}", flush=True)  # confirm suffix
+    def _resolve_deepseek_key() -> str:
+        key = args.api_key or os.environ.get("HYMEM_LLM_API_KEY", "")
+        if not key:
+            config_path = Path("/home/node/.hermes/config.yaml")
+            if config_path.exists():
+                for line in config_path.read_text().split("\n"):
+                    stripped = line.strip()
+                    if stripped.startswith("HYMEM_LLM_API_KEY:"):
+                        key = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                        break
+        return key
 
     if args.rejudge:
+        if args.judge_protocol != "legacy-custom":
+            parser.error(
+                "historical --rejudge currently requires --judge-protocol "
+                "legacy-custom; official strict runs use the resumable main path"
+            )
+        DEEPSEEK_API_KEY = _resolve_deepseek_key()
+        if not DEEPSEEK_API_KEY:
+            parser.error("--rejudge requires a DeepSeek API key")
         _rejudge_run(args, DEEPSEEK_API_KEY)
         return
 
-    scales = [s.strip() for s in args.scales.split(",")]
+    scales = [s.strip() for s in args.scales.split(",") if s.strip()]
+    if not scales:
+        parser.error("--scales must contain at least one scale")
+    if len(scales) != len(set(scales)):
+        parser.error("--scales must not contain duplicates")
+    unknown_scales = [scale for scale in scales if scale not in VALID_BEAM_SCALES]
+    if unknown_scales:
+        parser.error(
+            f"unsupported BEAM scale(s): {unknown_scales}; "
+            f"choose from {list(VALID_BEAM_SCALES)}"
+        )
+    if (args.freeze_calibration or args.protocol_split != "full") and args.sample:
+        parser.error(
+            "--freeze-calibration and dev/holdout require --sample 0 so the "
+            "receipt covers the complete selected scale(s)"
+        )
     max_conv = args.sample if args.sample > 0 else None
     top_k = args.top_k
 
-    print(f"\nHyMem BEAM Benchmark (direct API)")
-    print(f"  Scales: {scales}")
-    print(f"  Max conversations: {max_conv or 'all'}")
-    print(f"  Top-K: {top_k}")
-    ans_model, ans_base, ans_key, ans_provider = resolve_answer_provider(args.answer_model, DEEPSEEK_API_KEY)
+    ans_provider, ans_model, ans_base = parse_provider_spec(args.answer_model)
     args.answer_extra_body_obj, _answer_defaulted = apply_thinking_default(
         "answer", ans_model, ans_provider,
         args.answer_extra_body_absent, args.answer_extra_body_obj)
@@ -2281,144 +3593,524 @@ def main():
         print(f"answer extra_body DEFAULTED to {args.answer_extra_body_obj} "
               f"(v4-flash, no --answer-extra-body passed)")
     check_model_pin("answer", ans_model, ans_provider, args.answer_extra_body_obj)
-    check_model_pin("judge", args.judge_model, "deepseek", args.judge_extra_body_obj)
+    check_model_pin(
+        "judge", judge_model, judge_provider, args.judge_extra_body_obj
+    )
+    official_judge_match = is_official_judge_configuration(
+        protocol=args.judge_protocol,
+        provider=judge_provider,
+        model=judge_model,
+        base_url=judge_base,
+        extra_body=args.judge_extra_body_obj,
+    )
+    full_scale_run = max_conv is None
+    official_protocol_aligned = bool(
+        official_judge_match and not args.oracle_ability
+        and args.protocol_split == "full"
+    )
+    canonical_dataset_run = bool(
+        full_scale_run and official_protocol_aligned and args.prereg_obj
+    )
+
+    print(f"\nHyMem BEAM Benchmark (direct API)")
+    print(f"  Scales: {scales}")
+    print(f"  Max conversations: {max_conv or 'all'}")
+    print(f"  Top-K: {top_k}")
     print(f"  Answer model: {ans_model} (provider={ans_provider}, base={ans_base}, "
           f"extra_body={args.answer_extra_body_obj or '{}'})")
-    print(f"  Judge model: {args.judge_model} (provider=deepseek, "
+    print(f"  Judge model: {judge_model} (provider={judge_provider}, "
+          f"protocol={args.judge_protocol}, "
           f"extra_body={args.judge_extra_body_obj or '{}'})")
+    print(
+        "  Embeddings: "
+        f"{args.embedding_config['backend']} "
+        f"(model={args.embedding_config['model']}, "
+        f"dim={args.embedding_config['dimension']}, "
+        f"quality={args.embedding_config['quality']})"
+    )
 
-    # Temp DB
-    tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-beam-"))
-    db_path = tmp_dir / "hymem.sqlite"
-    print(f"\nTemp DB: {db_path}\n")
-
-    # Initialize HyMem
-    hy = HyMemAdapter(db_path, api_key=DEEPSEEK_API_KEY,
-                      facts_enabled=args.facts,
-                      facts_extraction=args.facts_extraction)
-    hy.open()
-
-    # LLM clients
-    answer_llm = LLMClient(ans_model, ans_key, base_url=ans_base,
-                           extra_body=args.answer_extra_body_obj)
-    judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY,
-                          extra_body=args.judge_extra_body_obj)
-
-    # Load data
+    # Dataset and frozen run identity are resolved before any provider client or
+    # API key. Calibration can therefore never touch the evaluation model.
     print("Loading BEAM dataset...", flush=True)
     dataset_revisions = resolve_dataset_revisions(scales, args.dataset_revision)
     print(f"  dataset revisions: {dataset_revisions}", flush=True)
-    conversations = load_beam_conversations(scales, max_conv,
-                                            revision=args.dataset_revision)
+    unresolved_revisions = validate_dataset_revision_binding(
+        dataset_revisions,
+        canonical=canonical_dataset_run,
+    )
+    conversations = load_beam_conversations(
+        scales, max_conv, seed=args.seed, revisions=dataset_revisions
+    )
     total_convs = sum(len(v) for v in conversations.values())
     total_questions = sum(len(c["questions"]) for v in conversations.values() for c in v)
     print(f"  Total: {total_convs} conversations, {total_questions} questions")
+    if full_scale_run and official_protocol_aligned:
+        validate_official_denominators(conversations, scales)
     print_gold_audit(conversations)
+    flat_questions = [
+        q for scale in scales for conv in conversations.get(scale, ())
+        for q in conv["questions"]
+    ]
+    all_ids = validate_ids(
+        (q["question_id"] for q in flat_questions), label="BEAM dataset"
+    )
+    if args.judge_protocol == "legacy-custom" and args.judge_gold:
+        missing_gold = [
+            q["question_id"] for q in flat_questions
+            if not isinstance(q.get("gold_text"), str) or not q["gold_text"].strip()
+        ]
+        if missing_gold:
+            raise BenchmarkIntegrityError(
+                "canonical BEAM gold is absent for question ids: "
+                f"{missing_gold[:5]}"
+            )
+        recovered_gold = [
+            q["question_id"] for q in flat_questions
+            if q.get("gold_resolution") != "exact"
+        ]
+        if recovered_gold:
+            raise BenchmarkIntegrityError(
+                "canonical BEAM gold did not resolve from the exact expected "
+                f"ability field for question ids: {recovered_gold[:5]}"
+            )
 
-    # ── CANARY: both live clients, real prompts, before the run spends ─────
-    # The rejudge path has canaried its judge since the gold-delta phase; the
-    # main path -- the one that makes the expensive ANSWER calls -- had no such
-    # check, so a pin landing in reasoning_content would have surfaced as a
-    # suspiciously low score hours later, if at all.
-    canary_msgs = build_canary_messages(conversations, scales, args.judge_gold)
-    print(f"  canary question ability: {canary_msgs['ability']}")
-    canary_answer = run_canary("answer", answer_llm, canary_msgs["answer"], 1024)
-    run_canary("judge", judge_llm,
-               canary_msgs["judge"](canary_answer), 512)
-    # Counted separately, NOT folded into answer_calls/judge_calls. The rejudge
-    # artifact set the opposite precedent (judge_calls=161 for 160 rows), but
-    # that is a wart to stop repeating rather than a convention to cement: a
-    # column named answer_calls should equal the number of questions scored, so
-    # that "calls != rows" stays readable as a defect.
-    canary_calls = {"canary_answer_calls": answer_llm.call_count,
-                    "canary_judge_calls": judge_llm.call_count}
-
-    # Evaluate
-    all_results = []
-    start_time = time.time()
-
-    for scale in scales:
-        if scale not in conversations:
-            continue
-        print(f"Evaluating {scale} ({len(conversations[scale])} conversations)...", flush=True)
-        for ci, conv in enumerate(conversations[scale]):
-            print(f"  [{ci+1}/{len(conversations[scale])}] Conv {conv['id']}", flush=True)
-            result = evaluate_conversation(args.judge_gold, answer_llm, judge_llm,
-                                           hy, conv, top_k)
-            all_results.append(result)
-            print()
-
-    elapsed = time.time() - start_time
-    print(f"Evaluation complete in {elapsed:.0f}s ({answer_llm.call_count} answer calls, {judge_llm.call_count} judge calls)")
-
-    # Report
-    summary = compute_scores(all_results)
-    print_report(summary, {
-        "answer_model": args.answer_model,
-        "judge_model": args.judge_model,
-        "sample_size": max_conv,
+    strict_config = {
+        "scales": scales,
+        "sample": max_conv,
+        "sample_strategy": "seeded-label-blind-hash-v1" if max_conv else "all",
+        "subset_run": not full_scale_run,
         "top_k": top_k,
-    })
-    print_episode_probe(all_results)
-
-    # Save — one file per run, so cross-run comparisons keep their metadata
-    # (sample size, top_k, models) instead of each run clobbering the last.
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    results_path = _repo_root.parent / "hymem_beam" / f"results_{stamp}.json"
-    results_path.parent.mkdir(exist_ok=True)
-    output = {
-        "metadata": {
-            "date": datetime.now(timezone.utc).isoformat(),
-            "answer_model": args.answer_model,
-            "judge_model": args.judge_model,
-            # Recorded on the rejudge path since the gold-delta phase and NOT
-            # here, so Step 2's canonical could not witness its own gold
-            # setting from its metadata — only from the pre-registration blob
-            # it pins. The blob is a real witness; a missing field is not a
-            # good reason to rely on it.
-            "judge_gold": bool(args.judge_gold),
-            "scales": scales,
-            "sample": max_conv,
-            "top_k": top_k,
-            # Effective answer-context width (top_k × 3). Saved explicitly:
-            # the June 2026 score step came down to this number changing
-            # without any record of it in run output.
-            "context_memories": top_k * 3,
-            "elapsed_s": elapsed,
-            "answer_calls": answer_llm.call_count - canary_calls["canary_answer_calls"],
-            "judge_calls": judge_llm.call_count - canary_calls["canary_judge_calls"],
-            **canary_calls,
-            # WHAT WAS SENT, not what the guard would have permitted. A reader
-            # of answer_model="deepseek-v4-flash" cannot otherwise tell whether
-            # thinking was disabled -- and that single field is the difference
-            # between a capability number and a plumbing failure (lme_runs.db
-            # id=53 0.6% vs id=54 69.8%). Inferring it from check_model_pin's
-            # rules is an inference about the code that scored the run, which
-            # is exactly the kind of thing artifacts exist to stop.
-            "answer_extra_body": args.answer_extra_body_obj,
-            "judge_extra_body": args.judge_extra_body_obj,
-            "extra_body_defaulted": list(args.extra_body_defaulted),
-            "prereg": args.prereg_obj,
-            "dataset_revisions": dataset_revisions,
-        },
-        "summary": {scale: {ab: data["avg"] for ab, data in abilities.items()}
-                     for scale, abilities in summary.items()},
-        # Full per-question records (answer, ideal, rubric, judge scores) so
-        # runs can be re-judged and diffed post-hoc. An empty "scores" list on
-        # a question with a non-empty rubric means the judge reply failed to
-        # parse and the 0.0 is an artifact, not a graded zero.
-        "conversations": all_results,
+        "max_input_tokens": args.max_input_tokens,
+        "indexing_max_cycles": args.indexing_max_cycles,
+        "indexing_timeout_s": args.indexing_timeout_s,
+        "indexing_require_healthy": True,
+        "embedding": public_embedding_config(args.embedding_config),
+        "facts": args.facts,
+        "facts_extraction": args.facts_extraction,
+        "judge_gold": bool(args.judge_gold),
+        "judge_protocol": args.judge_protocol,
+        "official_judge_protocol_match": official_judge_match,
+        "official_protocol_aligned": official_protocol_aligned,
+        "official_denominator_validated": bool(
+            full_scale_run and official_protocol_aligned
+        ),
+        "official_judge_prompt_hash": BEAM_OFFICIAL_JUDGE_PROMPT_HASH,
+        "official_judge_upstream_commit": BEAM_UPSTREAM_COMMIT,
+        "official_judge_evaluator_url": BEAM_OFFICIAL_EVALUATOR_URL,
+        "official_judge_prompt_url": BEAM_OFFICIAL_PROMPT_URL,
+        "oracle_ability": bool(args.oracle_ability),
+        "label_free_answer_path": not args.oracle_ability,
+        "scored_run": True,
+        "exploratory_label_steering": bool(args.oracle_ability),
+        "exploratory_non_comparable": bool(
+            args.oracle_ability or not args.judge_gold or args.no_prereg
+            or unresolved_revisions or not official_judge_match
+            or not full_scale_run or args.protocol_split != "full"
+        ),
+        "answer_extra_body": args.answer_extra_body_obj,
+        "judge_extra_body": args.judge_extra_body_obj,
+        "extra_body_defaulted": list(args.extra_body_defaulted),
+        "prereg": args.prereg_obj,
+        "dataset_revisions": dataset_revisions,
+        "dataset_revision_provenance_complete": not unresolved_revisions,
     }
-    with open(results_path, "w") as f:
-        json.dump(output, f, indent=2, default=str)
-    print(f"\nResults saved to {results_path}")
+    config_probe = HyMemAdapter(
+        Path("/benchmark-identity/hymem.sqlite"), facts_enabled=args.facts,
+        facts_extraction=args.facts_extraction,
+        pipeline_model=args.hymem_model,
+        pipeline_base_url=args.hymem_base_url,
+        pipeline_thinking=args.hymem_thinking,
+        embedding_backend=args.embedding_backend,
+        embedding_model=args.embedding_model,
+        embedding_base_url=args.embedding_base_url,
+        embedding_dim=args.embedding_dim,
+    ).build_config()
+    strict_config["effective_hymem_config"] = dataclass_identity(
+        config_probe, exclude={"root"}
+    )
+    pipeline_sends_thinking = (
+        args.hymem_thinking == "disabled"
+        or (
+            args.hymem_thinking == "auto"
+            and (
+                "deepseek" in args.hymem_base_url.casefold()
+                or "deepseek" in args.hymem_model.casefold()
+            )
+        )
+    )
+    strict_models = {
+        "reader": {"provider": ans_provider, "model": ans_model,
+                   "base_url": ans_base},
+        "judge": {
+            "provider": judge_provider, "model": judge_model,
+            "base_url": judge_base, "temperature": 0.0,
+            "max_tokens": None if args.judge_protocol == "official" else 512,
+            "extra_body": args.judge_extra_body_obj,
+            "protocol": args.judge_protocol,
+            "upstream_commit": (
+                BEAM_UPSTREAM_COMMIT
+                if args.judge_protocol == "official" else None
+            ),
+            "prompt_hash": (
+                BEAM_OFFICIAL_JUDGE_PROMPT_HASH
+                if args.judge_protocol == "official"
+                else content_hash(JUDGE_SYSTEM_PROMPT)
+            ),
+        },
+        "memory_pipeline": {
+            "provider": "openai-compatible", "model": args.hymem_model,
+            "base_url": args.hymem_base_url,
+            "thinking_mode": args.hymem_thinking,
+            "effective_extra_body": (
+                {"thinking": {"type": "disabled"}}
+                if pipeline_sends_thinking else {}
+            ),
+        },
+        "embedding": public_embedding_config(args.embedding_config),
+    }
+    dataset_sha = content_hash({
+        "revisions": dataset_revisions,
+        "conversations": conversations,
+    })
+    if args.freeze_calibration:
+        receipt = freeze_calibration(
+            args.freeze_calibration, benchmark="BEAM", dataset_hash=dataset_sha,
+            ids=all_ids, config=strict_config, models=strict_models,
+            seed=args.seed, dev_fraction=args.dev_fraction,
+        )
+        print(f"Frozen BEAM calibration: dev={len(receipt['dev_ids'])}, "
+              f"holdout={len(receipt['holdout_ids'])}")
+        return
 
-    hy.close()
+    calibration = None
+    if args.calibration_receipt:
+        calibration = load_calibration(
+            args.calibration_receipt, benchmark="BEAM",
+            dataset_hash=dataset_sha, config=strict_config,
+            models=strict_models, ids=all_ids,
+        )
+    selected_ids = select_protocol_ids(
+        all_ids, split=args.protocol_split, receipt=calibration
+    )
+    selected_set = set(selected_ids)
+    selected_conversations: dict[str, list[dict]] = {}
+    for scale in scales:
+        selected_conversations[scale] = []
+        for original in conversations.get(scale, ()):
+            selected_questions = [
+                q for q in original["questions"] if q["question_id"] in selected_set
+            ]
+            if selected_questions:
+                selected_conversations[scale].append({
+                    **original, "questions": selected_questions,
+                })
+    selected_order = tuple(
+        q["question_id"] for scale in scales
+        for conv in selected_conversations.get(scale, ())
+        for q in conv["questions"]
+    )
+    if selected_order != selected_ids:
+        raise BenchmarkIntegrityError("selected BEAM id order drifted")
 
-    if not args.keep_db:
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        print("Temp DB cleaned up.")
+    manifest = build_manifest(
+        benchmark="BEAM",
+        code_sha256=code_hash(
+            [Path(__file__), Path(__file__).with_name("strictness.py"),
+             Path(__file__).with_name("longmemeval_adapter.py"),
+             _repo_root / "hymem"], root=_repo_root,
+        ),
+        data_sha256=dataset_sha, config=strict_config, models=strict_models,
+        seed=args.seed, expected_ids=selected_ids,
+        protocol_split=args.protocol_split, calibration=calibration,
+    )
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path, is_resume = resolve_checkpoint_path(
+        checkpoint=args.checkpoint, resume_from=args.resume_from,
+        base_dir=results_dir, benchmark="beam", run_id=manifest["run_id"],
+    )
+    ledger = AtomicCheckpoint(
+        checkpoint_path, manifest=manifest, expected_ids=selected_ids,
+        resume=is_resume, retry_failures=args.retry_failures,
+        verdict_key="result_valid",
+    )
+    if _owned_ledgers is not None:
+        _owned_ledgers.append(ledger)
+    pending = set(ledger.pending_ids)
+    print(f"  Strict checkpoint: {checkpoint_path} "
+          f"({len(pending)} pending / {len(selected_ids)} expected)")
+
+    start_time = time.time()
+    segment_id = (
+        f"process-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-"
+        f"{os.getpid()}"
+    )
+    answer_llm = judge_llm = None
+    hy = None
+    tmp_dir = None
+    attempted = 0
+    lifecycle_errors: list[str] = []
+    pipeline_usage_instances: list[dict[str, Any]] = []
+    embedding_usage_instances: list[dict[str, Any]] = []
+    indexing_runs: list[dict[str, Any]] = []
+
+    def _segment(status: str) -> dict:
+        pipeline_rows = list(pipeline_usage_instances)
+        embedding_rows = list(embedding_usage_instances)
+        if hy is not None:
+            pipeline_rows.append(usage_snapshot(hy.pipeline_llm))
+            embedding_rows.append(embedding_usage_snapshot(
+                hy.embedding_client,
+                configured=bool(args.embedding_config["configured"]),
+            ))
+        return {
+            "segment_id": segment_id, "status": status,
+            "elapsed_s": time.time() - start_time,
+            "attempted_attempts": attempted,
+            "reader_usage": usage_snapshot(answer_llm),
+            "judge_usage": usage_snapshot(judge_llm),
+            "memory_pipeline_usage": (
+                aggregate_usage_snapshots(pipeline_rows)
+                if pipeline_rows else usage_snapshot(None)
+            ),
+            "embedding_usage": (
+                aggregate_embedding_usage_snapshots(embedding_rows)
+                if embedding_rows else embedding_usage_snapshot(
+                    None, configured=bool(args.embedding_config["configured"])
+                )
+            ),
+            "latest_indexing": (
+                hy.last_indexing_summary if hy is not None
+                else (indexing_runs[-1] if indexing_runs else None)
+            ),
+            "indexing_runs": [dict(item) for item in indexing_runs],
+        }
+
+    def _record(row: dict) -> None:
+        nonlocal attempted
+        attempted += 1
+        ledger.record(
+            row["question_id"], row=row,
+            execution_segment=_segment("running"),
+        )
+
+    try:
+        if pending:
+            DEEPSEEK_API_KEY = _resolve_deepseek_key()
+            if not DEEPSEEK_API_KEY:
+                parser.error(
+                    "pending BEAM questions require --api-key or HYMEM_LLM_API_KEY"
+                )
+            ans_model_live, ans_base_live, ans_key, provider_live = \
+                resolve_answer_provider(args.answer_model, DEEPSEEK_API_KEY)
+            if (ans_model_live, ans_base_live, provider_live) != \
+                    (ans_model, ans_base, ans_provider):
+                raise BenchmarkIntegrityError("answer-provider identity drifted")
+            judge_model_live, judge_base_live, judge_key, judge_provider_live = \
+                resolve_answer_provider(
+                    args.judge_model, DEEPSEEK_API_KEY, role="judge"
+                )
+            if (judge_model_live, judge_base_live, judge_provider_live) != \
+                    (judge_model, judge_base, judge_provider):
+                raise BenchmarkIntegrityError("judge-provider identity drifted")
+            answer_llm = LLMClient(
+                ans_model, ans_key, base_url=ans_base,
+                extra_body=args.answer_extra_body_obj,
+            )
+            judge_llm = LLMClient(
+                judge_model, judge_key, base_url=judge_base,
+                extra_body=args.judge_extra_body_obj,
+            )
+            ledger.update_execution_segment(segment_id, _segment("running"))
+
+            # Canary spend is persisted immediately in the cumulative segment.
+            canary_msgs = build_canary_messages(
+                selected_conversations, scales, args.judge_gold,
+                judge_protocol=args.judge_protocol,
+            )
+            canary_answer = _run_canary_with_checkpoint(
+                ledger, segment_id, _segment,
+                "answer", answer_llm, canary_msgs["answer"], 1024,
+            )
+            _run_canary_with_checkpoint(
+                ledger, segment_id, _segment,
+                "judge", judge_llm,
+                canary_msgs["judge"](canary_answer),
+                None if args.judge_protocol == "official" else 512,
+            )
+
+            for scale in scales:
+                convs = selected_conversations.get(scale, ())
+                for ci, conv in enumerate(convs):
+                    conv_pending = {
+                        q["question_id"] for q in conv["questions"]
+                        if q["question_id"] in pending
+                    }
+                    if not conv_pending:
+                        continue
+                    print(f"  [{ci+1}/{len(convs)}] Conv {conv['id']}", flush=True)
+                    # Every BEAM conversation is an independent memory/user.
+                    # A fresh store prevents graph evidence counts, retention
+                    # budgets, inference and ranking state from one example
+                    # changing another example's write-side representation.
+                    tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-beam-conv-"))
+                    hy = HyMemAdapter(
+                        tmp_dir / "hymem.sqlite", api_key=DEEPSEEK_API_KEY,
+                        facts_enabled=args.facts,
+                        facts_extraction=args.facts_extraction,
+                        pipeline_model=args.hymem_model,
+                        pipeline_base_url=args.hymem_base_url,
+                        pipeline_thinking=args.hymem_thinking,
+                        embedding_backend=args.embedding_backend,
+                        embedding_model=args.embedding_model,
+                        embedding_base_url=args.embedding_base_url,
+                        embedding_dim=args.embedding_dim,
+                        embedding_api_key=args.embedding_api_key,
+                    )
+                    try:
+                        hy.open()
+                        evaluate_conversation(
+                            args.judge_gold, answer_llm, judge_llm, hy, conv,
+                            top_k, oracle_ability=args.oracle_ability,
+                            judge_protocol=args.judge_protocol,
+                            pending_ids=conv_pending, on_result=_record,
+                            indexing_max_cycles=args.indexing_max_cycles,
+                            indexing_timeout_s=args.indexing_timeout_s,
+                            max_input_tokens=args.max_input_tokens,
+                        )
+                    except Exception as exc:
+                        # Ingest/dream failures occur before the per-question
+                        # callback; materialize every affected expected id.
+                        remaining_now = set(ledger.pending_ids)
+                        for q in conv["questions"]:
+                            if q["question_id"] not in remaining_now:
+                                continue
+                            _record({
+                                "question_id": q["question_id"],
+                                "scale": scale, "conv_id": conv["id"],
+                                "ability": q["ability_short"],
+                                "oracle_ability": q["ability_short"],
+                                "detected_ability": None,
+                                "ability_used": None,
+                                "question": q["question"],
+                                "score": 0.0, "scores": [],
+                                "llm_judge_score": 0.0,
+                                "judge_protocol": args.judge_protocol,
+                                "result_valid": False, "correct": False,
+                                "benchmark_failure": (
+                                    f"conversation_failure: {type(exc).__name__}: {exc}"
+                                ),
+                                "indexing": (
+                                    hy.last_indexing_summary if hy is not None else None
+                                ),
+                            })
+                    finally:
+                        if hy is not None:
+                            pipeline_usage_instances.append(
+                                usage_snapshot(hy.pipeline_llm)
+                            )
+                            embedding_usage_instances.append(
+                                embedding_usage_snapshot(
+                                    hy.embedding_client,
+                                    configured=bool(
+                                        args.embedding_config["configured"]
+                                    ),
+                                )
+                            )
+                            if hy.last_indexing_summary is not None:
+                                indexing_runs.append({
+                                    "scale": scale,
+                                    "conversation_id": conv["id"],
+                                    **dict(hy.last_indexing_summary),
+                                })
+                            try:
+                                hy.close()
+                            except Exception as exc:
+                                lifecycle_errors.append(
+                                    "adapter_close "
+                                    f"{scale}/{conv['id']}: "
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+                        if tmp_dir is not None and not args.keep_db:
+                            try:
+                                import shutil
+                                shutil.rmtree(tmp_dir, ignore_errors=False)
+                            except Exception as exc:
+                                lifecycle_errors.append(
+                                    "temporary_store_cleanup "
+                                    f"{scale}/{conv['id']}: "
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+                        hy = None
+                        tmp_dir = None
+                        ledger.update_execution_segment(
+                            segment_id, _segment("running")
+                        )
+        if pending:
+            ledger.update_execution_segment(segment_id, _segment("complete"))
+    finally:
+        if hy is not None:
+            try:
+                hy.close()
+            except Exception as exc:
+                lifecycle_errors.append(
+                    f"adapter_close: {type(exc).__name__}: {exc}"
+                )
+        if tmp_dir is not None and not args.keep_db:
+            try:
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=False)
+            except Exception as exc:
+                lifecycle_errors.append(
+                    f"temporary_store_cleanup: {type(exc).__name__}: {exc}"
+                )
+
+    try:
+        elapsed = time.time() - start_time
+        payload, summary, all_results = _strict_beam_payload(
+            ledger, selected_conversations, scales,
+            label_free=not args.oracle_ability, judge_gold=args.judge_gold,
+            official_judge_match=official_judge_match,
+            lifecycle_errors=lifecycle_errors,
+        )
+        payload["elapsed_s"] = elapsed
+        archive_now = datetime.now(timezone.utc)
+        stamp = archive_now.strftime("%Y%m%dT%H%M%SZ")
+        publication_nonce = archive_now.strftime("%f")
+        archive_path = results_dir / (
+            f"results_{stamp}-{publication_nonce}-strict-"
+            f"{manifest['run_id'].removeprefix('sha256:')[:12]}.json"
+        )
+        from benchmarks.strictness import publish_checkpoint_artifact
+        publish_checkpoint_artifact(ledger, archive_path, payload=payload)
+        latest_path = results_dir / "results_latest.json"
+        write_latest_pointer(latest_path, archive=archive_path,
+                             run_id=manifest["run_id"])
+
+        # Optional presentation occurs after immutable publication.
+        print(f"Evaluation complete in {elapsed:.0f}s")
+        print_report(summary, {
+            "answer_model": args.answer_model, "judge_model": args.judge_model,
+            "sample_size": max_conv, "top_k": top_k,
+        })
+        print_episode_probe(all_results)
+        print(f"\nResults saved to {archive_path}")
+    finally:
+        ledger.close()
+
+
+def main():
+    """CLI entry point that owns every checkpoint lease for its full lifetime."""
+
+    owned_ledgers: list[AtomicCheckpoint] = []
+    try:
+        return _main(owned_ledgers)
+    finally:
+        # Covers BaseException/SystemExit from client creation, canaries,
+        # evaluation, checkpoint I/O, publication and presentation. Inner
+        # success-path closes are idempotent.
+        for ledger in reversed(owned_ledgers):
+            ledger.close()
 
 
 if __name__ == "__main__":

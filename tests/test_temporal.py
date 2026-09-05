@@ -5,7 +5,7 @@ temporal.py), and augment(ability="TR") returning a date-ordered event list.
 
 from __future__ import annotations
 
-from tests.conftest import make_routed_llm, seed_edge
+from tests.conftest import make_routed_llm
 
 
 # --- date parsing ----------------------------------------------------------
@@ -133,14 +133,24 @@ def test_tr_returns_events_in_chronological_order(hy):
 
 def test_tr_merges_dated_graph_edges(hy):
     sid = "tr-graph"
-    _dream_with_dates(
-        hy, sid, [("user", "we adopted kafka on 2024-06-01 for events.")]
+    hy.open_session(sid)
+    message_id = hy.log_message(
+        sid,
+        "user",
+        "Kafka deployed to production; we adopted kafka on 2024-06-01 for events.",
+        created_at="2024-04-15T09:30:00Z",
     )
-    # A dated graph edge for a matched entity. kafka is registered as an alias
-    # so match_known_entities resolves it (a single object-only edge would fail
-    # the entity-shape filter), and it sits in subject position here.
-    hy.register_alias("kafka", "kafka")
-    seed_edge(hy.conn, "kafka", "deploys_to", "production", days_ago=100)
+    hy.close_session(sid)
+    hy.set_llm(make_routed_llm([
+        {
+            "subject": "kafka",
+            "predicate": "deploys_to",
+            "object": "production",
+            "polarity": 1,
+            "source_message_id": message_id,
+        }
+    ], []))
+    hy.dream(session_ids=[sid])
 
     ctx = hy.augment("timeline for kafka", ability="TR")
     sources = {e.source for e in ctx.temporal_events}

@@ -53,23 +53,23 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.dreaming.value_supersession import _ISO_DATE, _classify_object
 
-# The EXACT anchor predicate — copy of dreaming/aggregate.py:825-835. If the
-# digest anchor ever changes, this module must change with it (the probe's
-# whole point is measuring the CURRENT state anchor).
+# The exact anchor ordering/projection. The truth predicate itself comes from
+# core.graph so every public/live reader changes together.
 #
 # `id` is projected in ADDITION to the digest's three columns. The digest only
 # renders text; the probe must trace a seed edge back to the chunks it was
 # extracted from, to exclude provenance-circular "recoveries" (D4). The filter,
 # the ordering and the cap are untouched, which is what the parity control
 # pins.
-_ANCHOR_SQL = """
+_ANCHOR_SQL = f"""
     SELECT id, subject_canonical, predicate, object_canonical
     FROM knowledge_graph
-    WHERE status = 'active' AND derived = 0 AND invalid_at IS NULL
-      AND pos_evidence > neg_evidence
-    ORDER BY pos_evidence - neg_evidence DESC, last_seen DESC, id
+    WHERE {live_edge_predicate()}
+    ORDER BY pos_evidence - neg_evidence DESC,
+             {graph_clock_order_sql('last_seen')}, id
     LIMIT ?
 """
 

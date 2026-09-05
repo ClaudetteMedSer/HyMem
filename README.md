@@ -6,13 +6,13 @@
 
 **HyMem** is a local-first, embedded memory system for AI agents. It gives the **Hermes** agent persistent memory across conversations by extracting a structured SQLite knowledge graph from chat logs during idle "dreaming" cycles, then making that knowledge queryable at conversation time via keyword search, vector search, semantic graph search, and entity lookup — plus a working-memory tier of recent raw turns so facts from the current session are recallable before they're dreamed. It also auto-maintains two Markdown files (`MEMORY.md` and `USER.md`) that the agent reads before each conversation, and — with aggregation enabled — a standing whole-store digest (`HyMem.digest()`, the RAPTOR root) answering "what do you know about this user?" for system-prompt injection.
 
-**No cloud, no Postgres, no 500MB Docker images.** One SQLite file, two Markdown files, and a Python library. Query-time retrieval defaults to LLM-free — FTS5 + sqlite-vec ANN + graph traversal. An optional hybrid reranker (cross-encoder *or* the configured LLM) can be enabled to break ties when keyword and semantic search disagree, gated by an ambiguity threshold so the LLM hot path stays the exception, not the rule.
+**No cloud, no Postgres, no 500MB Docker images.** One SQLite file, two Markdown files, and a Python library. Query-time retrieval defaults to LLM-free — FTS5 + deterministic local feature vectors + graph traversal. An optional hybrid reranker (cross-encoder *or* the configured LLM) can be enabled to break ties when keyword and semantic search disagree, gated by an ambiguity threshold so the LLM hot path stays the exception, not the rule.
 
-**Two deployment modes:** an MCP tools server for direct agent integration, and a **Honcho v3-compatible HTTP server** so Hermes can use the standard `honcho-ai` SDK and treat HyMem as a drop-in replacement for Honcho's managed cloud service.
+**Two deployment modes:** an MCP tools server for direct agent integration, and a **Honcho-compatible HTTP subset** covering the pinned `honcho-ai` SDK calls Hermes uses. It is an interoperability layer, not a drop-in implementation of every Honcho cloud behavior.
 
 **~15,000 lines of Python**, zero npm, zero Docker required.
 
-**Benchmarked on LongMemEval.** On the 500-question LongMemEval-S suite, HyMem scores **70.0% overall on the production path** — the in-library ability router shaping retrieval with *no* oracle labels, so the number reflects what real Hermes gets, not a benchmark-only ceiling. The headline runs with **dreaming on** (worth +3.6pp; the A/B and per-category lifts are in §11). Full table and methodology in [§11](#11-benchmark-results-longmemeval).
+**LongMemEval evidence is tracked, not advertised as a current leaderboard score.** A historical full-S local-protocol development run recorded 70.0%, but it predates the strict pinned evaluator/dataset/manifest path and is neither an official-comparable result nor a current headline. The present harness records label-free routing, failures, provider identities, indexing health, and the exact denominator; no replacement score is claimed until that protocol is rerun. See [§11](#11-benchmark-evidence-longmemeval).
 
 ---
 
@@ -25,26 +25,31 @@ variables, and run a server — no config files.
 pip install 'hymem[server]'
 
 export HYMEM_LLM_API_KEY=sk-...        # extraction LLM (DeepSeek/OpenAI/...)
-export HYMEM_EMBEDDING_API_KEY=sk-...  # optional — omit for FTS-only retrieval
+# Optional: configure an OpenAI-compatible semantic embedder. If omitted,
+# HyMem uses its deterministic no-network lexical feature-hash backend.
+export HYMEM_EMBEDDING_API_KEY=sk-...
 export HYMEM_ROOT=~/.hermes            # optional — SQLite + Markdown live here
 export HYMEM_AGGREGATION_NODES_ENABLED=true  # optional — standing whole-store
                                              # digest (see §7 Hermes integration)
 
 hymem-doctor      # preflight: verify config before launching
-hymem-honcho      # Honcho v3-compatible HTTP server on :8765
+hymem-honcho      # Honcho-compatible HTTP subset on :8765
 # or
 hymem-server      # MCP tools server
 ```
 
 `hymem-doctor` prints the resolved provider/model/URLs and checks that the
-keys work, the endpoints are reachable, `sqlite-vec` loads, the schema
-migrates, and the embedding dimension matches any existing vector table. If the
+keys work, configured remote endpoints are reachable, `sqlite-vec` loads, the schema
+migrates, and the embedding model and dimension match existing vector shadows. If the
 LLM key is missing the servers refuse to start with a clear message rather than
 failing deep inside the first request.
 
-Defaults target DeepSeek; override `HYMEM_LLM_BASE_URL` / `HYMEM_LLM_MODEL`
-(and the `HYMEM_EMBEDDING_*` equivalents) for OpenAI or any OpenAI-compatible
-endpoint. Full inventory in [§9 Configuration](#9-configuration).
+The extraction LLM defaults target DeepSeek. Embeddings are configured
+independently: omission selects a deterministic no-network lexical feature
+backend; an explicit remote endpoint must be HTTPS and use
+`HYMEM_EMBEDDING_API_KEY` (the general `OPENAI_API_KEY` is inherited only by
+the official `api.openai.com` endpoint). Full inventory in
+[§9 Configuration](#9-configuration).
 
 ---
 
@@ -123,8 +128,8 @@ hymem/
 │                         ask, profile, digest, alias, retract)
 ├── honcho_server.py    Back-compat shim → hymem.honcho
 │
-├── honcho/             Honcho v3-compatible HTTP server
-│   ├── app.py          FastAPI routes (19 Honcho endpoints + /health, /dream-status) + entry point
+├── honcho/             Honcho-compatible HTTP subset
+│   ├── app.py          FastAPI routes (pinned-SDK surface + operations) + entry point
 │   ├── models.py       Typed Pydantic request models (one per endpoint body)
 │   └── adapters.py     Response shaping + request-shape normalization
 │
@@ -199,15 +204,31 @@ hymem/
 
 ---
 
-## 4. The Data Model (28 SQLite Tables + 5 FTS5 Indexes)
+## 4. The Data Model
 
 **Conversation storage:**
-- `sessions` — session ID + start/end timestamps + LLM-generated summary
+- `sessions` — session ID + start/end timestamps, independent lossless-coverage
+  and resumable digest cursors, an automatic rolling summary, and provenance
+  for the compatibility/operator summary; a published-generation marker keeps
+  partial episode rebuilds out of retrieval and aggregation
 - `messages` — raw turns (user, assistant, system, tool)
 - `messages_fts` — FTS5 over raw turns, indexed live at ingest; powers the `message_hits` tier so a turn is recallable before any dream chunks it
+- `message_retention_coverage` — immutable, content-hashed proof that each
+  source message has an exact canonical JSONL backing artifact; this is the
+  only proof that can authorize raw-message pruning
+
+Portable v10 exports are coherent, manifest-backed snapshots. Imports merge
+disjoint identities and exact reimports are idempotent; if an existing
+session, chunk, or durable proof has the same identity but different canonical
+state, the entire import fails closed instead of silently rebinding evidence.
+Narrative-fact outcomes, exact source occurrences, revisions, and lifecycle
+events round-trip as one authority ledger; pre-v10 fact cursors are rewound
+because a numeric message range alone is not provenance.
 
 **Extraction artifacts:**
-- `chunks` — high-salience conversation segments
+- `chunks` — purpose-tagged artifacts: selective `extraction` segments plus
+  namespaced, exact per-message `coverage` records. Coverage records never run
+  through Phase 1, retrieval, or embedding.
 - `chunks_fts` — FTS5 virtual table over chunk text (BM25 search)
 - `chunk_embeddings` — JSON-encoded embedding vectors
 - `processed_chunks` — idempotency tracking per (chunk_id, prompt_version)
@@ -216,10 +237,30 @@ hymem/
 - `entity_properties` — free-form key/value attributes per canonical entity (e.g. `language=python`), extracted alongside types
 - `temporal_mentions` — per-message date mentions extracted at dream time; feeds the `ability="TR"` chronology
 - `embedding_cache` — content-addressed (text, model) → vector cache deduplicating embedding-API calls across chunks/edges/episodes
+- `fact_extraction_outcomes` + `fact_extraction_source_occurrences` — one
+  immutable, lossless source unit per facts cursor step, including successful
+  empty results; malformed/over-cap results durably retry without advancing
+- `fact_extraction_revisions` + `narrative_fact_lifecycle` — authoritative
+  replay history. Prompt/config bumps re-extract each stored unit on its exact
+  original boundaries, retract omitted payloads, and deterministically
+  resurrect payloads that return
+- `narrative_facts` — the current fact projection. Its FTS and vector readers
+  expose only active rows whose complete source/result/lifecycle proof validates
 
 **Knowledge graph:**
-- `knowledge_graph` — (subject, predicate, object) triples with evidence counters, confidence, status (active/stale/retracted), and derived flag for inferred edges. **Bi-temporal** (schema v15): alongside the transaction-time columns (`first_seen`/`last_seen` — when HyMem *learned* a fact), each edge carries a valid-time interval `valid_at`/`invalid_at` — when the fact was true *in the world*, sourced from the originating message's date — so supersession is a closed interval (`invalid_at IS NULL` = still valid) rather than a status flip that erases the "what was true as of date X" axis
-- `kg_evidence` — per-source provenance linking edges to chunks, with value/text/temporal metadata
+- `knowledge_graph` — the materialized current cache of direct and inferred
+  `(subject, predicate, object)` rows. It carries evidence counters,
+  confidence, status, and one cached `valid_at`/`invalid_at` interval, but is
+  not itself the historical authority.
+- `kg_evidence` — the immutable, revisioned per-claim ledger (schema v40/41).
+  Canonical rows identify the exact source session, message, role, source event
+  time, lossless coverage artifact, extraction chunk, and interpretation.
+  Re-extraction retires a revision with `superseded_at`; it never overwrites
+  the old source claim.
+- `kg_edge_lifecycle` + `kg_lifecycle_dependencies` — immutable assertion and
+  retraction transitions with causal evidence links. Replaying eligible events
+  yields half-open source-valid intervals (`valid_at <= t < invalid_at`) and
+  correctly handles assert → retract → reassert without erasing old intervals.
 - `edge_embeddings` — JSON-encoded embedding vectors for knowledge graph edges, keyed on triple text so churning derived edges reuse cached vectors
 - `entity_aliases` — surface form → canonical entity mapping
 
@@ -229,8 +270,12 @@ hymem/
 - `user_profile` — typed personal-fact slots (role, name, employer, location, language, …) with bi-temporal `valid_at`/`invalid_at`; consumed by the digest's verified-facts anchor, `ctx.user_profile`, and `HyMem.profile()`
 
 **Episodic & procedural memory:**
-- `episodes` — named, summarized conversation segments with outcomes and entities
-- `episodes_fts` — FTS5 search over episode titles and summaries
+- `episodes` — named, summarized conversation segments with outcomes and
+  entities. A bounded replacement walk stages generation-scoped rows beside
+  the last complete generation; readers expose only the session's atomically
+  published generation (plus standalone NULL-generation rows).
+- `episodes_fts` — FTS5 search over published episode titles and summaries;
+  staged generations have no postings and therefore cannot perturb BM25 ranks
 - `episode_embeddings` — vectors for semantic episode search (`vec_episodes`)
 - `procedures` — step-by-step workflows with triggers and involved entities
 - `procedures_fts` — FTS5 search over procedure names, descriptions, and steps
@@ -254,7 +299,18 @@ hymem/
 
 ## 5. The Dreaming Pipeline (How Memory Gets Built)
 
-Dreaming is the offline process that converts raw chat logs into structured knowledge. It's called by Hermes after each conversation (or on a cron-like schedule). The pipeline holds an advisory lock so concurrent runs bail out safely; a slow run heartbeats that lock once per session so it isn't mistaken for a crashed holder (see §8 *Advisory lock with lease heartbeat*).
+Dreaming is the offline process that converts raw chat logs into structured knowledge. It's called by Hermes after each conversation (or on a cron-like schedule). The pipeline holds an advisory lock so concurrent runs bail out safely; a slow run heartbeats that lock once per session and between bounded coverage batches so it isn't mistaken for a crashed holder (see §8 *Advisory lock with lease heartbeat*).
+
+Before any selective extraction, every surviving raw turn—user, assistant,
+system, or tool, including empty and short turns—is materialized as one exact,
+namespaced coverage record. Public ingestion writes the raw turn, artifact,
+coverage proof, and coverage cursor in the same transaction. Legacy backfill is
+paged in short transactions. These records form the durable session-digest
+stream; salience never decides whether a turn is covered or summarized.
+This guarantee costs roughly one additional chunk row, one ledger row, and one
+canonical copy of the accepted content per message. Coverage artifacts are
+intentionally exempt from `max_chunks`; leave raw retention enabled for easiest
+auditability, or opt into `message_retention_days` once that duplication matters.
 
 ### Phase 1 — Extraction (`dreaming/phase1.py`)
 
@@ -271,11 +327,21 @@ Dreaming is the offline process that converts raw chat logs into structured know
 
 ### Inter-Phase Steps (`dreaming/runner.py`)
 
-After chunk extraction per session, three additional LLM-powered steps run before Phase 2:
-
-- **Episode extraction** (`episodes.py`): Groups adjacent chunks from the same session, asks the LLM to identify distinct episodes with titles, summaries, outcomes, and key entities. Stored in `episodes` (FTS5-searchable).
-- **Session summarization** (`summary.py`): Generates a one-sentence summary of what was accomplished in the session. Stored in `sessions.summary` and surfaced via Honcho's context endpoint.
-- **Procedure extraction** (`procedures.py`): Detects step-by-step workflows described in the conversation (e.g., "Deploy to staging"), extracts ordered steps with tools and triggers, and stores them in `procedures` (FTS5-searchable).
+After chunk extraction per session, one batched digest call produces episodes,
+an automatic summary, and procedures from the independent coverage stream. A
+persistent message/character cursor makes each bounded window retryable and
+idempotent: an oversized message resumes at the exact next character, and the
+message-level watermark advances only after its final slice commits. Short and
+assistant-only tails therefore reopen the digest even when they create no
+salience chunk. Each new window receives the prior automatic summary and must
+return the rolled-forward value (or an explicit empty no-op). Automatic text is
+stored separately from operator/legacy summaries; Honcho renders the effective
+combination without allowing dreaming to overwrite curated text. A prompt or
+window-size change rewinds against the durable artifacts, including after raw
+messages have been safely pruned. Episode replacement is generation-scoped:
+partial rows remain durable for retry but are excluded from FTS, vectors, and
+RAPTOR until the complete walk atomically swaps the published marker, so a
+failed rebuild cannot mutate or hide the last complete episode set.
 
 ### Phase 2 — Consolidation (`dreaming/phase2.py`)
 
@@ -300,13 +366,46 @@ Results are written to `MEMORY.md`'s auto-section, capped at `insights_max_entri
    - If no → leave alone (topic hasn't resurfaced)
 2. Any edge whose Laplace-smoothed confidence `(pos+1)/(pos+neg+2)` drops below the retract threshold (default: 0.15) gets `status = 'retracted'` — kept for audit but excluded from query results.
 
-**Bi-temporal stamping** (`dreaming/bitemporal.py`, schema v15): after decay, `stamp_validity()` opens the valid-time interval on every edge minted this cycle — `valid_at` ← the earliest **positive**-evidence source-message date (falling back to `first_seen`), write-once and idempotent. When an edge is superseded — phase-3 retraction here, or an explicit `retract_edge()` — `stamp_invalidation()` closes it: `invalid_at` ← the newest **negative**-evidence date (the moment the contradicting fact arrived), falling back to the flip time. Behavioral-dedup retraction is *not* stamped: collapsing duplicate edges into a survivor is representational, not a valid-time invalidation.
+**Bi-temporal lifecycle** (`dreaming/bitemporal.py`, schema v40–42): every
+canonical positive claim appends an assertion at its normalized source-message
+event time; phase-3, value-supersession, and manual decisions append causal
+close events. Replaying the immutable ledger produces half-open validity
+intervals and deterministic equal-time ordering. Public temporal readers never
+substitute ingestion-time `first_seen` when source-valid evidence is missing.
+Evidence `extracted_at`/`published_at`/`superseded_at` and lifecycle
+`created_at` form the separate authority clock. Canonical assertions obey
+`extracted_at <= lifecycle.created_at <= published_at <= superseded_at` (when
+retired); `published_at` is written once only after the entire extraction chunk
+succeeds. An explicit historical cutoff therefore uses that immutable first
+publication boundary even after unchanged re-extraction. The no-cutoff path
+also requires the latest matching observation and whole-chunk outcome to remain
+coherent, so staged, orphaned, future, or superseded extraction state cannot
+appear as current memory.
+Canonical entity merges are not transaction-versioned: historical authority is
+projected onto the **current canonical topology**, not presented as a literal
+old graph shape.
+
+Caller-supplied message `created_at` is the occurrence/source-valid timestamp,
+not a way to schedule a fact to become effective later. It must be strict
+ISO-8601 and cannot lead HyMem's observation clock by more than the shared
+300-second producer-skew allowance. Single and batched ingestion reject a bad
+clock atomically before raw or coverage rows land; lifecycle persistence and
+portable v7 import enforce the same event-versus-recorded-time invariant. This
+keeps the single cached current interval sound instead of folding future
+transitions into today's state.
 
 **Transitive inference** (`inference.py`): After decay, computes transitive closure for derived edges via two rules. (1) `A depends_on B, B depends_on C → A depends_on C` (BFS over the depends_on subgraph). (2) `A uses B, B depends_on C → A depends_on C` (one-hop cross-predicate, folded into `depends_on` so the predicate vocabulary stays stable and no schema migration is required). All derived edges are marked `derived=1` with confidence equal to the product of the source edges' smoothed confidences; previously-derived edges are wiped each cycle so the closure refreshes from scratch. Edges below the retract threshold are filtered out.
 
 After inference, Phase 2 insights are refreshed to reflect the new graph state, and old unreferenced chunks are pruned via `retention.py`.
 
-**Edge embedding** (`embeddings.py`): Once the graph has settled, every active edge — base and derived — is embedded as `"{subject} {predicate} {object}"` text into `edge_embeddings` and the `vec_edges` sqlite-vec table, so the query layer can do semantic search against the graph (see §6). The cache is keyed on triple text, not edge id: derived edges are deleted and recreated every cycle with fresh ids, so keying on text means a recreated edge reuses its cached vector instead of re-hitting the embedding API. Only genuinely new triple texts cost an embedding call — and the lock-free dedup pass in Phase 1 has usually pre-warmed the content-addressed `embedding_cache` with those texts already, so this pass mostly reads the cache rather than calling the API again. Skipped entirely when no embedding client is configured.
+**Edge embedding** (`embeddings.py`): Once the graph has settled, every current
+direct edge is embedded as `"{subject} {predicate} {object}"` text into
+`edge_embeddings` and the `vec_edges` sqlite-vec table, so semantic retrieval
+cannot reintroduce inferred, invalid, or negative-dominant rows excluded by the
+public graph contract. The cache is keyed on triple text, not edge id. Only
+genuinely new triple texts cost an embedding call, and Phase 1's lock-free dedup
+pass has usually pre-warmed the content-addressed cache. Skipped entirely when
+no embedding client is configured.
 
 ---
 
@@ -319,9 +418,10 @@ AugmentedContext(
     user_md: str,              # USER.md content
     memory_md: str,            # MEMORY.md content
     fts_hits: list[FtsHit],    # Ranked relevant chunks
-    message_hits: list[MessageHit],   # Raw-message keyword hits (see below)
+    message_hits: list[MessageHit],   # Raw-message lexical + semantic hits
     total_message_matches: int,       # Candidate count for ability="MR" (see below)
     graph_facts: list[GraphFact],     # Ranked knowledge graph edges (see below)
+    facts: list[FactHit],             # Current exact-source narrative facts
     temporal_events: list[TemporalEvent], # Date-ordered chronology for ability="TR"
     episodes: list[EpisodeHit],       # Matching episodes
     procedures: list[ProcedureHit],   # Matching procedures
@@ -332,30 +432,83 @@ AugmentedContext(
 )
 ```
 
-**Raw-message tier (`message_hits`).** Alongside chunk FTS, `augment()` runs a direct FTS5 keyword search over the raw `messages` table (user/assistant turns), indexed live at ingest — so a turn is recallable across sessions and *before* any dream chunks it, the gap chunk-only FTS leaves. Hits are separate from `fts_hits` (different granularity; non-comparable BM25) and each carries `created_at`/`message_id`. Knob: `message_fts_top_k` (default 5, 0 disables).
+**Raw-message tier (`message_hits`).** Alongside chunk retrieval, `augment()`
+combines FTS5 with semantic scoring over exact, durable user/assistant message
+occurrences. Each occurrence is embedded after its lossless coverage artifact
+commits, so it remains recallable after opt-in raw pruning and can recover
+paraphrases with no shared keyword. Peer/workspace/session scope is applied to
+the validated coverage parent, not cached vector metadata. Lexical winners are
+preserved when the local fallback's lower-quality vector arm adds candidates.
+Hits remain separate from `fts_hits` (different granularity) and carry
+`created_at`/`message_id`. Knob: `message_fts_top_k` (default 5, 0 disables).
+
+**Narrative-fact tier (`facts`).** Extraction and retrieval ship enabled
+together. Each bounded call consumes an exact lossless source slice; oversized
+turns resume by character offset, valid `[]` advances, and malformed or lossy
+output holds the cursor for adaptive retry. Search validates the committed
+outcome chain, exact occurrence ownership, result revisions, and lifecycle
+projection before ranking or provider hooks. The native tier is additive, then
+joins the same occurrence-aware fusion and finite token packer as other memory;
+source-equivalent representations deduplicate rather than crowding the prompt.
+Knobs: `facts_extraction_enabled`, `facts_enabled` (both default on), and
+`facts_top_k`.
 
 **Ability hints (`augment(..., ability=...)`).** An optional question-type hint (`IE`, `MR`, `TR`, `SUM`, `IF`, `KU`) that shapes *what HyMem returns*, never how the host answers. An explicit host hint always wins; when the host passes none, `augment()` runs the label-free `detect_ability` router (`query/intent.py`) and fills `MR`/`TR` from the query text alone — so ability shaping fires in production without an oracle label, and the result records `detected_ability` + `detected_rule` for observability. Unknown/None leaves the default path byte-for-byte unchanged.
 
 - **`ability="IF"`** (instruction/step recall — "what steps did I take to implement X?") pulls a wider procedure set (`procedure_top_k_if`, default 10) since procedures are the natural fit.
 - **`ability="MR"`** ("how many X across all my requests?") is an **opt-in counting path** (default off — set `message_fts_aggregate_cap > 0`). LLMs count poorly across a long context, so HyMem does the deterministic part: it restricts to **user** turns (assistant echoes would double-count actions), drops query stopwords (EN + NL), collapses literal restatements (conservative dedup that never merges turns differing by a number or entity — so distinct events aren't under-counted), and returns the **distinct count** in `total_message_matches` plus those turns in `message_hits` as evidence. The count is a *candidate* — one turn may state several items or none — so the host's LLM verifies it against the turns; it stays exact even when evidence is capped. Crucially the count is **additive** — it layers on top of normal relevance retrieval rather than replacing it — so a mis-routed MR question still gets full context and stays answerable. Off by default because keyword counting only fits *lexical* "how many" questions; semantic ones ("how many different ways…") need the answering LLM.
-- **`ability="TR"`** (temporal reasoning — "what did I do *before* X?", "how long ago?") builds a date-ordered chronology in `temporal_events` from dates extracted at dream time plus session-date anchors on retrieved turns, so the answerer has an explicit timeline instead of guessing order from prose.
+- **`ability="TR"`** (temporal reasoning — "what did I do *before* X?", "how long ago?") builds a date-ordered chronology in `temporal_events` from dates extracted at dream time, cited direct graph assertions, and session-date anchors on retrieved turns. Graph events use lifecycle-derived `valid_at` plus the terminal current citation's optional scope; retired scopes and ingestion-time `first_seen` never supply a graph event date. Uncited, inferred, invalid, and negative-dominant rows are omitted from this chronology.
 
 The host assembles these pieces into its prompt and **decides ordering** — for single-conversation *task-recall* questions, `message_hits`/`procedures` should outrank `graph_facts`, whose cross-session tool/preference facts can otherwise crowd the context.
 
 **Working-memory tier (`recent_turns`).** All the fields above are built from *dreaming artifacts* (chunks, embeddings, graph) — so a fact stated this session is invisible to `augment()` until a dream runs. When called with a `session_id`, `augment()` also returns the last `working_memory_turns` (default 10) raw turns of that session, oldest→newest, so within-session facts are recallable *before* any dream has consolidated them. Omitting `session_id` leaves `recent_turns` empty (unchanged legacy behavior). The turns are already secret-redacted at ingest (see §8), so they are safe to surface.
 
-Each `GraphFact` carries the edge (`subject`, `predicate`, `object`), its `confidence`, evidence counters, `derived` flag, the final `score`, and a `why_retrieved` list of reason codes explaining *why* the edge surfaced — e.g. `["semantic_0.84", "predicate:uses", "entity_type:framework", "recency_3d", "entity_match"]`. The reason codes are the ranking formula itself, so the agent gets an explanation with zero extra LLM calls.
+Each default `GraphFact` is a current, direct observation and carries a stable
+`edge_id`, source-valid `valid_at`/`invalid_at`, confidence/evidence counters,
+`derived=False`, final score, and `why_retrieved` reason codes. It also carries
+up to five deterministic, current-positive citations from the terminal open
+interval. A citation includes its stable evidence id, real source
+role/session/message, source event and creation times, coverage and extraction
+chunk ids, revision authority flags, and optional temporal scope. Retired and
+negative evidence never appears. Legacy/manual facts remain available to native
+`augment()` with `citations=[]`; renderers say `source unavailable` rather than
+inventing an author. Honcho Message-shaped routes omit graph facts until the
+ledger can supply an exact originating peer id; source role alone is never
+masqueraded as peer identity.
+
+**Public graph read contracts:**
+
+- `hy.timeline(entity)` returns the earliest **currently live direct** edge per
+  predicate, ordered by source-valid `valid_at`. For compatibility each
+  `TimelineEntry` retains the actual ingestion clock in `first_seen`; the two
+  clocks are separate fields. Inferred rows are never offered because HyMem
+  does not persist a truthful derivation-time interval for them.
+- `hy.count_relations(...)` is an exact distinct count over current direct
+  edges (`active`, open, and positive evidence strictly greater than negative).
+  `include_derived=True` is the explicit closure-inclusive count mode; it does
+  not claim observation time.
+- `hy.facts_at(valid_time, recorded_at=None, entity=None)` replays immutable
+  direct-edge lifecycle events and returns the half-open interval containing
+  `valid_time`. With no cutoff it uses today's authoritative evidence revisions
+  and dependencies. `recorded_at` instead selects revisions/events that existed
+  at that authority cutoff; malformed or missing transaction metadata fails
+  closed. It does not copy today's confidence counters into a historical
+  result. This lifecycle view can be broader than live retrieval: a confidence
+  tie remains in history until an actual close event is persisted, while
+  augment/timeline/count hide it immediately. Entity merges are not
+  transaction-versioned, so every result is projected onto the **current
+  canonical topology**.
 
 **How it works:**
 
 1. **Load profile + insights** from `USER.md` and `MEMORY.md` (file read, instant)
 2. **Keyword search** (`_fts_search`): Sanitize the query, tokenize it, wrap each token in FTS5-safe quotes, build an OR query, run against SQLite FTS5 with BM25 scoring. Returns top-k chunks (default: 5).
-3. **Vector search** (`_vector_search`, optional): If an embedding client is available, uses sqlite-vec ANN if available or falls back to Python cosine similarity (capped at `embedding_max_scan` default 5000). Returns top-k.
+3. **Vector search** (`_vector_search`, optional): One validated query vector is reused by every semantic tier. Retrieval scores the durable JSON vectors whose exact provider/model, dimension, and current content hash match; malformed or stale rows fail closed. sqlite-vec tables are rebuildable acceleration shadows, never retrieval authority. Chunk scans are capped at `embedding_max_scan` (default 5000).
 4. **Reciprocal rank fusion** (`_rrf_merge`): Merge FTS and vector results via RRF: `score = sum(1/(60 + rank))` across each list. This hybrid approach captures both keyword relevance and semantic similarity.
 5. **LLM reranking** (`_rerank`, optional): When FTS and vector disagree on the #1 result enough to trigger ambiguity (configurable threshold), the LLM scores each candidate's relevance to the query on a 1-5 scale. RRF and LLM scores are combined for final ranking.
 6. **Episode search** (`_episode_search`): FTS5 search over episode titles and summaries for the query.
 7. **Procedure search** (`_procedure_search`): FTS5 search over procedure names, descriptions, and steps.
-8. **Entity matching** (`match_known_entities`): Tokenize the user message (including 2-3 word n-grams), normalize each, and look them up against `entity_aliases` and the graph's canonical names. The object-canonical branch applies a *shape filter* — an object only counts as a known entity if it also appears as a subject, has an `entity_types` record, or shows up as an object in more than one edge. This suppresses one-off LLM extractions where a gerund or verb form (e.g. "working") landed as an edge object and would otherwise match any query containing that word.
+8. **Entity matching** (`match_known_entities`): Tokenize the user message (including 2-3 word n-grams), normalize each, and look them up against aliases and canonical names that participate in a current direct edge. The object-canonical branch additionally applies a live-direct *shape filter* — an object must also be a subject, have an `entity_types` record, or occur as an object more than once. Retracted, active-but-invalid, negative-dominant, and derived-only names cannot suppress semantic fallback or trigger rules.
 9. **Entity expansion** — two complementary fuzzy-link layers:
     - **Type expansion** (`_expand_entities_by_type`): for each matched entity, find other entities of the same type (e.g., if user mentions `uv`, also surface `pip` and `poetry` since they're all `package_manager`). Records the type for the `entity_type:` reason code.
     - **Token-overlap expansion** (`_expand_entities_by_token_overlap`): for each multi-segment matched canonical (e.g. `atta_van_westreenen`), look up other canonicals that share a *rare* underscore-segment as a complete token. Common tokens (`system`, `data`, … — anything appearing in more than `graph_token_overlap_threshold` canonicals) are dropped as noise. Closes the gap where the LLM extracted sibling canonicals (`atta_van_westreenen` and `atta_projects`) without a linking edge. Edges anchored *only* via this fuzzy link score at `graph_token_overlap_weight × confidence × recency` and carry `fallback:entity_anchored:overlap` + `overlap_via:{token}` reason codes, so they surface without out-ranking direct entity matches.
@@ -409,7 +562,7 @@ Exposes 9 tools via the Model Context Protocol:
 
 ### Honcho HTTP Server (`hymem-honcho` → `hymem/honcho/`)
 
-A FastAPI server implementing a **Honcho v3-compatible REST protocol** — 19 endpoints, plus two HyMem-native operational routes (`/health`, `/dream-status`). Hermes can use the standard `honcho-ai` Python SDK by setting `HONCHO_BASE_URL=http://127.0.0.1:8765`.
+A FastAPI server implementing the **Honcho v3 subset used by Hermes**, plus a legacy GET representation alias and two HyMem-native operational routes (`/health`, `/dream-status`). It is tested against the pinned `honcho-ai` Python SDK; set `HONCHO_BASE_URL=http://127.0.0.1:8765` to use it. Unlisted Honcho cloud features are not implied.
 
 The server is a small package, not a monolith: `models.py` holds the typed Pydantic request models (so an SDK shape mismatch is a clean 422, not an `AttributeError` deep in a handler), `adapters.py` owns all response shaping and request-shape normalization (one place that knows "what shape the SDK expects"), and `app.py` holds the routes. The pinned `honcho-ai` SDK is exercised end-to-end against a live server in `test_honcho_contract.py`.
 
@@ -419,20 +572,22 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 | `GET /v3/workspaces/{wid}` | Get workspace | |
 | `POST /v3/workspaces/{wid}/peers` | Get-or-create peer | Role auto-inferred from peer_id pattern |
 | `GET /v3/workspaces/{wid}/peers/{pid}` | Get peer by ID | Returns role + metadata |
-| `POST /v3/workspaces/{wid}/sessions` | Get-or-create session | Registers peers from `peer_names` |
+| `POST /v3/workspaces/{wid}/sessions` | Get-or-create session | Registers peers from `peers`; accepts legacy `peer_names` |
 | `GET /v3/workspaces/{wid}/sessions/{sid}` | Get session by ID | Returns is_active, metadata |
 | `POST .../sessions/{sid}/messages` | Log turns + bg dream | Dream cooldown: 60s default |
 | `POST .../sessions/{sid}/messages/upload` | File upload as message | For migrating MEMORY.md/USER.md |
 | `POST .../sessions/{sid}/messages/list` | Paginated message listing | page + size, returns total/pages |
-| `POST .../sessions/{sid}/search` | `hy.augment()` as Message objects | Graph facts + FTS hits |
-| `GET .../sessions/{sid}/context` | MEMORY.md + recent turns + summary | `peer_representation` = digest + USER.md, like the peer routes |
+| `POST .../sessions/{sid}/search` | `hy.augment()` as Message objects | FTS/raw hits; graph facts only once exact originating peer identity is available |
+| `GET .../sessions/{sid}/context` | Exact recent turns + scoped summary | Optional directional representation and card with `peer_target`; representation search/`limit_to_session` do not rewrite the global directional card |
 | `POST .../sessions/{sid}/peers` | Register peers + role mappings | |
 | `GET .../sessions/{sid}/peers/{pid}/config` | Per-session peer config | |
-| `GET .../peers/{pid}/card` | Standing digest + USER.md behavioral profile | Digest block (when built) precedes USER.md |
-| `GET .../peers/{pid}/context` | Peer-scoped context with optional search | `peer_representation` = digest + USER.md |
-| `POST .../peers/{pid}/representation` | Update peer representation | |
-| `POST .../peers/{pid}/chat` | Dialectic Q&A via `hy.augment()` | Returns prose + structured `facts[]` with `why` |
-| `GET /v3/workspaces/{wid}/conflicts` | `hy.conflicts()` over the graph | Pure SQL, no LLM call |
+| `POST .../peers/{pid}/search` | Peer-authored search results | Exact workspace/peer provenance required |
+| `GET .../peers/{pid}/card` | Self or directional representation | Optional `target` selects the observed peer; authorized shared-session evidence only |
+| `GET .../peers/{pid}/context` | Directional peer context | Path peer is observer; optional `target` is observed peer |
+| `POST .../peers/{pid}/representation` | Read directional representation | SDK contract is a POST read; optional session narrows scope |
+| `GET .../peers/{pid}/representation` | Legacy representation read | Compatibility alias for older direct callers |
+| `POST .../peers/{pid}/chat` | Scoped dialectic Q&A | Bounded iterative reasoning, deterministic fallback, JSON or SDK-compatible SSE |
+| `GET /v3/workspaces/{wid}/conflicts` | Unsupported legacy guard | Returns 501; native graph conflicts are not workspace-partitioned |
 | `GET /health` | Health check | |
 | `GET /dream-status` | `hy.dream_status()` — extraction backlog | Pending/total chunks, prompt_version, in_progress, last run |
 
@@ -441,15 +596,16 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 - **Background dreaming on a forked connection**: `_background_dream` runs on `HyMem.fork()` — a fresh SQLite connection that reuses the live instance's LLM/embedding clients — so a dream cycle never collides with concurrent `add_messages` writes.
 - **Batched ingestion**: `add_messages` logs a whole batch under one transaction via `HyMem.log_messages()` rather than one `BEGIN IMMEDIATE` per turn.
 - **Role inference**: Peer IDs matching `user[-_]|human|client|telegram|discord|slack` → user role, `agent|hermes|assistant|ai[-_]|bot|llm` → assistant role.
-- **LLM-free query path by default**: Search, context, and chat endpoints only call `hy.augment()`. With the default config (`rerank_model="llm"`, ambiguity-gated) the reranker fires only when FTS and vec disagree enough to trigger ambiguity; pick `rerank_model="cross-encoder"` for a local sentence-transformers reranker, or raise `rerank_ambiguity_threshold` to suppress it entirely. SQLite-only is the steady state.
-- **Explainability surfaced as metadata, not prose**: `graph_fact` results carry `metadata.why` with the ranker's reason codes (`fallback:entity_anchored`, `semantic_0.83`, `predicate:uses`, `recency_3d`, …). The `/chat` endpoint returns clean prose alongside a structured `facts[]` array — Hermes-friendly text without losing the trail.
+- **Bounded query and reasoning paths**: Search/context retrieval remains deterministic unless an optional reranker fires. Chat may additionally call the configured LLM through a bounded evidence-expansion loop; provider failure or unusable output falls back to deterministic, provenance-grounded text.
+- **Explainability and provenance stay attached**: native graph results and
+  `/chat` output carry stable edge/time fields, rank reasons, and bounded exact
+  source workspace/peer/session/message/event citations. Derived graph claims
+  are exposed only when those citations resolve to a validated exact source;
+  ambiguous or corrupt ownership fails closed.
 
-### Getting the standing digest into the host agent's context (Hermes)
+### Standing digest and the Honcho tenant boundary
 
-HyMem's whole-store digest (the RAPTOR root, §11) is served by this server: the peer `card`/`context` routes **and** the session-scoped `GET .../sessions/{sid}/context` all return `peer_representation` = digest + USER.md. That is the entire HyMem side — it ships with the package, nothing to patch after `pip install`. For the digest to actually reach the agent's auto-injected context block, two things must hold on the *host* side:
-
-1. **Aggregation is enabled** — set `HYMEM_AGGREGATION_NODES_ENABLED=true` (§9) and let one dream complete so a digest exists. Until then `peer_representation` degrades byte-for-byte to plain `USER.md`.
-2. **HyMem is at or after 2026-07-06** — then a stock, unpatched harness receives the digest. The peer-context route now returns an SDK-parseable response with the representation under both field names, working around two upstream `honcho-ai` SDK issues: `PeerContextResponse` expects `representation` (no alias for the wire name `peer_representation`) and requires `peer_id`/`target_id`, so the route previously failed SDK validation and the peer path came back empty. Pinned by a real-SDK contract test. Older HyMem servers instead need the two-line harness patch in [hymem/Hermes_instruction.md](hymem/Hermes_instruction.md) — the runbook also covers verification, always in a **fresh** session, since the harness caches its assembled base context.
+The RAPTOR root, `MEMORY.md`, `USER.md`, profiles, and unowned rules are process-global artifacts. They remain available through native HyMem/MCP integration, but are deliberately excluded from Honcho peer representations and dialectic answers because they have no workspace-and-peer ownership proof. Honcho reads use directional `(observer → target)` collections built only from authorized shared sessions; explicit session scope is validated against workspace ownership and participant observation policy.
 
 ---
 
@@ -457,7 +613,7 @@ HyMem's whole-store digest (the RAPTOR root, §11) is served by this server: the
 
 **Locked vocabulary (18 predicates).** No open-ended relation extraction. This means the knowledge graph is clean, queryable, and predictable — no hallucinated "loves" or "feels" edges. The predicate set covers technical relationships comprehensively: usage, dependency, preference, rejection, replacement, deployment, composition, configuration, versioning, runtime, connectivity, generation, testing, and interface conformance. The tradeoff: some relationships won't fit the schema, but the system errs on the side of silence rather than noise.
 
-**Host-agent responsibility split.** Hermes owns *when* to call HyMem; HyMem owns *how* memory works. HyMem never assembles prompts, never decides token budgets, never injects itself into the agent's reasoning loop. It just returns structured pieces.
+**Host-agent responsibility split.** Hermes owns *when* to call HyMem; HyMem owns *how* memory works. Native retrieval returns structured pieces, while `HyMem.ask()` and Honcho chat deliberately assemble bounded, evidence-only synthesis prompts. HyMem never injects itself into an unrelated host prompt.
 
 **Laplace-smoothed confidence.** Every edge's confidence is `(pos+1)/(pos+neg+2)` — a Bayesian-style smoothing that starts at 0.5 for an untested fact and converges toward truth as evidence accumulates.
 
@@ -489,7 +645,7 @@ HyMem's whole-store digest (the RAPTOR root, §11) is served by this server: the
 
 **Advisory lock with lease heartbeat.** The `run_lock` table prevents concurrent dreaming cycles. A holder that crashes is reclaimed after a 2-minute stale-takeover TTL so the system doesn't deadlock. But a *genuinely slow* run (a `prompt_version` re-extraction wave can take minutes) would otherwise cross that TTL while still alive and be wrongly taken over — so a live dream heartbeats the lease once per session (`_refresh_lock`, holder-guarded so it can't steal another process's lock), keeping `acquired_at` fresh. Net: live dreams hold the lock as long as they need; only crashed ones are reclaimed.
 
-**Secret redaction + ingest guards.** Message content is scrubbed for high-confidence secrets (API keys, JWTs, private-key blocks, bearer tokens, credentials-in-URLs, emails) at the single ingest chokepoint (`HyMem._prepare_content`) before it reaches SQLite, so the on-disk store and the chunks derived from it never hold the raw value (toggle: `redact_secrets`, default on). The same chokepoint caps message length (`max_message_chars`) and `augment()` caps query length (`max_query_chars`) so a pathological turn can't bloat the DB or stall extraction.
+**Secret redaction + ingest guards.** Message content is scrubbed for high-confidence secrets (API keys, JWTs, private-key blocks, bearer tokens, credentials-in-URLs, emails) at the single ingest chokepoint (`HyMem._prepare_content`) before it reaches SQLite, so the on-disk store and the chunks derived from it never hold the raw value (toggle: `redact_secrets`, default on). The same chokepoint caps message length (`max_message_chars`) and `augment()` caps query length (`max_query_chars`) so a pathological turn can't bloat the DB or stall extraction. Coverage is byte-exact for the value accepted into SQLite; the separate digest cap never truncates that stored value and instead advances through bounded slices.
 
 **Working memory before dreaming.** `augment(session_id=...)` returns the last N raw turns of the active session (`recent_turns`, `working_memory_turns` default 10) so within-session facts are recallable immediately, without waiting for a dream to consolidate them — see §6.
 
@@ -497,7 +653,7 @@ HyMem's whole-store digest (the RAPTOR root, §11) is served by this server: the
 
 **Lock-free dedup embedding + same-wave collapse.** Triple-dedup similarity vectors are embedded *before* the per-chunk write transaction opens, so no embedding-API round-trip is ever held inside the SQLite writer lock; the in-lock path is pure SQL + in-memory cosine. The same in-memory vectors let sibling variants minted within one dream collapse against each other (not just against prior-cycle edges), which curbs the phrasal-variant edge proliferation a `prompt_version` bump used to cause — see §5.
 
-**Bounded retries on external calls.** The contrib OpenAI-compatible LLM and embedding clients wrap their network calls in bounded exponential backoff (`extraction/retry.py`), so a transient API blip doesn't drop a whole dream cycle. The read/`augment()` hot path stays retry-free.
+**Bounded external calls.** The contrib OpenAI-compatible LLM client uses bounded exponential backoff during extraction. Embedding calls sit on query and post-commit ingestion paths, so their SDK client instead uses one attempt (`max_retries=0`) with an explicit 10-second default timeout; provider failures abstain from semantic retrieval while lexical tiers continue.
 
 ---
 
@@ -513,10 +669,12 @@ dimension).
 | `HYMEM_ROOT` | `~/.hermes` | Directory for sqlite + markdown files |
 | `HYMEM_LLM_API_KEY` | `DEEPSEEK_API_KEY` | LLM API key |
 | `HYMEM_LLM_BASE_URL` | `https://api.deepseek.com` | LLM endpoint |
-| `HYMEM_LLM_MODEL` | `deepseek-chat` | Extraction model |
-| `HYMEM_EMBEDDING_API_KEY` | (falls back to LLM key) | Embedding API key |
-| `HYMEM_EMBEDDING_BASE_URL` | `https://api.deepseek.com` | Embedding endpoint |
-| `HYMEM_EMBEDDING_MODEL` | `deepseek-embedding` | Embedding model |
+| `HYMEM_LLM_MODEL` | `deepseek-v4-flash` | Extraction model |
+| `HYMEM_EMBEDDING_API_KEY` | none | Key for an explicit remote embedding endpoint; `OPENAI_API_KEY` is inherited only for official `api.openai.com`, while loopback uses `local` |
+| `HYMEM_EMBEDDING_BASE_URL` | `local://feature-hash` | OpenAI-compatible endpoint; remote URLs require HTTPS, while HTTP is accepted only on loopback; omission selects the deterministic no-network fallback |
+| `HYMEM_EMBEDDING_MODEL` | `hymem-local-feature-hash-v1` | Exact embedding-space model id |
+| `HYMEM_EMBEDDING_DIM` | `384` | Exact embedding dimension |
+| `HYMEM_EMBEDDING_TIMEOUT_SECONDS` | `10` | Per-request timeout for an explicitly configured remote embedder; SDK retries are disabled |
 | `HYMEM_HONCHO_HOST` | `127.0.0.1` | Honcho server bind address |
 | `HYMEM_HONCHO_PORT` | `8765` | Honcho server port |
 | `HYMEM_DREAM_COOLDOWN_SECONDS` | `60` | Min seconds between bg dream kicks |
@@ -533,7 +691,7 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `max_query_chars` | 10000 | Truncate an `augment()` query longer than this (0 disables) |
 | `working_memory_turns` | 10 | Recent raw turns `augment(session_id=…)` returns (0 disables) |
 | `fts_top_k` | 5 | FTS results to return |
-| `message_fts_top_k` | 5 | Raw-message keyword hits in `message_hits` (0 disables) |
+| `message_fts_top_k` | 5 | Raw-message lexical + semantic hits in `message_hits` (0 disables) |
 | `message_fts_aggregate_cap` | 0 | Opt-in `ability="MR"` counting path; evidence cap, count stays exact (0 = off) |
 | `procedure_top_k_if` | 10 | Procedure budget for `ability="IF"` (else `fts_top_k`) |
 | `graph_top_k_per_entity` | 3 | Entity-anchored graph facts per matched entity |
@@ -552,13 +710,21 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 | `retract_threshold` | 0.15 | Confidence below which edges retract |
 | `profile_max_entries` | 16 | Max profile entries in USER.md |
 | `insights_max_entries` | 12 | Max insights in MEMORY.md |
-| `prompt_version` | `"v9"` | Bump to force full reprocessing |
+| `profile_max_items_per_session` | 16 | Max typed-profile items per bounded response; overflow fails atomically and retries |
+| `profile_extraction_max_attempts` | 6 | Consecutive profile failures before cursor-preserving quarantine; 0 retries forever |
+| `prompt_version` | `"v13"` | Bump to force full reprocessing; v13 requires exact per-claim source-message citations and source-record-safe split extraction |
+| `chunk_extraction_max_attempts` | 3 | Consecutive Phase-1 failures before observable quarantine (never marked processed) |
+| `digest_extraction_max_attempts` | 6 | Consecutive digest failures before cursor-preserving quarantine; <=0 retries forever |
 | `aggregation_nodes_enabled` | `False` | Master switch for the RAPTOR aggregation layer + digest |
 | `aggregation_digest_enabled` | `True` | Build the root standing digest at dream time (needs the master switch) |
 | `aggregation_inject_abilities` | `("TR",)` | Abilities whose queries surface aggregation nodes at query time (additive tier) |
 | `dream_budget` | 50 | Max chunks to process per dreaming cycle |
-| `max_chunks` | 50000 | Soft cap on total stored chunks |
+| `dream_digest_max_chars` | 12000 | Per-call digest input window; oversized stored messages resume at exact character offsets |
+| `dream_digest_max_tokens` | 3072 | Per-call digest output ceiling; changing it safely reopens/rebuilds held digest work |
+| `max_chunks` | 50000 | Soft cap on retrieval/extraction chunks; exact coverage artifacts are excluded |
 | `retention_days` | 90 | Chunks newer than this always kept |
+| `message_retention_days` | 0 | Opt-in raw-message pruning age; <=0 retains forever. Enabled pruning requires an ended session and exact per-message lossless chunk coverage |
+| `tombstone_retention_days` | 0 | Opt-in retracted-edge pruning age; <=0 keeps graph evidence and lifecycle history forever so `facts_at()` remains complete. Positive values cascade-delete old tombstones and their history |
 | `rerank_top_k` | 20 | Candidate pool size handed to the reranker before final top-k trim |
 | `rerank_model` | `"llm"` | `"llm"` (uses the configured LLM client) or `"cross-encoder"` (local sentence-transformers) |
 | `rerank_cross_encoder_model` | `"mixedbread-ai/mxbai-rerank-base-v1"` | HuggingFace model id used when `rerank_model="cross-encoder"` |
@@ -579,7 +745,8 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_graph_semantic.py` — Edge embedding, hybrid graph ranker (routed + per-candidate fallback branches), `why_retrieved` codes, predicate routing, contradiction detection, token-overlap entity expansion, token-overlap index cache + invalidation
 - `test_rerank.py` — Hybrid reranking: LLM and cross-encoder backends, ambiguity gating, graceful fallback when sentence-transformers is unavailable
 - `test_entity_properties.py` — Entity-type and entity-property extraction + query-time expansion
-- `test_episodes.py` — Episodic memory: persistence, stable ids across re-dreams, semantic episode search via `vec_episodes`
+- `test_episodes.py` — Episodic memory: stable ids within an active digest walk,
+  atomic replacement generations, and semantic episode search via `vec_episodes`
 - `test_procedures.py` — Procedural memory: extraction validation, step-order renormalization, FTS-backed surfacing through `augment()`
 - `test_summary.py` — Session summarization: persistence, idempotency, validation (short / quoted / long), Honcho context preference
 - `test_inference.py` — Transitive inference: depends_on BFS + uses-cross-predicate rule, derivation refresh, retract-threshold filtering
@@ -596,22 +763,24 @@ Tunable in `HyMemConfig` dataclass (programmatic):
 - `test_dedup_samewave.py` — Same-cycle sibling collapse (same- and cross-chunk), no over-merging of non-siblings, lexical guard still applies, no in-lock embed
 - `test_hardening.py` — Secret/PII redaction, message/query size caps, embedding model/dim guard (incl. mixed-corpus), external-call retry/backoff
 - `test_dream_scheduler.py` — Background dream cooldown + concurrency
-- `test_honcho_server.py` — Full Honcho v3 protocol (19 endpoints, all passing)
-- `test_honcho_contract.py` — Real honcho-ai SDK driven against a live server (response-parse contract)
+- `test_honcho_server.py` — Raw HTTP behavior for the supported Honcho subset
+- `test_honcho_contract.py` — Pinned real SDK against a live server, including directional representations and SSE chat
 - `test_concurrency.py` — Dreaming + ingestion + reads coexisting under WAL
 
 ---
 
-## 11. Benchmark Results (LongMemEval)
+## 11. Benchmark Evidence (LongMemEval)
 
-HyMem is evaluated end-to-end on **LongMemEval-S**, the standard long-term-memory benchmark: 500 questions across six question types, each answered over a multi-session conversation "haystack" of distractor sessions. The harness (`benchmarks/longmemeval_adapter.py`) runs the *real* pipeline per question — ingest the haystack → optionally dream → `hy.augment()` → the host LLM answers from the returned context → an LLM judge scores it.
+HyMem's harness targets **LongMemEval-S**: 500 questions across six base question types, each answered over a multi-session conversation haystack. The strict adapter (`benchmarks/longmemeval_adapter.py`) runs the real pipeline per question — isolated ingest → bounded healthy indexing → `hy.augment()` → host reader → pinned or explicitly legacy judge — and preserves every expected ID, failure, model identity, and usage segment.
 
-**Two numbers, always — and the one that counts is production-truth.** A result is only treated as real if it carries to live Hermes; nothing that reads the oracle `question_type` label (which production does not have) is allowed to drive the score. So every run reports both:
+**Current evidence policy.** The default answer path is label-free: source `question_type`, `_abs`, answers, and answer-session marks cannot steer sampling, retrieval, or the reader. Oracle routing is an explicitly exploratory diagnostic. Full-set runs remain development evidence because LongMemEval has no official held-out split; the manifest separately records denominator validity, exact evaluator identity, pre-registration, and whether a run is scored or retrieval-only. A required row digest binds the ordered results, while the latest pointer and registry bind the immutable full-artifact digest; copied evidence is deduplicated and a reused basename with different bytes is rejected.
 
-- **Oracle** — the question-type label drives retrieval shaping. The category ceiling.
-- **Production-truth (`--auto-ability`)** — the in-library `detect_ability` router (`query/intent.py`, §3) infers the ability from the query alone, label-free, exactly as it does in Hermes. The honest number.
+Reader packing has two explicitly different capacity policies. A locally supplied `tokenizer.json` is hashed, bound to the answer model, and fails closed if counting fails. Without one, the default is a 60,000-byte UTF-8 budget—not a token claim—checked together with 1,024 output tokens and a 256-token chat-framing reserve against the declared provider context ceiling. Raw retrieval receives a 60% selection reserve before summaries or distilled aids, although those aids still lead the rendered prompt. Official judge prompts/model/parser can match upstream scoring semantics, but the local safety-bounded three-attempt transport differs from upstream's unbounded retry policy; artifacts therefore record scoring-semantics alignment separately and do not claim full protocol/transport equivalence.
 
-**Production-truth: 70.0% overall** on the full 500-question suite (auto-ability router; permissive, abstention-guarded default answer prompt; recency-dated raw-message context; **full dream**). Answering and judging use the default DeepSeek model. Earlier headline runs were no-dream (LME's single-haystack setup once looked dream-neutral); the definitive A/B below overturns that — dream is worth **+3.6pp overall** and the graph facts it consolidates now carry real weight in retrieval.
+- **Oracle** — the question-type label drives retrieval shaping; exploratory only.
+- **Label-free (`--auto-ability`, the default)** — the in-library router infers ability from the question alone.
+
+**Historical local-protocol snapshot (development-only; not official-comparable): 70.0% overall.** This 500-question run used the then-current DeepSeek reader/judge and local prompts. It is retained to explain engineering decisions, not as a current benchmark claim. Its category table was:
 
 | Question type | Score |
 |---|---|
@@ -623,9 +792,9 @@ HyMem is evaluated end-to-end on **LongMemEval-S**, the standard long-term-memor
 | Multi-session (MS) | 51.9% |
 | **Overall** | **70.0%** |
 
-For context, published LongMemEval figures place this local, embedded, SQLite-only system ahead of Honcho (63.8) and the RAG / LIGHT baselines (48.5 / 51.7); the frontier system (Hindsight, 89.4) leads almost entirely on **multi-session** — which is exactly HyMem's lowest row and its open frontier (below).
+External numbers are not directly comparable without matching answer models, evaluator, item count, and metric. For orientation only: Honcho reports vendor results of 90.4 with Haiku 4.5 and 92.6 with Gemini 3 Pro; Hindsight's official March 2026 result is 94.6 in its single-query setup; Mnemosyne reports 98.9 **Recall@All@5** on 100 LongMemEval items, a retrieval metric rather than end-to-end answer accuracy. BEAM-100K's 65.2 is a separate workload and denominator. None of these values establishes a HyMem ranking.
 
-**Dreaming is worth +3.6pp — the definitive A/B (500q, seed 0, auto-ability, permissive-default).** The full-dream table above is the canonical number; the no-dream column below is the same config with the dream cycle skipped:
+**Historical local A/B (500q, seed 0, label-free router, permissive default).** Under that superseded protocol, full-dream was 3.6 points above no-dream:
 
 | Question type | No-dream | Full-dream | Δ |
 |---|---|---|---|
@@ -647,7 +816,7 @@ The biggest lifts land where cross-session consolidation matters most: **MS +9pp
 - **Permissive, abstention-guarded default prompt** — recovers single-session-preference questions the strict prompt refused, while holding the abstention guard tight on single-turn facts.
 - **Dreaming (graph consolidation)** — the background dream cycle extracts a cross-session knowledge graph whose facts join the retrieval pool; worth +3.6pp overall and the dominant lever on MS / SS-P / KU (the A/B above).
 
-**The open frontier is multi-session (51.9%).** Extensive LLM-free probing established that MS *retrieval* is effectively closed — the gold turns do reach the answer context; the residual is cross-session **synthesis** (a reader problem, not retrieval) plus a small floor of facts buried as incidental asides inside otherwise off-topic turns. One tempting "fix" (a user-only context filter for MR) was built, measured, and **reverted**: it was neutral on its target and dropped assistant-turn gold on MR-misrouted single-session-assistant questions — a worked example of the project's rule that you never *suppress* retrieval on a routed ability that has false positives, only *add* to it. The full investigation, including dead-ends not to re-chase, lives in `benchmarks/longmemeval_roadmap.md`.
+**In that historical run, the largest weakness was multi-session (51.9%).** LLM-free probes suggested the remaining misses were dominated by cross-session synthesis plus a small sparse-signal floor. This is a development hypothesis, not a current leaderboard diagnosis. The investigation and dead ends remain in `benchmarks/longmemeval_roadmap.md`.
 
 **RAPTOR cross-session aggregation (Phase 2), gate PASSED → built.** Since the MS residual is *synthesis* (all gold turns reach context, the reader fails to fuse ~45 raw slots), the fix is upstream: pre-compute hierarchical aggregation nodes so the answer model fuses a handful of cluster summaries instead of dozens of raw turns. This only helps if clustering *co-locates* a question's synthesis inputs into a single node — so, mirroring the front-run discipline that killed the L3 diversity-pack, it was gated by an offline probe (`benchmarks/raptor_cluster_probe.py`) **before** any table or migration was built. The probe dreams each MS miss into episodes, clusters them across sessions by embedding-or-entity overlap, and measures how often the gold-bearing episodes land in one cluster. **Result (grid emb≥0.55 OR ent≥0.50, 53 MS ranking misses): of the 31 questions whose gold turns became episodes, 27 (87%) had all their gold episodes land in a single cluster (mean 1.13 gold-clusters/question against 16.8 clusters/question)** — one aggregation-node summary captures everything the reader must fuse. The remaining 22/53 (42%) have *no* gold episode at all: a dream **coverage** gap (episode-extraction recall), not a clustering gap, and a separate lever that doesn't block this build. High co-location → build, so the layer has LANDED: schema v16 (`aggregation_nodes` + `aggregation_node_embeddings`, migration `016`), `dreaming/aggregate.py` (cluster → fuse each cross-session multi-session cluster with one LLM call → full-rebuild the nodes, cache-keyed summary embeddings), a dream-runner step, and an **additive, off-by-default** retrieval tier (`cfg.aggregation_nodes_enabled`) that surfaces cluster summaries in `ctx.aggregation_nodes` without displacing the episode/chunk/message tiers. Off by default → zero dream-time cost and zero query-time behavior change until a host opts in. It is unit-covered offline (`test_aggregate.py`, plus the clusterer pinned in `test_raptor_cluster_probe.py`); the decisive co-location run was on the Hermes box (it needs real dreams).
 
@@ -656,14 +825,15 @@ The biggest lifts land where cross-session consolidation matters most: **MS +9pp
 **Reproduce:**
 
 ```bash
-# production-truth (the 70.0% headline — full dream, ~140 min at this config)
+# exploratory full-set development run; produces no official-comparable claim
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
-    --workers 4 --permissive-default
-# fast no-dream A/B (the 66.4% column, ~12 min)
+    --workers 4 --permissive-default --no-prereg
+# fast exploratory no-dream A/B
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
-    --workers 4 --no-dream --permissive-default
-# oracle ceiling (question-type label drives shaping)
-python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8
+    --workers 4 --no-dream --permissive-default --no-prereg
+# oracle-label diagnostic (explicitly exploratory)
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 \
+    --no-auto-ability --workers 8 --no-prereg
 ```
 
 **Methodology.** Every diagnostic behind these numbers is run against a control
@@ -682,14 +852,14 @@ this project one retracted ceiling and three reversed lever orderings.
 | **Scope** | Single-agent memory module for Hermes | Multi-tenant platform for stateful agents |
 | **Architecture** | Embedded library (SQLite + 2 servers) | Client-server (FastAPI + Postgres + Redis + workers) |
 | **Storage** | 1 SQLite file + 2 Markdown files | Postgres + pgvector + Redis cache |
-| **Entity model** | Simple: user + assistant roles | Peer paradigm: all participants are "peers" |
+| **Entity model** | Native roles plus arbitrary workspace-scoped Honcho peers | Peer paradigm: all participants are "peers" |
 | **Memory extraction** | "Dreaming" — multi-phase LLM pipeline with locked vocabulary, transitive inference, episode/procedure extraction, feedback learning | "Deriver" — background workers doing representation, summarization, peer cards |
 | **Ontology** | Locked 18-predicate vocabulary + entity types | Open-ended reasoning, no fixed ontology |
 | **Query interface** | FTS5 + vector + RRF + LLM rerank + semantic graph ranking (with `why_retrieved` explainability) + predicate routing + episode/procedure search | Chat API (natural language), context (token-budgeted), hybrid search |
 | **Decay** | Co-occurrence-aware with confidence thresholds | Continual representation updates (implicit) |
 | **Contradiction detection** | `conflicts()` surfaces competing-object and opposing-predicate edges (pure SQL) | Not available |
 | **Self-improvement** | Feedback-driven extraction (negative examples from retractions) | Not available |
-| **Honcho SDK compat** | v3-compatible protocol via the `hymem.honcho` package (19 endpoints, real-SDK contract tests) | Native |
+| **Honcho SDK compat** | Hermes-used v3 subset via `hymem.honcho`, pinned real-SDK contract tests | Native/full surface |
 | **Deployment** | Local-only, pip install, zero config | Managed cloud (app.honcho.dev) or self-hosted Docker/Fly.io |
 | **SDKs** | Python + MCP + Honcho SDK | Python + TypeScript |
 | **Maturity** | v0.1.0, ~15,000 lines | v3.0.6, 514 commits, 3.4k stars |
@@ -697,14 +867,15 @@ this project one retracted ceiling and three reversed lever orderings.
 
 **The key philosophical difference:** Honcho is a platform — multi-tenant, cloud-native, with a broad API surface for many use cases. HyMem is a tool — focused, embeddable, opinionated about what memory should look like. HyMem's locked vocabulary, co-occurrence-aware decay, transitive inference, semantic-and-explainable graph ranking, and feedback learning are design bets that prioritize precision over recall. Honcho prioritizes flexibility and scale.
 
-**HyMem can self-host the Honcho experience.** With the Honcho server fully functional (19 endpoints, verified against the pinned `honcho-ai` SDK), Hermes can use the standard `honcho-ai` SDK and get the same API surface as Honcho's cloud — search, context, chat, peer management, sessions, pagination — without leaving the machine. This is HyMem's headline feature: **Honcho compatibility without any infrastructure.**
+**HyMem can self-host the Honcho workflow Hermes uses.** The pinned SDK can perform peer/session management, message ingestion, pagination, search, directional representations/context, and JSON or streaming chat without leaving the machine. This compatibility layer does not claim parity with Honcho's full cloud API or its learned representation semantics.
 
 ---
 
 ## 13. Limitations & Known Gaps
 
-- **Python cosine fallback**: sqlite-vec is the primary vector search path (vec0 KNN over `vec_chunks` / `vec_edges` / `vec_episodes`), but the extension isn't available on every platform. When it's not loadable, retrieval falls back to a pure-Python cosine scan capped at `embedding_max_scan` chunks (default 5000); on installs where the extension is missing, vector search degrades beyond that cap.
-- **No streaming**: The Honcho server doesn't implement SSE streaming for chat responses.
+- **Bounded exact vector scans**: durable, identity- and content-validated vectors are the retrieval authority; sqlite-vec tables are rebuildable acceleration shadows. Chunk/aggregation scans are bounded by `embedding_max_scan` (default 5000), so very large stores still need a production ANN candidate strategy that preserves these validation checks.
+- **Partial Honcho surface**: The pinned Hermes-used SDK paths are supported and contract-tested; unlisted Honcho cloud endpoints and operational semantics are not implemented. Chat streaming uses SDK-compatible SSE.
+- **Representation is a safe directional proxy, not Honcho's durable conclusion model**: `(observer → target)` reads currently render proof-valid target-authored occurrences from authorized shared sessions. They do not persist observer/observed conclusions, and therefore cannot yet represent something the observer learned about the target solely from observer-authored or third-party text.
 - **Single-writer database**: WAL mode lets reads run concurrently with the writer, and dreaming/ingestion run on separate connections, but SQLite still serializes the two writers. Fine for a single-agent setup, not for multi-tenant.
 - **No authentication**: Both MCP and Honcho servers are unauthenticated — they assume localhost-only access.
 - **Latin-script only**: Canonicalization, query-time entity matching, and the LLM prompts handle Latin-script languages (English, Dutch, French, German, Spanish, etc.) — accents are folded into canonical keys. Chunking salience triggers are tuned for English and Dutch; other languages fall back to length-based salience (the LLM is still the real filter). Non-Latin scripts (CJK, Cyrillic, Arabic) are not supported.

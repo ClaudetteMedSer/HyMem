@@ -84,10 +84,18 @@ def test_unflagged_client_sends_exactly_what_it_sent_before(captured):
     }
 
 
-def test_extra_body_wins_on_key_collision(captured):
-    """Merged last, per LME :373 — the caller's override is the point."""
-    ba.LLMClient("m", "k", extra_body={"max_tokens": 4096})._call([], 0.0, 512)
-    assert captured["body"]["max_tokens"] == 4096
+def test_official_judge_request_omits_unset_max_tokens(captured):
+    ba.LLMClient("gpt-4.1-mini", "k")._call([], 0.0, None)
+    assert captured["body"] == {
+        "model": "gpt-4.1-mini", "messages": [], "temperature": 0.0,
+    }
+
+
+@pytest.mark.parametrize("key", ["model", "messages", "temperature", "max_tokens"])
+def test_extra_body_cannot_override_manifested_request_identity(captured, key):
+    with pytest.raises(ba.BenchmarkIntegrityError, match="core field"):
+        ba.LLMClient("m", "k", extra_body={key: "forged"})
+    assert "body" not in captured
 
 
 # ── the empty-content raise ───────────────────────────────────────────────
@@ -361,3 +369,44 @@ def test_judge_answer_still_accepts_a_bare_stub():
     out = ba.judge_answer(Stub(), "q", "i", ["r"], "a", return_raw=True)
     assert out["score"] == 1.0
     assert out["judge_finish_reason"] is None
+
+
+def test_usage_is_unavailable_after_failure_then_success(monkeypatch):
+    replies = [OSError("network down"), _Resp({
+        **_message(content="ok"),
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+    })]
+
+    def post(*_args, **_kwargs):
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(ba.http, "post", post)
+    monkeypatch.setattr(ba.time, "sleep", lambda *_args: None)
+    client = ba.LLMClient("m", "k")
+    assert client.chat([]) == "ok"
+    usage = ba.usage_snapshot(client)
+    assert usage["request_attempts"] == 2
+    assert usage["successful_responses"] == 1
+    assert usage["calls"] == 1
+    assert usage["total_tokens"] is None
+    assert usage["token_usage_available"] is False
+
+
+def test_usage_is_unavailable_when_every_attempt_fails(monkeypatch):
+    monkeypatch.setattr(
+        ba.http, "post", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("network down")
+        )
+    )
+    monkeypatch.setattr(ba.time, "sleep", lambda *_args: None)
+    client = ba.LLMClient("m", "k")
+    assert client.chat([]).startswith("[LLM_ERROR")
+    usage = ba.usage_snapshot(client)
+    assert usage["request_attempts"] == 3
+    assert usage["successful_responses"] == 0
+    assert usage["calls"] == 0
+    assert usage["total_tokens"] is None
+    assert usage["token_usage_available"] is False

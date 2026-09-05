@@ -280,16 +280,29 @@ class MSCAdapter:
                 api_key=self.api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
                 base_url=self.hymem_base_url, model=self.hymem_model)
             if self.embeddings:
-                from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
+                from hymem.contrib.openai_embedding_client import (
+                    OpenAICompatibleEmbeddingClient,
+                    is_loopback_embedding_url,
+                    is_official_openai_embedding_url,
+                )
                 # Fallback constants imported from the LME adapter so --embeddings
                 # means the SAME local embed server/model in both benchmarks
                 # (comparability frame); env vars still override.
                 from longmemeval_adapter import (LOCAL_EMBED_API_KEY, LOCAL_EMBED_BASE_URL,
                                                  LOCAL_EMBED_DIM, LOCAL_EMBED_MODEL)
                 env = os.environ.get
+                embedding_base_url = env("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
+                embedding_api_key = env("HYMEM_EMBEDDING_API_KEY")
+                if not embedding_api_key and is_loopback_embedding_url(embedding_base_url):
+                    embedding_api_key = LOCAL_EMBED_API_KEY
+                if (
+                    not embedding_api_key
+                    and is_official_openai_embedding_url(embedding_base_url)
+                ):
+                    embedding_api_key = env("OPENAI_API_KEY")
                 embedding_client = OpenAICompatibleEmbeddingClient(
-                    api_key=env("HYMEM_EMBEDDING_API_KEY") or env("HYMEM_LLM_API_KEY") or LOCAL_EMBED_API_KEY,
-                    base_url=env("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL,
+                    api_key=embedding_api_key,
+                    base_url=embedding_base_url,
                     model=env("HYMEM_EMBEDDING_MODEL") or LOCAL_EMBED_MODEL,
                     dim=int(env("HYMEM_EMBEDDING_DIM") or LOCAL_EMBED_DIM))
         self.hy = HyMem(cfg, llm=llm, embedding_client=embedding_client)

@@ -38,7 +38,9 @@ that preceded this work is its own story — summarized under *Background* below
 | + EO/SUM episode coverage | ~59% | CR/EO moves within noise at sample=3 |
 | **isolated, sample≈10** | **52.1%** | **the honest number**; shared-store equivalent = 59.8% |
 
-SOTA reference (100K): Hindsight 73.4, Mnemosyne 65.2, Honcho 63.0, LIGHT 35.8, RAG 32.3.
+Historical SOTA table removed: it mixed stale vendor figures and incompatible
+protocols. BEAM-100K 65.2 is retained only as this separate workload's reference,
+not as a LongMemEval end-to-end competitor comparison.
 
 ---
 

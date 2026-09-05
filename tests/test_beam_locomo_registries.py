@@ -24,6 +24,7 @@ sys.path.insert(0, str(REPO))
 import benchmarks.beam_registry  # noqa: E402
 import benchmarks.locomo_registry  # noqa: E402
 import benchmarks.run_registry  # noqa: E402
+from benchmarks.strictness import build_manifest  # noqa: E402
 
 
 @pytest.fixture()
@@ -37,6 +38,39 @@ def _row(con, archive):
 
 def _cols(con):
     return [d[0] for d in con.execute("SELECT * FROM runs LIMIT 0").description]
+
+
+def _strict_usage(calls, prompt, completion, *, latency=1.0):
+    return {
+        "calls": calls, "calls_available": True,
+        "request_attempts": calls, "request_attempts_available": True,
+        "successful_responses": calls,
+        "successful_responses_available": True,
+        "prompt_tokens": prompt, "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "latency_s": latency, "latency_available": True,
+        "cost_usd": None, "cost_available": False,
+        "token_usage_available": True,
+    }
+
+
+def _strict_local_embedding_usage():
+    return {
+        "configured": True, "backend": "local_feature_hash",
+        "quality": "lexical", "network_free": True,
+        "model": "feature-hash-v1", "dimension": 384,
+        "identity_consistent": True, "instances": 2,
+        "calls": 6, "calls_available": True,
+        "request_attempts": 0, "request_attempts_available": True,
+        "successful_responses": 0,
+        "successful_responses_available": True,
+        "input_count": 30, "input_count_available": True,
+        "input_characters": 600, "input_characters_available": True,
+        "prompt_tokens": None, "total_tokens": None,
+        "provider_token_usage_available": False,
+        "latency_s": 0.5, "latency_available": True,
+        "cost_usd": None, "cost_available": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +228,278 @@ def _make_beam_results(path: Path, date="2026-08-31T16:50:39.701802+00:00",
     }
     path.write_text(json.dumps(data))
     return path
+
+
+def _make_strict_beam(path: Path, *, segment_status="complete"):
+    embedding = {
+        "configured": True, "backend": "local-hash",
+        "model": "feature-hash-v1", "base_url": "local://feature-hash",
+        "dimension": 384, "quality": "lexical-feature-hash",
+        "network_free": True, "fallback_policy": "none",
+        "fallback_reason": None,
+    }
+    config = {
+        "scales": ["100K", "500K"], "sample": 1,
+        "sample_strategy": "seeded-label-blind-hash-v1",
+        "subset_run": True, "top_k": 7,
+        "max_input_tokens": 16000, "indexing_max_cycles": 100,
+        "indexing_timeout_s": 3600.0,
+        "indexing_require_healthy": True,
+        "facts": True, "facts_extraction": False,
+        "embedding": embedding,
+        "effective_hymem_config": {
+            "facts_enabled": True,
+            "facts_extraction_enabled": False,
+            "graph_multihop_enabled": False,
+            "aggregation_nodes_enabled": False,
+            "episode_granularity_enabled": False,
+            "value_supersession_enabled": True,
+        },
+        "judge_protocol": "official",
+        "official_judge_protocol_match": True,
+        "official_protocol_aligned": True,
+        "official_denominator_validated": False,
+        "official_judge_prompt_hash": (
+            benchmarks.beam_registry.BEAM_OFFICIAL_JUDGE_PROMPT_HASH
+        ),
+        "official_judge_upstream_commit": (
+            benchmarks.beam_registry.BEAM_UPSTREAM_COMMIT
+        ),
+        "official_judge_evaluator_url": (
+            benchmarks.beam_registry.BEAM_OFFICIAL_EVALUATOR_URL
+        ),
+        "official_judge_prompt_url": (
+            benchmarks.beam_registry.BEAM_OFFICIAL_PROMPT_URL
+        ),
+        "oracle_ability": False, "judge_gold": True,
+        "prereg": {
+            "path": "benchmarks/beam-prereg.md", "commit": "b" * 40,
+            "blob": "c" * 40,
+            "committed_at": "2026-09-04T10:00:00+00:00",
+            "code_commit": "d" * 40,
+        },
+        "dataset_revisions": {
+            benchmarks.beam_registry.BEAM_REPO: "a" * 40
+        },
+        "dataset_revision_provenance_complete": True,
+        "answer_extra_body": {}, "judge_extra_body": {},
+        "label_free_answer_path": True,
+        "exploratory_label_steering": False,
+        "exploratory_non_comparable": True,
+        "scored_run": True,
+    }
+    models = {
+        "reader": {
+            "provider": "deepseek", "model": "reader-pinned",
+            "base_url": "https://api.deepseek.com",
+        },
+        "judge": {
+            "provider": "openai", "model": "gpt-4.1-mini",
+            "base_url": benchmarks.beam_registry.OFFICIAL_JUDGE_BASE_URL,
+            "temperature": 0.0, "max_tokens": None, "extra_body": {},
+            "protocol": "official",
+            "upstream_commit": benchmarks.beam_registry.BEAM_UPSTREAM_COMMIT,
+            "prompt_hash": (
+                benchmarks.beam_registry.BEAM_OFFICIAL_JUDGE_PROMPT_HASH
+            ),
+        },
+        "memory_pipeline": {
+            "provider": "openai-compatible", "model": "pipeline-pinned",
+            "base_url": "https://api.deepseek.com",
+            "thinking_mode": "off", "effective_extra_body": {},
+        },
+        "embedding": embedding,
+    }
+    rows = []
+    score_by_scale = {scale: {} for scale in ("100K", "500K")}
+    for scale in ("100K", "500K"):
+        for ability in benchmarks.beam_registry.BEAM_ABILITIES:
+            scores_for_ability = []
+            for ordinal in range(2):
+                failed = (
+                    scale == "100K" and ability == "CR" and ordinal == 0
+                )
+                score = (
+                    (1.0 if ability == "ABS" else 0.5)
+                    if scale == "100K"
+                    else (1.0 if ability == "CR" else 0.0)
+                )
+                if failed:
+                    score = 0.0
+                scores_for_ability.append(score)
+                criterion_scores = (
+                    [1.0, 1.0] if score == 1.0
+                    else [0.0, 1.0] if score == 0.5
+                    else [0.0, 0.0]
+                )
+                rubric = ["criterion one", "criterion two"]
+                criteria = [{
+                    "criterion_index": criterion_index,
+                    "rubric_item": rubric_item,
+                    "raw": json.dumps({
+                        "score": criterion_score, "reason": "audited reason",
+                    }),
+                    "finish_reason": "stop", "parse": "ok",
+                    "score": criterion_score, "reason": "audited reason",
+                } for criterion_index, (rubric_item, criterion_score) in enumerate(
+                    zip(rubric, criterion_scores)
+                )]
+                rows.append({
+                    "question_id": (
+                        f"beam:{scale}:conversation-{scale}:{ability}:{ordinal}"
+                    ),
+                    "scale": scale, "conv_id": f"conversation-{scale}",
+                    "ability": ability, "oracle_ability": ability,
+                    "detected_ability": None, "ability_used": None,
+                    "question": f"Question for {ability}?",
+                    "answer": "A benchmark answer",
+                    "rubric": rubric, "score": score,
+                    "llm_judge_score": score,
+                    "correct": score == 1.0 and not failed,
+                    "result_valid": not failed, "judge_protocol": "official",
+                    "judge_parse": "not_called" if failed else "ok",
+                    "scores": [] if failed else criterion_scores,
+                    "judge_criterion_results": [] if failed else criteria,
+                    "benchmark_failure": (
+                        "conversation_failure: fixture" if failed else None
+                    ),
+                })
+            score_by_scale[scale][ability] = (
+                sum(scores_for_ability) / len(scores_for_ability)
+            )
+    expected_ids = [row["question_id"] for row in rows]
+    manifest = build_manifest(
+        benchmark="BEAM", code_sha256="sha256:" + "c" * 64,
+        data_sha256="sha256:" + "d" * 64,
+        config=config, models=models, seed=17, expected_ids=expected_ids,
+        protocol_split="full",
+    )
+    summary = {}
+    summary_counts = {}
+    for scale in ("100K", "500K"):
+        summary[scale] = dict(score_by_scale[scale])
+        scale_rows = [row for row in rows if row["scale"] == scale]
+        summary[scale]["OVERALL"] = (
+            sum(row["score"] for row in scale_rows) / len(scale_rows)
+        )
+        summary_counts[scale] = {
+            ability: 2 for ability in benchmarks.beam_registry.BEAM_ABILITIES
+        }
+        summary_counts[scale]["OVERALL"] = 20
+    data = {
+        "benchmark": "BEAM",
+        "version": "strict-v1",
+        "date": "2026-09-04T12:00:01+00:00",
+        "manifest": manifest,
+        "config": manifest["config"],
+        "models": manifest["models"],
+        "summary": summary,
+        "summary_counts": summary_counts,
+        "execution": {
+            "counts": {
+                "expected": 40, "attempted": 40, "unique_attempted": 40,
+                "total_attempts": 40, "completed": 39,
+                "failed": 1, "missing": 0,
+            },
+            "segments": [{
+                "segment_id": "process-a", "status": segment_status,
+                "attempted_attempts": 40,
+                "elapsed_s": 3.5,
+                "reader_usage": _strict_usage(39, 4, 6),
+                "judge_usage": _strict_usage(78, 12, 8),
+                "memory_pipeline_usage": _strict_usage(4, 10, 20),
+                "embedding_usage": _strict_local_embedding_usage(),
+            }],
+        },
+        "per_question": rows,
+    }
+    path.write_text(json.dumps(data))
+    return path
+
+
+def test_beam_strict_archive_discovery_multiscale_and_metadata(
+    tmp_db, tmp_path,
+):
+    archive = _make_strict_beam(
+        tmp_path / "results_20260904T120000Z-strict-deadbeef.json"
+    )
+    # Mutable pointers are never auto-ingested as a second result row.
+    (tmp_path / "results_latest.json").write_text(json.dumps({
+        "archive": archive.name,
+        "run_id": json.loads(archive.read_text())["manifest"]["run_id"],
+    }))
+    spec = dict(benchmarks.beam_registry.SPEC)
+    spec["builder"] = benchmarks.beam_registry._beam_row
+    benchmarks.run_registry.cmd_ingest(
+        spec, bench_dir=tmp_path, db_path=tmp_db
+    )
+    con = sqlite3.connect(tmp_db)
+    idx = _cols(con)
+    row = _row(con, archive.name)
+    assert con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+    assert row[idx.index("kind")] == "archive"
+    assert row[idx.index("source_date")] == "20260904T120000Z"
+    assert row[idx.index("run_date")] == "2026-09-04T12:00:01"
+    assert row[idx.index("scale")] == "100K,500K"
+    assert row[idx.index("overall")] == pytest.approx(31.25)
+    assert row[idx.index("ability_abs")] == pytest.approx(50.0)
+    assert row[idx.index("answer_model")] == "reader-pinned"
+    assert row[idx.index("judge_model")] == "gpt-4.1-mini"
+    assert row[idx.index("count")] == 40
+    assert row[idx.index("answer_calls")] == 39
+    assert row[idx.index("judge_calls")] == 78
+    assert row[idx.index("total_tokens")] == 60
+    assert row[idx.index("elapsed_s")] == pytest.approx(3.5)
+    assert row[idx.index("embeddings")] == 1
+    assert row[idx.index("facts")] == 1
+    assert row[idx.index("facts_extraction")] == 0
+    assert row[idx.index("graph_multihop")] == 0
+    assert row[idx.index("no_dream")] == 0
+    assert row[idx.index("distill")] == 0
+    assert row[idx.index("aggregation_nodes_enabled")] == 0
+    assert row[idx.index("value_supersession_enabled")] == 1
+    assert row[idx.index("run_id")].startswith("sha256:")
+    assert row[idx.index("protocol_split")] == "full"
+    assert row[idx.index("development_only")] == 1
+    assert row[idx.index("exploratory_non_comparable")] == 1
+    assert row[idx.index("label_free_answer_path")] == 1
+    assert row[idx.index("judge_protocol")] == "official"
+    assert row[idx.index("official_judge_protocol_match")] == 1
+    assert row[idx.index("dataset_revisions_complete")] == 1
+    extras = json.loads(row[idx.index("extras")])
+    assert extras["execution_disclosure"]["segments_complete"] is True
+    assert extras["execution"]["segments"][0]["segment_id"] == "process-a"
+    assert extras["manifest"]["run_id"] == row[idx.index("run_id")]
+
+
+def test_beam_strict_incomplete_segment_never_claims_exact_usage(
+    tmp_db, tmp_path,
+):
+    archive = _make_strict_beam(
+        tmp_path / "results_20260904T120000Z-strict-incomplete.json",
+        segment_status="running",
+    )
+    benchmarks.beam_registry._ingest([archive], db_path=tmp_db)
+    con = sqlite3.connect(tmp_db)
+    idx = _cols(con)
+    row = _row(con, archive.name)
+    assert row[idx.index("count")] == 40
+    assert row[idx.index("answer_calls")] is None
+    assert row[idx.index("judge_calls")] is None
+    assert row[idx.index("total_tokens")] is None
+    assert row[idx.index("elapsed_s")] is None
+    extras = json.loads(row[idx.index("extras")])
+    assert extras["execution_disclosure"]["segments_complete"] is False
+
+
+def test_beam_strict_multiscale_without_counts_is_rejected(tmp_path):
+    archive = _make_strict_beam(
+        tmp_path / "results_20260904T120000Z-strict-malformed.json"
+    )
+    data = json.loads(archive.read_text())
+    data.pop("summary_counts")
+    with pytest.raises(ValueError, match="stored summary/counts are partial"):
+        benchmarks.beam_registry._beam_row(data, archive)
 
 
 def test_beam_stampless_archive_source_date_null(tmp_db, tmp_path):

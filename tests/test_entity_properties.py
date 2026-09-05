@@ -122,7 +122,7 @@ def test_entity_properties_persisted_and_replaced_on_re_extraction(hy):
     ]
     # Force re-extraction by bumping prompt_version.
     from dataclasses import replace as dc_replace
-    new_cfg = dc_replace(hy.config, prompt_version="v_test")
+    new_cfg = dc_replace(hy.config, prompt_version="v14")
     hy.config = new_cfg
     hy.set_llm(make_routed_llm(revised, []))
     hy.dream()

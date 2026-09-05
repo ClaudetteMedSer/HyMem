@@ -1,4 +1,4 @@
-"""Honcho v3-compatible HTTP server for HyMem.
+"""Honcho-compatible HTTP subset for HyMem.
 
 Package layout:
   models.py    — typed Pydantic request models (one per endpoint body)

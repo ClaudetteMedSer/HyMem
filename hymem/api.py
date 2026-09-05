@@ -8,6 +8,7 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Iterable, Literal
 from urllib.parse import urlsplit
@@ -18,16 +19,36 @@ from hymem import rules as rules_mod
 from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
-from hymem.dreaming import bitemporal
+from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.dreaming import canonicalize as canon
+from hymem.dreaming import evidence as evidence_ledger
 from hymem.dreaming.aggregate import (
     Digest,
     NodeExpansion,
     expand_node as aggregate_expand_node,
     load_digest,
 )
+from hymem.dreaming.lossless import materialize_message_coverage
+from hymem.dreaming.embeddings import (
+    fetch_message_embeddings,
+    message_embedding_id_batches,
+    persist_message_embeddings,
+)
+from hymem.dreaming.digest import (
+    active_episode_prompt_version,
+    digest_config_version,
+    digest_retry_policy_version,
+    digest_retry_state_is_valid,
+)
 from hymem.dreaming.runner import DreamReport, run_dreaming
-from hymem.dreaming.user_profile import ProfileEntry, load_profile
+from hymem.dreaming.user_profile import (
+    ProfileEntry,
+    enforce_profile_redaction_policy,
+    load_profile,
+    profile_config_version,
+    profile_retry_policy_version,
+    profile_retry_state_is_valid,
+)
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
 from hymem.query.ask import Answer, ask as query_ask
@@ -39,19 +60,18 @@ from hymem.query.entities import (
     count_relations as query_count_relations,
     timeline as query_timeline,
 )
+from hymem.query.graph_state import AsOfGraphFact, facts_at as query_facts_at
 
 log = logging.getLogger("hymem.api")
 
 
 def _clean_timestamp(value: str | None) -> str | None:
-    """Normalize a caller-supplied event timestamp: trim whitespace and treat
-    an empty string as "not provided" so it falls through to the DB's
-    ingestion-time default rather than writing a blank that would sort before
-    every real date."""
-    if not value:
+    """Type-check a caller timestamp without changing its wire spelling."""
+    if value is None:
         return None
-    cleaned = value.strip()
-    return cleaned or None
+    if not isinstance(value, str):
+        raise ValueError("created_at must be an ISO-8601 string")
+    return value
 
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
@@ -79,6 +99,8 @@ def _ensure_embedding_server(timeout: float = 45.0) -> bool:
     base_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL")
     if not base_url:
         return True
+    from hymem.contrib.openai_embedding_client import safe_embedding_base_url
+    display_url = safe_embedding_base_url(base_url)
 
     parts = urlsplit(base_url)
     host = (parts.hostname or "").lower()
@@ -98,11 +120,11 @@ def _ensure_embedding_server(timeout: float = 45.0) -> bool:
     if not cmd:
         log.warning(
             "embedding server at %s is down and HYMEM_EMBEDDING_SERVER_CMD is "
-            "not set — cannot restart it automatically", base_url,
+            "not set — cannot restart it automatically", display_url,
         )
         return False
 
-    log.warning("embedding server at %s is down — restarting via %r", base_url, cmd)
+    log.warning("embedding server at %s is down — restarting via %r", display_url, cmd)
     try:
         # Detach so the embedding server outlives this restart trigger; inherit
         # the environment so HYMEM_EMBEDDING_* stay consistent with the client.
@@ -119,13 +141,13 @@ def _ensure_embedding_server(timeout: float = 45.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _embedding_health_ok(health_url):
-            log.info("embedding server at %s is back up", base_url)
+            log.info("embedding server at %s is back up", display_url)
             return True
         time.sleep(1.0)
 
     log.warning(
         "embedding server at %s did not become healthy within %.0fs",
-        base_url, timeout,
+        display_url, timeout,
     )
     return False
 
@@ -177,6 +199,9 @@ class HyMem:
         if not self._initialized:
             core_db.initialize(self._conn)
             core_db.backfill_entity_mentions(self._conn)
+            if self.config.redact_secrets:
+                with core_db.transaction(self._conn):
+                    enforce_profile_redaction_policy(self._conn)
             self._initialized = True
         return self._conn
 
@@ -185,8 +210,8 @@ class HyMem:
         if self._read_conn is None:
             self.conn  # ensure the write connection is initialized first
             self._read_conn = core_db.connect(self.config.db_path)
-            # Load vec extension before query_only so semantic edge KNN uses
-            # the vec0 fast path instead of falling back to python cosine.
+            # Load optional vec0 acceleration shadows before query_only. Durable
+            # identity/content-validated vectors remain retrieval authority.
             core_db._load_vec_extension(self._read_conn)
             self._read_conn.execute("PRAGMA query_only = ON")
         return self._read_conn
@@ -206,6 +231,94 @@ class HyMem:
     def set_embedding_client(self, embedding_client: EmbeddingClient) -> None:
         self._embed = embedding_client
 
+    @property
+    def embedding_status(self) -> dict[str, object]:
+        """Resolved embedding backend identity without probing the network."""
+        if self._embed is None:
+            return {
+                "configured": False,
+                "backend": "none",
+                "quality": "none",
+                "network_free": True,
+                "model": None,
+                "dim": None,
+                "fallback_reason": None,
+            }
+        try:
+            model: object = self._embed.model
+        except Exception:
+            model = None
+        try:
+            dim: object = self._embed.dim
+        except Exception:
+            dim = None
+        try:
+            backend = str(getattr(self._embed, "backend", "configured"))
+        except Exception:
+            backend = "configured"
+        try:
+            quality = str(getattr(self._embed, "quality", "semantic"))
+        except Exception:
+            quality = "semantic"
+        try:
+            network_free = bool(getattr(self._embed, "network_free", False))
+        except Exception:
+            network_free = False
+        try:
+            fallback_reason = getattr(self._embed, "fallback_reason", None)
+        except Exception:
+            fallback_reason = None
+        if not isinstance(fallback_reason, str) or not fallback_reason:
+            fallback_reason = None
+        return {
+            "configured": True,
+            "backend": backend,
+            "quality": quality,
+            "network_free": network_free,
+            "model": model,
+            "dim": dim,
+            "fallback_reason": fallback_reason,
+        }
+
+    def _embed_pending_messages_best_effort(
+        self, message_ids: Iterable[int]
+    ) -> None:
+        """Fill the durable message-vector mirror without holding a write lock.
+
+        Public ingestion has already committed and validated/redacted the
+        source before this runs. A provider failure therefore never rolls back
+        accepted history and leaves a plainly retryable missing embedding for
+        the next message or dream cycle.
+        """
+        if self._embed is None:
+            return
+        if self.conn.in_transaction:
+            raise RuntimeError("message embedding must run outside a transaction")
+        consecutive_failures = 0
+        for batch in message_embedding_id_batches(
+            self.conn, message_ids=tuple(message_ids)
+        ):
+            try:
+                pending = fetch_message_embeddings(
+                    self.conn, self._embed, message_ids=batch
+                )
+                if pending is not None:
+                    with core_db.transaction(self.conn):
+                        persist_message_embeddings(self.conn, pending)
+            except Exception as exc:  # provider failure leaves retryable rows
+                consecutive_failures += 1
+                log.error(
+                    "embedding.message_ingest_failure batch_size=%d error=%s",
+                    len(batch), type(exc).__name__,
+                )
+                # Bound a genuinely unavailable provider to two timed attempts,
+                # while allowing a single poison/oversized batch not to block
+                # later committed groups in the same public batch.
+                if consecutive_failures >= 2:
+                    break
+            else:
+                consecutive_failures = 0
+
     def fork(self) -> "HyMem":
         """Return a new HyMem on the same database with its own SQLite
         connection, reusing this instance's LLM and embedding clients.
@@ -217,9 +330,17 @@ class HyMem:
 
     # ---- session log -------------------------------------------------
 
-    def open_session(self, session_id: str) -> None:
+    def open_session(
+        self,
+        session_id: str,
+        *,
+        source_workspace_id: str | None = None,
+    ) -> None:
         with core_db.transaction(self.conn):
-            session_log.open_session(self.conn, session_id)
+            session_log.open_session(
+                self.conn, session_id,
+                source_workspace_id=source_workspace_id,
+            )
 
     def close_session(self, session_id: str) -> None:
         with core_db.transaction(self.conn):
@@ -247,26 +368,61 @@ class HyMem:
         content: str,
         *,
         created_at: str | None = None,
+        source_peer_id: str | None = None,
+        source_workspace_id: str | None = None,
     ) -> int:
+        """Atomically append one source turn and its lossless coverage proof.
+
+        ``created_at`` is the message occurrence/source-valid time, not a
+        scheduled future effective date. It must be strict ISO-8601 and may
+        lead HyMem's observation clock by at most 300 seconds for producer
+        skew; invalid/further-future input is rejected without writing either
+        the raw turn or coverage artifact. Omit it to use ingestion time.
+        """
         content = self._prepare_content(content)
         with core_db.transaction(self.conn):
-            session_log.open_session(self.conn, session_id)
-            return session_log.append_message(
+            session_log.open_session(
+                self.conn, session_id,
+                source_workspace_id=source_workspace_id,
+            )
+            if source_peer_id is not None:
+                if source_workspace_id is None:
+                    raise ValueError(
+                        "source_peer_id and source_workspace_id must be provided together"
+                    )
+                session_log.register_session_peer(
+                    self.conn, session_id, source_workspace_id,
+                    source_peer_id, role,
+                )
+            message_id = session_log.append_message(
                 self.conn, session_id, role, content,
                 created_at=_clean_timestamp(created_at),
+                source_peer_id=source_peer_id,
+                source_workspace_id=source_workspace_id,
             )
+            # Source and durable canonical artifact commit together.  Dreaming
+            # still backfills legacy/direct-SQL rows, but public ingestion never
+            # leaves a newly accepted message outside the lossless stream.
+            materialize_message_coverage(self.conn, session_id)
+        self._embed_pending_messages_best_effort((message_id,))
+        return message_id
 
     def log_messages(
         self,
         session_id: str,
         turns: Iterable[tuple[str, str] | tuple[str, str, str | None]],
+        *,
+        source_peer_ids: Iterable[str | None] | None = None,
+        source_workspace_id: str | None = None,
     ) -> list[int]:
         """Append a batch of turns in a single transaction.
 
         Each turn is `(role, content)` or `(role, content, created_at)`, where
-        `created_at` is the caller-supplied *event* time (ISO-8601); omit it (or
-        pass the 2-tuple) to fall back to ingestion time. One BEGIN IMMEDIATE for
-        the whole batch instead of one per message.
+        `created_at` is the caller-supplied occurrence/source-valid time, not a
+        scheduled-effective date. It must be strict ISO-8601 and may lead the
+        observation clock by at most 300 seconds; omit it (or pass the 2-tuple)
+        to use ingestion time. Any invalid turn rolls back the full batch and
+        its coverage artifacts. One BEGIN IMMEDIATE covers the whole batch.
         """
         prepared = [
             (
@@ -276,14 +432,43 @@ class HyMem:
             )
             for turn in turns
         ]
+        peers = (
+            list(source_peer_ids)
+            if source_peer_ids is not None
+            else [None] * len(prepared)
+        )
+        if len(peers) != len(prepared):
+            raise ValueError("source_peer_ids must align one-to-one with turns")
+        if any(peer is not None for peer in peers) and source_workspace_id is None:
+            raise ValueError(
+                "source_peer_ids and source_workspace_id must be provided together"
+            )
+        if source_workspace_id is not None and any(peer is None for peer in peers):
+            raise ValueError(
+                "workspace-qualified batches require an exact peer for every turn"
+            )
         with core_db.transaction(self.conn):
-            session_log.open_session(self.conn, session_id)
-            return [
+            session_log.open_session(
+                self.conn, session_id,
+                source_workspace_id=source_workspace_id,
+            )
+            for (role, _content, _created_at), peer_id in zip(prepared, peers):
+                if peer_id is not None:
+                    session_log.register_session_peer(
+                        self.conn, session_id, source_workspace_id,
+                        peer_id, role,
+                    )
+            message_ids = [
                 session_log.append_message(
-                    self.conn, session_id, role, content, created_at=created_at
+                    self.conn, session_id, role, content, created_at=created_at,
+                    source_peer_id=peer_id,
+                    source_workspace_id=source_workspace_id,
                 )
-                for role, content, created_at in prepared
+                for (role, content, created_at), peer_id in zip(prepared, peers)
             ]
+            materialize_message_coverage(self.conn, session_id)
+        self._embed_pending_messages_best_effort(message_ids)
+        return message_ids
 
     def add_rule(
         self,
@@ -375,6 +560,9 @@ class HyMem:
         user_message: str,
         *,
         session_id: str | None = None,
+        source_session_id: str | None = None,
+        source_peer_id: str | None = None,
+        source_workspace_id: str | None = None,
         ability: str | None = None,
     ) -> AugmentedContext:
         """Build retrieval context for `user_message`.
@@ -403,6 +591,9 @@ class HyMem:
             llm=self._llm,
             token_overlap_index=self._token_overlap_index,
             session_id=session_id,
+            source_session_id=source_session_id,
+            source_peer_id=source_peer_id,
+            source_workspace_id=source_workspace_id,
             ability=ability,
         )
 
@@ -422,7 +613,7 @@ class HyMem:
         retrieval (`session_id`/`ability` pass straight through), renders the
         tiers into a compact most-authoritative-first context block (capped at
         `cfg.ask_max_context_chars`), and makes ONE completion against the
-        host-provided LLM under `ASK_PROMPT_V1` — answer only from the
+        host-provided LLM under `ASK_PROMPT_V2` — answer only from the
         context, quote concrete values/dates, state contradictions with their
         dates (most recent value-bearing statement wins), soften
         low-confidence facts, and say plainly when the memory doesn't contain
@@ -498,13 +689,43 @@ class HyMem:
         return load_profile(self.read_conn)
 
     def timeline(self, entity: str) -> list["TimelineEntry"]:
-        """First-seen active edge per predicate for `entity`, oldest first.
+        """Earliest source-valid edge per predicate for ``entity``.
 
-        Answers "when did we start using X?" from `knowledge_graph.first_seen`
-        without re-asking the user. `entity` may be a surface form; it's
-        resolved through the alias table. Read-only.
+        Current direct observations are returned by default and ordered by
+        ``valid_at`` -- never ingestion time. ``entity`` may be a surface form;
+        it is resolved through the alias table. Inferred rows are excluded
+        because no derivation-time lineage is persisted. Read-only.
         """
         return query_timeline(self.read_conn, entity)
+
+    def facts_at(
+        self,
+        valid_time: str,
+        *,
+        recorded_at: str | None = None,
+        entity: str | None = None,
+    ) -> list[AsOfGraphFact]:
+        """Direct graph facts valid at one source-time coordinate.
+
+        This reconstructs half-open validity intervals from the immutable edge
+        lifecycle (assert -> retract -> reassert), rather than consulting the
+        current materialized row. ``recorded_at`` is an independent optional
+        authority cutoff: omit it for today's authoritative revisions, or
+        provide it to select revisions/events that existed then. Canonical
+        merges are not transaction-versioned, so either mode projects onto
+        today's entity topology rather than claiming a literal old graph shape.
+        This lifecycle view changes only on persisted transitions; ordinary
+        current retrieval additionally applies the active/open/evidence-majority
+        gate and may therefore be a conservative subset. Both inputs are
+        validated ISO timestamps and normalized to UTC. ``entity`` is an
+        optional alias-aware subject/object filter. Read-only.
+        """
+        return query_facts_at(
+            self.read_conn,
+            valid_time,
+            recorded_at=recorded_at,
+            entity=entity,
+        )
 
     def conflicts(self) -> list[Conflict]:
         """Return detected contradictions in the knowledge graph. Read-only.
@@ -523,6 +744,7 @@ class HyMem:
         object: str | None = None,
         object_type: str | None = None,
         subject_type: str | None = None,
+        include_derived: bool = False,
     ) -> GraphCount:
         """Exact graph-native count over active `knowledge_graph` edges, for
         in-domain "how many X …" questions. Read-only.
@@ -542,7 +764,10 @@ class HyMem:
         side from the filters. `subject`/`object` surface forms are resolved
         through the alias table; `subject_type`/`object_type` filter via
         `entity_types`; `predicates` is optional (omit ⇒ all predicates). The
-        returned `GraphCount` carries the exact `count`, the distinct entities
+        Current direct observations are the default (active, open interval,
+        positive evidence majority). Pass ``include_derived=True`` only when a
+        closure-inclusive count is intentional. The returned `GraphCount`
+        carries the exact `count`, the distinct entities
         behind it (capped, count stays exact), and the resolved filters used.
         """
         return query_count_relations(
@@ -553,6 +778,7 @@ class HyMem:
             object=object,
             object_type=object_type,
             subject_type=subject_type,
+            include_derived=include_derived,
         )
 
     # ---- dreaming ----------------------------------------------------
@@ -563,10 +789,6 @@ class HyMem:
                 "HyMem.dream requires an LLMClient. Pass one to the constructor "
                 "or call set_llm() before dreaming."
             )
-        if self._embed is not None:
-            # Dreaming embeds canonicals/edges; if a local embedding server died
-            # since the last cycle, revive it here before we depend on it.
-            _ensure_embedding_server()
         ids = list(session_ids) if session_ids is not None else None
         report = run_dreaming(
             self.conn,
@@ -708,9 +930,13 @@ class HyMem:
         reprocess the whole backlog, which can take minutes.
 
         Returns a dict with:
-          - `pending_chunks`: chunks with NO `processed_chunks` row for the
-            CURRENT `config.prompt_version` (i.e. still owed an extraction pass).
-          - `total_chunks`: total chunk count.
+          - `pending_chunks`: actionable chunks still owed an extraction pass
+            for the CURRENT prompt version (quarantined failures excluded).
+          - `quarantined_chunks`: unprocessed chunks whose consecutive failure
+            count reached the current retry bound. These are not completed and
+            reopen when the prompt or retry policy changes.
+          - `total_chunks`: retrieval/extraction chunk count. Lossless coverage
+            artifacts are durable source storage and do not enter this budget.
           - `prompt_version`: the current `config.prompt_version`.
           - `in_progress`: True iff a `run_lock` row named 'dreaming' exists.
             This is intentionally coarse — a *stale* lock (e.g. from a crashed
@@ -722,14 +948,103 @@ class HyMem:
         conn = self.read_conn
         pv = self.config.prompt_version
 
+        retry_bound = int(self.config.chunk_extraction_max_attempts)
         pending_chunks = conn.execute(
-            "SELECT COUNT(*) FROM chunks "
-            "WHERE id NOT IN ("
-            "    SELECT chunk_id FROM processed_chunks WHERE prompt_version = ?"
-            ")",
-            (pv,),
+            "SELECT COUNT(*) FROM chunks c "
+            "WHERE c.chunk_kind = 'extraction' "
+            "AND COALESCE(c.salience_reason, '') <> 'short_session_fallback' "
+            "AND NOT EXISTS ("
+            "    SELECT 1 FROM processed_chunks pc "
+            "    WHERE pc.chunk_id = c.id AND pc.prompt_version = ?"
+            ") "
+            "AND (? <= 0 OR NOT EXISTS ("
+            "    SELECT 1 FROM chunk_extraction_attempts a "
+            "    WHERE a.chunk_id = c.id AND a.prompt_version = ? "
+            "      AND a.attempts >= ?"
+            "))",
+            (pv, retry_bound, pv, retry_bound),
         ).fetchone()[0]
-        total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        quarantined_chunks = (
+            conn.execute(
+                "SELECT COUNT(*) FROM chunks c "
+                "WHERE c.chunk_kind = 'extraction' "
+                "AND COALESCE(c.salience_reason, '') <> 'short_session_fallback' "
+                "AND NOT EXISTS ("
+                "    SELECT 1 FROM processed_chunks pc "
+                "    WHERE pc.chunk_id = c.id AND pc.prompt_version = ?"
+                ") "
+                "AND EXISTS ("
+                "    SELECT 1 FROM chunk_extraction_attempts a "
+                "    WHERE a.chunk_id = c.id AND a.prompt_version = ? "
+                "      AND a.attempts >= ?"
+                ")",
+                (pv, pv, retry_bound),
+            ).fetchone()[0]
+            if retry_bound > 0
+            else 0
+        )
+        digest_config = digest_config_version(
+            prompt_version=self.config.prompt_version,
+            episode_prompt_version=active_episode_prompt_version(
+                self.config.episode_granularity_enabled
+            ),
+            max_chars=self.config.dream_digest_max_chars,
+            max_tokens=self.config.dream_digest_max_tokens,
+            max_episodes=(
+                self.config.dream_max_episodes_per_session
+                if self.config.episode_granularity_enabled else None
+            ),
+        )
+        digest_retry_key = digest_retry_policy_version(
+            digest_config,
+            max_attempts=self.config.digest_extraction_max_attempts,
+        )
+        digest_retry_prefix = digest_retry_key.rsplit("|", 1)[0] + "|"
+        digest_retry_rows = conn.execute(
+            "SELECT digest_retry_count, digest_retry_config_version, "
+            "digest_quarantined FROM sessions"
+        ).fetchall()
+        quarantined_digests = sum(
+            1
+            for row in digest_retry_rows
+            if digest_retry_state_is_valid(
+                row["digest_retry_count"], row["digest_retry_config_version"],
+                row["digest_quarantined"],
+            )
+            and self.config.digest_extraction_max_attempts > 0
+            and row["digest_retry_count"]
+            >= self.config.digest_extraction_max_attempts
+            and row["digest_retry_config_version"].startswith(digest_retry_prefix)
+        )
+        profile_config = profile_config_version(
+            max_chars=self.config.dream_digest_max_chars,
+            max_items=self.config.profile_max_items_per_session,
+            redact_values=self.config.redact_secrets,
+        )
+        profile_retry_key = profile_retry_policy_version(
+            profile_config,
+            max_attempts=self.config.profile_extraction_max_attempts,
+        )
+        profile_retry_prefix = profile_retry_key.rsplit("|", 1)[0] + "|"
+        profile_retry_rows = conn.execute(
+            "SELECT profile_retry_count, profile_retry_config_version, "
+            "profile_quarantined FROM sessions"
+        ).fetchall()
+        quarantined_profiles = sum(
+            1
+            for row in profile_retry_rows
+            if profile_retry_state_is_valid(
+                row["profile_retry_count"], row["profile_retry_config_version"],
+                row["profile_quarantined"],
+            )
+            and self.config.profile_extraction_max_attempts > 0
+            and row["profile_retry_count"]
+            >= self.config.profile_extraction_max_attempts
+            and row["profile_retry_config_version"].startswith(profile_retry_prefix)
+        )
+        total_chunks = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE chunk_kind = 'extraction'"
+        ).fetchone()[0]
         in_progress = (
             conn.execute(
                 "SELECT 1 FROM run_lock WHERE name = 'dreaming' LIMIT 1"
@@ -742,6 +1057,9 @@ class HyMem:
 
         return {
             "pending_chunks": pending_chunks,
+            "quarantined_chunks": quarantined_chunks,
+            "quarantined_digests": quarantined_digests,
+            "quarantined_profiles": quarantined_profiles,
             "total_chunks": total_chunks,
             "prompt_version": pv,
             "in_progress": in_progress,
@@ -759,12 +1077,16 @@ class HyMem:
         return portability.export_jsonl(self.conn, path)
 
     def import_(self, path: str | Path) -> dict[str, int]:
-        """Load a JSON Lines export written by `export()`. Additive and
-        idempotent (INSERT-OR-IGNORE, sessions first); returns per-kind counts
-        of rows inserted. Best run against a fresh database. Invalidates the
-        query-side caches afterwards.
+        """Load a JSON Lines export written by `export()`.
+
+        Disjoint identities merge additively and exact reimports are no-ops;
+        a conflicting deterministic identity aborts the complete import.
+        Returns per-kind inserted-row counts and invalidates query caches.
         """
-        result = portability.import_jsonl(self.conn, path)
+        result = portability.import_jsonl(
+            self.conn, path, redact_values=self.config.redact_secrets,
+            config=self.config,
+        )
         self._token_overlap_index = None
         return result
 
@@ -795,30 +1117,28 @@ class HyMem:
             subj = canon.resolve(self.conn, subject)
             obj = canon.resolve(self.conn, object)
             row = self.conn.execute(
-                "SELECT id FROM knowledge_graph "
+                f"SELECT id FROM knowledge_graph "
                 "WHERE subject_canonical = ? AND predicate = ? AND object_canonical = ? "
-                "AND status = 'active'",
+                f"AND {live_edge_predicate()}",
                 (subj, predicate, obj),
             ).fetchone()
             if row is None:
                 return False
-            self.conn.execute(
-                "UPDATE knowledge_graph "
-                "SET status = 'retracted', "
-                "    neg_evidence = neg_evidence + 1, "
-                "    last_seen = CURRENT_TIMESTAMP "
-                "WHERE id = ?",
-                (row["id"],),
+            evidence_ledger.record_signal(
+                self.conn,
+                edge_id=row["id"],
+                signal_key=f"manual-retraction:{uuid.uuid4().hex}",
+                signal_kind="manual_retraction",
+                polarity=-1,
+                evidence_weight=1,
+                details=f"HyMem.retract_edge({subj}, {predicate}, {obj})",
             )
-            # Close the bi-temporal validity interval (schema v15). An explicit
-            # host retraction has no dated contradicting evidence, so this falls
-            # back to the flip time inside stamp_invalidation.
-            bitemporal.stamp_invalidation(self.conn, [row["id"]])
             # Store feedback for future extraction improvement
             evidence_rows = self.conn.execute(
-                """SELECT chunk_id FROM kg_evidence 
-                   WHERE edge_id = ? AND polarity = 1
-                   ORDER BY extracted_at DESC LIMIT 5""",
+                f"""SELECT chunk_id FROM kg_evidence
+                   WHERE edge_id = ? AND polarity = 1 AND is_current = 1
+                   ORDER BY {graph_clock_order_sql('extracted_at')}, id
+                   LIMIT 5""",
                 (row["id"],),
             ).fetchall()
             for er in evidence_rows:
@@ -836,9 +1156,9 @@ class HyMem:
                     )
             for c in (subj, obj):
                 still_active = self.conn.execute(
-                    "SELECT 1 FROM knowledge_graph "
+                    f"SELECT 1 FROM knowledge_graph "
                     "WHERE (subject_canonical = ? OR object_canonical = ?) "
-                    "AND status = 'active' LIMIT 1",
+                    f"AND {live_edge_predicate()} LIMIT 1",
                     (c, c),
                 ).fetchone()
                 if still_active is None:

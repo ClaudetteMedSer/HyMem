@@ -34,7 +34,10 @@ import pytest
 
 from hymem import HyMem
 from hymem.core import db as core_db
+from hymem.dreaming.lossless import materialize_message_coverage
+from hymem.dreaming.user_profile import ProfileExtraction, persist_user_profile
 from hymem.extraction.llm import StubLLMClient
+from hymem.query.state_anchor import select_anchor_edges
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 from recovery_probe import (  # noqa: E402
@@ -84,13 +87,49 @@ def _seed_edge(conn, subject: str, predicate: str, obj: str, *,
     return cur.lastrowid
 
 
+def _seed_profile(conn, slot: str, value: str) -> None:
+    """Seed a profile assertion through the same durable USER proof as runtime.
+
+    These probe fixtures used to insert unattributed rows directly.  v39
+    deliberately grandfathers existing legacy rows but rejects creation of new
+    source-less claims, so the fixture now supplies real producer-bounded
+    provenance without changing the probe's profile-row accounting.
+    """
+    session_id = "recovery-profile-source"
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions(id, started_at) VALUES (?, '2024-01-01 00:00:00')",
+        (session_id,),
+    )
+    cur = conn.execute(
+        "INSERT INTO messages(session_id, role, content, created_at) "
+        "VALUES (?, 'user', ?, '2024-01-01 00:00:00')",
+        (session_id, f"My {slot} is {value}."),
+    )
+    materialize_message_coverage(conn, session_id)
+    inserted = persist_user_profile(
+        conn,
+        ProfileExtraction(items=[{
+            "slot": slot,
+            "value": value,
+            "evidence_message_id": int(cur.lastrowid),
+            "confidence": 1.0,
+        }]),
+        redact_values=False,
+    )
+    assert inserted == 1
+
+
 def _seed_evidence(conn, edge_id: int, chunk_id: str, polarity: int,
                    extracted_at: str) -> None:
-    conn.execute(
-        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity, extracted_at) "
-        "VALUES (?, ?, ?, ?)",
-        (edge_id, chunk_id, polarity, extracted_at),
-    )
+    # This probe intentionally recreates a historical defect state that public
+    # helpers would immediately reconcile.  Use the scoped internal fixture
+    # authority while retaining the exact legacy row shape/timestamps.
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity, extracted_at) "
+            "VALUES (?, ?, ?, ?)",
+            (edge_id, chunk_id, polarity, extracted_at),
+        )
 
 
 @pytest.fixture
@@ -179,10 +218,7 @@ def test_profile_rows_consume_the_cap_before_edges(conn):
     populated profile — which is every real one."""
     with core_db.transaction(conn):
         for i in range(2):
-            conn.execute(
-                "INSERT INTO user_profile(slot, value, confidence) VALUES (?, ?, 1.0)",
-                ("role" if i == 0 else "employer", f"v{i}"),
-            )
+            _seed_profile(conn, "role" if i == 0 else "employer", f"v{i}")
         for i in range(4):
             _recovered_edge(conn, subject=f"app{i}")
 
@@ -315,6 +351,36 @@ def test_the_probe_writes_nothing(cfg, tmp_path):
     try:
         report = measure_recovery(ro, cap=20)
         assert report["anchor_delta"] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            ro.execute("DELETE FROM knowledge_graph")
+    finally:
+        ro.close()
+
+
+def test_readonly_opener_supports_strict_temporal_graph_reads(cfg):
+    """The shared probe connection has every UDF required by graph reads.
+
+    UDF registration is connection-local, including for ``mode=ro`` handles.
+    Exercise the production anchor selector instead of merely checking a
+    function name so this protects the consumer behavior that the digest
+    squeeze CLIs depend on.
+    """
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    try:
+        with core_db.transaction(hy.conn):
+            edge_id = _seed_edge(
+                hy.conn,
+                "strict timestamp",
+                "uses",
+                "read-only udf",
+                valid_at="2024-01-01T00:00:00.000Z",
+            )
+    finally:
+        hy.close()
+
+    ro = open_store_readonly(cfg.db_path)
+    try:
+        assert [row["id"] for row in select_anchor_edges(ro, cap=20)] == [edge_id]
         with pytest.raises(sqlite3.OperationalError):
             ro.execute("DELETE FROM knowledge_graph")
     finally:

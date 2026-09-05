@@ -22,8 +22,10 @@ import ast
 import gc
 import hashlib
 import json
+import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -40,6 +42,61 @@ import requests as http
 _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root))
 
+from benchmarks.strictness import (
+    AtomicCheckpoint,
+    BenchmarkIntegrityError,
+    aggregate_embedding_usage_snapshots,
+    aggregate_usage_snapshots,
+    add_strict_run_arguments,
+    build_manifest,
+    code_hash,
+    content_hash,
+    file_hash,
+    freeze_calibration,
+    load_calibration,
+    publish_checkpoint_artifact,
+    resolve_checkpoint_path,
+    select_protocol_ids,
+    sanitize_for_artifact,
+    strict_accuracy,
+    usage_snapshot,
+    embedding_usage_snapshot,
+    validate_ids,
+    dataclass_identity,
+    write_immutable_artifact,
+    write_latest_pointer,
+)
+from benchmarks.lme_protocol import (
+    LME_ABILITY_BY_TYPE,
+    LME_BASE_QUESTION_TYPES,
+    LME_EVALUATOR_COMMIT,
+    LME_EVALUATOR_SHA256,
+    LME_EVALUATOR_URL,
+    LME_HISTORICAL_LOCAL_JUDGE_PROMPTS_EXACT_OFFICIAL,
+    LME_OFFICIAL_JUDGE_BASE_URL,
+    LME_OFFICIAL_JUDGE_MAX_TOKENS,
+    LME_OFFICIAL_JUDGE_MODEL,
+    LME_OFFICIAL_JUDGE_TEMPERATURE,
+    LME_OFFICIAL_VERDICT_PARSER,
+    LME_LOCAL_RETRY_POLICY,
+    LME_UPSTREAM_RETRY_POLICY,
+    LME_S_DATASET_REVISION,
+    LME_S_DATASET_SHA256,
+    LME_S_DATASET_URL,
+    LME_S_EXPECTED_COUNT,
+    LME_S_QTYPE_COUNTS,
+    LME_S_SOURCE_IDS_HASH,
+    LME_SUPPORTED_SCALES,
+    export_official_predictions,
+    is_official_abstention_id,
+    normalize_extra_body,
+    normalize_lme_date,
+    official_judge_match,
+    parse_official_verdict,
+    validate_lme_dataset,
+    validate_safe_endpoint,
+)
+
 # ── Config ──────────────────────────────────────────────────────────
 
 def _normalize_date(raw: str | None) -> str | None:
@@ -47,18 +104,7 @@ def _normalize_date(raw: str | None) -> str | None:
     to ISO-8601 '2023-05-20T02:21:00'. Returns None for empty/None input."""
     if not raw or not raw.strip():
         return None
-    # Strip day-of-week parenthetical: '2023/05/20 (Sat) 02:21' -> '2023/05/20 02:21'
-    import re
-    cleaned = re.sub(r'\s*\([^)]*\)', '', raw).strip()
-    # Try common formats
-    for fmt in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M", "%Y/%m/%d", "%Y-%m-%d"):
-        try:
-            dt = datetime.strptime(cleaned, fmt)
-            return dt.strftime("%Y-%m-%dT%H:%M:%S")
-        except ValueError:
-            continue
-    # Return cleaned if we can't parse — better than wall-clock
-    return cleaned if cleaned else None
+    return normalize_lme_date(raw, label="LongMemEval date")
 
 
 # ── Recall-ceiling instrumentation ──────────────────────────────────
@@ -140,9 +186,9 @@ def _extract_gold_turns(q_data: dict) -> tuple[list[str], str]:
 def _gold_in_pool(gold_turns: list[str], pool_texts: list[str]) -> bool:
     """True if any gold turn is present in any pooled hit text.
 
-    message_hits expose the raw turn (truncated to 600 chars); fts chunks are a
+    Message hits expose the complete raw turn; FTS hits may still be a chunked
     slice of one. So a match is: one string contains the other, or they share a
-    distinctive 40-char prefix (covers the 600-char cap and chunk slicing)."""
+    distinctive 40-character prefix (covering chunk boundaries)."""
     pool_n = [_norm_text(p) for p in pool_texts if p and p.strip()]
     for g in gold_turns:
         gn = _norm_text(g)
@@ -183,16 +229,32 @@ def _gold_turn_tiers(gold_turns: list[str], pool: dict) -> list[str]:
 # on every run (free) and can optionally DRIVE shaping from it (--auto-ability)
 # to measure the true production score.
 
-def _detect_ability_safe(question: str) -> str | None:
-    """HyMem's production ability inference, or None if unavailable.
+def _detect_ability(question: str) -> str | None:
+    """HyMem's production ability inference, failing loudly if it is broken.
+
+    ``None`` is a legitimate generic-route decision. Import/runtime failure is
+    not: strict scored runs must never turn a broken router into that abstention
+    signal and continue scoring.
 
     detect_ability emits only "MR"/"TR"/None by design — those are the only
     wired-in shaping paths; every other oracle ability (IE/KU/PF/ABS) correctly
     maps to a None inference (no shaping), so a None here on those categories is
     a correct abstain, not a miss."""
+    from hymem.query.intent import detect_ability
+
+    detected = detect_ability(question or "")
+    if detected not in {"MR", "TR", None}:
+        raise BenchmarkIntegrityError(
+            f"production ability router returned invalid value: {detected!r}"
+        )
+    return detected
+
+
+def _detect_ability_safe(question: str) -> str | None:
+    """Best-effort shadow diagnostic; never use this to drive a scored path."""
+
     try:
-        from hymem.query.intent import detect_ability
-        return detect_ability(question or "")
+        return _detect_ability(question)
     except Exception:
         return None
 
@@ -200,7 +262,22 @@ def _detect_ability_safe(question: str) -> str | None:
 DEFAULT_SCALE = "S"
 DEFAULT_SAMPLE = 50  # questions to evaluate (500 total)
 DEFAULT_TOP_K = 15
+# Historical compatibility constant only.  The strict adapter no longer uses
+# this 8K/16K character bottleneck beneath its explicit token budget.
 MAX_CONTEXT_CHARS = 8000
+DEFAULT_MAX_INPUT_TOKENS = 16000
+DEFAULT_MAX_INPUT_BYTES = 60000
+# A deliberately conservative floor for the default DeepSeek reader.  The
+# byte fallback relies on the mathematical ``tokens <= UTF-8 bytes`` bound, so
+# input bytes plus the output reserve must fit inside this manifested ceiling.
+DEFAULT_PROVIDER_CONTEXT_TOKENS = 65536
+READER_OUTPUT_RESERVE_TOKENS = 1024
+READER_TRANSPORT_OVERHEAD_TOKENS = 256
+RAW_EVIDENCE_RESERVE_FRACTION = 0.60
+MIN_SEMANTIC_EXCERPT_ALNUM = 8
+MIN_SEMANTIC_EXCERPT_CHARS = 12
+DEFAULT_INDEXING_MAX_CYCLES = 100
+DEFAULT_INDEXING_TIMEOUT_S = 3600.0
 
 # DeepSeek API
 DEEPSEEK_API_KEY = ""
@@ -211,12 +288,178 @@ JUDGE_MODEL = "deepseek-chat"
 # Local embedding server (lever L1) — the FastEmbed ONNX server Hermes runs in
 # production. These are the OUT-OF-THE-BOX defaults for --embeddings so the flag
 # works with no env setup; every field is still overridable via HYMEM_EMBEDDING_*.
-# DeepSeek has no embeddings API, so the client's own deepseek defaults are a dead
-# end — point at the local server. api_key="local" because the server ignores it.
+# DeepSeek has no embeddings API, so this benchmark deliberately points at its
+# own local FastEmbed service. api_key="local" because that service ignores it.
 LOCAL_EMBED_BASE_URL = "http://localhost:8766/v1"
 LOCAL_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 LOCAL_EMBED_DIM = 384
 LOCAL_EMBED_API_KEY = "local"
+
+
+def longmemeval_code_hash(
+    *,
+    adapter_path: Path | None = None,
+    strictness_path: Path | None = None,
+    protocol_path: Path | None = None,
+    run_registry_path: Path | None = None,
+    hymem_path: Path | None = None,
+    root: Path | None = None,
+) -> str:
+    """Hash every local module that can change LME evidence or scoring.
+
+    Arguments are injectable so the identity dependency can be regression
+    tested against temporary files without editing the working tree.
+    """
+
+    root_path = Path(root or _repo_root).resolve()
+    benchmark_dir = Path(__file__).resolve().parent
+    return code_hash(
+        [
+            Path(adapter_path or __file__),
+            Path(strictness_path or benchmark_dir / "strictness.py"),
+            Path(protocol_path or benchmark_dir / "lme_protocol.py"),
+            Path(run_registry_path or benchmark_dir / "run_registry.py"),
+            Path(hymem_path or root_path / "hymem"),
+        ],
+        root=root_path,
+    )
+
+
+def _load_local_tokenizer_counter(path: Path):
+    """Load a Hugging Face ``tokenizer.json`` without network access.
+
+    ``tokenizers`` is intentionally optional. Selecting this strict path when
+    the package or local file is unavailable fails before any provider client
+    is constructed; the adapter never downloads or guesses a tokenizer.
+    """
+
+    try:
+        from tokenizers import Tokenizer
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise BenchmarkIntegrityError(
+            "--tokenizer-json requires the local 'tokenizers' package"
+        ) from exc
+    try:
+        tokenizer = Tokenizer.from_file(str(path))
+    except Exception as exc:
+        raise BenchmarkIntegrityError(
+            f"cannot load local tokenizer JSON {path}: {exc}"
+        ) from exc
+
+    def count(text: str) -> int:
+        return len(tokenizer.encode(text).ids)
+
+    return count
+
+
+def resolve_context_policy(args, parser=None) -> tuple[dict[str, Any], Any]:
+    """Resolve the truthful reader budget and optional exact local counter.
+
+    The no-tokenizer policy is explicitly byte-denominated. Since a byte-level
+    tokenizer cannot emit more tokens than UTF-8 input bytes, a byte budget plus
+    output and chat-framing reserves below the declared provider ceiling is
+    conservative without pretending bytes are model tokens. A selected local
+    tokenizer is a different, fail-closed policy; it never silently switches
+    units during a strict run.
+    """
+
+    def fail(message: str):
+        if parser is not None:
+            parser.error(message)
+        raise BenchmarkIntegrityError(message)
+
+    endpoint = validate_safe_endpoint(args.answer_base_url, label="reader")
+    ceiling = getattr(args, "provider_context_tokens", None)
+    if ceiling is None:
+        if endpoint == DEEPSEEK_BASE_URL:
+            ceiling = DEFAULT_PROVIDER_CONTEXT_TOKENS
+        else:
+            fail(
+                "--provider-context-tokens is required for a non-default "
+                "answer endpoint"
+            )
+    if (
+        isinstance(ceiling, bool) or not isinstance(ceiling, int)
+        or ceiling <= 0
+    ):
+        fail("--provider-context-tokens must be a positive integer")
+    byte_budget = getattr(args, "max_input_bytes", DEFAULT_MAX_INPUT_BYTES)
+    if (
+        isinstance(byte_budget, bool) or not isinstance(byte_budget, int)
+        or byte_budget <= 0
+    ):
+        fail("--max-input-bytes must be a positive integer")
+    tokenizer_path_raw = getattr(args, "tokenizer_json", None)
+    counter = None
+    tokenizer_identity = None
+    exact_budget = getattr(args, "max_input_tokens", None)
+    if tokenizer_path_raw:
+        tokenizer_path = Path(tokenizer_path_raw).expanduser().resolve()
+        if not tokenizer_path.is_file():
+            fail(f"--tokenizer-json is not a file: {tokenizer_path}")
+        if exact_budget is None:
+            exact_budget = DEFAULT_MAX_INPUT_TOKENS
+        if (
+            isinstance(exact_budget, bool) or not isinstance(exact_budget, int)
+            or exact_budget <= 0
+        ):
+            fail("--max-input-tokens must be a positive integer")
+        if (
+            exact_budget + READER_OUTPUT_RESERVE_TOKENS
+            + READER_TRANSPORT_OVERHEAD_TOKENS > ceiling
+        ):
+            fail(
+                "--max-input-tokens plus reader output/framing reserves exceeds "
+                "the declared provider context ceiling"
+            )
+        try:
+            counter = _load_local_tokenizer_counter(tokenizer_path)
+        except BenchmarkIntegrityError as exc:
+            fail(str(exc))
+        tokenizer_identity = {
+            "configured": True,
+            "backend": "huggingface-tokenizers-json",
+            "bound_model": args.answer_model,
+            "file_sha256": file_hash(tokenizer_path),
+            "local_only": True,
+        }
+        budget_unit = "model_tokens"
+        policy_name = "model-bound-tokenizer-query-head-tail-v2"
+        effective_byte_budget = None
+    else:
+        if exact_budget is not None:
+            fail("--max-input-tokens requires --tokenizer-json")
+        if (
+            byte_budget + READER_OUTPUT_RESERVE_TOKENS
+            + READER_TRANSPORT_OVERHEAD_TOKENS > ceiling
+        ):
+            fail(
+                "--max-input-bytes plus reader output/framing reserves exceeds "
+                "the declared provider context ceiling"
+            )
+        budget_unit = "utf8_bytes"
+        policy_name = "conservative-utf8-byte-query-head-tail-v2"
+        effective_byte_budget = byte_budget
+
+    policy = {
+        "name": policy_name,
+        "budget_unit": budget_unit,
+        "max_input_tokens": exact_budget,
+        "max_input_bytes": effective_byte_budget,
+        "provider_context_window_tokens": ceiling,
+        "reserved_output_tokens": READER_OUTPUT_RESERVE_TOKENS,
+        "reserved_transport_overhead_tokens": READER_TRANSPORT_OVERHEAD_TOKENS,
+        "tokenizer": tokenizer_identity,
+        "tokenizer_failure_policy": (
+            "fail-closed" if tokenizer_identity else "not-applicable"
+        ),
+        "source_boundaries": ["head", "query-window", "tail"],
+        "raw_evidence_reserve_fraction": RAW_EVIDENCE_RESERVE_FRACTION,
+        "min_semantic_excerpt_alnum": MIN_SEMANTIC_EXCERPT_ALNUM,
+        "min_semantic_excerpt_chars": MIN_SEMANTIC_EXCERPT_CHARS,
+        "gold_access": False,
+    }
+    return policy, counter
 
 # Recency-conflict resolution (KU lever). message_hits are stamped with their date
 # in the answer context (see the context builder in answer_question), so when a
@@ -307,31 +550,54 @@ QUESTION_TYPE_TO_ABILITY = {
 # the prefix out by hand; they now share one predicate, because the D3 fix turns
 # it from a cosmetic detail into a decision about whether a row is scored.
 LLM_ERROR_PREFIX = "[LLM_ERROR"
+RESERVED_CHAT_BODY_KEYS = frozenset({
+    "model", "messages", "temperature", "max_tokens", "n",
+})
 
 
 def is_llm_error(text: str | None) -> bool:
     return bool(text) and str(text).startswith(LLM_ERROR_PREFIX)
 
 
+def validate_request_extra_body(value: dict | None) -> dict:
+    """Keep provider extensions from overriding manifested core request fields."""
+
+    return normalize_extra_body(value, label="request")
+
+
 # ── LLM Client ──────────────────────────────────────────────────────
 
 class LLMClient:
     def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
-                 extra_body: dict | None = None):
+                 extra_body: dict | None = None, *, n: int | None = None):
+        if not isinstance(model, str) or not model.strip() or model != model.strip():
+            raise BenchmarkIntegrityError("LLM model identity must be non-empty")
         self.model = model
         self.api_key = api_key
         # Default keeps every existing caller byte-path-identical; only the ANSWER
         # client is ever pointed elsewhere (via --answer-base-url), so the judge
         # posture stays the frozen comparability contract with the canonical run.
-        self.base_url = base_url.rstrip("/")
+        self.base_url = validate_safe_endpoint(base_url, label="LLM")
         # Extra top-level request-body fields merged into every call — the raw-HTTP
         # equivalent of the OpenAI SDK's `extra_body`. Needed post-2026-07-24: the
         # deepseek-chat deprecation moved reader/judge to deepseek-v4-flash, a
         # REASONING model that prepends thinking tokens (corrupting the yes/no judge
         # parse) unless sent {"thinking":{"type":"disabled"}}. Empty = unchanged.
-        self.extra_body = dict(extra_body) if extra_body else {}
+        self.extra_body = validate_request_extra_body(extra_body)
+        if n is not None and (
+            isinstance(n, bool) or not isinstance(n, int) or n <= 0
+        ):
+            raise BenchmarkIntegrityError("LLM completion count must be positive")
+        self.n = n
         self.call_count = 0
+        self.request_attempts = 0
+        self.successful_responses = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
         self.total_tokens = 0
+        self.total_latency_s = 0.0
+        self.token_usage_available = False
+        self._usage_complete = True
         self.last_error: str | None = None
         # Guards the two counters so they aggregate correctly when many worker
         # threads share this client (--workers > 1).
@@ -343,10 +609,31 @@ class LLMClient:
             try:
                 content, usage = self._call(messages, temperature, max_tokens)
                 with self._lock:
-                    self.total_tokens += usage.get("total_tokens", 0)
+                    required = ("prompt_tokens", "completion_tokens", "total_tokens")
+                    valid = all(
+                        isinstance(usage.get(key), (int, float))
+                        and not isinstance(usage.get(key), bool)
+                        and usage[key] >= 0
+                        for key in required
+                    )
+                    if valid:
+                        self.prompt_tokens += usage["prompt_tokens"]
+                        self.completion_tokens += usage["completion_tokens"]
+                        self.total_tokens += usage["total_tokens"]
+                    else:
+                        self._usage_complete = False
+                    self.token_usage_available = (
+                        self.successful_responses > 0 and self._usage_complete
+                    )
                 return content
             except Exception as e:
                 last_error = str(e)
+                # A failed request may have reached the provider but did not
+                # return an auditable usage block. Even a later successful
+                # retry cannot make the call-chain token total complete.
+                with self._lock:
+                    self._usage_complete = False
+                    self.token_usage_available = False
                 if "429" in last_error or "rate" in last_error.lower():
                     time.sleep(15 * (attempt + 1))
                 elif "null content" in last_error and "finish=length" in last_error:
@@ -369,19 +656,26 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        # Merge last so a caller can force provider-specific fields (e.g. disable
-        # v4-flash thinking). Collisions with the four keys above are the caller's.
+        if self.n is not None:
+            body["n"] = self.n
+        # Only provider-specific extensions reach this merge; core request
+        # fields cannot disagree with the manifest.
         body.update(self.extra_body)
-        resp = http.post(
-            f"{self.base_url}/chat/completions",
-            json=body,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        started = time.monotonic()
         with self._lock:
-            self.call_count += 1
+            self.request_attempts += 1
+        try:
+            resp = http.post(
+                f"{self.base_url}/chat/completions",
+                json=body,
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        finally:
+            with self._lock:
+                self.total_latency_s += time.monotonic() - started
         content = data["choices"][0]["message"].get("content")
         if content is None:
             # A 200 with content=null. Transient provider behavior should be
@@ -391,6 +685,14 @@ class LLMClient:
             # raising makes the failure explicit and countable.
             raise RuntimeError(
                 f"null content (finish={data['choices'][0].get('finish_reason')})")
+        if not isinstance(content, str):
+            raise RuntimeError(
+                "non-string content "
+                f"(finish={data['choices'][0].get('finish_reason')})"
+            )
+        with self._lock:
+            self.call_count += 1
+            self.successful_responses += 1
         return (
             content,
             data.get("usage", {}),
@@ -399,40 +701,47 @@ class LLMClient:
 
 # ── Dataset Loader (streaming) ──────────────────────────────────────
 
-def load_longmemeval_data(dataset_path: str, max_questions: int = None, seed: int = 0) -> list[dict]:
-    """Stream-load LongMemEval questions using ijson, with stratified sampling.
+def load_longmemeval_data(
+    dataset_path: str,
+    max_questions: int = None,
+    seed: int = 0,
+    *,
+    strict_schema: bool = False,
+    scale: str = DEFAULT_SCALE,
+) -> list[dict]:
+    """Stream-load LongMemEval questions with label-blind sampling.
 
-    `seed` makes the stratified sample + shuffle deterministic so two runs
+    `seed` makes the sample deterministic so two runs
     (e.g. old code vs new code) evaluate the IDENTICAL question set — without
     it every run draws a fresh sample and per-category deltas are dominated by
     which questions happened to be drawn, not by the code change. Pass
     `max_questions=None` (CLI `--sample 0`) to evaluate the full set and remove
     sampling variance entirely.
     """
-    import ijson, random
+    import ijson
 
-    rng = random.Random(seed)
-
-    # First pass: collect all questions grouped by type
-    by_type = defaultdict(list)
+    # Labels are retained for official judging and post-answer diagnostics, but
+    # they never determine which examples enter a scored run.
+    questions: list[dict] = []
     with open(dataset_path, "rb") as f:
         for item in ijson.items(f, "item"):
-            # Official LongMemEval flags ABSTENTION questions via the question_id
-            # suffix `_abs`, NOT question_type — but the judge (get_judge_prompt)
-            # and the answerable-vs-abstention report (compute_abstention_scores)
-            # both key on `_abs` in question_type. Normalize here so an abstention-
-            # bearing dataset measures correctly and the --permissive-default guard
-            # rail actually fires. The `_cleaned` S file dropped abstention entirely
-            # (all-answerable), so this is a no-op there.
-            qtype = item["question_type"]
-            if str(item.get("question_id", "")).endswith("_abs") and not qtype.endswith("_abs"):
-                qtype = f"{qtype}_abs"
-                item["question_type"] = qtype
-            by_type[qtype].append(item)
+            # Preserve the upstream row byte-semantics: its question_type stays
+            # one of six base categories.  The evaluator selects abstention from
+            # ``'_abs' in question_id`` separately, after the answer exists.
+            questions.append(item)
 
-    total_available = sum(len(v) for v in by_type.values())
-    num_types = len(by_type)
-    n_abs = sum(len(v) for k, v in by_type.items() if k.endswith("_abs"))
+    if strict_schema:
+        questions = list(validate_lme_dataset(questions, scale=scale))
+
+    total_available = len(questions)
+    # Compute display-only diversity after strict validation. A corrupt,
+    # unhashable qtype must become BenchmarkIntegrityError, never leak a raw
+    # TypeError from set insertion before schema checks run.
+    num_types = len({
+        item.get("question_type") for item in questions
+        if isinstance(item.get("question_type"), str)
+    })
+    n_abs = sum(1 for item in questions if is_official_abstention_id(item.get("question_id")))
     if n_abs:
         print(f"  Abstention questions present: {n_abs} (guard-rail measurable)", flush=True)
     else:
@@ -440,27 +749,41 @@ def load_longmemeval_data(dataset_path: str, max_questions: int = None, seed: in
               f"answerable-vs-abstention guard rail cannot fire (all-answerable set)", flush=True)
 
     if max_questions is None or max_questions >= total_available:
-        # Return all questions
-        questions = [q for group in by_type.values() for q in group]
         print(f"  Loaded all {total_available} questions ({num_types} types)", flush=True)
         return questions
 
-    # Stratified sampling: distribute max_questions across types
-    per_type = max(1, max_questions // num_types)
-    remaining = max_questions - per_type * num_types
+    sampled = select_label_blind_questions(
+        questions, sample=min(max_questions, total_available), seed=seed
+    )
+    print(f"  Loaded {len(sampled)} questions ({num_types} types, "
+          f"label-blind sample, seed={seed})", flush=True)
+    return sampled
 
-    questions = []
-    for qtype, items in sorted(by_type.items()):
-        n = min(per_type + (1 if remaining > 0 else 0), len(items))
-        sampled = rng.sample(items, n) if n < len(items) else items
-        questions.extend(sampled)
-        if remaining > 0:
-            remaining -= 1
-        print(f"    {qtype}: {n}/{len(items)} sampled", flush=True)
 
-    rng.shuffle(questions)
-    print(f"  Loaded {len(questions)} questions ({num_types} types, stratified, seed={seed})", flush=True)
-    return questions
+def select_label_blind_questions(
+    questions: list[dict], *, sample: int, seed: int,
+) -> list[dict]:
+    """Deterministically select examples without reading type, answer, or gold."""
+
+    if isinstance(sample, bool) or not isinstance(sample, int) or sample < 0:
+        raise BenchmarkIntegrityError("sample must be a non-negative integer")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise BenchmarkIntegrityError("seed must be an integer")
+    if sample == 0 or sample >= len(questions):
+        return list(questions)
+    # Rank source positions by a stable SHA-256 draw, then restore source
+    # order.  The draw never reads qid (whose `_abs` marker is a label), qtype,
+    # answer, answer_session_ids or has_answer.  Unlike random.sample's output
+    # ordering, this makes selected-row order a stable subsequence of the
+    # pinned source order across Python versions.
+    ranked = sorted(
+        range(len(questions)),
+        key=lambda index: hashlib.sha256(
+            f"longmemeval-label-blind-v1\0{seed}\0{index}".encode("ascii")
+        ).digest(),
+    )[:sample]
+    chosen = set(ranked)
+    return [row for index, row in enumerate(questions) if index in chosen]
 
 
 def load_longmemeval_oracle(oracle_path: str) -> dict[str, dict]:
@@ -488,7 +811,14 @@ class HyMemAdapter:
                  rules_enabled: bool | None = None,
                  rules_extraction: bool | None = None,
                  facts_enabled: bool | None = None,
-                 facts_extraction: bool | None = None):
+                 facts_extraction: bool | None = None,
+                 pipeline_model: str = "deepseek-chat",
+                 pipeline_base_url: str = DEEPSEEK_BASE_URL,
+                 pipeline_thinking: str = "auto",
+                 embedding_base_url: str | None = None,
+                 embedding_model: str | None = None,
+                 embedding_dim: int | None = None,
+                 embedding_api_key: str | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -507,7 +837,61 @@ class HyMemAdapter:
         self.rules_extraction = rules_extraction
         self.facts_enabled = facts_enabled
         self.facts_extraction = facts_extraction
+        self.pipeline_model = pipeline_model
+        self.pipeline_base_url = validate_safe_endpoint(
+            pipeline_base_url, label="memory pipeline"
+        )
+        if pipeline_thinking not in {"auto", "disabled", "off", "enabled"}:
+            raise BenchmarkIntegrityError("invalid memory-pipeline thinking mode")
+        self.pipeline_thinking = pipeline_thinking
+        self.embedding_base_url = embedding_base_url
+        self.embedding_model = embedding_model
+        self.embedding_dim = embedding_dim
+        self.embedding_api_key = embedding_api_key
         self.hy = None
+        self.pipeline_llm = None
+        self.embedding_client = None
+        self.last_indexing_summary = None
+
+    def build_config(self):
+        """Exact effective HyMem config, usable before provider construction."""
+        from hymem import HyMemConfig
+
+        overrides = {}
+        if self.rerank_top_k is not None:
+            overrides["rerank_top_k"] = self.rerank_top_k
+        if self.rerank_model is not None:
+            overrides["rerank_model"] = self.rerank_model
+        if self.rerank_message_hits is not None:
+            overrides["rerank_message_hits"] = self.rerank_message_hits
+        overrides["aggregation_nodes_enabled"] = self.aggregation_nodes
+        if self.aggregation_broad:
+            overrides["aggregation_inject_abilities"] = ()
+        overrides["episode_granularity_enabled"] = self.episode_granularity
+        overrides["value_supersession_enabled"] = self.value_supersession
+        if self.graph_multihop:
+            overrides["graph_multihop_enabled"] = True
+            if self.graph_multihop_max_hops is not None:
+                overrides["graph_multihop_max_hops"] = self.graph_multihop_max_hops
+            if self.graph_multihop_decay is not None:
+                overrides["graph_multihop_decay"] = self.graph_multihop_decay
+            if self.graph_multihop_min_score is not None:
+                overrides["graph_multihop_min_score"] = self.graph_multihop_min_score
+        if self.rules_enabled is not None:
+            overrides["rules_enabled"] = self.rules_enabled
+        if self.rules_extraction is not None:
+            overrides["rules_extraction_enabled"] = self.rules_extraction
+        if self.facts_enabled is not None:
+            overrides["facts_enabled"] = self.facts_enabled
+        if self.facts_extraction is not None:
+            overrides["facts_extraction_enabled"] = self.facts_extraction
+        return HyMemConfig(
+            root=self.db_path.parent,
+            message_fts_top_k=15,
+            fts_top_k=10,
+            graph_top_k=10,
+            **overrides,
+        )
 
     def open(self):
         from hymem import HyMem, HyMemConfig
@@ -596,38 +980,50 @@ class HyMemAdapter:
             overrides["facts_enabled"] = self.facts_enabled
         if self.facts_extraction is not None:
             overrides["facts_extraction_enabled"] = self.facts_extraction
-        cfg = HyMemConfig(
-            root=self.db_path.parent,
-            message_fts_top_k=15,
-            fts_top_k=10,
-            graph_top_k=10,
-            **overrides,
-        )
+        cfg = self.build_config()
         llm = OpenAICompatibleClient(
             api_key=self.api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
-            base_url="https://api.deepseek.com",
-            model="deepseek-chat",
+            base_url=self.pipeline_base_url,
+            model=self.pipeline_model,
+            thinking=self.pipeline_thinking,
         )
+        self.pipeline_llm = llm
         # Optional semantic-recall A/B (lever L1). Drives the SAME local FastEmbed
-        # server Hermes uses in production. Pass the local defaults explicitly so
-        # --embeddings works with ZERO env setup (the client's own defaults point at
-        # DeepSeek, which has no embeddings API — a dead end); HYMEM_EMBEDDING_* still
-        # overrides every field for anyone pointing at a different server. Off by
-        # default: the headline baseline is lexical-only (a paired comparison).
+        # server Hermes uses in production. Pass this benchmark's local FastEmbed
+        # defaults explicitly so --embeddings works with ZERO env setup. DeepSeek
+        # has no embeddings API; HYMEM_EMBEDDING_* can instead select a real
+        # embedding endpoint. Off by default: the headline baseline is lexical-only
+        # (a paired comparison).
         embedding_client = None
         if self.embeddings:
             from hymem.contrib.openai_embedding_client import (
                 OpenAICompatibleEmbeddingClient,
+                is_loopback_embedding_url,
+                is_official_openai_embedding_url,
             )
 
             env = os.environ.get
-            embedding_client = OpenAICompatibleEmbeddingClient(
-                api_key=(env("HYMEM_EMBEDDING_API_KEY")
-                         or env("HYMEM_LLM_API_KEY") or LOCAL_EMBED_API_KEY),
-                base_url=env("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL,
-                model=env("HYMEM_EMBEDDING_MODEL") or LOCAL_EMBED_MODEL,
-                dim=int(env("HYMEM_EMBEDDING_DIM") or LOCAL_EMBED_DIM),
+            embedding_base_url = (
+                self.embedding_base_url
+                or env("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
             )
+            embedding_api_key = self.embedding_api_key or env("HYMEM_EMBEDDING_API_KEY")
+            if not embedding_api_key and is_loopback_embedding_url(embedding_base_url):
+                embedding_api_key = LOCAL_EMBED_API_KEY
+            if (
+                not embedding_api_key
+                and is_official_openai_embedding_url(embedding_base_url)
+            ):
+                embedding_api_key = env("OPENAI_API_KEY")
+            embedding_client = OpenAICompatibleEmbeddingClient(
+                api_key=embedding_api_key,
+                base_url=embedding_base_url,
+                model=(self.embedding_model or env("HYMEM_EMBEDDING_MODEL")
+                       or LOCAL_EMBED_MODEL),
+                dim=(self.embedding_dim if self.embedding_dim is not None else
+                     int(env("HYMEM_EMBEDDING_DIM") or LOCAL_EMBED_DIM)),
+            )
+        self.embedding_client = embedding_client
         self.hy = HyMem(cfg, llm=llm, embedding_client=embedding_client)
         return self
 
@@ -637,7 +1033,8 @@ class HyMemAdapter:
             self.hy = None
 
     def ingest_sessions(self, sessions: list[list[dict]], session_ids: list[str],
-                         session_dates: list[str] | None = None) -> dict:
+                         session_dates: list[str] | None = None, *,
+                         namespace: str = "question") -> dict:
         """Ingest all sessions for a question. Each session is a list of messages.
         
         If session_dates is provided (one ISO-8601 date per session), each message
@@ -645,34 +1042,116 @@ class HyMemAdapter:
         instead of wall-clock clustering."""
         total_msgs = 0
         total_chars = 0
-        dates = session_dates or []
-        for idx, (sess_id, messages) in enumerate(zip(session_ids, sessions)):
-            session_date = _normalize_date(dates[idx]) if idx < len(dates) else None
+        empty_msgs = 0
+        if not isinstance(session_dates, list):
+            raise BenchmarkIntegrityError(
+                "LongMemEval ingestion requires explicit session dates"
+            )
+        dates = session_dates
+        if len(session_ids) != len(sessions):
+            raise BenchmarkIntegrityError("session IDs and sessions differ in length")
+        if len(dates) != len(sessions):
+            raise BenchmarkIntegrityError("session dates and sessions differ in length")
+        namespace_hash = hashlib.sha256(
+            str(namespace).encode("utf-8")
+        ).hexdigest()[:12]
+        for idx, (sess_id, messages) in enumerate(
+            zip(session_ids, sessions, strict=True)
+        ):
+            if (
+                not isinstance(sess_id, str) or not sess_id.strip()
+                or sess_id != sess_id.strip()
+            ):
+                raise BenchmarkIntegrityError("LongMemEval session id is malformed")
+            if not isinstance(messages, list) or not messages:
+                raise BenchmarkIntegrityError("LongMemEval session messages are malformed")
+            session_date = _normalize_date(dates[idx])
+            if session_date is None:
+                raise BenchmarkIntegrityError("LongMemEval session date is malformed")
             entries = []
             for m in messages:
-                role = m.get("role", "user")
-                content = m.get("content", "")
+                if not isinstance(m, dict) or m.get("role") not in {
+                    "user", "assistant",
+                } or not isinstance(m.get("content"), str):
+                    raise BenchmarkIntegrityError("LongMemEval message is malformed")
+                role = m["role"]
+                content = m["content"]
                 if content.strip():
                     entries.append((role, content, session_date))
                     total_msgs += 1
                     total_chars += len(content)
+                else:
+                    empty_msgs += 1
             if entries:
                 chunk_size = 50
                 for i in range(0, len(entries), chunk_size):
                     chunk = entries[i : i + chunk_size]
-                    self.hy.log_messages(f"{sess_id}_{i//chunk_size}", chunk)
-        return {"sessions": len(sessions), "messages": total_msgs, "chars": total_chars}
+                    # Source session IDs are not unique in the pinned dataset.
+                    # Bind the internal key to the ordered occurrence so no
+                    # duplicate silently overwrites/merges another session.
+                    self.hy.log_messages(
+                        f"lme_{namespace_hash}_{idx}_{i//chunk_size}", chunk
+                    )
+        return {
+            "sessions": len(sessions), "messages": total_msgs,
+            "chars": total_chars, "empty_messages_skipped": empty_msgs,
+        }
 
-    def dream_and_wait(self, timeout: int = 300):
-        """Run dream cycle and wait for completion."""
+    def dream_and_wait(
+        self,
+        timeout: float = DEFAULT_INDEXING_TIMEOUT_S,
+        *,
+        max_cycles: int = DEFAULT_INDEXING_MAX_CYCLES,
+        require_healthy: bool = True,
+    ):
+        """Run bounded cycles until the durable extraction backlog is healthy."""
+        from benchmarks.strictness import converge_indexing
+
         start = time.time()
         dream_hy = self.hy.fork()
+        cleanup_errors: list[str] = []
         try:
-            dream_hy.dream()
+            try:
+                self.last_indexing_summary = converge_indexing(
+                    dream_hy.dream,
+                    status=dream_hy.dream_status,
+                    max_cycles=max_cycles,
+                    timeout_s=timeout,
+                    require_healthy=require_healthy,
+                )
+            except Exception as exc:
+                if hasattr(exc, "summary"):
+                    self.last_indexing_summary = dict(exc.summary)
+                raise
         finally:
-            dream_hy.close()
+            try:
+                dream_hy.close()
+            except BaseException as exc:
+                cleanup_errors.append(
+                    f"dream_fork_close: {type(exc).__name__}: {exc}"
+                )
+            try:
+                self.hy.invalidate_query_caches()
+            except BaseException as exc:
+                cleanup_errors.append(
+                    f"query_cache_invalidation: {type(exc).__name__}: {exc}"
+                )
+            if cleanup_errors:
+                if self.last_indexing_summary is None:
+                    self.last_indexing_summary = {
+                        "complete": False, "healthy": False,
+                        "cleanup_errors": cleanup_errors,
+                    }
+                else:
+                    self.last_indexing_summary.setdefault(
+                        "cleanup_errors", []
+                    ).extend(cleanup_errors)
         elapsed = time.time() - start
-        print(f"      Dream completed in {elapsed:.0f}s", flush=True)
+        print(
+            f"      Dream converged in {elapsed:.0f}s across "
+            f"{self.last_indexing_summary['cycles']} cycle(s)", flush=True,
+        )
+        return self.last_indexing_summary
 
     def search(self, query: str, ability: str = None, top_k: int = 10,
                graph_facts_first: bool = False):
@@ -689,11 +1168,7 @@ class HyMemAdapter:
         message hits out of the answer pool (KU −9.0pp). Both render as their
         own bracketed context block instead.
         """
-        try:
-            result = self.hy.augment(query, ability=ability)
-        except Exception as e:
-            print(f"    [DEBUG] augment error: {e}", flush=True)
-            return [], 0, None, [], [], [], {"message": [], "fts": []}
+        result = self.hy.augment(query, ability=ability)
 
         # Collect all sources
         graph_facts = []
@@ -706,7 +1181,10 @@ class HyMemAdapter:
 
         message_hits = []
         for hit in (getattr(result, "message_hits", None) or []):
-            text = getattr(hit, "text", "")[:600]
+            # Keep the complete DTO payload.  Presentation may excerpt under the
+            # final token budget, but retrieval must not permanently discard an
+            # answer-bearing tail before the packer sees it.
+            text = getattr(hit, "text", "")
             role = getattr(hit, "role", "unknown")
             if text.strip():
                 message_hits.append({
@@ -720,7 +1198,7 @@ class HyMemAdapter:
 
         fts_hits = []
         for hit in (getattr(result, "fts_hits", None) or []):
-            text = getattr(hit, "text", "")[:600]
+            text = getattr(hit, "text", "")
             if text.strip():
                 fts_hits.append({
                     "content": text,
@@ -731,11 +1209,11 @@ class HyMemAdapter:
         procedure_hits = []
         for proc in (getattr(result, "procedures", None) or []):
             name = getattr(proc, "name", "")
-            desc = getattr(proc, "description", "")[:400]
+            desc = getattr(proc, "description", "")
             content = f"Procedure: {name}: {desc}" if name else desc
             if content.strip():
                 procedure_hits.append({
-                    "content": content[:600],
+                    "content": content,
                     "type": "procedure",
                     "confidence": 0.75,
                 })
@@ -746,7 +1224,7 @@ class HyMemAdapter:
         aggregation_nodes = []
         for node in (getattr(result, "aggregation_nodes", None) or []):
             title = getattr(node, "title", "")
-            summary = getattr(node, "summary", "")[:600]
+            summary = getattr(node, "summary", "")
             content = f"{title}: {summary}" if title else summary
             if content.strip():
                 aggregation_nodes.append(content)
@@ -758,7 +1236,7 @@ class HyMemAdapter:
         # the recency-sensitive abilities.
         narrative_facts = []
         for nf in (getattr(result, "facts", None) or []):
-            text = getattr(nf, "text", "")[:600]
+            text = getattr(nf, "text", "")
             if text.strip():
                 date = getattr(nf, "fact_date", None) or ""
                 narrative_facts.append(f"[{date}] {text}" if date else text)
@@ -766,7 +1244,7 @@ class HyMemAdapter:
         episode_hits = []
         for ep in (getattr(result, "episodes", None) or []):
             title = getattr(ep, "title", "")
-            summary = getattr(ep, "summary", "")[:500]
+            summary = getattr(ep, "summary", "")
             content = f"{title}: {summary}" if title else summary
             if content.strip():
                 episode_hits.append({
@@ -927,63 +1405,181 @@ def distill_should_fire(ability: str | None, memories: list[dict]) -> bool:
     return ability in DISTILL_ABILITIES or len(memories) >= 12
 
 
+def query_centered_boundary_excerpt(text: str, *, query: str, limit: int) -> str:
+    """Deterministic bounded excerpt retaining head, query window, and tail.
+
+    LongMemEval turns can be much longer than a legacy 500/600-character slice.
+    A leading-only slice is especially destructive because answers are often a
+    final correction or concrete value.  This presentation-only helper leaves
+    retrieval payloads intact and, when a single item must shrink, preserves
+    both source boundaries plus the most discriminative query-centered window.
+    """
+    from hymem.query.presentation import query_centered_excerpt
+
+    normalized = " ".join(str(text or "").split())
+    if limit <= 0:
+        return ""
+    if len(normalized) <= limit:
+        return normalized
+    if limit <= 12:
+        return normalized[:limit]
+    separator = " … "
+    available = limit - len(separator) * 2
+    head_n = max(1, available // 5)
+    tail_n = max(1, available // 4)
+    middle_n = max(1, available - head_n - tail_n)
+    middle = query_centered_excerpt(normalized, query=query, limit=middle_n)
+    parts = [normalized[:head_n], middle, normalized[-tail_n:]]
+    out: list[str] = []
+    for part in parts:
+        if part and part not in out:
+            out.append(part)
+    rendered = separator.join(out)
+    return rendered[:limit]
+
+
 def _render_answer_context(memories: list[dict], ability: str | None,
                            total_matches: int, graph_count,
                            temporal_events: list | None,
                            aggregation_nodes: list | None,
                            distilled: list[str] | None = None,
-                           narrative_facts: list[str] | None = None) -> str:
-    """Build the CONTEXT block the answerer sees from the retrieved tiers.
+                           narrative_facts: list[str] | None = None,
+                           *, max_context_chars: int | None = None,
+                           max_input_tokens: int | None = None,
+                           max_input_bytes: int | None = None,
+                           token_counter=None,
+                           fail_on_tokenizer_error: bool = False,
+                           prompt_prefix: str = "",
+                           prompt_suffix: str = "",
+                           query: str = "",
+                           _stable_counter: bool = False) -> str:
+    """Build a deterministic, source-bounded reader context.
 
-    Extracted from answer_question so (a) the distillation dry-run can re-render
-    the IDENTICAL context (same char caps) to decide the deep-lexical split, and
-    (b) the additive [DISTILLED EVIDENCE] block has one canonical insertion point
-    — directly ABOVE the raw memories, mirroring how aggregation_nodes render as
-    a separate non-competing block (never consuming a raw-turn slot or budget
-    ahead of the turns; the crowding that cost KU −9.0pp once already)."""
-    # MR and TR questions span many sessions — expand context window
-    context_limit = MAX_CONTEXT_CHARS * 2 if ability in ("MR", "TR") else MAX_CONTEXT_CHARS
+    Auxiliary synthesis is selected separately from raw retrieval evidence. It
+    may lead the rendered prompt, but it cannot consume the raw-evidence reserve.
+    A configured model tokenizer governs the token path. Strict LME callers fail
+    closed if it errors; compatibility callers may explicitly provide a byte
+    budget for a deterministic whole-pack retry under that separate unit.
+    """
+    from hymem.query.fusion import (
+        _ConfiguredTokenizerFailure,
+        estimate_tokens,
+        stable_token_counter,
+    )
+
+    if token_counter is not None and not _stable_counter:
+        try:
+            return _render_answer_context(
+                memories, ability, total_matches, graph_count,
+                temporal_events, aggregation_nodes, distilled=distilled,
+                narrative_facts=narrative_facts,
+                max_context_chars=max_context_chars,
+                max_input_tokens=max_input_tokens,
+                max_input_bytes=max_input_bytes,
+                token_counter=stable_token_counter(token_counter),
+                fail_on_tokenizer_error=fail_on_tokenizer_error,
+                prompt_prefix=prompt_prefix,
+                prompt_suffix=prompt_suffix,
+                query=query,
+                _stable_counter=True,
+            )
+        except _ConfiguredTokenizerFailure as exc:
+            if fail_on_tokenizer_error:
+                raise BenchmarkIntegrityError(
+                    f"configured reader tokenizer failed: {exc}"
+                ) from exc
+            return _render_answer_context(
+                memories, ability, total_matches, graph_count,
+                temporal_events, aggregation_nodes, distilled=distilled,
+                narrative_facts=narrative_facts,
+                max_context_chars=max_context_chars,
+                max_input_tokens=None,
+                max_input_bytes=max_input_bytes,
+                token_counter=None,
+                fail_on_tokenizer_error=False,
+                prompt_prefix=prompt_prefix,
+                prompt_suffix=prompt_suffix,
+                query=query,
+                _stable_counter=True,
+            )
+
+    if max_input_tokens is not None and token_counter is None:
+        if fail_on_tokenizer_error:
+            raise BenchmarkIntegrityError(
+                "a model-token input budget requires its configured token counter"
+            )
+        # Legacy/direct callers (not strict LME manifests) historically passed
+        # this knob without a tokenizer and received the conservative UTF-8
+        # byte path. Preserve that API/BEAM behavior while strict LME calls
+        # select and name their byte policy before entering the renderer.
+        max_input_bytes = (
+            max_input_bytes if max_input_bytes is not None
+            else max_input_tokens
+        )
+        max_input_tokens = None
+
+    # Character limits are compatibility/test-only. Strict runs use either the
+    # exact configured model counter or the explicitly byte-denominated policy.
+    context_limit = max_context_chars
 
     # MR counting: prefer graph_count (EXACT graph-native count) over
     # total_matches (keyword candidate). When graph_count is present it is
     # the dedup-correct answer — trust it.
-    parts: list[str] = []
+    auxiliary: list[dict[str, Any]] = []
+    raw: list[dict[str, Any]] = []
+
+    def candidate(kind: str, body: str, *, prefix: str = "") -> dict[str, Any]:
+        return {
+            "kind": kind,
+            "body": str(body),
+            "prefix": prefix,
+            "ordinal": len(auxiliary) + len(raw),
+        }
+
     if ability == "MR" and graph_count is not None:
         count = graph_count.count
         counted = getattr(graph_count, 'counted', 'items')
-        parts = [f"[HyMem graph-native count: {count} distinct {counted} "
-                  f"(exact COUNT(DISTINCT) over knowledge graph edges). "
-                  f"Use this as the answer. Verify against evidence below.]\n"]
+        auxiliary.append(candidate("graph-count",
+            f"[HyMem graph-native count: {count} distinct {counted} "
+            f"(exact COUNT(DISTINCT) over knowledge graph edges). "
+            f"Use this as the answer. Verify against evidence below.]"
+        ))
     elif ability == "MR" and total_matches > 0:
-        parts = [f"[HyMem counted {total_matches} distinct user messages "
-                  f"matching your question (assistant echoes excluded, "
-                  f"restatements deduped). Verify this count against the "
-                  f"evidence below and return the final number.]\n"]
+        auxiliary.append(candidate("retrieval-count",
+            f"[HyMem counted {total_matches} distinct user messages "
+            f"matching your question (assistant echoes excluded, "
+            f"restatements deduped). Verify this count against the "
+            f"evidence below and return the final number.]"
+        ))
 
-    # TR: inject temporal events as a date-ordered chronology
-    if ability == "TR" and temporal_events:
-        parts.append("[TEMPORAL CHRONOLOGY — events in date order. A 'discussed' "
-                     "line is the date the turn was logged (when-discussed), not "
-                     "necessarily when the event happened:]\n")
+    # If retrieval produced a chronology, it is evidence regardless of which
+    # label-free prompt won. Routing may prioritize it; routing must not erase it.
+    if temporal_events:
+        block = ["[TEMPORAL CHRONOLOGY — events in date order. A 'discussed' "
+                 "line is the date the turn was logged (when-discussed), not "
+                 "necessarily when the event happened:]"]
         for ev in temporal_events:
             date = getattr(ev, 'date', '')
             desc = getattr(ev, 'text', str(ev))
             marker = " (discussed)" if getattr(ev, 'source', '') == "session-date" else ""
-            parts.append(f"  {date}{marker}: {desc}\n")
-        parts.append("[END CHRONOLOGY]\n\n")
+            block.append(f"  {date}{marker}: {desc}")
+        block.append("[END CHRONOLOGY]")
+        auxiliary.append(candidate("temporal", "\n".join(block)))
 
     # RAPTOR aggregation nodes render as their own block, NOT as memories: they
-    # never consume a memories[:top_k] slot or context-budget chars ahead of raw
-    # turns — the crowding that cost KU −9.0pp in the broad-injection A/B.
+    # never consume a memories[:top_k] slot and cannot consume the reserved raw-
+    # evidence share of the context budget — the crowding that cost KU −9.0pp
+    # in the broad-injection A/B.
     # Empty unless the layer is enabled and the ability passed the inject gate
     # (TR-only by default).
     if aggregation_nodes:
-        parts.append("[CROSS-SESSION SUMMARIES — each fuses related episodes "
-                     "from multiple sessions; verify details against the "
-                     "memories below:]\n")
+        block = ["[CROSS-SESSION SUMMARIES — each fuses related episodes "
+                 "from multiple sessions; verify details against the "
+                 "memories below:]"]
         for node in aggregation_nodes:
-            parts.append(f"  {node}\n")
-        parts.append("[END SUMMARIES]\n\n")
+            block.append(f"  {node}")
+        block.append("[END SUMMARIES]")
+        auxiliary.append(candidate("aggregation", "\n".join(block)))
 
     # E1 narrative facts: dream-extracted self-contained statements, rendered as
     # their own block for the same reason as the summaries above — never a
@@ -992,29 +1588,28 @@ def _render_answer_context(memories: list[dict], ability: str | None,
     # contract in ask(): facts LEAD the evidence but the raw turns stay below as
     # the check (the Acme lesson — a summary is never the only copy).
     if narrative_facts:
-        parts.append("[NARRATIVE FACTS — self-contained statements extracted "
-                     "from past sessions; a leading date is when the fact "
-                     "happened. Verify details against the memories below:]\n")
+        block = ["[NARRATIVE FACTS — self-contained statements extracted "
+                 "from past sessions; a leading date is when the fact "
+                 "happened. Verify details against the memories below:]"]
         for nf in narrative_facts:
-            parts.append(f"  • {nf}\n")
-        parts.append("[END NARRATIVE FACTS]\n\n")
+            block.append(f"  • {nf}")
+        block.append("[END NARRATIVE FACTS]")
+        auxiliary.append(candidate("narrative", "\n".join(block)))
 
     # Distilled evidence (P1): question-conditioned facts extracted per-turn,
     # rendered ABOVE the raw memories as their own non-competing block. Additive
     # — the raw turns stay below, unchanged. Verify-against-source framing so the
     # answerer treats it as a lens, not a replacement.
     if distilled:
-        parts.append("[DISTILLED EVIDENCE — extracted per-turn, verify against "
-                     "the memories below:]\n")
+        block = ["[DISTILLED EVIDENCE — extracted per-turn, verify against "
+                 "the memories below:]"]
         for line in distilled:
-            parts.append(f"  • {line}\n")
-        parts.append("[END DISTILLED EVIDENCE]\n\n")
+            block.append(f"  • {line}")
+        block.append("[END DISTILLED EVIDENCE]")
+        auxiliary.append(candidate("distilled", "\n".join(block)))
 
-    total_chars = 0
     for m in memories:
-        content = m["content"]
-        if total_chars + len(content) > context_limit:
-            break
+        content = str(m["content"])
         # Date-stamp raw turns (the only tier carrying created_at) so the recency-
         # conflict clause can prefer the newest value-bearing statement. FACT/fts/
         # episode tiers stay undated (graph dating deferred — see KU analysis).
@@ -1023,10 +1618,195 @@ def _render_answer_context(memories: list[dict], ability: str | None,
         else:
             date10 = (m.get("created_at") or "")[:10]
             tag = f"[MEM {date10}]" if (m["type"] == "message_hit" and date10) else "[MEM]"
-        parts.append(f"{tag} {content}")
-        total_chars += len(content) + len(tag) + 2
+        raw.append(candidate(m.get("type", "memory"), content, prefix=f"{tag} "))
 
-    return "\n".join(parts) if parts else "No relevant memories found."
+    def render(item: dict[str, Any]) -> str:
+        return f"{item['prefix']}{item['body']}"
+
+    def evidence_payload(body: str, *, kind: str) -> str:
+        # Retrieved contents sometimes already carry their own source tag.
+        # Strip complete tags before deciding whether anything semantic remains,
+        # and reject a cut-off tag such as ``[ME`` outright.
+        stripped = body.strip()
+        if kind in {"temporal", "aggregation", "narrative", "distilled"}:
+            closing = stripped.find("]")
+            if not stripped.startswith("[") or closing < 0:
+                return ""
+            stripped = stripped[closing + 1:].lstrip()
+            stripped = re.sub(r"\s*\[END [^\]]+\]\s*$", "", stripped)
+        elif kind not in {"graph-count", "retrieval-count", "truncation", "empty"}:
+            match = re.match(
+                r"^\[(?:MEM(?:\s+[^\]]+)?|FACT|user|assistant)\]\s*",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                stripped = stripped[match.end():]
+            elif stripped.startswith("[") and "]" not in stripped:
+                return ""
+        return stripped
+
+    def excerpt_meaningful(item: dict[str, Any]) -> bool:
+        payload = evidence_payload(item["body"], kind=item["kind"])
+        return (
+            len(payload) >= MIN_SEMANTIC_EXCERPT_CHARS
+            and sum(character.isalnum() for character in payload)
+            >= MIN_SEMANTIC_EXCERPT_ALNUM
+        )
+
+    def joined(aux_items: list[dict[str, Any]],
+               raw_items: list[dict[str, Any]]) -> str:
+        # Selection priority and render priority are intentionally different:
+        # raw evidence gets reserved first, while concise aids lead the prompt.
+        return "\n".join(render(item) for item in [*aux_items, *raw_items])
+
+    def measure_visible(context: str) -> int:
+        visible_input = prompt_prefix + context + prompt_suffix
+        if max_input_tokens is not None:
+            return estimate_tokens(visible_input, token_counter)
+        if max_input_bytes is not None:
+            return len(visible_input.encode("utf-8"))
+        return len(visible_input)
+
+    def fits(aux_items: list[dict[str, Any]], raw_items: list[dict[str, Any]],
+             *, primary_limit: int | None = None) -> bool:
+        context = joined(aux_items, raw_items)
+        visible_input = prompt_prefix + context + prompt_suffix
+        if context_limit is not None and len(visible_input) > context_limit:
+            return False
+        hard_limit = (
+            max_input_tokens if max_input_tokens is not None
+            else max_input_bytes
+        )
+        if primary_limit is not None:
+            hard_limit = primary_limit
+        return hard_limit is None or measure_visible(context) <= hard_limit
+
+    if not fits([], []):
+        raise BenchmarkIntegrityError(
+            "reader system/question wrappers alone exceed hard input budget"
+        )
+
+    # When everything fits, preserve every source byte-for-byte exactly once.
+    if fits(auxiliary, raw):
+        return joined(auxiliary, raw)
+
+    hard_limit = (
+        max_input_tokens if max_input_tokens is not None else max_input_bytes
+    )
+    if hard_limit is None:
+        hard_limit = context_limit
+    wrapper_units = measure_visible("")
+    raw_reserve_limit = (
+        wrapper_units + int(max(0, hard_limit - wrapper_units)
+                            * RAW_EVIDENCE_RESERVE_FRACTION)
+        if hard_limit is not None else None
+    )
+
+    selected_aux: list[dict[str, Any]] = []
+    selected_raw: list[dict[str, Any]] = []
+    selected_ordinals: set[int] = set()
+    dropped = 0
+
+    def pack_group(group: list[dict[str, Any]], *, placement: str,
+                   primary_limit: int | None = None) -> None:
+        nonlocal dropped
+        available_group = [
+            item for item in group if item["ordinal"] not in selected_ordinals
+        ]
+        for index, item in enumerate(available_group):
+            target = selected_aux if placement == "aux" else selected_raw
+
+            def trial_with(extra: list[dict[str, Any]]) -> tuple[
+                list[dict[str, Any]], list[dict[str, Any]]
+            ]:
+                if placement == "aux":
+                    return [*selected_aux, *extra], selected_raw
+                return selected_aux, [*selected_raw, *extra]
+
+            # Keep room for a later compact source in the same tier. This is
+            # the guard against a leading '['/verbose distractor starving a
+            # later answer-bearing source.
+            reserve = None
+            for later in available_group[index + 1:]:
+                aux_trial, raw_trial = trial_with([later])
+                if fits(
+                    aux_trial, raw_trial, primary_limit=primary_limit
+                ):
+                    if reserve is None or len(render(later)) < len(render(reserve)):
+                        reserve = later
+
+            extras = [item, *([reserve] if reserve is not None else [])]
+            aux_trial, raw_trial = trial_with(extras)
+            if fits(
+                aux_trial, raw_trial, primary_limit=primary_limit
+            ):
+                target.append(item)
+                selected_ordinals.add(item["ordinal"])
+                continue
+
+            # Excerpt only the evidence body; a syntactic source header can
+            # never make a punctuation/one-character stub look meaningful.
+            best = None
+            low, high = 1, len(item["body"])
+            while low <= high:
+                middle = (low + high) // 2
+                excerpt_body = query_centered_boundary_excerpt(
+                    item["body"], query=query, limit=middle
+                )
+                excerpt = {**item, "body": excerpt_body}
+                if not excerpt_meaningful(excerpt):
+                    low = middle + 1
+                    continue
+                excerpt_extras = [excerpt, *(
+                    [reserve] if reserve is not None else []
+                )]
+                aux_trial, raw_trial = trial_with(excerpt_extras)
+                if fits(aux_trial, raw_trial, primary_limit=primary_limit):
+                    best = excerpt
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best is not None:
+                target.append(best)
+                selected_ordinals.add(item["ordinal"])
+            dropped += 1
+
+    # Reserve raw evidence first, then select aids, then spend any remainder on
+    # additional raw sources. Render order remains aids-before-raw.
+    pack_group(raw, placement="raw", primary_limit=raw_reserve_limit)
+    pack_group(auxiliary, placement="aux")
+    pack_group(raw, placement="raw")
+
+    if not selected_aux and not selected_raw:
+        empty = "No relevant memories found."
+        empty_item = candidate("empty", empty)
+        if fits([empty_item], []):
+            return empty
+        if fits([], []):
+            return ""
+        raise BenchmarkIntegrityError(
+            "reader system/question wrappers alone exceed hard input budget"
+        )
+    if dropped:
+        marker = candidate("truncation", "[... context truncated]")
+        # A disclosure marker is metadata, not evidence. Never evict the last
+        # compact/answer-bearing source merely to make the marker fit.
+        if fits([*selected_aux, marker], selected_raw):
+            selected_aux.append(marker)
+        else:
+            # Disclosure may replace an auxiliary excerpt, never raw evidence.
+            # This also prevents a clipped auxiliary header from being the only
+            # signal that the prompt was truncated.
+            with_marker = list(selected_aux)
+            while with_marker and not fits([*with_marker, marker], selected_raw):
+                with_marker.pop()
+            if fits([*with_marker, marker], selected_raw):
+                selected_aux = [*with_marker, marker]
+    rendered = joined(selected_aux, selected_raw)
+    if not fits(selected_aux, selected_raw):
+        raise BenchmarkIntegrityError("rendered answer context exceeds hard budget")
+    return rendered
 
 
 def context_sha(messages: list[dict]) -> str:
@@ -1115,7 +1895,14 @@ class PoisonLLM:
     # questions had been dreamed and BEFORE the artifact was written. A
     # stand-in that is not a drop-in just relocates the failure.
     call_count = 0
+    request_attempts = 0
+    successful_responses = 0
+    prompt_tokens = 0
+    completion_tokens = 0
     total_tokens = 0
+    total_latency_s = 0.0
+    cost_usd = 0.0
+    token_usage_available = True
 
     def __init__(self, which: str):
         self._which = which
@@ -1134,7 +1921,11 @@ def build_answer_messages(memories: list[dict], question: str,
                           permissive_default: bool = False,
                           distilled: list[str] | None = None,
                           extra_system: str | None = None,
-                          narrative_facts: list[str] | None = None) -> list[dict]:
+                          narrative_facts: list[str] | None = None,
+                          max_input_tokens: int | None = None,
+                          max_input_bytes: int | None = None,
+                          token_counter=None,
+                          fail_on_tokenizer_error: bool = False) -> list[dict]:
     """The reader's prompt, built and not sent.
 
     Split out of `answer_question_raw` so `--retrieval-only` can fingerprint
@@ -1152,7 +1943,8 @@ def build_answer_messages(memories: list[dict], question: str,
     return _answer_messages(
         memories, question, ability, total_matches, graph_count,
         temporal_events, aggregation_nodes, question_date, permissive_default,
-        distilled, extra_system, narrative_facts)
+        distilled, extra_system, narrative_facts, max_input_tokens,
+        max_input_bytes, token_counter, fail_on_tokenizer_error)
 
 
 def answer_question_raw(llm: LLMClient, memories: list[dict], question: str,
@@ -1162,6 +1954,9 @@ def answer_question_raw(llm: LLMClient, memories: list[dict], question: str,
     Prompt construction lives in `build_answer_messages` and happens in ONE
     place, so a `--retrieval-only` run fingerprints exactly the prompt a full
     run would have sent."""
+    if "token_counter" not in kwargs:
+        counter = getattr(llm, "count_tokens", None)
+        kwargs["token_counter"] = counter if callable(counter) else None
     messages = build_answer_messages(memories, question, *args, **kwargs)
     return llm.chat(messages, temperature=0.0, max_tokens=1024), \
         context_sha(messages)
@@ -1174,7 +1969,11 @@ def _answer_messages(memories: list[dict], question: str,
                      question_date: str = "", permissive_default: bool = False,
                      distilled: list[str] | None = None,
                      extra_system: str | None = None,
-                     narrative_facts: list[str] | None = None) -> list[dict]:
+                     narrative_facts: list[str] | None = None,
+                     max_input_tokens: int | None = None,
+                     max_input_bytes: int | None = None,
+                     token_counter=None,
+                     fail_on_tokenizer_error: bool = False) -> list[dict]:
     """Render the reader's prompt. The only place it is built.
 
     Uses ability-aware prompts and expanded context for multi-session
@@ -1183,21 +1982,14 @@ def _answer_messages(memories: list[dict], question: str,
     total_matches (keyword candidate). For TR questions, injects
     temporal_events as a date-ordered chronology. `aggregation_nodes` (RAPTOR
     cross-session summaries, TR-gated upstream) render as a separate block so
-    they never compete with raw turns for top_k slots or context budget.
+    they never compete with raw turns for top_k slots and cannot consume the
+    explicit raw-evidence budget reserve.
 
     `question_date` is the "now" the question is asked at — the reference point
     relative-date questions ("how many days ago?", "a month ago") subtract from.
     Without it the chronology gives event dates but the model has no anchor to
     compute an interval against, and answers "current date not provided".
     """
-    # Render the CONTEXT block from the retrieved tiers (+ the additive distilled
-    # block, above the raw turns). Shared with the distillation dry-run so both
-    # see identical char caps and insertion order.
-    context = _render_answer_context(
-        memories, ability, total_matches, graph_count,
-        temporal_events, aggregation_nodes, distilled=distilled,
-        narrative_facts=narrative_facts)
-
     # The default (unknown-ability) prompt. When --permissive-default is set this
     # is the permissive preference-style prompt (D4 fix) instead of the strict
     # "only provided context" one — so a label-free SS-P question (router emits
@@ -1210,12 +2002,6 @@ def _answer_messages(memories: list[dict], question: str,
         system_prompt = ANSWERING_PREFERENCE_PROMPT
     elif ability == "MR":
         system_prompt = ANSWERING_MR_PROMPT
-        # Filter to user-only messages for MR counting questions.
-        # Assistant responses are mostly noise for "how many" questions —
-        # the answer-bearing information is always in user messages.
-        memories = [m for m in memories if m["type"] == "message_hit" and "[user]" in m.get("content", "")]
-        if not memories:
-            system_prompt = default_prompt  # fallback if no user messages
     elif ability == "TR":
         system_prompt = ANSWERING_TR_PROMPT
     else:
@@ -1230,18 +2016,44 @@ def _answer_messages(memories: list[dict], question: str,
     # can subtract event dates from it ("how many days ago", "a month ago")
     # instead of complaining the current date is unknown.
     today_line = f"Today's date is {question_date}.\n\n" if question_date else ""
+    user_prefix = f"{today_line}CONTEXT:\n"
+    user_suffix = f"\n\nQUESTION: {question}\n\nANSWER:"
+
+    # The selected policy measures every part of the visible system/user input,
+    # including question wrappers and all context headers, in either exact model
+    # tokens or explicitly named UTF-8 bytes. Context candidates retain source
+    # boundaries; oversized items are excerpted deterministically across
+    # head/query/tail while reserving later evidence.
+    context = _render_answer_context(
+        memories, ability, total_matches, graph_count,
+        temporal_events, aggregation_nodes, distilled=distilled,
+        narrative_facts=narrative_facts,
+        max_input_tokens=max_input_tokens,
+        max_input_bytes=max_input_bytes,
+        token_counter=token_counter,
+        fail_on_tokenizer_error=fail_on_tokenizer_error,
+        prompt_prefix=f"system:{system_prompt}\nuser:{user_prefix}",
+        prompt_suffix=user_suffix,
+        query=question,
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"{today_line}CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"},
+        {"role": "user", "content": f"{user_prefix}{context}{user_suffix}"},
     ]
 
     return messages
 
 
-def get_judge_prompt(question_type: str, question: str, answer: str, response: str) -> str:
-    """Get the appropriate judge prompt per question type (from original LongMemEval evaluate_qa.py)."""
-    is_abstention = "_abs" in question_type
+def get_judge_prompt(
+    question_type: str, question: str, answer: str, response: str, *,
+    question_id: str | None = None,
+) -> str:
+    """Historical local prompt; deliberately not claimed byte-exact upstream."""
+    is_abstention = (
+        is_official_abstention_id(question_id)
+        if question_id is not None else "_abs" in question_type
+    )
     base_type = question_type.replace("_abs", "")
 
     if is_abstention:
@@ -1311,6 +2123,72 @@ def get_judge_prompt(question_type: str, question: str, answer: str, response: s
         )
 
     raise NotImplementedError(f"Unknown question type: {question_type}")
+
+
+def get_official_judge_prompt(
+    question_type: str,
+    question_id: str,
+    question: str,
+    answer: str,
+    response: str,
+) -> str:
+    """Pinned upstream ``get_anscheck_prompt`` byte semantics.
+
+    The two ordinary templates retain upstream's space immediately before the
+    first newline.  Abstention is selected from the prediction question id,
+    exactly as evaluate_qa.py does, never from a mutated question type.
+    """
+    if is_official_abstention_id(question_id):
+        template = (
+            "I will give you an unanswerable question, an explanation, and a response from a model. "
+            "Please answer yes if the model correctly identifies the question as unanswerable. "
+            "The model could say that the information is incomplete, or some other information is given "
+            "but the asked information is not.\n\nQuestion: {}\n\nExplanation: {}\n\n"
+            "Model Response: {}\n\nDoes the model correctly identify the question as unanswerable? "
+            "Answer yes or no only."
+        )
+    elif question_type in {"single-session-user", "single-session-assistant", "multi-session"}:
+        template = (
+            "I will give you a question, a correct answer, and a response from a model. "
+            "Please answer yes if the response contains the correct answer. Otherwise, answer no. "
+            "If the response is equivalent to the correct answer or contains all the intermediate steps "
+            "to get the correct answer, you should also answer yes. If the response only contains a subset "
+            "of the information required by the answer, answer no. \n\nQuestion: {}\n\n"
+            "Correct Answer: {}\n\nModel Response: {}\n\nIs the model response correct? "
+            "Answer yes or no only."
+        )
+    elif question_type == "temporal-reasoning":
+        template = (
+            "I will give you a question, a correct answer, and a response from a model. "
+            "Please answer yes if the response contains the correct answer. Otherwise, answer no. "
+            "If the response is equivalent to the correct answer or contains all the intermediate steps "
+            "to get the correct answer, you should also answer yes. If the response only contains a subset "
+            "of the information required by the answer, answer no. In addition, do not penalize off-by-one "
+            "errors for the number of days. If the question asks for the number of days/weeks/months, etc., "
+            "and the model makes off-by-one errors (e.g., predicting 19 days when the answer is 18), the "
+            "model's response is still correct. \n\nQuestion: {}\n\nCorrect Answer: {}\n\n"
+            "Model Response: {}\n\nIs the model response correct? Answer yes or no only."
+        )
+    elif question_type == "knowledge-update":
+        template = (
+            "I will give you a question, a correct answer, and a response from a model. "
+            "Please answer yes if the response contains the correct answer. Otherwise, answer no. "
+            "If the response contains some previous information along with an updated answer, "
+            "the response should be considered as correct as long as the updated answer is the required "
+            "answer.\n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\n"
+            "Is the model response correct? Answer yes or no only."
+        )
+    elif question_type == "single-session-preference":
+        template = (
+            "I will give you a question, a rubric for desired personalized response, and a response from a "
+            "model. Please answer yes if the response satisfies the desired response. Otherwise, answer no. "
+            "The model does not need to reflect all the points in the rubric. The response is correct as long "
+            "as it recalls and utilizes the user's personal information correctly.\n\nQuestion: {}\n\n"
+            "Rubric: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only."
+        )
+    else:
+        raise NotImplementedError(f"Unknown question type: {question_type}")
+    return template.format(question, answer, response)
 
 
 # ── Judge verdict parsing ───────────────────────────────────────────
@@ -1410,7 +2288,9 @@ def parse_judge_verdict(raw: str) -> bool:
 
 
 def judge_answer_raw(llm: LLMClient, question_type: str, question: str,
-                     answer: str, ai_answer: str) -> tuple[bool, str]:
+                     answer: str, ai_answer: str, *,
+                     question_id: str | None = None,
+                     protocol: str = "legacy-custom") -> tuple[bool, str]:
     """`judge_answer`, plus the reply it used to throw away. D3.
 
     The bare-bool return is why an outage was invisible: a judge that never
@@ -1425,10 +2305,29 @@ def judge_answer_raw(llm: LLMClient, question_type: str, question: str,
     before the 2026-08-25 run, and that identity is the whole warrant for
     C1 = 0.00% certifying this function rather than something merely like it.
     Neither function's logic is touched here — only the channel around them."""
-    prompt = get_judge_prompt(question_type, question, answer, ai_answer)
+    if protocol == "official":
+        if not isinstance(question_id, str) or not question_id:
+            raise BenchmarkIntegrityError("official LongMemEval judge requires question_id")
+        prompt = get_official_judge_prompt(
+            question_type, question_id, question, answer, ai_answer
+        )
+    elif protocol == "legacy-custom":
+        prompt = get_judge_prompt(
+            question_type, question, answer, ai_answer,
+            question_id=question_id,
+        )
+    else:
+        raise BenchmarkIntegrityError(f"unknown LongMemEval judge protocol {protocol!r}")
     messages = [{"role": "user", "content": prompt}]
-    raw = llm.chat(messages, temperature=0.0, max_tokens=10)
-    return parse_judge_verdict(raw), raw
+    raw = llm.chat(
+        messages, temperature=LME_OFFICIAL_JUDGE_TEMPERATURE,
+        max_tokens=LME_OFFICIAL_JUDGE_MAX_TOKENS,
+    )
+    verdict = (
+        parse_official_verdict(raw) if protocol == "official"
+        else parse_judge_verdict(raw)
+    )
+    return verdict, raw
 
 
 def judge_answer(llm: LLMClient, question_type: str, question: str, answer: str, ai_answer: str) -> bool:
@@ -1437,63 +2336,68 @@ def judge_answer(llm: LLMClient, question_type: str, question: str, answer: str,
 
 
 def judge_scored(llm: LLMClient, question_type: str, question: str,
-                 answer: str, ai_answer: str) -> tuple[bool | None, str]:
-    """(correct, raw) where `correct` is None iff the JUDGE itself errored.
+                 answer: str, ai_answer: str, *,
+                 question_id: str | None = None,
+                 protocol: str = "legacy-custom") -> tuple[bool | None, str]:
+    """Return a verdict only when the judge transport and reply are parseable.
 
-    The one place the D3 policy is written down, so six call sites across three
-    adapters cannot each decide it differently:
-
-      * a judge sentinel yields `correct = None` — the row is UNSCORED, not
-        wrong. It drops out of the accuracy denominator (`accuracy` below) and
-        is counted separately.
-      * `correct = False` keeps meaning the judge read the answer and rejected
-        it, which is what every canonical number was scored under.
-
-    PROVABLY INERT WHERE IT MATTERS: the 2026-08-25 audit recorded 0 judge-side
-    sentinels over 500 replies, so on a clean run this returns exactly what
-    `judge_answer` returned and no canonical number moves. That is the same
-    inert-window argument that licensed landing the parse fix rather than
-    deferring it to the next judge migration — and the insurance is only free
-    once, because at the next verbose judge the decision rule and the data would
-    change in the same step with no way to separate them."""
-    verdict, raw = judge_answer_raw(llm, question_type, question, answer, ai_answer)
-    return (None if is_llm_error(raw) else verdict), raw
+    ``None`` is retained in the raw row for auditability, but strict
+    reconciliation converts it to a wrong answer in the full expected
+    denominator.  The separately named judged-only diagnostic may condition on
+    valid replies; the headline score never does.
+    """
+    verdict, raw = judge_answer_raw(
+        llm, question_type, question, answer, ai_answer,
+        question_id=question_id, protocol=protocol,
+    )
+    if protocol == "official":
+        # Upstream accepts any successful string and applies its literal
+        # substring rule. Transport/sentinel failures remain benchmark failures.
+        parseable = bool(
+            isinstance(raw, str) and raw.strip() and not is_llm_error(raw)
+        )
+        return (verdict if parseable else None), raw
+    low = (raw or "").casefold()
+    has_yes = bool(_YES_WORD.search(low))
+    has_no = bool(_NO_WORD.search(low))
+    parseable = bool(raw and not is_llm_error(raw) and has_yes != has_no)
+    return (verdict if parseable else None), raw
 
 
 # ── Scoring over rows that may be UNSCORED ──────────────────────────
 
 def is_scored(row: dict) -> bool:
-    """A row carries a verdict. `correct is None` means no verdict exists —
-    either the judge errored (`judge_error`) or no reader ran at all
-    (`--diag-only`). Both are excluded from accuracy; only the first is a
-    defect, and `judge_error` is what tells them apart."""
-    return row.get("correct") is not None
+    """Whether a row belongs in the explicitly conditional judged-only view."""
+    return isinstance(row.get("correct"), bool) and not row.get("benchmark_failure")
 
 
 def is_retrieval_only(artifact: dict) -> bool:
     """See `run_registry.is_retrieval_only` -- one definition, re-exported so
     the adapter and the scorers cannot drift on what counts as a run with no
     verdicts."""
-    from run_registry import is_retrieval_only as _impl
+    try:
+        from .run_registry import is_retrieval_only as _impl
+    except (ImportError, ValueError):
+        from run_registry import is_retrieval_only as _impl
     return _impl(artifact)
 
 
 def scored(rows: list[dict]) -> list[dict]:
+    """Conditional judged-only rows; never use this for a headline score."""
     return [r for r in rows if is_scored(r)]
 
 
 def accuracy(rows: list[dict]) -> float:
-    """Accuracy over SCORED rows only.
-
-    Exists because `sum(r["correct"] for r in rows) / len(rows)` — the shape
-    repeated at roughly fifteen sites across the three adapters — TypeErrors the
-    moment one row is unscored, and because the fix for that must be ONE
-    decision rather than fifteen slightly different guards. Returns 0.0 for an
-    empty set; callers that must distinguish "scored zero" from "measured
-    nothing" check `len(scored(rows))` and say so, exactly as the `--diag-only`
-    branch already refuses to print 0.0% for a run that measured nothing."""
-    s = scored(rows)
-    return sum(1 for r in s if r["correct"]) / len(s) if s else 0.0
+    """Strict accuracy: invalid/missing verdicts are wrong, never omitted."""
+    normalized = []
+    for index, row in enumerate(rows):
+        verdict = row.get("correct")
+        if verdict is not None and not isinstance(verdict, bool):
+            raise BenchmarkIntegrityError(
+                f"malformed verdict at row {index}: {verdict!r}"
+            )
+        normalized.append({"correct": bool(verdict)})
+    return strict_accuracy(normalized)
 
 
 def judge_error_rows(rows: list[dict]) -> list[dict]:
@@ -1509,9 +2413,9 @@ def judge_error_note(rows: list[dict]) -> str:
     is stated whenever the count is zero."""
     errs, judged = judge_error_rows(rows), scored(rows)
     if errs:
-        return (f"⚠ {len(errs)} row(s) UNSCORED — the judge returned an "
-                f"[LLM_ERROR] sentinel. They are excluded from the "
-                f"{len(judged)}-row accuracy denominator, NOT counted wrong. "
+        return (f"⚠ {len(errs)} judge transport/parse failure(s); each counts "
+                f"WRONG in the strict {len(rows)}-row denominator. Conditional "
+                f"judged-only n={len(judged)}. "
                 f"ids: {[r.get('id') or r.get('question_id') for r in errs][:10]}")
     return f"judge errors: 0 of {len(rows)} row(s) that could have errored"
 
@@ -1523,7 +2427,7 @@ def evaluate_question(
     hy: HyMemAdapter,
     q_data: dict,
     top_k: int,
-    auto_ability: bool = False,
+    auto_ability: bool = True,
     no_dream: bool = False,
     graph_facts_first: bool = False,
     permissive_default: bool = False,
@@ -1531,6 +2435,13 @@ def evaluate_question(
     distill_prompt_version: str = DEFAULT_DISTILL_PROMPT_VERSION,
     retrieval_only: bool = False,
     distill_llm: LLMClient | None = None,
+    max_input_tokens: int | None = None,
+    max_input_bytes: int | None = None,
+    token_counter=None,
+    judge_protocol: str = "legacy-custom",
+    indexing_max_cycles: int = DEFAULT_INDEXING_MAX_CYCLES,
+    indexing_timeout_s: float = DEFAULT_INDEXING_TIMEOUT_S,
+    indexing_require_healthy: bool = True,
 ) -> dict:
     """Evaluate a single LongMemEval question.
 
@@ -1542,34 +2453,48 @@ def evaluate_question(
     question_id = q_data["question_id"]
     question_type = q_data["question_type"]
     question = q_data["question"]
-    answer = q_data["answer"]
-    sessions = q_data.get("haystack_sessions", [])
-    session_ids = q_data.get("haystack_session_ids", [str(i) for i in range(len(sessions))])
-    session_dates = q_data.get("haystack_dates", [])
-
-    # Reference "now" for relative-date math. LongMemEval ships `question_date`;
-    # if the cleaned dataset stripped it, fall back to the latest session date
-    # (questions are asked after all sessions, so the most recent haystack date
-    # is the best available proxy for "today").
-    question_date = q_data.get("question_date", "") or (
-        max(session_dates) if session_dates else ""
+    sessions = q_data.get("haystack_sessions")
+    session_ids = q_data.get("haystack_session_ids")
+    session_dates = q_data.get("haystack_dates")
+    question_date = q_data.get("question_date")
+    if not all(isinstance(value, list) for value in (
+        sessions, session_ids, session_dates,
+    )):
+        raise BenchmarkIntegrityError(
+            "LongMemEval question lacks explicit session/id/date arrays"
+        )
+    if len(sessions) != len(session_ids) or len(sessions) != len(session_dates):
+        raise BenchmarkIntegrityError(
+            "LongMemEval session/id/date lengths differ"
+        )
+    # The question timestamp is score-affecting. Never substitute the latest
+    # haystack date (or wall clock) for a malformed official source value.
+    question_date = normalize_lme_date(
+        question_date, label=f"{question_id} question_date"
     )
 
-    # Ensure session_ids length matches sessions
-    while len(session_ids) < len(sessions):
-        session_ids.append(f"extra_{len(session_ids)}")
-
-    # Map question type to HyMem ability. We ALWAYS record what the production
-    # router (detect_ability) would infer from the raw question, so the router's
-    # accuracy is measurable on every run. Only when --auto-ability is set do we
-    # actually DRIVE shaping from the inferred label (the true production path);
-    # otherwise the oracle question_type label drives it as before.
-    oracle_ability = QUESTION_TYPE_TO_ABILITY.get(question_type, None)
-    detected_ability = _detect_ability_safe(question)
+    # The default route is structurally label-free: it does not even resolve
+    # the source qtype to an oracle ability before the reader has answered.
+    # Explicit oracle mode is exploratory and is the sole pre-answer exception.
+    oracle_ability = (
+        QUESTION_TYPE_TO_ABILITY.get(question_type) if not auto_ability else None
+    )
+    detected_ability = (
+        _detect_ability(question) if auto_ability
+        else _detect_ability_safe(question)
+    )
     ability = detected_ability if auto_ability else oracle_ability
 
     # Ingest
-    stats = hy.ingest_sessions(sessions, session_ids, session_dates)
+    # The official qid may contain `_abs`, which is a gold label.  Keep it out
+    # of every retrieval-affecting identifier; the DB itself is question-local,
+    # and ordered session/chunk positions provide collision-free keys.
+    stats = hy.ingest_sessions(
+        sessions, session_ids, session_dates,
+        # Bind the isolated question's internal namespace to reader-visible text,
+        # never the qid: upstream qids carry the `_abs` gold label.
+        namespace=question,
+    )
     print(f"    Ingested {stats['sessions']} sessions ({stats['messages']} msgs, {stats['chars']} chars)", flush=True)
 
     # Dream — skipped in --no-dream fast mode. The message/rerank/MR paths under
@@ -1582,7 +2507,11 @@ def evaluate_question(
         print(f"    Skipping dream (--no-dream)", flush=True)
     else:
         print(f"    Running dream cycle...", flush=True)
-        hy.dream_and_wait()
+        hy.dream_and_wait(
+            timeout=indexing_timeout_s,
+            max_cycles=indexing_max_cycles,
+            require_healthy=indexing_require_healthy,
+        )
 
     # Search
     (memories, total_matches, graph_count, temporal_events, aggregation_nodes,
@@ -1590,30 +2519,9 @@ def evaluate_question(
         question, ability=ability, top_k=top_k * 3, graph_facts_first=graph_facts_first)
     src = "question_date" if q_data.get("question_date") else ("haystack_max" if session_dates else "none")
 
-    # Recall ceiling: was the answer-bearing turn anywhere in the pre-truncation
-    # pool? Splits a miss into retrieval loss (ceiling=False) vs ranking/
-    # synthesis loss (ceiling=True). None when the dataset carries no gold marks.
-    gold_turns, gold_mode = _extract_gold_turns(q_data)
-    if gold_turns:
-        in_msg = _gold_in_pool(gold_turns, pool["message"])
-        in_fts = _gold_in_pool(gold_turns, pool["fts"])
-        recall_ceiling = in_msg or in_fts
-        recall_tier = ("both" if in_msg and in_fts
-                       else "message" if in_msg
-                       else "fts" if in_fts else "none")
-        # Per-gold-turn fused-pool membership — de-conflates the any-match ceiling so
-        # the L3 floor audit can tell phantom (chunks rescue) from real recall gap.
-        gold_turn_tiers = _gold_turn_tiers(gold_turns, pool)
-        gold_turns_in_pool = sum(1 for t in gold_turn_tiers if t != "none")
-    else:
-        recall_ceiling, recall_tier = None, "unknown"
-        gold_turn_tiers, gold_turns_in_pool = [], None
-
-    ceiling_str = ("∅" if recall_ceiling is None
-                   else f"{recall_ceiling}[{recall_tier}]")
     used_marker = "←used" if auto_ability else ""
-    router_str = f"{oracle_ability or '∅'}/det={detected_ability or '∅'}{used_marker}"
-    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, agg_nodes={len(aggregation_nodes)}, facts={len(narrative_facts)}, now={question_date or '∅'}[{src}], ceiling={ceiling_str}, ability={router_str})", flush=True)
+    router_str = f"oracle={'hidden' if auto_ability else (oracle_ability or '∅')}/det={detected_ability or '∅'}{used_marker}"
+    print(f"    Retrieved {len(memories)} memories (total_matches={total_matches}, graph_count={graph_count is not None}, temporal_events={len(temporal_events)}, agg_nodes={len(aggregation_nodes)}, facts={len(narrative_facts)}, now={question_date or '∅'}[{src}], ability={router_str})", flush=True)
 
     # P1 distillation (additive, cost-gated, label-free): map an extraction call
     # over the distillable hits, then answer over the kept lines PLUS the raw
@@ -1638,7 +2546,11 @@ def evaluate_question(
         aggregation_nodes=aggregation_nodes,
         question_date=question_date, permissive_default=permissive_default,
         distilled=distilled_lines,
-        narrative_facts=narrative_facts)
+        narrative_facts=narrative_facts,
+        max_input_tokens=max_input_tokens,
+        max_input_bytes=max_input_bytes,
+        token_counter=token_counter,
+        fail_on_tokenizer_error=token_counter is not None)
     if retrieval_only:
         # Build the prompt, fingerprint it, send nothing. `f` -- the fraction
         # of questions a lever moves -- is a property of retrieval, so it can
@@ -1653,15 +2565,67 @@ def evaluate_question(
     _ep_texts = [m["content"] for m in memories
                  if isinstance(m, dict) and m.get("type") == "episode"]
 
+    # Labels/gold are first read only after the retrieval and reader route is
+    # complete.  These diagnostics are nonblocking: corrupt optional marks can
+    # never discard an answer or alter its context.
+    oracle_ability = QUESTION_TYPE_TO_ABILITY.get(question_type)
+    answer = str(q_data["answer"])
+    recall_diagnostic_error = None
+    try:
+        gold_turns, gold_mode = _extract_gold_turns(q_data)
+        if gold_turns:
+            in_msg = _gold_in_pool(gold_turns, pool["message"])
+            in_fts = _gold_in_pool(gold_turns, pool["fts"])
+            recall_ceiling = in_msg or in_fts
+            recall_tier = ("both" if in_msg and in_fts
+                           else "message" if in_msg
+                           else "fts" if in_fts else "none")
+            gold_turn_tiers = _gold_turn_tiers(gold_turns, pool)
+            gold_turns_in_pool = sum(1 for tier in gold_turn_tiers if tier != "none")
+        else:
+            recall_ceiling, recall_tier = None, "unknown"
+            gold_turn_tiers, gold_turns_in_pool = [], None
+    except Exception as exc:
+        gold_turns, gold_mode = [], "diagnostic-error"
+        recall_ceiling, recall_tier = None, "unknown"
+        gold_turn_tiers, gold_turns_in_pool = [], None
+        recall_diagnostic_error = f"{type(exc).__name__}: {exc}"
+    try:
+        gold_in_episodes = (
+            _answer_in_texts(answer, _ep_texts) if _ep_texts else False
+        )
+        gold_in_facts = (
+            _answer_in_texts(answer, narrative_facts)
+            if narrative_facts else False
+        )
+    except Exception as exc:
+        gold_in_episodes = gold_in_facts = None
+        detail = f"answer_containment: {type(exc).__name__}: {exc}"
+        recall_diagnostic_error = (
+            f"{recall_diagnostic_error}; {detail}"
+            if recall_diagnostic_error else detail
+        )
+
     # Judge (binary yes/no, or None when the JUDGE itself errored — D3)
+    benchmark_failure = None
     if retrieval_only:
         correct, judge_raw = None, ""
         print(f"    retrieval-only: ctx={ctx_sha[:12]} "
               f"episodes={len(_ep_texts)} distill_calls={distill_calls}",
               flush=True)
+    elif is_llm_error(ai_answer) or not str(ai_answer).strip():
+        # A reader transport failure is not a candidate answer.  Never pay a
+        # judge to turn an outage sentinel into benchmark data.
+        correct, judge_raw = False, ""
+        benchmark_failure = "reader_transport_or_empty_response"
+        print(f"    Reader failure before judge: {ai_answer[:120]}", flush=True)
     else:
-        correct, judge_raw = judge_scored(judge_llm, question_type, question,
-                                          answer, ai_answer)
+        correct, judge_raw = judge_scored(
+            judge_llm, question_type, question, answer, ai_answer,
+            question_id=question_id, protocol=judge_protocol,
+        )
+        if correct is None:
+            benchmark_failure = "judge_transport_or_parse_failure"
         print(f"    Correct: {correct if correct is not None else 'UNSCORED (judge error)'}"
               f" | Answer: {ai_answer[:120]}...", flush=True)
 
@@ -1675,6 +2639,7 @@ def evaluate_question(
         "answer": str(answer),
         "hypothesis": ai_answer,
         "correct": correct,
+        "judge_protocol": judge_protocol,
         # The judge's own reply, kept for the same reason the strings above are
         # un-clipped: a discarded reply is why judge_audit had to re-judge 500
         # rows to measure a rate that had already been produced once. ~10 tokens.
@@ -1684,7 +2649,12 @@ def evaluate_question(
         # on a run that made zero judge calls is the same vacuity as "0 judge
         # errors" over a run that made none: a count whose denominator is not
         # what the reader assumes.
-        "judge_error": (correct is None) and not retrieval_only,
+        "judge_error": bool(benchmark_failure and benchmark_failure.startswith("judge_")),
+        "judge_parse_valid": (
+            None if retrieval_only or benchmark_failure == "reader_transport_or_empty_response"
+            else correct is not None
+        ),
+        "benchmark_failure": benchmark_failure,
         # What the reader was HANDED, hashed. Two runs that agree here gave
         # the reader byte-identical input, so a differing answer is the
         # provider's decoder and nothing of ours -- which is the distinction
@@ -1695,6 +2665,7 @@ def evaluate_question(
         "retrieval_only": bool(retrieval_only),
         "num_sessions": stats["sessions"],
         "num_messages": stats["messages"],
+        "empty_messages_skipped": stats["empty_messages_skipped"],
         "num_memories": len(memories),
         # Fired-indicators for the two tiers a lever can switch on, recorded
         # for the reason `n_facts` below already is: E1's all-800 net read NULL
@@ -1716,10 +2687,7 @@ def evaluate_question(
         # control was n=1. `gold_in_episodes` is the analogue of the instrument
         # that DID work there -- the tier's own hit rate, independent of whether
         # the answer was right. None = answer too short to test.
-        "gold_in_episodes": (
-            _answer_in_texts(str(answer), _ep_texts)
-            if _ep_texts else False
-        ),
+        "gold_in_episodes": gold_in_episodes,
         # Procedures share the episode budget (`proc_top_k = fts_top_k` for
         # every ability but IF, where procedure_top_k_if is also 10), so the
         # retrieved pool can reach 15+10+10+10+10 = 55 and the memories[:45] cut
@@ -1738,6 +2706,7 @@ def evaluate_question(
         # the per-turn tier ("none" entries = the unrecovered floor turns).
         "gold_turns_in_pool": gold_turns_in_pool,
         "gold_turn_tiers": gold_turn_tiers,
+        "recall_diagnostic_error": recall_diagnostic_error,
         "oracle_ability": oracle_ability,
         "detected_ability": detected_ability,
         "ability_used": ability,
@@ -1755,25 +2724,24 @@ def evaluate_question(
         # facts block — the tier's own hit rate, independent of the answer.
         # None = the answer is too short to test (see _answer_in_texts).
         "n_facts": len(narrative_facts),
-        "gold_in_facts": (
-            _answer_in_texts(str(answer), narrative_facts)
-            if narrative_facts else False
-        ),
+        "gold_in_facts": gold_in_facts,
+        "indexing": (None if no_dream else hy.last_indexing_summary),
     }
 
 
 def compute_scores(results: list[dict]) -> dict:
-    """Compute accuracy by question type, over SCORED rows only."""
-    # UNSCORED rows (correct is None — the judge errored, D3) are dropped HERE,
-    # once, rather than guarded at each summation below. They are reported by
-    # `judge_error_note`, never counted wrong.
-    results = scored(results)
+    """Compute strict accuracy by type over the complete supplied denominator."""
     by_type = defaultdict(list)
-    for r in results:
+    for index, r in enumerate(results):
+        verdict = r.get("correct")
+        if verdict is not None and not isinstance(verdict, bool):
+            raise BenchmarkIntegrityError(
+                f"malformed verdict at row {index}: {verdict!r}"
+            )
         qtype = r["question_type"]
-        # Group by base type (strip _abs suffix for reporting)
-        base_type = qtype.replace("_abs", "")
-        by_type[base_type].append(r["correct"])
+        # Source question_type remains one of the six base categories. The
+        # upstream abstention branch is carried only by question_id.
+        by_type[qtype].append(bool(verdict))
 
     scores = {}
     all_correct = []
@@ -1796,32 +2764,44 @@ def compute_abstention_scores(results: list[dict]) -> dict:
     A permissive default prompt buys back SS-P recommendation questions by letting
     the model bridge to general knowledge; the SAME license can turn a correct "I
     don't know" into a hallucinated answer on the `_abs` questions (whose gold
-    answer IS abstention). compute_scores strips the `_abs` suffix and folds those
-    into the base category, hiding exactly this regression. Here we keep the split:
-      - ANSWERABLE: question_type without `_abs`
-      - ABSTENTION: question_type ending `_abs`
+    answer IS abstention). Upstream keeps question_type as a base category and
+    routes abstention from ``'_abs' in question_id``. Here we keep that split:
+      - ANSWERABLE: id without `_abs`
+      - ABSTENTION: id containing `_abs`
     reported overall AND per base category, so a permissive run can be A/B'd
     against strict with the abstention cost made explicit. If overall goes up while
     ABSTENTION drops, the gain is partly a hallucination trade, not a clean win.
     """
-    # UNSCORED rows (correct is None — the judge errored, D3) are dropped HERE,
-    # once, rather than guarded at each summation below. They are reported by
-    # `judge_error_note`, never counted wrong.
-    results = scored(results)
-    answerable: list[bool] = []
-    abstention: list[bool] = []
-    by_cat: dict[str, dict[str, list[bool]]] = defaultdict(
+    def _infrastructure_failure(row: dict) -> bool:
+        return bool(row.get("judge_error") or row.get("benchmark_failure"))
+
+    answerable: list[tuple[bool, bool]] = []
+    abstention: list[tuple[bool, bool]] = []
+    by_cat: dict[str, dict[str, list[tuple[bool, bool]]]] = defaultdict(
         lambda: {"answerable": [], "abstention": []})
     for r in results:
         qtype = r.get("question_type", "")
-        is_abs = qtype.endswith("_abs")
-        base = qtype[:-4] if is_abs else qtype
+        is_abs = is_official_abstention_id(r.get("question_id"))
+        base = qtype
         bucket = "abstention" if is_abs else "answerable"
-        (abstention if is_abs else answerable).append(bool(r.get("correct")))
-        by_cat[base][bucket].append(bool(r.get("correct")))
+        value = (bool(r.get("correct")), _infrastructure_failure(r))
+        (abstention if is_abs else answerable).append(value)
+        by_cat[base][bucket].append(value)
 
-    def _acc(xs: list[bool]) -> dict:
-        return {"accuracy": (sum(xs) / len(xs)) if xs else None, "count": len(xs)}
+    def _acc(xs: list[tuple[bool, bool]]) -> dict:
+        valid = [correct for correct, failed in xs if not failed]
+        return {
+            "accuracy": (
+                sum(correct for correct, _failed in xs) / len(xs)
+                if xs else None
+            ),
+            "count": len(xs),
+            "benchmark_failures": sum(1 for _correct, failed in xs if failed),
+            "conditional_valid_accuracy": (
+                sum(valid) / len(valid) if valid else None
+            ),
+            "conditional_valid_count": len(valid),
+        }
 
     return {
         "answerable": _acc(answerable),
@@ -1863,10 +2843,6 @@ def compute_recall_diagnostics(results: list[dict]) -> dict:
     The miss split is the actionable signal: retrieval-dominant → embeddings/
     chunking; ranking-dominant → rerank/budget/packing.
     """
-    # UNSCORED rows (correct is None — the judge errored, D3) are dropped HERE,
-    # once, rather than guarded at each summation below. They are reported by
-    # `judge_error_note`, never counted wrong.
-    results = scored(results)
     by_type: dict[str, list[dict]] = defaultdict(list)
     for r in results:
         by_type[r["question_type"].replace("_abs", "")].append(r)
@@ -1875,24 +2851,33 @@ def compute_recall_diagnostics(results: list[dict]) -> dict:
     modes = Counter()
     diag: dict[str, dict] = {}
     for qtype, rows in sorted(by_type.items()):
-        known = [r for r in rows if r.get("recall_ceiling") is not None]
+        infrastructure = [
+            r for r in rows
+            if r.get("judge_error") or r.get("benchmark_failure")
+        ]
+        causal_rows = [
+            r for r in rows
+            if not (r.get("judge_error") or r.get("benchmark_failure"))
+        ]
+        known = [r for r in causal_rows if r.get("recall_ceiling") is not None]
         hit = [r for r in known if r["recall_ceiling"]]
-        misses = [r for r in rows if not r["correct"]]
+        misses = [r for r in causal_rows if not r["correct"]]
         miss_retrieval = sum(1 for r in misses if r.get("recall_ceiling") is False)
         miss_ranking = sum(1 for r in misses if r.get("recall_ceiling") is True)
         miss_unknown = sum(1 for r in misses if r.get("recall_ceiling") is None)
         for r in known:
             tiers[r.get("recall_tier", "none")] += 1
-        for r in rows:
+        for r in causal_rows:
             modes[r.get("gold_mode", "none")] += 1
         diag[qtype] = {
             "known": len(known),
-            "unknown": len(rows) - len(known),
+            "unknown": len(causal_rows) - len(known),
             "ceiling_rate": (len(hit) / len(known)) if known else None,
             "misses": len(misses),
             "miss_retrieval": miss_retrieval,
             "miss_ranking": miss_ranking,
             "miss_unknown": miss_unknown,
+            "benchmark_failures_excluded": len(infrastructure),
         }
     diag["_tiers"] = dict(tiers)
     diag["_gold_mode"] = dict(modes)
@@ -2018,14 +3003,261 @@ def print_report(scores: dict, metadata: dict):
     overall = scores.get("OVERALL", {})
     print(f"    {'OVERALL':<30} {overall.get('accuracy', 0)*100:>5.1f}%  (n={overall.get('count', 0)})")
 
-    print(f"\n  Published SOTA (LongMemEval-S, GPT-4o judge):")
-    print(f"    Hindsight: 89.4%")
-    print(f"    Honcho:    63.8%")
-    print(f"    LIGHT:     51.7%")
-    print(f"    RAG:       48.5%")
+    print("\n  No external leaderboard is printed: vendor-reported results use "
+          "different models, judges, prompts, versions and sample sets. See "
+          "README.md for protocol-specific source links and limitations.")
 
 
 # ── Per-question worker ─────────────────────────────────────────────
+
+def _adapter_for_args(db_path: Path, args, api_key: str) -> HyMemAdapter:
+    """Single construction path for runtime and pre-run config identity."""
+
+    return HyMemAdapter(
+        db_path, api_key=api_key, embeddings=args.embeddings,
+        rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model,
+        rerank_message_hits=args.rerank_message_hits,
+        aggregation_nodes=args.aggregation_nodes,
+        aggregation_broad=args.aggregation_broad,
+        episode_granularity=args.episode_granularity,
+        value_supersession=args.value_supersession,
+        graph_multihop=args.graph_multihop,
+        graph_multihop_max_hops=args.graph_multihop_max_hops,
+        graph_multihop_decay=args.graph_multihop_decay,
+        graph_multihop_min_score=args.graph_multihop_min_score,
+        rules_enabled=args.rules, rules_extraction=args.rules_extraction,
+        facts_enabled=args.facts, facts_extraction=args.facts_extraction,
+        pipeline_model=getattr(args, "hymem_model", "deepseek-chat"),
+        pipeline_base_url=getattr(args, "hymem_base_url", DEEPSEEK_BASE_URL),
+        pipeline_thinking=getattr(args, "hymem_thinking", "auto"),
+        embedding_base_url=getattr(args, "embedding_base_url", None),
+        embedding_model=getattr(args, "embedding_model", None),
+        embedding_dim=getattr(args, "embedding_dim", None),
+        embedding_api_key=getattr(args, "embedding_api_key", None),
+    )
+
+
+def _git(*args: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ("git", "-C", str(_repo_root), *args), capture_output=True,
+            text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def resolve_prereg(path: str | None) -> dict | None:
+    """Bind a canonical claim to a committed spec before any benchmark spend."""
+    if path is None:
+        return None
+    if _git("rev-parse", "--git-dir") is None:
+        raise BenchmarkIntegrityError("pre-registration requires a git repository")
+    source = Path(path) if os.path.isabs(path) else _repo_root / path
+    if not source.is_file():
+        raise BenchmarkIntegrityError(f"pre-registration does not exist: {path!r}")
+    try:
+        relative = source.resolve().relative_to(_repo_root).as_posix()
+    except ValueError as exc:
+        raise BenchmarkIntegrityError("pre-registration must be inside this repository") from exc
+    if _git("status", "--porcelain", "--", relative):
+        raise BenchmarkIntegrityError("pre-registration is uncommitted or modified")
+    commit = _git("log", "-1", "--format=%H", "--", relative)
+    blob = _git("rev-parse", f"HEAD:{relative}")
+    committed_at = _git("log", "-1", "--format=%cI", "--", relative)
+    head = _git("rev-parse", "HEAD")
+    if not all((commit, blob, committed_at, head)):
+        raise BenchmarkIntegrityError("pre-registration has no complete git provenance")
+    if _git("status", "--porcelain", "--untracked-files=no"):
+        raise BenchmarkIntegrityError(
+            "tracked code is dirty; canonical pre-registration cannot name it"
+        )
+    return {
+        "path": relative, "commit": commit, "blob": blob,
+        "committed_at": committed_at, "code_commit": head,
+    }
+
+
+def _provider_for_url(base_url: str) -> str:
+    normalized = validate_safe_endpoint(base_url, label="provider")
+    if normalized == DEEPSEEK_BASE_URL:
+        return "deepseek"
+    if normalized == LME_OFFICIAL_JUDGE_BASE_URL:
+        return "openai"
+    return "openai-compatible"
+
+
+def resolve_endpoint_key(
+    *, role: str, base_url: str, explicit_key: str | None,
+    deepseek_key: str,
+) -> str:
+    """Resolve credentials without leaking one provider's key to another.
+
+    Only the exact DeepSeek origin may inherit the shared historical key.  A
+    custom reader/pipeline endpoint always needs its role-specific option.
+    The exact official OpenAI judge may use OPENAI_API_KEY, because that is a
+    provider-specific judge credential rather than cross-provider fallback.
+    """
+
+    normalized = validate_safe_endpoint(base_url, label=role)
+    if explicit_key:
+        return explicit_key
+    if normalized == DEEPSEEK_BASE_URL and deepseek_key:
+        return deepseek_key
+    if role == "judge" and normalized == LME_OFFICIAL_JUDGE_BASE_URL:
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        if openai_key:
+            return openai_key
+    option = {
+        "reader": "--answer-api-key",
+        "judge": "--judge-api-key",
+        "memory pipeline": "--hymem-api-key",
+    }.get(role, "an explicit role-specific API key")
+    raise BenchmarkIntegrityError(
+        f"{role} endpoint {normalized!r} requires {option}"
+    )
+
+
+def resolve_embedding_identity(args) -> dict[str, Any]:
+    if not args.embeddings:
+        return {
+            "configured": False, "backend": "none", "quality": "none",
+            "network_free": True, "model": None, "base_url": None,
+            "dimension": None, "fallback_policy": "none",
+        }
+    from hymem.contrib.openai_embedding_client import (
+        openai_compatible_embedding_identity,
+        safe_embedding_base_url,
+        validate_embedding_base_url,
+    )
+    base_url = (
+        args.embedding_base_url
+        or os.environ.get("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
+    )
+    model = (
+        args.embedding_model
+        or os.environ.get("HYMEM_EMBEDDING_MODEL") or LOCAL_EMBED_MODEL
+    )
+    raw_dim = (
+        args.embedding_dim if args.embedding_dim is not None
+        else os.environ.get("HYMEM_EMBEDDING_DIM", LOCAL_EMBED_DIM)
+    )
+    try:
+        dimension = int(raw_dim)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise BenchmarkIntegrityError("embedding dimension must be a positive integer") from exc
+    if isinstance(raw_dim, bool) or dimension <= 0 or str(raw_dim).strip() != str(dimension):
+        raise BenchmarkIntegrityError("embedding dimension must be a positive integer")
+    if not isinstance(model, str) or not model.strip() or model != model.strip():
+        raise BenchmarkIntegrityError("embedding model identity is malformed")
+    validate_embedding_base_url(base_url)
+    # Query parameters make two request routes share a misleading public label;
+    # strict benchmark identities refuse that ambiguity outright.
+    parsed = __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit(base_url)
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise BenchmarkIntegrityError("embedding endpoint is unsafe or ambiguous")
+    public_url = safe_embedding_base_url(base_url)
+    return {
+        "configured": True, "backend": "openai_compatible",
+        "quality": "semantic", "network_free": False,
+        "model": openai_compatible_embedding_identity(base_url, model),
+        "request_model": model, "base_url": public_url,
+        "dimension": dimension, "fallback_policy": "fail-closed",
+    }
+
+
+def resolve_embedding_key(args) -> str | None:
+    """Resolve only an embedding-specific credential for pending work."""
+
+    if not args.embeddings:
+        return None
+    from hymem.contrib.openai_embedding_client import (
+        is_loopback_embedding_url,
+        is_official_openai_embedding_url,
+    )
+    base_url = (
+        args.embedding_base_url
+        or os.environ.get("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
+    )
+    if args.embedding_api_key:
+        return args.embedding_api_key
+    if is_loopback_embedding_url(base_url):
+        return LOCAL_EMBED_API_KEY
+    if is_official_openai_embedding_url(base_url):
+        key = os.environ.get("OPENAI_API_KEY")
+        if key:
+            return key
+    key = os.environ.get("HYMEM_EMBEDDING_API_KEY")
+    if key:
+        return key
+    raise BenchmarkIntegrityError(
+        "non-loopback embedding endpoint requires --embedding-api-key or "
+        "HYMEM_EMBEDDING_API_KEY"
+    )
+
+
+def validate_runtime_arguments(args, parser: argparse.ArgumentParser) -> None:
+    def positive_number(name: str, value: object) -> None:
+        if (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or value <= 0
+        ):
+            parser.error(f"--{name.replace('_', '-')} must be positive and finite")
+
+    def integer(name: str, value: object, *, allow_zero: bool = False) -> None:
+        if (
+            isinstance(value, bool) or not isinstance(value, int)
+            or value < 0 or (not allow_zero and value <= 0)
+        ):
+            parser.error(
+                f"--{name.replace('_', '-')} must be "
+                + ("a non-negative integer" if allow_zero else "a positive integer")
+            )
+
+    if args.scales.upper() not in LME_SUPPORTED_SCALES:
+        parser.error("--scales must be S or M")
+    integer("sample", args.sample, allow_zero=True)
+    integer("top_k", args.top_k)
+    integer("workers", args.workers)
+    if args.max_input_tokens is not None:
+        integer("max_input_tokens", args.max_input_tokens)
+    integer("max_input_bytes", args.max_input_bytes)
+    if args.provider_context_tokens is not None:
+        integer("provider_context_tokens", args.provider_context_tokens)
+    integer("indexing_max_cycles", args.indexing_max_cycles)
+    positive_number("indexing_timeout_s", args.indexing_timeout_s)
+    if args.rerank_top_k is not None:
+        integer("rerank_top_k", args.rerank_top_k)
+    if args.graph_multihop_max_hops is not None:
+        integer("graph_multihop_max_hops", args.graph_multihop_max_hops)
+    if args.graph_multihop_decay is not None and not (
+        math.isfinite(args.graph_multihop_decay) and 0 < args.graph_multihop_decay <= 1
+    ):
+        parser.error("--graph-multihop-decay must be finite in (0, 1]")
+    if args.graph_multihop_min_score is not None and not (
+        math.isfinite(args.graph_multihop_min_score)
+        and 0 <= args.graph_multihop_min_score <= 1
+    ):
+        parser.error("--graph-multihop-min-score must be finite in [0, 1]")
+    if not args.graph_multihop and any(value is not None for value in (
+        args.graph_multihop_max_hops,
+        args.graph_multihop_decay,
+        args.graph_multihop_min_score,
+    )):
+        parser.error("graph multihop parameters require --graph-multihop")
+    if args.aggregation_broad and not args.aggregation_nodes:
+        parser.error("--aggregation-broad requires --aggregation-nodes")
+    for field in ("answer_model", "judge_model", "hymem_model"):
+        value = getattr(args, field)
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            parser.error(f"--{field.replace('_', '-')} must be a non-empty model id")
+    for label in ("answer_base_url", "judge_base_url", "hymem_base_url"):
+        try:
+            validate_safe_endpoint(getattr(args, label), label=label)
+        except BenchmarkIntegrityError as exc:
+            parser.error(str(exc))
+
 
 def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
                            api_key, distill_llm=None):
@@ -2034,31 +3266,28 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
     Self-contained so it can run in a worker thread. Each question gets its own
     SQLite file + HyMem instance (created and used entirely within this call, so
     no connection crosses threads); the only shared state is the two LLMClients,
-    whose counters are lock-guarded. Returns the result dict (never raises — an
-    error is captured as an incorrect result so one bad question can't abort a
-    parallel run)."""
+    whose counters are lock-guarded. Ordinary per-row exceptions are captured as
+    incorrect results so one bad question cannot abort a parallel run. Process-
+    control ``BaseException`` values still propagate after best-effort cleanup.
+    """
     print(f"[{qi+1}/{total}] Q: {q_data['question_id']} ({q_data['question_type']})", flush=True)
 
     # Fresh temp DB per question (sessions are question-specific)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-lme-"))
-    db_path = tmp_dir / "hymem.sqlite"
+    tmp_dir: Path | None = None
     hy = None
+    result = {
+        "question_id": q_data.get("question_id", "unknown"),
+        "question_type": q_data.get("question_type", "unknown"),
+        "correct": False,
+        "benchmark_failure": "execution_did_not_produce_a_row",
+        "distill_fired": False,
+        "distill_calls": 0,
+    }
+    lifecycle_errors: list[str] = []
     try:
-        hy = HyMemAdapter(db_path, api_key=api_key, embeddings=args.embeddings,
-                          rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model,
-                          rerank_message_hits=args.rerank_message_hits,
-                          aggregation_nodes=args.aggregation_nodes,
-                          aggregation_broad=args.aggregation_broad,
-                          episode_granularity=args.episode_granularity,
-                          value_supersession=args.value_supersession,
-                          graph_multihop=args.graph_multihop,
-                          graph_multihop_max_hops=args.graph_multihop_max_hops,
-                          graph_multihop_decay=args.graph_multihop_decay,
-                          graph_multihop_min_score=args.graph_multihop_min_score,
-                          rules_enabled=args.rules,
-                          rules_extraction=args.rules_extraction,
-                          facts_enabled=args.facts,
-                          facts_extraction=args.facts_extraction)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-lme-"))
+        db_path = tmp_dir / "hymem.sqlite"
+        hy = _adapter_for_args(db_path, args, api_key)
         hy.open()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
@@ -2069,6 +3298,19 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
             distill_prompt_version=args.distill_prompt_version,
             retrieval_only=getattr(args, "retrieval_only", False),
             distill_llm=distill_llm,
+            max_input_tokens=getattr(args, "max_input_tokens", None),
+            max_input_bytes=getattr(args, "max_input_bytes", None),
+            token_counter=getattr(args, "token_counter", None),
+            judge_protocol=getattr(args, "judge_protocol", "legacy-custom"),
+            indexing_max_cycles=getattr(
+                args, "indexing_max_cycles", DEFAULT_INDEXING_MAX_CYCLES
+            ),
+            indexing_timeout_s=getattr(
+                args, "indexing_timeout_s", DEFAULT_INDEXING_TIMEOUT_S
+            ),
+            indexing_require_healthy=getattr(
+                args, "indexing_require_healthy", True
+            ),
         )
     except Exception as e:
         print(f"    ERROR: {e}", flush=True)
@@ -2079,15 +3321,69 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
             "question_type": q_data.get("question_type", "unknown"),
             "correct": False,
             "error": str(e),
+            "benchmark_failure": f"execution_failure: {type(e).__name__}: {e}",
+            "oracle_ability": QUESTION_TYPE_TO_ABILITY.get(
+                q_data.get("question_type")
+            ),
+            "detected_ability": None,
+            "ability_used": (
+                None if getattr(args, "auto_ability", True) else
+                QUESTION_TYPE_TO_ABILITY.get(q_data.get("question_type"))
+            ),
+            "retrieval_only": bool(getattr(args, "retrieval_only", False)),
+            "distill_fired": False,
+            "distill_calls": 0,
         }
     finally:
-        if hy:
-            hy.close()
-        if not args.keep_db:
-            import shutil
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        # Force GC to prevent file handle leaks
-        gc.collect()
+        if hy is not None:
+            try:
+                result.setdefault(
+                    "memory_pipeline_usage",
+                    usage_snapshot(getattr(hy, "pipeline_llm", None)),
+                )
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    f"pipeline_usage: {type(exc).__name__}: {exc}"
+                )
+            try:
+                result.setdefault(
+                    "embedding_usage",
+                    embedding_usage_snapshot(
+                        getattr(hy, "embedding_client", None),
+                        configured=bool(getattr(args, "embeddings", False)),
+                    ),
+                )
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    f"embedding_usage: {type(exc).__name__}: {exc}"
+                )
+            try:
+                if getattr(hy, "last_indexing_summary", None) is not None:
+                    result.setdefault("indexing", hy.last_indexing_summary)
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    f"indexing_usage: {type(exc).__name__}: {exc}"
+                )
+            try:
+                hy.close()
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    f"adapter_close: {type(exc).__name__}: {exc}"
+                )
+        if tmp_dir is not None and not args.keep_db:
+            try:
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=False)
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    f"temporary_store_cleanup: {type(exc).__name__}: {exc}"
+                )
+        try:
+            gc.collect()
+        except BaseException as exc:
+            lifecycle_errors.append(f"gc: {type(exc).__name__}: {exc}")
+        if lifecycle_errors:
+            result.setdefault("lifecycle_errors", []).extend(lifecycle_errors)
     return result
 
 
@@ -2327,7 +3623,12 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                                     narrative_facts=narrative_facts)
         out["ai_answer"] = ai_answer
         _correct, _judge_raw = judge_scored(judge_llm, question_type, question,
-                                            answer, ai_answer)
+                                            answer, ai_answer,
+                                            question_id=q_data.get("question_id"),
+                                            protocol=getattr(
+                                                args, "judge_protocol",
+                                                "legacy-custom",
+                                            ))
         out["correct"] = _correct
         out["judge_raw"] = _judge_raw
         out["judge_error"] = _correct is None
@@ -2342,7 +3643,10 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
     return out
 
 
-def _distill_dryrun_questions(questions: list[dict], args, api_key: str) -> None:
+def _distill_dryrun_questions(
+    questions: list[dict], args, pipeline_key: str,
+    answer_key: str, judge_key: str,
+) -> None:
     """G-P1a front-run gate. Reads the instrumented source run, recovers the MS
     synthesis misses (with a live deep-lexical split), runs the distillation arm
     on each + an equal-sized MS-hit control, and reports the flip rate + control
@@ -2393,16 +3697,19 @@ def _distill_dryrun_questions(questions: list[dict], args, api_key: str) -> None
     print(f"  distill prompt: {args.distill_prompt_version.upper()}   "
           f"max calls/q: {DISTILL_MAX_CALLS}\n{'='*72}", flush=True)
 
-    answer_llm = LLMClient(args.answer_model, args.answer_api_key or api_key,
+    answer_llm = LLMClient(args.answer_model, answer_key,
                            base_url=args.answer_base_url,
                            extra_body=getattr(args, "answer_extra_body_obj", None))
-    judge_llm = LLMClient(args.judge_model, api_key,
-                          extra_body=getattr(args, "judge_extra_body_obj", None))
+    judge_llm = LLMClient(args.judge_model, judge_key,
+                          base_url=args.judge_base_url,
+                          extra_body=getattr(args, "judge_extra_body_obj", None),
+                          n=1 if args.judge_protocol == "official" else None)
 
     tasks = [("cand", qid) for qid in candidates] + [("ctrl", qid) for qid in control]
 
     def _run(kind: str, qid: str) -> dict:
-        res = _distill_run_one(by_id[qid], args, answer_llm, judge_llm, api_key,
+        res = _distill_run_one(by_id[qid], args, answer_llm, judge_llm,
+                               pipeline_key,
                                check_gold_in_context=(kind == "cand"))
         res["_kind"] = kind
         return res
@@ -2505,7 +3812,9 @@ def _rejudge_run(args, api_key: str) -> None:
     orig_judge = (run.get("config", {}) or {}).get("judge_model", "unknown")
 
     judge_llm = LLMClient(args.judge_model, api_key,
-                          extra_body=getattr(args, "judge_extra_body_obj", None))
+                          base_url=args.judge_base_url,
+                          extra_body=getattr(args, "judge_extra_body_obj", None),
+                          n=1 if args.judge_protocol == "official" else None)
 
     # Flag the pre-untruncation artifact (q[:200]/a[:200]/hyp[:500]) so the
     # approximation caveat is raised only when it actually applies.
@@ -2533,7 +3842,10 @@ def _rejudge_run(args, api_key: str) -> None:
         else:
             verdict, judge_raw = judge_scored(
                 judge_llm, r.get("question_type", ""), r.get("question", ""),
-                str(r.get("answer", "")), hyp)
+                str(r.get("answer", "")), hyp,
+                question_id=r.get("question_id", ""),
+                protocol=args.judge_protocol,
+            )
             # A JUDGE error keeps the prior verdict and leaves `_rejudged` False,
             # reusing the answer-side rule one line up rather than inventing a
             # second one. Overwriting with None would drop the row out of the
@@ -2601,10 +3913,14 @@ def _rejudge_run(args, api_key: str) -> None:
                 "total_tokens": judge_llm.total_tokens,
                 "elapsed_s": elapsed})
     out["config"] = cfg
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    dest = src.with_name(f"{src.stem}-rejudged-{args.judge_model.replace('/', '_')}-{stamp}.json")
-    with open(dest, "w") as f:
-        json.dump(out, f, indent=2, default=str)
+    archive_now = datetime.now(timezone.utc)
+    stamp = archive_now.strftime("%Y%m%dT%H%M%SZ")
+    nonce = archive_now.strftime("%f")
+    dest = src.with_name(
+        f"{src.stem}-rejudged-{args.judge_model.replace('/', '_')}-"
+        f"{stamp}-{nonce}.json"
+    )
+    write_immutable_artifact(dest, out)
     print(f"\n  Archived re-judged results → {dest.name}")
     print(f"{'='*72}\n  Use the re-judged OVERALL as the paired baseline for a parity run "
           f"judged by {args.judge_model}.\n")
@@ -2612,7 +3928,7 @@ def _rejudge_run(args, api_key: str) -> None:
 
 # ── Main ────────────────────────────────────────────────────────────
 
-def main():
+def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     global DEEPSEEK_API_KEY
 
     parser = argparse.ArgumentParser(description="HyMem LongMemEval Benchmark")
@@ -2627,24 +3943,51 @@ def main():
                              "without paying for the reader. Every scorer "
                              "REFUSES the resulting artifact.")
     parser.add_argument("--seed", type=int, default=0,
-                        help="RNG seed for stratified sampling; fixed so runs are paired/comparable")
+                        help="RNG seed for label-blind sampling/internal splitting")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--max-input-tokens", type=int,
+                        default=None,
+                        help="exact model-token ceiling over the complete visible "
+                             "reader input; requires --tokenizer-json (default "
+                             f"{DEFAULT_MAX_INPUT_TOKENS} when configured)")
+    parser.add_argument(
+        "--max-input-bytes", type=int, default=DEFAULT_MAX_INPUT_BYTES,
+        help="conservative UTF-8 byte ceiling used when no tokenizer is "
+             "selected; strict configured-tokenizer failures fail closed; default "
+             f"{DEFAULT_MAX_INPUT_BYTES}",
+    )
+    parser.add_argument(
+        "--tokenizer-json", default=None, metavar="LOCAL_TOKENIZER.json",
+        help="offline Hugging Face tokenizer.json bound to --answer-model; "
+             "never downloaded",
+    )
+    parser.add_argument(
+        "--provider-context-tokens", type=int, default=None,
+        help="declared provider context ceiling. Required for non-default "
+             "answer endpoints; the conservative byte budget and output "
+             "plus chat-framing reserves must fit beneath it",
+    )
     parser.add_argument("--answer-model", default=ANSWER_MODEL)
     parser.add_argument("--answer-base-url", default=DEEPSEEK_BASE_URL,
                         help="P0 parity lever: OpenAI-compatible endpoint for the "
                              "ANSWER client only (default DeepSeek). Point at a "
                              "gpt-oss-120b-class reader to measure how much of the "
-                             "gap to Hindsight's 91.4 is reader vs architecture. "
-                             "The JUDGE stays deepseek-chat @ DeepSeek regardless — "
-                             "judge posture is the frozen comparability contract, "
-                             "never varied. Recorded in the output metadata so a "
-                             "run is self-describing.")
+                             "reader/architecture split. The judge endpoint/model "
+                             "is configured and recorded independently; use "
+                             "--judge-protocol official for the pinned evaluator.")
     parser.add_argument("--answer-api-key", default=None,
                         help="API key for the --answer-base-url endpoint. Defaults "
-                             "to the resolved --api-key/env/config DeepSeek key, so "
-                             "the default path is unchanged; set this only when the "
-                             "answer endpoint needs a different credential.")
+                             "to the resolved DeepSeek key ONLY for the exact "
+                             "DeepSeek endpoint. Other endpoints require this flag.")
     parser.add_argument("--judge-model", default=JUDGE_MODEL)
+    parser.add_argument("--judge-base-url", default=DEEPSEEK_BASE_URL)
+    parser.add_argument("--judge-api-key", default=None)
+    parser.add_argument(
+        "--judge-protocol", choices=("legacy-custom", "official"),
+        default="legacy-custom",
+        help="legacy-custom preserves historical local scoring; official pins "
+             "the upstream gpt-4o-2024-08-06 evaluator request/parser exactly",
+    )
     parser.add_argument("--answer-extra-body", default=None, metavar="JSON",
                         help="JSON object merged into the ANSWER request body (raw-HTTP "
                              "`extra_body`). Use for a reasoning reader that needs "
@@ -2662,14 +4005,33 @@ def main():
                              "--judge-model (+ --judge-extra-body) — NO ingest, NO answer "
                              "calls, just the judge pass over each stored hypothesis. "
                              "Built for the deepseek-chat deprecation: re-pair the banked "
-                             "70.0 baseline under deepseek-v4-flash so a parity run judged "
+                             "historical local baseline under a replacement judge so a paired run "
                              "by the same new judge is comparable. Reports per-category "
                              "judge drift (original vs re-judged) and archives a new JSON. "
                              "Skips the benchmark. NOTE: runs produced before the "
                              "field-truncation was lifted carry clipped q/a/hypothesis — "
                              "the re-judge is then a close approximation, not byte-faithful.")
     parser.add_argument("--api-key", default="")
+    parser.add_argument("--hymem-model", default="deepseek-chat")
+    parser.add_argument("--hymem-base-url", default=DEEPSEEK_BASE_URL)
+    parser.add_argument(
+        "--hymem-thinking", choices=("auto", "disabled", "off", "enabled"),
+        default="auto",
+    )
+    parser.add_argument("--hymem-api-key", default=None)
     parser.add_argument("--data-dir", default=str(_repo_root.parent / "hymem_beam" / "data"))
+    parser.add_argument("--results-dir", default="/home/node/.hermes/benchmarks")
+    parser.add_argument(
+        "--export-official", metavar="STRICT_RUN.json", default=None,
+        help="offline: validate a completed exact full-S artifact and export "
+             "the upstream question_id/hypothesis JSONL schema",
+    )
+    parser.add_argument("--official-output", default=None, metavar="FILE.jsonl")
+    parser.add_argument("--prereg", default=None, metavar="SPEC.md")
+    parser.add_argument(
+        "--no-prereg", action="store_true",
+        help="explicitly mark this run exploratory/development-only",
+    )
     parser.add_argument("--keep-db", action="store_true")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of questions to evaluate concurrently. "
@@ -2685,6 +4047,19 @@ def main():
                              "dreamed-chunk/KG/temporal tiers, so it is NOT a "
                              "faithful headline run. Do one full-dream pass for "
                              "the published number.")
+    parser.add_argument(
+        "--indexing-max-cycles", type=int, default=DEFAULT_INDEXING_MAX_CYCLES,
+        help="bounded dream-cycle count before fail-close",
+    )
+    parser.add_argument(
+        "--indexing-timeout-s", type=float, default=DEFAULT_INDEXING_TIMEOUT_S,
+        help="wall-clock bound for per-question indexing convergence",
+    )
+    parser.add_argument(
+        "--indexing-require-healthy", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="canonical runs fail on quarantined extraction (must remain true)",
+    )
     parser.add_argument("--graph-facts-first", action="store_true",
                         help="A/B OPT-OUT: restore the legacy graph-facts-first "
                              "ordering for IE/KU/PF lookups (dream-derived "
@@ -2694,11 +4069,11 @@ def main():
                              "returns None for those lookups and graph-facts-first "
                              "caused the −14.3pp SS-user regression. Use this flag "
                              "only to reproduce the old ordering for comparison.")
-    parser.add_argument("--auto-ability", action="store_true",
-                        help="Drive retrieval shaping from HyMem's production "
-                             "detect_ability() instead of the oracle question_type "
-                             "label — measures the true label-free production score. "
-                             "(The router confusion is reported either way.)")
+    parser.add_argument("--auto-ability", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="label-free production routing (default). "
+                             "--no-auto-ability explicitly enables oracle-label "
+                             "steering and makes the artifact exploratory/non-comparable")
     parser.add_argument("--permissive-default", action="store_true",
                         help="LEVER D4: use a permissive preference-style DEFAULT "
                              "answer prompt for the unknown-ability case instead of "
@@ -2749,6 +4124,10 @@ def main():
                              "_BASE_URL/_MODEL/_DIM to point at a different server. DEFAULT "
                              "OFF (lexical-only baseline); run paired on --seed to measure "
                              "the recall the FTS-only path leaves behind.")
+    parser.add_argument("--embedding-base-url", default=None)
+    parser.add_argument("--embedding-model", default=None)
+    parser.add_argument("--embedding-dim", type=int, default=None)
+    parser.add_argument("--embedding-api-key", default=None)
     parser.add_argument("--aggregation-nodes", action="store_true",
                         help="RAPTOR G4 lever: enable the Phase-2 cross-session aggregation "
                              "layer (dream builds cluster-summary nodes; the retrieval tier "
@@ -2880,7 +4259,33 @@ def main():
                              "(+full dream) to reproduce the audited floor. Skips the benchmark.")
     parser.add_argument("--category", default="multi-session",
                         help="(--inspect-floor) question_type to inspect, or 'all'.")
+    add_strict_run_arguments(parser)
     args = parser.parse_args()
+
+    if args.export_official:
+        if not args.official_output:
+            parser.error("--export-official requires --official-output")
+        # Provider-free by construction: validation + exclusive JSONL write,
+        # dispatched before credential resolution, dataset loading, or clients.
+        summary = export_official_predictions(
+            args.export_official, args.official_output
+        )
+        print(
+            f"Official LongMemEval predictions: {summary['count']} rows -> "
+            f"{summary['path']}"
+        )
+        return
+    if args.official_output:
+        parser.error("--official-output is only valid with --export-official")
+    validate_runtime_arguments(args, parser)
+    args.prereg_obj = None
+    if not args.rejudge:
+        if bool(args.prereg) == bool(args.no_prereg):
+            parser.error("pass exactly one of --prereg SPEC.md or --no-prereg")
+        try:
+            args.prereg_obj = resolve_prereg(None if args.no_prereg else args.prereg)
+        except BenchmarkIntegrityError as exc:
+            parser.error(str(exc))
 
     # Resolve API key
     DEEPSEEK_API_KEY = args.api_key or os.environ.get("HYMEM_LLM_API_KEY", "")
@@ -2892,12 +4297,6 @@ def main():
                 if s.startswith("HYMEM_LLM_API_KEY:"):
                     DEEPSEEK_API_KEY = s.split(":", 1)[1].strip().strip('"').strip("'")
                     break
-    if not DEEPSEEK_API_KEY:
-        print("ERROR: No API key. Set --api-key, HYMEM_LLM_API_KEY env var, or config.yaml key.")
-        sys.exit(1)
-
-    print(f"API key: ...{DEEPSEEK_API_KEY[-4:]}", flush=True)
-
     # Parse the optional per-client extra_body JSON (fail fast on bad JSON).
     def _parse_extra_body(raw: str | None, which: str) -> dict | None:
         if not raw:
@@ -2910,23 +4309,49 @@ def main():
         if not isinstance(val, dict):
             print(f"ERROR: --{which}-extra-body must be a JSON object, got {type(val).__name__}")
             sys.exit(1)
-        return val
-    args.answer_extra_body_obj = _parse_extra_body(args.answer_extra_body, "answer")
-    args.judge_extra_body_obj = _parse_extra_body(args.judge_extra_body, "judge")
+        try:
+            return validate_request_extra_body(val)
+        except BenchmarkIntegrityError as exc:
+            parser.error(f"--{which}-extra-body: {exc}")
+    args.answer_extra_body_obj = _parse_extra_body(args.answer_extra_body, "answer") or {}
+    args.judge_extra_body_obj = _parse_extra_body(args.judge_extra_body, "judge") or {}
 
     # Re-judge a stored results JSON under the current judge — no dataset needed,
     # so dispatch before the (large) dataset load. Built for the deepseek-chat
     # deprecation: re-pair the banked baseline under deepseek-v4-flash.
     if args.rejudge:
-        _rejudge_run(args, DEEPSEEK_API_KEY)
+        try:
+            rejudge_key = resolve_endpoint_key(
+                role="judge", base_url=args.judge_base_url,
+                explicit_key=args.judge_api_key,
+                deepseek_key=DEEPSEEK_API_KEY,
+            )
+        except BenchmarkIntegrityError as exc:
+            parser.error(str(exc))
+        _rejudge_run(args, rejudge_key)
         return
+
+    # Resolve the input-capacity policy before dataset work can reach any
+    # provider client. Unknown endpoints must state their context ceiling;
+    # configured tokenizers are local-only and hashed into run identity.
+    args.context_policy_obj, args.token_counter = resolve_context_policy(
+        args, parser
+    )
+    args.max_input_tokens = args.context_policy_obj["max_input_tokens"]
+    args.max_input_bytes = args.context_policy_obj["max_input_bytes"]
+    args.provider_context_tokens = args.context_policy_obj[
+        "provider_context_window_tokens"
+    ]
 
     # Determine dataset path
     scale = args.scales.upper()
+    args.scales = scale
     if scale == "S":
         data_file = Path(args.data_dir) / "longmemeval_s_cleaned.json"
-    else:
+    elif scale == "M":
         data_file = Path(args.data_dir) / f"longmemeval_{scale.lower()}_cleaned.json"
+    else:  # validate_runtime_arguments should make this unreachable
+        raise BenchmarkIntegrityError(f"unsupported LongMemEval scale {scale!r}")
 
     if not data_file.exists():
         print(f"ERROR: Dataset not found at {data_file}")
@@ -2942,7 +4367,7 @@ def main():
     print(f"  Answer model: {args.answer_model}")
     if args.answer_base_url != DEEPSEEK_BASE_URL:
         print(f"  ⚠ Answer endpoint: {args.answer_base_url} (PARITY READER — "
-              f"judge stays deepseek-chat @ {DEEPSEEK_BASE_URL})")
+              f"judge remains independently configured at {args.judge_base_url})")
     print(f"  Judge model: {args.judge_model}")
     print(f"  Workers: {args.workers}")
     if args.embeddings:
@@ -2972,47 +4397,350 @@ def main():
 
     # Load data
     print("\nLoading dataset...", flush=True)
-    questions = load_longmemeval_data(
-        str(data_file),
-        max_questions=args.sample or None,  # --sample 0 -> full set
-        seed=args.seed,
+    if (args.freeze_calibration or args.protocol_split != "full") and args.sample:
+        parser.error(
+            "--freeze-calibration and dev/holdout runs require --sample 0 so "
+            "the frozen internal split covers the complete dataset"
+        )
+    source_questions = load_longmemeval_data(
+        str(data_file), max_questions=None, seed=args.seed,
+        strict_schema=True, scale=scale,
+    )
+    if args.sample > len(source_questions):
+        parser.error(
+            f"--sample {args.sample} exceeds the validated dataset size "
+            f"({len(source_questions)}); use --sample 0 for the full set"
+        )
+    source_ids = validate_ids(
+        (q["question_id"] for q in source_questions),
+        label="LongMemEval source dataset",
+    )
+    questions = (
+        list(source_questions)
+        if args.freeze_calibration or args.protocol_split != "full"
+        else select_label_blind_questions(
+            source_questions, sample=args.sample, seed=args.seed
+        )
     )
     total_sessions = sum(len(q.get("haystack_sessions", [])) for q in questions)
     total_msgs = sum(sum(len(s) for s in q.get("haystack_sessions", [])) for q in questions)
     print(f"  Total: {len(questions)} questions, ~{total_sessions} sessions, ~{total_msgs} messages\n")
 
+    # Freeze every score-affecting input before a holdout can be touched.  The
+    # labels remain in rows for official judging/diagnostics, never selection or
+    # default routing. Runtime totals and credentials are deliberately absent.
+    dataset_sha = file_hash(data_file)
+    embedding_identity = resolve_embedding_identity(args)
+    source_ids_hash = content_hash(list(source_ids))
+    observed_qtype_counts = dict(Counter(
+        q["question_type"] for q in source_questions
+    ))
+    pinned_s_source = bool(
+        scale == "S" and dataset_sha == LME_S_DATASET_SHA256
+        and len(source_questions) == LME_S_EXPECTED_COUNT
+        and source_ids_hash == LME_S_SOURCE_IDS_HASH
+        and observed_qtype_counts == LME_S_QTYPE_COUNTS
+    )
+    exact_full_s = bool(
+        pinned_s_source and args.sample == 0
+        and args.protocol_split == "full"
+    )
+
+    excluded_config = {
+        "api_key", "answer_api_key", "judge_api_key", "hymem_api_key",
+        "embedding_api_key", "data_dir", "results_dir",
+        "checkpoint", "resume_from", "retry_failures",
+        "calibration_receipt", "freeze_calibration", "dev_fraction",
+        "protocol_split",
+        "rejudge", "inspect_floor", "distill_dryrun", "export_official",
+        "official_output", "prereg", "no_prereg", "prereg_obj",
+        "tokenizer_json", "token_counter", "context_policy_obj",
+        # Raw JSON strings can hide credential-shaped nested keys from the
+        # recursive sanitizer. Only the parsed objects below enter identity.
+        "answer_extra_body", "judge_extra_body",
+    }
+    strict_config = {
+        key: value for key, value in vars(args).items()
+        if key not in excluded_config and "api_key" not in key
+    }
+    subset_run = bool(args.sample > 0 and args.protocol_split == "full")
+    exploratory_non_comparable = bool(
+        args.prereg_obj is None or subset_run or not args.auto_ability
+        or not args.indexing_require_healthy or args.retrieval_only
+        or args.no_dream or not pinned_s_source
+    )
+    strict_config.update({
+        "label_free_answer_path": bool(args.auto_ability),
+        "scored_run": not args.retrieval_only,
+        "exploratory_label_steering": not args.auto_ability,
+        "exploratory_non_comparable": exploratory_non_comparable,
+        "subset_run": subset_run,
+        "sample_strategy": (
+            "sha256-seed-source-index-preserve-order-v1"
+            if subset_run else "all-source-order"
+        ),
+        "official_denominator_validated": exact_full_s,
+        "source_order_validated": pinned_s_source,
+        "source_ids_hash": source_ids_hash,
+        "source_qtype_counts": observed_qtype_counts,
+        "dataset_revision": (
+            LME_S_DATASET_REVISION if pinned_s_source
+            else f"unverified-local-{scale}"
+        ),
+        "dataset_sha256": dataset_sha,
+        "dataset_expected_count": len(source_questions),
+        "dataset_url": LME_S_DATASET_URL if pinned_s_source else None,
+        "evaluator_commit": LME_EVALUATOR_COMMIT,
+        "evaluator_sha256": LME_EVALUATOR_SHA256,
+        "evaluator_url": LME_EVALUATOR_URL,
+        "official_judge_model": LME_OFFICIAL_JUDGE_MODEL,
+        "official_judge_base_url": LME_OFFICIAL_JUDGE_BASE_URL,
+        "official_judge_temperature": LME_OFFICIAL_JUDGE_TEMPERATURE,
+        "official_judge_max_tokens": LME_OFFICIAL_JUDGE_MAX_TOKENS,
+        "official_verdict_parser": LME_OFFICIAL_VERDICT_PARSER,
+        "historical_local_judge_prompts_exact_official": (
+            LME_HISTORICAL_LOCAL_JUDGE_PROMPTS_EXACT_OFFICIAL
+        ),
+        "judge_transport_retry_policy": LME_LOCAL_RETRY_POLICY,
+        "official_transport_retry_policy": LME_UPSTREAM_RETRY_POLICY,
+        "official_transport_exact": False,
+        "retrieval_usage_owner": (
+            "separate-retrieval-meter" if args.retrieval_only and args.distill
+            else "reader" if args.distill else "none"
+        ),
+        "prereg": args.prereg_obj,
+        "indexing_require_healthy": bool(args.indexing_require_healthy),
+        "embedding_runtime": embedding_identity,
+        "context_policy": args.context_policy_obj,
+    })
+    config_probe = _adapter_for_args(
+        Path("/benchmark-identity/hymem.sqlite"), args, ""
+    ).build_config()
+    strict_config["effective_hymem_config"] = dataclass_identity(
+        config_probe, exclude={"root"}
+    )
+    pipeline_base = validate_safe_endpoint(args.hymem_base_url, label="memory pipeline")
+    pipeline_host = (__import__("urllib.parse", fromlist=["urlsplit"])
+                     .urlsplit(pipeline_base).hostname or "").casefold()
+    pipeline_sends_thinking = args.hymem_thinking == "disabled" or (
+        args.hymem_thinking == "auto"
+        and ("deepseek" in pipeline_host or "deepseek" in args.hymem_model.casefold())
+    )
+    strict_models = {
+        "reader": {
+            "provider": _provider_for_url(args.answer_base_url),
+            "model": args.answer_model,
+            "base_url": validate_safe_endpoint(args.answer_base_url, label="reader"),
+            "temperature": 0.0, "max_tokens": 1024,
+            "extra_body": args.answer_extra_body_obj,
+        },
+        "judge": {
+            "provider": _provider_for_url(args.judge_base_url),
+            "model": args.judge_model,
+            "base_url": validate_safe_endpoint(args.judge_base_url, label="judge"),
+            "temperature": 0.0, "max_tokens": 10,
+            "n": 1 if args.judge_protocol == "official" else None,
+            "extra_body": args.judge_extra_body_obj,
+            "protocol": args.judge_protocol,
+            "evaluator_commit": LME_EVALUATOR_COMMIT,
+            "evaluator_sha256": LME_EVALUATOR_SHA256,
+            "verdict_parser": (
+                LME_OFFICIAL_VERDICT_PARSER if args.judge_protocol == "official"
+                else "anchored-exclusive-yes-no-local-v1"
+            ),
+            "prompt_exact_official": args.judge_protocol == "official",
+            "retry_policy": LME_LOCAL_RETRY_POLICY,
+        },
+        "memory_pipeline": {
+            "provider": _provider_for_url(args.hymem_base_url),
+            "model": args.hymem_model,
+            "base_url": pipeline_base, "thinking_mode": args.hymem_thinking,
+            "effective_extra_body": (
+                {"thinking": {"type": "disabled"}}
+                if pipeline_sends_thinking else {}
+            ),
+        },
+        "embedding": embedding_identity,
+    }
+    strict_config["official_judge_match"] = official_judge_match(
+        strict_config, strict_models
+    )
+    if args.judge_protocol == "official" and not strict_config["official_judge_match"]:
+        parser.error(
+            "--judge-protocol official requires gpt-4o-2024-08-06 at "
+            "https://api.openai.com/v1, temperature 0, max_tokens 10, and no extra_body"
+        )
+    all_ids = validate_ids(
+        (q.get("question_id") for q in questions), label="LongMemEval dataset"
+    )
+    if args.freeze_calibration:
+        receipt = freeze_calibration(
+            args.freeze_calibration,
+            benchmark="LongMemEval",
+            dataset_hash=dataset_sha,
+            ids=source_ids,
+            config=strict_config,
+            models=strict_models,
+            seed=args.seed,
+            dev_fraction=args.dev_fraction,
+        )
+        print(f"Frozen internal calibration receipt: {args.freeze_calibration}")
+        print(f"  dev={len(receipt['dev_ids'])}, holdout={len(receipt['holdout_ids'])}")
+        return
+
+    calibration = None
+    if args.calibration_receipt:
+        calibration = load_calibration(
+            args.calibration_receipt,
+            benchmark="LongMemEval",
+            dataset_hash=dataset_sha,
+            config=strict_config,
+            models=strict_models,
+            ids=source_ids,
+        )
+
+    def _role_key(role: str, base_url: str, explicit: str | None) -> str:
+        try:
+            return resolve_endpoint_key(
+                role=role, base_url=base_url, explicit_key=explicit,
+                deepseek_key=DEEPSEEK_API_KEY,
+            )
+        except BenchmarkIntegrityError as exc:
+            parser.error(str(exc))
+
     # Floor inspector: a diagnostic, not a benchmark run — dump and exit.
     if args.inspect_floor:
-        _inspect_floor_questions(questions, args, DEEPSEEK_API_KEY)
+        pipeline_key = _role_key(
+            "memory pipeline", args.hymem_base_url, args.hymem_api_key
+        )
+        try:
+            args.embedding_api_key = resolve_embedding_key(args)
+        except BenchmarkIntegrityError as exc:
+            parser.error(str(exc))
+        _inspect_floor_questions(questions, args, pipeline_key)
         return
 
     # Distillation dry-run (G-P1a front-run gate): offline test on the banked
     # synthesis misses — dump the verdict and exit, no full benchmark.
     if args.distill_dryrun:
-        _distill_dryrun_questions(questions, args, DEEPSEEK_API_KEY)
+        pipeline_key = _role_key(
+            "memory pipeline", args.hymem_base_url, args.hymem_api_key
+        )
+        answer_key = _role_key(
+            "reader", args.answer_base_url, args.answer_api_key
+        )
+        judge_key = _role_key(
+            "judge", args.judge_base_url, args.judge_api_key
+        )
+        try:
+            args.embedding_api_key = resolve_embedding_key(args)
+        except BenchmarkIntegrityError as exc:
+            parser.error(str(exc))
+        _distill_dryrun_questions(
+            questions, args, pipeline_key, answer_key, judge_key
+        )
         return
 
-    # LLM clients. The ANSWER client can be pointed at a non-DeepSeek reader
-    # (P0 parity lever); its key falls back to the resolved DeepSeek key so the
-    # default path is unchanged. The JUDGE stays on DEEPSEEK_BASE_URL; post the
-    # deepseek-chat deprecation it must be deepseek-v4-flash + --judge-extra-body
-    # '{"thinking":{"type":"disabled"}}' to keep the yes/no parse clean.
-    answer_api_key = args.answer_api_key or DEEPSEEK_API_KEY
+    selected_ids = select_protocol_ids(
+        all_ids, split=args.protocol_split, receipt=calibration
+    )
+    selected_set = set(selected_ids)
+    questions = [q for q in questions if q["question_id"] in selected_set]
+    if tuple(q["question_id"] for q in questions) != selected_ids:
+        raise BenchmarkIntegrityError("selected LongMemEval id order drifted")
+    manifest = build_manifest(
+        benchmark="LongMemEval",
+        code_sha256=longmemeval_code_hash(),
+        data_sha256=dataset_sha,
+        config=strict_config,
+        models=strict_models,
+        seed=args.seed,
+        expected_ids=selected_ids,
+        protocol_split=args.protocol_split,
+        calibration=calibration,
+    )
+    # HyMem's current architecture/prompt campaign was informed by the public S
+    # set.  A frozen internal split remains useful for disciplined iteration,
+    # but cannot retroactively create clean benchmark evidence.
+    manifest["development_only"] = True
+    manifest["official_split"] = False
+    manifest["official_comparable"] = False
+    manifest["run_id"] = content_hash({
+        key: value for key, value in manifest.items() if key != "run_id"
+    })
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(exist_ok=True, parents=True)
+    checkpoint_path, is_resume = resolve_checkpoint_path(
+        checkpoint=args.checkpoint,
+        resume_from=args.resume_from,
+        base_dir=results_dir,
+        benchmark="longmemeval",
+        run_id=manifest["run_id"],
+    )
+    ledger = AtomicCheckpoint(
+        checkpoint_path,
+        manifest=manifest,
+        expected_ids=selected_ids,
+        resume=is_resume,
+        retry_failures=args.retry_failures,
+        scored=not args.retrieval_only,
+    )
+    if _owned_ledgers is not None:
+        _owned_ledgers.append(ledger)
+    pending = set(ledger.pending_ids)
+    print(f"  Strict checkpoint: {checkpoint_path} "
+          f"({len(pending)} pending / {len(selected_ids)} expected)")
+    work_questions = [q for q in questions if q["question_id"] in pending]
+    work_total = len(work_questions)
+    pipeline_key = ""
+    if work_total:
+        pipeline_key = _role_key(
+            "memory pipeline", args.hymem_base_url, args.hymem_api_key
+        )
+        try:
+            args.embedding_api_key = resolve_embedding_key(args)
+        except BenchmarkIntegrityError as exc:
+            parser.error(str(exc))
+
+    # Terminal checkpoint publication is provider-free. For pending work,
+    # construct only clients that the selected mode can actually reach.
     # Under --retrieval-only the reader and judge are never reached, and the
     # clients enforce that rather than trusting the branch: PoisonLLM raises,
     # CountingLLM records what distillation and the store actually spend.
-    answer_llm = LLMClient(args.answer_model, answer_api_key, base_url=args.answer_base_url,
-                           extra_body=args.answer_extra_body_obj)
-    judge_llm = LLMClient(args.judge_model, DEEPSEEK_API_KEY,
-                          extra_body=args.judge_extra_body_obj)
+    needs_reader_client = bool(work_total and (
+        not args.retrieval_only or args.distill
+    ))
+    needs_judge_client = bool(work_total and not args.retrieval_only)
+    if needs_reader_client:
+        answer_api_key = _role_key(
+            "reader", args.answer_base_url, args.answer_api_key
+        )
+        answer_llm = LLMClient(
+            args.answer_model, answer_api_key, base_url=args.answer_base_url,
+            extra_body=args.answer_extra_body_obj,
+        )
+    else:
+        answer_llm = PoisonLLM("reader")
+    if needs_judge_client:
+        judge_api_key = _role_key(
+            "judge", args.judge_base_url, args.judge_api_key
+        )
+        judge_llm = LLMClient(
+            args.judge_model, judge_api_key, base_url=args.judge_base_url,
+            extra_body=args.judge_extra_body_obj,
+            n=1 if args.judge_protocol == "official" else None,
+        )
+    else:
+        judge_llm = PoisonLLM("judge")
     retrieval_counter = None
     distill_llm = None
     if args.retrieval_only:
         # The reader and the judge become unreachable OBJECTS, not skipped
         # branches. Distillation keeps a real (counted) client because it is
         # part of retrieval and genuinely fires.
-        retrieval_counter = CountingLLM(answer_llm)
-        distill_llm = retrieval_counter
+        if args.distill:
+            retrieval_counter = CountingLLM(answer_llm)
+            distill_llm = retrieval_counter
         answer_llm = PoisonLLM("reader")
         judge_llm = PoisonLLM("judge")
 
@@ -3022,6 +4750,184 @@ def main():
     # near-linearly while sharing the LLMClient token counters.
     start_time = time.time()
     total = len(questions)
+    all_results: list[dict] = list(ledger.reconcile().rows)
+    segment_id = (
+        f"process-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-"
+        f"{os.getpid()}"
+    )
+    pipeline_usage_instances: list[dict[str, Any]] = []
+    embedding_usage_instances: list[dict[str, Any]] = []
+    indexing_runs: list[dict[str, Any]] = []
+    runtime_instrumentation_errors: list[str] = []
+
+    def unavailable_llm_usage() -> dict[str, Any]:
+        return {
+            "calls": None, "calls_available": False,
+            "request_attempts": None, "request_attempts_available": False,
+            "successful_responses": None,
+            "successful_responses_available": False,
+            "prompt_tokens": None, "completion_tokens": None,
+            "total_tokens": None, "token_usage_available": False,
+            "latency_s": None, "latency_available": False,
+            "cost_usd": None, "cost_available": False,
+        }
+
+    def zero_llm_usage() -> dict[str, Any]:
+        return usage_snapshot(PoisonLLM("unused usage role"))
+
+    def zero_embedding_usage() -> dict[str, Any]:
+        identity = manifest["models"]["embedding"]
+        return {
+            "configured": identity["configured"],
+            "backend": identity["backend"],
+            "quality": identity["quality"],
+            "network_free": identity["network_free"],
+            "model": identity["model"],
+            "dimension": identity["dimension"],
+            "identity_available": True,
+            "calls": 0, "calls_available": True,
+            "request_attempts": 0,
+            "request_attempts_available": True,
+            "successful_responses": 0,
+            "successful_responses_available": True,
+            "input_count": 0, "input_count_available": True,
+            "input_characters": 0,
+            "input_characters_available": True,
+            "prompt_tokens": None, "total_tokens": None,
+            "provider_token_usage_available": False,
+            "latency_s": 0.0, "latency_available": True,
+            "cost_usd": None, "cost_available": False,
+        }
+
+    def unavailable_embedding_usage() -> dict[str, Any]:
+        if not bool(args.embeddings):
+            return zero_embedding_usage()
+        return {
+            "configured": True, "backend": "unavailable",
+            "quality": "none", "network_free": None,
+            "model": None, "dimension": None,
+            "identity_available": False,
+            "calls": None, "calls_available": False,
+            "request_attempts": None,
+            "request_attempts_available": False,
+            "successful_responses": None,
+            "successful_responses_available": False,
+            "input_count": None, "input_count_available": False,
+            "input_characters": None,
+            "input_characters_available": False,
+            "prompt_tokens": None, "total_tokens": None,
+            "provider_token_usage_available": False,
+            "latency_s": None, "latency_available": False,
+            "cost_usd": None, "cost_available": False,
+        }
+
+    def _capture_runtime(row: dict[str, Any]) -> None:
+        pipeline = row.get("memory_pipeline_usage")
+        if not isinstance(pipeline, dict):
+            runtime_instrumentation_errors.append(
+                f"{row.get('question_id')}: memory pipeline usage unavailable"
+            )
+        pipeline_usage_instances.append(
+            dict(pipeline) if isinstance(pipeline, dict) else unavailable_llm_usage()
+        )
+        embedding = row.get("embedding_usage")
+        if bool(args.embeddings) and not isinstance(embedding, dict):
+            runtime_instrumentation_errors.append(
+                f"{row.get('question_id')}: embedding usage/identity unavailable"
+            )
+        embedding_usage_instances.append(
+            dict(embedding) if isinstance(embedding, dict) else
+            unavailable_embedding_usage()
+        )
+        indexing = row.get("indexing")
+        if isinstance(indexing, dict):
+            indexing_runs.append({
+                "question_id": row.get("question_id"), **dict(indexing),
+            })
+
+    def _segment(status: str, attempted: int) -> dict:
+        instrumentation_errors: list[str] = list(runtime_instrumentation_errors)
+
+        def captured(label: str, fn, fallback):
+            try:
+                return fn()
+            except BaseException as exc:
+                instrumentation_errors.append(
+                    f"{label}: {type(exc).__name__}: {exc}"
+                )
+                return fallback()
+
+        reader_usage = captured(
+            "reader_usage", lambda: usage_snapshot(answer_llm),
+            unavailable_llm_usage,
+        )
+        judge_usage = captured(
+            "judge_usage", lambda: usage_snapshot(judge_llm),
+            unavailable_llm_usage,
+        )
+        retrieval_usage = captured(
+            "retrieval_usage",
+            lambda: (
+                usage_snapshot(retrieval_counter)
+                if retrieval_counter is not None else zero_llm_usage()
+            ),
+            unavailable_llm_usage,
+        )
+        pipeline_usage = captured(
+            "memory_pipeline_usage",
+            lambda: (
+                aggregate_usage_snapshots(pipeline_usage_instances)
+                if pipeline_usage_instances else usage_snapshot(
+                    PoisonLLM("unused memory pipeline")
+                )
+            ),
+            unavailable_llm_usage,
+        )
+
+        embedding_usage = captured(
+            "embedding_usage",
+            lambda: (
+                aggregate_embedding_usage_snapshots(
+                    embedding_usage_instances
+                ) if embedding_usage_instances else zero_embedding_usage()
+            ),
+            unavailable_embedding_usage,
+        )
+        return {
+            "segment_id": segment_id,
+            "status": status,
+            "elapsed_s": time.time() - start_time,
+            "attempted_attempts": attempted,
+            # Use the manifest's recursively sanitized identity. Provider
+            # extension bodies can contain credential-shaped fields and the
+            # checkpoint writer intentionally preserves execution segments.
+            "model_identities": manifest["models"],
+            "reader_usage": reader_usage,
+            "judge_usage": judge_usage,
+            "retrieval_usage": retrieval_usage,
+            "memory_pipeline_usage": pipeline_usage,
+            "embedding_usage": embedding_usage,
+            "latest_indexing": (
+                dict(indexing_runs[-1]) if indexing_runs else None
+            ),
+            "indexing_runs": [dict(item) for item in indexing_runs],
+            "instrumentation_errors": instrumentation_errors,
+        }
+
+    if work_total:
+        ledger.update_execution_segment(segment_id, _segment("running", 0))
+    elif is_resume:
+        # A crash after its last durable row but before segment finalization is
+        # recoverable without constructing a provider client. Close that history
+        # with an explicit zero-work segment. Already-finalized checkpoints are
+        # terminal and need no mutation.
+        try:
+            ledger.update_execution_segment(
+                segment_id, _segment("complete", 0)
+            )
+        except BenchmarkIntegrityError as exc:
+            if "cannot mutate a finalized checkpoint" not in str(exc):
+                raise
 
     def _progress(done: int):
         elapsed = time.time() - start_time
@@ -3029,7 +4935,8 @@ def main():
         if args.retrieval_only:
             # No verdicts exist. "Acc: 0.0%" here is not a low score, it is a
             # measurement that was never taken.
-            print(f"  ── Progress: {done}/{total} | retrieval-only (no "
+            print(f"  ── Progress: {done}/{work_total} attempted this segment | "
+                  f"retrieval-only (no "
                   f"verdicts) | Elapsed: {elapsed:.0f}s | "
                   f"Avg: {elapsed/max(1, done):.0f}s/q{suffix_w}", flush=True)
             return
@@ -3039,8 +4946,9 @@ def main():
         # An outage should be visible WHILE the run burns reader calls, not only
         # in the post-mortem — that is the whole point of D3. Silent when zero:
         # the run summary states the denominator instead.
-        err = f" | ⚠ UNSCORED (judge error): {n_err}" if n_err else ""
-        print(f"  ── Progress: {done}/{total} | Acc: {acc*100:.1f}% | "
+        err = f" | strict judge failures: {n_err}" if n_err else ""
+        print(f"  ── Progress: {done}/{work_total} attempted this segment | "
+              f"strict full-denominator Acc: {acc*100:.1f}% | "
               f"Elapsed: {elapsed:.0f}s | Avg: {elapsed/max(1, done):.0f}s/q"
               f"{suffix}{err}", flush=True)
 
@@ -3049,224 +4957,248 @@ def main():
 
         # Collect by original index so per_question stays input-ordered (stable
         # / comparable across runs) even though completion order is arbitrary.
-        results_by_idx: dict[int, dict] = {}
-        all_results: list[dict] = []
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
-                pool.submit(_evaluate_one_question, qi, total, q_data, args,
-                            answer_llm, judge_llm, DEEPSEEK_API_KEY, distill_llm): qi
-                for qi, q_data in enumerate(questions)
+                pool.submit(_evaluate_one_question, qi, work_total, q_data, args,
+                            answer_llm, judge_llm, pipeline_key,
+                            distill_llm): q_data
+                for qi, q_data in enumerate(work_questions)
             }
-            for fut in as_completed(futures):
-                qi = futures[fut]
-                results_by_idx[qi] = fut.result()
-                all_results = list(results_by_idx.values())
-                if len(results_by_idx) % 10 == 0:
-                    _progress(len(results_by_idx))
-        all_results = [results_by_idx[i] for i in range(total)]
+            for done, fut in enumerate(as_completed(futures), 1):
+                q_data = futures[fut]
+                try:
+                    result = fut.result()
+                    _capture_runtime(result)
+                    ledger.record(
+                        q_data["question_id"], row=result,
+                        execution_segment=_segment("running", done),
+                    )
+                except Exception as exc:
+                    row = {
+                        "question_id": q_data["question_id"],
+                        "question_type": q_data.get("question_type", "unknown"),
+                        "correct": False,
+                        "benchmark_failure": (
+                            f"worker_failure: {type(exc).__name__}: {exc}"
+                        ),
+                        "oracle_ability": LME_ABILITY_BY_TYPE.get(
+                            q_data.get("question_type")
+                        ),
+                        "detected_ability": None,
+                        "ability_used": (
+                            None if args.auto_ability else
+                            LME_ABILITY_BY_TYPE.get(q_data.get("question_type"))
+                        ),
+                        "retrieval_only": bool(args.retrieval_only),
+                        "distill_fired": False,
+                        "distill_calls": 0,
+                    }
+                    _capture_runtime(row)
+                    ledger.record(
+                        q_data["question_id"], row=row,
+                        execution_segment=_segment("running", done),
+                    )
+                all_results = list(ledger.reconcile().rows)
+                if done % 10 == 0 or done == work_total:
+                    _progress(done)
     else:
-        all_results = []
-        for qi, q_data in enumerate(questions):
-            all_results.append(
-                _evaluate_one_question(qi, total, q_data, args,
-                                       answer_llm, judge_llm, DEEPSEEK_API_KEY,
-                                       distill_llm)
+        for qi, q_data in enumerate(work_questions):
+            result = _evaluate_one_question(
+                qi, work_total, q_data, args, answer_llm, judge_llm,
+                pipeline_key, distill_llm,
             )
+            _capture_runtime(result)
+            ledger.record(
+                q_data["question_id"], row=result,
+                execution_segment=_segment("running", qi + 1),
+            )
+            all_results = list(ledger.reconcile().rows)
             if (qi + 1) % 10 == 0:
                 _progress(qi + 1)
 
     elapsed = time.time() - start_time
+    if work_total:
+        ledger.update_execution_segment(
+            segment_id, _segment("complete", work_total)
+        )
+    checkpoint_snapshot = ledger.finalize()
+    all_results = list(ledger.reconcile().rows)
 
-    # ---- SAFETY DUMP -----------------------------------------------------
-    # Written BEFORE any reporting touches these rows, because everything
-    # expensive has already happened and everything after this line is
-    # presentation. On 2026-09-03 the f probe dreamed 50 questions in 876s and
-    # then died in the summary `print` on an attribute the stand-in client did
-    # not carry: the run was complete, and the result was destroyed by a
-    # formatting statement. Five diagnostic passes sit between here and the
-    # real artifact; any of them can raise, and none of them is worth the
-    # compute above.
-    #
-    # Deliberately minimal and deliberately NOT named like a real artifact, so
-    # nothing globbing `longmemeval-v2-hymem-*` picks it up by accident.
-    try:
-        _safety = Path("/home/node/.hermes/benchmarks") / (
-            f"partial-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-            f"-seed{args.seed}.json")
-        _safety.write_text(json.dumps({
-            "partial": True,
-            "note": "written before reporting; carries the rows, not the "
-                    "summary",
-            "config": {
-                "retrieval_only": bool(args.retrieval_only),
-                "episode_granularity_enabled": bool(
-                    getattr(args, "episode_granularity", False)),
-                "seed": args.seed,
-                "sample": args.sample,
-                "scale": args.scales,
-                "answer_model": args.answer_model,
-                "judge_model": args.judge_model,
-                "elapsed_s": elapsed,
-            },
-            "per_question": all_results,
-        }))
-        print(f"  safety dump: {_safety}", flush=True)
-    except Exception as _e:                      # never let the guard be the
-        print(f"  ⚠ safety dump failed: {_e}", flush=True)   # thing that fails
+    # Compute optional diagnostics defensively, then publish the immutable
+    # row/denominator evidence BEFORE any presentation function. A formatting
+    # bug must never strand an expensive completed checkpoint.
+    diagnostic_errors: dict[str, str] = {}
 
-    total_calls = answer_llm.call_count + judge_llm.call_count
-    print(f"\nEvaluation complete in {elapsed:.0f}s")
-    print(f"  Answer calls: {answer_llm.call_count}, Judge calls: {judge_llm.call_count}")
-    print(f"  Total tokens: {answer_llm.total_tokens + judge_llm.total_tokens}")
-    if args.distill:
-        n_fired = sum(1 for r in all_results if r.get("distill_fired"))
-        n_calls = sum(r.get("distill_calls", 0) for r in all_results)
-        print(f"  Distill: fired on {n_fired}/{len(all_results)} questions, "
-              f"{n_calls} extraction calls (included in Answer calls above)")
-    print(f"  Avg time/question: {elapsed/len(questions):.0f}s")
+    def _diagnostic(name: str, fn, default):
+        try:
+            return fn(all_results)
+        except Exception as exc:
+            diagnostic_errors[name] = f"{type(exc).__name__}: {exc}"
+            return default
 
-    # Report. The judge-error line comes FIRST and is unconditional: a score
-    # printed without it cannot be read, because the reader cannot tell an
-    # accuracy over n rows from an accuracy over n-k. When k is 0 the line
-    # states the denominator instead, so "0 errors" is never a claim made by an
-    # instrument that had nothing to measure.
-    print(f"\n  {judge_error_note(all_results)}")
-    scores = compute_scores(all_results)
-    print_report(scores, {
-        "answer_model": args.answer_model,
-        "judge_model": args.judge_model,
-        "num_questions": len(questions),
-        "top_k": args.top_k,
-        "scale": scale,
-    })
-    abstention_diag = compute_abstention_scores(all_results)
-    print_abstention_scores(abstention_diag)
-    recall_diag = compute_recall_diagnostics(all_results)
-    print_recall_diagnostics(recall_diag)
-    router_diag = compute_router_diagnostics(all_results)
-    print_router_diagnostics(router_diag, args.auto_ability)
+    if args.retrieval_only:
+        scores: dict[str, dict] = {}
+        abstention_diag: dict = {}
+        recall_diag: dict = {}
+    else:
+        scores = _diagnostic("scores", compute_scores, {
+            "OVERALL": {
+                "accuracy": strict_accuracy(all_results),
+                "count": len(all_results),
+            }
+        })
+        abstention_diag = _diagnostic(
+            "abstention", compute_abstention_scores, {}
+        )
+        recall_diag = _diagnostic("recall", compute_recall_diagnostics, {})
+    router_diag = _diagnostic("router", compute_router_diagnostics, {})
 
-    # Save
-    results_dir = Path("/home/node/.hermes/benchmarks")
-    results_dir.mkdir(exist_ok=True, parents=True)
-
-    output = {
+    conditional_rows = scored(all_results) if not args.retrieval_only else []
+    payload = {
         "benchmark": "LongMemEval",
-        "version": "v2-hymem-tr-mr-wired",
+        "version": "strict-v1",
         "date": datetime.now(timezone.utc).isoformat(),
-        "config": {
-            "scale": scale,
-            "sample": args.sample,
-            "seed": args.seed,
-            "retrieval_only": bool(args.retrieval_only),
-            "top_k": args.top_k,
-            "auto_ability": args.auto_ability,
-            "workers": args.workers,
-            "no_dream": args.no_dream,
-            # The config LEVERS this adapter pins, recorded because a run
-            # that varies one of them has to be able to EVIDENCE which arm it
-            # was. The 2026-08-31 granularity guard diffed the two arms' config
-            # blocks and found them "byte-identical except elapsed_s" -- which
-            # was true, and vacuous: neither lever was in the block, so the diff
-            # could not see the only thing the run varied, and would have read
-            # the same had --episode-granularity been forgotten on the ON arm.
-            # A drift control that cannot observe the variable is not a control
-            # over it (the E3 shape: a check that reads PASS when broken).
-            # `aggregation_nodes` matters for a different reason: the library
-            # default flipped False -> True on 2026-08-26, so it is what makes a
-            # score comparable (or not) to the pre-flip 70.0 / 68.4 baselines.
-            # Key names match hymem.config field names exactly, because
-            # benchmarks/lme_registry.py reads them by that name -- it lists
-            # all three under KNOWN_ABSENT ("filled from `overrides` in the
-            # adapter, which never made it into the config block"). Writing
-            # them under any other spelling would leave those columns NULL
-            # forever while looking recorded here.
-            "aggregation_nodes_enabled": args.aggregation_nodes,
-            "episode_granularity_enabled": getattr(
-                args, "episode_granularity", False),
-            "value_supersession_enabled": args.value_supersession,
-            "graph_facts_first": args.graph_facts_first,
-            "permissive_default": args.permissive_default,
-            "embeddings": args.embeddings,
-            "rerank_top_k": args.rerank_top_k,
-            "rerank_model": args.rerank_model,
-            "rerank_message_hits": args.rerank_message_hits,
-            "answer_model": args.answer_model,
-            "answer_base_url": args.answer_base_url,
-            "answer_extra_body": args.answer_extra_body_obj,
-            "judge_model": args.judge_model,
-            "judge_extra_body": args.judge_extra_body_obj,
-            "graph_multihop": args.graph_multihop,
-            "graph_multihop_knobs": (
-                {"max_hops": args.graph_multihop_max_hops,
-                 "decay": args.graph_multihop_decay,
-                 "min_score": args.graph_multihop_min_score}
-                if args.graph_multihop else None
-            ),
-            "distill": args.distill,
-            "distill_prompt_version": args.distill_prompt_version.upper() if args.distill else None,
-            "distill_fired_count": sum(1 for r in all_results if r.get("distill_fired")),
-            "distill_total_calls": sum(r.get("distill_calls", 0) for r in all_results),
-            "hy_mem": "beam-optimisation branch (53d490d + adapter wiring)",
-            "features": "created_at from haystack_dates, graph_count trusted, temporal_events injected (hits-based anchors), question_date as reference-now, str(answer) fix, recall-ceiling instrumentation (retrieval-vs-ranking miss split), ability-router shadow/auto measurement (detect_ability vs oracle)",
-            "elapsed_s": elapsed,
-            "answer_calls": answer_llm.call_count,
-            "judge_calls": judge_llm.call_count,
-            "total_tokens": answer_llm.total_tokens + judge_llm.total_tokens,
-        },
+        "protocol_disclosure": (
+            "label-free default routing; labels used only for official judging "
+            "and post-answer diagnostics" if args.auto_ability else
+            "EXPLORATORY NON-COMPARABLE: oracle question-type routing enabled"
+        ),
         "scores": {qtype: {
             "accuracy": round(data["accuracy"] * 100, 1),
             "count": data["count"],
         } for qtype, data in scores.items()},
+        "conditional_judged_only": {
+            "accuracy": accuracy(conditional_rows) if conditional_rows else None,
+            "count": len(conditional_rows),
+        },
         "abstention_diagnostics": abstention_diag,
         "recall_diagnostics": recall_diag,
         "router_diagnostics": router_diag,
-        "per_question": all_results,
+        "diagnostic_errors": diagnostic_errors,
+        # Canonical ordered row commitment. The full artifact digest lives
+        # outside the archive (pointer/registry) to avoid self-reference.
+        "result_digest": content_hash(sanitize_for_artifact(all_results)),
     }
     if args.retrieval_only:
         # What the mode ACTUALLY spent, measured rather than assumed. It skips
         # the reader and the judge; it does not skip distillation, and it
         # cannot vouch for what reranking does inside the store.
-        output["retrieval_cost"] = {
-            "llm_calls": retrieval_counter.calls if retrieval_counter else None,
-            "prompt_chars": (retrieval_counter.prompt_chars
-                             if retrieval_counter else None),
+        cost_segments = checkpoint_snapshot.get("execution_segments", [])
+        exact_retrieval_calls = None
+        if cost_segments and all(
+            isinstance(segment, dict)
+            and segment.get("status") == "complete"
+            and isinstance(segment.get("retrieval_usage"), dict)
+            and segment["retrieval_usage"].get("calls_available") is True
+            and isinstance(segment["retrieval_usage"].get("calls"), int)
+            for segment in cost_segments
+        ):
+            exact_retrieval_calls = sum(
+                segment["retrieval_usage"]["calls"] for segment in cost_segments
+            )
+        payload["retrieval_cost"] = {
+            "usage_owner": strict_config["retrieval_usage_owner"],
+            "llm_calls": exact_retrieval_calls,
             "answer_calls": 0,
             "judge_calls": 0,
             "distill_calls": sum(r.get("distill_calls") or 0
                                  for r in all_results),
         }
 
-    # Canonical "latest" pointer (stable filename other tools read)...
+    # The archive is exclusive/immutable. The stable filename is only a small
+    # atomic pointer, never a mutable second copy of the benchmark evidence.
     results_path = results_dir / "longmemeval-v2-hymem.json"
-    with open(results_path, "w") as f:
-        json.dump(output, f, indent=2, default=str)
-    # ...plus an immutable, uniquely-named archive copy so a later run never
-    # clobbers a prior result (a seeded run is reproducible, but per-question
-    # detail and one-off numbers are worth keeping). Key by timestamp+seed.
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    archive_path = results_dir / f"longmemeval-v2-hymem-{stamp}-seed{args.seed}.json"
-    with open(archive_path, "w") as f:
-        json.dump(output, f, indent=2, default=str)
+    archive_now = datetime.now(timezone.utc)
+    stamp = archive_now.strftime("%Y%m%dT%H%M%SZ")
+    publication_nonce = archive_now.strftime("%f")
+    archive_path = results_dir / (
+        f"longmemeval-v2-hymem-{stamp}-{publication_nonce}-seed{args.seed}-"
+        f"strict-{manifest['run_id'].removeprefix('sha256:')[:12]}.json"
+    )
+    output = publish_checkpoint_artifact(
+        ledger, archive_path, payload=payload
+    )
+    artifact_digest = content_hash(output)
+    write_latest_pointer(results_path, archive=archive_path,
+                         run_id=manifest["run_id"],
+                         artifact_digest=artifact_digest)
     print(f"  Archived: {archive_path.name}", flush=True)
 
-    # Update manifest
-    manifest_path = results_dir / "manifest.json"
-    manifest = {}
-    if manifest_path.exists():
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-    manifest["LongMemEval-v2"] = {
-        "latest": "longmemeval-v2-hymem.json",
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "overall_score": round(scores.get("OVERALL", {}).get("accuracy", 0) * 100, 1),
-        "scale": scale,
-        "sample": args.sample,
-    }
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
+    print(f"\nEvaluation complete in {elapsed:.0f}s")
+    try:
+        answer_usage = usage_snapshot(answer_llm)
+    except BaseException as exc:
+        print(
+            f"WARNING: final reader usage unavailable: "
+            f"{type(exc).__name__}: {exc}", file=sys.stderr,
+        )
+        answer_usage = unavailable_llm_usage()
+    try:
+        judge_usage = usage_snapshot(judge_llm)
+    except BaseException as exc:
+        print(
+            f"WARNING: final judge usage unavailable: "
+            f"{type(exc).__name__}: {exc}", file=sys.stderr,
+        )
+        judge_usage = unavailable_llm_usage()
+    print(f"  Answer calls: {answer_usage['calls']}, "
+          f"Judge calls: {judge_usage['calls']}")
+    totals = (answer_usage["total_tokens"], judge_usage["total_tokens"])
+    print("  Total tokens: " + (
+        str(sum(totals)) if all(value is not None for value in totals)
+        else "unavailable (provider usage missing)"
+    ))
+    if args.distill:
+        n_fired = sum(1 for r in all_results if r.get("distill_fired"))
+        n_calls = sum(r.get("distill_calls", 0) for r in all_results)
+        owner = (
+            "the separately metered retrieval usage"
+            if args.retrieval_only else "reader usage"
+        )
+        print(f"  Distill: fired on {n_fired}/{len(all_results)} questions, "
+              f"{n_calls} extraction calls (owned by {owner})")
+    print(f"  Avg time/question: {elapsed/len(questions):.0f}s")
+
+    # Presentation occurs only after durable publication.
+    if args.retrieval_only:
+        print("\n  Retrieval-only diagnostic: no accuracy was measured.")
+    else:
+        print(f"\n  {judge_error_note(all_results)}")
+        print_report(scores, {
+            "answer_model": args.answer_model,
+            "judge_model": args.judge_model,
+            "num_questions": len(questions),
+            "top_k": args.top_k,
+            "scale": scale,
+        })
+        if abstention_diag:
+            print_abstention_scores(abstention_diag)
+        if recall_diag:
+            print_recall_diagnostics(recall_diag)
+    if router_diag:
+        print_router_diagnostics(router_diag, args.auto_ability)
 
     print(f"\nResults saved to {results_path}")
+
+
+def main():
+    """CLI entry point; always release a checkpoint lease on BaseException."""
+
+    owned_ledgers: list[AtomicCheckpoint] = []
+    try:
+        return _main(owned_ledgers)
+    finally:
+        for ledger in reversed(owned_ledgers):
+            try:
+                ledger.close()
+            except BaseException as exc:
+                # Lease release is cleanup. Never replace an expensive run's
+                # row/result (or the original interruption) with a close error.
+                print(
+                    f"WARNING: checkpoint cleanup failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":

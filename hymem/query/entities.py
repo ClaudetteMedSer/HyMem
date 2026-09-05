@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
 from hymem.dreaming.canonicalize import normalize, resolve
+from hymem.core.graph import live_edge_predicate
 
 # Cap on the evidence entities returned by count_relations. The `count` stays
 # exact (it is COUNT(DISTINCT ...) in SQL); this only bounds the materialized
@@ -50,18 +51,36 @@ def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
     # query containing that word. The alias and subject branches pass through
     # unfiltered: an explicit alias registration or subject-position usage are
     # already strong entity-shape signals.
+    live_alias = live_edge_predicate("alias_edge")
+    live_subject = live_edge_predicate("subject_edge")
+    live_object = live_edge_predicate("kg")
+    live_shape_subject = live_edge_predicate("shape_subject")
+    live_shape_object = live_edge_predicate("kg2")
     rows = conn.execute(
         f"""
-        SELECT DISTINCT canonical FROM entity_aliases WHERE alias IN ({placeholders})
+        SELECT DISTINCT aliases.canonical
+        FROM entity_aliases aliases
+        WHERE aliases.alias IN ({placeholders})
+          AND EXISTS (
+              SELECT 1 FROM knowledge_graph alias_edge
+              WHERE {live_alias}
+                AND (alias_edge.subject_canonical = aliases.canonical
+                     OR alias_edge.object_canonical = aliases.canonical)
+          )
         UNION
-        SELECT DISTINCT subject_canonical FROM knowledge_graph WHERE subject_canonical IN ({placeholders})
+        SELECT DISTINCT subject_edge.subject_canonical
+        FROM knowledge_graph subject_edge
+        WHERE subject_edge.subject_canonical IN ({placeholders})
+          AND {live_subject}
         UNION
         SELECT DISTINCT object_canonical FROM knowledge_graph kg
         WHERE object_canonical IN ({placeholders})
+          AND {live_object}
           AND (
             EXISTS (
-              SELECT 1 FROM knowledge_graph
-              WHERE subject_canonical = kg.object_canonical
+              SELECT 1 FROM knowledge_graph shape_subject
+              WHERE shape_subject.subject_canonical = kg.object_canonical
+                AND {live_shape_subject}
             )
             OR EXISTS (
               SELECT 1 FROM entity_types
@@ -70,6 +89,7 @@ def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
             OR EXISTS (
               SELECT 1 FROM knowledge_graph kg2
               WHERE kg2.object_canonical = kg.object_canonical AND kg2.id != kg.id
+                AND {live_shape_object}
             )
           )
         """,
@@ -80,37 +100,55 @@ def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
 
 @dataclass
 class TimelineEntry:
-    """The earliest active edge involving an entity, per predicate."""
+    """The earliest currently-valid direct edge per predicate.
+
+    ``first_seen`` remains the honest ingestion clock for compatibility;
+    ``valid_at`` is the source/world clock used for selection and ordering.
+    """
     predicate: str
     subject: str
     object: str
     first_seen: str
     status: str
+    valid_at: str | None = None
+    edge_id: int | None = None
+    derived: bool = False
 
 
-def timeline(conn: sqlite3.Connection, entity: str) -> list[TimelineEntry]:
-    """First-seen active edge per predicate for `entity` (as subject or object),
-    oldest first — so Hermes can answer "when did we start using Postgres?"
-    without re-asking. Reads `knowledge_graph.first_seen`; no new schema.
+def timeline(
+    conn: sqlite3.Connection,
+    entity: str,
+) -> list[TimelineEntry]:
+    """Earliest source-valid edge per predicate for ``entity``, oldest first.
+
+    Inferred closure is always excluded because it has no persisted derivation
+    lineage or truthful source-valid interval.
 
     `entity` is resolved through the alias table, so a surface form
     ("Postgres") maps to its canonical id ("postgres").
     """
     canon = resolve(conn, entity)
+    current = live_edge_predicate()
     rows = conn.execute(
-        """
-        SELECT predicate, subject_canonical, object_canonical, first_seen, status
+        f"""
+        SELECT id, predicate, subject_canonical, object_canonical,
+               first_seen, normalized_valid_at AS valid_at, status, derived
         FROM (
-            SELECT predicate, subject_canonical, object_canonical, first_seen, status,
+            SELECT id, predicate, subject_canonical, object_canonical,
+                   first_seen,
+                   hymem_normalize_iso_timestamp(valid_at) AS normalized_valid_at,
+                   status, derived,
                    ROW_NUMBER() OVER (
-                       PARTITION BY predicate ORDER BY first_seen ASC, id ASC
+                       PARTITION BY predicate
+                       ORDER BY hymem_normalize_iso_timestamp(valid_at) ASC, id ASC
                    ) AS rn
             FROM knowledge_graph
-            WHERE status = 'active'
+            WHERE {current}
+              AND valid_at IS NOT NULL
               AND (subject_canonical = ? OR object_canonical = ?)
         )
         WHERE rn = 1
-        ORDER BY first_seen ASC, predicate ASC
+        ORDER BY normalized_valid_at ASC, predicate ASC, id ASC
         """,
         (canon, canon),
     ).fetchall()
@@ -121,6 +159,9 @@ def timeline(conn: sqlite3.Connection, entity: str) -> list[TimelineEntry]:
             object=r["object_canonical"],
             first_seen=r["first_seen"],
             status=r["status"],
+            valid_at=r["valid_at"],
+            edge_id=int(r["id"]),
+            derived=bool(r["derived"]),
         )
         for r in rows
     ]
@@ -158,6 +199,7 @@ def count_relations(
     object: str | None = None,
     object_type: str | None = None,
     subject_type: str | None = None,
+    include_derived: bool = False,
 ) -> GraphCount:
     """Count DISTINCT subjects or objects of `knowledge_graph` edges matching the
     given filters — the graph-native primitive behind in-domain "how many X …"
@@ -176,8 +218,9 @@ def count_relations(
     number is unambiguous.
 
     Filter semantics (all ANDed; an omitted filter is not constrained):
-      - `status='active'` is ALWAYS enforced — stale/retracted edges never count,
-        matching `timeline()`/`_graph_lookup()` which only surface active edges.
+      - the full live-current predicate is ALWAYS enforced: active, open valid
+        interval, and positive evidence strictly outweighing negative evidence.
+        Direct observations are counted unless ``include_derived=True``.
       - `subject`/`object` are surface forms resolved through the alias table via
         `resolve()` (the same helper `timeline()` uses), so "Postgres" → "postgres"
         before filtering. Filtering an anchor to its canonical is what makes the
@@ -207,7 +250,7 @@ def count_relations(
         else None
     )
 
-    where: list[str] = ["status = 'active'"]
+    where: list[str] = [live_edge_predicate(include_derived=include_derived)]
     params: list[object] = []
     if subject_canon is not None:
         where.append("subject_canonical = ?")
@@ -225,7 +268,7 @@ def count_relations(
                 entities=[],
                 filters=_count_filters(
                     count, predicate_list, subject_canon, object_canon,
-                    subject_type, object_type,
+                    subject_type, object_type, include_derived,
                 ),
             )
         placeholders = ",".join("?" * len(predicate_list))
@@ -249,7 +292,7 @@ def count_relations(
     where_sql = " AND ".join(where)
     filters = _count_filters(
         count, predicate_list, subject_canon, object_canon,
-        subject_type, object_type,
+        subject_type, object_type, include_derived,
     )
 
     try:
@@ -293,10 +336,14 @@ def _count_filters(
     object: str | None,
     subject_type: str | None,
     object_type: str | None,
+    include_derived: bool,
 ) -> dict[str, object]:
     """Assemble the `GraphCount.filters` audit dict, omitting unset filters so the
     echo shows only what actually constrained the count."""
-    filters: dict[str, object] = {"counted": count}
+    filters: dict[str, object] = {
+        "counted": count,
+        "include_derived": include_derived,
+    }
     if predicates is not None:
         filters["predicates"] = list(predicates)
     if subject is not None:

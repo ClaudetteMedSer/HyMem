@@ -26,6 +26,7 @@ from typing import Protocol
 from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.extraction.prompts import RERANK_SYSTEM, RERANK_USER_TEMPLATE
+from hymem.query.presentation import query_centered_excerpt
 
 log = logging.getLogger("hymem.query.rerank")
 
@@ -62,7 +63,10 @@ def llm_rerank(
     if not candidates:
         return candidates
 
-    excerpts_lines = [f"[{i}] {hit.text[:400]}" for i, hit in enumerate(candidates)]
+    excerpts_lines = [
+        f"[{i}] {query_centered_excerpt(hit.text, query=query, limit=400)}"
+        for i, hit in enumerate(candidates)
+    ]
     excerpts = "\n\n".join(excerpts_lines)
 
     request = LLMRequest(
@@ -144,7 +148,10 @@ def cross_encoder_rerank(
     if model is None:
         return candidates[:top_k]
 
-    pairs = [(query, hit.text[:400]) for hit in candidates]
+    pairs = [
+        (query, query_centered_excerpt(hit.text, query=query, limit=400))
+        for hit in candidates
+    ]
     try:
         scores = model.predict(pairs)
     except Exception:

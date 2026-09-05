@@ -35,6 +35,7 @@ import pytest
 from hymem import HyMem
 from hymem.dreaming.value_supersession import _classify_object
 from hymem.extraction.llm import StubLLMClient
+from tests.conftest import PromptSourceAwareStub
 
 # Stable subject/predicate; only the object (the dated value) changes between the
 # original assertion and the update. Canonicalization lowercases, so we use
@@ -70,7 +71,7 @@ def _update_routed_llm() -> StubLLMClient:
     second = _chunk_extraction_response(
         [{"subject": SUBJECT, "predicate": PREDICATE, "object": NEW_OBJECT, "polarity": 1}]
     )
-    return StubLLMClient(
+    return PromptSourceAwareStub(
         fixtures={
             "April 1": first,
             "April 5": second,
@@ -229,7 +230,7 @@ def _numeric_update_llm() -> StubLLMClient:
         [{"subject": NUM_SUBJECT, "predicate": NUM_PREDICATE, "object": NUM_NEW,
           "polarity": 1, "value_numeric": 78, "value_unit": "percent"}]
     )
-    return StubLLMClient(
+    return PromptSourceAwareStub(
         fixtures={"65 percent": first, "78 percent": second}, default="[]"
     )
 
@@ -348,7 +349,9 @@ def _date_update_llm() -> StubLLMClient:
     second = _chunk_extraction_response(
         [{"subject": SUBJECT, "predicate": PREDICATE, "object": NEW_OBJECT, "polarity": 1}]
     )
-    return StubLLMClient(fixtures={"April 1": first, "April 5": second}, default="[]")
+    return PromptSourceAwareStub(
+        fixtures={"April 1": first, "April 5": second}, default="[]"
+    )
 
 
 @pytest.mark.parametrize("flag_on", [False, True])
@@ -400,7 +403,9 @@ def _untagged_numeric_llm() -> StubLLMClient:
     second = _chunk_extraction_response(
         [{"subject": "team_size", "predicate": "configured_with", "object": "7", "polarity": 1}]
     )
-    return StubLLMClient(fixtures={"five engineers": first, "seven engineers": second}, default="[]")
+    return PromptSourceAwareStub(
+        fixtures={"five engineers": first, "seven engineers": second}, default="[]"
+    )
 
 
 @pytest.mark.parametrize("flag_on", [False, True])
@@ -462,7 +467,7 @@ def _xsession_llm() -> StubLLMClient:
     second = _chunk_extraction_response(
         [{"subject": XS_SUBJECT, "predicate": XS_PRED, "object": XS_NEW, "polarity": 1}]
     )
-    return StubLLMClient(
+    return PromptSourceAwareStub(
         fixtures={"twenty people": first, "thirty-five people": second}, default="[]"
     )
 
@@ -588,7 +593,9 @@ def _version_update_llm() -> StubLLMClient:
     second = _chunk_extraction_response(
         [{"subject": VER_SUBJECT, "predicate": VER_PRED, "object": VER_NEW, "polarity": 1}]
     )
-    return StubLLMClient(fixtures={"2.3.1": first, "2.4.0": second}, default="[]")
+    return PromptSourceAwareStub(
+        fixtures={"2.3.1": first, "2.4.0": second}, default="[]"
+    )
 
 
 @pytest.mark.parametrize("flag_on", [False, True])
@@ -645,7 +652,9 @@ def _python_bump_llm() -> StubLLMClient:
     second = _chunk_extraction_response(
         [{"subject": "backend", "predicate": "uses", "object": "python_3.13", "polarity": 1}]
     )
-    return StubLLMClient(fixtures={"Python 3.12": first, "Python 3.13": second}, default="[]")
+    return PromptSourceAwareStub(
+        fixtures={"Python 3.12": first, "Python 3.13": second}, default="[]"
+    )
 
 
 @pytest.mark.parametrize("flag_on", [False, True])
@@ -707,7 +716,9 @@ def _python_vs_node_llm() -> StubLLMClient:
         [{"subject": "backend", "predicate": "uses", "object": "node_20",
           "polarity": 1, "value_numeric": 20}]
     )
-    return StubLLMClient(fixtures={"Python 3.12": first, "Node 20": second}, default="[]")
+    return PromptSourceAwareStub(
+        fixtures={"Python 3.12": first, "Node 20": second}, default="[]"
+    )
 
 
 @pytest.mark.parametrize("flag_on", [False, True])
@@ -760,7 +771,9 @@ def _sprints_llm() -> StubLLMClient:
     second = _chunk_extraction_response(
         [{"subject": "project_atlas", "predicate": "contains", "object": "sprint_4", "polarity": 1}]
     )
-    return StubLLMClient(fixtures={"sprint 3": first, "sprint 4": second}, default="[]")
+    return PromptSourceAwareStub(
+        fixtures={"sprint 3": first, "sprint 4": second}, default="[]"
+    )
 
 
 @pytest.mark.parametrize("flag_on", [False, True])
@@ -819,7 +832,7 @@ def _possessions_llm() -> StubLLMClient:
         [{"subject": "atta", "predicate": "owns", "object": "leica_m6_camera",
           "polarity": 1, "value_numeric": 1984}]
     )
-    return StubLLMClient(
+    return PromptSourceAwareStub(
         fixtures={"Omega Seamaster": first, "Leica M6": second}, default="[]"
     )
 
@@ -884,7 +897,7 @@ def _bare_number_unit_refinement_llm() -> StubLLMClient:
           "object": "90_minutes", "polarity": 1, "value_numeric": 90,
           "value_unit": "minutes"}]
     )
-    return StubLLMClient(
+    return PromptSourceAwareStub(
         fixtures={"165 minutes": first, "90 minutes": second}, default="[]"
     )
 

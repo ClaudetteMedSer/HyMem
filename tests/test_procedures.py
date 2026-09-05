@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from hymem import HyMem
 from hymem.dreaming.procedures import (
@@ -26,16 +27,57 @@ from hymem.extraction.llm import StubLLMClient
 # --- helpers ---------------------------------------------------------------
 
 
-def _procedure_llm(items: list[dict]) -> StubLLMClient:
+class _ProcedureDigestLLM:
+    """Produce strict digest procedures backed by ids in the actual window."""
+
+    def __init__(self, items: list[dict]):
+        self.items = items
+        self.calls = []
+        self.cited_chunk_ids: list[list[str]] = []
+
+    def complete(self, request) -> str:
+        self.calls.append(request)
+        if "Return the JSON object now" not in request.user:
+            return "[]"
+        # The strict digest contract admits only producer-rendered NEW
+        # msgcov ids. Deriving these from the exact prompt keeps the fixture
+        # valid when global message ids and coverage hashes change.
+        chunk_ids = list(dict.fromkeys(re.findall(
+            r"\[chunk (msgcov_[^\]\s]+)\]", request.user
+        )))
+        assert chunk_ids, "digest prompt must expose current coverage provenance"
+        self.cited_chunk_ids.append(chunk_ids)
+        procedures = []
+        for item in self.items:
+            prepared = json.loads(json.dumps(item))
+            prepared["chunk_ids"] = chunk_ids
+            procedures.append(prepared)
+        return json.dumps({
+            "episodes": [], "summary": "", "procedures": procedures,
+        })
+
+
+def _procedure_llm(items: list[dict]) -> _ProcedureDigestLLM:
     """Stub that returns ``items`` as the procedures section of the batched
     session-digest response (episodes/summary empty), and an empty array for
     every other extraction call (triples, markers). Keyed on the unique digest
     user-prompt closer ``Return the JSON object now``."""
-    digest = {"episodes": [], "summary": "", "procedures": items}
-    return StubLLMClient(
-        fixtures={"Return the JSON object now": json.dumps(digest)},
-        default="[]",
-    )
+    return _ProcedureDigestLLM(items)
+
+
+def _assert_current_coverage_was_cited(
+    hy: HyMem, sid: str, llm: _ProcedureDigestLLM
+) -> None:
+    assert llm.cited_chunk_ids
+    actual = {
+        row["chunk_id"]
+        for row in hy.conn.execute(
+            "SELECT chunk_id FROM message_retention_coverage "
+            "WHERE source_session_id = ? AND source_role IN ('user','assistant')",
+            (sid,),
+        ).fetchall()
+    }
+    assert set(llm.cited_chunk_ids[-1]) == actual
 
 
 def _seed_session(hy: HyMem, sid: str, turns: list[tuple[str, str]]) -> None:
@@ -62,9 +104,12 @@ def test_extract_returns_none_for_empty_session(cfg, stub_llm):
         hy.close()
 
 
-def test_extract_filters_items_missing_name_or_steps(cfg):
-    """An item with no name, no steps list, or no valid step objects is
-    silently dropped. The valid sibling still comes through."""
+def test_digest_rejects_malformed_procedure_siblings_atomically(cfg):
+    """Malformed non-empty items hold the whole digest slice for retry.
+
+    Persisting the valid sibling while advancing would silently discard the
+    malformed procedures and falsely claim complete source coverage.
+    """
     llm = _procedure_llm([
         {"name": "", "steps": [{"order": 1, "action": "do thing"}]},          # no name
         {"name": "no steps", "steps": []},                                    # empty steps
@@ -95,16 +140,7 @@ def test_extract_filters_items_missing_name_or_steps(cfg):
             "FROM procedures WHERE session_id = ?",
             (sid,),
         ).fetchall()
-        assert len(rows) == 1, "only the well-formed procedure should survive"
-        row = rows[0]
-        assert row["name"] == "Deploy to staging"
-        assert row["description"].startswith("Push the current build")
-        assert json.loads(row["triggers"]) == ["deploy", "ship to staging"]
-        assert json.loads(row["entities_involved"]) == ["docker", "staging"]
-        steps = json.loads(row["steps"])
-        assert [s["order"] for s in steps] == [1, 2]
-        assert steps[0]["tool"] == "docker"
-        assert steps[1]["tool"] is None
+        assert rows == []
     finally:
         hy.close()
 
@@ -118,7 +154,7 @@ def test_extract_renormalizes_step_order(cfg):
             "name": "Run integration tests",
             "description": "Run the pytest integration suite locally.",
             "steps": [
-                {"order": 7, "action": "interpret coverage report"},
+                {"order": 7, "action": "interpret coverage report", "tool": None},
                 {"order": 3, "action": "spin up the docker compose stack", "tool": "docker compose"},
                 {"order": 5, "action": "invoke pytest", "tool": "pytest"},
             ],
@@ -134,6 +170,7 @@ def test_extract_renormalizes_step_order(cfg):
             ("user", "We spin up docker compose, run pytest, then read the coverage report."),
         ])
         hy.dream()
+        _assert_current_coverage_was_cited(hy, sid, llm)
 
         row = hy.conn.execute(
             "SELECT steps FROM procedures WHERE session_id = ?", (sid,),
@@ -213,6 +250,7 @@ def test_procedure_surfaces_via_augment_fts(cfg):
             ("user", "Build the docker image and kubectl apply the staging manifests."),
         ])
         hy.dream()
+        _assert_current_coverage_was_cited(hy, sid, llm)
 
         ctx = hy.augment("how do I deploy to staging?")
         assert ctx.procedures, "expected a procedure hit for a staging-deploy query"
@@ -251,6 +289,7 @@ def _seed_one_procedure(cfg) -> tuple[HyMem, str]:
         ("user", "Build the docker image and kubectl apply the staging manifests."),
     ])
     hy.dream()
+    _assert_current_coverage_was_cited(hy, "s_stale", llm)
     hit = hy.augment("how do I deploy to staging?").procedures[0]
     return hy, hit.procedure_id
 

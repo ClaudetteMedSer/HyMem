@@ -78,7 +78,7 @@ import tempfile
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _repo_root = Path(__file__).resolve().parent.parent
@@ -90,6 +90,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling benchmark im
 # msc_adapter's module level is stdlib-only, so this import stays --sim-safe;
 # longmemeval_adapter pieces are imported lazily inside functions, MSC-style.
 from msc_adapter import MSCAdapter, _lex_match
+from benchmarks.strictness import (
+    AtomicCheckpoint,
+    BenchmarkIntegrityError,
+    add_strict_run_arguments,
+    build_manifest,
+    code_hash,
+    content_hash,
+    file_hash,
+    freeze_calibration,
+    load_calibration,
+    publish_checkpoint_artifact,
+    resolve_checkpoint_path,
+    select_protocol_ids,
+    usage_snapshot,
+    validate_ids,
+    write_latest_pointer,
+)
 
 _ANSWER_MODEL = "deepseek-v4-flash"
 _JUDGE_MODEL = "deepseek-v4-flash"
@@ -224,7 +241,15 @@ def load_locomo_data(path: str | None, *, user_speaker: str = "a",
 
     out = []
     for ci, rec in enumerate(raw):
+        if not isinstance(rec, dict):
+            raise BenchmarkIntegrityError(
+                f"LoCoMo conversation {ci} must be an object"
+            )
         conv = rec.get("conversation") or {}
+        if not isinstance(conv, dict):
+            raise BenchmarkIntegrityError(
+                f"LoCoMo conversation {ci} payload must be an object"
+            )
         speaker_a = (conv.get("speaker_a") or "Speaker A").strip()
         speaker_b = (conv.get("speaker_b") or "Speaker B").strip()
         user_name = speaker_a if user_speaker == "a" else speaker_b
@@ -256,27 +281,60 @@ def load_locomo_data(path: str | None, *, user_speaker: str = "a",
                 sessions.append(turns)
                 dates.append(dt.strftime("%Y-%m-%d %H:%M"))
         if not sessions:
-            continue
+            raise BenchmarkIntegrityError(
+                f"LoCoMo conversation {ci} contains no usable sessions"
+            )
 
         sample_id = str(rec.get("sample_id") or f"locomo_{ci}")
         qa = []
-        for qi, q in enumerate(rec.get("qa") or []):
+        raw_qa = rec.get("qa") or []
+        if not isinstance(raw_qa, list):
+            raise BenchmarkIntegrityError(
+                f"LoCoMo {sample_id} qa must be a list"
+            )
+        for qi, q in enumerate(raw_qa):
+            if not isinstance(q, dict):
+                raise BenchmarkIntegrityError(
+                    f"LoCoMo {sample_id} question {qi} must be an object"
+                )
             cat = _coerce_category(q)
             question = (q.get("question") or "").strip()
-            if cat not in CATEGORY_NAME or not question:
-                continue
+            if cat not in CATEGORY_NAME:
+                raise BenchmarkIntegrityError(
+                    f"LoCoMo {sample_id} question {qi} has invalid category"
+                )
+            if not question:
+                raise BenchmarkIntegrityError(
+                    f"LoCoMo {sample_id} question {qi} is empty"
+                )
             if categories and cat not in categories:
                 continue
+            answer = _coerce_answer(q)
+            adversarial = (q.get("adversarial_answer") or "").strip()
+            if cat != 5 and answer is None:
+                raise BenchmarkIntegrityError(
+                    f"LoCoMo {sample_id} question {qi} has no answer"
+                )
+            if cat == 5 and not adversarial:
+                raise BenchmarkIntegrityError(
+                    f"LoCoMo {sample_id} adversarial question {qi} has no trap answer"
+                )
+            question_id = f"{sample_id}_q{qi}"
             qa.append({
-                "qa_id": f"{sample_id}_q{qi}",
+                "qa_id": question_id,
+                "question_id": question_id,
                 "question": question,
-                "answer": _coerce_answer(q),          # None on cat-5
-                "adversarial_answer": (q.get("adversarial_answer") or "").strip(),
+                "answer": answer,          # None on cat-5
+                "adversarial_answer": adversarial,
                 "category": cat,
                 "qtype": CATEGORY_NAME[cat],
                 "judge_type": CATEGORY_JUDGE[cat],
                 "evidence": _coerce_evidence(q),
             })
+        if not qa and not categories:
+            raise BenchmarkIntegrityError(
+                f"LoCoMo {sample_id} contains no usable questions"
+            )
         out.append({
             "id": sample_id, "speaker_a": speaker_a, "speaker_b": speaker_b,
             "sessions": sessions, "session_dates": dates,
@@ -378,6 +436,15 @@ def _gold_for_judge(cat: int, answer, trap) -> str:
 def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
                 answer_llm, judge_llm) -> dict:
     cat = q["category"]
+    from longmemeval_adapter import _detect_ability, _detect_ability_safe
+
+    category_steering = bool(getattr(args, "category_steering", False))
+    detected_ability = (
+        _detect_ability_safe(q["question"])
+        if category_steering else _detect_ability(q["question"])
+    )
+    oracle_ability = "TR" if cat == 2 else None
+    ability = oracle_ability if category_steering else detected_ability
     # top_k * 3 at the pipeline layer — the LME driver's multiplier, inherited
     # via MSCAdapter.search (the silently-dropped ×3 was the entire BEAM June
     # regression AND the first 23pp of the MSC arc; never again).
@@ -387,26 +454,43 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
     # char caps — cat-2 routes to ability="TR", which doubles the budget) so
     # gold-surface is measured against what the reader actually receives, not
     # against the pre-render top_k list. Pure string work, no LLM call.
-    ability = "TR" if cat == 2 else None
-    rendered = None
-    if not args.sim:
-        from longmemeval_adapter import _render_answer_context
-        rendered = _render_answer_context(
-            memories, ability, info["total_matches"], info["graph_count"],
-            info["temporal_events"], info["aggregation_nodes"],
-            narrative_facts=info["narrative_facts"])
-
-    diag = _evidence_diagnostics(q, conv, [m["content"] for m in memories],
-                                 info["pool"], rendered=rendered)
-
     extra = locomo_perspective_clause(conv["speaker_a"], conv["speaker_b"],
                                       user_is_a=(args.user_speaker == "a"))
-    if cat == 3:
+    if category_steering and cat == 3:
         extra += LOCOMO_OPEN_DOMAIN_CLAUSE
     if args.answerable_clause and cat != 5:
         extra += LOCOMO_ANSWERABLE_CLAUSE
 
+    rendered = None
+    messages = None
+    if not args.sim:
+        from longmemeval_adapter import build_answer_messages
+        question_date = conv["session_dates"][-1] if conv["session_dates"] else ""
+        messages = build_answer_messages(
+            memories, q["question"], ability=ability,
+            total_matches=info["total_matches"], graph_count=info["graph_count"],
+            temporal_events=info["temporal_events"],
+            aggregation_nodes=info["aggregation_nodes"],
+            narrative_facts=info["narrative_facts"],
+            question_date=question_date,
+            permissive_default=(category_steering and cat == 3),
+            extra_system=extra,
+            max_input_tokens=getattr(args, "max_input_tokens", 16000),
+            token_counter=(
+                getattr(answer_llm, "count_tokens", None)
+                if answer_llm is not None else None
+            ),
+        )
+        user_text = messages[1]["content"]
+        rendered = user_text.split("CONTEXT:\n", 1)[-1].rsplit(
+            "\n\nQUESTION:", 1
+        )[0]
+
+    diag = _evidence_diagnostics(q, conv, [m["content"] for m in memories],
+                                 info["pool"], rendered=rendered)
+
     judge_raw = ""            # only the judge branch below can set this
+    benchmark_failure = None
     if args.diag_only:
         # Retrieval + render only — no reader, no judge. `correct` stays None
         # because this pass CANNOT produce accuracy; locomo_audit.py joins the
@@ -419,24 +503,21 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
         # (on cat-5 it reports whether the trap-source turn surfaces).
         ai, correct = (memories[0]["content"] if memories else ""), diag["gold_in_context"]
     else:
-        from longmemeval_adapter import answer_question, judge_scored
-        question_date = conv["session_dates"][-1] if conv["session_dates"] else ""
-        ai = answer_question(
-            answer_llm, memories, q["question"],
-            ability="TR" if cat == 2 else None,
-            total_matches=info["total_matches"], graph_count=info["graph_count"],
-            temporal_events=info["temporal_events"],
-            aggregation_nodes=info["aggregation_nodes"],
-            narrative_facts=info["narrative_facts"],
-            question_date=question_date,
-            permissive_default=(cat == 3),
-            extra_system=extra)
-        gold_for_judge = _gold_for_judge(cat, q["answer"] or "",
-                                         q["adversarial_answer"])
-        correct, judge_raw = judge_scored(judge_llm, q["judge_type"],
-                                          q["question"], gold_for_judge, ai)
+        from longmemeval_adapter import judge_scored
+        ai = answer_llm.chat(messages, temperature=0.0, max_tokens=1024)
+        if (ai or "").startswith("[LLM_ERROR"):
+            correct = False
+            benchmark_failure = "reader_transport_or_content_failure"
+        else:
+            gold_for_judge = _gold_for_judge(cat, q["answer"] or "",
+                                             q["adversarial_answer"])
+            correct, judge_raw = judge_scored(judge_llm, q["judge_type"],
+                                              q["question"], gold_for_judge, ai)
+            if correct is None:
+                benchmark_failure = "judge_transport_or_parse_failure"
 
-    rec = {"id": q["qa_id"], "conv_id": conv["id"], "question_type": q["qtype"],
+    rec = {"id": q["qa_id"], "question_id": q["question_id"],
+           "conv_id": conv["id"], "question_type": q["qtype"],
            "category": cat,
            "correct": (None if correct is None else bool(correct)),
            "judge_raw": judge_raw,
@@ -445,6 +526,10 @@ def evaluate_qa(q: dict, conv: dict, adapter: MSCAdapter, args,
            # than "the judge failed". Conflating them would report a run that
            # deliberately measured nothing as an outage.
            "judge_error": bool(judge_raw) and correct is None,
+           "benchmark_failure": benchmark_failure,
+           "oracle_ability": oracle_ability,
+           "detected_ability": detected_ability,
+           "ability_used": ability,
            "question": q["question"],
            "answer": q["answer"] if cat != 5 else f"[unanswerable; trap: {q['adversarial_answer']}]",
            "ai_answer": ai, "n_sessions": conv["n_sessions"],
@@ -494,7 +579,10 @@ def _aperture(args) -> dict:
             "graph_top_k": args.graph_top_k}
 
 
-def evaluate_conversation(conv: dict, args, answer_llm, judge_llm) -> list[dict]:
+def evaluate_conversation(
+    conv: dict, args, answer_llm, judge_llm, *,
+    pending_ids: set[str] | None = None, on_result=None,
+) -> list[dict]:
     """Ingest one conversation into its own store, then answer its questions.
     With --db-dir the store persists and is REUSED on later runs (ingest+dream
     over 19-32 sessions is the expensive step; QA/prompt iterations shouldn't
@@ -528,7 +616,23 @@ def evaluate_conversation(conv: dict, args, answer_llm, judge_llm) -> list[dict]
                 adapter.dream()
         results = []
         for k, q in enumerate(conv["qa"], 1):
-            results.append(evaluate_qa(q, conv, adapter, args, answer_llm, judge_llm))
+            if pending_ids is not None and q["question_id"] not in pending_ids:
+                continue
+            try:
+                row = evaluate_qa(q, conv, adapter, args, answer_llm, judge_llm)
+            except Exception as exc:
+                row = {
+                    "id": q["qa_id"], "question_id": q["question_id"],
+                    "conv_id": conv["id"], "question_type": q["qtype"],
+                    "category": q["category"], "question": q["question"],
+                    "correct": False, "judge_raw": "", "judge_error": False,
+                    "benchmark_failure": (
+                        f"execution_failure: {type(exc).__name__}: {exc}"
+                    ),
+                }
+            results.append(row)
+            if on_result is not None:
+                on_result(row)
             if k % 20 == 0:
                 print(f"  [{conv['id']}] {k}/{len(conv['qa'])}", flush=True)
         # --diag-only writes correct=None (no reader ran), so there is no accuracy
@@ -564,10 +668,12 @@ def _compute_scores_local(results: list[dict]) -> dict:
     """Fallback mirror of longmemeval_adapter.compute_scores (accuracy by
     question_type, _abs folded into the base type) so --sim runs with zero API
     deps — importing the LME module pulls in `requests` at module level."""
-    results = [r for r in results if r.get("correct") is not None]
     by_type: dict[str, list[bool]] = defaultdict(list)
     for r in results:
-        by_type[r["question_type"].replace("_abs", "")].append(r["correct"])
+        verdict = r.get("correct")
+        if verdict is not None and not isinstance(verdict, bool):
+            raise BenchmarkIntegrityError("LoCoMo result has malformed verdict")
+        by_type[r["question_type"].replace("_abs", "")].append(bool(verdict))
     scores = {t: {"accuracy": sum(c) / len(c), "count": len(c)}
               for t, c in by_type.items()}
     all_c = [c for cs in by_type.values() for c in cs]
@@ -584,18 +690,10 @@ def _print_report(results: list[dict], args) -> None:
         compute_scores = _compute_scores_local
         compute_abstention_scores = print_abstention_scores = None
         judge_error_note = None
-    # UNSCORED rows (the judge errored — D3) are dropped ONCE, here, rather than
-    # guarded at each summation below. `--diag-only` never reaches this branch,
-    # so the only correct=None seen here is a judge error.
-    #
-    # The note is silent on the offline `--sim` path, which is correct rather
-    # than a gap: that path takes the ImportError fallback above precisely
-    # because it makes no LLM calls at all, so there is no judge that could
-    # have failed. It is the one place where "no judge errors" needs no
-    # denominator.
+    # Strict headline scores retain judge/reader/execution failures as wrong.
+    # A separately named conditional count is printed for diagnosis only.
     if judge_error_note:
         print(f"\n  {judge_error_note(results)}")
-    results = [r for r in results if r.get("correct") is not None]
     scores = compute_scores(results)
     ov = scores.pop("OVERALL")
     print(f"\n=== LoCoMo — n={ov['count']} ===")
@@ -605,6 +703,10 @@ def _print_report(results: list[dict], args) -> None:
         print("  [NON-CANONICAL] --answerable-clause is label-leaky "
               "(conditions the prompt on the adversarial label)")
     print(f"  overall accuracy: {ov['accuracy']*100:.1f}%")
+    valid_rows = [r for r in results if not r.get("benchmark_failure")]
+    print(f"  conditional valid-only: n={len(valid_rows)} "
+          f"(strict denominator n={len(results)}, "
+          f"failures={len(results) - len(valid_rows)})")
     # Stamp the aperture: a run is only comparable to another at the SAME one,
     # and message_fts_top_k is the hard ceiling on gold-turn surfacing.
     ap_eff = {**MSCAdapter.APERTURE,
@@ -624,7 +726,10 @@ def _print_report(results: list[dict], args) -> None:
     # E1 analogue: accuracy vs sessions-back to the farthest evidence turn,
     # bucketed (LoCoMo distances run 1..32). Answerable cats only — cat-5
     # "evidence" is the trap source, not a gold location.
-    answerable = [r for r in results if r["category"] != 5]
+    answerable = [
+        r for r in results
+        if r["category"] != 5 and not r.get("benchmark_failure")
+    ]
     if answerable:
         by_bucket: dict[str, list[dict]] = defaultdict(list)
         for r in answerable:

@@ -184,11 +184,11 @@ def test_render_puts_rules_first_and_only_when_present():
 
 
 def test_system_prompt_gains_directive_only_with_rules():
-    from hymem.query.ask import ASK_PROMPT_V1, ASK_RULES_DIRECTIVE, _system_prompt
+    from hymem.query.ask import ASK_PROMPT_V2, ASK_RULES_DIRECTIVE, _system_prompt
 
-    assert _system_prompt(False) == ASK_PROMPT_V1          # base untouched
+    assert _system_prompt(False) == ASK_PROMPT_V2          # active base untouched
     withr = _system_prompt(True)
-    assert withr.startswith(ASK_PROMPT_V1) and ASK_RULES_DIRECTIVE in withr
+    assert withr.startswith(ASK_PROMPT_V2) and ASK_RULES_DIRECTIVE in withr
 
 
 def test_ask_end_to_end_surfaces_rules(hyr, stub_llm):

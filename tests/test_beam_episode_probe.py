@@ -409,7 +409,9 @@ def test_the_judge_s_field_is_unchanged_by_the_probe_fix():
 
     sample = {
         "conversation_id": "c1",
-        "chat": [[{"role": "user", "content": "hi", "time_anchor": None}]],
+        "chat": [[{
+            "role": "user", "content": "hi", "time_anchor": "2025-01-02",
+        }]],
         "probing_questions": {
             "event_ordering": [
                 {"question": "in what order?", "answer": "first A then B",

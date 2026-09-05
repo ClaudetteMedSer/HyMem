@@ -31,6 +31,8 @@ import pytest
 
 from hymem import HyMem
 from hymem.core import db as core_db
+from hymem.dreaming.lossless import materialize_message_coverage
+from hymem.dreaming.user_profile import ProfileExtraction, persist_user_profile
 from hymem.extraction.llm import StubLLMClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
@@ -78,11 +80,15 @@ def _seed_edge(conn, subject: str, predicate: str, obj: str, *,
 
 
 def _seed_evidence(conn, edge_id: int, chunk_id: str, polarity: int = 1) -> None:
-    conn.execute(
-        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity, extracted_at) "
-        "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-        (edge_id, chunk_id, polarity),
-    )
+    # The probe deliberately seeds a historical ledger/cache snapshot instead
+    # of exercising runtime reconciliation.  Keep that setup behind the same
+    # scoped authority used by migrations/importers.
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity, extracted_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (edge_id, chunk_id, polarity),
+        )
 
 
 def _count_writes(conn) -> dict[str, int]:
@@ -233,18 +239,45 @@ def test_seed_terms_dedup_stable_order():
 
 def _seed_profile(conn, slot: str, value: str, *, slot_key: str | None = None,
                   invalid_at: str | None = None, confidence: float = 1.0) -> None:
+    if slot != "relationship":
+        assert slot_key is None, "non-relationship profile slots cannot have keys"
+    session_id = "state-anchor-profile-source"
     conn.execute(
-        "INSERT INTO user_profile(slot, slot_key, value, confidence, valid_at, invalid_at) "
-        "VALUES (?, ?, ?, ?, '2024-01-01 00:00:00', ?)",
-        (slot, slot_key, value, confidence, invalid_at),
+        "INSERT OR IGNORE INTO sessions(id, started_at) VALUES (?, '2024-01-01 00:00:00')",
+        (session_id,),
     )
+    cur = conn.execute(
+        "INSERT INTO messages(session_id, role, content, created_at) "
+        "VALUES (?, 'user', ?, '2024-01-01 00:00:00')",
+        (session_id, f"My {slot} is {value}."),
+    )
+    materialize_message_coverage(conn, session_id)
+    item = {
+        "slot": slot,
+        "value": value,
+        "evidence_message_id": int(cur.lastrowid),
+        "confidence": confidence,
+    }
+    if slot == "relationship":
+        item["slot_key"] = slot_key
+    inserted = persist_user_profile(
+        conn,
+        ProfileExtraction(items=[item]),
+        redact_values=False,
+    )
+    assert inserted == 1
+    if invalid_at is not None:
+        conn.execute(
+            "UPDATE user_profile SET invalid_at = ? WHERE source_message_id = ?",
+            (invalid_at, int(cur.lastrowid)),
+        )
 
 
 def _seed_squeeze(conn) -> None:
     """3 profile rows + 6 edges — enough for a cap of 4 to starve the edges."""
     with core_db.transaction(conn):
         for val in ["running", "pottery", "reading"]:
-            _seed_profile(conn, "recurring_activity", val, slot_key="melanie")
+            _seed_profile(conn, "recurring_activity", val)
         for i in range(6):
             _seed_edge(conn, f"m{i}", "uses", "postgres", pos=3, neg=0)
 

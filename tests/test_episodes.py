@@ -99,7 +99,8 @@ def test_persist_episodes_populates_message_range_and_participants(cfg):
         # episode-returning stub.
         hy.dream()
         rows = hy.conn.execute(
-            "SELECT id FROM chunks WHERE session_id = ? ORDER BY start_message_id",
+            "SELECT id FROM chunks WHERE session_id = ? "
+            "AND chunk_kind = 'coverage' ORDER BY start_message_id",
             (sid,),
         ).fetchall()
         assert rows, "expected at least one chunk to be persisted"
@@ -150,10 +151,11 @@ def test_persist_episodes_drops_hallucinated_chunk_ids(cfg, stub_llm):
         # Persist chunks via a no-episode dream.
         hy.dream()
         real_ids = [
-            r["id"]
-            for r in hy.conn.execute(
-                "SELECT id FROM chunks WHERE session_id = ?", (sid,)
-            ).fetchall()
+                r["id"]
+                for r in hy.conn.execute(
+                    "SELECT id FROM chunks WHERE session_id = ? "
+                    "AND chunk_kind = 'extraction'", (sid,)
+                ).fetchall()
         ]
         assert real_ids
 
@@ -182,9 +184,12 @@ def test_persist_episodes_drops_hallucinated_chunk_ids(cfg, stub_llm):
 
 
 def test_episode_id_is_stable_across_redreams(cfg):
-    """Same message range → same id → UPSERT updates title/summary in place,
-    so re-dreaming with new content for the same range doesn't drop or
-    duplicate rows."""
+    """A completed full re-digest atomically swaps its episode generation.
+
+    Standalone persistence and retries inside one active walk retain stable
+    ids, but an explicitly forced replacement walk needs distinct ids so it
+    cannot overwrite published content before reaching the coverage tail.
+    """
     sid = "s_redream"
     hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
     try:
@@ -196,7 +201,8 @@ def test_episode_id_is_stable_across_redreams(cfg):
         chunk_ids = [
             r["id"]
             for r in hy.conn.execute(
-                "SELECT id FROM chunks WHERE session_id = ?", (sid,)
+                "SELECT id FROM chunks WHERE session_id = ? "
+                "AND chunk_kind = 'coverage'", (sid,)
             ).fetchall()
         ]
 
@@ -219,9 +225,9 @@ def test_episode_id_is_stable_across_redreams(cfg):
         first_id = rows1[0]["id"]
         assert rows1[0]["title"] == "Database choice"
 
-        # Dream 2: re-emit the same episode (same chunk range) but rewrite
-        # title and summary. UPSERT keeps the row count at 1 and updates
-        # the content rather than ignoring the new fields.
+        # Dream 2: re-emit the same episode (same chunk range) but rewrite its
+        # title and summary. Completion removes the prior generation, leaving
+        # one authoritative replacement rather than a duplicate.
         hy.set_llm(_episode_llm_response([
             {
                 "title": "Postgres selection rationale",
@@ -237,7 +243,7 @@ def test_episode_id_is_stable_across_redreams(cfg):
             "SELECT id, title, summary FROM episodes WHERE session_id = ?", (sid,)
         ).fetchall()
         assert len(rows2) == 1
-        assert rows2[0]["id"] == first_id  # rowid-stable for FTS / vec joins
+        assert rows2[0]["id"] != first_id
         assert rows2[0]["title"] == "Postgres selection rationale"
         assert "replication" in rows2[0]["summary"]
 
@@ -271,7 +277,8 @@ def test_dream_populates_episode_embeddings_and_vec(cfg):
         chunk_ids = [
             r["id"]
             for r in hy.conn.execute(
-                "SELECT id FROM chunks WHERE session_id = ?", (sid,)
+                "SELECT id FROM chunks WHERE session_id = ? "
+                "AND chunk_kind = 'coverage'", (sid,)
             ).fetchall()
         ]
         hy.set_llm(_episode_llm_response([
@@ -316,7 +323,8 @@ def test_episode_embedding_refreshes_after_upsert(cfg):
         chunk_ids = [
             r["id"]
             for r in hy.conn.execute(
-                "SELECT id FROM chunks WHERE session_id = ?", (sid,)
+                "SELECT id FROM chunks WHERE session_id = ? "
+                "AND chunk_kind = 'coverage'", (sid,)
             ).fetchall()
         ]
 
@@ -348,8 +356,7 @@ def test_episode_embedding_refreshes_after_upsert(cfg):
 
 
 def test_episode_embedding_idempotent_when_unchanged(cfg):
-    """Two dreams in a row with identical episode content → second cycle
-    embeds nothing extra."""
+    """An identical replacement generation reuses cached embedding content."""
     sid = "s_idem"
     embed = StubEmbeddingClient()
     hy = HyMem(cfg, llm=StubLLMClient(default="[]"), embedding_client=embed)
@@ -362,7 +369,8 @@ def test_episode_embedding_idempotent_when_unchanged(cfg):
         chunk_ids = [
             r["id"]
             for r in hy.conn.execute(
-                "SELECT id FROM chunks WHERE session_id = ?", (sid,)
+                "SELECT id FROM chunks WHERE session_id = ? "
+                "AND chunk_kind = 'coverage'", (sid,)
             ).fetchall()
         ]
         ep_payload = [{
@@ -377,14 +385,14 @@ def test_episode_embedding_idempotent_when_unchanged(cfg):
         report1 = hy.dream()
         assert report1.episodes_embedded == 1
 
-        # Same content → fetch_episode_embeddings sees matching text_hash
-        # for the only episode → returns None → no embed. We force the digest
-        # to re-run so this exercises embedding idempotency (matching text_hash),
-        # not just the per-session digest skip-guard.
+        # The forced full walk intentionally receives a new episode id for
+        # publication safety. Its identical text must hit the content-addressed
+        # embedding cache instead of calling the embedder again.
         hy.set_llm(_episode_llm_response(ep_payload))
         _force_redigest(hy, sid)
         report2 = hy.dream()
-        assert report2.episodes_embedded == 0
+        assert report2.episodes_embedded == 1
+        assert report2.episodes_embedded_from_cache == 1
     finally:
         hy.close()
 
@@ -410,7 +418,8 @@ def test_episode_semantic_search_surfaces_topic_match(cfg):
         chunk_ids = [
             r["id"]
             for r in hy.conn.execute(
-                "SELECT id FROM chunks WHERE session_id = ?", (sid,)
+                "SELECT id FROM chunks WHERE session_id = ? "
+                "AND chunk_kind = 'coverage'", (sid,)
             ).fetchall()
         ]
         title = "Metrics pipeline migration"

@@ -4,7 +4,11 @@ import json
 import math
 
 from hymem import HyMem, StubEmbeddingClient
-from hymem.extraction.embeddings import CachedEmbeddingClient, normalize_text
+from hymem.extraction.embeddings import (
+    CachedEmbeddingClient,
+    embedding_text_hash,
+    normalize_text,
+)
 from hymem.extraction.llm import StubLLMClient
 from hymem.core import db as core_db
 from hymem.query.augment import _vector_search
@@ -76,7 +80,8 @@ def test_persist_chunk_embeddings_reembed_same_rowid(hy_with_embed):
     def pending(vec: list[float]) -> PendingChunkEmbeddings:
         return PendingChunkEmbeddings(
             ids=["c1"], chunk_rowids=[rowid], vectors=[vec], dim=len(vec),
-            model="stub", text_hashes=["h"], from_cache=[False],
+                model="stub", text_hashes=[embedding_text_hash("txt")],
+                from_cache=[False],
         )
 
     with core_db.transaction(conn):
@@ -336,7 +341,12 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg):
     embed = SlowEmbed()
     tight_cfg = _dc_replace(cfg, dream_budget=5, dream_baseline_budget=0)
 
-    llm = SlowLLM(default="[]")
+    llm = SlowLLM(
+        fixtures={
+            "single pass": json.dumps({"triples": [], "markers": []}),
+        },
+        default="[]",
+    )
     hy = HyMem(tight_cfg, llm=llm, embedding_client=embed)
     try:
         hy.open_session("s1")

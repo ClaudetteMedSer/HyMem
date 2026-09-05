@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from hymem.core.db import connect, initialize
-from hymem.dreaming.chunks import extract_high_salience_chunks
+from hymem.dreaming.chunks import extract_high_salience_chunks, persist_chunks
+from hymem.dreaming.lossless import materialize_message_coverage
 
 
 @pytest.fixture
@@ -85,3 +87,26 @@ def test_dutch_we_gebruiken_trigger(conn):
     out = _reasons(conn)
     assert len(out) == 1
     assert out[0][0] == "correction_or_preference_trigger"
+
+
+def test_persisted_chunk_identity_ignores_scheduling_reason(conn):
+    """A tier/race label is not part of the immutable source artifact.
+
+    A baseline snapshot can be persisted immediately before the salience tier
+    sees the same stable source range.  Session/range/text/kind and the exact
+    manifest must collide exactly, while the scheduling reason may differ.
+    """
+    _add_user(conn, "A sufficiently long source message for deterministic chunking.")
+    materialize_message_coverage(conn, "s")
+    chunk = extract_high_salience_chunks(conn, "s", min_chars=30)[0]
+    persist_chunks(conn, [replace(chunk, salience_reason="baseline_backstop")])
+    persist_chunks(conn, [chunk])
+
+    stored = conn.execute(
+        "SELECT salience_reason, source_manifest_count FROM chunks WHERE id = ?",
+        (chunk.id,),
+    ).fetchone()
+    assert stored["salience_reason"] == "baseline_backstop"
+    assert stored["source_manifest_count"] == 1
+    with pytest.raises(RuntimeError, match="chunk identity collision"):
+        persist_chunks(conn, [replace(chunk, text=chunk.text + " tampered")])

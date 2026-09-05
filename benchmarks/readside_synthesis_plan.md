@@ -1,5 +1,11 @@
 # Read-side synthesis plan — flip-watch → P0 reader parity → P1 bounded reflect
 
+> **Historical plan, not current benchmark evidence.** Its 70.0 HyMem and 91.4
+> Hindsight figures were local/then-current planning inputs under a superseded
+> protocol. Do not quote its gap arithmetic as a present comparison. The current
+> orientation point is Hindsight's official March 2026 94.6 single-query result;
+> HyMem has not rerun a replacement score under the new strict LME envelope.
+
 *Written 2026-07-24, branch `Beam-optimisation`. Companion to
 `benchmarks/raptor_digest_plan.md` (RAPTOR product thread),
 `benchmarks/longmemeval_roadmap.md` (LME record — P0/P1 are its candidate
@@ -8,10 +14,10 @@ contract: front-run gate before any build, additive-only, mechanism > score,
 nothing reads oracle labels at decision time, per-category LME deltas under
 ~±5pp are noise (strict runs swing ~4 questions/category on identical config).*
 
-**Motivating context (from the 2026-07 Hindsight review):** Hindsight
-(Vectorize.io, arXiv 2512.12818) reports 91.4% LongMemEval (MS 79.7) on an
+**Motivating context (from the historical 2026-07 Hindsight review):** Hindsight
+(Vectorize.io, arXiv 2512.12818) then reported 91.4% LongMemEval (MS 79.7) on an
 OSS-120B-class reader with an agentic ≤10-iteration "reflect" answer loop.
-HyMem's canonical is 70.0% full-dream (MS floor 51.9) on deepseek-chat with a
+HyMem's then-local baseline was 70.0% full-dream (MS floor 51.9) on deepseek-chat with a
 single-shot answerer. Three independent closed HyMem investigations agree the
 residual is **answer-side synthesis, not retrieval**: LME retrieval CLOSED
 (floor audit: 14-floor unrecoverable, MS decomposition banks 20 synthesis
@@ -185,7 +191,7 @@ unblocked in writing.
 
 ## Phase 1 — P0 reader-parity run (one measurement run, run before P1's A/B)
 
-**Question this answers:** how much of the ~21pp gap to Hindsight's 91.4 is
+**Historical question this answered:** how much of the then-estimated ~21pp gap to Hindsight's 91.4 was
 reader strength vs architecture? Even perfect MS only reaches ~82 from 70.0,
 so the gap is distributed — and D2/D8/KU residuals are all documented
 deepseek reader weaknesses. One run, condition-honest (reader reported next to

@@ -24,9 +24,72 @@ silently narrow it to its first element.
 from __future__ import annotations
 
 import json
+import math
+import re
 from typing import Any
 
 _DELIMS = {"object": ("{", "}"), "array": ("[", "]")}
+
+
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
+
+
+def loads_strict_json(text: str) -> Any:
+    """RFC-style JSON: reject duplicate keys and Python's NaN extensions."""
+    return json.loads(
+        text,
+        object_pairs_hook=_reject_duplicate_object_keys,
+        parse_constant=_reject_nonfinite_constant,
+        parse_float=_finite_float,
+    )
+
+
+def loads_exact_or_fenced(raw: object) -> Any | None:
+    """Parse exact JSON, allowing only a whole-response Markdown fence.
+
+    This is the advancement-authorizing parser for durable extraction
+    cursors/processed markers.  It deliberately does *not* scan surrounding
+    prose: a refusal or example containing a valid-looking empty object must
+    not become an authoritative successful empty.  Providers may still wrap
+    an otherwise pure answer in one complete ``json`` fence.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return loads_strict_json(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    match = re.fullmatch(
+        r"```(?:json)?\s*([\s\S]*?)\s*```",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    try:
+        return loads_strict_json(match.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return None
 
 
 def is_ceiling_cut(raw: str) -> bool:

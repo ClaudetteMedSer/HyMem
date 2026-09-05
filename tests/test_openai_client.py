@@ -176,6 +176,17 @@ def test_text_response_format_omits_the_key(calls) -> None:
     assert "response_format" not in calls[0]
 
 
+def test_explicit_trusted_token_counter_is_exposed(calls) -> None:
+    counter = lambda text: len(text.split())
+    client = OpenAICompatibleClient(token_counter=counter)
+    assert client.count_tokens is counter
+
+
+def test_non_callable_token_counter_is_rejected(calls) -> None:
+    with pytest.raises(TypeError, match="token_counter"):
+        OpenAICompatibleClient(token_counter=3)
+
+
 def test_missing_api_key_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     import openai
 

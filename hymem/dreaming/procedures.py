@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -29,12 +30,16 @@ def extract_procedures_for_session(
     transaction held; persist via persist_procedures inside one.
     """
     chunks = conn.execute(
-        "SELECT id, text FROM chunks WHERE session_id = ? ORDER BY start_message_id",
+        "SELECT id, text FROM chunks WHERE session_id = ? "
+        "AND chunk_kind = 'extraction' ORDER BY start_message_id",
         (session_id,),
     ).fetchall()
 
     episodes = conn.execute(
-        "SELECT title, summary FROM episodes WHERE session_id = ?",
+        "SELECT e.title, e.summary FROM episodes e "
+        "JOIN sessions s ON s.id = e.session_id "
+        "WHERE e.session_id = ? AND (e.digest_generation IS NULL "
+        "OR e.digest_generation = s.digest_published_generation)",
         (session_id,),
     ).fetchall()
 
@@ -146,14 +151,35 @@ def persist_procedures(
     session_id: str,
     extraction: ProceduresExtraction,
 ) -> int:
-    """Insert validated procedures. Caller wraps in core_db.transaction()."""
+    """Upsert validated procedures by stable session/name identity.
+
+    The old ``@proc0`` ordinal restarted for every digest tail, so the first
+    procedure from every later slice collided and was silently ignored.  A
+    normalized-name identity is stable across re-dreams and additive across
+    unrelated tails; existing legacy rows with the same name are reused.
+    """
     count = 0
     for item in extraction.items:
-        procedure_id = f"{session_id}@proc{count}"
+        existing = conn.execute(
+            "SELECT id FROM procedures WHERE session_id = ? "
+            "AND lower(name) = lower(?) ORDER BY id LIMIT 1",
+            (session_id, item["name"]),
+        ).fetchone()
+        name_hash = hashlib.sha1(
+            f"{session_id}\0{item['name'].strip().casefold()}".encode("utf-8")
+        ).hexdigest()[:16]
+        procedure_id = existing["id"] if existing else f"{session_id}@proc_{name_hash}"
         conn.execute(
-            """INSERT OR IGNORE INTO procedures(id, session_id, name, description,
+            """INSERT INTO procedures(id, session_id, name, description,
                steps, triggers, entities_involved)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   name = excluded.name,
+                   description = excluded.description,
+                   steps = excluded.steps,
+                   triggers = excluded.triggers,
+                   entities_involved = excluded.entities_involved,
+                   status = 'active'""",
             (
                 procedure_id,
                 session_id,

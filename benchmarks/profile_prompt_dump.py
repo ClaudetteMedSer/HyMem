@@ -12,13 +12,14 @@ never write to the store). It samples N sessions evenly across the store's
 history (not just the newest stretch) and prints, per session, the exact
 rendered extraction prompt over that session's USER turns ONLY. The rendering
 is delegated to `hymem.dreaming.user_profile.build_profile_user_prompt` — the
-same function the dream phase calls — so what you paste into the LLM on the
-box IS the production prompt, byte for byte (same [msg N] tags, same char
-cap). The shared system prompt is printed once at the top.
+same window renderer the dream phase calls — so what you paste into the LLM on
+the box is the exact first production slice (same [msg N] tags and character
+cap). Later slices are cursor-driven and include labeled boundary context. The
+shared system prompt is printed once at the top.
 
 Scoring procedure:
   1. For each printed session, paste the SYSTEM PROMPT + the session's user
-     prompt into the box LLM and collect the JSON array.
+     prompt into the box LLM and collect the named `{"items": [...]}` object.
   2. Per emitted item, judge: is the (slot, value) actually asserted by the
      cited [msg N] turn? precision = correct / emitted.
   3. Per session, note profile facts the user clearly stated that the LLM
@@ -72,9 +73,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--max-chars", type=int, default=12000,
-        help="Char cap on each rendered prompt body; keep at the production "
+        help="Char cap on the first rendered prompt body; keep at production "
              "default (cfg.dream_digest_max_chars = 12000) so the gate tests "
-             "the truncation the dream phase applies",
+             "resumable-window settings",
     )
     args = parser.parse_args()
 

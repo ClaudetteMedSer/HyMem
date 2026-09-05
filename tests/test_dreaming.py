@@ -36,9 +36,11 @@ def test_phase1_extracts_and_writes_evidence(hy):
         "FROM knowledge_graph ORDER BY object_canonical"
     ).fetchall()
     by_obj = {r["object_canonical"]: r for r in rows}
-    assert by_obj["docker"]["neg_evidence"] == 1
+    # Both claims cite the correcting USER message, so role weighting applies
+    # independently to positive and negative evidence.
+    assert by_obj["docker"]["neg_evidence"] == 2
     assert by_obj["docker"]["pos_evidence"] == 0
-    assert by_obj["uv"]["pos_evidence"] == 1
+    assert by_obj["uv"]["pos_evidence"] == 2
 
 
 def test_phase1_is_idempotent(hy):
@@ -53,7 +55,7 @@ def test_phase1_is_idempotent(hy):
     row = hy.conn.execute(
         "SELECT pos_evidence, neg_evidence FROM knowledge_graph WHERE object_canonical='uv'"
     ).fetchone()
-    assert row["pos_evidence"] == 1
+    assert row["pos_evidence"] == 2
 
 
 def test_phase2_writes_behavioral_profile_and_insights(hy):
@@ -123,24 +125,40 @@ def test_phase3_negative_dominance_retracts_gray_zone(hy):
     """Edges where negatives clearly dominate (e.g. pos=1, neg=4) must retract
     even though their smoothed confidence (0.33) is above retract_threshold."""
     conn = hy.conn
+    conn.execute("INSERT INTO sessions(id) VALUES ('phase3_counts')")
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES "
+        "('phase3_counts_chunk', 'phase3_counts', 1, 1, 'test', 'legacy evidence')"
+    )
+    from hymem.dreaming import evidence
+
+    def seed_ledger_edge(obj: str, pos: int, neg: int) -> None:
+        edge_id = conn.execute(
+            "INSERT INTO knowledge_graph(subject_canonical, predicate, "
+            "object_canonical, pos_evidence, neg_evidence, last_reinforced) "
+            "VALUES ('hook', 'uses', ?, 0, 0, datetime('now'))",
+            (obj,),
+        ).lastrowid
+        if pos:
+            evidence.record_chunk_evidence(
+                conn, edge_id=edge_id, chunk_id="phase3_counts_chunk",
+                evidence_kind="test_positive", polarity=1,
+                evidence_weight=pos, weight_source="test_fixture",
+            )
+        if neg:
+            evidence.record_chunk_evidence(
+                conn, edge_id=edge_id, chunk_id="phase3_counts_chunk",
+                evidence_kind="test_negative", polarity=-1,
+                evidence_weight=neg, weight_source="test_fixture",
+            )
+
     # Classic zombie: pos=0, neg=2 — smoothed 0.25, above 0.15 threshold.
-    conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
-        "pos_evidence, neg_evidence, last_reinforced) "
-        "VALUES ('hook', 'uses', 'nohup_zombie', 0, 2, datetime('now'))"
-    )
+    seed_ledger_edge("nohup_zombie", 0, 2)
     # Gray-zone: pos=1, neg=4 — smoothed 0.33, above threshold but neg dominates.
-    conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
-        "pos_evidence, neg_evidence, last_reinforced) "
-        "VALUES ('hook', 'uses', 'nohup_grayzone', 1, 4, datetime('now'))"
-    )
+    seed_ledger_edge("nohup_grayzone", 1, 4)
     # Mixed but not dominated: pos=2, neg=4 — should NOT retract.
-    conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
-        "pos_evidence, neg_evidence, last_reinforced) "
-        "VALUES ('hook', 'uses', 'mixed_signal', 2, 4, datetime('now'))"
-    )
+    seed_ledger_edge("mixed_signal", 2, 4)
 
     from hymem.dreaming.phase3 import decay
     decay(conn, hy.config)
@@ -171,12 +189,14 @@ def test_phase3_retraction_feedback_falls_back_to_negative_evidence(hy):
     cur = conn.execute(
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
         "pos_evidence, neg_evidence, last_reinforced) "
-        "VALUES ('gateway', 'runs_on', 'pid_77', 0, 2, datetime('now'))"
+        "VALUES ('gateway', 'runs_on', 'pid_77', 0, 0, datetime('now'))"
     )
     edge_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO kg_evidence(edge_id, chunk_id, polarity) VALUES (?, 'c_zombie', -1)",
-        (edge_id,),
+    from hymem.dreaming import evidence
+    evidence.record_chunk_evidence(
+        conn, edge_id=edge_id, chunk_id="c_zombie",
+        evidence_kind="test_negative", polarity=-1, evidence_weight=2,
+        weight_source="test_fixture",
     )
 
     from hymem.dreaming.phase3 import decay

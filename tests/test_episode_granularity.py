@@ -104,7 +104,8 @@ def _seed(hy: HyMem, sid: str, turns=_TURNS) -> None:
 def _chunk_ids(hy: HyMem, sid: str) -> list[str]:
     return [
         r["id"] for r in hy.conn.execute(
-            "SELECT id FROM chunks WHERE session_id = ? ORDER BY start_message_id",
+            "SELECT id FROM chunks WHERE session_id = ? "
+            "AND chunk_kind = 'coverage' ORDER BY start_message_id",
             (sid,),
         ).fetchall()
     ]
@@ -256,10 +257,12 @@ def test_several_granular_episodes_on_the_same_chunk_all_persist(granular_cfg):
         hy.close()
 
 
-def test_granular_cap_truncates_a_runaway_reply(granular_cfg):
-    """A reply with one episode per turn is bounded before any row is written.
-    Exercised at 20 returned against a cap of 3, so the assertion reads a real
-    truncation rather than a reply that happened to be short."""
+def test_granular_cap_rejects_a_runaway_reply_atomically(granular_cfg):
+    """A capped reply fails as a unit instead of claiming tail coverage.
+
+    Exercised at 20 returned against a cap of 3: silently keeping the first
+    three would make output truncation indistinguishable from full extraction.
+    """
     llm = _digest_llm()
     hy = HyMem(granular_cfg, llm=llm)
     try:
@@ -275,13 +278,18 @@ def test_granular_cap_truncates_a_runaway_reply(granular_cfg):
             max_tokens=1024, max_chars=12000, granular=True, max_episodes=3,
         )
         assert len(items) > 3  # precondition: the cap must actually bite
-        assert len(digest.episodes.items) == 3
+        assert digest.parse_failed is True
+        assert digest.failure_reason == "episode_output_cap"
+        assert digest.episode_input_items == 20
+        assert digest.episode_rejected_items == 17
+        assert digest.episodes.items == []
+        assert digest.covered_message_id is None
 
         with core_db.transaction(hy.conn):
             persist_episodes(hy.conn, "s_cap", digest.episodes, granular=True)
         assert hy.conn.execute(
             "SELECT COUNT(*) AS c FROM episodes WHERE session_id = 's_cap'"
-        ).fetchone()["c"] == 3
+        ).fetchone()["c"] == 0
     finally:
         hy.close()
 
@@ -532,13 +540,16 @@ def test_reverting_the_flag_re_extracts_under_the_blob_prompt(cfg, granular_cfg)
 def test_granular_dream_stamps_and_persists_end_to_end(granular_cfg):
     """One full dream on the granular arm: the granular prompt is what gets
     sent, episodes land, and the stamp is written in the same transaction."""
-    llm = _digest_llm(
-        episodes=[_episode("Pinned alembic to 2.1.4", [])],
-        summary="Deployed to staging and pinned alembic to 2.1.4.",
-    )
+    llm = _digest_llm()
     hy = HyMem(granular_cfg, llm=llm)
     try:
         _seed(hy, "s_e2e")
+        cids = _chunk_ids(hy, "s_e2e")
+        hy.set_llm(_digest_llm(
+            episodes=[_episode("Pinned alembic to 2.1.4", [cids[-1]])],
+            summary="Deployed to staging and pinned alembic to 2.1.4.",
+        ))
+        llm = hy._llm
         hy.dream()
         assert len(_calls(llm, _GRANULAR_CLOSER)) == 1
         assert _calls(llm, _BLOB_CLOSER) == []
@@ -584,7 +595,7 @@ def test_v35_adds_the_session_stamp_to_a_pre_v35_store(tmp_path):
 
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
     assert "episodes_prompt_version" in cols
-    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 35
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
     row = conn.execute("SELECT * FROM sessions WHERE id = 'old'").fetchone()
     assert row["summary"] == "a pre-v35 session"
     assert row["episodes_prompt_version"] is None, (
@@ -664,8 +675,10 @@ def test_reverting_supersedes_the_granular_rows_it_replaces(cfg, granular_cfg):
         assert not [i for i in rows if i in granular_ids], (
             f"granular rows survived the revert: {rows}"
         )
-        # Both blob episodes resolve to the same range, hence one bare-range id.
-        assert rows == [f"s_mix@{_range(hy2, 's_mix')}"], rows
+        # v38 adds a stable per-slice ordinal: both valid blob episodes survive
+        # even though they cite the same message range.
+        assert len(rows) == 2, rows
+        assert all("#i" in episode_id for episode_id in rows), rows
     finally:
         hy2.close()
 
@@ -679,20 +692,15 @@ def _range(hy: HyMem, sid: str) -> str:
     return f"{row['s']}-{row['e']}"
 
 
-def test_the_window_is_passed_on_a_change_and_never_on_a_blob_only_store(
+def test_generation_cleanup_replaces_destructive_window_supersession(
     cfg, granular_cfg, monkeypatch
 ):
-    """The wiring itself, in all three states — this is where the bug was.
+    """v38 never deletes old episodes before a replacement walk completes.
 
-    Superseding is keyed on the session's STAMP, not on the flag, so it fires on
-    either side of a granularity CHANGE and never on a store that has only ever
-    run the shipping prompt. That last case is the inertness guarantee: without
-    it, turning a default-OFF feature on for nobody would still have made every
-    blob re-dream destructive-in-window, which is a silent default change.
-
-    Asserted on the argument rather than on surviving rows because a blob-only
-    re-dream re-cuts to the SAME ids, so there is nothing for a stray DELETE to
-    remove and a row-level assertion here would pass no matter how it is wired.
+    Granularity changes now use digest generations: old rows coexist during a
+    bounded/retryable walk and are retired atomically only at the coverage tail.
+    The legacy per-window destructive argument must therefore remain disabled
+    in every state.
     """
     import hymem.dreaming.runner as runner
 
@@ -705,13 +713,13 @@ def test_the_window_is_passed_on_a_change_and_never_on_a_blob_only_store(
 
     monkeypatch.setattr(runner, "persist_episodes", spy)
 
-    eps = [_episode("Chose fly.io over render", [])]
-
     # (a) blob-only store, first dream: stamp NULL -> no window.
-    llm0 = _digest_llm(episodes=eps, summary="Deploy notes for staging.")
+    llm0 = _digest_llm()
     hy0 = HyMem(cfg, llm=llm0)
     try:
         _seed(hy0, "s_wire")
+        eps = [_episode("Chose fly.io over render", [_chunk_ids(hy0, "s_wire")[0]])]
+        hy0.set_llm(_digest_llm(episodes=eps, summary="Deploy notes for staging."))
         hy0.dream()
     finally:
         hy0.close()
@@ -728,7 +736,7 @@ def test_the_window_is_passed_on_a_change_and_never_on_a_blob_only_store(
         hy1.close()
     assert seen == [None], seen
 
-    # (c) flip ON, then (d) flip OFF again: a window on both.
+    # (c) flip ON, then (d) flip OFF again: still no eager window deletion.
     seen.clear()
     llm2 = _digest_llm(episodes=eps, summary="Deploy notes for staging.")
     hy2 = HyMem(granular_cfg, llm=llm2)
@@ -736,7 +744,7 @@ def test_the_window_is_passed_on_a_change_and_never_on_a_blob_only_store(
         hy2.dream()
     finally:
         hy2.close()
-    assert len(seen) == 1 and seen[0] is not None, seen
+    assert seen == [None], seen
 
     seen.clear()
     llm3 = _digest_llm(episodes=eps, summary="Deploy notes for staging.")
@@ -745,4 +753,4 @@ def test_the_window_is_passed_on_a_change_and_never_on_a_blob_only_store(
         hy3.dream()
     finally:
         hy3.close()
-    assert len(seen) == 1 and seen[0] is not None, seen
+    assert seen == [None], seen

@@ -1,5 +1,14 @@
 # Additional Planning
 
+> **Historical engineering ledger.** LongMemEval numbers such as 70.0 and old
+> Honcho/Hindsight comparisons below document earlier local/sample decisions;
+> they are not current official-comparable claims. The strict LME harness now
+> pins dataset/evaluator identities, labels full-set work development-only, and
+> has no newly rerun HyMem score. Current external figures, if cited, require
+> protocol caveats: Honcho vendor 90.4 (Haiku 4.5) / 92.6 (Gemini 3 Pro),
+> Hindsight official March 2026 94.6 single-query, Mnemosyne 98.9
+> Recall@All@5 on 100 items (not end-to-end), and BEAM-100K 65.2 separately.
+
 Two ideas borrowed from [BrainDB](https://github.com/dimknaf/braindb), adapted to
 HyMem's embedded, edge-typed architecture, plus the episode-granularity plan
 (added 2026-07-02, see [Plan C](#plan-c--episode-granularity-in-dreaming)),
@@ -378,6 +387,12 @@ CREATE INDEX IF NOT EXISTS idx_rules_active ON rules(scope, status, invalid_at);
 Rules ride along in `GET .../context` and `peers/{pid}/card`, ahead of MEMORY.md
 — matching how BrainDB's `always_on` injects into every context call.
 
+**Superseded 2026-09-04:** that historical design was removed from the Honcho
+surface. Process-global rules have no workspace/peer ownership proof and must
+not cross a tenant-scoped route. Rules remain available through native HyMem
+and MCP APIs only until they carry explicit workspace, peer, and session
+provenance; Honcho representation/context/chat/card now exclude their text.
+
 ### Constraint (from §0)
 Do **not** add rules to `_anchor_facts` (`aggregate.py:530`). That block hashes
 into the RAPTOR root digest cache id; coupling rule edits to digest regeneration
@@ -480,6 +495,9 @@ Idea B is now backed by three data-driven gates (see
 - **Surfaces**: `HyMem.add_rule/rules/retract_rule`; MCP `hymem_add_rule` +
   `hymem_list_rules` (`server.py`); Honcho — active rules lead the peer card +
   peer/session context ahead of MEMORY.md (`honcho/app.py::_rules_block`).
+  **Superseded 2026-09-04:** the Honcho clause is retained here as history, but
+  unowned global rules are now native/MCP-only and are excluded from every
+  workspace-scoped Honcho read until a provenance model exists.
 - **Gates — mechanical (`tests/test_rules.py`, 21 green; full suite 746)**: adds
   classifier + end-to-end dream-routing (routes imperative markers, skips
   one-offs, respects the write-side gate) + `list_rules` + MCP tools + Honcho
@@ -1167,17 +1185,21 @@ reads oracle labels, per-category LME deltas under ~±5pp are noise.*
 
 | Item | State | Verdict in one line |
 |---|---|---|
-| **E1 narrative facts** | **BUILT 2026-08-02 (schema v26); Step 5 RAN 2026-08-04/05 — verdict `READ OFF, WRITE ON`** | G-F1 failed twice ON deepseek-v4-flash (0.55–0.76 vs 0.90), but the revival gate `G-F1b` cleared decisively on gpt-oss-120b (**123/123 strict**, all five criteria, truncation-tail clean). Step 4 built as specced: `narrative_facts` + FTS/vec, `hymem/dreaming/facts.py` (append-only, own watermark, forward-only prompt versioning), additive `ctx.facts` tier, FACTS block in `ask()`; prompt ships VERBATIM as `FACTS_SYSTEM`/`facts.v2`. **Step 5 then measured a COST on LoCoMo** — fired-subset McNemar −2.9pp (b=10/c=24, z=−2.40, p=0.024) against a flat not-fired control (+0.9pp, p=0.45), where the all-800 net (−1.4pp, z=−1.72) had read as non-significant. **Defaults now `facts_enabled=False` (read) / `facts_extraction_enabled=True` (write)** — see the Step 5 verdict block below for the mechanism, the LME null, and the judge artifact. |
+| **E1 narrative facts** | **AUTHORITATIVE LIFECYCLE UPGRADE 2026-09-04 (schema v46); historical Step 5 result retained** | The v26 append-only/range-only design was replaced by exact lossless occurrence manifests, durable empty/failure/retry outcomes, revisioned retract/resurrect lifecycle, prompt/config replay on immutable source-unit boundaries, active-authority-only FTS/vector search, and v10 portability. Extraction and retrieval now both default on so paid work is visible; the old benchmark result remains evidence for future empirical gating, not a reason to ship a hidden write-only tier. |
 | **E5 anaphora** | **SHIPPED ✓** | `hymem/query/coref.py`, on by default; 31/31 resolution, 0/12 no-harm. The hedge that paid. |
 | **E3 rerank A/B (M1+M2)** | **RUN 2026-07-30/31 — VERDICT IN, NOTHING FLIPPED** | **M1 FAIL on latency arithmetic** (CE is 10.7× *slower* than the API on CPU vs a required ≥10× faster; ~9.5ms/candidate is unreachable — mxbai 108× off, bge 37× off) and its quality row is **unmeasured**, not parity (it ran on the vacuous handset). **M2 = parity, not a bge win** (NL R@1 +4/20 at p≥0.125, EN −2/15; fails the pre-registered effect size once rescaled to n=20). bge's real edge is latency (3–4× on CPU, language-flat). **Decision: keep both defaults as they are** — Step 6 closes unexercised. |
-| **E6 supersession over facts** | **UNBLOCKED 2026-08-02 (E1 landed) — not built** | Its prerequisites are now met: G-F1b passed and Step 4 shipped `narrative_facts` with `invalid_at` as the one mutable field, which is exactly the column E6 closes. At v4-flash's faithfulness it would have been an amplifier of fabrication — which is why it had to follow a faithfulness pass, not precede one. Sequence it behind Step 5. |
+| **E6 supersession over facts** | **NARROW SOURCE-UNIT LIFECYCLE BUILT IN v46; CROSS-SOURCE E6 NOT BUILT** | Successful replay authoritatively replaces only the same exact extraction unit: omissions retract and later identical payloads resurrect deterministically, with immutable revision/lifecycle history. The old typed-value/date heuristic across distinct sessions is explicitly rejected as unsafe and remains unimplemented; simultaneous contradictory facts from different source units can coexist, and Step 14 must gate the default-on tier's distraction risk empirically. |
 | **E4 temporal boost (query-side)** | **NOT BUILT — closed by decomposition, then by selectivity arithmetic** | LME gate technically PASSED (8.8% / 90.9% / 0) but the same rules fail across corpora on the speech-time/event-time axis, and selective fire rate lands under criterion 1 on both. **Carry-forward `G-E4b` (ingest-side `valid_at`) PRE-REGISTERED 2026-07-31 — and its Step 0 pre-check closes the query-range consumer for free: ceiling ≈0.22% of queries (LME), ~20× under the bar.** The only live path is Fork B (an existing `valid_at` reader — supersession / recency-dating), which is a different feature and must be argued on its own terms. |
 | **E2 per-entity observations** *(Campaign E's E2 — not Grove's recovery gauge)* | **DORMANT (still double-blocked, but one blocker is now moving)** | Needs flip-watch green AND a new faithfulness result clearing `fact_probe.py`'s bar. The flip-watch leg is no longer *untestable*: schema v30 (persisted leaf watermark) and v31 (structural rebuild forecast) closed the observability holes, criterion 6 (keying integrity) was banked 2026-08-09, and the first post-v31 dream `#1182` read clean (predicted=9, residual=0, reuse 91.7%). The gate is now **PENDING on accrual** — it needs every verdict row to carry a populated `aggregation_keying_residual` — not blocked on a defect. The faithfulness leg is untouched. |
 | **E7 usage feedback** | **OPEN, ungated** | Artifact-agnostic long game; no front-run designed yet. |
 
-**Campaign E is closed as a scored campaign.** Every item is either shipped (E5),
-run-and-verdicted (E1 Step 5, E3), closed by argument (E4), or dormant on a named
-blocker (Campaign-E E2, E6, E7). Nothing in Campaign E is awaiting a run.
+**Campaign E is closed as a scored campaign.** Every scored item is either
+shipped (E5), run-and-verdicted (E1 Step 5, E3), closed by argument (E4),
+dormant on a named blocker (Campaign-E E2, E7), or rejected as unsafe
+(cross-source E6). Schema v46's
+same-unit replay lifecycle is not evidence that cross-source contradictions are
+resolved; the default-on retrieval change remains subject to Step 14's empirical
+non-regression gate.
 
 **Next actions, in order** (2026-08-25, superseding the 2026-07-30 list): the live
 work is now Plan D + Grove E2, sequenced in that plan's own section below.
@@ -1291,10 +1313,10 @@ the LME artifact rate applied to -2.9pp lands near z = -2.1, still significant.
 therefore stays exactly where the honesty rule put it — **"costs on LoCoMo in
 this regime"** — and that wording is now load-bearing rather than provisional.
 
-**Not next, and why**, so the sequencing is auditable rather than implicit:
-**E6** is unblocked but would close `invalid_at` on a tier whose READ default is
-off (E1 Step 5's `read off, write on`) — instrumenting a path nothing consumes
-is the unreachable-code-path trap. **E7** is ungated with no front-run designed.
+**Historical 2026-08-25 sequencing note (superseded by v46):** E6 was then
+unblocked but would have closed `invalid_at` on a tier whose READ default was
+off (E1 Step 5's `read off, write on`) — instrumenting a path nothing consumed
+was the unreachable-code-path trap. **E7** is ungated with no front-run designed.
 **The `_anchor_facts` squeeze fix** was refused at S1-C1 and stays refused.
 
 ### E0. Evidence base and the six review constraints
@@ -1322,11 +1344,12 @@ probes alone.
    judging buys nothing). Offline mechanism results decide build/no-build;
    LME A/Bs are **non-regression only**; scored confirmation lives on LoCoMo
    n=800 (±1.6pp) + MSC.
-2. **Facts are per-range IMMUTABLE, append-only, version-tagged.** A closed
-   range's facts never change → no re-fusion, no resample, no poison-cascade:
-   the entire aggregation reuse bug class (the third flip-watch failed on the
-   deepseek outage streak; watch still red) is sidestepped by construction.
-   The ONE mutable field is `invalid_at` (closing it is itself append-only).
+2. **Historical v26 constraint (superseded by v46): facts were per-range
+   immutable, append-only, and version-tagged.** V46 instead makes the exact
+   source unit immutable while publishing immutable result revisions and
+   lifecycle events; the active projection changes only through validated
+   replay of that same unit. It deliberately does not infer cross-source
+   semantic supersession.
 3. **E2 (per-entity observations) does NOT get that exemption** — it is
    synthetic over a mutable set, i.e. the aggregation-node pattern under watch.
    E2 is gated on the flip-watch turning green.
@@ -1550,7 +1573,8 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 >    the char-cap cut or confabulate past it (the sessions-3/10 pattern)? A model
 >    that stops cleanly moots the secondary failure mode; one that doesn't
 >    re-opens the cap-vs-cost trade.
-> 6. **PASS** reopens Step 4 as specced (E6 behind it) and supplies the
+> 6. **PASS** reopens Step 4 as specced (the historical plan put E6 behind it;
+>    cross-source E6 was later rejected) and supplies the
 >    faithfulness result E2/Plan C are gated on (the flip-watch still blocks E2
 >    independently). **FAIL** banks E1 dead on a second model class — record and
 >    stop; at that point the finding is about the task, not the model.
@@ -1645,7 +1669,8 @@ sampling band ≠ churn floor (LoCoMo ±7.4pp @ n=151 answerable across samples)
 > mode does not reproduce on gpt-oss-120b — the cap-vs-cost trade is mooted.
 > Two disclosed quibbles (E09 pronoun, E15 one-word completion) dock nothing —
 > even at 0.99 the verdict is identical. Per pre-registered step 6: **PASS
-> reopens Step 4 as specced, E6 revives behind it, and the faithfulness result
+> reopens Step 4 as specced; the historical plan said E6 revived behind it
+> (cross-source E6 was later rejected), and the faithfulness result
 > E2/Plan C are gated on is supplied** (the flip-watch still blocks E2
 > independently). Wholesale-vs-scoped migration decision is now live, priced
 > separately per protocol step 1. **Open item:** the same `[:4000]` trap would
@@ -2009,14 +2034,26 @@ on the arms. See [docs/diagnostic_controls.md](docs/diagnostic_controls.md).
 > `rules` (v23) and the aggregation layer, so this joins the tracked
 > export-gap phase rather than being fixed inconsistently here. **Step 5
 > (scored confirmation: LoCoMo n=800 `--fresh`, MSC, LME non-regression) is
-> now the open item** — the build is unmeasured on any benchmark. E6 revives
+> now the open item** — the build is unmeasured on any benchmark. The historical
+> plan said E6 revived
 > behind this step; E2 stays blocked on the flip-watch independently.
 
-**Idea.** Dream-time extraction of self-contained narrative facts, stored
+> **Superseded 2026-09-04 by schema v46.** The block above is historical. The
+> current contract uses exact lossless source occurrences and resumable
+> character offsets; successful empty units advance, malformed/over-cap units
+> hold and retry, and no oversized tail is discarded. Prompt/config changes
+> replay every stored unit on its original exact coordinates before new tail
+> units append. Facts have immutable result revisions plus retract/resurrect
+> lifecycle history, active-authority-only FTS/vector readers, and atomic v10
+> portability. Both extraction and retrieval default on.
+
+**Historical v26 idea.** Dream-time extraction of self-contained narrative facts, stored
 immutably (append-only, version-tagged), served as an additive retrieval tier
 and as the lead evidence block in `ask()`. Subsumes Plan C's granularity goal
 as a NEW artifact class — episode membership is untouched, so the Plan C
-sequencing constraint (RAPTOR flip-watch) does not apply. Unblocks E6.
+sequencing constraint (RAPTOR flip-watch) does not apply. The historical v26
+plan described this as unblocking E6; cross-source E6 was later rejected, and
+v46's exact same-unit replay does not unblock or implement it.
 
 **Schema (migration `026_narrative_facts.sql`; `EXPECTED_SCHEMA_VERSION` 25→26;
 table also added to the `schema.sql` fresh-DB baseline — indexes/ALTERs only in
@@ -2053,30 +2090,34 @@ CREATE TABLE IF NOT EXISTS narrative_facts (
   `FACTS_PROMPT_VERSION` like `PROFILE_PROMPT_VERSION`), returns validated
   items. Validation mirrors `validate_episode_items`: non-empty text ≤600
   chars, date ISO-or-null, entities through `canonicalize.normalize`, cap
-  `cfg.dream_max_facts_per_session` (default 8, truncate).
-- Persist **append-only**: `INSERT OR IGNORE` keyed on the UNIQUE constraint;
-  no UPDATE path for `text`/`entities`; `invalid_at` starts NULL. Watermark
-  advances only on successful parse; parse failure → `DreamReport.fact_failures
-  += 1`, watermark held, retried next dream (the v25 `digest_failures`/
-  `parse_failed` contract).
-- **Prompt bumps extract FORWARD ONLY**: new ranges are tagged with the new
-  `FACTS_PROMPT_VERSION`; covered ranges are never re-extracted. (Review
-  constraint 2 — this is what makes E1 safe while the flip-watch is red.)
-- Idempotency: re-dream of a quiescent store = 0 extraction calls (watermark at
-  tail) + 0 new rows (UNIQUE key).
+  `cfg.dream_max_facts_per_session` (default 8). Over-cap arrays reject as a
+  whole and hold the exact cursor for adaptive retry; they are never truncated.
+- Persist one authoritative source outcome plus exact occurrence manifest.
+  Successful replay publishes a new immutable result revision, retracts facts
+  omitted from the replacement set, and resurrects identical payload keys
+  deterministically without erasing history.
+- **Prompt/config bumps replay first.** Every committed source unit is
+  re-extracted on its stored exact boundaries/input; old units are never
+  repartitioned under a changed character cap. Only after the replay walk and
+  full authority audit may the new version append tail units.
+- Idempotency: a quiescent current store makes no extraction call; duplicate
+  first-pass/replay workers are generation/cursor-CAS checked and cannot fork
+  or regress the ledger.
 - Embeddings: batch-embed fact texts OUTSIDE the write lock (the phase1
   lock-free pattern); content-addressed `embedding_cache` reuse is free.
 - `DreamReport.facts_extracted` / `fact_failures` persisted to `dream_runs`.
 
 **Retrieval — additive tier in `query/augment.py`:**
 - `FactHit` dataclass `{fact_id, text, fact_date, entities, session_id, score,
-  why_retrieved}`; `ctx.facts: list[FactHit]` with the standard additive-tier
-  docstring (own SELECT/FTS, never consumes another tier's budget, degrades to
-  [] on a pre-v26 store).
+  why_retrieved, source_occurrences}`; `ctx.facts: list[FactHit]` has its own
+  native candidate budget, then shares occurrence dedup and the finite final
+  prompt packer with higher-priority standing/current evidence.
 - `_fact_search()`: FTS5 over `narrative_facts_fts` (same `_FTS_SAFE` +
   `_fold_diacritics` query path as the other six FTS sites) + optional vec KNN
-  + RRF; `WHERE invalid_at IS NULL` (superseded facts leave the tier but stay
-  in the DB for audit); cap `cfg.facts_top_k` (default 8, 0 disables).
+  + RRF. Only current rows with a complete, committed exact source/result/
+  lifecycle proof can rank or cross a provider hook; retracted history stays
+  in the DB but outside the active-only FTS shadow. Cap `cfg.facts_top_k`
+  (default 8, 0 disables).
   `facts_enabled` (default True) is the master switch;
   `facts_extraction_enabled` (default True) gates the write side separately.
 - Wired after `_fts_search`/`_vector_search`, before graph lookup; v1 does NOT
@@ -2090,23 +2131,25 @@ CREATE TABLE IF NOT EXISTS narrative_facts (
   rendering. Honcho `/search` response shaping is a documented follow-up, not
   part of this step.
 
-**Risks:** extraction quality on deepseek (G-F1 faithfulness gate is the
-mitigation); growth on long-lived sessions (watermark + caps); version mixing
-at retrieval (harmless — additive evidence, duplicates impossible by
-append-only + UNIQUE).
+**Risks:** extraction quality still needs empirical benchmark gating; immutable
+history grows on long-lived sessions (bounded units/revisions/items); and every
+native tier ultimately competes inside one finite token pack. Exact-occurrence
+dedup and priority-aware packing prevent a source-equivalent fact from silently
+displacing standing/current evidence, but do not create unlimited context.
 
 **Tests (`tests/test_facts.py`, StubLLMClient + stub embeddings, mirroring
 `test_digest.py`):**
 1. extraction→persist round-trip (rows, canonical entities, watermark advanced
    to covered `end_message_id`);
-2. append-only: new messages arrive, re-dream → old rows byte-identical, new
-   rows only for the new range;
+2. new messages append exact cursor-successor units; immutable historical
+   revisions/events remain byte-identical;
 3. idempotent re-dream: 0 new rows, 0 extraction calls (stub call count),
    watermark stable;
-4. forward-only versioning: bump `FACTS_PROMPT_VERSION` → new range under new
-   tag, covered ranges untouched;
+4. prompt/config bump replays every old unit on its exact stored coordinates,
+   with successful empty replacement retracting its prior active payloads;
 5. parse failure → `fact_failures` +1, watermark held, retry succeeds;
-6. UNIQUE dedup on re-submitted range;
+6. cursor/generation CAS makes identical concurrent submission idempotent and
+   rejects divergent first-pass or stale-replay workers;
 7. tier surfaces matching facts; non-matching query → empty; `invalid_at` set →
    never surfaces, row retained;
 8. **additive invariant:** with facts present, `message_hits`/`fts_hits`/
@@ -2183,12 +2226,16 @@ LoCoMo in this regime."*
 
 **MSC / BEAM / LME-MS were all under-powered ⇒ UNMEASURED, not null.**
 
-**Verdict: read off, write on.** `facts_enabled=False`,
-`facts_extraction_enabled=True` (`hymem/config.py`). This rests on **zero
+**Historical Step-5 verdict (superseded by the v46 authority/default
+alignment): read off, write on.** It used `facts_enabled=False` and
+`facts_extraction_enabled=True`. This rested on **zero
 measured benefit**, not on the harm — the store keeps filling so the tier can be
 revived without a backfill. **Any revival must pre-register the count-gate
-prediction.** E2/Plan C inherit the relevance-precision bar. E6 is unblocked (its
-`invalid_at` column exists).
+prediction.** E2/Plan C inherit the relevance-precision bar. The old cross-source
+E6 heuristic is not revived merely because lifecycle fields exist: it remains
+rejected as unsafe. Schema v46 now ships both sides on and supports only exact
+same-unit replay; future benchmark work may revisit ranking/defaults but must not
+silently pay for hidden memory.
 
 Collateral: the `[:4000]` recorder bug had turned 50 faithful facts into
 "inventions" (50/50 resolved faithful) ⇒ **G-F1's v4-flash 0.55–0.76 still needs
@@ -2249,7 +2296,7 @@ not-in-anchor assertion.
 
 ---
 
-### Step 8 — E4, E6, E7 (production track, independent)
+### Historical Step 8 — E4, E6, E7 (cross-source E6 later rejected)
 
 **E4 temporal-range boost.**
 
@@ -2623,16 +2670,16 @@ argued on its own terms, not inherited on E4's momentum.
 G-F1/G-E4a — threshold tuning is not a visible defect. A second failure banks
 the ingest side.
 
-**~~E6 supersession over facts~~ — CANCELLED 2026-07-30 with E1; SUSPENDED the
-same day when `G-F1b` opened** (revives automatically iff G-F1b → Step 4 land).
+**~~E6 cross-source supersession over facts~~ — CANCELLED 2026-07-30 with E1;
+later REJECTED rather than implemented by v46.**
 Worth keeping the reason visible: supersession is the
 mechanism that would have *defended* a fabricated fact — closing the older,
 correct row in favour of a newer invented one — so at 0.55–0.76 faithfulness E6
 was not merely unbuildable, it was the amplifier. That is also why E6 must
-never land before a faithfulness PASS on the model actually doing the
-extraction. Spec retained below as the intended design.
+not be conflated with v46's narrower authoritative replay. The old heuristic is
+retained below as a rejected design record, not an intended implementation.
 
-**E6 supersession over facts** (after Step 4). Extend the
+**Rejected E6 design (not built):** Extend the
 `value_supersession.py` classify→group→compare pipeline to `narrative_facts`:
 typed-value classification over fact text+entities, group by (entity, attribute
 cue), compare `fact_date`; a newer contradicting fact closes the older fact's
@@ -2643,6 +2690,14 @@ False → flip after a clean audit, mirroring the v3.1 guard. **Tests:**
 cross-session numeric update closes old fact (tier stops surfacing, row
 retained); same-date never fires; multi-valued never fires; flag-off no-op;
 audit emitted.
+
+**What v46 actually guarantees:** a successful correction of one previously
+committed exact source unit publishes a new result generation atomically;
+payloads omitted by that generation retract and later-identical payloads can
+resurrect, while all prior revisions/events remain auditable. It never treats a
+fact from another session or source unit as a correction, so conflicting
+current facts may coexist. That precision avoids invented attribution but does
+not solve the old E6 problem or eliminate the measured distraction risk.
 
 **E7 usage-signal feedback** (long game). `ask()` post-pass: stdlib
 token-overlap between the answer text and rendered items →
@@ -2666,7 +2721,7 @@ unused.
 | 5 | Scored confirmation — **SUSPENDED with Step 4** | Step 4 | box runs | reinstated as written iff Step 4 builds |
 | 6 | E3 adoption — **CLOSED UNEXERCISED**; nothing flipped, rebaseline unspent | Step 3 only (Step 5 suspended) | **0 (not spent)** | precondition unmet: M1 ✗, M2 parity — revisit only if M1 is re-run and passes on GPU |
 | 7 | E2 observations — **needs re-spec** (was over facts) | flip-watch green **+ a faithfulness result (a G-F1b PASS supplies it)** | capped per dream | must clear `fact_probe.py`'s bar first |
-| 8 | E4 — **query-side CLOSED on arithmetic**, not built; carry-forward **`G-E4b` now PRE-REGISTERED (2026-07-31)**, Fork A (query-range consumer) closed by its free Step 0 pre-check, Fork B (existing `valid_at` reader) unstarted (E7 open; **E6 suspended with E1** — revives iff G-F1b → Step 4 land) | Fork B must name ONE live consumer before anything is measured | none spent (probe is LLM-free) | raw gate: LoCoMo 1.1%/23.8% ✗, LME 8.8%/90.9% ✓ — **but SELECTIVE fire rate 0.3% / ~3.4%, both under criterion 1**; **G-E4b Step 0 ceiling ≈0.22% (LME) / 0.02% (LoCoMo) of queries ⇒ Fork A dead**; C1 ≥5% incremental, **C2 ≥95%** (higher than query side: ingest writes are permanent), C3 zero-tolerance abstention, C4 reachability |
+| 8 | E4 — **query-side CLOSED on arithmetic**, not built; carry-forward **`G-E4b` now PRE-REGISTERED (2026-07-31)**, Fork A (query-range consumer) closed by its free Step 0 pre-check, Fork B (existing `valid_at` reader) unstarted. This historical row said E6 would revive with E1; cross-source E6 was later rejected and v46 implements only same-unit replay. | Fork B must name ONE live consumer before anything is measured | none spent (probe is LLM-free) | raw gate: LoCoMo 1.1%/23.8% ✗, LME 8.8%/90.9% ✓ — **but SELECTIVE fire rate 0.3% / ~3.4%, both under criterion 1**; **G-E4b Step 0 ceiling ≈0.22% (LME) / 0.02% (LoCoMo) of queries ⇒ Fork A dead**; C1 ≥5% incremental, **C2 ≥95%** (higher than query side: ingest writes are permanent), C3 zero-tolerance abstention, C4 reachability |
 
 **Post-G-F1 campaign state (amended 2026-07-30 when `G-F1b` opened).**
 Campaign E's generative half is **SUSPENDED, not closed**: G-F1's verdict is
@@ -2694,9 +2749,10 @@ inherits G-F1's finding directly and must clear the same bar before it costs
 anything.
 
 Hard rules carried into this campaign: never suppress-filter on a routed
-signal (boost ≠ filter); additive tiers never touch another tier's budget; any
-material prompt change bumps its version constant AND extracts forward-only
-(facts) or re-gates (profile precedent); judge posture frozen; LME A/Bs are
+signal (boost ≠ filter); native tiers keep separate candidate budgets but share
+final fusion/token packing; any material facts prompt/config change bumps its
+generation and replays immutable exact source units before new tail work;
+profile changes re-gate (profile precedent); judge posture frozen; LME A/Bs are
 non-regression confirmations, never tuning signals.
 
 ---
@@ -3746,7 +3802,7 @@ that is ever non-trivial, and build it against observed cases.
 | **`recites_gold` token rule** | Pre-registered `5884adf`, **UNRUN**, free. Changes the licence arithmetic, not just the C3 footnote. *(State as of 2026-08-25. Built 2026-08-26; RAN the same day and **FAILED R2** — see "A5 RAN" below. Closed, alias stays v1.)* |
 | **C4 arm asymmetry** | Blocked on a scored LoCoMo run pair that does not exist. |
 | **D3 visibility** | Pinned defect. Needs a channel `judge_answer`'s bool return does not have. |
-| **E6 supersession over facts** | Unblocked since `a0cd73d`; its `invalid_at` prerequisite is now genuinely sound rather than nominally so. |
+| **E6 supersession over facts** | **Historical status, superseded 2026-09-04:** v46 safely implements same-source-unit replacement history, but the cross-session typed-value/date heuristic described by E6 is rejected and not built. |
 | **Grove E3** | Pre-registered, unbuilt; its "behind Campaign E" sequencing tie is released now that Campaign E is closed as a scored campaign. |
 | **Grove E4** | Pre-registered, unbuilt; still tied to the Stage 3c flip decision (same dependency as Plan C), NOT to Campaign E. |
 | **`main`** | 209 commits behind `Beam-optimisation`, which now holds Campaign E, narrative facts, schema v19→v26 and this audit under a name that no longer describes it. |
@@ -3891,7 +3947,7 @@ to be guarded all along.
 | **`recites_gold` gate** | **CLOSED — R2 FAIL.** Ran free on Afrodite the same day; 2 FP against a bar of ≤1. Alias stays v1, rule not re-tuned. See "A5 RAN" below. |
 | **C4 arm asymmetry** | Still blocked on the old pair; **unblocked for the next one** now that `judge_raw` is persisted. |
 | **D3 visibility** | **CLOSED.** |
-| **E6, Grove E3/E4, digest staleness** | **Grove E4 CLOSED 2026-09-01, FAIL-mechanism** — its specified null leaves the gated statistic invariant (one distinct value over 2000 permutations), and against a null that reaches it the box store sits below chance (9 vs 19.74). **Digest staleness (G-DS1) re-measured 2026-09-01: still not runnable**, 28 active profile rows vs cap 20 (22 → 23 → 28). E6 and Grove E3 unchanged; Grove E3's measured population is ~2 rows on the box and 0 on conv-26, and nothing consumes `retraction_history` — the shape that closed Grove E2 FAIL-mechanism. |
+| **E6, Grove E3/E4, digest staleness** | **Grove E4 CLOSED 2026-09-01, FAIL-mechanism** — its specified null leaves the gated statistic invariant (one distinct value over 2000 permutations), and against a null that reaches it the box store sits below chance (9 vs 19.74). **Digest staleness (G-DS1) re-measured 2026-09-01: still not runnable**, 28 active profile rows vs cap 20 (22 → 23 → 28). Cross-source E6 is rejected/unbuilt (v46's same-unit replay is a narrower authority mechanism); Grove E3's measured population is ~2 rows on the box and 0 on conv-26, and nothing consumes `retraction_history` — the shape that closed Grove E2 FAIL-mechanism. |
 | **`main`** | Now 214 commits behind `Beam-optimisation` and 4 ahead: a real merge, not a fast-forward. |
 
 ### A5 RAN — `recites_gold` v2 CLOSED, R2 FAIL (2026-08-26, Afrodite)

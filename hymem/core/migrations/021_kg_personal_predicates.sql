@@ -12,6 +12,16 @@
 -- the common interrupted-rerun case clean.
 PRAGMA foreign_keys=OFF;
 
+-- Latest-schema bootstraps already expose the v40 lifecycle guard set. Drop
+-- the dependent triggers while this historical KG rebuild replays; v40
+-- reinstalls them after all table shapes are final.
+DROP TRIGGER IF EXISTS kg_edge_lifecycle_insert_guard;
+DROP TRIGGER IF EXISTS kg_edge_lifecycle_update_guard;
+DROP TRIGGER IF EXISTS kg_edge_lifecycle_delete_guard;
+DROP TRIGGER IF EXISTS kg_lifecycle_dependencies_insert_guard;
+DROP TRIGGER IF EXISTS kg_lifecycle_dependencies_update_guard;
+DROP TRIGGER IF EXISTS kg_lifecycle_dependencies_delete_guard;
+
 -- Guarantee the base evidence columns exist before the copy. On a real DB they
 -- already do, so each ALTER raises "duplicate column name" — an error the
 -- migration runner tolerates as a no-op (existing data untouched). On a minimal

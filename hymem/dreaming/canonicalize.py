@@ -4,6 +4,13 @@ import re
 import sqlite3
 import unicodedata
 
+from hymem.dreaming import evidence
+from hymem.core.time import (
+    latest_timestamp_spelling,
+    normalize_iso_timestamp,
+    timestamp_at_or_before,
+)
+
 # Strip leading articles, trailing parentheticals like "(container)", and
 # punctuation. Lowercase. ASCII-fold. Collapse whitespace and underscores.
 # Articles cover common Latin-script European languages; this runs after the
@@ -153,8 +160,9 @@ def merge(conn: sqlite3.Connection, keep: str, drop: str) -> None:
         (drop, keep),
     )
 
-    # Migrate edges. Conflicts (same subject/predicate/object after rewrite) get
-    # their evidence summed into the surviving row, then the duplicate is dropped.
+    # Migrate edges.  On a collision, provenance is moved and deduplicated by
+    # source before cached counters are rebuilt; blindly summing the two caches
+    # double-counted a chunk that supported both aliases.
     for column in ("subject_canonical", "object_canonical"):
         rows = conn.execute(
             f"SELECT id FROM knowledge_graph WHERE {column} = ?", (drop,)
@@ -169,7 +177,8 @@ def merge(conn: sqlite3.Connection, keep: str, drop: str) -> None:
 
             existing = conn.execute(
                 """
-                SELECT id, pos_evidence, neg_evidence
+                SELECT id, pos_evidence, neg_evidence, last_seen,
+                       last_reinforced
                 FROM knowledge_graph
                 WHERE subject_canonical = ? AND predicate = ? AND object_canonical = ?
                 """,
@@ -177,30 +186,61 @@ def merge(conn: sqlite3.Connection, keep: str, drop: str) -> None:
             ).fetchone()
 
             if existing and existing["id"] != edge_id:
+                present_cutoff = conn.execute(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now','+300 seconds')"
+                ).fetchone()[0]
+
+                def latest_present(left, right, *, fallback):
+                    usable = []
+                    for value in (left, right):
+                        try:
+                            canonical = normalize_iso_timestamp(
+                                value, context="edge merge timestamp"
+                            )
+                        except ValueError:
+                            continue
+                        if timestamp_at_or_before(canonical, present_cutoff):
+                            usable.append(value)
+                    if not usable:
+                        # Neither branch has usable recency authority. Collapse
+                        # to one conservative value so A->B and B->A converge
+                        # instead of preserving whichever poison survived.
+                        return fallback
+                    return latest_timestamp_spelling(*usable)
+
                 conn.execute(
                     """
                     UPDATE knowledge_graph
-                    SET pos_evidence = pos_evidence + ?,
-                        neg_evidence = neg_evidence + ?,
-                        last_seen = MAX(last_seen, ?),
-                        last_reinforced = MAX(COALESCE(last_reinforced, ''), COALESCE(?, ''))
+                    SET last_seen = ?, last_reinforced = ?
                     WHERE id = ?
                     """,
                     (
-                        edge["pos_evidence"],
-                        edge["neg_evidence"],
-                        edge["last_seen"],
-                        edge["last_reinforced"],
+                        latest_present(
+                            existing["last_seen"], edge["last_seen"],
+                            fallback="0001-01-01T00:00:00.000Z",
+                        ),
+                        latest_present(
+                            existing["last_reinforced"],
+                            edge["last_reinforced"],
+                            fallback=None,
+                        ),
                         existing["id"],
                     ),
                 )
-                conn.execute(
-                    "UPDATE kg_evidence SET edge_id = ? WHERE edge_id = ?",
-                    (existing["id"], edge_id),
-                )
+                evidence.move_edge_provenance(conn, existing["id"], [edge_id])
                 conn.execute("DELETE FROM knowledge_graph WHERE id = ?", (edge_id,))
             else:
+                outcome_chunks = [
+                    str(item["chunk_id"])
+                    for item in conn.execute(
+                        "SELECT DISTINCT chunk_id FROM kg_claim_observations "
+                        "WHERE edge_id=?",
+                        (edge_id,),
+                    ).fetchall()
+                ]
                 conn.execute(
                     "UPDATE knowledge_graph SET subject_canonical = ?, object_canonical = ? WHERE id = ?",
                     (new_subject, new_object, edge_id),
                 )
+                evidence.recanonicalize_lifecycle_keys(conn)
+                evidence.refresh_claim_extraction_outcomes(conn, outcome_chunks)

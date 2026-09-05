@@ -82,6 +82,58 @@ def seed_edge(
     )
 
 
+class PromptSourceAwareStub(StubLLMClient):
+    """Fill legacy canned triples from an exact source record in the prompt.
+
+    Most integration fixtures predate claim-level provenance and intentionally
+    describe only the semantic triple.  At request time the extraction prompt
+    contains the authoritative, one-line JSON source records, so choosing the
+    final record keeps those fixtures useful without weakening production
+    validation or inventing an id outside the exact input slice.  Tests that
+    exercise mixed-source attribution provide ``source_message_id`` explicitly
+    and are left untouched.
+    """
+
+    def complete(self, request):
+        raw = super().complete(request)
+        if "source_message_id (integer)" not in request.system:
+            return raw
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return raw
+        if not isinstance(payload, dict) or not isinstance(payload.get("triples"), list):
+            return raw
+
+        source_ids: list[int] = []
+        for line in request.user.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            source_id = record.get("source_message_id")
+            if isinstance(source_id, int) and not isinstance(source_id, bool):
+                source_ids.append(source_id)
+        if not source_ids:
+            return raw
+
+        changed = False
+        triples = []
+        for original in payload["triples"]:
+            if not isinstance(original, dict) or "source_message_id" in original:
+                triples.append(original)
+                continue
+            item = dict(original)
+            item["source_message_id"] = source_ids[-1]
+            triples.append(item)
+            changed = True
+        if not changed:
+            return raw
+        return json.dumps({**payload, "triples": triples})
+
+
 def make_routed_llm(triples: list[dict], markers: list[dict]) -> StubLLMClient:
     """Stub for the merged per-chunk extraction call.
 
@@ -93,7 +145,7 @@ def make_routed_llm(triples: list[dict], markers: list[dict]) -> StubLLMClient:
     standalone triple/marker prompts continues to route correctly.
     """
     combined = json.dumps({"triples": triples, "markers": markers})
-    return StubLLMClient(
+    return PromptSourceAwareStub(
         fixtures={
             # Combined chunk-extraction prompt -> object with both keys.
             "single pass": combined,
