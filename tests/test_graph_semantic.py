@@ -6,9 +6,12 @@ import math
 
 import pytest
 
+from hymem import StubEmbeddingClient
 from hymem.core import db as core_db
+from hymem.extraction.embeddings import MappedStubEmbeddingClient
 from hymem.dreaming.canonicalize import register_alias
 from hymem.dreaming.embeddings import fetch_edge_embeddings
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.query.augment import (
     AugmentedContext,
     _expand_entities_by_token_overlap,
@@ -21,17 +24,15 @@ from hymem.query.predicate_routing import route_predicates
 from tests.conftest import make_routed_llm, seed_edge
 
 
-class _MappingEmbedder:
-    model = "mapping-v1"
-    dim = 2
+def _MappingEmbedder(vectors=None):
+    """Return the maintained immutable semantic fixture producer."""
 
-    def __init__(self, vectors=None):
-        self.vectors = vectors or {}
-        self.calls: list[list[str]] = []
-
-    def embed(self, texts):
-        self.calls.append(list(texts))
-        return [list(self.vectors.get(text, [1.0, 0.0])) for text in texts]
+    return MappedStubEmbeddingClient(
+        vectors,
+        model="mapping-v1",
+        dim=2,
+        default=[1.0, 0.0],
+    )
 
 
 # --- schema migration v6 ----------------------------------------------------
@@ -493,17 +494,26 @@ def test_semantic_fallback_without_sqlite_vec(hy_with_embed, monkeypatch):
     assert calls, "python-cosine edge search should run when vec extension is off"
 
 
-def _store_edge_vector(conn, edge_id, vector, *, model="mapping-v1", dim=2):
+def _store_edge_vector(conn, edge_id, vector, *, model=None, dim=2):
     edge = conn.execute(
         "SELECT subject_canonical,predicate,object_canonical "
         "FROM knowledge_graph WHERE id=?", (edge_id,),
     ).fetchone()
     text = f"{edge['subject_canonical']} {edge['predicate']} {edge['object_canonical']}"
-    conn.execute(
-        "INSERT OR REPLACE INTO edge_embeddings(edge_text,vector_json,model,dim) "
-        "VALUES (?,?,?,?)",
-        (text, json.dumps(vector), model, dim),
-    )
+    if model is None:
+        model, declared_dim = embedding_storage_identity(_MappingEmbedder())
+        assert declared_dim == dim
+    elif not model.startswith("hymem-embedding-producer-v1:"):
+        model, declared_dim = embedding_storage_identity(
+            StubEmbeddingClient(model_name=model, dim_value=dim)
+        )
+        assert declared_dim == dim
+    with core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT OR REPLACE INTO edge_embeddings("
+            "edge_text,vector_json,model,dim) VALUES (?,?,?,?)",
+            (text, json.dumps(vector), model, dim),
+        )
 
 
 def test_augmented_context_declares_graph_facts_contract():
@@ -610,12 +620,14 @@ def test_malformed_packed_edge_vector_fails_closed_and_refreshes(hy):
     seed_edge(hy.conn, "service", "uses", "redis")
     edge_id = int(hy.conn.execute("SELECT id FROM knowledge_graph").fetchone()[0])
     edge_text = "service uses redis"
-    hy.conn.execute(
-        "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
-        "VALUES (?,?,?,2)",
-        (edge_text, "b64f32:notbase64", "mapping-v1"),
-    )
     embedder = _MappingEmbedder()
+    model, dim = embedding_storage_identity(embedder)
+    with core_db.embedding_mutation(hy.conn):
+        hy.conn.execute(
+            "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+            "VALUES (?,?,?,?)",
+            (edge_text, "b64f32:notbase64", model, dim),
+        )
     assert _python_cosine_edge_search(
         hy.conn, embedder, "service", top_k=5, max_scan=5
     ) == []
@@ -629,12 +641,14 @@ def test_vec_edge_backfill_rejects_non_sequence_json(hy_with_embed):
     edge_id = int(hy_with_embed.conn.execute(
         "SELECT id FROM knowledge_graph"
     ).fetchone()[0])
-    hy_with_embed.conn.execute(
-        "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
-        "VALUES ('service uses redis', ?, 'mapping-v1', 2)",
-        (json.dumps({"0": 1.0, "1": 0.0}),),
-    )
-    core_db.ensure_vec_table(hy_with_embed.conn, 2)
+    model, dim = embedding_storage_identity(_MappingEmbedder())
+    with core_db.embedding_mutation(hy_with_embed.conn):
+        hy_with_embed.conn.execute(
+            "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+            "VALUES ('service uses redis', ?, ?, ?)",
+            (json.dumps({"0": 1.0, "1": 0.0}), model, dim),
+        )
+    core_db.ensure_vec_table(hy_with_embed.conn, dim, model=model)
     if core_db.has_vec_table(hy_with_embed.conn, table="vec_edges"):
         assert hy_with_embed.conn.execute(
             "SELECT COUNT(*) FROM vec_edges WHERE rowid=?", (edge_id,)
@@ -676,7 +690,8 @@ def test_stale_sqlite_vec_hit_cannot_crowd_out_live_durable_hit(
     ids = {row["subject_canonical"]: int(row["id"]) for row in rows}
     _store_edge_vector(hy_with_embed.conn, ids["stale"], [1.0, 0.0])
     _store_edge_vector(hy_with_embed.conn, ids["live_target"], [1.0, 0.0])
-    core_db.ensure_vec_table(hy_with_embed.conn, 2)
+    model, dim = embedding_storage_identity(_MappingEmbedder())
+    core_db.ensure_vec_table(hy_with_embed.conn, dim, model=model)
     monkeypatch.setattr(
         core_db, "vec_search",
         lambda conn, query_vector, top_k, table="vec_edges": [(ids["stale"], 0.0)],

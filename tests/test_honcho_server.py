@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -23,14 +24,168 @@ from hymem.query.graph_state import GraphEvidenceCitation
 from tests.conftest import make_routed_llm, seed_edge
 
 
+def test_asgi_lifespan_orders_start_body_then_owned_shutdown(monkeypatch):
+    events: list[str] = []
+    monkeypatch.setattr(
+        hsrv, "_get_scheduler", lambda: events.append("scheduler:start")
+    )
+    monkeypatch.setattr(
+        hsrv, "_stop_scheduler", lambda: events.append("scheduler:stop")
+    )
+
+    def shutdown(*, stop_background):
+        events.append("shutdown:enter")
+        stop_background()
+        events.append("shutdown:return")
+
+    monkeypatch.setattr(hsrv, "_shutdown_hy", shutdown)
+
+    async def exercise():
+        async with hsrv._lifespan(hsrv.app):
+            events.append("body")
+
+    asyncio.run(exercise())
+    assert events == [
+        "scheduler:start",
+        "body",
+        "shutdown:enter",
+        "scheduler:stop",
+        "shutdown:return",
+    ]
+
+
+def test_asgi_startup_failure_runs_cleanup_without_replacing_primary(monkeypatch):
+    primary = KeyboardInterrupt("startup primary")
+    cleanup = SystemExit("cleanup secondary")
+    monkeypatch.setattr(
+        hsrv,
+        "_get_scheduler",
+        lambda: (_ for _ in ()).throw(primary),
+    )
+    monkeypatch.setattr(
+        hsrv,
+        "_shutdown_hy",
+        lambda **_kwargs: (_ for _ in ()).throw(cleanup),
+    )
+
+    async def exercise():
+        async with hsrv._lifespan(hsrv.app):
+            raise AssertionError("startup failure must prevent the body")
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        asyncio.run(exercise())
+
+    assert caught.value is primary
+    notes = " ".join(getattr(primary, "__notes__", ()))
+    assert "SystemExit" in notes
+    assert "cleanup secondary" not in notes
+
+
+def test_scheduler_install_rolls_back_failed_start(monkeypatch):
+    events: list[str] = []
+    primary = RuntimeError("start failed")
+
+    class FailingScheduler:
+        shutdown_pending = False
+
+        def __init__(self, _hy, _cooldown):
+            events.append("construct")
+
+        def start(self):
+            events.append("start")
+            raise primary
+
+        def stop(self):
+            events.append("stop")
+
+    hsrv.set_scheduler(None)
+    monkeypatch.setattr(hsrv, "DreamScheduler", FailingScheduler)
+    monkeypatch.setattr(hsrv, "_get_hy", lambda: object())
+
+    with pytest.raises(RuntimeError) as caught:
+        hsrv._get_scheduler()
+
+    assert caught.value is primary
+    assert events == ["construct", "start", "stop"]
+    assert hsrv._scheduler is None
+
+
+def test_scheduler_install_retains_partial_owner_when_rollback_times_out(monkeypatch):
+    events: list[str] = []
+    primary = RuntimeError("start failed")
+
+    class PartialScheduler:
+        shutdown_pending = True
+
+        def __init__(self, _hy, _cooldown):
+            self.stop_calls = 0
+
+        def start(self):
+            events.append("start")
+            raise primary
+
+        def stop(self):
+            self.stop_calls += 1
+            events.append(f"stop:{self.stop_calls}")
+            if self.stop_calls == 1:
+                raise TimeoutError("worker still alive")
+            self.shutdown_pending = False
+
+    hsrv.set_scheduler(None)
+    monkeypatch.setattr(hsrv, "DreamScheduler", PartialScheduler)
+    monkeypatch.setattr(hsrv, "_get_hy", lambda: object())
+
+    with pytest.raises(RuntimeError) as caught:
+        hsrv._get_scheduler()
+
+    assert caught.value is primary
+    assert isinstance(hsrv._scheduler, PartialScheduler)
+    assert "TimeoutError" in " ".join(getattr(primary, "__notes__", ()))
+    hsrv._stop_scheduler()
+    assert hsrv._scheduler is None
+    assert events == ["start", "stop:1", "stop:2"]
+
+
+def test_honcho_entrypoint_preserves_control_flow_over_cleanup(monkeypatch):
+    primary = KeyboardInterrupt("uvicorn stop")
+    cleanup = SystemExit("shutdown exit")
+    monkeypatch.setattr(
+        hsrv.uvicorn, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(primary)
+    )
+    monkeypatch.setattr(
+        hsrv,
+        "_shutdown_hy",
+        lambda **_kwargs: (_ for _ in ()).throw(cleanup),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        hsrv.main()
+
+    assert caught.value is primary
+    notes = " ".join(getattr(primary, "__notes__", ()))
+    assert "SystemExit" in notes
+    assert "shutdown exit" not in notes
+
+
+class _NoopScheduler:
+    shutdown_pending = False
+
+    def kick(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
 @pytest.fixture
 def client(hy_with_embed):
     hsrv.set_hy(hy_with_embed)
-    # Stop any scheduler leaked from a prior test before TestClient triggers
-    # lifespan startup (which creates a new one).
+    # General HTTP contract tests do not need a concurrent dream cycle.  Keep
+    # those reads deterministic; the scheduler-specific tests below replace
+    # this fixture owner with a real DreamScheduler and exercise it directly.
     if hsrv._scheduler is not None:
         hsrv._scheduler.stop()
-        hsrv.set_scheduler(None)
+    hsrv.set_scheduler(_NoopScheduler())
     with TestClient(hsrv.app) as c:
         for peer_id in ("user-1", "agent-main"):
             assert c.post(
@@ -149,13 +304,65 @@ def test_dream_status_endpoint(client):
     assert r.status_code == 200
     body = r.json()
     assert set(body.keys()) >= {
+        "dream_status_schema",
+        "pending_source_materialization",
         "pending_chunks",
+        "pending_digests",
+        "pending_profiles",
+        "pending_facts",
+        "phase1_backlog_status",
+        "pending_chunks_authoritative",
+        "phase1_generation_key",
+        "terminal_loss_chunks",
+        "terminal_loss_reasons",
+        "coverage_integrity_failures",
+        "coverage_integrity_failure_reasons",
+        "coverage_integrity_failure_details",
+        "coverage_integrity_failure_details_truncated",
+        "coverage_integrity_config_version",
+        "malformed_source_materialization",
+        "malformed_digests",
+        "malformed_profiles",
+        "malformed_facts",
+        "pending_aggregation",
+        "aggregation_enabled",
+        "aggregation_config_version",
+        "aggregation_active_caught_exceptions",
+        "aggregation_active_fusion_failures",
+        "aggregation_total_caught_exceptions",
+        "aggregation_total_fusion_failures",
+        "quarantined_facts",
+        "quarantined_facts_malformed",
         "total_chunks",
         "prompt_version",
         "in_progress",
         "last_run",
     }
-    assert isinstance(body["pending_chunks"], int)
+    assert body["quarantined_facts"] == 0
+    assert body["quarantined_facts_malformed"] == 0
+    assert body["dream_status_schema"] == "hymem-dream-status-v6"
+    assert body["phase1_backlog_status"] == "current_producer"
+    assert body["pending_chunks_authoritative"] is True
+    assert isinstance(body["phase1_generation_key"], str)
+    for key in (
+        "pending_source_materialization", "pending_chunks", "pending_digests",
+        "pending_profiles", "pending_facts", "malformed_source_materialization",
+        "malformed_digests", "malformed_profiles", "malformed_facts",
+    ):
+        assert isinstance(body[key], int)
+        assert body[key] >= 0
+    assert isinstance(body["terminal_loss_chunks"], int)
+    assert isinstance(body["terminal_loss_reasons"], dict)
+    assert isinstance(body["coverage_integrity_failures"], int)
+    assert isinstance(body["coverage_integrity_failure_reasons"], dict)
+    assert isinstance(body["coverage_integrity_failure_details"], list)
+    assert isinstance(body["coverage_integrity_failure_details_truncated"], bool)
+    assert isinstance(body["pending_aggregation"], int)
+    assert isinstance(body["aggregation_enabled"], bool)
+    assert isinstance(body["aggregation_active_caught_exceptions"], int)
+    assert isinstance(body["aggregation_active_fusion_failures"], int)
+    assert isinstance(body["aggregation_total_caught_exceptions"], int)
+    assert isinstance(body["aggregation_total_fusion_failures"], int)
     assert isinstance(body["total_chunks"], int)
     assert isinstance(body["in_progress"], bool)
 
@@ -200,7 +407,7 @@ def test_search_returns_full_exact_message_and_does_not_apply_token_excerpts(cli
         "/v3/workspaces/hermes/sessions/exact-search/search",
         # ``tokens`` is a future/unknown SDK extra. Search is item-limited and
         # must never change exact Message identity/content based on it.
-        json={"query": "rare-search-tail", "limit": 1, "tokens": 1},
+        json={"query": "rare", "limit": 1, "tokens": 1},
     )
     assert response.status_code == 200
     assert response.json()[0]["id"] == created.json()[0]["id"]

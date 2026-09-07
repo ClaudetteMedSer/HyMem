@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import threading
+
+import pytest
 
 from hymem import HyMem, StubEmbeddingClient
 from hymem.extraction.embeddings import (
@@ -11,7 +14,111 @@ from hymem.extraction.embeddings import (
 )
 from hymem.extraction.llm import StubLLMClient
 from hymem.core import db as core_db
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.query.augment import _vector_search
+
+
+class _ExactTestEmbeddingDeclaration:
+    """Explicit durable authority for behavior-changing test subclasses."""
+
+    def embedding_producer_declaration(self):
+        return {
+            "schema": "hymem-custom-embedding-producer-declaration-v2",
+            "implementation": "tests.embedding-control",
+            "implementation_revision": "v1",
+            "deployment_revision": "fixture-v1",
+            "deployment_tenant": "tests",
+            "model_revision": self.model,
+            "request_policy": "deterministic-test-v1",
+            "dimension": self.dim,
+            "network_free": True,
+        }
+
+
+def test_cached_embedding_close_delegates_exactly_once_and_rejects_late_use():
+    class ClosableEmbedding:
+        model = "close-test"
+        dim = 2
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def close(self):
+            self.close_calls += 1
+
+    inner = ClosableEmbedding()
+    cached = CachedEmbeddingClient(inner)
+
+    assert cached.embed(["before close"]) == [[1.0, 0.0]]
+    cached.close()
+    cached.close()
+
+    assert inner.close_calls == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        cached.embed(["after close"])
+
+
+def test_cached_embedding_close_waits_for_inflight_provider_call():
+    entered = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+
+    class BlockingEmbedding:
+        model = "blocking"
+        dim = 2
+
+        def embed(self, texts):
+            entered.set()
+            assert release.wait(timeout=5.0)
+            events.append("embed:return")
+            return [[1.0, 0.0] for _ in texts]
+
+        def close(self):
+            events.append("close")
+
+    cached = CachedEmbeddingClient(BlockingEmbedding())
+    worker = threading.Thread(target=lambda: cached.embed(["x"]))
+    worker.start()
+    assert entered.wait(timeout=2.0)
+    closer = threading.Thread(target=cached.close)
+    closer.start()
+    assert closer.is_alive()
+    release.set()
+    worker.join(timeout=2.0)
+    closer.join(timeout=2.0)
+
+    assert not worker.is_alive() and not closer.is_alive()
+    assert events == ["embed:return", "close"]
+
+
+def test_cached_embedding_does_not_retry_a_failed_transport_close():
+    primary = RuntimeError("provider close failed")
+
+    class FailingCloseEmbedding:
+        model = "close-failure"
+        dim = 2
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def close(self):
+            self.close_calls += 1
+            raise primary
+
+    inner = FailingCloseEmbedding()
+    cached = CachedEmbeddingClient(inner)
+
+    with pytest.raises(RuntimeError) as caught:
+        cached.close()
+    assert caught.value is primary
+    cached.close()
+    assert inner.close_calls == 1
 
 
 def test_stub_embedding_client_shape_and_determinism():
@@ -56,7 +163,8 @@ def test_dreaming_populates_chunk_embeddings(hy_with_embed):
         "SELECT chunk_id, model, dim FROM chunk_embeddings"
     ).fetchall()
     assert len(rows) >= 1
-    assert all(r["model"] == "stub" for r in rows)
+    model, _dim = embedding_storage_identity(hy_with_embed._embed)
+    assert all(r["model"] == model for r in rows)
     assert all(r["dim"] == 16 for r in rows)
 
 
@@ -76,11 +184,13 @@ def test_persist_chunk_embeddings_reembed_same_rowid(hy_with_embed):
         "salience_reason, text) VALUES ('c1', 's', 1, 1, 'r', 'txt')"
     )
     rowid = conn.execute("SELECT rowid FROM chunks WHERE id = 'c1'").fetchone()["rowid"]
+    producer = StubEmbeddingClient(model_name="stub", dim_value=3)
+    model, _dim = embedding_storage_identity(producer)
 
     def pending(vec: list[float]) -> PendingChunkEmbeddings:
         return PendingChunkEmbeddings(
             ids=["c1"], chunk_rowids=[rowid], vectors=[vec], dim=len(vec),
-                model="stub", text_hashes=[embedding_text_hash("txt")],
+                model=model, text_hashes=[embedding_text_hash("txt")],
                 from_cache=[False],
         )
 
@@ -300,50 +410,85 @@ def test_embedding_cache_skips_repeat_chunk_text_across_dreams(cfg):
         hy.close()
 
 
-def test_chunk_embedding_runs_in_parallel_with_phase1(cfg):
-    """A slow embedder + a non-trivial Phase 1 LLM stream should finish in
-    roughly max(LLM*N, EMBED) wall-time rather than their sum, because chunk
-    embedding is kicked off on a background thread after each persist_chunks
-    and joined after the per-session loop.
+def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
+    """The first chunk-embedding request and Phase 1 make progress together.
 
-    Tunings: with 5 chunks → 5 Phase-1 LLM calls (one combined triples+markers
-    call per chunk) + 3 per-session tail calls (digest, user profile, narrative
-    facts) = 8 LLM calls. LLM_DELAY is sized so the Phase-1 stream
-    (5*LLM_DELAY) is comparable to EMBED_DELAY, so overlapping the two saves
-    close to a full EMBED_DELAY. Serial: 8*LLM_DELAY + EMBED_DELAY. Parallel:
-    ~max(5*LLM_DELAY, EMBED_DELAY) + the tail calls.
+    The event handshake asserts the actual happens-before relationship instead
+    of inferring it from a wall-clock threshold.  The embedding worker waits
+    until the first Phase-1 provider call has entered; that provider call only
+    releases it after observing the embed request still in flight.  A serial
+    implementation therefore times out the handshake and fails
+    deterministically.
 
-    The tail-call COUNT is part of the serial floor, so it has to track
-    reality: each tail extractor added since (profile in v19, facts in v26) ate
-    into the asserted margin until the test failed on a dream whose
-    phase-1/embed overlap was never broken. If a new tail call lands, update
-    `n_llm_calls` — do not widen `savings_target`, which is the property under
-    test.
+    Prompt v20 performs a primary extraction and one omission-verification pass
+    for every non-empty terminal result, hence exactly two Phase-1 calls for
+    each of the five chunks in this fixture.
     """
-    import time
+    import threading
     from dataclasses import replace as _dc_replace
 
     from hymem.extraction.llm import LLMRequest
 
-    LLM_DELAY = 0.04
-    EMBED_DELAY = 0.20
+    sync_timeout = 2.0
+    embed_started = threading.Event()
+    phase1_entered_while_embedding = threading.Event()
+    embed_observed_phase1 = threading.Event()
+    phase1_observed_embed_inflight = threading.Event()
+    first_embed_finished = threading.Event()
 
-    class SlowEmbed(StubEmbeddingClient):
-        def embed(self, texts):
-            time.sleep(EMBED_DELAY)
-            return super().embed(texts)
+    from concurrent.futures import ThreadPoolExecutor as _RealThreadPoolExecutor
+    from hymem.dreaming import runner as runner_mod
 
-    class SlowLLM(StubLLMClient):
+    class CoordinatedExecutor:
+        """Instrument the worker boundary without altering producer identity."""
+
+        def __init__(self, *args, **kwargs):
+            self._inner = _RealThreadPoolExecutor(*args, **kwargs)
+
+        def submit(self, function):
+            def coordinated():
+                embed_started.set()
+                if phase1_entered_while_embedding.wait(sync_timeout):
+                    embed_observed_phase1.set()
+                try:
+                    return function()
+                finally:
+                    first_embed_finished.set()
+
+            return self._inner.submit(coordinated)
+
+        def shutdown(self, *args, **kwargs):
+            return self._inner.shutdown(*args, **kwargs)
+
+    monkeypatch.setattr(runner_mod, "ThreadPoolExecutor", CoordinatedExecutor)
+
+    class CoordinatedLLM(StubLLMClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.phase1_calls = 0
+
         def complete(self, request: LLMRequest) -> str:
-            time.sleep(LLM_DELAY)
+            if "source_message_id (integer)" in request.system:
+                self.phase1_calls += 1
+                if self.phase1_calls == 1 and embed_started.wait(sync_timeout):
+                    if not first_embed_finished.is_set():
+                        phase1_observed_embed_inflight.set()
+                        phase1_entered_while_embedding.set()
             return super().complete(request)
 
-    embed = SlowEmbed()
+    embed = StubEmbeddingClient()
     tight_cfg = _dc_replace(cfg, dream_budget=5, dream_baseline_budget=0)
 
-    llm = SlowLLM(
+    llm = CoordinatedLLM(
         fixtures={
-            "single pass": json.dumps({"triples": [], "markers": []}),
+            "single pass": json.dumps({
+                "triples": [],
+                "markers": [{
+                    "kind": "preference",
+                    "statement": "user explicitly prefers the named choice",
+                }],
+                "complete": True,
+            }),
         },
         default="[]",
     )
@@ -358,45 +503,47 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg):
             )
         hy.close_session("s1")
 
-        t0 = time.monotonic()
         report = hy.dream()
-        elapsed = time.monotonic() - t0
 
         assert report.chunks_embedded >= 5
-        # We saved roughly EMBED_DELAY by running it parallel to Phase 1.
-        # The serial floor is the sum of Phase 1 LLM + tail LLM + 1 embed.
-        # Require at least 30% of EMBED_DELAY shaved off vs serial.
-        # 1 combined call per chunk + the 3 per-session tail calls
-        # (digest, user profile, narrative facts).
-        n_llm_calls = 5 * 1 + 3
-        serial_floor = n_llm_calls * LLM_DELAY + EMBED_DELAY
-        savings_target = EMBED_DELAY * 0.30
-        assert elapsed < serial_floor - savings_target, (
-            f"expected ≥{savings_target:.3f}s saved by parallelism; "
-            f"elapsed={elapsed:.3f}s serial_floor={serial_floor:.3f}s"
+        assert llm.phase1_calls == 5 * 2
+        assert phase1_observed_embed_inflight.is_set(), (
+            "Phase 1 did not observe the chunk embedding request in flight"
+        )
+        assert embed_observed_phase1.is_set(), (
+            "the chunk embedding request finished before Phase 1 entered"
         )
     finally:
         hy.close()
 
 
-def test_background_embed_failure_falls_back_to_post_loop_fetch(cfg):
+def test_background_embed_failure_falls_back_to_post_loop_fetch(cfg, monkeypatch):
     """If the background embed task raises, the dream cycle must continue
     and the post-loop fetch_chunk_embeddings call must still embed the
     affected chunks."""
-    from hymem.extraction.embeddings import StubEmbeddingClient as _Stub
+    from concurrent.futures import ThreadPoolExecutor as _RealThreadPoolExecutor
+    from hymem.dreaming import runner as runner_mod
 
-    class FlakyEmbed(_Stub):
-        def __init__(self):
-            super().__init__()
-            self.call_count = 0
+    class FailingFirstExecutor:
+        def __init__(self, *args, **kwargs):
+            self._inner = _RealThreadPoolExecutor(*args, **kwargs)
+            self._failed = False
 
-        def embed(self, texts):
-            self.call_count += 1
-            if self.call_count == 1:
-                raise RuntimeError("simulated background failure")
-            return super().embed(texts)
+        def submit(self, function):
+            if not self._failed:
+                self._failed = True
 
-    embed = FlakyEmbed()
+                def fail():
+                    raise RuntimeError("simulated background failure")
+
+                return self._inner.submit(fail)
+            return self._inner.submit(function)
+
+        def shutdown(self, *args, **kwargs):
+            return self._inner.shutdown(*args, **kwargs)
+
+    monkeypatch.setattr(runner_mod, "ThreadPoolExecutor", FailingFirstExecutor)
+    embed = StubEmbeddingClient()
     llm = StubLLMClient(default="[]")
     hy = HyMem(cfg, llm=llm, embedding_client=embed)
     try:
@@ -413,7 +560,7 @@ def test_background_embed_failure_falls_back_to_post_loop_fetch(cfg):
         # Background call failed, fallback fetch_chunk_embeddings ran the
         # second embedder call and persisted the chunk.
         assert report.chunks_embedded >= 1
-        assert embed.call_count >= 2
+        assert embed.calls
 
         rows = hy.conn.execute(
             "SELECT COUNT(*) AS c FROM chunk_embeddings"
@@ -440,11 +587,17 @@ def test_vector_search_respects_embedding_max_scan(cfg):
                     (cid, "s1", f"chunk text {i}", ts),
                 )
                 vec = embed.embed([f"chunk text {i}"])[0]
-                conn.execute(
-                    "INSERT INTO chunk_embeddings(chunk_id, vector_json, model, dim) "
-                    "VALUES (?, ?, ?, ?)",
-                    (cid, json.dumps(vec), embed.model, embed.dim),
-                )
+                model, dim = embedding_storage_identity(embed)
+                with core_db.embedding_mutation(conn):
+                    conn.execute(
+                        "INSERT INTO chunk_embeddings("
+                        "chunk_id,vector_json,model,dim,text_hash) "
+                        "VALUES (?,?,?,?,?)",
+                        (
+                            cid, json.dumps(vec), model, dim,
+                            embedding_text_hash(f"chunk text {i}"),
+                        ),
+                    )
 
         hits = _vector_search(conn, embed, "anything", top_k=5, max_scan=2)
         assert len(hits) <= 2

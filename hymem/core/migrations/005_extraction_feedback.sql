@@ -1,4 +1,4 @@
--- v5: extraction feedback table (wrongly-extracted triples for few-shot negatives).
+-- v5: retraction audit table (historical name retained for compatibility).
 CREATE TABLE IF NOT EXISTS extraction_feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,

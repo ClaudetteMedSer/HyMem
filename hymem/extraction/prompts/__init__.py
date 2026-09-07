@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-# Prompts are kept in code so prompt_version pins them. Bump HyMemConfig.prompt_version
-# whenever you change wording so already-processed chunks get reprocessed cleanly.
+from hymem.contrib.implementation_identity import import_time_source_sha256
+
+EXTRACTION_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
+
+# Prompts stay in code and Phase-1 derives its durable cache namespace from the
+# rendered bytes plus validator/recovery behavior. ``prompt_version`` remains a
+# human generation label; bump it for an intentional protocol generation, but
+# an omitted bump can no longer make changed extraction code reuse stale rows.
 
 ALLOWED_PREDICATES = (
     "uses",
@@ -29,6 +35,13 @@ ALLOWED_PREDICATES = (
     "located_in",
     "participates_in",
     "has_attribute",
+)
+
+# Retraction records are durable audit evidence, not prompt instructions.
+# Keeping this policy explicit and contract-bound prevents a future refactor
+# from silently reintroducing store-derived text into a system prompt.
+EXTRACTION_FEEDBACK_PROMPT_POLICY_VERSION = (
+    "hymem-extraction-feedback-audit-only-v1"
 )
 
 _TRIPLE_SYSTEM_TEMPLATE = """You extract structured technical relationships and personal-life facts from conversation excerpts.
@@ -73,7 +86,6 @@ Rules:
     located_in: A lives in, is located in, or is based in place B
     participates_in: A does, plays, practices, attends, or is enrolled in activity/event B (put frequency or schedule in temporal_scope)
     has_attribute: A has the personal attribute or measurement B (age, height, weight, salary, a rate); state the value as the object (e.g. 60_bpm) and also in value_numeric/value_unit when numeric
-{negative_examples}
 - polarity is -1 only when the speaker negates or retracts the relationship
   ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
   Mapping for negations: "no longer uses" -> uses with polarity -1.
@@ -116,20 +128,10 @@ Rules:
 """
 
 
-def build_triple_system(negative_examples: str = "") -> str:
-    """Build the triple extraction system prompt with optional negative examples."""
-    neg_section = ""
-    if negative_examples:
-        neg_section = (
-            "\nCRITICAL: The following triples were previously extracted INCORRECTLY "
-            "from similar conversation contexts. DO NOT extract these exact "
-            "relationships or close variants:\n"
-            + negative_examples
-            + "\n"
-        )
+def build_triple_system() -> str:
+    """Build the deterministic standalone triple-extraction system prompt."""
     return _TRIPLE_SYSTEM_TEMPLATE.format(
         predicates=", ".join(ALLOWED_PREDICATES),
-        negative_examples=neg_section,
     )
 
 
@@ -169,18 +171,25 @@ Return the JSON array now."""
 
 
 # --- Combined per-chunk extraction (triples + markers in one call) ----------
-# Single prompt that returns a JSON OBJECT with both "triples" and "markers",
-# halving the per-chunk LLM call count. The rules below are the verbatim triple
-# and marker rules from the separate prompts above so quality does not regress;
-# only the output container changes (object with two array keys, mirroring
-# SESSION_DIGEST_SYSTEM). The distinctive substrings "structured technical
-# relationships" and "EXPLICIT behavioral signals" are preserved for prompt
-# routing in tests.
+# One contract returns a JSON OBJECT with both "triples" and "markers". The
+# primary and its bounded omission check both use this contract, avoiding
+# separate triple/marker calls within either pass. The rules below are the
+# verbatim triple and marker rules from the separate prompts above; only the
+# output container changes (object with two arrays plus completeness). The
+# distinctive substrings "structured technical relationships" and "EXPLICIT
+# behavioral signals" are preserved for prompt routing in tests.
 
 _CHUNK_EXTRACTION_SYSTEM_TEMPLATE = """You extract structured technical relationships, personal-life facts, and EXPLICIT behavioral signals from a conversation excerpt in a single pass.
 
+Work source record by source record, sentence by sentence:
+1. Identify only explicitly supported candidate relationships and behavioral signals.
+2. Remove alternate phrasings and inferred/transitive claims.
+3. Check that every retained claim cites the one source record that states it.
+4. Set `complete` true only after checking the ENTIRE excerpt and fitting every
+   retained item within the limits below.
+
 Output a strict JSON OBJECT (not an array). No prose, no markdown, no code fences.
-The object has exactly these two keys:
+The object has exactly these three keys:
 
 "triples": a JSON array of relationship items. Each item has exactly: subject
 (string), predicate (string), object (string), polarity (1 or -1), and
@@ -229,12 +238,14 @@ source_message_id (integer).
     located_in: A lives in, is located in, or is based in place B
     participates_in: A does, plays, practices, attends, or is enrolled in activity/event B (put frequency or schedule in temporal_scope)
     has_attribute: A has the personal attribute or measurement B (age, height, weight, salary, a rate); state the value as the object (e.g. 60_bpm) and also in value_numeric/value_unit when numeric
-{negative_examples}
 - polarity is -1 only when the speaker negates or retracts the relationship
   ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
   Mapping for negations: "no longer uses" -> uses with polarity -1.
   Statements like "we avoid X" use predicate 'avoids' with polarity 1, NOT 'uses' with -1.
-- Skip relationships you are not confident about. An empty array [] is a valid answer.
+- Skip relationships you are not confident about. If no relationship is
+  supported, return an empty `triples` array inside the exact three-key object;
+  never return a top-level array, and always include the boolean `complete`
+  certificate.
 - Subject and object should be concrete named things — tools, libraries, services,
   files, modules, environments, people, teams, projects, or codebases by name, AND
   the user's personal-life things: possessions, places they live, activities they
@@ -280,30 +291,95 @@ source_message_id (integer).
     style: user explicitly asked for a way of communicating (verbosity, format, tone).
 - 'statement' is a single short factual sentence, not a quote.
 
-Always return both keys. An empty array [] is valid for either. Example shape:
-{{"triples": [], "markers": []}}
+"complete": a boolean completeness certificate for this exact excerpt.
+- Return true only when every source record was checked and ALL supported items
+  are present in the arrays.
+- Return FEWER THAN 24 triples and FEWER THAN 12 markers. Counts of exactly 24
+  or 12 are reserved saturation signals and the caller will subdivide even if
+  you say complete. If all supported items do not fit below those boundaries,
+  do NOT return a selected/partial subset: return empty arrays and
+  `complete: false`. The caller will safely subdivide the source records.
+- A fragment record carries `source_content_start` and `source_content_end` as
+  absolute character offsets into its original source message. Treat the
+  fragment as the excerpt, but continue to cite its unchanged source_message_id.
+- A canonical-table continuation may additionally carry
+  `source_fragment_context`. Its separately labelled `content` is an exact
+  earlier header+delimiter slice from the same source record; use those column
+  labels only to interpret table rows in the fragment up to
+  `applies_through_source_content_end`. It is context, not part of the fragment:
+  never extract an item supported only by this repeated header context.
+  When `kind` is `introduced_canonical_markdown_table_header`, the separately
+  labelled `prelude_content` is also an exact earlier ATX/Setext heading or
+  colon-led paragraph from that source. Use it only to interpret the table rows
+  covered by the same applicability end. It is not fragment evidence either:
+  never extract an item supported only by the repeated prelude or header.
+- A right-hand prose continuation may carry `source_boundary_context`. Its
+  separately labelled `content` is an exact, bounded suffix immediately before
+  `source_content_start` in the same source message. Use it only to finish a
+  relationship or signal whose support crosses that exact boundary and whose
+  authoritative fragment `content` contributes indispensable support before
+  `applies_through_source_content_end`. The preceding context does not own
+  items: never return a triple or marker stated wholly in it, and never repeat
+  such an item from the preceding fragment. Do not join it to later fragment
+  text beyond the applicability end. A boundary-spanning triple still cites
+  the unchanged source_message_id of this same source message.
+
+Always return all three keys. Empty arrays are valid when the checked excerpt
+contains no supported item. Example shape:
+{{"triples": [], "markers": [], "complete": true}}
 """
 
 
-def build_chunk_extraction_system(negative_examples: str = "") -> str:
-    """Build the combined triples+markers extraction system prompt with optional
-    negative examples. Mirrors ``build_triple_system``."""
-    neg_section = ""
-    if negative_examples:
-        neg_section = (
-            "\nCRITICAL: The following triples were previously extracted INCORRECTLY "
-            "from similar conversation contexts. DO NOT extract these exact "
-            "relationships or close variants:\n"
-            + negative_examples
-            + "\n"
-        )
+def build_chunk_extraction_system() -> str:
+    """Build the deterministic combined triples+markers system prompt."""
     return _CHUNK_EXTRACTION_SYSTEM_TEMPLATE.format(
         predicates=", ".join(ALLOWED_PREDICATES),
-        negative_examples=neg_section,
     )
 
 
 CHUNK_EXTRACTION_SYSTEM = build_chunk_extraction_system()
+
+
+_CHUNK_OMISSION_VERIFICATION_SUFFIX = """
+
+OMISSION VERIFICATION PASS:
+- Re-read the ENTIRE excerpt, source record by source record and sentence by
+  sentence, specifically looking for supported items omitted from the
+  ALREADY ACCEPTED RESULT.
+- Return ONLY missed supported triples and markers. Do not intentionally
+  repeat an already accepted item. The caller will deterministically dedupe an
+  accidental exact repeat, but a contradictory repeat fails the whole unit.
+- The ALREADY ACCEPTED RESULT is comparison context only. It is not evidence.
+  Every returned item must still be explicitly supported by the excerpt, and
+  every triple must cite the exact source_message_id of the record that states
+  it.
+- `complete` certifies this omission check, not the primary pass. Set it true
+  only after checking the entire excerpt and fitting every missed item below
+  the declared array limits. If the check is incomplete or missed items do not
+  fit, return empty arrays with `complete: false`.
+"""
+
+_CHUNK_EMPTY_VERIFICATION_SUFFIX = (
+    "\nEMPTY VERIFICATION PASS: deterministic wording in this excerpt may state "
+    "an explicit relationship or behavioral signal. Re-read every source "
+    "record sentence by sentence. Return a clean empty only if none of the "
+    "allowed items is explicitly supported."
+)
+
+
+def build_chunk_empty_verification_system() -> str:
+    """Build the exact whole-unit clean-empty verification prompt."""
+    return build_chunk_extraction_system() + (
+        _CHUNK_EMPTY_VERIFICATION_SUFFIX
+    )
+
+
+def build_chunk_omission_verification_system() -> str:
+    """Build the one-shot non-empty omission-check prompt."""
+    return (
+        build_chunk_extraction_system()
+        + _CHUNK_OMISSION_VERIFICATION_SUFFIX
+    )
 
 
 CHUNK_EXTRACTION_USER_TEMPLATE = """Excerpt:
@@ -311,7 +387,19 @@ CHUNK_EXTRACTION_USER_TEMPLATE = """Excerpt:
 {text}
 \"\"\"
 
-Return the JSON object with "triples" and "markers" now."""
+Return the JSON object with "triples", "markers", and "complete" now."""
+
+
+CHUNK_OMISSION_VERIFICATION_USER_TEMPLATE = """Excerpt (the exact same source records as the primary pass):
+\"\"\"
+{text}
+\"\"\"
+
+ALREADY ACCEPTED RESULT (comparison context only; return only supported omissions):
+{accepted}
+
+Return the JSON object with only MISSED "triples" and "markers", plus
+"complete", now."""
 
 
 EPISODE_SYSTEM = """You identify distinct episodes within a conversation session.

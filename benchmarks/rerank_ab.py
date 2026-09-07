@@ -383,6 +383,16 @@ def main() -> None:
     if not (args.m1 or args.m2 or args.sim):
         ap.error("pick a measurement: --m1, --m2 (or --sim for plumbing)")
 
+    if args.m1 and not args.sim:
+        from hymem.contrib.model_policy import (
+            DeprecatedModelAliasError,
+            require_active_model,
+        )
+        try:
+            require_active_model(args.model, role="rerank A/B LLM arm")
+        except DeprecatedModelAliasError as exc:
+            ap.error(str(exc))
+
     spec = json.loads(args.handset.read_text())
     tmp = tempfile.TemporaryDirectory()
     summary: dict = {"config": {"pool": args.pool, "top_k": args.top_k,

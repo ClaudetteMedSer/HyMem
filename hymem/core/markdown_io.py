@@ -59,6 +59,40 @@ def write_section(path: Path, section: str, content: str, *, header: str | None 
     _atomic_write(path, new_text)
 
 
+def render_section(
+    existing: str,
+    section: str,
+    content: str,
+    *,
+    header: str | None = None,
+    insert_if_missing: bool = True,
+) -> str:
+    """Pure in-memory counterpart to :func:`write_section`.
+
+    Read paths use this to replace a possibly stale managed section with the
+    connection-authoritative database projection without mutating the sidecar.
+    Manual text outside the delimiters is preserved byte-for-byte.
+    """
+
+    block = (
+        f"{_START.format(name=section)}\n{content.rstrip()}\n"
+        f"{_END.format(name=section)}"
+    )
+    pattern = _pattern(section)
+    if pattern.search(existing):
+        return pattern.sub(lambda _m: block, existing, count=1)
+    if not insert_if_missing:
+        return existing
+    prefix = existing
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    if header:
+        prefix += f"\n{header}\n" if prefix else f"{header}\n"
+    elif prefix:
+        prefix += "\n"
+    return prefix + block + "\n"
+
+
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))

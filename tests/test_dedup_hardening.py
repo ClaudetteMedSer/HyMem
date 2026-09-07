@@ -5,8 +5,10 @@ from dataclasses import replace
 
 import pytest
 
+from hymem import StubEmbeddingClient
 from hymem.core import db as core_db
 from hymem.dreaming import phase1
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.dreaming.chunks import Chunk, persist_chunks
 from hymem.dreaming.phase1 import ChunkExtraction
 from hymem.extraction.triples import Triple
@@ -64,8 +66,9 @@ def _publish_claim(
                 markers=[],
                 claim_sources={source.message_id: source for source in sources},
                 source_validated=True,
+                phase1_generation=hy._phase1_generation,
             ),
-            prompt_version="dedup-hard-v1",
+            prompt_version=hy.config.prompt_version,
             cfg=cfg,
         )
     return int(hy.conn.execute(
@@ -74,26 +77,34 @@ def _publish_claim(
     ).fetchone()[0])
 
 
-def _embedding(hy, edge_id: int, *, model: str = "fake", vector=None) -> None:
+def _model(model: str = "dedup-hardening-fixture-v1") -> str:
+    return embedding_storage_identity(StubEmbeddingClient(
+        model_name=model, dim_value=2,
+    ))[0]
+
+
+def _embedding(hy, edge_id: int, *, model: str | None = None, vector=None) -> None:
     vector = [1.0, 0.0] if vector is None else vector
+    model = _model() if model is None else _model(model)
     row = hy.conn.execute(
         "SELECT subject_canonical,predicate,object_canonical "
         "FROM knowledge_graph WHERE id=?", (edge_id,),
     ).fetchone()
-    hy.conn.execute(
-        "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
-        "VALUES (?,?,?,?)",
-        (
-            f"{row['subject_canonical']} {row['predicate']} {row['object_canonical']}",
-            json.dumps(vector), model, len(vector),
-        ),
-    )
+    with core_db.embedding_mutation(hy.conn):
+        hy.conn.execute(
+            "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+            "VALUES (?,?,?,?)",
+            (
+                f"{row['subject_canonical']} {row['predicate']} {row['object_canonical']}",
+                json.dumps(vector), model, len(vector),
+            ),
+        )
 
 
 def _eligible(hy):
     return phase1._eligible_dedup_edges(
         hy.conn, hy.config, "service", "uses", "redis_cache",
-        model="fake", dim=2,
+        model=_model(), dim=2,
     )
 
 
@@ -156,7 +167,7 @@ def test_exact_embedding_model_and_strict_stored_coordinates_required(hy):
     _embedding(hy, edge_id, vector=[True, 0.0])
     assert phase1._find_near_duplicate_edge(
         hy.conn, hy.config, [1.0, 0.0], "service", "uses", "redis_cache",
-        model="fake", dim=2,
+        model=_model(), dim=2,
     ) is None
 
 
@@ -349,6 +360,7 @@ def test_rollback_does_not_publish_stale_samewave_registry_entry(hy, monkeypatch
         markers=[],
         claim_sources={source.message_id: source for source in sources},
         source_validated=True,
+        phase1_generation=hy._phase1_generation,
     )
     monkeypatch.setattr(
         phase1.evidence, "record_claim_extraction_outcome", fail_outcome
@@ -357,7 +369,7 @@ def test_rollback_does_not_publish_stale_samewave_registry_entry(hy, monkeypatch
         with core_db.transaction(hy.conn):
             phase1.persist_chunk_results(
                 hy.conn, source_chunk, extraction,
-                prompt_version="rollback-v1", cfg=hy.config,
+                prompt_version=hy.config.prompt_version, cfg=hy.config,
                 dedup_vectors=vectors, in_cycle_edges=shared,
             )
     assert shared == []
@@ -396,13 +408,14 @@ def test_published_staged_entry_is_revalidated_after_finalization(hy):
         markers=[],
         claim_sources={source.message_id: source for source in sources},
         source_validated=True,
+        phase1_generation=hy._phase1_generation,
     )
     shared = phase1.new_in_cycle_pool()
     staged = None
     with core_db.transaction(hy.conn):
         staged = phase1.persist_chunk_results(
             hy.conn, chunk, extraction,
-            prompt_version="published-stage-v1", cfg=hy.config,
+            prompt_version=hy.config.prompt_version, cfg=hy.config,
             dedup_vectors=_prepared("service uses redis"),
             in_cycle_edges=shared,
         )
@@ -444,6 +457,7 @@ def test_unpublished_commit_does_not_activate_staged_samewave_entry(
         markers=[],
         claim_sources={source.message_id: source for source in sources},
         source_validated=True,
+        phase1_generation=hy._phase1_generation,
     )
 
     monkeypatch.setattr(
@@ -454,7 +468,7 @@ def test_unpublished_commit_does_not_activate_staged_samewave_entry(
     with core_db.transaction(hy.conn):
         staged = phase1.persist_chunk_results(
             hy.conn, chunk, extraction,
-            prompt_version="unpublished-stage-v1", cfg=hy.config,
+            prompt_version=hy.config.prompt_version, cfg=hy.config,
             dedup_vectors=_prepared("service uses redis"),
             in_cycle_edges=shared,
         )

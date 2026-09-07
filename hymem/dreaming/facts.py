@@ -282,6 +282,73 @@ def facts_retry_state_is_valid(
     return bool(quarantined) == bool(maximum > 0 and retry_count >= maximum)
 
 
+def _fact_replay_order_sql(alias: str = "") -> str:
+    """Canonical oldest-source ordering for stale fact authority units."""
+
+    if alias not in ("", "o."):
+        raise ValueError("invalid fact replay SQL alias")
+    return (
+        f"COALESCE({alias}cursor_before_partial_message_id,"
+        f"{alias}cursor_before_message_id,-1),"
+        f"CASE WHEN {alias}cursor_before_partial_message_id IS NULL "
+        f"THEN 1 ELSE 0 END,{alias}cursor_before_offset,{alias}slice_key"
+    )
+
+
+def fact_quarantine_status(
+    conn: sqlite3.Connection, cfg: HyMemConfig
+) -> dict[str, int]:
+    """Report quarantines that block the current fact write policy.
+
+    A persisted quarantine belongs to one exact retry unit and policy identity.
+    Old prompt/config generations, old retry bounds, and already-advanced
+    cursors therefore do not count as active.  Invalid flagged retry, cursor,
+    or publication state is surfaced separately without exposing session or
+    source content.
+
+    Disabling fact extraction, or configuring a zero retry bound, makes fact
+    quarantine non-actionable and deterministically returns zero for both
+    counters without querying the store.
+    """
+
+    facts_enabled = getattr(cfg, "facts_extraction_enabled", None)
+    if not isinstance(facts_enabled, bool):
+        raise ValueError(
+            "current fact extraction policy is missing or malformed"
+        )
+    if not facts_enabled:
+        return {
+            "quarantined_facts": 0,
+            "quarantined_facts_malformed": 0,
+        }
+
+    maximum = getattr(cfg, "facts_extraction_max_attempts", None)
+    if (
+        isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or maximum < 0
+    ):
+        raise ValueError("invalid fact retry bound")
+
+    if maximum == 0:
+        return {
+            "quarantined_facts": 0,
+            "quarantined_facts_malformed": 0,
+        }
+
+    # One evaluator owns the runner-mirroring tail/replay/marker distinction.
+    # Import lazily to avoid a module cycle during status initialization.
+    from hymem.dreaming.status import durable_fact_work_status
+
+    status = durable_fact_work_status(conn, cfg)
+    return {
+        "quarantined_facts": status["quarantined_facts"],
+        "quarantined_facts_malformed": status[
+            "quarantined_facts_malformed"
+        ],
+    }
+
+
 def record_fact_failure(
     conn: sqlite3.Connection,
     session_id: str,
@@ -420,16 +487,13 @@ def next_fact_outcome_for_replay(
     if invalid_header is not None:
         raise RuntimeError("fact outcome source publication is incomplete")
     stale = conn.execute(
-        "SELECT slice_key FROM fact_extraction_outcomes WHERE session_id=? "
-        "AND source_manifest_complete=1 AND prompt_version<? LIMIT 1",
+        "SELECT slice_key FROM fact_extraction_outcomes INDEXED BY "
+        "idx_fact_outcome_chain_order WHERE session_id=? "
+        "AND source_manifest_complete=1 AND prompt_version<>? ORDER BY "
+        + _fact_replay_order_sql()
+        + " LIMIT 1",
         (session_id, publication_version),
     ).fetchone()
-    if stale is None:
-        stale = conn.execute(
-            "SELECT slice_key FROM fact_extraction_outcomes WHERE session_id=? "
-            "AND source_manifest_complete=1 AND prompt_version>? LIMIT 1",
-            (session_id, publication_version),
-        ).fetchone()
     if stale is None:
         return None
     slice_key = str(stale["slice_key"])
@@ -464,6 +528,18 @@ def fact_session_authority_is_valid(
         ) is not None
         for row in rows
     )
+
+
+def fact_cursor_authority_is_valid(
+    conn: sqlite3.Connection, session_id: str
+) -> bool:
+    """Bounded-memory structural audit for the indexed committed chain.
+
+    This cheaper internal telemetry verifies only the complete coordinate
+    chain, without re-hashing immutable payloads. Public completion status and
+    consumer read/export boundaries use the stronger full session audit.
+    """
+    return _committed_fact_slice_keys(conn, session_id) is True
 
 
 def _bound_occurrence(

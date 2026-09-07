@@ -14,14 +14,31 @@ from hymem.core import db as core_db
 from hymem.core.vectors import encode_vector
 from hymem.dreaming import aggregate as aggregate_mod
 from hymem.dreaming import episodes as episodes_mod
-from hymem.dreaming.aggregate import build_aggregation_nodes
+from hymem.dreaming.aggregate import (
+    aggregation_config_version,
+    build_aggregation_nodes,
+)
+from hymem.dreaming.aggregation_health import (
+    begin_aggregation_build,
+    complete_aggregation_build,
+    record_aggregation_build_failure,
+)
+from hymem.dreaming.aggregation_generation import aggregation_generation_binding
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.dreaming.aggregation_provenance import (
     AGGREGATION_SOURCE_MANIFEST_VERSION,
+    EPISODE_SOURCE_MANIFEST_VERSION,
+    BoundSourceOccurrence,
+    aggregation_publication_id,
+    aggregation_publication_node_set_hash,
     combine_source_occurrences,
+    load_aggregation_node_proof,
     load_aggregation_source_manifest,
+    load_current_aggregation_publication,
     load_episode_source_manifest,
     persist_aggregation_source_manifest,
     persist_episode_source_manifest,
+    source_manifest_hash,
     unpublish_episode_source_manifest,
 )
 from hymem.dreaming.episodes import (
@@ -430,12 +447,19 @@ def test_episode_rewrite_rekeys_fusion_and_forecast_without_stale_rows(cfg):
         assert steady.reused == 1
         sources = load_aggregation_source_manifest(hy.conn, first_node["id"])
         assert sources is not None
+        proof = load_aggregation_node_proof(hy.conn, first_node["id"])
+        assert proof is not None
         with core_db.transaction(hy.conn):
             persist_aggregation_source_manifest(
                 hy.conn,
                 first_node["id"],
-                occurrences=(sources[1], sources[0], sources[1]),
-                input_fingerprint=first_node["input_fingerprint"],
+                inputs=proof.inputs,
+                node_kind=str(proof.row["node_kind"]),
+                publication_id=str(proof.row["publication_id"]),
+                build_config_version=str(proof.row["build_config_version"]),
+                aggregation_generation_key=str(
+                    proof.row["aggregation_generation_key"]
+                ),
             )
         assert load_aggregation_source_manifest(hy.conn, first_node["id"]) == sources
 
@@ -512,7 +536,7 @@ def test_prompt_membership_never_exceeds_persisted_membership(cfg):
         hy.close()
 
 
-def test_root_with_unsourced_anchor_is_explicitly_incomplete(cfg, monkeypatch):
+def test_untyped_anchor_hook_cannot_enter_root_prompt(cfg, monkeypatch):
     hy = HyMem(cfg)
     try:
         _seed_native_episode(
@@ -524,25 +548,30 @@ def test_root_with_unsourced_anchor_is_explicitly_incomplete(cfg, monkeypatch):
         monkeypatch.setattr(
             aggregate_mod, "_anchor_facts", lambda _conn, _cap: ["verified anchor"]
         )
-        build_aggregation_nodes(
-            hy.conn, _aggregation_cfg(cfg, digest=True), _fusion_llm()
-        )
+        llm = _fusion_llm()
+        build_aggregation_nodes(hy.conn, _aggregation_cfg(cfg, digest=True), llm)
         root = hy.conn.execute(
             "SELECT id,source_manifest_complete,source_manifest_count "
             "FROM aggregation_nodes WHERE is_root=1"
         ).fetchone()
         assert root is not None
-        assert (root["source_manifest_complete"], root["source_manifest_count"]) == (0, 0)
-        assert load_aggregation_source_manifest(hy.conn, root["id"]) is None
+        assert (root["source_manifest_complete"], root["source_manifest_count"]) == (1, 2)
+        assert load_aggregation_source_manifest(hy.conn, root["id"]) is not None
         assert hy.conn.execute(
             "SELECT COUNT(*) FROM aggregation_node_source_occurrences WHERE node_id=?",
             (root["id"],),
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 2
+        digest_calls = [
+            call for call in llm.calls
+            if "standing digest of everything known" in call.system
+        ]
+        assert len(digest_calls) == 1
+        assert "verified anchor" not in digest_calls[0].user
     finally:
         hy.close()
 
 
-def test_exact_sources_propagate_through_rollups_and_incomplete_child_quarantines_ancestors(
+def test_exact_sources_propagate_and_incomplete_episode_is_excluded(
     cfg, monkeypatch
 ):
     hy = HyMem(cfg)
@@ -600,9 +629,8 @@ def test_exact_sources_propagate_through_rollups_and_incomplete_child_quarantine
             )
             assert manifest == expected
 
-        # Quarantine one leaf and rebuild. Every node containing that leaf, and
-        # therefore the whole-store root, must become explicitly incomplete;
-        # unaffected sibling subtrees stay complete.
+        # Quarantine one leaf and rebuild. It is excluded before clustering or
+        # prompting, and the replacement publication remains wholly exact.
         incomplete_episode = episode_ids[0]
         with core_db.transaction(hy.conn):
             unpublish_episode_source_manifest(hy.conn, incomplete_episode)
@@ -610,26 +638,27 @@ def test_exact_sources_propagate_through_rollups_and_incomplete_child_quarantine
         rebuilt_nodes = hy.conn.execute(
             "SELECT id,is_root,source_manifest_complete FROM aggregation_nodes"
         ).fetchall()
-        saw_unaffected = False
         for node in rebuilt_nodes:
             descendants = descendant_episode_ids(node["id"])
-            affected = incomplete_episode in descendants
-            if affected:
-                assert node["source_manifest_complete"] == 0
-                assert load_aggregation_source_manifest(hy.conn, node["id"]) is None
-            else:
-                saw_unaffected = True
-                assert node["source_manifest_complete"] == 1
-        assert saw_unaffected
+            assert incomplete_episode not in descendants
+            assert node["source_manifest_complete"] == 1
+            assert load_aggregation_source_manifest(hy.conn, node["id"]) is not None
+        assert hy.conn.execute(
+            "SELECT COUNT(*) FROM aggregation_node_inputs "
+            "WHERE input_kind='episode' AND json_extract(source_ref_json,'$.id')=?",
+            (incomplete_episode,),
+        ).fetchone()[0] == 0
+        assert load_current_aggregation_publication(hy.conn) is not None
         root = next(row for row in rebuilt_nodes if row["is_root"] == 1)
-        assert root["source_manifest_complete"] == 0
+        assert root["source_manifest_complete"] == 1
     finally:
         hy.close()
 
 
 def test_scoped_search_validates_before_fts_and_vector_limits(cfg):
     embedder = StubEmbeddingClient()
-    hy = HyMem(cfg, embedding_client=embedder)
+    active_cfg = _aggregation_cfg(cfg)
+    hy = HyMem(active_cfg, embedding_client=embedder)
     try:
         # One admissible node: two sessions, but every exact source belongs to
         # the same external peer/workspace.
@@ -657,7 +686,7 @@ def test_scoped_search_validates_before_fts_and_vector_limits(cfg):
             workspace_id="workspace-z", entity="workspace-mix",
         )
         build_aggregation_nodes(
-            hy.conn, _aggregation_cfg(cfg), _fusion_llm(), embedder
+            hy.conn, hy.config, _fusion_llm(), embedder
         )
         nodes = hy.conn.execute(
             "SELECT id FROM aggregation_nodes WHERE level=0"
@@ -678,7 +707,8 @@ def test_scoped_search_validates_before_fts_and_vector_limits(cfg):
         # consume both the FTS LIMIT and vector max_scan before proof checks.
         bad_text = "needle needle needle invalid composite"
         bad_vector = embedder.embed([bad_text])[0]
-        with core_db.transaction(hy.conn):
+        embedding_model, embedding_dim = embedding_storage_identity(embedder)
+        with core_db.transaction(hy.conn), core_db.embedding_mutation(hy.conn):
             for index in range(40):
                 node_id = f"aaa-invalid-{index:02d}"
                 hy.conn.execute(
@@ -696,13 +726,15 @@ def test_scoped_search_validates_before_fts_and_vector_limits(cfg):
                 )
                 hy.conn.execute(
                     "INSERT INTO aggregation_node_embeddings(node_id,vector_json,"
-                    "model,dim,text_hash) VALUES (?,?,?,?,?)",
+                    "model,dim,text_hash,embedding_producer_key) "
+                    "VALUES (?,?,?,?,?,?)",
                     (
                         node_id,
                         encode_vector(bad_vector),
-                        embedder.model,
-                        embedder.dim,
+                        embedding_model,
+                        embedding_dim,
                         embedding_text_hash(bad_text),
+                        embedding_model,
                     ),
                 )
 
@@ -758,7 +790,7 @@ def test_scoped_search_validates_before_fts_and_vector_limits(cfg):
         )
         context = AugmentedContext(aggregation_nodes=hits)
         enrich_context_provenance(hy.conn, context)
-        assert context.aggregation_nodes[0].source_provenance_complete is False
+        assert context.aggregation_nodes == []
         scope_context_in_place(
             context,
             source_session_id=None,
@@ -934,7 +966,7 @@ def test_v45_sparse_domain_skips_safely_and_stamps(tmp_path):
             "CREATE TABLE message_retention_coverage(message_id INTEGER)"
         )
         core_db._run_migrations(conn)
-        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
+        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='episode_source_occurrences'"
         ).fetchone() is None
@@ -945,7 +977,9 @@ def test_v45_sparse_domain_skips_safely_and_stamps(tmp_path):
 def test_v9_episode_proof_roundtrip_rebuilds_cache_and_exact_reimport_keeps_it(
     tmp_path,
 ):
-    source = HyMem(HyMemConfig(root=tmp_path / "portable-source"))
+    source = HyMem(_aggregation_cfg(HyMemConfig(
+        root=tmp_path / "portable-source"
+    )))
     wire = tmp_path / "episode-proof-v9.jsonl"
     try:
         _seed_native_episode(
@@ -962,25 +996,62 @@ def test_v9_episode_proof_roundtrip_rebuilds_cache_and_exact_reimport_keeps_it(
             summary="needle portable beta",
             entity="portable-thread",
         )
-        build_aggregation_nodes(
-            source.conn, _aggregation_cfg(source.config), _fusion_llm()
+        donor_llm = _fusion_llm()
+        donor_generation = aggregation_generation_binding(
+            source.config, donor_llm
         )
+        build_aggregation_nodes(source.conn, source.config, donor_llm)
         assert source.conn.execute(
             "SELECT COUNT(*) FROM aggregation_nodes"
         ).fetchone()[0] > 0
+        donor_version = aggregation_config_version(source.config)
+        donor_attempt_token = begin_aggregation_build(
+            source.conn, donor_version,
+            generation_binding=donor_generation,
+        )
+        record_aggregation_build_failure(
+            source.conn, donor_version, donor_generation["generation_key"],
+            donor_attempt_token,
+            fusion_failures=3,
+        )
+        assert source.dream_status()["aggregation_total_fusion_failures"] == 3
         source.conn.execute("DELETE FROM messages")
         assert source.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
         counts = source.export(wire)
         assert counts["episode"] == 2
         assert counts["episode_source_occurrence"] == 2
         assert "aggregation_node" not in counts
+        assert "aggregation_build_health" not in counts
     finally:
         source.close()
 
-    target = HyMem(HyMemConfig(root=tmp_path / "portable-target"))
+    target = HyMem(_aggregation_cfg(HyMemConfig(
+        root=tmp_path / "portable-target"
+    )))
     try:
-        # The cache is not portable. Any episode/proof insertion invalidates a
-        # pre-existing local tree so it cannot survive with stale membership.
+        # Publications are not portable.  Physical fusion rows remain a local,
+        # proof-checked cache, but imports must withdraw the old publication.
+        target_version = aggregation_config_version(target.config)
+        target_llm = _fusion_llm()
+        target_generation = aggregation_generation_binding(
+            target.config, target_llm
+        )
+        target_attempt_token = begin_aggregation_build(
+            target.conn, target_version,
+            generation_binding=target_generation,
+        )
+        empty_build = build_aggregation_nodes(
+            target.conn, target.config, target_llm,
+            health_managed=True,
+            health_attempt_token=target_attempt_token,
+        )
+        assert empty_build.nodes == 0
+        complete_aggregation_build(
+            target.conn, target_version, target_generation["generation_key"],
+            target_attempt_token,
+            expected_node_count=0,
+        )
+        assert target.dream_status()["pending_aggregation"] == 0
         target.conn.execute(
             "INSERT INTO aggregation_nodes(id,title,summary,input_fingerprint) "
             "VALUES ('stale-cache','stale','stale',?)",
@@ -990,8 +1061,15 @@ def test_v9_episode_proof_roundtrip_rebuilds_cache_and_exact_reimport_keeps_it(
         assert imported["episode"] == 2
         assert imported["episode_source_occurrence"] == 2
         assert target.conn.execute(
-            "SELECT COUNT(*) FROM aggregation_nodes"
+            "SELECT COUNT(*) FROM aggregation_publication_state"
         ).fetchone()[0] == 0
+        assert target.conn.execute(
+            "SELECT COUNT(*) FROM aggregation_nodes WHERE id='stale-cache'"
+        ).fetchone()[0] == 1
+        imported_health = target.dream_status()
+        assert imported_health["pending_aggregation"] == 1
+        # Donor-local operational failure counters never poison the target.
+        assert imported_health["aggregation_total_fusion_failures"] == 0
         episode_ids = [
             row["id"] for row in target.conn.execute(
                 "SELECT id FROM episodes ORDER BY id"
@@ -1003,8 +1081,14 @@ def test_v9_episode_proof_roundtrip_rebuilds_cache_and_exact_reimport_keeps_it(
             for episode_id in episode_ids
         )
 
-        build_aggregation_nodes(
-            target.conn, _aggregation_cfg(target.config), _fusion_llm()
+        target_attempt_token = begin_aggregation_build(
+            target.conn, target_version,
+            generation_binding=target_generation,
+        )
+        rebuilt = build_aggregation_nodes(
+            target.conn, target.config, target_llm,
+            health_managed=True,
+            health_attempt_token=target_attempt_token,
         )
         rebuilt_ids = {
             row["id"] for row in target.conn.execute(
@@ -1012,7 +1096,14 @@ def test_v9_episode_proof_roundtrip_rebuilds_cache_and_exact_reimport_keeps_it(
             ).fetchall()
         }
         assert rebuilt_ids
+        complete_aggregation_build(
+            target.conn, target_version, target_generation["generation_key"],
+            target_attempt_token,
+            expected_node_count=rebuilt.nodes,
+        )
+        assert target.dream_status()["pending_aggregation"] == 0
         assert sum(target.import_(wire).values()) == 0
+        assert target.dream_status()["pending_aggregation"] == 0
         assert {
             row["id"] for row in target.conn.execute(
                 "SELECT id FROM aggregation_nodes"
@@ -1198,7 +1289,7 @@ def test_v9_forged_episode_proof_fails_before_target_writes(tmp_path, case, muta
 
 
 def test_v9_conflicting_complete_episode_proof_rejects_atomically(tmp_path):
-    def make_source(root, cited_indexes, wire):
+    def make_source(root, wire):
         store = HyMem(HyMemConfig(root=root))
         try:
             with core_db.transaction(store.conn):
@@ -1220,7 +1311,7 @@ def test_v9_conflicting_complete_episode_proof_rejects_atomically(tmp_path):
                         "summary": "Same base bytes with competing exact proof.",
                         "chunk_ids": [
                             coverage_chunk_id("proof-conflict", message_ids[index])
-                            for index in cited_indexes
+                            for index in (0, 2)
                         ],
                     }]),
                 )
@@ -1231,11 +1322,73 @@ def test_v9_conflicting_complete_episode_proof_rejects_atomically(tmp_path):
 
     left_wire = tmp_path / "proof-left.jsonl"
     right_wire = tmp_path / "proof-right.jsonl"
-    left_id = make_source(
-        tmp_path / "proof-left", (0, 2), left_wire
-    )
-    right_id = make_source(
-        tmp_path / "proof-right", (0, 1, 2), right_wire
+    left_id = make_source(tmp_path / "proof-left", left_wire)
+
+    # Derive the competing wire from the exact same exported source state and
+    # change only the complete episode's typed occurrence manifest.  Building
+    # two stores independently made unrelated CURRENT_TIMESTAMP defaults race
+    # across a second boundary, occasionally causing the session collision to
+    # reject before this test reached the proof-authority boundary.
+    right_wire.write_bytes(left_wire.read_bytes())
+
+    def widen_episode_proof(body):
+        episode = next(item for item in body if item.get("type") == "episode")
+        coverage = sorted(
+            (
+                item["record"] for item in body
+                if item.get("type") == "message_retention_coverage"
+            ),
+            key=lambda record: record["message_id"],
+        )
+        occurrences = combine_source_occurrences((tuple(
+            BoundSourceOccurrence(
+                message_id=record["message_id"],
+                session_id=record["source_session_id"],
+                role=record["source_role"],
+                source_peer_id=record["source_peer_id"],
+                source_workspace_id=record["source_workspace_id"],
+                source_created_at=record["source_created_at"],
+                coverage_chunk_id=record["chunk_id"],
+                coverage_version=record["coverage_version"],
+                content_hash=record["message_content_hash"],
+            )
+            for record in coverage
+        ),))
+        episode_record = episode["record"]
+        episode_record["source_manifest_count"] = len(occurrences)
+        episode_record["source_manifest_hash"] = source_manifest_hash(
+            EPISODE_SOURCE_MANIFEST_VERSION, occurrences,
+        )
+        body[:] = [
+            item for item in body
+            if item.get("type") != "episode_source_occurrence"
+        ]
+        insert_at = body.index(episode) + 1
+        body[insert_at:insert_at] = [
+            {
+                "type": "episode_source_occurrence",
+                "record": {
+                    "episode_id": left_id,
+                    "ordinal": ordinal,
+                    "source_message_id": occurrence.message_id,
+                    "source_session_id": occurrence.session_id,
+                    "source_role": occurrence.role,
+                    "source_peer_id": occurrence.source_peer_id,
+                    "source_workspace_id": occurrence.source_workspace_id,
+                    "source_created_at": occurrence.source_created_at,
+                    "source_coverage_chunk_id": occurrence.coverage_chunk_id,
+                    "source_coverage_version": occurrence.coverage_version,
+                    "source_content_hash": occurrence.content_hash,
+                },
+            }
+            for ordinal, occurrence in enumerate(occurrences)
+        ]
+
+    _rewrite_portable_wire(right_wire, widen_episode_proof)
+    right_id = next(
+        json.loads(line)["record"]["id"]
+        for line in right_wire.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("type") == "episode"
     )
     assert left_id == right_id
 

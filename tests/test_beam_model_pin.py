@@ -67,17 +67,17 @@ def test_extra_body_is_merged_into_the_request(captured):
     assert captured["body"]["thinking"] == {"type": "disabled"}
 
 
-def test_unflagged_client_sends_exactly_what_it_sent_before(captured):
-    """Comparability guard: the default must not change the request bytes.
+def test_unflagged_supported_client_does_not_inject_request_fields(captured):
+    """Wire-shape guard for a supported, explicitly pinned model identity.
 
-    Every artifact before this commit was produced by a body with these four
-    keys and no others. If the plumbing defaulted to injecting the thinking
-    flag — the way the library client's `auto` mode does — those artifacts
-    would stop being comparators without anyone deciding that.
+    Historical artifacts remain parseable, but an active retired alias can no
+    longer be instantiated merely to reproduce old request bytes.
     """
-    ba.LLMClient("deepseek-chat", "k")._call([{"role": "user", "content": "q"}], 0.1, 99)
+    ba.LLMClient("deepseek-v3-pinned", "k")._call(
+        [{"role": "user", "content": "q"}], 0.1, 99
+    )
     assert captured["body"] == {
-        "model": "deepseek-chat",
+        "model": "deepseek-v3-pinned",
         "messages": [{"role": "user", "content": "q"}],
         "temperature": 0.1,
         "max_tokens": 99,
@@ -109,23 +109,30 @@ def test_extra_body_cannot_override_manifested_request_identity(captured, key):
 ])
 def test_empty_content_raises_instead_of_scoring_zero(captured, msg):
     captured["reply"] = _message(**msg)
-    with pytest.raises(RuntimeError, match="empty content"):
-        ba.LLMClient("deepseek-v4-flash", "k")._call([], 0.0, 512)
+    client = ba.LLMClient("deepseek-v4-flash", "k")
+    with pytest.raises(ba.LLMEmptyContentError) as raised:
+        client._call([], 0.0, 512)
+    assert isinstance(raised.value, RuntimeError)  # direct-call compatibility
+    assert str(raised.value) == ""
+    assert client.last_finish_reason == "stop"
 
 
 def test_chat_surfaces_the_empty_read_as_a_named_error(captured, monkeypatch):
-    """chat() retries then returns a string; it must SAY what went wrong.
+    """chat() returns a stable typed code without provider response detail.
 
-    An unnamed "[LLM_ERROR: ...]" would be scored as an explicit error and
-    excluded — correct handling, but it would not tell anyone the pin was
-    wrong. The raise text has to survive into the string a human reads.
+    The exception class identifies the empty-completion trap. Free-form
+    exception text and reasoning payloads are neither necessary nor safe in a
+    durable benchmark artifact.
     """
     monkeypatch.setattr(ba.time, "sleep", lambda *_: None)
-    captured["reply"] = _message(content="", reasoning_content="x" * 40)
-    out = ba.LLMClient("deepseek-v4-flash", "k").chat([])
-    assert out.startswith("[LLM_ERROR")
-    assert "empty content" in out
-    assert "reasoning=40" in out
+    private_reasoning = "PRIVATE_REASONING_MUST_NOT_LEAK_93"
+    captured["reply"] = _message(content="", reasoning_content=private_reasoning)
+    client = ba.LLMClient("deepseek-v4-flash", "k")
+    out = client.chat([])
+    assert ba.LLM_EMPTY_CONTENT_SENTINEL == "[LLM_ERROR:LLMEmptyContentError]"
+    assert out == ba.LLM_EMPTY_CONTENT_SENTINEL
+    assert private_reasoning not in out
+    assert client.last_finish_reason == "stop"
 
 
 def test_real_content_passes_through_unchanged(captured):
@@ -153,8 +160,8 @@ def test_v4_flash_with_thinking_enabled_is_still_refused():
                            {"thinking": {"type": "enabled"}})
 
 
-def test_the_working_alias_is_not_gated():
-    """deepseek-chat is the currently-working path; it must stay unflagged."""
+def test_the_historical_alias_comparator_is_not_rewritten():
+    """Pure analysis of historical config does not rewrite stored identity."""
     ba.check_model_pin("judge", "deepseek-chat", "deepseek", {})
 
 
@@ -190,7 +197,7 @@ class _Stub:
 
 def test_canary_aborts_on_an_llm_error():
     with pytest.raises(SystemExit) as e:
-        ba.run_canary("answer", _Stub("[LLM_ERROR: empty content (finish=length)]"), [], 1024)
+        ba.run_canary("answer", _Stub(ba.LLM_EMPTY_CONTENT_SENTINEL), [], 1024)
     assert e.value.code == 1
 
 
@@ -308,7 +315,7 @@ def test_finish_reason_survives_the_empty_content_raise(captured, monkeypatch):
     monkeypatch.setattr(ba.time, "sleep", lambda *_: None)
     captured["reply"] = _reply("", "length")
     c = ba.LLMClient("deepseek-v4-flash", "k")
-    assert c.chat([]).startswith("[LLM_ERROR")
+    assert c.chat([]) == ba.LLM_EMPTY_CONTENT_SENTINEL
     assert c.last_finish_reason == "length"
 
 
@@ -342,7 +349,7 @@ def test_a_truncated_judge_reply_scores_zero_but_says_why(captured):
     truncated = ('{"scores": [1], "total_score": 1.0, "explanation": "The response '
                  'includes numeric error status codes')
     captured["reply"] = _reply(truncated, "length")
-    llm = ba.LLMClient("deepseek-chat", "k")
+    llm = ba.LLMClient("deepseek-v4-flash", "k")
     out = ba.judge_answer(llm, "q", "ideal", ["states the code"], "an answer",
                           return_raw=True)
     assert out["score"] == 0.0 and out["scores"] == []
@@ -352,7 +359,7 @@ def test_a_truncated_judge_reply_scores_zero_but_says_why(captured):
 
 def test_a_complete_judge_reply_is_parsed_and_also_carries_its_finish(captured):
     captured["reply"] = _reply('{"scores": [1, 0], "total_score": 0.5}', "stop")
-    llm = ba.LLMClient("deepseek-chat", "k")
+    llm = ba.LLMClient("deepseek-v4-flash", "k")
     out = ba.judge_answer(llm, "q", "ideal", ["a", "b"], "ans", return_raw=True)
     assert out["score"] == 0.5 and out["scores"] == [1, 0]
     assert out["judge_finish_reason"] == "stop"

@@ -6,6 +6,7 @@ import pytest
 import sqlite3
 
 from hymem import HyMem
+from hymem import StubEmbeddingClient
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
 from hymem.dreaming import phase1
@@ -19,8 +20,10 @@ from hymem.dreaming.bitemporal import record_lifecycle_event
 from hymem.dreaming.chunks import Chunk, persist_chunks
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.dreaming.phase1 import ChunkExtraction
+from hymem.extraction.contract import extraction_cache_key
 from hymem.extraction.triples import Triple
 from hymem.extraction.markers import Marker
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 
 
 def _open(tmp_path: Path):
@@ -1552,16 +1555,21 @@ def test_observed_claim_promotes_exact_derived_edge_before_inference_rebuild(
 def test_semantic_dedup_never_attaches_claim_to_derived_candidate(tmp_path: Path):
     conn = _open(tmp_path)
     try:
+        model, dim = embedding_storage_identity(StubEmbeddingClient(
+            model_name="claim-dedup-fixture-v1", dim_value=2,
+        ))
         cur = conn.execute(
             "INSERT INTO knowledge_graph(subject_canonical,predicate,"
             "object_canonical,pos_evidence,derived,status) "
             "VALUES ('app','uses','redis_db',1,1,'active')"
         )
         derived_id = int(cur.lastrowid)
-        conn.execute(
-            "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
-            "VALUES ('app uses redis_db','[1.0,0.0]','test',2)"
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+                "VALUES ('app uses redis_db','[1.0,0.0]',?,?)",
+                (model, dim),
+            )
         [message_id] = _messages(
             conn,
             [("user", "The app uses Redis Database", "2026-03-01T00:00:00Z")],
@@ -1572,12 +1580,14 @@ def test_semantic_dedup_never_attaches_claim_to_derived_candidate(tmp_path: Path
             triple_dedup_enabled=True,
             triple_dedup_cosine_threshold=0.9,
         )
+        dedup_vectors = phase1._PreparedDedupVectors(model=model, dim=dim)
+        dedup_vectors["app uses redis_database"] = [1.0, 0.0]
         _persist(
             conn, chunk,
             [Triple("app", "uses", "redis_database", 1,
                     source_message_id=message_id)],
             prompt_version="v13", cfg=cfg,
-            dedup_vectors={"app uses redis_database": [1.0, 0.0]},
+            dedup_vectors=dedup_vectors,
         )
         direct = conn.execute(
             "SELECT id FROM knowledge_graph WHERE object_canonical='redis_database' "
@@ -2047,7 +2057,9 @@ def test_outcome_helper_rejects_wrong_prompt_authority_and_unmanifested_chunk(
         ).fetchone())
         with pytest.raises(ValueError, match="observation authority"):
             evidence_ledger.record_claim_extraction_outcome(
-                conn, chunk_id=chunk.id, prompt_version="v14"
+                conn,
+                chunk_id=chunk.id,
+                prompt_version=extraction_cache_key("v14"),
             )
         assert tuple(conn.execute(
             "SELECT prompt_version,prompt_generation,result_hash "
@@ -2062,7 +2074,9 @@ def test_outcome_helper_rejects_wrong_prompt_authority_and_unmanifested_chunk(
         )
         with pytest.raises(ValueError, match="published source manifest"):
             evidence_ledger.record_claim_extraction_outcome(
-                conn, chunk_id="unmanifested", prompt_version="v14"
+                conn,
+                chunk_id="unmanifested",
+                prompt_version=extraction_cache_key("v14"),
             )
         assert conn.execute(
             "SELECT COUNT(*) FROM kg_claim_extraction_outcomes "

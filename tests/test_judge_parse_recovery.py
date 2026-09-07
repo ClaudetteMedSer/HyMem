@@ -83,7 +83,7 @@ def test_strictly_more_permissive_never_different(raw):
 @pytest.mark.parametrize("raw", [
     "",
     "not json at all",
-    "[LLM_ERROR: empty content (finish=length, reasoning=40 chars)]",
+    ba.LLM_EMPTY_CONTENT_SENTINEL,
     '{"scores": [1], "explanation": "cut off mid',       # genuinely truncated
     '{"scores": [1', 
 ])

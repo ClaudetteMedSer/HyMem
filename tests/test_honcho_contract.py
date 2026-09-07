@@ -35,10 +35,25 @@ class _ThreadedServer(uvicorn.Server):
         pass
 
 
+class _NoopScheduler:
+    """Keep SDK contract tests deterministic; scheduler behavior has its own suite."""
+
+    def kick(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+
 @pytest.fixture
 def honcho(hy_with_embed):
     """A real honcho-ai SDK client wired to a live in-process HyMem server."""
     hsrv.set_hy(hy_with_embed)
+    # These tests explicitly invoke ``dream()`` after their HTTP writes.  A
+    # real background fork would race that call (and migration support-object
+    # reinstall) without adding SDK shape coverage; scheduler concurrency is
+    # exercised separately in ``test_honcho_server``.
+    hsrv.set_scheduler(_NoopScheduler())
 
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))

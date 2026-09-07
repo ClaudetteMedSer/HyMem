@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import pytest
 
-from hymem.extraction.jsonio import loads_exact_or_fenced, loads_lenient
+from hymem.extraction.jsonio import (
+    is_ceiling_cut,
+    loads_exact_or_fenced,
+    loads_lenient,
+)
 
 _OBJ = '{"title": "t", "summary": "s"}'
 _EXPECTED = {"title": "t", "summary": "s"}
@@ -128,3 +132,76 @@ def test_expect_any_recovers_either_shape_from_a_wrapper():
 
 def test_unknown_expect_falls_back_to_object_delimiters():
     assert loads_lenient(f"```json\n{_OBJ}\n```", expect="nonsense") == _EXPECTED
+
+
+@pytest.mark.parametrize("raw", [
+    '{"items": [1, {"name": "Ada"}',
+    '[{"name": "Ada"}, false, nul',
+    '{"message": "unfinished',
+    '{"message": "unfinished\\\\',
+    '{"message": "unfinished\\\" quote and slash \\\\',
+    '{"message": "partial unicode \\u12',
+    '{"count": -',
+    '{"count": 1.',
+    '{"count": 1e',
+    '{"count": 1e-',
+    '{"enabled": tru',
+    ' \t\r\n {"items": [1, 2',
+    'Here is the result:\n{"items": [1, 2',
+    'A [note] precedes the result: {"items": [1, 2',
+    '```json\n{"items": [1, 2',
+    '```JSON   \r\n ["café", {"emoji": "🧠"}',
+    '```   \n {"items": [1, 2',
+    '``` json \n {"items": [1, 2',
+])
+def test_ceiling_cut_accepts_only_unfinished_legal_json_prefixes(raw):
+    assert is_ceiling_cut(raw) is True
+
+
+@pytest.mark.parametrize("raw", [
+    None,
+    42,
+    b'{"items": [1',
+    "",
+    "plain prose",
+    "```json",
+    "```json\n",
+    "```JSON\n```",
+    '{"message": "a } brace and [ bracket in a value"}',
+    '{"message": "escaped quote: \\\" and backslash: \\\\"}',
+    '{"message": "café 🧠"}',
+    '{"items": [1, {"name": "Ada"}]}',
+    '[1, 2, {"name": "Ada"}]',
+    '{"items": [1]} trailing prose',
+    '```json\n{"items": [1]}\n```',
+    # A complete JSON root with only its Markdown fence cut is not evidence
+    # that the structured response itself hit the model's token ceiling.
+    '```json\n{"items": [1]}',
+    '{ not: "json"',
+    '{"a" "missing colon"',
+    '{"a": ???',
+    '{"a": 1,}',
+    '[1,]',
+    '{"a": 01',
+    '{"a": 1.}',
+    '{"a": 1e+}',
+    '{"a": trux',
+    '{"a": 1, "a":',
+    '{"a": 1, "\\u0061":',
+    '{"outer": {"a": 1, "a":',
+    'Here is JSON: {"a": 1, "a": [1',
+    '{"a": 1e999',
+    '{"a": "bad\\q escape',
+    '{"a": "raw\nnewline',
+    '{"a": [1}',
+])
+def test_ceiling_cut_rejects_complete_or_malformed_payloads(raw):
+    assert is_ceiling_cut(raw) is False
+
+
+def test_ceiling_cut_ignores_structural_characters_inside_a_large_string():
+    # This also guards the scanner's linear path: every byte is visited once,
+    # without repeated substring parsing or delimiter recounting.
+    raw = '{"payload":"' + ('}🧠[{' * 250_000)
+    assert len(raw) > 1_000_000
+    assert is_ceiling_cut(raw) is True

@@ -7,18 +7,22 @@ import sqlite3
 
 import pytest
 
-from hymem import HyMem
+from hymem import HyMem, StubEmbeddingClient
 from hymem.core import db as core_db
+from hymem.core.vectors import encode_vector
 from hymem.dreaming import canonicalize, evidence, phase1, phase3
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.dreaming.behavioral_dedup import (
     DuplicateMember,
     ProposedMerge,
     apply_behavioral_merges,
+    find_behavioral_duplicates,
 )
 from hymem.dreaming.chunks import Chunk, persist_chunks
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.dreaming.phase1 import ChunkExtraction
 from hymem.extraction.markers import Marker
+from hymem.extraction.contract import extraction_cache_key
 from hymem.extraction.triples import Triple
 
 
@@ -93,7 +97,9 @@ def test_prompt_version_replay_does_not_duplicate_weighted_evidence(cfg):
         assert row["n"] == 1
         assert row["evidence_weight"] == 2
         assert row["weight_source"] == "configured_role:user"
-        assert row["extraction_prompt_version"] == "triples.v1"
+        assert row["extraction_prompt_version"] == extraction_cache_key(
+            "triples.v1"
+        )
         assert row["source_role"] == "user"
         assert evidence.count_mismatches(hy.conn) == []
     finally:
@@ -135,7 +141,7 @@ def test_latest_successful_polarity_replaces_same_source_assertion(cfg):
         assert (row["polarity"], row["evidence_weight"], row["extraction_prompt_version"]) == (
             -1,
             2,
-            "v2",
+            extraction_cache_key("v2"),
         )
 
         _persist(hy, chunk, Triple("app", "uses", "sqlite", 1), prompt_version="v3")
@@ -159,14 +165,20 @@ def test_phase3_reinforcement_and_decay_are_idempotent_per_chunk(cfg):
         older_reinforcement = _chunk(
             hy, "c_reinforce_a", "app and postgres were also paired here"
         )
-        hy.conn.executemany(
-            "INSERT INTO entity_mentions(chunk_id, entity_canonical) VALUES (?, ?)",
-            [
-                (reinforcement.id, "app"),
-                (reinforcement.id, "postgres"),
-                (older_reinforcement.id, "app"),
-                (older_reinforcement.id, "postgres"),
-            ],
+        # Phase 3 consumes only the producer-bound current mention projection;
+        # legacy ``entity_mentions`` rows are intentionally historical.  Use
+        # real source-validated Phase-1 publications for both co-mentions.
+        _persist(
+            hy,
+            reinforcement,
+            Triple("postgres", "connects_to", "app", 1),
+            prompt_version="reinforcement-v1",
+        )
+        _persist(
+            hy,
+            older_reinforcement,
+            Triple("postgres", "connects_to", "app", 1),
+            prompt_version="reinforcement-v1",
         )
         phase3.reinforce(hy.conn, cfg)
         phase3.reinforce(hy.conn, cfg)
@@ -179,13 +191,17 @@ def test_phase3_reinforcement_and_decay_are_idempotent_per_chunk(cfg):
         )
         decay_chunk = _chunk(hy, "c_decay", "the app changed substantially")
         older_decay_chunk = _chunk(hy, "c_decay_a", "the app had changed before")
-        hy.conn.execute(
-            "INSERT INTO entity_mentions(chunk_id, entity_canonical) VALUES (?, 'app')",
-            (decay_chunk.id,),
+        _persist(
+            hy,
+            decay_chunk,
+            Triple("app", "has_attribute", "change", 1),
+            prompt_version="decay-v1",
         )
-        hy.conn.execute(
-            "INSERT INTO entity_mentions(chunk_id, entity_canonical) VALUES (?, 'app')",
-            (older_decay_chunk.id,),
+        _persist(
+            hy,
+            older_decay_chunk,
+            Triple("app", "has_attribute", "change", 1),
+            prompt_version="decay-v1",
         )
         phase3.decay(hy.conn, cfg)
         phase3.decay(hy.conn, cfg)
@@ -291,7 +307,8 @@ def test_canonical_merge_deduplicates_overlapping_source_provenance(cfg):
 
 
 def test_behavioral_merge_deduplicates_overlapping_source_provenance(cfg):
-    hy = HyMem(cfg)
+    embed = StubEmbeddingClient(model_name="ledger-behavioral-v1", dim_value=2)
+    hy = HyMem(cfg, embedding_client=embed)
     try:
         chunk = _chunk(hy, "c_behavior_merge")
         ids = []
@@ -313,17 +330,28 @@ def test_behavioral_merge_deduplicates_overlapping_source_provenance(cfg):
                 evidence_weight=1,
                 weight_source="test",
             )
-        proposal = ProposedMerge(
-            subject="user",
-            predicate="prefers",
-            survivor_id=ids[0],
-            survivor_object="concise",
-            survivor_pos=1,
-            survivor_neg=0,
-            members=[DuplicateMember(ids[1], "concise_mode", 1, 0, 0.99)],
+        model, dim = embedding_storage_identity(embed)
+        with core_db.embedding_mutation(hy.conn):
+            hy.conn.executemany(
+                "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+                "VALUES (?,?,?,?)",
+                [
+                    ("user prefers concise", encode_vector([1.0, 0.0]), model, dim),
+                    (
+                        "user prefers concise_mode",
+                        encode_vector([0.99, 0.01]),
+                        model,
+                        dim,
+                    ),
+                ],
+            )
+        [proposal] = find_behavioral_duplicates(
+            hy.conn, cosine_threshold=0.9, embedding_client=embed,
         )
         with core_db.transaction(hy.conn):
-            apply_behavioral_merges(hy.conn, [proposal])
+            apply_behavioral_merges(
+                hy.conn, [proposal], embedding_client=embed,
+            )
 
         assert hy.conn.execute(
             "SELECT pos_evidence FROM knowledge_graph WHERE id = ?", (ids[0],)

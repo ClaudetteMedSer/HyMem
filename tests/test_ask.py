@@ -117,15 +117,28 @@ def test_ask_uses_the_configured_llm_token_counter(cfg):
 
 
 def _seed_root_digest(hy) -> None:
-    """Insert a root aggregation node directly — load_digest() only reads the
-    table, so no aggregation build is needed (mirrors test_mcp_server)."""
-    hy.conn.execute(
-        "INSERT INTO aggregation_nodes "
-        "(id, title, summary, member_episode_ids, session_ids, "
-        " n_members, n_sessions, level, is_root) "
-        "VALUES ('root-ask', 'User digest', 'Works on HyMem.', '[]', '[]', 2, 2, 1, 1)"
+    """Build a fully proof-valid standing digest for the public ask path."""
+    from hymem.dreaming.aggregate import build_aggregation_nodes
+    from tests.test_aggregation_provenance import _seed_native_episode
+
+    _seed_native_episode(
+        hy.conn, "root-ask-a", title="Project", summary="Works on HyMem.",
+        entity="root-ask",
     )
-    hy.conn.commit()
+    _seed_native_episode(
+        hy.conn, "root-ask-b", title="Project", summary="Works on HyMem.",
+        entity="root-ask",
+    )
+    hy._llm.fixtures.update({
+        "fuse several related episodes": (
+            '{"title":"Project","summary":"Works on HyMem."}'
+        ),
+        "standing digest of everything known": (
+            '{"title":"User digest","summary":"Works on HyMem."}'
+        ),
+        "You answer questions about a user": "ok",
+    })
+    build_aggregation_nodes(hy.conn, hy.config, hy._llm)
 
 
 def test_ask_excludes_digest_by_default_and_loads_it_on_request(hy, stub_llm):
@@ -133,8 +146,6 @@ def test_ask_excludes_digest_by_default_and_loads_it_on_request(hy, stub_llm):
     sid = "ask-digest"
     hy.open_session(sid)
     hy.log_message(sid, "user", "I am rewriting the parser in rust.")
-    stub_llm.default = "ok"
-
     # Default: the standing digest stays out of the context and the prompt.
     answer = hy.ask("what am I working on?", session_id=sid)
     assert answer.context.digest is None

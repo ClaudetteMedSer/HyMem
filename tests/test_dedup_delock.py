@@ -14,16 +14,18 @@ import dataclasses
 import json
 
 from hymem import HyMem
+from hymem.core import db as core_db
 from hymem.dreaming import phase1
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.dreaming.chunks import Chunk
 from hymem.dreaming.phase1 import ChunkExtraction
-from hymem.extraction.embeddings import StubEmbeddingClient
+from hymem.extraction.embeddings import MappedStubEmbeddingClient
 from hymem.extraction.triples import Triple
 
 from tests.conftest import make_routed_llm
 
 
-class TxnRecordingEmbedder:
+def TxnRecordingEmbedder(conn, mapping: dict[str, list[float]]):
     """Wraps embed() to record `conn.in_transaction` at call time.
 
     `sqlite3.Connection.in_transaction` is True exactly when a transaction is
@@ -31,33 +33,28 @@ class TxnRecordingEmbedder:
     proves no embed ran under the write lock.
     """
 
-    model = "fake"
-    dim = 4
-
-    def __init__(self, conn, mapping: dict[str, list[float]]):
-        self._conn = conn
-        self._mapping = mapping
-        self.in_txn_flags: list[bool] = []
-        self.calls: list[list[str]] = []
-
-    def embed(self, texts):
-        self.in_txn_flags.append(self._conn.in_transaction)
-        self.calls.append(list(texts))
-        return [self._mapping[t] for t in texts]
+    return MappedStubEmbeddingClient(
+        mapping,
+        model="dedup-delock-fixture-v1",
+        dim=4,
+        conn=conn,
+    )
 
 
-def _seed_existing_edge(hy, subj, pred, obj, vector):
+def _seed_existing_edge(hy, subj, pred, obj, vector, embedder):
     conn = hy.conn
     conn.execute(
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
         "pos_evidence, neg_evidence) VALUES (?, ?, ?, 0, 0)",
         (subj, pred, obj),
     )
-    conn.execute(
-        "INSERT INTO edge_embeddings(edge_text, vector_json, model, dim) "
-        "VALUES (?, ?, 'fake', 4)",
-        (f"{subj} {pred} {obj}", json.dumps(vector)),
-    )
+    model, dim = embedding_storage_identity(embedder)
+    with core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT INTO edge_embeddings(edge_text, vector_json, model, dim) "
+            "VALUES (?, ?, ?, ?)",
+            (f"{subj} {pred} {obj}", json.dumps(vector), model, dim),
+        )
 
 
 def _seed_chunk(hy, chunk_id="c_dedup") -> Chunk:
@@ -83,9 +80,11 @@ def test_prepare_runs_embed_outside_transaction(cfg):
     precomputed vector must still drive the merge once inside the lock."""
     hy = HyMem(cfg)
     try:
-        _seed_existing_edge(hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0])
-        chunk = _seed_chunk(hy)
         embedder = TxnRecordingEmbedder(hy.conn, {"app uses uv_pip": [1.0, 0.0, 0.0, 0.0]})
+        _seed_existing_edge(
+            hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0], embedder,
+        )
+        chunk = _seed_chunk(hy)
         ext = ChunkExtraction(triples=[Triple("app", "uses", "uv_pip", 1)], markers=[])
 
         # Prepare OUTSIDE any transaction (as the runner does).
@@ -93,7 +92,6 @@ def test_prepare_runs_embed_outside_transaction(cfg):
         dedup_vectors = phase1.prepare_dedup_vectors(hy.conn, ext, hy.config, embedder)
         assert dedup_vectors == {"app uses uv_pip": [1.0, 0.0, 0.0, 0.0]}
 
-        from hymem.core import db as core_db
         with core_db.transaction(hy.conn):
             phase1.persist_chunk_results(
                 hy.conn, chunk, ext, prompt_version=hy.config.prompt_version,
@@ -102,7 +100,7 @@ def test_prepare_runs_embed_outside_transaction(cfg):
 
         # embed() was called exactly once, and never under the write lock.
         assert embedder.calls == [["app uses uv_pip"]]
-        assert embedder.in_txn_flags == [False]
+        assert embedder.transaction_states == [False]
         # Merge still fired: no sibling canonical created.
         assert hy.conn.execute(
             "SELECT COUNT(*) AS c FROM knowledge_graph WHERE object_canonical = 'uv_pip'"
@@ -115,42 +113,31 @@ def test_dream_embed_never_inside_write_lock(cfg):
     """End-to-end through hy.dream(): a wrapped StubEmbeddingClient records
     conn.in_transaction on every embed; it must be False for all of them, and
     at least one dedup embed must have occurred."""
-    seen_in_txn: list[bool] = []
-
-    class WatchingStub(StubEmbeddingClient):
-        # Set after HyMem builds its conn so we can observe the live connection.
-        conn = None
-
-        def embed(self, texts):
-            # Only watch the dedup-candidate embed. The runner's chunk-embedding
-            # pass runs on a *background* thread, where reading the main
-            # connection's in_transaction would be a cross-thread race; the
-            # dedup prepare embed is synchronous on the main thread, so its
-            # in_transaction reading is meaningful and is the call we de-locked.
-            if self.conn is not None and texts == ["app uses uv_pip"]:
-                seen_in_txn.append(self.conn.in_transaction)
-            return super().embed(texts)
-
-    embed = WatchingStub()
     # The exact source id is only known after the messages are written. Start
     # with an empty valid response, then install a source-citing response below.
     llm = make_routed_llm([], [])
-    hy = HyMem(cfg, llm=llm, embedding_client=embed)
-    embed.conn = hy.conn
+    hy = HyMem(cfg, llm=llm)
+    cand_text = "app uses uv_pip"
+    embed = TxnRecordingEmbedder(
+        hy.conn, {cand_text: [1.0, 0.0, 0.0, 0.0]},
+    )
+    hy.set_embedding_client(embed)
     try:
         # Seed the existing edge + its cached embedding the candidate matches.
-        cand_text = "app uses uv_pip"
         vec = embed.embed([cand_text])[0]  # outside txn; primes nothing but the vector
-        seen_in_txn.clear()
+        embed.calls.clear()
+        embed.transaction_states.clear()
         hy.conn.execute(
             "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
             "pos_evidence, neg_evidence, status) VALUES ('app', 'uses', 'uv', 0, 0, 'active')"
         )
-        hy.conn.execute(
-            "INSERT INTO edge_embeddings(edge_text, vector_json, model, dim) "
-            "VALUES (?, ?, ?, ?)",
-            ("app uses uv", json.dumps(vec), embed.model, embed.dim),
-        )
+        model, dim = embedding_storage_identity(embed)
+        with core_db.embedding_mutation(hy.conn):
+            hy.conn.execute(
+                "INSERT INTO edge_embeddings(edge_text, vector_json, model, dim) "
+                "VALUES (?, ?, ?, ?)",
+                ("app uses uv", json.dumps(vec), model, dim),
+            )
         hy.conn.commit()
 
         hy.open_session("s1")
@@ -172,9 +159,14 @@ def test_dream_embed_never_inside_write_lock(cfg):
 
         hy.dream()
 
-        assert seen_in_txn, "expected at least one embed() during the dream"
-        assert all(flag is False for flag in seen_in_txn), (
-            f"embed ran inside a write transaction: {seen_in_txn}"
+        candidate_states = [
+            state for call, state in zip(
+                embed.calls, embed.transaction_states
+            ) if call == [cand_text]
+        ]
+        assert candidate_states, "expected at least one embed() during the dream"
+        assert all(flag is False for flag in candidate_states), (
+            f"embed ran inside a write transaction: {candidate_states}"
         )
         # Behaviour preserved end-to-end: the near-duplicate attached to the
         # existing edge rather than minting a sibling canonical.
@@ -193,14 +185,16 @@ def test_prepare_returns_empty_when_disabled_or_no_client(cfg):
     """No embed and an empty dict when dedup is off or no embedding client."""
     hy = HyMem(cfg)
     try:
-        _seed_existing_edge(hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0])
+        embedder = TxnRecordingEmbedder(hy.conn, {"app uses uv_pip": [1.0, 0.0, 0.0, 0.0]})
+        _seed_existing_edge(
+            hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0], embedder,
+        )
         ext = ChunkExtraction(triples=[Triple("app", "uses", "uv_pip", 1)], markers=[])
 
         # No embedding client -> {}
         assert phase1.prepare_dedup_vectors(hy.conn, ext, hy.config, None) == {}
 
         # Dedup disabled -> {}, and the embedder is never called.
-        embedder = TxnRecordingEmbedder(hy.conn, {"app uses uv_pip": [1.0, 0.0, 0.0, 0.0]})
         disabled = dataclasses.replace(hy.config, triple_dedup_enabled=False)
         assert phase1.prepare_dedup_vectors(hy.conn, ext, disabled, embedder) == {}
         assert embedder.calls == []

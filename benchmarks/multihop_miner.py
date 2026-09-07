@@ -34,9 +34,9 @@ Two modes:
 
   • STORE MODE (`--store`, LLM-free, seconds) — mine an existing dreamed store.
     Fast, but a combined LME store must be dreamed TO COMPLETION first (one
-    `dream()` only drains `cfg.dream_budget`=50 chunks, so a mega-store is ~1%
-    dreamed and yields a false-empty graph — loop `dream()` until
-    `not report.budget_exhausted`).
+    `dream()` only drains bounded work, so a mega-store is ~1% dreamed and
+    yields a false-empty graph — converge against `dream_status()` rather than
+    trusting one report flag).
 
     python benchmarks/multihop_miner.py \
       --from ~/.hermes/benchmarks/<run>.json --store STORE.sqlite --out SLICE.json
@@ -44,8 +44,9 @@ Two modes:
   • PER-QUESTION MODE (`--lme-data`, LLM-bound) — rebuild+dream each question's
     OWN haystack (small → one/few cycles fully drain it), then mine it. Sidesteps
     the mega-store budget trap entirely and is faithful to how LME retrieves
-    (isolated per-question store). One dream per question; `--from` optionally
-    restricts to a run's qids. Dreams with `--dream-model` (default
+    (isolated per-question store). Each question uses bounded, durable-status
+    convergence; `--from` optionally restricts to a run's qids. Dreams with
+    `--dream-model` (default
     deepseek-v4-flash — thinking MUST be disabled, the box's patched client);
     `--dream-model stub` is a no-op plumbing test.
 
@@ -73,8 +74,17 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hymem.core.db import (  # noqa: E402
+    register_current_phase1_generation,
+    register_read_authority_functions,
+)
+from hymem.core.graph import live_edge_predicate  # noqa: E402
 from hymem.query.augment import _multihop_edges  # noqa: E402
 from hymem.query.entities import match_known_entities  # noqa: E402
+from hymem.contrib.model_policy import (  # noqa: E402
+    DeprecatedModelAliasError,
+    require_active_model,
+)
 
 # question_types worth mining for cross-predicate bridges (MR / TR abilities).
 # _abs (abstention) types are excluded — there is no fact to bridge to.
@@ -96,7 +106,37 @@ def _toks(s: str) -> set[str]:
 def _open_ro(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        register_read_authority_functions(conn)
+        generations = conn.execute(
+            "SELECT DISTINCT outcome.phase1_generation_key "
+            "FROM kg_claim_extraction_outcomes outcome "
+            "JOIN phase1_generations generation "
+            "ON generation.generation_key=outcome.phase1_generation_key "
+            "AND generation.extraction_cache_key=outcome.prompt_version "
+            "WHERE outcome.phase1_generation_key IS NOT NULL "
+            "AND hymem_phase1_generation_is_authorized("
+            "generation.generation_key,generation.identity_exact)=1"
+        ).fetchall()
+        generation_keys = [str(row[0]) for row in generations]
+        if len(generation_keys) > 1:
+            raise RuntimeError(
+                "raw store contains multiple authorized Phase-1 generations"
+            )
+        if generation_keys:
+            register_current_phase1_generation(conn, generation_keys[0])
+        elif conn.execute(
+            "SELECT 1 FROM kg_evidence "
+            "WHERE provenance_status='canonical' LIMIT 1"
+        ).fetchone() is not None:
+            raise RuntimeError(
+                "raw store has canonical graph evidence without an authorized "
+                "Phase-1 generation"
+            )
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _direct_edges(conn: sqlite3.Connection, seeds: list[str]) -> list[tuple]:
@@ -107,7 +147,7 @@ def _direct_edges(conn: sqlite3.Connection, seeds: list[str]) -> list[tuple]:
     rows = conn.execute(
         f"""SELECT subject_canonical AS s, predicate AS p, object_canonical AS o
             FROM knowledge_graph
-            WHERE status='active'
+            WHERE {live_edge_predicate()}
               AND (subject_canonical IN ({ph}) OR object_canonical IN ({ph}))""",
         seeds + seeds,
     ).fetchall()
@@ -213,10 +253,7 @@ def _build_dream_llm(model: str, base_url: str | None, api_key: str | None):
     if model == "stub":
         from hymem.extraction.llm import StubLLMClient
         return StubLLMClient(default="[]")
-    if "chat" in (model or "") and "v4" not in (model or ""):
-        print(f"WARNING: dream model '{model}' looks like the deprecated "
-              "deepseek-chat — extraction will fail. Use deepseek-v4-flash "
-              "(thinking disabled).", file=sys.stderr)
+    require_active_model(model, role="multihop-miner dream")
     from hymem.contrib.openai_client import OpenAICompatibleClient
     return OpenAICompatibleClient(api_key=api_key, base_url=base_url, model=model)
 
@@ -227,7 +264,8 @@ def _dump_edges(conn, edges_block: dict) -> None:
     reproduce it without --store. Deduped by (s,p,o) across questions."""
     for r in conn.execute(
         "SELECT subject_canonical s, predicate p, object_canonical o, "
-        "pos_evidence pos, neg_evidence neg FROM knowledge_graph WHERE status='active'"
+        "pos_evidence pos, neg_evidence neg FROM knowledge_graph WHERE "
+        + live_edge_predicate()
     ):
         edges_block[(r["s"], r["p"], r["o"])] = {
             "subject": r["s"], "predicate": r["p"], "object": r["o"],
@@ -238,15 +276,19 @@ def _dump_edges(conn, edges_block: dict) -> None:
 def _store_health(conn) -> tuple[int, int]:
     row = conn.execute(
         "SELECT COUNT(*) e, COUNT(DISTINCT subject_canonical) s "
-        "FROM knowledge_graph WHERE status='active'"
+        "FROM knowledge_graph WHERE " + live_edge_predicate()
     ).fetchone()
     return int(row[0]), int(row[1])
 
 
-def _ingest_and_dream(hy, qd: dict, normalize_date, max_cycles: int) -> int:
-    """Ingest a question's haystack and dream it TO COMPLETION — loop dream()
-    until it stops hitting the per-cycle `dream_budget` (the exact cap that
-    silently under-dreams a mega-store). Returns the cycle count."""
+def _ingest_and_dream(
+    hy,
+    qd: dict,
+    normalize_date,
+    max_cycles: int,
+    timeout_s: float = 3600.0,
+) -> int:
+    """Ingest and dream until the durable backlog is complete and healthy."""
     sessions = qd.get("haystack_sessions", []) or []
     ids = qd.get("haystack_session_ids") or [str(i) for i in range(len(sessions))]
     dates = qd.get("haystack_dates", []) or []
@@ -256,13 +298,23 @@ def _ingest_and_dream(hy, qd: dict, normalize_date, max_cycles: int) -> int:
                    for m in messages if (m.get("content") or "").strip()]
         for i in range(0, len(entries), 50):
             hy.log_messages(f"{sid}_{i // 50}", entries[i:i + 50])
-    cycles = 0
-    while cycles < max_cycles:
-        report = hy.dream()
-        cycles += 1
-        if not report.budget_exhausted:
-            break
-    return cycles
+    # A report can be non-exhausted after a failed attempt or an independently
+    # capped tier while durable work is still pending.  Use the same bounded,
+    # lock-aware and quarantine-aware convergence contract as the scored
+    # adapters instead of maintaining a miner-specific stopping rule.
+    try:
+        from benchmarks.strictness import converge_indexing
+    except (ImportError, ValueError):  # direct benchmark-script import
+        from strictness import converge_indexing  # type: ignore
+
+    summary = converge_indexing(
+        hy.dream,
+        status=hy.dream_status,
+        max_cycles=max_cycles,
+        timeout_s=timeout_s,
+        require_healthy=True,
+    )
+    return int(summary["cycles"])
 
 
 def _run_perq_mode(args, want_types, mine_cfg, items, stats, health, edges_block) -> None:
@@ -300,7 +352,13 @@ def _run_perq_mode(args, want_types, mine_cfg, items, stats, health, edges_block
         hy = None
         try:
             hy = HyMem(HyMemConfig(root=Path(tmpd)), llm=dream_llm)
-            cycles = _ingest_and_dream(hy, qd, _normalize_date, args.max_dream_cycles)
+            cycles = _ingest_and_dream(
+                hy,
+                qd,
+                _normalize_date,
+                args.max_dream_cycles,
+                args.dream_timeout,
+            )
             edges, subj = _store_health(hy.conn)
             health["stores"] += 1
             health["edges_total"] += edges
@@ -352,11 +410,19 @@ def main() -> None:
                     help="per-question mode: extraction API key (else env)")
     ap.add_argument("--max-dream-cycles", type=int, default=1000,
                     help="per-question mode: safety cap on dream() cycles per question")
+    ap.add_argument("--dream-timeout", type=float, default=3600.0,
+                    help="per-question mode: timeout in seconds for each store's "
+                         "bounded indexing convergence (default 3600)")
     args = ap.parse_args()
 
     if bool(args.store) == bool(args.lme_data):
         ap.error("pass exactly one of --store (existing dreamed store) or "
                  "--lme-data (per-question rebuild)")
+    if args.lme_data and args.dream_model != "stub":
+        try:
+            require_active_model(args.dream_model, role="multihop-miner dream")
+        except DeprecatedModelAliasError as exc:
+            ap.error(str(exc))
 
     want_types = {t.strip() for t in args.types.split(",") if t.strip()}
     from hymem import HyMemConfig
@@ -387,6 +453,8 @@ def main() -> None:
            "min_score": args.min_score, "stats": stats}
     if mode == "per-question":
         gen["store_health"] = health
+        gen["indexing_max_cycles"] = args.max_dream_cycles
+        gen["indexing_timeout_s"] = args.dream_timeout
     out = {
         "description": f"Track A mined probe stub ({source_desc}). AUTO-PROPOSED — verify "
                        "every item (_verify / _alt_bridges) before the G-A1 read. "

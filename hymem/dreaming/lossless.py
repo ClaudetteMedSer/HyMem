@@ -13,6 +13,8 @@ import sqlite3
 from dataclasses import dataclass
 
 from hymem.core.message_records import (
+    MESSAGE_CONTENT_HASH_VERSION,
+    MESSAGE_RECORD_VERSION,
     canonical_message_record,
 )
 from hymem.core.time import normalize_iso_timestamp
@@ -35,6 +37,81 @@ class CoveredMessage:
     source_created_at: str | None = None
     source_peer_id: str | None = None
     source_workspace_id: str | None = None
+
+
+# This identity changes only when the validation contract for the durable
+# ordered stream changes.  It deliberately contains no model, prompt, user
+# text, endpoint, or exception data, so it is safe to persist and export.
+COVERAGE_INTEGRITY_CONFIG_VERSION = (
+    "lossless-coverage-integrity-v1"
+    f"|coverage={LOSSLESS_COVERAGE_VERSION}"
+    f"|hash={MESSAGE_CONTENT_HASH_VERSION}"
+    f"|record={MESSAGE_RECORD_VERSION}"
+)
+COVERAGE_INTEGRITY_FAILURE_REASONS = frozenset({
+    "materialization_failure",
+    "source_stream_invalid",
+})
+MAX_COVERAGE_INTEGRITY_OCCURRENCES = 2_147_483_647
+
+
+def record_coverage_integrity_failure(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Record one bounded, non-secret health failure for a session.
+
+    There is at most one row per session. Repeated observations under the same
+    validator/reason increment a capped counter; a different validator or
+    stage replaces the operational identity instead of growing an unbounded
+    event log. Exception strings and source bytes never enter this ledger.
+    """
+    if reason not in COVERAGE_INTEGRITY_FAILURE_REASONS:
+        raise ValueError("unknown coverage integrity failure reason")
+    conn.execute(
+        """
+        INSERT INTO coverage_integrity_failures(
+            session_id, config_version, failure_reason, occurrences,
+            first_detected_at, last_detected_at
+        ) VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(session_id) DO UPDATE SET
+            occurrences = CASE
+                WHEN coverage_integrity_failures.config_version = excluded.config_version
+                 AND coverage_integrity_failures.failure_reason = excluded.failure_reason
+                THEN MIN(coverage_integrity_failures.occurrences + 1, ?)
+                ELSE 1
+            END,
+            first_detected_at = CASE
+                WHEN coverage_integrity_failures.config_version = excluded.config_version
+                 AND coverage_integrity_failures.failure_reason = excluded.failure_reason
+                THEN coverage_integrity_failures.first_detected_at
+                ELSE CURRENT_TIMESTAMP
+            END,
+            last_detected_at = CURRENT_TIMESTAMP,
+            config_version = excluded.config_version,
+            failure_reason = excluded.failure_reason
+        """,
+        (
+            session_id,
+            COVERAGE_INTEGRITY_CONFIG_VERSION,
+            reason,
+            MAX_COVERAGE_INTEGRITY_OCCURRENCES,
+        ),
+    )
+
+
+def clear_coverage_integrity_failure(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> bool:
+    """Clear the durable signal after a complete successful stream walk."""
+    cursor = conn.execute(
+        "DELETE FROM coverage_integrity_failures WHERE session_id = ?",
+        (session_id,),
+    )
+    return bool(cursor.rowcount)
 
 
 def _materialize_one_message_coverage(
@@ -190,6 +267,70 @@ def backfill_all_message_coverage(
             (newest, session_id),
         )
     return len(rows)
+
+
+def lossless_cursor_is_valid(
+    conn: sqlite3.Connection,
+    session_id: str,
+    cursor_message_id: int | None,
+    partial_message_id: int | None,
+    offset: int,
+    *,
+    roles: frozenset[str] | None = None,
+) -> bool:
+    """Prove that a persisted consumer cursor names exact producer artifacts.
+
+    The probe is deliberately bounded to the cursor occurrence and the next
+    partial occurrence.  Full sequential walks retain their existing stronger
+    page-by-page validation; health polling must not rescan every source byte.
+    """
+    try:
+        if (
+            isinstance(cursor_message_id, bool)
+            or (
+                cursor_message_id is not None
+                and not isinstance(cursor_message_id, int)
+            )
+            or isinstance(partial_message_id, bool)
+            or (
+                partial_message_id is not None
+                and not isinstance(partial_message_id, int)
+            )
+            or isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+        ):
+            return False
+        if cursor_message_id is not None:
+            at_cursor = covered_messages_after(
+                conn,
+                session_id,
+                int(cursor_message_id) - 1,
+                limit=1,
+                roles=roles,
+                through_message_id=int(cursor_message_id),
+            )
+            if not at_cursor or at_cursor[0].message_id != int(cursor_message_id):
+                return False
+        if partial_message_id is None:
+            return offset == 0
+        if offset <= 0:
+            return False
+        next_rows = covered_messages_after(
+            conn,
+            session_id,
+            cursor_message_id,
+            limit=1,
+            roles=roles,
+            through_message_id=int(partial_message_id),
+        )
+        return bool(
+            next_rows
+            and next_rows[0].message_id == int(partial_message_id)
+            and offset < len(next_rows[0].content)
+        )
+    except (RuntimeError, TypeError, ValueError):
+        return False
 
 
 COVERAGE_VALIDATION_COLUMNS = """
@@ -526,4 +667,54 @@ def covered_messages_after(
         ):
             raise RuntimeError(f"coverage proof mismatch for message {mid}")
         result.append(proof)
+
+    # A broken join would otherwise make a deleted/missing proof disappear
+    # from the result set and look exactly like a naturally empty stream. Raw
+    # rows are not guaranteed to survive retention, but while one does survive
+    # it independently witnesses that a producer-covered occurrence must have
+    # a recognized artifact. Check only the page interval so a paged full walk
+    # is O(stream), not O(pages * stream). An occurrence whose raw row *and*
+    # proof were both destroyed cannot be reconstructed from the v38 frontier;
+    # the immutable SQL guards are what prevent that unsupported state.
+    window_start = int(message_id) if message_id is not None else -1
+    # A short page proves the filtered SQL stream is exhausted, so extend the
+    # witness check through the producer frontier; otherwise a missing trailing
+    # proof after the last returned row would still look like a clean short
+    # final page and the caller would stop paginating.
+    window_end = (
+        int(effective_frontier)
+        if len(rows) < int(limit)
+        else int(result[-1].message_id)
+    )
+    if window_end > window_start:
+        missing_raw = conn.execute(
+            f"""
+            SELECT m.id
+            FROM messages m
+            WHERE m.session_id = ?
+              AND m.id > ?
+              AND m.id <= ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM message_retention_coverage mc
+                  JOIN chunks c ON c.id = mc.chunk_id
+                  WHERE mc.message_id = m.id
+                    AND mc.source_session_id = m.session_id
+                    AND mc.coverage_version IN ({version_placeholders})
+                    AND c.chunk_kind = 'coverage'
+              )
+            ORDER BY m.id
+            LIMIT 1
+            """,
+            (
+                session_id,
+                window_start,
+                window_end,
+                *LOSSLESS_READ_VERSIONS,
+            ),
+        ).fetchone()
+        if missing_raw is not None:
+            raise RuntimeError(
+                f"coverage proof missing for message {int(missing_raw['id'])}"
+            )
     return result

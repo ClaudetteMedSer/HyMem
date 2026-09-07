@@ -69,8 +69,7 @@ def test_retract_is_idempotent(hy):
 
 
 def test_retract_populates_extraction_feedback(hy):
-    """retract_edge writes a row to extraction_feedback so phase1 can inject
-    the bad triple as a few-shot negative in the next dream cycle."""
+    """retract_edge retains source-linked audit evidence for the correction."""
     conn = hy.conn
     conn.execute("INSERT INTO sessions(id) VALUES ('s1')")
     conn.execute(
@@ -103,7 +102,7 @@ def test_retract_populates_extraction_feedback(hy):
 
 def test_retract_without_evidence_writes_no_feedback(hy):
     """An edge with no positive kg_evidence rows leaves extraction_feedback
-    empty — there's no chunk text to attach a negative example to."""
+    empty — there is no source-linked evidence to audit."""
     _seed_edge(hy, "ghost_subject", "uses", "ghost_object")
 
     assert hy.retract_edge("ghost_subject", "uses", "ghost_object") is True

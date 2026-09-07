@@ -24,6 +24,16 @@ import pytest
 
 from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.core import db as core_db
+from hymem.dreaming.aggregation_material import embedding_storage_identity
+from hymem.dreaming.aggregation_provenance import (
+    persist_episode_source_manifest,
+    resolve_cited_episode_sources,
+)
+from hymem.dreaming.embeddings import embedding_text_hash
+from hymem.dreaming.lossless import (
+    coverage_chunk_id,
+    materialize_message_coverage,
+)
 from hymem.extraction.llm import StubLLMClient
 
 
@@ -41,12 +51,23 @@ def conn(cfg):
 
 def _seed_episode(conn, eid, title):
     conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('s1')")
+    message_id = int(conn.execute(
+        "INSERT INTO messages(session_id,role,content) "
+        "VALUES ('s1','user',?)",
+        (f"authoritative source for {eid}",),
+    ).lastrowid)
+    materialize_message_coverage(conn, "s1")
     conn.execute(
         """INSERT INTO episodes(id, session_id, title, summary, participants,
                                 start_message_id, end_message_id, outcome, key_entities)
            VALUES (?, 's1', ?, ?, '[]', 1, 2, NULL, '[]')""",
         (eid, title, f"summary of {title}"),
     )
+    occurrences = resolve_cited_episode_sources(
+        conn, "s1", [coverage_chunk_id("s1", message_id)],
+    )
+    assert occurrences
+    persist_episode_source_manifest(conn, eid, occurrences)
 
 
 def _fts_hits(conn, term: str) -> set[str]:
@@ -118,27 +139,37 @@ def test_vec_episodes_misalignment_is_detected_and_healed(cfg):
             for i in range(6):
                 _seed_episode(conn, f"e{i}", f"episode number {i}")
         vecs = embed.embed([f"episode number {i}" for i in range(6)])
-        with core_db.transaction(conn):
+        model, dim = embedding_storage_identity(embed)
+        with core_db.transaction(conn), core_db.embedding_mutation(conn):
             for i, v in enumerate(vecs):
                 conn.execute(
-                    "INSERT INTO episode_embeddings(episode_id, vector_json, model, dim, text_hash) "
-                    "VALUES (?, ?, 'stub', ?, ?)",
-                    (f"e{i}", json.dumps(v), len(v), f"h{i}"),
+                    "INSERT INTO episode_embeddings(episode_id, vector_json, model, dim, "
+                    "text_hash, embedding_producer_key) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        f"e{i}", json.dumps(v), model, dim,
+                        embedding_text_hash(
+                            f"episode number {i}\nsummary of episode number {i}"
+                        ),
+                        model,
+                    ),
                 )
-        core_db.ensure_vec_table(conn, len(vecs[0]))
+        core_db.ensure_vec_table(conn, dim, model=model)
         if not core_db.has_vec_table(conn, table="vec_episodes"):
             pytest.skip("vec extension present but vec table unavailable")
         assert core_db.vec_episodes_aligned(conn) is True
 
-        # Delete a low-rowid episode (cascades its embedding row), then VACUUM:
-        # surviving episodes' rowids compact downward while vec_episodes keeps
-        # the old numbering — the prod skew in miniature.
+        # Episode vectors no longer use the implicit source rowid: an explicit
+        # rowid move and VACUUM leave the deterministic id-derived keys intact.
         with core_db.transaction(conn):
-            conn.execute("DELETE FROM episodes WHERE id = 'e0'")
+            conn.execute("UPDATE episodes SET rowid=rowid+1000 WHERE id='e0'")
         conn.execute("VACUUM")
+        assert core_db.vec_episodes_aligned(conn) is True
 
-        if core_db.vec_episodes_aligned(conn):
-            pytest.skip("this SQLite build did not renumber rowids on VACUUM")
+        # Cascading the durable mirror cannot cascade through the optional
+        # virtual table. Its orphan is detected by exact key-set comparison.
+        with core_db.transaction(conn):
+            conn.execute("DELETE FROM episodes WHERE id='e0'")
+        assert core_db.vec_episodes_aligned(conn) is False
         assert core_db.heal_rowid_shadows(conn) is True
         assert core_db.vec_episodes_aligned(conn) is True
     finally:

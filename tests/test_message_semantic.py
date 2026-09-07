@@ -3,27 +3,41 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sqlite3
 import sys
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from hymem import HyMem
+from hymem import HyMem, StubEmbeddingClient
 from hymem.bootstrap import build_from_env, resolve_env
 from hymem.config import HyMemConfig
 from hymem.contrib.openai_embedding_client import (
     DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
     OpenAICompatibleEmbeddingClient,
+    embedding_attestation_sha256,
     openai_compatible_embedding_identity,
     safe_embedding_base_url,
 )
 from hymem.core import db as core_db
 from hymem.core.vectors import encode_vector
+from hymem.deadline import (
+    DeadlineBoundEmbeddingClient,
+    DeadlineBoundLLMClient,
+    MonotonicDeadline,
+)
 from hymem.doctor import FAIL, WARN, _check_embedding, _check_schema_and_dim
 from hymem.dreaming.aggregate import (
+    build_aggregation_nodes,
     fetch_node_embeddings,
     persist_node_embeddings,
+)
+from hymem.dreaming.aggregation_material import (
+    configured_openai_embedding_producer_binding,
+    embedding_producer_binding,
+    embedding_storage_identity,
 )
 from hymem.dreaming.embeddings import (
     MESSAGE_EMBEDDING_BATCH_SIZE,
@@ -41,10 +55,17 @@ from hymem.dreaming.retention import prune_messages
 from hymem.extraction.embeddings import (
     CachedEmbeddingClient,
     LocalHashEmbeddingClient,
+    MappedStubEmbeddingClient,
+    PinnedEmbeddingClient,
     embedding_text_hash,
     normalize_text,
 )
-from hymem.extraction.llm import StubLLMClient
+from hymem.extraction.llm import LLMRequest, StubLLMClient
+from hymem.extraction.producer import (
+    _register_phase1_producer_proxy,
+    phase1_generation_binding,
+)
+from hymem.extraction.producer import exact_callable_sha256
 from hymem.query.augment import (
     _aggregation_search,
     _episode_search,
@@ -53,46 +74,173 @@ from hymem.query.augment import (
 )
 
 
-class RecordingEmbedder:
-    def __init__(
-        self,
-        vectors: dict[str, list[float]] | None = None,
-        *,
-        model: str = "semantic-test-v1",
-        dim: int = 3,
-        default: list[float] | None = None,
-        quality: str = "semantic",
-        fail_on: str | None = None,
-        conn=None,
-    ) -> None:
-        self._model = model
-        self._dim = dim
-        self.vectors = vectors or {}
-        self.default = default or [0.0, 1.0, 0.0][:dim]
-        self.quality = quality
-        self.backend = "recording"
-        self.network_free = True
-        self.fail_on = fail_on
-        self.conn = conn
-        self.calls: list[list[str]] = []
-        self.transaction_states: list[bool] = []
+class _FakeDefaultHttpxClient:
+    """Owned no-proxy transport stub for OpenAI SDK boundary tests."""
 
-    @property
-    def model(self) -> str:
-        return self._model
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.trust_env = kwargs.get("trust_env")
 
-    @property
-    def dim(self) -> int:
-        return self._dim
+    def close(self):
+        pass
 
-    def embed(self, texts):
-        payload = list(texts)
-        self.calls.append(payload)
-        if self.conn is not None:
-            self.transaction_states.append(bool(self.conn.in_transaction))
-        if self.fail_on is not None and any(self.fail_on in text for text in payload):
-            raise RuntimeError("provider unavailable")
-        return [list(self.vectors.get(text, self.default)) for text in payload]
+
+def _fake_openai_module(openai_class):
+    return SimpleNamespace(
+        OpenAI=openai_class, DefaultHttpxClient=_FakeDefaultHttpxClient,
+    )
+
+
+RecordingEmbedder = MappedStubEmbeddingClient
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "sk_live_1234567890abcdef",
+        "sk_test_1234567890abcdef",
+        "Bearer:opaque-credential",
+        "apiKey:opaque-credential",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signature123",
+        "c3VwZXItc2VjcmV0LWNyZWRlbnRpYWw",
+        "sk%5Flive%5F1234567890abcdef",
+        "Bearer%3Aopaque-credential",
+        "Authorization:Bearer-opaque-credential",
+        "api%4bey%3Dopaque-credential",
+        "api.key=opaque-credential",
+        "api/key=opaque-credential",
+        "api\u200bkey=opaque-credential",
+        "api／key＝opaque-credential",
+    ],
+)
+def test_embedding_public_attestations_reject_credential_shapes_without_echo(
+    credential,
+):
+    with pytest.raises(ValueError) as direct:
+        embedding_attestation_sha256(credential, label="deployment revision")
+    assert credential not in str(direct.value)
+
+    class CredentialDeclaredEmbedder:
+        network_free = True
+        dim = 1
+
+        def embed(self, _texts):
+            return [[1.0]]
+
+        def embedding_producer_declaration(self):
+            return {
+                "schema": "hymem-custom-embedding-producer-declaration-v2",
+                "implementation": "tests.credential-declaration",
+                "implementation_revision": "v1",
+                "deployment_revision": credential,
+                "deployment_tenant": "tests",
+                "model_revision": "v1",
+                "request_policy": "fixed-v1",
+                "dimension": 1,
+                "network_free": True,
+            }
+
+    with pytest.raises(ValueError) as custom:
+        embedding_producer_binding(CredentialDeclaredEmbedder())
+    assert credential not in str(custom.value)
+
+
+def test_embedding_public_attestation_preserves_ordinary_long_release_label():
+    label = "releaseabcdefghijklmnopqrstuvwx"
+    assert embedding_attestation_sha256(
+        label, label="deployment revision",
+    ) == "sha256:" + hashlib.sha256(label.encode()).hexdigest()
+
+
+def _custom_embedding_declaration(**overrides):
+    value = {
+        "schema": "hymem-custom-embedding-producer-declaration-v2",
+        "implementation": "tests.closed-custom-embedding",
+        "implementation_revision": "v1",
+        "deployment_revision": "fixture-v1",
+        "deployment_tenant": "tests",
+        "model_revision": "model-v1",
+        "request_policy": "fixed-v1",
+        "dimension": 2,
+        "network_free": True,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_custom_embedding_indirect_dispatch_cannot_claim_exact_authority():
+    class Indirect:
+        dim = 2
+        network_free = True
+
+        @staticmethod
+        def _vector():
+            return [1.0, 0.0]
+
+        def embed(self, _texts):
+            return [self._vector()]
+
+        def embedding_producer_declaration(self):
+            return _custom_embedding_declaration()
+
+    with pytest.raises(ValueError, match="not attestable"):
+        embedding_producer_binding(Indirect())
+
+
+def test_custom_embedding_requires_exact_dict_and_network_free_execution():
+    class Declared:
+        dim = 2
+        network_free = False
+
+        def embed(self, _texts):
+            return [[1.0, 0.0]]
+
+        def embedding_producer_declaration(self):
+            return _custom_embedding_declaration(network_free=False)
+
+    with pytest.raises(ValueError, match="network"):
+        embedding_producer_binding(Declared())
+
+    class DictSubclass(dict):
+        pass
+
+    class SubclassDeclaration(Declared):
+        network_free = True
+
+        def embedding_producer_declaration(self):
+            return DictSubclass(_custom_embedding_declaration())
+
+    with pytest.raises(ValueError, match="shape"):
+        embedding_producer_binding(SubclassDeclaration())
+
+
+def test_exact_callable_rejects_mutable_or_custom_mapping_state():
+    class HiddenMap(dict):
+        pass
+
+    hidden = HiddenMap(advertised=1.0)
+
+    def mutable_default(_texts, state=hidden):
+        return [[state["advertised"]]]
+
+    with pytest.raises(ValueError, match="mutable|unsupported"):
+        exact_callable_sha256(mutable_default)
+
+
+def test_closed_network_free_custom_embedding_can_still_be_exact():
+    class Pure:
+        dim = 2
+        network_free = True
+
+        def embed(self, texts):
+            return [[1.0, 0.0] for _text in texts]
+
+        def embedding_producer_declaration(self):
+            return _custom_embedding_declaration()
+
+    binding = embedding_producer_binding(Pure())
+    assert binding["identity_exact"] is True
+    assert binding["reuse_scope"] == "durable"
 
 
 def _quiet_cfg(cfg: HyMemConfig, **overrides) -> HyMemConfig:
@@ -131,6 +279,296 @@ def test_default_local_backend_is_deterministic_observable_and_collision_safe(cf
         assert hy.embedding_status["network_free"] is True
     finally:
         hy.close()
+
+
+def test_local_hash_helper_shadow_revokes_exact_cache_authority():
+    client = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    cached = CachedEmbeddingClient(client)
+    before = embedding_producer_binding(client)
+    first = cached.embed(["same"])
+
+    client._features = lambda _text: [("forced", 1.0)]
+
+    after = embedding_producer_binding(client)
+    assert before != after
+    assert after["identity_exact"] is False
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(client)
+    second = cached.embed(["same"])
+    # The class-qualified maintained helper ignores the shadow, and the
+    # inexact transition still forces a fresh call rather than replaying the
+    # exact cache entry.
+    assert second == first
+    assert client.call_count == 2
+
+
+def test_local_hash_class_dispatch_override_revokes_exact_authority(monkeypatch):
+    client = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    before = embedding_producer_binding(client)
+    first = client.embed(["same"])
+    original = LocalHashEmbeddingClient.__getattribute__
+
+    def redirected(instance, name):
+        if name == "dim_value":
+            return 4
+        return original(instance, name)
+
+    monkeypatch.setattr(LocalHashEmbeddingClient, "__getattribute__", redirected)
+    after = embedding_producer_binding(client)
+    assert before != after
+    assert after["identity_exact"] is False
+    assert client.embed(["same"]) != first
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(client)
+
+
+def test_maintained_embedding_identity_never_rereads_mutable_source(monkeypatch):
+    """Loaded OLD code cannot be relabelled with a later on-disk digest."""
+
+    from hymem.dreaming import aggregation_material as material_module
+    from hymem.extraction import producer as producer_module
+
+    client = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    before = embedding_producer_binding(client)
+
+    def source_was_reread(*_args, **_kwargs):
+        raise AssertionError("maintained identity reread mutable source")
+
+    monkeypatch.setattr(
+        producer_module, "canonical_callable_sha256", source_was_reread,
+    )
+    monkeypatch.setattr(
+        producer_module, "canonical_module_sha256", source_was_reread,
+    )
+    monkeypatch.setattr(
+        material_module, "canonical_callable_sha256", source_was_reread,
+    )
+    assert embedding_producer_binding(client) == before
+
+
+@pytest.mark.parametrize(
+    "helper_name",
+    ["normalize_text", "_exact_embedding_text_payload"],
+)
+def test_local_embedding_helper_rebind_revokes_exact_authority(
+    monkeypatch, helper_name,
+):
+    from hymem.extraction import embeddings as embedding_module
+
+    client = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    cached = CachedEmbeddingClient(client)
+    assert embedding_producer_binding(cached)["identity_exact"] is True
+    monkeypatch.setattr(
+        embedding_module,
+        helper_name,
+        (lambda _value: "omega") if helper_name == "normalize_text"
+        else (lambda texts: ["omega" for _text in texts]),
+    )
+    assert embedding_producer_binding(client)["identity_exact"] is False
+    assert embedding_producer_binding(cached)["identity_exact"] is False
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(cached)
+
+
+def test_deadline_helper_drift_revokes_nested_embedding_authority(monkeypatch):
+    from hymem import deadline as deadline_module
+
+    inner = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    proxy = DeadlineBoundEmbeddingClient(
+        inner, MonotonicDeadline.after(60),
+    )
+    _register_phase1_producer_proxy(proxy, inner)
+    assert embedding_producer_binding(proxy)["identity_exact"] is True
+    monkeypatch.setattr(MonotonicDeadline, "check", lambda _self: None)
+    assert embedding_producer_binding(proxy)["identity_exact"] is False
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(proxy)
+    assert deadline_module.deadline_proxy_support_integrity() is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backend", "semantic-proxy"),
+        ("quality", "semantic"),
+        ("network_free", False),
+    ],
+)
+def test_local_hash_policy_field_drift_revokes_exact_authority(field, value):
+    client = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    before = embedding_producer_binding(client)
+    setattr(client, field, value)
+    after = embedding_producer_binding(client)
+    assert before != after
+    assert after["identity_exact"] is False
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(client)
+
+
+def test_cached_embedding_dispatch_shadow_cannot_write_durable_vectors(cfg):
+    inner = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    cached = CachedEmbeddingClient(inner)
+    assert embedding_producer_binding(cached)["identity_exact"] is True
+    cached._embed_serialized = lambda _texts: [[0.0, 1.0] + [0.0] * 6]
+    assert embedding_producer_binding(cached)["identity_exact"] is False
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(cached)
+
+    conn = core_db.connect(cfg.db_path)
+    core_db.initialize(conn)
+    try:
+        conn.execute("INSERT INTO sessions(id) VALUES ('s')")
+        conn.execute(
+            "INSERT INTO chunks(id,session_id,start_message_id,end_message_id,"
+            "salience_reason,text) VALUES ('c','s',1,1,'test','source')"
+        )
+        with pytest.raises(RuntimeError, match="durable storage identity"):
+            fetch_chunk_embeddings(conn, cached)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chunk_embeddings"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_embedding_cache_rejects_string_subclass_key_dispatch_alias():
+    class RenderedText(str):
+        def __new__(cls, stored: str, rendered: str):
+            value = super().__new__(cls, stored)
+            value.rendered = rendered
+            return value
+
+        def __str__(self):
+            return self.rendered
+
+    left = RenderedText("same-key", "alpha")
+    right = RenderedText("same-key", "omega")
+    assert left == right and hash(left) == hash(right)
+    client = CachedEmbeddingClient(
+        LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    )
+
+    with pytest.raises(TypeError, match="exact strings"):
+        client.embed([left])
+    with pytest.raises(TypeError, match="exact strings"):
+        client.embed([right])
+    assert client.hits == 0
+    assert client.misses == 0
+
+
+def test_only_maintained_registered_embedding_proxy_can_inherit_authority():
+    inner = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+
+    class ArbitraryProxy:
+        def __init__(self, source):
+            self._inner = source
+            self.model = source.model
+            self.dim = source.dim
+
+        def embed(self, _texts):
+            return [[0.0, 1.0] + [0.0] * 6]
+
+    arbitrary = ArbitraryProxy(inner)
+    with pytest.raises(ValueError, match="proxy type is not maintained"):
+        _register_phase1_producer_proxy(arbitrary, inner)
+    assert embedding_producer_binding(arbitrary)["identity_exact"] is False
+
+    deadline = DeadlineBoundEmbeddingClient(
+        inner, MonotonicDeadline.after(60),
+    )
+    _register_phase1_producer_proxy(deadline, inner)
+    assert embedding_producer_binding(deadline)["identity_exact"] is True
+    deadline.embed = lambda _texts: [[0.0, 1.0] + [0.0] * 6]
+    assert embedding_producer_binding(deadline)["identity_exact"] is False
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(deadline)
+
+
+def test_nested_embedding_proxy_revalidates_every_direct_delegate():
+    inner = LocalHashEmbeddingClient(dim_value=8, model_name="local-test")
+    pinned = PinnedEmbeddingClient(inner, expected_dimension=8)
+    outer = DeadlineBoundEmbeddingClient(
+        pinned, MonotonicDeadline.after(60),
+    )
+    _register_phase1_producer_proxy(outer, pinned)
+    expected = embedding_storage_identity(inner)
+    assert embedding_storage_identity(outer) == expected
+
+    pinned.embed = lambda _texts: [[0.0, 1.0] + [0.0] * 6]
+    assert embedding_producer_binding(pinned)["identity_exact"] is False
+    assert embedding_producer_binding(outer)["identity_exact"] is False
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(outer)
+
+
+def test_maintained_proxy_registration_requires_its_direct_delegate():
+    claimed = LocalHashEmbeddingClient(dim_value=8, model_name="same-label")
+    invoked = LocalHashEmbeddingClient(dim_value=8, model_name="same-label")
+    proxy = DeadlineBoundEmbeddingClient(
+        invoked, MonotonicDeadline.after(60),
+    )
+    with pytest.raises(ValueError, match="source does not match its delegate"):
+        _register_phase1_producer_proxy(proxy, claimed)
+    # Construction registered the genuine direct delegate.  A later rejected
+    # attempt to relabel it must neither replace nor revoke that safe binding.
+    assert embedding_producer_binding(proxy)["identity_exact"] is True
+    assert embedding_storage_identity(proxy) == embedding_storage_identity(invoked)
+
+
+def test_maintained_embedding_proxy_delegate_aba_cannot_execute_replacement():
+    """All transparent embedding wrappers dispatch only their frozen delegate."""
+
+    producer_a = LocalHashEmbeddingClient(dim_value=8, model_name="aba-model")
+    producer_b = StubEmbeddingClient(
+        model_name=producer_a.model, dim_value=producer_a.dim,
+    )
+    wrappers = (
+        (CachedEmbeddingClient(producer_a), "_inner"),
+        (
+            PinnedEmbeddingClient(producer_a, expected_dimension=producer_a.dim),
+            "_inner",
+        ),
+        (
+            DeadlineBoundEmbeddingClient(
+                producer_a, MonotonicDeadline.after(60),
+            ),
+            "_inner",
+        ),
+    )
+    for wrapper, delegate_attr in wrappers:
+        before = embedding_producer_binding(wrapper)
+        setattr(wrapper, delegate_attr, producer_b)
+        with pytest.raises(RuntimeError, match="proxy identity changed"):
+            wrapper.embed(["must never reach producer B"])
+        setattr(wrapper, delegate_attr, producer_a)
+        assert embedding_producer_binding(wrapper) == before
+
+
+def test_maintained_llm_proxy_delegate_aba_cannot_execute_replacement():
+    """Runner/deadline wrappers cannot relabel a temporary LLM delegate swap."""
+
+    from hymem.dreaming.runner import _CountingPhase1LLM, _HeartbeatLLMClient
+
+    producer_a = StubLLMClient(default="A")
+    producer_b = StubLLMClient(default="B")
+    wrappers = (
+        (
+            DeadlineBoundLLMClient(
+                producer_a, MonotonicDeadline.after(60),
+            ),
+            "_inner",
+        ),
+        (_CountingPhase1LLM(producer_a), "delegate"),
+        (_HeartbeatLLMClient(producer_a, lambda: None), "_delegate"),
+    )
+    request = LLMRequest(system="system", user="user")
+    for wrapper, delegate_attr in wrappers:
+        before = phase1_generation_binding("wrapper-aba-v1", wrapper)
+        setattr(wrapper, delegate_attr, producer_b)
+        with pytest.raises(RuntimeError, match="proxy identity changed"):
+            wrapper.complete(request)
+        setattr(wrapper, delegate_attr, producer_a)
+        assert phase1_generation_binding("wrapper-aba-v1", wrapper) == before
 
 
 def test_deepseek_only_environment_uses_local_fallback_without_remote_embedder(
@@ -201,11 +639,11 @@ def test_custom_embedding_endpoint_never_inherits_openai_key(monkeypatch, cfg):
         def __init__(self, **kwargs):
             constructed.append(kwargs)
 
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
     resolved = resolve_env()
     assert resolved.embedding_backend == "local_feature_hash"
     assert resolved.embedding_fallback_reason == "remote_embedding_credentials_missing"
-    doctor_result, live_dim = _check_embedding(resolved)
+    doctor_result, live_dim, _model_key = _check_embedding(resolved)
     assert doctor_result.status == WARN
     assert "remote_embedding_credentials_missing" in doctor_result.detail
     assert live_dim == resolved.embedding_dim
@@ -239,13 +677,13 @@ def test_embedding_transport_requires_https_except_loopback(monkeypatch):
             constructed.append(kwargs)
             self.embeddings = SimpleNamespace()
 
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
     monkeypatch.setenv("HYMEM_EMBEDDING_API_KEY", "embedding-specific")
     monkeypatch.setenv("HYMEM_EMBEDDING_BASE_URL", "http://remote.example/v1")
     rejected = resolve_env()
     assert rejected.embedding_backend == "local_feature_hash"
     assert rejected.embedding_fallback_reason == "remote_embedding_endpoint_rejected"
-    doctor_result, live_dim = _check_embedding(rejected)
+    doctor_result, live_dim, _model_key = _check_embedding(rejected)
     assert doctor_result.status == FAIL
     assert "remote_embedding_endpoint_rejected" in doctor_result.detail
     assert live_dim == rejected.embedding_dim
@@ -266,30 +704,34 @@ def test_embedding_transport_requires_https_except_loopback(monkeypatch):
     secure = resolve_env()
     assert secure.embedding_backend == "openai_compatible"
     OpenAICompatibleEmbeddingClient()
+    owned_http = constructed[-1].pop("http_client")
+    assert isinstance(owned_http, _FakeDefaultHttpxClient)
+    assert owned_http.trust_env is False
     assert constructed[-1] == {
         "api_key": "embedding-specific",
         "base_url": "https://remote.example/v1",
+        "organization": "",
+        "project": "",
         "timeout": DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
         "max_retries": 0,
     }
 
 
-def test_provider_identity_namespaces_endpoint_without_hashing_query_secrets():
+def test_provider_identity_namespaces_endpoint_and_rejects_query_secrets():
     a = openai_compatible_embedding_identity(
-        "HTTPS://Embed.Example/v1/?deployment=a&api_key=top-secret", "same-model"
+        "HTTPS://Embed.Example/v1/a", "same-model"
     )
     b = openai_compatible_embedding_identity(
-        "https://embed.example/v1?deployment=b&api_key=other-secret", "same-model"
+        "https://embed.example/v1/b", "same-model"
     )
     assert a != b
     assert "same-model" in a
-    assert "top-secret" not in a
-    assert "other-secret" not in b
-    assert "deployment=a" in a and "deployment=b" in b
-    # Credentials do not alter vector-space identity.
-    assert a == openai_compatible_embedding_identity(
-        "https://embed.example/v1?deployment=a&api_key=different", "same-model"
-    )
+    secret = "opaque-query-secret"
+    with pytest.raises(ValueError) as exc_info:
+        openai_compatible_embedding_identity(
+            f"https://embed.example/v1?opaque={secret}", "same-model"
+        )
+    assert secret not in str(exc_info.value)
 
 
 def test_embedding_diagnostics_redact_url_credentials_and_provider_errors(
@@ -303,9 +745,7 @@ def test_embedding_diagnostics_redact_url_credentials_and_provider_errors(
         f"?deployment=a&api_key={secret}#private-fragment"
     )
     safe_url = safe_embedding_base_url(raw_url)
-    assert safe_url.startswith(
-        "https://embed.example/v1?deployment=a"
-    )
+    assert safe_url == "<invalid embedding URL>"
     assert all(value not in safe_url for value in (
         secret, "operator", "password", "private-fragment", "api_key",
     ))
@@ -318,28 +758,14 @@ def test_embedding_diagnostics_redact_url_credentials_and_provider_errors(
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    class LeakyFailureClient:
-        dim = 3
-
-        def __init__(self, **_kwargs):
-            pass
-
-        def embed(self, _texts):
-            raise RuntimeError(f"provider failed at {raw_url}")
-
-    monkeypatch.setattr(
-        "hymem.contrib.openai_embedding_client.OpenAICompatibleEmbeddingClient",
-        LeakyFailureClient,
-    )
     cfg = resolve_env()
-    result, live_dim = _check_embedding(cfg)
-    assert live_dim is None and result.status == FAIL
-    assert safe_url in result.detail
+    result, live_dim, _model_key = _check_embedding(cfg)
+    assert live_dim == cfg.embedding_dim and result.status == FAIL
+    assert cfg.embedding_fallback_reason == "remote_embedding_endpoint_rejected"
     assert secret not in result.detail and "password" not in result.detail
 
     assert doctor_mod.run_doctor() == 1
     output = capsys.readouterr().out
-    assert safe_url in output
     assert secret not in output and "password" not in output
 
 
@@ -357,7 +783,7 @@ def test_openai_provider_has_one_explicitly_timed_attempt(monkeypatch):
 
             self.embeddings = SimpleNamespace(create=create)
 
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
     client = OpenAICompatibleEmbeddingClient(
         api_key="key",
         base_url="https://embed.example/v1",
@@ -367,27 +793,179 @@ def test_openai_provider_has_one_explicitly_timed_attempt(monkeypatch):
     )
     with pytest.raises(TimeoutError, match="simulated timeout"):
         client.embed(["one request"])
+    owned_http = constructed[0].pop("http_client")
+    assert isinstance(owned_http, _FakeDefaultHttpxClient)
+    assert owned_http.trust_env is False
     assert constructed == [{
         "api_key": "key",
         "base_url": "https://embed.example/v1",
+        "organization": "",
+        "project": "",
         "timeout": 2.5,
         "max_retries": 0,
     }]
     assert calls == [{"model": "m", "input": ["one request"]}]
 
 
+def test_openai_owned_transport_closes_when_sdk_construction_fails(monkeypatch):
+    closed: list[bool] = []
+
+    class OwnedTransport:
+        def close(self):
+            closed.append(True)
+
+    class RaisingOpenAI:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("sdk construction failed")
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(
+        OpenAI=RaisingOpenAI,
+        DefaultHttpxClient=lambda **_kwargs: OwnedTransport(),
+    ))
+    with pytest.raises(RuntimeError, match="sdk construction failed"):
+        OpenAICompatibleEmbeddingClient(
+            api_key="key", base_url="https://embed.example/v1",
+        )
+    assert closed == [True]
+
+
+def test_openai_transport_seal_allows_requests_and_rejects_policy_drift(
+    monkeypatch,
+):
+    openai = pytest.importorskip("openai")
+    httpx = pytest.importorskip("httpx")
+
+    def handler(request):
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={
+            "object": "list",
+            "model": "m",
+            "data": [
+                {
+                    "object": "embedding", "index": index,
+                    "embedding": [1.0, 0.0, 0.0],
+                }
+                for index, _text in enumerate(payload["input"])
+            ],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        })
+
+    original_factory = openai.DefaultHttpxClient
+    monkeypatch.setattr(
+        openai, "DefaultHttpxClient",
+        lambda **kwargs: httpx.Client(
+            timeout=kwargs["timeout"], trust_env=kwargs["trust_env"],
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+    client = OpenAICompatibleEmbeddingClient(
+        api_key="key", base_url="https://embed.example/v1", model="m", dim=3,
+        pin_dimension=True, deployment_revision="revision-v1",
+        deployment_tenant="tenant-v1",
+    )
+    try:
+        assert client.embed(["one"]) == [[1.0, 0.0, 0.0]]
+        assert client.embed(["two"]) == [[1.0, 0.0, 0.0]]
+        assert client.transport_integrity_ok is True
+    finally:
+        client.close()
+
+    # A default maintained transport exposes httpcore's stable pool policy.
+    monkeypatch.setattr(openai, "DefaultHttpxClient", original_factory)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.internal:8080")
+    sealed = OpenAICompatibleEmbeddingClient(
+        api_key="key", base_url="https://embed.example/v1", model="m", dim=3,
+        pin_dimension=True, deployment_revision="revision-v1",
+        deployment_tenant="tenant-v1",
+    )
+    try:
+        http_client = sealed._client._client
+        assert http_client.trust_env is False
+        assert not any(
+            transport is not None
+            for transport in getattr(http_client, "_mounts", {}).values()
+        )
+        pool = http_client._transport._pool
+        original_http2 = pool._http2
+        pool._http2 = not original_http2
+        assert sealed.transport_integrity_ok is False
+        pool._http2 = original_http2
+        assert sealed.transport_integrity_ok is True
+
+        original_pool = http_client._transport._pool
+        http_client._transport._pool = object()
+        assert sealed.transport_integrity_ok is False
+        http_client._transport._pool = original_pool
+        assert sealed.transport_integrity_ok is True
+
+        monkeypatch.setattr(
+            OpenAICompatibleEmbeddingClient, "_accept_observed_dimension",
+            lambda self, dimension: None,
+        )
+        assert sealed.transport_integrity_ok is False
+    finally:
+        sealed.close()
+
+
+def test_embedding_transport_lock_covers_response_decode_and_dimension_latch(
+    monkeypatch,
+):
+    decode_started = threading.Event()
+    release_decode = threading.Event()
+
+    class Response:
+        usage = SimpleNamespace(prompt_tokens=1, total_tokens=1)
+
+        @property
+        def data(self):
+            decode_started.set()
+            assert release_decode.wait(timeout=5)
+            return [SimpleNamespace(index=0, embedding=[1.0, 0.0, 0.0])]
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self._client = kwargs["http_client"]
+            self.embeddings = SimpleNamespace(create=lambda **_kwargs: Response())
+
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
+    client = OpenAICompatibleEmbeddingClient(
+        api_key="key", base_url="https://embed.example/v1", model="m", dim=3,
+        pin_dimension=True, deployment_revision="revision-v1",
+        deployment_tenant="tenant-v1",
+    )
+    result: list[list[list[float]]] = []
+    worker = threading.Thread(target=lambda: result.append(client.embed(["x"])))
+    worker.start()
+    assert decode_started.wait(timeout=2)
+    assert client._transport_lock.acquire(timeout=0.05) is False
+    release_decode.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert result == [[[1.0, 0.0, 0.0]]]
+
+
 def test_provider_identity_prevents_cross_endpoint_cache_reuse(cfg):
     conn = core_db.connect(cfg.db_path)
     core_db.initialize(conn)
-    first = openai_compatible_embedding_identity("https://a.example/v1", "m")
-    second = openai_compatible_embedding_identity("https://b.example/v1", "m")
+    first = configured_openai_embedding_producer_binding(
+        base_url="https://a.example/v1", request_model="m", dimension=3,
+        pin_dimension=True, deployment_revision="revision-v1",
+        deployment_tenant="tenant-v1",
+    )["producer_key"]
+    second = configured_openai_embedding_producer_binding(
+        base_url="https://b.example/v1", request_model="m", dimension=3,
+        pin_dimension=True, deployment_revision="revision-v1",
+        deployment_tenant="tenant-v1",
+    )["producer_key"]
     text_hash = embedding_text_hash("same input")
     try:
-        conn.execute(
-            "INSERT INTO embedding_cache(text_hash,model,vector_json,dim) "
-            "VALUES (?,?,?,3)",
-            (text_hash, first, encode_vector([1.0, 0.0, 0.0])),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO embedding_cache(text_hash,model,vector_json,dim) "
+                "VALUES (?,?,?,3)",
+                (text_hash, first, encode_vector([1.0, 0.0, 0.0])),
+            )
         assert _fetch_cached_vectors(
             conn, [text_hash], first, expected_dim=3
         ) == {text_hash: [1.0, 0.0, 0.0]}
@@ -416,14 +994,151 @@ def test_openai_provider_reorders_complete_indices_and_rejects_partial(
         def __init__(self, **_kwargs):
             self.embeddings = SimpleNamespace(create=lambda **_kw: responses.pop(0))
 
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
     client = OpenAICompatibleEmbeddingClient(
         api_key="key", base_url="https://one.example/v1", model="m", dim=99
     )
+    assert client.configured_dim == 99
+    assert client.observed_dim is None
+    assert client.dimension_policy == "adaptive"
     assert client.embed(["first", "second"]) == [[1.0, 0.0], [0.0, 1.0]]
     assert client.dim == 2
+    assert client.configured_dim == 99
+    assert client.observed_dim == 2
+    assert client.dimension_integrity_ok is True
     with pytest.raises(RuntimeError, match="partial/malformed indices"):
         client.embed(["first", "second"])
+
+
+def test_cached_adaptive_openai_allows_first_dimension_transition_without_reuse(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            def create(**request):
+                calls.append(request)
+                return SimpleNamespace(data=[
+                    SimpleNamespace(index=0, embedding=[1.0, 0.0]),
+                ])
+
+            self.embeddings = SimpleNamespace(create=create)
+
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
+    raw = OpenAICompatibleEmbeddingClient(
+        api_key="key", base_url="https://one.example/v1", model="m", dim=3,
+    )
+    cached = CachedEmbeddingClient(raw)
+
+    assert cached.embed(["x"]) == [[1.0, 0.0]]
+    assert raw.dim == 2
+    assert cached.embed(["x"]) == [[1.0, 0.0]]
+    assert len(calls) == 2
+    assert (cached.hits, cached.misses) == (0, 2)
+    with pytest.raises(RuntimeError, match="no durable storage identity"):
+        embedding_storage_identity(cached)
+
+
+def test_pinned_openai_embedding_rejects_first_response_dimension_mismatch(
+    monkeypatch,
+):
+    responses = [
+        SimpleNamespace(data=[
+            SimpleNamespace(index=0, embedding=[1.0, 0.0]),
+        ]),
+        SimpleNamespace(data=[
+            SimpleNamespace(index=0, embedding=[1.0, 0.0, 0.0]),
+        ]),
+    ]
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.embeddings = SimpleNamespace(
+                create=lambda **_kw: responses.pop(0)
+            )
+
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
+    client = OpenAICompatibleEmbeddingClient(
+        api_key="key", base_url="https://one.example/v1", model="m", dim=3,
+        pin_dimension=True,
+    )
+
+    with pytest.raises(RuntimeError, match="pinned configured dimension"):
+        client.embed(["first"])
+    assert client.configured_dim == 3
+    assert client.dim == 3
+    assert client.observed_dim == 2
+    assert client.dimension_policy == "pinned"
+    assert client.dimension_integrity_ok is False
+
+    # A later conforming response cannot erase the contradictory observation.
+    assert client.embed(["retry"]) == [[1.0, 0.0, 0.0]]
+    assert client.observed_dim == 3
+    assert client.dimension_integrity_ok is False
+
+
+def test_pinned_openai_embedding_latches_later_dimension_drift(monkeypatch):
+    responses = [
+        SimpleNamespace(data=[
+            SimpleNamespace(index=0, embedding=[1.0, 0.0, 0.0]),
+        ]),
+        SimpleNamespace(data=[
+            SimpleNamespace(index=0, embedding=[1.0, 0.0, 0.0, 0.0]),
+        ]),
+    ]
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.embeddings = SimpleNamespace(
+                create=lambda **_kw: responses.pop(0)
+            )
+
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
+    client = OpenAICompatibleEmbeddingClient(
+        api_key="key", base_url="https://one.example/v1", model="m", dim=3,
+        pin_dimension=True,
+    )
+
+    assert client.embed(["first batch"]) == [[1.0, 0.0, 0.0]]
+    assert client.dimension_integrity_ok is True
+    with pytest.raises(RuntimeError, match="pinned configured dimension"):
+        client.embed(["later batch"])
+    assert client.dim == client.configured_dim == 3
+    assert client.observed_dim == 4
+    assert client.dimension_integrity_ok is False
+
+
+def test_pinned_openai_embedding_latches_mixed_batch_in_either_order(
+    monkeypatch,
+):
+    responses = [
+        SimpleNamespace(data=[
+            SimpleNamespace(index=0, embedding=[1.0, 0.0, 0.0, 0.0]),
+            SimpleNamespace(index=1, embedding=[1.0, 0.0, 0.0]),
+        ]),
+        SimpleNamespace(data=[
+            SimpleNamespace(index=0, embedding=[1.0, 0.0, 0.0]),
+            SimpleNamespace(index=1, embedding=[1.0, 0.0, 0.0, 0.0]),
+        ]),
+    ]
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.embeddings = SimpleNamespace(
+                create=lambda **_kw: responses.pop(0)
+            )
+
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
+    for _ in range(2):
+        client = OpenAICompatibleEmbeddingClient(
+            api_key="key", base_url="https://one.example/v1", model="m", dim=3,
+            pin_dimension=True,
+        )
+        with pytest.raises(RuntimeError, match="mixed vector dimensions"):
+            client.embed(["first", "second"])
+        assert client.dim == 3
+        assert client.dimension_integrity_ok is False
 
 
 @pytest.mark.parametrize(
@@ -443,7 +1158,7 @@ def test_openai_provider_rejects_bad_cardinality_and_vectors(
                 create=lambda **_kw: SimpleNamespace(data=data)
             )
 
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(FakeOpenAI))
     client = OpenAICompatibleEmbeddingClient(
         api_key="key", base_url="https://one.example/v1", model="m", dim=2
     )
@@ -486,7 +1201,7 @@ def test_cached_client_rejects_identity_change_between_snapshot_and_call():
 
     inner = RacingIdentityClient()
     cached = CachedEmbeddingClient(inner)
-    with pytest.raises(RuntimeError, match="changed before provider call"):
+    with pytest.raises(RuntimeError, match="changed during snapshot"):
         cached.embed(["x"])
     assert inner.calls == 0
 
@@ -509,11 +1224,13 @@ def test_exact_input_hash_prevents_normalization_cache_alias(cfg):
         legacy_hash = hashlib.sha256(
             normalize_text("Hello  World").encode("utf-8")
         ).hexdigest()
-        conn.execute(
-            "INSERT INTO embedding_cache(text_hash,model,vector_json,dim) "
-            "VALUES (?,?,?,?)",
-            (legacy_hash, embedder.model, encode_vector([0.0, 0.0, 1.0]), 3),
-        )
+        model, dim = embedding_storage_identity(embedder)
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO embedding_cache(text_hash,model,vector_json,dim) "
+                "VALUES (?,?,?,?)",
+                (legacy_hash, model, encode_vector([0.0, 0.0, 1.0]), dim),
+            )
         pending = fetch_chunk_embeddings(conn, embedder)
         assert pending is not None
         assert embedder.calls == [["Hello  World", " hello world "]]
@@ -602,7 +1319,7 @@ def test_dream_isolates_one_poison_without_starving_same_batch_peers(cfg):
     poison = "PERMANENTLY_REJECTED_INPUT"
     texts[poison_index] = poison
     hy = HyMem(
-        _quiet_cfg(cfg),
+        _quiet_cfg(cfg, dream_baseline_budget=0),
         llm=StubLLMClient(default="[]"),
     )
     try:
@@ -633,7 +1350,10 @@ def test_dream_isolates_one_poison_without_starving_same_batch_peers(cfg):
 
 
 def test_dream_message_isolation_circuit_breaks_a_general_outage(cfg):
-    hy = HyMem(_quiet_cfg(cfg), llm=StubLLMClient(default="[]"))
+    hy = HyMem(
+        _quiet_cfg(cfg, dream_baseline_budget=0),
+        llm=StubLLMClient(default="[]"),
+    )
     try:
         hy.log_messages(
             "s",
@@ -741,24 +1461,29 @@ def test_message_semantic_rejects_wrong_identity_and_malformed_vectors(cfg):
     try:
         texts = [f"stored occurrence {index}" for index in range(6)]
         ids = hy.log_messages("s", [("user", text) for text in texts])
+        live_model, live_dim = embedding_storage_identity(embedder)
+        other_model, _ = embedding_storage_identity(RecordingEmbedder(
+            model="other-model", default=[1.0, 0.0, 0.0],
+        ))
         rows = [
-            ("other-model", 3, encode_vector([1.0, 0.0, 0.0])),
-            (embedder.model, 2, encode_vector([1.0, 0.0])),
-            (embedder.model, 3, "[NaN,0,0]"),
-            (embedder.model, 3, encode_vector([0.0, 0.0, 0.0])),
-            (embedder.model, 3, "corrupt"),
+            (other_model, live_dim, encode_vector([1.0, 0.0, 0.0])),
+            (live_model, 2, encode_vector([1.0, 0.0])),
+            (live_model, live_dim, "[NaN,0,0]"),
+            (live_model, live_dim, encode_vector([0.0, 0.0, 0.0])),
+            (live_model, live_dim, "corrupt"),
         ]
-        for message_id, (model, dim, vector) in zip(ids[1:], rows):
-            hy.conn.execute(
-                "UPDATE message_embeddings SET model=?,dim=?,vector_json=? "
-                "WHERE message_id=?",
-                (model, dim, vector, message_id),
-            )
-        if core_db.has_vec_table(hy.conn, table="vec_messages"):
-            hy.conn.execute(
-                "INSERT OR IGNORE INTO vec_messages(rowid,embedding) VALUES (?,?)",
-                (999999, core_db._pack_vector([1.0, 0.0, 0.0])),
-            )
+        with core_db.embedding_mutation(hy.conn):
+            for message_id, (model, dim, vector) in zip(ids[1:], rows):
+                hy.conn.execute(
+                    "UPDATE message_embeddings SET model=?,dim=?,vector_json=? "
+                    "WHERE message_id=?",
+                    (model, dim, vector, message_id),
+                )
+            if core_db.has_vec_table(hy.conn, table="vec_messages"):
+                hy.conn.execute(
+                    "INSERT OR IGNORE INTO vec_messages(rowid,embedding) VALUES (?,?)",
+                    (999999, core_db._pack_vector([1.0, 0.0, 0.0])),
+                )
         hits = hy.augment(query, source_session_id="s").message_hits
         assert [hit.message_id for hit in hits] == [ids[0]]
     finally:
@@ -811,7 +1536,7 @@ def test_ingest_batches_only_new_ids_redacts_before_provider_and_retries_in_drea
         hy.close()
 
 
-def test_dream_background_first_response_dimension_change_persists_true_shape(cfg):
+def test_dynamic_custom_dimension_has_no_durable_authority(cfg):
     scoped = replace(
         cfg,
         aggregation_nodes_enabled=False,
@@ -821,13 +1546,13 @@ def test_dream_background_first_response_dimension_change_persists_true_shape(cf
 
     class DynamicDimensionEmbedder(RecordingEmbedder):
         def __init__(self, conn):
-            super().__init__(dim=99, conn=conn, default=[1.0, 0.0, 0.0])
+            super().__init__(dim=3, conn=conn, default=[1.0, 0.0, 0.0])
 
         def embed(self, texts):
             payload = list(texts)
             self.calls.append(payload)
             self.transaction_states.append(bool(self.conn.in_transaction))
-            self._dim = 3
+            self._dim = 4
             return [[1.0, 0.0, 0.0] for _ in payload]
 
     try:
@@ -841,16 +1566,9 @@ def test_dream_background_first_response_dimension_change_persists_true_shape(cf
         hy.close_session("s")
         embedder = DynamicDimensionEmbedder(hy.conn)
         hy.set_embedding_client(embedder)
-        report = hy.dream()
-        rows = hy.conn.execute(
-            "SELECT vector_json,dim,model FROM chunk_embeddings"
-        ).fetchall()
-        assert report.chunks_embedded >= 1 and rows
-        assert all(row["dim"] == 3 and row["model"] == embedder.model for row in rows)
-        assert embedder.transaction_states[0] is False
-        assert hy.conn.execute(
-            "SELECT value FROM schema_meta WHERE key='vec_dim'"
-        ).fetchone()[0] == "3"
+        with pytest.raises(RuntimeError, match="no durable storage identity"):
+            embedding_storage_identity(embedder)
+        assert embedder.calls == []
     finally:
         hy.close()
 
@@ -888,10 +1606,17 @@ def test_all_embedding_fetch_batches_reject_provider_model_swap(cfg):
             "pos_evidence,neg_evidence,status) "
             "VALUES ('app','uses','sqlite',1,0,'active')"
         )
-        conn.execute(
-            "INSERT INTO aggregation_nodes(id,title,summary,level) "
-            "VALUES ('node','node','source',0)"
+        from tests.test_aggregation_provenance import (
+            _aggregation_cfg, _fusion_llm, _seed_native_episode,
         )
+
+        _seed_native_episode(
+            conn, "node-a", title="node", summary="source", entity="node-space"
+        )
+        _seed_native_episode(
+            conn, "node-b", title="node", summary="source", entity="node-space"
+        )
+        build_aggregation_nodes(conn, _aggregation_cfg(hy.config), _fusion_llm())
 
         fetches = (
             lambda embedder: fetch_message_embeddings(
@@ -907,14 +1632,14 @@ def test_all_embedding_fetch_batches_reject_provider_model_swap(cfg):
             embedder = ModelSwapEmbedder(
                 model="space-before-call", default=[1.0, 0.0, 0.0]
             )
-            with pytest.raises(RuntimeError, match="changed model"):
+            with pytest.raises(RuntimeError, match="no durable storage identity"):
                 fetch(embedder)
-            assert len(embedder.calls) == 1
+            assert embedder.calls == []
     finally:
         hy.close()
 
 
-def test_edge_fetch_accepts_first_call_dynamic_dimension_without_cache(cfg):
+def test_edge_fetch_rejects_custom_first_call_dimension_identity_change(cfg):
     class DynamicDimEmbedder(RecordingEmbedder):
         def __init__(self):
             super().__init__(model="dynamic-space", dim=99)
@@ -933,11 +1658,10 @@ def test_edge_fetch_accepts_first_call_dynamic_dimension_without_cache(cfg):
             "VALUES ('app','uses','sqlite',1,0,'active')"
         )
         embedder = DynamicDimEmbedder()
-        pending = fetch_edge_embeddings(conn, embedder)
-        assert pending is not None
-        assert pending.dim == 3
-        assert pending.model == "dynamic-space"
-        assert list(pending.new_text_vectors.values()) == [[1.0, 0.0, 0.0]]
+        with pytest.raises(RuntimeError, match="no durable storage identity"):
+            fetch_edge_embeddings(conn, embedder)
+        assert embedder.calls == []
+        assert conn.execute("SELECT COUNT(*) FROM edge_embeddings").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -990,36 +1714,41 @@ def test_all_semantic_tiers_share_one_query_embedding(cfg):
     try:
         hy.log_message("messages", "user", "durable occurrence corpus")
         conn = hy.conn
+        model, dim = embedding_storage_identity(embedder)
         conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('derived')")
         conn.execute(
             "INSERT INTO chunks(id,session_id,start_message_id,end_message_id,"
             "salience_reason,text) VALUES ('chunk','derived',1,1,'test','chunk corpus')"
         )
-        conn.execute(
-            "INSERT INTO chunk_embeddings(chunk_id,vector_json,model,dim,text_hash) "
-            "VALUES ('chunk',?,?,?,?)",
-            (encode_vector(vector), embedder.model, embedder.dim,
-             embedding_text_hash("chunk corpus")),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO chunk_embeddings(chunk_id,vector_json,model,dim,text_hash) "
+                "VALUES ('chunk',?,?,?,?)",
+                (encode_vector(vector), model, dim,
+                 embedding_text_hash("chunk corpus")),
+            )
         edge_id = conn.execute(
             "INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,"
             "pos_evidence) VALUES ('alpha','uses','omega',2)"
         ).lastrowid
-        conn.execute(
-            "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) VALUES (?,?,?,?)",
-            ("alpha uses omega", encode_vector(vector), embedder.model, embedder.dim),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+                "VALUES (?,?,?,?)",
+                ("alpha uses omega", encode_vector(vector), model, dim),
+            )
         conn.execute(
             "INSERT INTO episodes(id,session_id,title,summary) "
             "VALUES ('episode','derived','episode title','episode corpus')"
         )
         episode_text = "episode title\nepisode corpus"
-        conn.execute(
-            "INSERT INTO episode_embeddings(episode_id,vector_json,model,dim,text_hash) "
-            "VALUES ('episode',?,?,?,?)",
-            (encode_vector(vector), embedder.model, embedder.dim,
-             embedding_text_hash(episode_text)),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO episode_embeddings(episode_id,vector_json,model,dim,text_hash,"
+                "embedding_producer_key) VALUES ('episode',?,?,?,?,?)",
+                (encode_vector(vector), model, dim,
+                 embedding_text_hash(episode_text), model),
+            )
         fact_extraction = narrative_facts.extract_facts(
             conn, "messages",
             StubLLMClient(default=json.dumps([{"text": "fact corpus"}])),
@@ -1031,23 +1760,29 @@ def test_all_semantic_tiers_share_one_query_embedding(cfg):
         fact_id = conn.execute(
             "SELECT id FROM narrative_facts WHERE text='fact corpus'"
         ).fetchone()[0]
-        conn.execute(
-            "INSERT INTO narrative_fact_embeddings(fact_id,vector_json,model,dim,text_hash) "
-            "VALUES (?,?,?,?,?)",
-            (fact_id, encode_vector(vector), embedder.model, embedder.dim,
-             embedding_text_hash("fact corpus")),
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO narrative_fact_embeddings(fact_id,vector_json,model,dim,text_hash) "
+                "VALUES (?,?,?,?,?)",
+                (fact_id, encode_vector(vector), model, dim,
+                 embedding_text_hash("fact corpus")),
+            )
+        from tests.test_aggregation_provenance import (
+            _aggregation_cfg, _fusion_llm, _seed_native_episode,
         )
-        conn.execute(
-            "INSERT INTO aggregation_nodes(id,title,summary,level) "
-            "VALUES ('node','node title','node corpus',0)"
+
+        _seed_native_episode(
+            conn, "semantic-node-a", title="node title",
+            summary="node corpus", entity="semantic-node",
         )
-        node_text = "node title\nnode corpus"
-        conn.execute(
-            "INSERT INTO aggregation_node_embeddings(node_id,vector_json,model,dim,text_hash) "
-            "VALUES ('node',?,?,?,?)",
-            (encode_vector(vector), embedder.model, embedder.dim,
-             embedding_text_hash(node_text)),
+        _seed_native_episode(
+            conn, "semantic-node-b", title="node title",
+            summary="node corpus", entity="semantic-node",
         )
+        build_aggregation_nodes(conn, acfg, _fusion_llm(), embedder)
+        node = conn.execute(
+            "SELECT id,title,summary FROM aggregation_nodes WHERE level=0"
+        ).fetchone()
         embedder.calls.clear()
         ctx = hy.augment(query)
         assert embedder.calls == [[query]]
@@ -1064,38 +1799,46 @@ def test_stale_content_hashes_are_filtered_from_chunk_episode_fact_and_node(cfg)
     core_db.initialize(conn)
     vector = encode_vector([1.0, 0.0, 0.0])
     try:
+        model, dim = embedding_storage_identity(embedder)
         conn.execute("INSERT INTO sessions(id) VALUES ('s')")
         conn.execute(
             "INSERT INTO chunks(id,session_id,start_message_id,end_message_id,"
             "salience_reason,text) VALUES ('c','s',1,1,'test','old chunk')"
         )
-        conn.execute(
-            "INSERT INTO chunk_embeddings(chunk_id,vector_json,model,dim,text_hash) "
-            "VALUES ('c',?,?,?,?)",
-            (vector, embedder.model, 3, embedding_text_hash("old chunk")),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO chunk_embeddings(chunk_id,vector_json,model,dim,text_hash) "
+                "VALUES ('c',?,?,?,?)",
+                (vector, model, dim, embedding_text_hash("old chunk")),
+            )
         conn.execute(
             "INSERT INTO episodes(id,session_id,title,summary) VALUES ('e','s','old','episode')"
         )
-        conn.execute(
-            "INSERT INTO episode_embeddings VALUES ('e',?,?,?,?,CURRENT_TIMESTAMP)",
-            (vector, embedder.model, 3, embedding_text_hash("old\nepisode")),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO episode_embeddings(episode_id,vector_json,model,dim,"
+                "text_hash,embedding_producer_key) VALUES ('e',?,?,?,?,?)",
+                (vector, model, dim, embedding_text_hash("old\nepisode"), model),
+            )
         fact_id = conn.execute(
             "INSERT INTO narrative_facts(session_id,start_message_id,end_message_id,"
             "text,prompt_version) VALUES ('s',1,1,'old fact','test')"
         ).lastrowid
-        conn.execute(
-            "INSERT INTO narrative_fact_embeddings VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)",
-            (fact_id, vector, embedder.model, 3, embedding_text_hash("old fact")),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO narrative_fact_embeddings(fact_id,vector_json,model,dim,"
+                "text_hash) VALUES (?,?,?,?,?)",
+                (fact_id, vector, model, dim, embedding_text_hash("old fact")),
+            )
         conn.execute(
             "INSERT INTO aggregation_nodes(id,title,summary,level) VALUES ('n','old','node',0)"
         )
-        conn.execute(
-            "INSERT INTO aggregation_node_embeddings VALUES ('n',?,?,?,?,CURRENT_TIMESTAMP)",
-            (vector, embedder.model, 3, embedding_text_hash("old\nnode")),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO aggregation_node_embeddings(node_id,vector_json,model,dim,"
+                "text_hash,embedding_producer_key) VALUES ('n',?,?,?,?,?)",
+                (vector, model, dim, embedding_text_hash("old\nnode"), model),
+            )
         conn.execute("UPDATE chunks SET text='changed chunk' WHERE id='c'")
         conn.execute("UPDATE episodes SET title='changed' WHERE id='e'")
         conn.execute("UPDATE narrative_facts SET text='changed fact' WHERE id=?", (fact_id,))
@@ -1121,37 +1864,60 @@ def test_stale_content_hashes_are_filtered_from_chunk_episode_fact_and_node(cfg)
         conn.close()
 
 
-def test_aggregation_embeddings_refresh_identity_cache_and_run_without_write_lock(cfg):
+def test_aggregation_embedding_mirror_rejects_external_identity_tamper(cfg):
     conn = core_db.connect(cfg.db_path)
     core_db.initialize(conn)
     embedder = RecordingEmbedder(model="new-space", conn=conn, default=[1.0, 0.0, 0.0])
     try:
-        text = "node title\nnode summary"
-        text_hash = embedding_text_hash(text)
-        conn.execute(
-            "INSERT INTO aggregation_nodes(id,title,summary,level) "
-            "VALUES ('n','node title','node summary',0)"
+        from tests.test_aggregation_provenance import (
+            _aggregation_cfg, _fusion_llm, _seed_native_episode,
         )
-        conn.execute(
-            "INSERT INTO aggregation_node_embeddings(node_id,vector_json,model,dim,text_hash) "
-            "VALUES ('n',?,'old-space',3,?)",
-            (encode_vector([1.0, 0.0, 0.0]), text_hash),
+
+        _seed_native_episode(
+            conn, "node-refresh-a", title="node", summary="source",
+            entity="node-refresh",
         )
-        conn.execute(
-            "INSERT INTO embedding_cache(text_hash,model,vector_json,dim) "
-            "VALUES (?,?,?,3)",
-            (text_hash, embedder.model, encode_vector([0.0, 0.0, 0.0])),
+        _seed_native_episode(
+            conn, "node-refresh-b", title="node", summary="source",
+            entity="node-refresh",
         )
-        pending = fetch_node_embeddings(conn, embedder)
-        assert pending is not None
-        assert embedder.calls == [[text]]
-        assert embedder.transaction_states == [False]
-        with core_db.transaction(conn):
-            assert persist_node_embeddings(conn, pending) == 1
-        row = conn.execute(
-            "SELECT model,dim,vector_json FROM aggregation_node_embeddings WHERE node_id='n'"
+        build_aggregation_nodes(conn, _aggregation_cfg(cfg), _fusion_llm(), embedder)
+        model, dim = embedding_storage_identity(embedder)
+        old_model, _ = embedding_storage_identity(RecordingEmbedder(
+            model="old-space", default=[1.0, 0.0, 0.0],
+        ))
+        node = conn.execute(
+            "SELECT id,title,summary FROM aggregation_nodes WHERE level=0"
         ).fetchone()
-        assert (row["model"], row["dim"]) == (embedder.model, embedder.dim)
+        text = f"{node['title']}\n{node['summary']}"
+        text_hash = embedding_text_hash(text)
+        embedder.calls.clear()
+        embedder.transaction_states.clear()
+        with pytest.raises(sqlite3.IntegrityError, match="not authorized"):
+            conn.execute(
+                "UPDATE aggregation_node_embeddings SET vector_json=?,model=?,dim=?,"
+                "text_hash=?,embedding_producer_key=? WHERE node_id=?",
+                (
+                    encode_vector([1.0, 0.0, 0.0]), old_model, dim,
+                    text_hash, old_model, node["id"],
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="not authorized"):
+            conn.execute(
+                "INSERT INTO embedding_cache(text_hash,model,vector_json,dim) "
+                "VALUES (?,?,?,?) ON CONFLICT(text_hash,model) DO UPDATE SET "
+                "vector_json=excluded.vector_json,dim=excluded.dim",
+                (text_hash, model, encode_vector([0.0, 0.0, 0.0]), dim),
+            )
+        pending = fetch_node_embeddings(conn, embedder)
+        assert pending is None
+        assert embedder.calls == []
+        assert embedder.transaction_states == []
+        row = conn.execute(
+            "SELECT model,dim,vector_json FROM aggregation_node_embeddings "
+            "WHERE node_id=?", (node["id"],),
+        ).fetchone()
+        assert (row["model"], row["dim"]) == (model, dim)
     finally:
         conn.close()
 
@@ -1166,6 +1932,12 @@ def test_doctor_reports_same_dim_model_swap_and_malformed_vec_metadata(
     ):
         monkeypatch.delenv(name, raising=False)
     cfg = resolve_env()
+    live_model, _ = embedding_storage_identity(LocalHashEmbeddingClient(
+        dim_value=cfg.embedding_dim, model_name=cfg.embedding_model,
+    ))
+    wrong_model, _ = embedding_storage_identity(LocalHashEmbeddingClient(
+        dim_value=cfg.embedding_dim, model_name="wrong-model",
+    ))
     conn = core_db.connect(HyMemConfig(root=tmp_path).db_path)
     core_db.initialize(conn)
     try:
@@ -1174,13 +1946,14 @@ def test_doctor_reports_same_dim_model_swap_and_malformed_vec_metadata(
             (str(cfg.embedding_dim),),
         )
         conn.execute(
-            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('vec_model','wrong-model')"
+            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('vec_model',?)",
+            (wrong_model,),
         )
     finally:
         conn.close()
-    results = _check_schema_and_dim(cfg, cfg.embedding_dim)
+    results = _check_schema_and_dim(cfg, cfg.embedding_dim, live_model)
     assert any(
-        result.status == FAIL and "wrong-model" in result.detail
+        result.status == FAIL and "MISMATCH" in result.detail
         for result in results
     )
 
@@ -1188,7 +1961,7 @@ def test_doctor_reports_same_dim_model_swap_and_malformed_vec_metadata(
     try:
         conn.execute("UPDATE schema_meta SET value='not-an-int' WHERE key='vec_dim'")
         core_db.ensure_vec_table(
-            conn, cfg.embedding_dim, model=cfg.embedding_identity
+            conn, cfg.embedding_dim, model=live_model
         )
         assert conn.execute(
             "SELECT value FROM schema_meta WHERE key='vec_dim'"
@@ -1203,7 +1976,18 @@ def test_doctor_accepts_remote_endpoint_qualified_identity(monkeypatch, tmp_path
     monkeypatch.setenv("HYMEM_EMBEDDING_BASE_URL", "https://embed.example/v1/")
     monkeypatch.setenv("HYMEM_EMBEDDING_MODEL", "shared-label")
     monkeypatch.setenv("HYMEM_EMBEDDING_DIM", "3")
+    monkeypatch.setenv("HYMEM_EMBEDDING_PIN_DIMENSION", "1")
+    monkeypatch.setenv("HYMEM_EMBEDDING_DEPLOYMENT_REVISION", "public-revision-v1")
+    monkeypatch.setenv("HYMEM_EMBEDDING_DEPLOYMENT_TENANT", "public-tenant-v1")
     cfg = resolve_env()
+    model = configured_openai_embedding_producer_binding(
+        base_url=cfg.embedding_base_url,
+        request_model=cfg.embedding_model,
+        dimension=cfg.embedding_dim,
+        pin_dimension=cfg.embedding_pin_dimension,
+        deployment_revision=cfg.embedding_deployment_revision,
+        deployment_tenant=cfg.embedding_deployment_tenant,
+    )["producer_key"]
     conn = core_db.connect(HyMemConfig(root=tmp_path).db_path)
     core_db.initialize(conn)
     try:
@@ -1212,11 +1996,11 @@ def test_doctor_accepts_remote_endpoint_qualified_identity(monkeypatch, tmp_path
         )
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('vec_model',?)",
-            (cfg.embedding_identity,),
+            (model,),
         )
     finally:
         conn.close()
-    results = _check_schema_and_dim(cfg, 3)
+    results = _check_schema_and_dim(cfg, 3, model)
     assert any(
         result.status == "OK" and "matches stored shadows" in result.detail
         for result in results
@@ -1230,8 +2014,9 @@ def test_provider_failure_status_keeps_known_identity(cfg):
         status = hy.augment("query").semantic_status
         assert status.attempted is True and status.available is False
         assert status.reason == "provider_error"
+        expected_model, _ = embedding_storage_identity(embedder)
         assert (status.backend, status.model, status.dim) == (
-            "recording", "known-model", 3,
+            "configured", expected_model, 3,
         )
     finally:
         hy.close()
@@ -1317,17 +2102,24 @@ def test_vec_backfill_rejects_wrong_length_instead_of_padding(cfg):
     conn = core_db.connect(cfg.db_path)
     core_db.initialize(conn)
     try:
+        model, _ = embedding_storage_identity(RecordingEmbedder(
+            model="space", default=[1.0, 0.0, 0.0],
+        ))
         conn.execute("INSERT INTO sessions(id) VALUES ('s')")
         conn.execute(
             "INSERT INTO episodes(id,session_id,title,summary) VALUES ('e','s','t','s')"
         )
-        conn.execute(
-            "INSERT INTO episode_embeddings(episode_id,vector_json,model,dim,text_hash) "
-            "VALUES ('e',?,'space',3,?)",
-            (encode_vector([1.0, 0.0]), embedding_text_hash("t\ns")),
-        )
+        with core_db.embedding_mutation(conn):
+            conn.execute(
+                "INSERT INTO episode_embeddings(episode_id,vector_json,model,dim,"
+                "text_hash,embedding_producer_key) VALUES ('e',?, ?,3,?,?)",
+                (
+                    encode_vector([1.0, 0.0]), model,
+                    embedding_text_hash("t\ns"), model,
+                ),
+            )
         conn.execute("DELETE FROM schema_meta WHERE key IN ('vec_dim','vec_model')")
-        core_db.ensure_vec_table(conn, 3, model="space")
+        core_db.ensure_vec_table(conn, 3, model=model)
         if core_db.has_vec_table(conn, table="vec_episodes"):
             assert conn.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0] == 0
     finally:
@@ -1340,6 +2132,9 @@ def test_identity_matched_vec_ensure_does_not_rescan_durable_corpora(
     conn = core_db.connect(cfg.db_path)
     core_db.initialize(conn)
     try:
+        model, _ = embedding_storage_identity(RecordingEmbedder(
+            model="space", default=[1.0, 0.0, 0.0],
+        ))
         for table in core_db._VEC_TABLES:
             conn.execute(
                 f"CREATE TABLE IF NOT EXISTS {table} "
@@ -1349,7 +2144,8 @@ def test_identity_matched_vec_ensure_does_not_rescan_durable_corpora(
             "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('vec_dim','3')"
         )
         conn.execute(
-            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('vec_model','space')"
+            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('vec_model',?)",
+            (model,),
         )
         monkeypatch.setattr(core_db, "_load_vec_extension", lambda _conn: True)
 
@@ -1361,7 +2157,7 @@ def test_identity_matched_vec_ensure_does_not_rescan_durable_corpora(
             "_backfill_vec_episodes", "_backfill_vec_facts",
         ):
             monkeypatch.setattr(core_db, name, unexpected_scan)
-        core_db.ensure_vec_table(conn, 3, model="space")
+        core_db.ensure_vec_table(conn, 3, model=model)
     finally:
         conn.close()
 

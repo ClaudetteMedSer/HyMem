@@ -26,6 +26,7 @@ from hymem.core.message_records import (
     message_content_hash,
 )
 from hymem.dreaming import phase1
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.dreaming.chunks import Chunk, persist_chunks
 from hymem.dreaming.lossless import (
     coverage_chunk_id,
@@ -34,6 +35,7 @@ from hymem.dreaming.lossless import (
 from hymem.dreaming.message_coverage import LOSSLESS_COVERAGE_VERSION
 from hymem.dreaming.phase1 import ChunkExtraction
 from hymem.dreaming.retention import prune_messages
+from hymem.extraction.embeddings import MappedStubEmbeddingClient
 from hymem.extraction.triples import Triple
 from hymem.query.augment import _graph_lookup
 import hymem.honcho.app as hsrv
@@ -45,18 +47,6 @@ class _NoopScheduler:
 
     def stop(self) -> None:
         return None
-
-
-class _ScopedMappingEmbedder:
-    model = "scoped-mapping-v1"
-    dim = 2
-
-    def __init__(self):
-        self.calls: list[list[str]] = []
-
-    def embed(self, texts):
-        self.calls.append(list(texts))
-        return [[1.0, 0.0] for _ in texts]
 
 
 @pytest.fixture
@@ -119,8 +109,9 @@ def _publish_claim(
                 markers=[],
                 claim_sources={source.message_id: source for source in sources},
                 source_validated=True,
+                phase1_generation=hy._phase1_generation,
             ),
-            prompt_version="v13",
+            prompt_version=hy.config.prompt_version,
             cfg=hy.config,
         )
     return int(message_id)
@@ -1687,9 +1678,9 @@ def test_scoped_entity_match_uses_in_scope_source_surface_form(hy):
 
 
 def test_scoped_entity_match_preserves_non_latin_source_surface(hy):
-    # The historical global canonicalizer is ASCII-only, so register the
-    # extraction-time mapping once. Retrieval must subsequently prove the
-    # Unicode surface from the retained scoped evidence, not the alias table.
+    # Register the extraction-time mapping once. Retrieval must subsequently
+    # prove the Unicode surface from retained scoped evidence, not the alias
+    # table.
     hy.register_alias("東京", "tokyo_city")
     _publish_claim(
         hy, session_id="surface-unicode", peer_id="alice", workspace_id="a",
@@ -1720,6 +1711,13 @@ def test_invalid_graph_top_k_disables_scoped_lookup(hy, invalid_limit):
 
 
 def test_scoped_semantic_recall_beats_more_than_top_k_recency_distractors(hy):
+    embedding = MappedStubEmbeddingClient(
+        {"constellation memory": [1.0, 0.0]},
+        model="scoped-mapping-v1",
+        dim=2,
+        default=[0.0, 1.0],
+    )
+    model, dimension = embedding_storage_identity(embedding)
     _publish_claim(
         hy, session_id="semantic-target", peer_id="alice", workspace_id="a",
         content="the archival constellation choice", chunk_id="semantic-target",
@@ -1738,12 +1736,13 @@ def test_scoped_semantic_recall_beats_more_than_top_k_recency_distractors(hy):
         "FROM knowledge_graph WHERE subject_canonical='semantic_target'"
     ).fetchone()
     edge_text = f"{edge['subject_canonical']} {edge['predicate']} {edge['object_canonical']}"
-    hy.conn.execute(
-        "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
-        "VALUES (?,?,?,2)",
-        (edge_text, json.dumps([1.0, 0.0]), "scoped-mapping-v1"),
-    )
-    hy.set_embedding_client(_ScopedMappingEmbedder())
+    with core_db.embedding_mutation(hy.conn):
+        hy.conn.execute(
+            "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+            "VALUES (?,?,?,?)",
+            (edge_text, json.dumps([1.0, 0.0]), model, dimension),
+        )
+    hy.set_embedding_client(embedding)
     ctx = hy.augment(
         "constellation memory", source_peer_id="alice", source_workspace_id="a"
     )

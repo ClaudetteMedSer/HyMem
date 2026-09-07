@@ -335,8 +335,19 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    corpus = load_corpus(args.labels)
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    if not args.sim and any(mode != "lexical" for mode in modes):
+        from hymem.contrib.model_policy import (
+            DeprecatedModelAliasError,
+            require_active_model,
+        )
+        try:
+            require_active_model(
+                args.answer_model, role="rule-extraction tagger"
+            )
+        except DeprecatedModelAliasError as exc:
+            ap.error(str(exc))
+    corpus = load_corpus(args.labels)
     taus = [float(x) for x in args.tau_sweep.split(",") if x.strip()]
     ns = [int(x) for x in args.evidence_sweep.split(",") if x.strip()]
     gold_map = {c["statement"]: c for c in corpus}

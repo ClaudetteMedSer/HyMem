@@ -125,6 +125,9 @@ def _seed_store(root: Path, edges: list[dict]) -> sqlite3.Connection:
 def _open_store_ro(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    from hymem.core.db import register_read_authority_functions
+
+    register_read_authority_functions(conn)
     return conn
 
 

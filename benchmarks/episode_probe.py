@@ -113,6 +113,14 @@ from hymem.dreaming.digest import (  # noqa: E402
 )
 from hymem.dreaming.lossless import materialize_message_coverage  # noqa: E402
 from hymem.extraction.llm import LLMRequest  # noqa: E402
+from hymem.contrib.model_policy import (  # noqa: E402
+    DeprecatedModelAliasError,
+    require_active_model,
+)
+from benchmarks.strictness import (  # noqa: E402
+    bounded_exception_type,
+    content_hash,
+)
 
 # NOTE on imports: everything above is pure HyMem and pulls in no network stack.
 # `longmemeval_adapter` (and `fact_probe`, which imports it) needs `requests`, so
@@ -267,7 +275,9 @@ class CapturingLLM:
         try:
             reply = self._backend(request.system, request.user)
         except Exception as exc:  # a probe row must never abort the run
-            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_error = (
+                f"execution_failure:{bounded_exception_type(exc)}"
+            )
             reply = ""
         reply = reply if isinstance(reply, str) else ""
         # What came BACK, recorded next to what went out. The first real run of
@@ -382,12 +392,12 @@ def extract_one(conn, entry: dict, llm: CapturingLLM, cfg: HyMemConfig,
             max_episodes=cfg.dream_max_episodes_per_session,
         )
     except Exception as exc:
-        row["error"] = f"{type(exc).__name__}: {exc}"
+        row["error"] = f"execution_failure:{bounded_exception_type(exc)}"
         return row
     row["calls"] = llm.calls - before
     if digest is None:
         # No chunks: nothing was sent, so there is no source to hand-score.
-        row["error"] = "no chunks (session produced no digest input)"
+        row["error"] = "no_digest_input"
         return row
     row["parse_failed"] = bool(digest.parse_failed)
     row["episodes"] = [
@@ -804,10 +814,25 @@ def main() -> None:
                         prior.get("prompt_arm", "?"), args.verbose, target)
         if args.out:
             args.out.write_text(json.dumps(
-                {**prior, "summary": s, "rescored_from": str(args.rescore)},
+                {
+                    **prior,
+                    "summary": s,
+                    "rescored_from": {
+                        "artifact_sha256": content_hash(prior),
+                    },
+                },
                 indent=2))
             print(f"\n  dump → {args.out}")
         sys.exit(0 if passed else 1)
+
+    # Simulation and cost estimation are intentionally model-policy free: both
+    # are zero-call historical/offline operations.  A paid run rejects the
+    # alias before reading the source or the large dataset.
+    if not args.sim and not args.cost:
+        try:
+            require_active_model(args.model, role="episode-probe extractor")
+        except DeprecatedModelAliasError as exc:
+            ap.error(str(exc))
 
     run = json.loads(args.source.read_text())
     from longmemeval_adapter import load_longmemeval_data  # noqa: E402

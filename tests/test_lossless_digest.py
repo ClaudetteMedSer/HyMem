@@ -23,6 +23,7 @@ from hymem.dreaming.digest import (
     digest_generation_matches_config,
 )
 from hymem.dreaming.lossless import (
+    COVERAGE_INTEGRITY_CONFIG_VERSION,
     LOSSLESS_COVERAGE_VERSION,
     coverage_chunk_id,
     covered_messages_after,
@@ -141,7 +142,7 @@ class RollingLLM:
                 "procedures": procedures,
             })
         if "single pass" in request.system:
-            return '{"triples":[],"markers":[]}'
+            return '{"triples":[],"markers":[],"complete":true}'
         return "[]"
 
 
@@ -157,7 +158,7 @@ class FailingDigestLLM:
                 return '{"episodes":[],"summary":"","procedures":[]}'
             return '{"episodes":[],"summary":"","procedures":[],"error":"refused"}'
         if "single pass" in request.system:
-            return '{"triples":[],"markers":[]}'
+            return '{"triples":[],"markers":[],"complete":true}'
         return "[]"
 
 
@@ -1165,11 +1166,158 @@ def test_corrupt_coverage_artifact_holds_digest_cursor(cfg):
         with pytest.raises(RuntimeError, match="coverage proof mismatch"):
             covered_messages_after(hy.conn, sid, None)
 
-        hy.dream()
+        report = hy.dream()
+        assert report.coverage_integrity_failures == 1
         assert _digest_calls(llm) == []
         assert hy.conn.execute(
             "SELECT digest_cursor_message_id FROM sessions WHERE id = ?", (sid,),
         ).fetchone()["digest_cursor_message_id"] is None
+        failure = hy.conn.execute(
+            "SELECT * FROM coverage_integrity_failures WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+        assert failure is not None
+        assert failure["config_version"] == COVERAGE_INTEGRITY_CONFIG_VERSION
+        assert failure["failure_reason"] == "source_stream_invalid"
+        assert failure["occurrences"] == 1
+        assert set(failure.keys()) == {
+            "session_id", "config_version", "failure_reason", "occurrences",
+            "first_detected_at", "last_detected_at",
+        }
+        status = hy.dream_status()
+        assert status["pending_chunks"] == 0
+        assert status["coverage_integrity_failures"] == 1
+        assert status["coverage_integrity_failure_reasons"] == {
+            "source_stream_invalid": 1,
+        }
+        assert status["coverage_integrity_failure_details"][0]["session_id"] == sid
+        assert status["coverage_integrity_failure_details"][0][
+            "config_version"
+        ] == COVERAGE_INTEGRITY_CONFIG_VERSION
+        assert status["last_run"]["coverage_integrity_failures"] == 1
+
+        repeated = hy.dream()
+        assert repeated.coverage_integrity_failures == 1
+        repeated_failure = hy.conn.execute(
+            "SELECT COUNT(*) AS rows,MAX(occurrences) AS occurrences "
+            "FROM coverage_integrity_failures WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+        assert tuple(repeated_failure) == (1, 2)
+        assert _digest_calls(llm) == []
+
+        # Simulate an explicit operator rebuild while the raw source still
+        # exists. The normal immutable guards correctly forbid this direct
+        # surgery; dropping them is test-only. A complete subsequent stream
+        # walk must deterministically acknowledge recovery and clear health.
+        hy.conn.execute("DROP TRIGGER message_lossless_stream_delete_guard")
+        hy.conn.execute("DROP TRIGGER message_retention_coverage_delete_guard")
+        hy.conn.execute(
+            "DELETE FROM message_retention_coverage WHERE message_id = ?",
+            (message_id,),
+        )
+        hy.conn.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
+        hy.conn.execute(
+            "UPDATE sessions SET coverage_message_id = NULL WHERE id = ?", (sid,)
+        )
+
+        recovered = hy.dream()
+        assert recovered.coverage_integrity_failures == 0
+        assert hy.conn.execute(
+            "SELECT 1 FROM coverage_integrity_failures WHERE session_id = ?",
+            (sid,),
+        ).fetchone() is None
+        recovered_status = hy.dream_status()
+        assert recovered_status["coverage_integrity_failures"] == 0
+        assert recovered_status["coverage_integrity_failure_details"] == []
+        assert recovered_status[
+            "coverage_integrity_failure_details_truncated"
+        ] is False
+        assert _digest_calls(llm)
+    finally:
+        hy.close()
+
+
+def test_missing_coverage_proof_is_not_a_clean_empty_stream(cfg):
+    llm = RollingLLM()
+    hy = HyMem(_quiet_cfg(cfg), llm=llm)
+    try:
+        sid = "missing_coverage"
+        first_message_id = hy.log_message(
+            sid, "user", "alpha valid retained witness"
+        )
+        message_id = hy.log_message(
+            sid, "assistant", "omega trailing retained witness"
+        )
+        hy.close_session(sid)
+        assert hy.conn.execute(
+            "SELECT COUNT(*) FROM message_retention_coverage "
+            "WHERE message_id IN (?, ?)",
+            (first_message_id, message_id),
+        ).fetchone()[0] == 2
+
+        # Test-only corruption: remove the proof while retaining both its raw
+        # witness and the producer frontier. The joined reader used to return
+        # a short page here, which was indistinguishable from a legitimately
+        # complete tail after the first valid occurrence.
+        hy.conn.execute("DROP TRIGGER message_lossless_stream_delete_guard")
+        hy.conn.execute(
+            "DELETE FROM message_retention_coverage WHERE message_id = ?",
+            (message_id,),
+        )
+        with pytest.raises(RuntimeError, match="coverage proof missing"):
+            covered_messages_after(hy.conn, sid, None)
+
+        report = hy.dream()
+        assert report.coverage_integrity_failures == 1
+        failure = hy.conn.execute(
+            "SELECT failure_reason,occurrences "
+            "FROM coverage_integrity_failures WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+        assert tuple(failure) == ("source_stream_invalid", 1)
+        assert hy.dream_status()["coverage_integrity_failures"] == 1
+        assert _digest_calls(llm) == []
+    finally:
+        hy.close()
+
+
+def test_coverage_materialization_collision_is_durable_unhealthy(cfg):
+    hy = HyMem(_quiet_cfg(cfg), llm=RollingLLM())
+    try:
+        sid = "coverage_collision"
+        hy.conn.execute("INSERT INTO sessions(id) VALUES (?)", (sid,))
+        message_id = hy.conn.execute(
+            "INSERT INTO messages(session_id,role,content) "
+            "VALUES (?, 'user', 'canonical source')",
+            (sid,),
+        ).lastrowid
+        hy.conn.execute(
+            "INSERT INTO chunks(id,session_id,start_message_id,end_message_id,"
+            "salience_reason,text,chunk_kind) "
+            "VALUES (?,?,?,?, 'corrupt-collision', '{}', 'coverage')",
+            (
+                coverage_chunk_id(sid, message_id),
+                sid,
+                message_id,
+                message_id,
+            ),
+        )
+
+        report = hy.dream()
+        assert report.coverage_integrity_failures == 1
+        failure = hy.conn.execute(
+            "SELECT config_version,failure_reason,occurrences "
+            "FROM coverage_integrity_failures WHERE session_id=?",
+            (sid,),
+        ).fetchone()
+        assert tuple(failure) == (
+            COVERAGE_INTEGRITY_CONFIG_VERSION,
+            "materialization_failure",
+            1,
+        )
+        assert hy.dream_status()["pending_chunks"] == 0
+        assert hy.dream_status()["coverage_integrity_failures"] == 1
     finally:
         hy.close()
 

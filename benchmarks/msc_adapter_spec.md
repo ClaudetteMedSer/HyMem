@@ -138,6 +138,27 @@ rather than reimplementing them.
 > the target benchmark's full contract — feeding parity, question deixis, and
 > answerability.
 
+> **STATUS 2026-09-06 — STRICT RESTART-SAFE RECALL EVIDENCE.** Recall runs now
+> establish a deterministic manifest before any extraction canary, provider
+> client, or memory store is constructed. The manifest binds the raw dataset
+> hash, exact selected ID order, seed/sampling/protocol, full effective HyMem
+> configuration (including the fixed MSC aperture), and reader/judge/pipeline/
+> embedding request identities. Each question is atomically checkpointed with
+> indexing, extraction-canary, pipeline, and embedding evidence; shared reader
+> and judge usage is recorded once per process execution segment. A crash resumes
+> only missing questions. Failed rows stay terminal unless `--retry-failures` is
+> explicit, in which case each is attempted once in that invocation. A terminal
+> resume performs no canary, client construction, store open, indexing, or model
+> call. After all item stores, shared clients, and the checkpoint lease close
+> successfully, the runner exclusively creates an immutable
+> `msc-…-strict-….json` archive and updates `msc-latest.json`; mutable `--out`
+> bare rows are a compatibility sidecar written afterward. `msc_registry.py`
+> validates the strict envelope (or a digest-bound latest pointer) and excludes
+> pointers/checkpoints/sidecars from default discovery. Simulation archives are
+> explicitly unscored (`scores=null`, `strict_accuracy=null`) and identify only
+> the local empty-list stub; recurrence remains an unscored legacy marker export
+> and rejects checkpoint/calibration controls.
+
 ---
 
 ## 1. Data contract (VERIFIED 2026-07-28 against MemGPT/MSC-Self-Instruct)
@@ -187,7 +208,7 @@ slice to `hymem_beam/data/`.
 
 `MSCAdapter(db_path, …)` mirrors `HyMemAdapter` — isolated temp DB per dialogue,
 same `open()` → `HyMemConfig(root=…, **overrides)` + `OpenAICompatibleClient`, same
-`--keep-db`, same `fork()`-based `dream_and_wait`. Two MSC-specific rules:
+`--keep-db`, same `fork()`-based bounded convergence. Two MSC-specific rules:
 
 - **One HyMem session per MSC session — never merge.** LME chunks at 50 msgs/session
   (`f"{sess_id}_{i//50}"`); MSC sessions are ~10–14 turns, so keep exactly one
@@ -210,9 +231,70 @@ extracts *the user's* markers/profile.
 
 Per dialogue, in an isolated DB, parallelizable over `--workers`:
 1. `ingest_sessions(sessions, dates)` — §2 mapping.
-2. `dream_and_wait()` — one dream after the last session (or `--dream-per-session` to
-   dream after each, which better mimics a live store and lets `pos_evidence`
-   accumulate across dreams; default single-dream for speed, flag to compare).
+2. Bounded indexing convergence after the last session. A non-exhausted
+   `DreamReport` is not completion while durable pending work remains. Every
+   convergence snapshot requires `hymem-dream-status-v3` plus
+   `hymem-benchmark-indexing-status-v3`; chunk,
+   digest/profile/fact quarantine, terminal source loss, and coverage-integrity
+   failure all fail closed before scoring. `--dream-per-session` reaches the same
+   healthy fixed point after every session (closer to a live store, but much more
+   expensive). `--indexing-max-cycles` and `--indexing-timeout-s` bound each wave.
+   `--no-dream` and `--sim` skip it explicitly and are recorded non-comparable.
+   Before any store opens, canary policy v17
+   (`hymem-phase1-extraction-canary-v17`) forces two >5,000-character source
+   records through the production four-leaf extraction path. One supported
+   table row exists only in a later continuation carrying the exact v9
+   canonical header plus ATX-heading prelude context; a separate prose claim
+   crosses a proven paragraph cut and requires its exact bounded
+   `source_boundary_context`. Actual request/response provenance proves neither
+   claim was self-contained, each exact claim was emitted on its context-bearing
+   continuation and never another leaf, both exact source IDs were seen, and
+   list/fenced-code decoy controls reached the provider whole with no split
+   inside either span. A
+   policy-bound, zero-provider structural subprobe also requires both exact
+   Markdown controls to be unsplittable. The pass requires exactly two typed,
+   source-bound canonical claims with zero markers or coalesced duplicates,
+   and reconciles its eight-call normal path, 24-call/72-attempt recovery
+   envelope, usage, and exact pipeline model/endpoint/thinking request body.
+   Recall rows and recurrence provenance carry that validated report;
+   malformed, partial, stale-v16, or forged-pass reports fail before indexing.
+   Healthy convergence is emitted as `hymem-benchmark-indexing-v4`; each run's
+   exact report count, fixed `DreamReport` totals and cycle flags, final cycle,
+   clean final status, and pipeline usage must reconcile with the root totals.
+   A healthy build atomically publishes a v6 secret-free store receipt
+   (`hymem-benchmark-store-build-v7`) binding
+   the memory-source hash, the AST identity of the adapter's material
+   construction/ingestion/convergence surface (`MSCAdapter.open`, `ingest`,
+   `dream`, and `_durable_status`), the deterministic transitive HyMem import
+   closure (including executed package initializers and runtime-loaded schema
+   and migrations), material config, the exact canonical Phase-1
+   producer/effective request, embedding identity,
+   and a canonical digest of the actual SQLite material state. Receipt v6 also
+   embeds the exact sanitized
+   `hymem-benchmark-store-indexing-attestation-v2` projection and binds its bytes
+   with `indexing_sha256`; a reduced, relabelled, or internally inconsistent
+   indexing summary therefore cannot authorize reuse. Remote embedding
+   dimensions are pinned to the configured `HYMEM_EMBEDDING_DIM`: every
+   provider batch is checked, a mismatch is latched even when hot ingestion
+   catches the immediate error, and no reusable receipt can then be published.
+   The receipt uses the immutable configured dimension (never the client's
+   phase-dependent observed dimension) and separately attests that every
+   durable vector mirror plus optional sqlite-vec metadata belongs to that exact
+   endpoint-namespaced model/dimension. Older embedding clients that cannot
+   prove this pinned contract fail closed. Query-time semantic failure also
+   fails before reader scoring instead of silently changing the treatment to
+   lexical-only retrieval. The material digest uses
+   `hymem-material-store-attestation-v5`, and its transitive write-side
+   implementation identity is `hymem-material-code-closure-v3`. It covers
+   source and derived rows plus logical FTS/vec contents, but not run locks,
+   dream history, retry counters, health counters, retention-bounded
+   `extraction_feedback` audit rows, or SQLite implementation shadows.
+   Application tables are explicitly classified; an unknown future
+   table or view fails closed until the policy is updated. Reuse validates it
+   both before and immediately after its no-op
+   convergence wave. Scored rows own one cumulative indexing/usage receipt per
+   store; cycle/timeout/health failures publish `*.indexing-failure.json` beside
+   `--out` and no question in the affected store is evaluated.
 3. derive/attach **probes** (§4).
 4. per probe: `search`/`answer`/`judge` (recall & adherence modes) or a pure
    structural read (recurrence mode).
@@ -279,12 +361,31 @@ Reused verbatim: `--sample --seed --workers --answer-model --answer-base-url
 --answer-api-key --judge-model --data-dir --keep-db --no-dream --embeddings
 --graph-multihop --rules/--no-rules --rules-extraction --value-supersession`.
 
+Active answer, judge, and memory-pipeline defaults use the exact pinned model ID
+`deepseek-v4-flash`; `deepseek-chat` and `deepseek-reasoner` are rejected rather
+than resolved as aliases. Pin all three model flags explicitly in recorded box
+commands even when using those defaults.
+
+Recall evidence controls:
+```
+--checkpoint FILE                  new atomic ledger (existing files refused)
+--resume-from FILE                 resume only an exact manifest/ID match
+--retry-failures                   retry each prior failed ID once this invocation
+--results-dir DIR                  immutable archives + msc-latest.json
+--freeze-calibration FILE          freeze exact deterministic dev/holdout receipt
+--calibration-receipt FILE         bind a dev/holdout run to that receipt
+--protocol-split {full,dev,holdout}
+--out FILE                         post-publication mutable bare-row compatibility
+```
+
 MSC-specific:
 ```
 --probe-mode {recall,recurrence,adherence}   default: recurrence
 --speaker {A,B}            default A       (whose memory we model)
 --session-gap-days N       default 7       (synthetic inter-session spacing)
 --dream-per-session        flag            (dream after each session, not just last)
+--indexing-max-cycles N    default 100     (per-wave fail-closed safety cap)
+--indexing-timeout-s SEC   default 3600    (per-wave wall-clock bound)
 --recurrence-tau FLOAT     default 0.75    (tagger τ for the recurrence probe)
 --annotations {persona,embedding-match}     default persona (falls back per §4)
 ```

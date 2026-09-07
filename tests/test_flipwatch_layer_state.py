@@ -16,6 +16,7 @@ No LLM token is spent. Row dicts are assembled by hand, pre-classification.
 """
 from __future__ import annotations
 
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -25,9 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
 
 from hymem import HyMem, StubEmbeddingClient  # noqa: E402
 from hymem.extraction.llm import StubLLMClient  # noqa: E402
+import flipwatch_classify as flipwatch  # noqa: E402
 from flipwatch_classify import (  # noqa: E402
     MIN_VERDICT_ROWS,
     REUSE_BAR,
+    check_episodes,
     classify,
     gate,
 )
@@ -99,6 +102,30 @@ def test_classify_no_agg_when_layer_enabled_but_idle():
     out = classify(rows)
     assert out[0]["label"] == "no-agg"
     assert "enabled" in out[0]["note"]
+
+
+def test_episode_check_drops_sql_exception_text_from_report(monkeypatch):
+    secret = "Bearer sk-private-flipwatch-token"
+    private_path = "/home/node/private/watch.sqlite"
+
+    class Connection:
+        row_factory = None
+
+        def execute(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError(
+                f"{secret} at {private_path}: " + "x" * 20_000
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(flipwatch.sqlite3, "connect", lambda *_a, **_k: Connection())
+    result = check_episodes(Path(private_path), "2026-09-05")
+    assert all(
+        item == {"error": "execution_failure:OperationalError"}
+        for item in result.values()
+    )
+    assert secret not in str(result) and private_path not in str(result)
 
 
 def test_classify_no_agg_for_pre_v32_unrecorded():

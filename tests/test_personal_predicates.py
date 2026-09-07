@@ -20,7 +20,7 @@ from tests.conftest import PromptSourceAwareStub
 
 
 def _chunk(triples: list[dict]) -> str:
-    return json.dumps({"triples": triples, "markers": []})
+    return json.dumps({"triples": triples, "markers": [], "complete": True})
 
 
 @pytest.mark.parametrize("predicate", ["owns", "located_in", "participates_in", "has_attribute"])

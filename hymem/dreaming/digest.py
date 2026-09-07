@@ -132,6 +132,32 @@ def digest_retry_state_is_valid(
     return bool(quarantined) == bool(maximum > 0 and retry_count >= maximum)
 
 
+def digest_retry_is_quarantined(
+    retry_count: object,
+    retry_config_version: object,
+    *,
+    retry_key: str,
+    max_attempts: int,
+) -> bool:
+    """Mirror the runner's exact scheduling gate without trusting its flag.
+
+    ``digest_quarantined`` is redundant audit state. A damaged flag must be
+    reported malformed, but cannot make a count-at-bound unit look actionable
+    when the runner itself will skip it.
+    """
+    return bool(
+        isinstance(retry_count, int)
+        and not isinstance(retry_count, bool)
+        and retry_count >= 0
+        and isinstance(retry_config_version, str)
+        and retry_config_version == retry_key
+        and isinstance(max_attempts, int)
+        and not isinstance(max_attempts, bool)
+        and max_attempts > 0
+        and retry_count >= max_attempts
+    )
+
+
 def record_digest_failure(
     conn: sqlite3.Connection,
     session_id: str,

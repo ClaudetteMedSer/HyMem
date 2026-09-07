@@ -9,9 +9,10 @@ cross-session cluster into a single `aggregation_nodes` summary, so a synthesis
 question can be answered from a handful of cluster summaries instead of dozens
 of raw turns.
 
-The whole layer is additive and off by default (`cfg.aggregation_nodes_enabled`):
-when disabled, `build_aggregation_nodes` is never called and query-time behavior
-is unchanged. The build was front-run gated by an offline co-location probe
+The whole layer is additive and enabled by default
+(`cfg.aggregation_nodes_enabled`): set the master switch to False to skip
+`build_aggregation_nodes` and leave query-time behavior unchanged. The build was
+front-run gated by an offline co-location probe
 (`benchmarks/raptor_cluster_probe.py`); the pure clustering core below is the
 canonical home the probe re-exports, so probe, unit tests, and production all
 run the *same* clusterer.
@@ -39,19 +40,46 @@ import hashlib
 import json
 import logging
 import sqlite3
+import copy
 from dataclasses import dataclass
 from typing import NamedTuple
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from hymem.config import HyMemConfig
-from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
+from hymem.deadline import check_current_deadline
 from hymem.core import db as core_db
 from hymem.core.vectors import decode_vector, encode_vector
 from hymem.dreaming.aggregation_provenance import (
+    AGGREGATION_CLUSTER_SALT,
+    AGGREGATION_INPUT_MANIFEST_VERSION,
+    AGGREGATION_MAX_SUMMARY_CHARS,
+    AGGREGATION_MAX_TITLE_CHARS,
+    AGGREGATION_ROLLUP_SALT,
+    AGGREGATION_ROOT_SALT,
     AGGREGATION_SOURCE_MANIFEST_VERSION,
-    aggregation_input_fingerprint,
+    AggregationInputProof,
+    aggregation_canonical_json,
+    aggregation_input_manifest_hash,
+    aggregation_fusion_max_tokens,
+    aggregation_llm_request,
+    aggregation_llm_request_hash,
+    aggregation_node_authority_hash,
+    aggregation_node_embedding_set_hash,
+    aggregation_node_id,
+    aggregation_output_hash,
+    aggregation_output_is_canonical,
+    aggregation_publication_id,
+    aggregation_publication_node_set_hash,
+    aggregation_publication_timestamp_is_canonical,
+    aggregation_typed_input_fingerprint,
     combine_source_occurrences,
-    load_aggregation_source_manifest,
+    episode_authority_hash,
+    load_aggregation_node_proof,
+    load_current_aggregation_publication,
+    load_current_aggregation_node_proof,
+    load_published_aggregation_root,
+    load_root_anchor_inputs,
+    make_aggregation_input_proof,
     load_episode_source_manifest,
     persist_aggregation_source_manifest,
     source_manifest_hash,
@@ -62,7 +90,17 @@ from hymem.dreaming.embeddings import (
     _finite_embedding_vector,
     _post_embed_identity,
 )
-from hymem.dreaming.user_profile import load_profile, render_profile_fact
+from hymem.dreaming.aggregation_material import (
+    aggregation_anchor_phase1_generation_keys,
+    aggregation_material_binding,
+    aggregation_phase1_scope_identity,
+    current_aggregation_material_revision,
+    disabled_aggregation_phase1_scope_identity,
+    embedding_execution_identity,
+    register_aggregation_material_epoch,
+    validate_aggregation_material_binding,
+    verify_aggregation_material_epoch,
+)
 from hymem.extraction.embeddings import (
     EmbeddingClient,
     embedding_text_hash,
@@ -80,6 +118,7 @@ from hymem.extraction.prompts import (
 )
 
 log = logging.getLogger("hymem.dreaming.aggregate")
+_CANDIDATE_PAIRS_UNSET = object()
 
 
 class AggregationResult(NamedTuple):
@@ -110,6 +149,18 @@ class AggregationResult(NamedTuple):
     rebuilt_root: int = 0
     leaf_added: int | None = None
     leaf_removed: int | None = None
+    material_epoch_key: str | None = None
+
+
+@dataclass(frozen=True)
+class CapturedAggregationMaterial:
+    """One coherent, exact aggregation input and candidate-selection bundle."""
+
+    episodes: tuple[dict, ...]
+    anchor_inputs: tuple[AggregationInputProof, ...]
+    candidate_pairs: frozenset[tuple[str, str]] | None
+    blocking: Mapping[str, object]
+    binding: Mapping[str, object]
 
 # Fusion-prompt versions, baked into the node-id salt of the level the prompt
 # serves. Reuse is keyed by node id, so bumping a version when its prompt
@@ -119,14 +170,73 @@ class AggregationResult(NamedTuple):
 # incident lived in a persisted rollup and survived a root-only fix), so a
 # prompt hardened against an artifact must invalidate the level that produced
 # it, or the artifact outlives the fix.
-_CLUSTER_SALT = "cluster.v4"  # v4: content-defined window cuts (positional
+_CLUSTER_SALT = AGGREGATION_CLUSTER_SALT
                               #     windows re-keyed the whole component on any
                               #     mid-order membership change — 2026-07-12
                               #     reuse instability); v3: recency-window split
                               #     at max_cluster_size; v2: identity evidence-bound
-_ROLLUP_SALT = "rollup.v3"    # v3: content-defined fallback grouping (same
+_ROLLUP_SALT = AGGREGATION_ROLLUP_SALT
                               #     2026-07-12 fix); v2: identity evidence-bound
-_ROOT_SALT = "root.v4"        # v4: VERIFIED FACTS anchor block
+_ROOT_SALT = AGGREGATION_ROOT_SALT
+
+# Only settings that can change the materialized aggregation tree belong in
+# this identity. Query-time delivery controls (top-k, ability routing, sparse
+# fallback) intentionally do not: changing them does not require a rebuild.
+# The contract literal must be bumped for a material algorithm change that is
+# not already represented by a salt, prompt, source-manifest version, or field.
+_AGGREGATION_MATERIAL_CONFIG_FIELDS = (
+    # A False -> True transition scrubs persisted profile anchors before the
+    # next build, so privacy policy is material even though it is not an
+    # `aggregation_*` field.
+    "redact_secrets",
+    "aggregation_emb_threshold",
+    "aggregation_ent_threshold",
+    "aggregation_max_cluster_size",
+    "aggregation_blocking_top_k",
+    "aggregation_min_sessions",
+    "aggregation_min_members",
+    "aggregation_max_members",
+    "aggregation_digest_enabled",
+    "aggregation_digest_max_leaves",
+    "aggregation_digest_anchor_facts",
+)
+
+
+def aggregation_config_version(cfg: HyMemConfig) -> str:
+    """Return a non-secret identity for one material aggregation policy.
+
+    The full payload is hashed rather than persisted: operator status can bind
+    pending work to the exact effective build policy without retaining prompt
+    text, endpoints, model credentials, or conversation content.
+    """
+
+    payload = {
+        "contract": "aggregation-material-v2",
+        "enabled": cfg.aggregation_nodes_enabled,
+        "salts": {
+            "cluster": _CLUSTER_SALT,
+            "rollup": _ROLLUP_SALT,
+            "root": _ROOT_SALT,
+        },
+        "source_manifest": AGGREGATION_SOURCE_MANIFEST_VERSION,
+        "input_manifest": AGGREGATION_INPUT_MANIFEST_VERSION,
+        "prompts": {
+            "cluster_system": AGGREGATE_SYSTEM,
+            "cluster_user": AGGREGATE_USER_TEMPLATE,
+            "rollup_system": ROLLUP_SYSTEM,
+            "rollup_user": ROLLUP_USER_TEMPLATE,
+            "digest_system": DIGEST_SYSTEM,
+            "digest_user": DIGEST_USER_TEMPLATE,
+        },
+        "settings": {
+            field: getattr(cfg, field)
+            for field in _AGGREGATION_MATERIAL_CONFIG_FIELDS
+        },
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return "aggregation-build-config-v1:" + hashlib.sha256(encoded).hexdigest()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,7 +348,20 @@ def cluster_episodes(
     """
     if max_cluster_size is not None and max_cluster_size < 1:
         raise ValueError(f"max_cluster_size must be >= 1, got {max_cluster_size}")
-    parent: dict[str, str] = {e["id"]: e["id"] for e in episodes}
+    def item_key(item: dict) -> str:
+        # Rollup frontiers can contain an episode and an aggregation child
+        # whose identifiers are byte-identical. Their typed identity is the
+        # clustering identity; ordinary episode callers carry no override and
+        # retain the historical id-keyed API.
+        value = item.get("_aggregation_cluster_key", item["id"])
+        if not isinstance(value, str) or not value:
+            raise ValueError("cluster item identity must be non-empty text")
+        return value
+
+    keys = [item_key(item) for item in episodes]
+    if len(keys) != len(set(keys)):
+        raise ValueError("cluster item identities must be unique")
+    parent: dict[str, str] = {key: key for key in keys}
 
     def find(x: str) -> str:
         root = x
@@ -255,18 +378,20 @@ def cluster_episodes(
 
     if candidate_pairs is None:
         for i in range(len(episodes)):
+            check_current_deadline()
             for j in range(i + 1, len(episodes)):
                 if _linked(episodes[i], episodes[j], emb_threshold, ent_threshold):
-                    union(episodes[i]["id"], episodes[j]["id"])
+                    union(item_key(episodes[i]), item_key(episodes[j]))
     else:
-        by_id = {e["id"]: e for e in episodes}
+        by_id = {item_key(e): e for e in episodes}
         for a, b in candidate_pairs:
+            check_current_deadline()
             if a == b or a not in by_id or b not in by_id:
                 continue
             if _linked(by_id[a], by_id[b], emb_threshold, ent_threshold):
                 union(a, b)
 
-    roots = {e["id"]: find(e["id"]) for e in episodes}
+    roots = {item_key(e): find(item_key(e)) for e in episodes}
     label_of: dict[str, int] = {}
     out: dict[str, int] = {}
     for eid, root in roots.items():
@@ -277,18 +402,19 @@ def cluster_episodes(
         return out
 
     # Chaining guard: split every over-cap component into recency windows.
-    pos = {e["id"]: i for i, e in enumerate(episodes)}
+    pos = {item_key(e): i for i, e in enumerate(episodes)}
 
     def _recency_key(e: dict) -> tuple:
         sm = e.get("start_message_id")
         # Episodes carrying a message id sort by it (global ingestion order);
         # items without one (rollup nodes, plain dicts) keep input order and
         # sort after dated ones. Input position breaks all ties → deterministic.
-        return (0, sm, pos[e["id"]]) if isinstance(sm, int) else (1, 0, pos[e["id"]])
+        key = item_key(e)
+        return (0, sm, pos[key]) if isinstance(sm, int) else (1, 0, pos[key])
 
     components: dict[int, list[dict]] = {}
     for e in episodes:
-        components.setdefault(out[e["id"]], []).append(e)
+        components.setdefault(out[item_key(e)], []).append(e)
 
     capped: dict[str, int] = {}
     next_label = 0
@@ -296,7 +422,7 @@ def cluster_episodes(
         members = components[label]
         if len(members) <= max_cluster_size:
             for m in members:
-                capped[m["id"]] = next_label
+                capped[item_key(m)] = next_label
             next_label += 1
             continue
         ordered = sorted(members, key=_recency_key)   # oldest → newest
@@ -304,7 +430,7 @@ def cluster_episodes(
         # membership change anywhere re-cuts only its local window(s).
         for window in _content_defined_groups(ordered, max_cluster_size):
             for m in window:
-                capped[m["id"]] = next_label
+                capped[item_key(m)] = next_label
             next_label += 1
     return capped
 
@@ -329,7 +455,8 @@ def _content_defined_groups(ordered: list[dict], max_size: int) -> list[list[dic
     current: list[dict] = []
     for item in ordered:
         current.append(item)
-        if len(current) >= max_size or _is_cut_id(item["id"], max_size):
+        cut_identity = item.get("_aggregation_cluster_key", item["id"])
+        if len(current) >= max_size or _is_cut_id(cut_identity, max_size):
             groups.append(current)
             current = []
     if current:
@@ -347,6 +474,8 @@ def _norm_entity(x: str) -> str:
 
 def load_clusterable_episodes(
     conn: sqlite3.Connection, *, max_rowid: int | None = None,
+    embedding_model: str | None = None,
+    embedding_dim: int | None = None,
 ) -> list[dict]:
     """All episodes with their summary vector + normalized entity set, ordered so
     a stable member list / id falls out of clustering. Mirrors the probe loader.
@@ -360,53 +489,133 @@ def load_clusterable_episodes(
     nothing is deleted after the snapshot within a dream, so `rowid <= max_rowid`
     is exactly 'present at the snapshot'; strays land above it and defer to the
     next dream, which clusters them deterministically."""
-    ceiling = "AND e.rowid <= ?" if max_rowid is not None else ""
-    rows = conn.execute(
-        f"""
-        SELECT e.rowid AS rowid, e.id, e.session_id, e.title, e.summary,
-               e.start_message_id, e.end_message_id, e.key_entities,
-               e.source_manifest_hash, em.vector_json
-        FROM episodes e
-        JOIN sessions s ON s.id = e.session_id
-        LEFT JOIN episode_embeddings em ON em.episode_id = e.id
-        WHERE (e.digest_generation IS NULL
-               OR e.digest_generation = s.digest_published_generation)
-        {ceiling}
-        ORDER BY e.session_id, e.start_message_id, e.id
-        """,
-        () if max_rowid is None else (max_rowid,),
-    ).fetchall()
-    episodes: list[dict] = []
-    for r in rows:
-        try:
-            raw_entities = json.loads(r["key_entities"] or "[]")
-        except (ValueError, TypeError):
-            raw_entities = []
-        vec = decode_vector(r["vector_json"]) if r["vector_json"] else None
-        sources = load_episode_source_manifest(conn, r["id"])
-        episodes.append({
-            "id": r["id"],
-            # episodes.rowid mirrors vec_episodes.rowid (see _backfill_vec_episodes /
-            # persist_episode_embeddings), so blocking can translate KNN hits back
-            # to episode ids without a per-hit SELECT.
-            "rowid": r["rowid"],
-            "session_id": r["session_id"],
-            "title": r["title"],
-            "summary": r["summary"],
-            # Recency signal for the max_cluster_size window split: messages.id
-            # is a store-wide AUTOINCREMENT, so this orders episodes by
-            # ingestion time across sessions (session_id alone is lexicographic
-            # and NOT chronological for non-date-prefixed session names).
-            "start_message_id": r["start_message_id"],
-            "entities": {_norm_entity(x) for x in raw_entities if x},
-            "vector": vec,
-            "source_occurrences": sources or (),
-            "source_provenance_complete": sources is not None,
-            "source_manifest_hash": (
-                r["source_manifest_hash"] if sources is not None else None
-            ),
-        })
-    return episodes
+    owned_snapshot = not conn.in_transaction
+    try:
+        if owned_snapshot:
+            conn.execute("BEGIN")
+        ceiling = "AND e.rowid <= ?" if max_rowid is not None else ""
+        rows = conn.execute(
+            f"""
+            SELECT e.rowid AS rowid, e.id, e.session_id, e.title, e.summary,
+                   e.start_message_id, e.end_message_id, e.key_entities,
+                   e.digest_slice_key,e.digest_generation,
+                   e.source_manifest_version,e.source_manifest_count,
+                   e.source_manifest_hash,e.source_manifest_complete,
+                   em.vector_json,em.model AS embedding_model,
+                   em.dim AS embedding_dim,em.text_hash AS embedding_text_hash,
+                   em.embedding_producer_key
+            FROM episodes e
+            JOIN sessions s ON s.id = e.session_id
+            LEFT JOIN episode_embeddings em ON em.episode_id = e.id
+            WHERE (e.digest_generation IS NULL
+                   OR e.digest_generation = s.digest_published_generation)
+            {ceiling}
+            ORDER BY e.session_id, e.start_message_id, e.id
+            """,
+            () if max_rowid is None else (max_rowid,),
+        ).fetchall()
+        vector_rowids = core_db.episode_vector_rowids(
+            str(row["id"]) for row in rows
+        )
+        episodes: list[dict] = []
+        for r in rows:
+            try:
+                raw_entities = json.loads(r["key_entities"] or "[]")
+            except (ValueError, TypeError):
+                raw_entities = []
+            sources = load_episode_source_manifest(
+                conn, r["id"], _episode_row=r,
+            )
+            # An episode without a complete exact lossless manifest is
+            # historical input, never material the aggregation model may see.
+            if sources is None:
+                continue
+            # The row and exact occurrence manifest already belong to this
+            # coherent snapshot.  Construct both renderings from that one
+            # proof instead of reloading the episode and revalidating every
+            # coverage occurrence twice more.
+            authority_hash = episode_authority_hash(dict(r))
+            plain_text = f"{r['title']}\n{r['summary']}"
+            plain_proof = make_aggregation_input_proof(
+                kind="episode", source_ref={"id": r["id"]},
+                rendered_text=plain_text, authority_hash=authority_hash,
+                occurrences=sources,
+            )
+            cluster_proof = make_aggregation_input_proof(
+                kind="episode", source_ref={"id": r["id"]},
+                rendered_text=f"[{r['session_id']}] {plain_text}",
+                authority_hash=authority_hash, occurrences=sources,
+            )
+            expected_text_hash = embedding_text_hash(
+                f"{r['title']}\n{r['summary']}"
+            )
+            vec = None
+            embedding_record: dict[str, object] = {
+                "effective": False,
+                "model": None,
+                "dimension": None,
+                "text_hash": None,
+                "vector_sha256": None,
+            }
+            if (
+                embedding_model is not None
+                and embedding_dim is not None
+                and r["embedding_model"] == embedding_model
+                and r["embedding_producer_key"] == embedding_model
+                and r["embedding_dim"] == embedding_dim
+                and r["embedding_text_hash"] == expected_text_hash
+                and r["vector_json"] is not None
+            ):
+                try:
+                    decoded = decode_vector(r["vector_json"])
+                except (AttributeError, UnicodeError, TypeError, ValueError):
+                    decoded = None
+                vec = _finite_embedding_vector(
+                    decoded, expected_dim=embedding_dim,
+                )
+                if vec is not None:
+                    embedding_record = {
+                        "effective": True,
+                        "model": embedding_model,
+                        "dimension": embedding_dim,
+                        "text_hash": expected_text_hash,
+                        "vector_sha256": "sha256:" + hashlib.sha256(
+                            encode_vector(vec).encode("utf-8")
+                        ).hexdigest(),
+                    }
+            episodes.append({
+                "id": r["id"],
+                # sqlite-vec needs an integer rowid, but episodes uses a TEXT
+                # primary key whose implicit rowid can be renumbered by
+                # VACUUM. Use the canonical id-derived vector key instead.
+                "rowid": vector_rowids[str(r["id"])],
+                "session_id": r["session_id"],
+                "title": r["title"],
+                "summary": r["summary"],
+                # Recency signal for the max_cluster_size window split:
+                # messages.id is a store-wide AUTOINCREMENT.
+                # Order derives from exact authoritative occurrences. Mutable
+                # start/end range columns remain compatibility metadata only.
+                "start_message_id": min(item.message_id for item in sources),
+                "entities": {_norm_entity(x) for x in raw_entities if x},
+                "vector": vec,
+                "source_occurrences": sources,
+                "source_provenance_complete": True,
+                "source_manifest_hash": r["source_manifest_hash"],
+                "cluster_input_proof": cluster_proof,
+                "plain_input_proof": plain_proof,
+                "embedding_record": embedding_record,
+            })
+        episodes.sort(key=lambda item: (
+            item["session_id"], item["start_message_id"], item["id"],
+        ))
+        if owned_snapshot:
+            conn.execute("COMMIT")
+        return episodes
+    except BaseException:
+        if owned_snapshot and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def generate_candidate_pairs(
@@ -416,12 +625,16 @@ def generate_candidate_pairs(
     instead of all O(n²) pairs (prod, 2026-06-12: 395 episodes → 77,815 pairs →
     4.04s per dream, past the 2s gate).
 
-    Returns None whenever blocking cannot run exactly as designed, and the
-    caller MUST then fall back to exact all-pairs (pass candidate_pairs=None):
+    Returns None whenever the vector arm cannot run exactly as designed while
+    at least one valid vector exists, and the caller MUST then fall back to
+    exact all-pairs (pass candidate_pairs=None):
       - `emb_top_k <= 0` (config: aggregation_blocking_top_k=0 disables blocking);
       - no `vec_episodes` table / sqlite_vec extension unavailable — sqlite_vec
         is an optional dependency, and embedded small stores without it must
         keep today's exact behavior unchanged.
+
+    When no episode has a valid vector, the cosine arm is provably empty and
+    the exact entity-only candidate set is returned without requiring sqlite-vec.
 
     Otherwise returns ascending-normalized id pairs from two arms:
       - Entity arm (EXACT): inverted index entity → episode ids over the
@@ -429,8 +642,8 @@ def generate_candidate_pairs(
         any entity is a candidate. Jaccard >= 0.5 requires >= 1 shared entity,
         so this arm loses nothing.
       - Cosine arm (approximate): per-episode KNN top `emb_top_k` neighbors via
-        `core_db.vec_search` over `vec_episodes` (whose rowids mirror
-        episodes.rowid). Queried as k+1 so the episode's own row never consumes
+        `core_db.vec_search` over `vec_episodes` (whose integer rowids are a
+        deterministic projection of episode ids). Queried as k+1 so self never consumes
         a neighbor slot — hence with emb_top_k >= n-1 the arm is exact and
         small stores lose nothing. Hits whose rowid is not in `episodes`
         (retention may have pruned the row since vec ingest) and self-pairs are
@@ -438,56 +651,283 @@ def generate_candidate_pairs(
         exactly `_linked`'s behavior, whose cosine arm never fires for them;
         the entity arm still covers them.
     """
+    return _aggregation_candidate_plan(
+        conn, episodes, emb_top_k=emb_top_k,
+    )[0]
+
+
+def _aggregation_candidate_plan(
+    conn: sqlite3.Connection, episodes: list[dict], *, emb_top_k: int,
+) -> tuple[set[tuple[str, str]] | None, dict[str, object]]:
+    """Return candidate pairs plus the actual, auditable execution mode."""
+
+    ordered_ids = [str(item["id"]) for item in episodes]
+    universe_hash = "sha256:" + hashlib.sha256(
+        aggregation_canonical_json(ordered_ids).encode("utf-8")
+    ).hexdigest()
+
+    def exact(reason: str) -> tuple[None, dict[str, object]]:
+        return None, {
+            "contract": "hymem-aggregation-blocking-v1",
+            "mode": "exact",
+            "reason": reason,
+            "top_k": emb_top_k,
+            "candidate_count": None,
+            "candidate_pairs_sha256": None,
+            "episode_order_sha256": universe_hash,
+        }
+
     if emb_top_k <= 0:
-        return None
-    # Mirrors the augment.py vec path guard: the virtual table can be listed in
-    # sqlite_master while the extension fails to load on THIS connection — then
-    # every vec_search returns [], which would silently amputate the cosine arm
-    # rather than approximate it. Treat that as "cannot run as designed".
-    # The declines are logged because the fallback is invisible from results
-    # (identical components, just slower) — a bare core_db.connect() without
-    # vec initialization once made a hand-timed box run measure the exact path.
-    # WARNING, not debug: a decline is invisible from results (identical-ish
-    # components, just slower) yet it changes WHICH pairs get tested — a
-    # deployment where one trigger path declines and another doesn't alternates
-    # between two different clusterings, re-keying cached fusions every switch.
-    if not core_db._load_vec_extension(conn):
-        log.warning("blocking.decline reason=vec_extension_unavailable (exact all-pairs)")
-        return None
-    if not core_db.has_vec_table(conn, table="vec_episodes"):
-        log.warning("blocking.decline reason=no_vec_episodes_table (exact all-pairs)")
-        return None
-
+        return exact("disabled")
     pairs: set[tuple[str, str]] = set()
-
-    # Entity arm (exact): invert entity → episode ids, pair all co-occurrences.
     inverted: dict[str, list[str]] = {}
-    for e in episodes:
-        for ent in e.get("entities") or ():
-            inverted.setdefault(ent, []).append(e["id"])
+    for episode in episodes:
+        for entity in episode.get("entities") or ():
+            inverted.setdefault(entity, []).append(str(episode["id"]))
     for ids in inverted.values():
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                a, b = ids[i], ids[j]
-                if a != b:
-                    pairs.add((a, b) if a < b else (b, a))
-
-    # Cosine arm (approximate): KNN per vectored episode, translated rowid → id.
-    id_of_rowid = {
-        e["rowid"]: e["id"] for e in episodes if e.get("rowid") is not None
+        for index, left in enumerate(ids):
+            for right in ids[index + 1:]:
+                if left != right:
+                    pairs.add((left, right) if left < right else (right, left))
+    vectored = [item for item in episodes if item.get("vector") is not None]
+    if not vectored:
+        # With no valid vectors the cosine arm is provably empty.  Entity
+        # co-occurrence is therefore the complete exact candidate relation;
+        # returning it avoids an unnecessary O(n^2) all-pairs walk.
+        ordered_pairs = [list(pair) for pair in sorted(pairs)]
+        pairs_hash = "sha256:" + hashlib.sha256(
+            aggregation_canonical_json(ordered_pairs).encode("utf-8")
+        ).hexdigest()
+        return pairs, {
+            "contract": "hymem-aggregation-blocking-v1",
+            "mode": "entity_only",
+            "reason": "no_valid_episode_vectors",
+            "top_k": emb_top_k,
+            "candidate_count": len(pairs),
+            "candidate_pairs_sha256": pairs_hash,
+            "episode_order_sha256": universe_hash,
+        }
+    if not core_db._load_vec_extension(conn):
+        return exact("vec_extension_unavailable")
+    if not core_db.has_vec_table(conn, table="vec_episodes"):
+        return exact("vec_table_unavailable")
+    dimensions = {len(item["vector"]) for item in vectored}
+    models = {
+        item["embedding_record"]["model"] for item in vectored
     }
-    for e in episodes:
-        vec = e.get("vector")
-        if not vec:
-            continue
-        hits = core_db.vec_search(conn, vec, emb_top_k + 1, table="vec_episodes")
-        for rowid, _distance in hits:
-            other = id_of_rowid.get(rowid)
-            if other is None or other == e["id"]:
-                continue
-            a, b = e["id"], other
-            pairs.add((a, b) if a < b else (b, a))
-    return pairs
+    if len(dimensions) != 1 or len(models) != 1 or None in models:
+        return exact("mixed_vector_space")
+    dimension = next(iter(dimensions))
+    model = next(iter(models))
+    dim_row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key='vec_dim'"
+    ).fetchone()
+    model_row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key='vec_model'"
+    ).fetchone()
+    if (
+        dim_row is None or model_row is None
+        or str(dim_row["value"]) != str(dimension)
+        or model_row["value"] != model
+    ):
+        return exact("vec_metadata_mismatch")
+
+    expected_shadow = {
+        int(item["rowid"]): core_db._pack_vector(item["vector"])
+        for item in vectored
+    }
+    try:
+        shadow_rows = conn.execute(
+            "SELECT rowid,embedding FROM vec_episodes ORDER BY rowid"
+        ).fetchall()
+        actual_shadow = {
+            int(row["rowid"]): bytes(row["embedding"])
+            for row in shadow_rows
+        }
+    except (sqlite3.Error, TypeError, ValueError):
+        return exact("vec_shadow_unverifiable")
+    # Exact equality prevents ineligible/late rows from consuming global KNN
+    # slots and proves every used rowid maps to the JSON vector we committed.
+    if actual_shadow != expected_shadow:
+        return exact("vec_shadow_mismatch")
+
+    id_of_rowid = {int(item["rowid"]): str(item["id"]) for item in vectored}
+    try:
+        for episode in vectored:
+            check_current_deadline()
+            # Full-shadow equality above proves there are no out-of-snapshot
+            # rows to steal a global slot, so k+1 retains the intended cost.
+            hits = core_db.vec_search_strict(
+                conn, episode["vector"], min(
+                    len(vectored), emb_top_k + 1,
+                ), table="vec_episodes",
+            )
+            neighbors = [
+                id_of_rowid[rowid] for rowid, _distance in hits
+                if rowid in id_of_rowid and rowid != int(episode["rowid"])
+            ][:emb_top_k]
+            for other in neighbors:
+                left = str(episode["id"])
+                pairs.add((left, other) if left < other else (other, left))
+    except (RuntimeError, sqlite3.Error, TypeError, ValueError):
+        return exact("vec_query_failed")
+
+    ordered_pairs = [list(pair) for pair in sorted(pairs)]
+    pairs_hash = "sha256:" + hashlib.sha256(
+        aggregation_canonical_json(ordered_pairs).encode("utf-8")
+    ).hexdigest()
+    return pairs, {
+        "contract": "hymem-aggregation-blocking-v1",
+        "mode": "knn",
+        "reason": "verified_full_shadow",
+        "top_k": emb_top_k,
+        "candidate_count": len(pairs),
+        "candidate_pairs_sha256": pairs_hash,
+        "episode_order_sha256": universe_hash,
+        "vec_model": model,
+        "vec_dimension": dimension,
+        "vec_row_count": len(actual_shadow),
+    }
+
+
+def capture_aggregation_material(
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+    embedding_client: EmbeddingClient | None,
+    *,
+    episode_ceiling_rowid: int | None = None,
+    pending_generation_key: str | None = None,
+    pending_attempt_token: int | None = None,
+) -> CapturedAggregationMaterial:
+    """Capture one exact material epoch in a coherent read transaction.
+
+    The caller's historical ceiling is advisory only. We recapture the current
+    eligible high-water inside this snapshot, so an episode landing after the
+    runner's earlier phase boundary cannot be silently omitted. A later insert
+    advances the material clock and aborts publication.
+    """
+
+    del episode_ceiling_rowid
+    if conn.in_transaction:
+        raise RuntimeError("aggregation material capture requires no transaction")
+    producer, embedding_model, embedding_dim = embedding_execution_identity(
+        embedding_client
+    )
+    if embedding_client is None:
+        embedding_model = None
+    config_version = aggregation_config_version(cfg)
+    conn.execute("BEGIN")
+    try:
+        revision = current_aggregation_material_revision(conn)
+        # Root anchors are reselected and exact-proof-hashed at every build
+        # fence and every serving publication load. A guessed MIN horizon over
+        # a broader KG relation can only introduce false expiry (and cannot
+        # replace that exact check), so v57 carries no independent time lease.
+        fresh_until = None
+        # Load the complete generation-visible, proof-valid universe.
+        episodes = load_clusterable_episodes(
+            conn, max_rowid=None, embedding_model=embedding_model,
+            embedding_dim=embedding_dim,
+        )
+        # This transaction already owns a coherent snapshot. An allocation
+        # rowid ceiling is neither needed nor portable and would make VACUUM
+        # change an otherwise identical material identity.
+        ceiling = None
+        candidate_pairs, blocking = _aggregation_candidate_plan(
+            conn, episodes, emb_top_k=cfg.aggregation_blocking_top_k,
+        )
+        # A rootless empty publication consumes no root prompt material.  Bind
+        # the canonical inert root scope until at least one episode can feed a
+        # digest root; the first eligible episode is clock-fenced and forces a
+        # fresh capture.
+        root_anchors_enabled = bool(cfg.aggregation_digest_enabled and episodes)
+        anchors = load_root_anchor_inputs(
+            conn, cfg.aggregation_digest_anchor_facts,
+        ) if root_anchors_enabled else []
+        selected_generation_keys = aggregation_anchor_phase1_generation_keys(
+            anchors,
+        )
+        (
+            phase1_scope,
+            phase1_scope_exact,
+            phase1_scope_reuse,
+        ) = (
+            aggregation_phase1_scope_identity(
+                conn, generation_keys=selected_generation_keys,
+            )
+            if selected_generation_keys
+            else disabled_aggregation_phase1_scope_identity()
+        )
+        if current_aggregation_material_revision(conn) != revision:
+            raise RuntimeError("aggregation material changed during capture")
+        episode_records = [
+            {
+                "ordinal": ordinal,
+                "id": episode["id"],
+                "session_id": episode["session_id"],
+                "order_message_id": episode["start_message_id"],
+                "cluster_input_proof_sha256": episode["cluster_input_proof"].proof_hash,
+                "plain_input_proof_sha256": episode["plain_input_proof"].proof_hash,
+                "entities": sorted(episode["entities"]),
+                "embedding": episode["embedding_record"],
+            }
+            for ordinal, episode in enumerate(episodes)
+        ]
+        anchor_records = [
+            {
+                "ordinal": ordinal,
+                "kind": anchor.kind,
+                "source_key": anchor.source_key,
+                "proof_sha256": anchor.proof_hash,
+            }
+            for ordinal, anchor in enumerate(anchors)
+        ]
+        binding = aggregation_material_binding(
+            material_revision=revision,
+            config_version=config_version,
+            episode_ceiling_rowid=ceiling,
+            episode_records=episode_records,
+            anchor_records=anchor_records,
+            blocking=blocking,
+            embedding_binding=producer,
+            embedding_dimension=embedding_dim,
+            node_embedding_required=embedding_client is not None,
+            root_anchors_enabled=root_anchors_enabled,
+            phase1_scope_sha256=phase1_scope,
+            phase1_scope_identity_exact=phase1_scope_exact,
+            phase1_scope_reuse_scope=phase1_scope_reuse,
+            fresh_until=fresh_until,
+        )
+        # Registration and the runner's durable pending attribution share the
+        # exact capture transaction. A crash after this commit can therefore
+        # never leave a successfully captured epoch unattributed, and source
+        # invalidators can scope vector mutations to this pending producer.
+        register_aggregation_material_epoch(conn, binding)
+        if (pending_generation_key is None) != (pending_attempt_token is None):
+            raise ValueError(
+                "aggregation pending generation and attempt must be paired"
+            )
+        if pending_generation_key is not None:
+            from hymem.dreaming.aggregation_health import (
+                bind_pending_aggregation_material,
+            )
+            bind_pending_aggregation_material(
+                conn, config_version, pending_generation_key,
+                pending_attempt_token,
+                str(binding["material_epoch_key"]),
+            )
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    return CapturedAggregationMaterial(
+        episodes=tuple(episodes), anchor_inputs=tuple(anchors),
+        candidate_pairs=(
+            None if candidate_pairs is None else frozenset(candidate_pairs)
+        ),
+        blocking=blocking, binding=binding,
+    )
 
 
 def _node_id(
@@ -499,13 +939,18 @@ def _node_id(
     cycles. `salt` separates id spaces for nodes that could share a member set
     but carry a different KIND of fusion (the root digest uses a different
     prompt than an intermediate rollup, so they must never reuse each other)."""
-    payload = "|".join(sorted(member_ids))
-    if salt:
-        payload = f"{salt}::{payload}"
-    if input_fingerprint is not None:
-        payload = f"{payload}::input={input_fingerprint}"
-    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
-    return f"agg_{digest}"
+    kind_by_salt = {
+        _CLUSTER_SALT: "cluster", _ROLLUP_SALT: "rollup", _ROOT_SALT: "root",
+    }
+    kind = kind_by_salt.get(salt)
+    if kind is None or input_fingerprint is None:
+        # Compatibility for pure clustering probes which deliberately exercise
+        # only a local synthetic id, never a publishable material node.
+        payload = f"{salt}::{'|'.join(sorted(member_ids))}::input={input_fingerprint}"
+        return "agg_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return aggregation_node_id(
+        member_ids, node_kind=kind, input_fingerprint=input_fingerprint,
+    )
 
 
 def _stable_sample(seq: list[dict], cap: int) -> list[dict]:
@@ -554,6 +999,7 @@ def _centroid(vectors: list[list[float] | None]) -> list[float] | None:
 def select_clusters(
     episodes: list[dict], cfg: HyMemConfig,
     conn: sqlite3.Connection | None = None,
+    *, candidate_pairs: object = _CANDIDATE_PAIRS_UNSET,
 ) -> list[list[dict]]:
     """Cluster all episodes, then keep only the clusters worth a summary: at least
     `aggregation_min_members` episodes spanning at least `aggregation_min_sessions`
@@ -575,7 +1021,9 @@ def select_clusters(
     pairs = (
         generate_candidate_pairs(
             conn, episodes, emb_top_k=cfg.aggregation_blocking_top_k)
-        if conn is not None else None
+        if candidate_pairs is _CANDIDATE_PAIRS_UNSET and conn is not None
+        else None if candidate_pairs is _CANDIDATE_PAIRS_UNSET
+        else candidate_pairs
     )
     labels = cluster_episodes(
         episodes, cfg.aggregation_emb_threshold, cfg.aggregation_ent_threshold,
@@ -588,6 +1036,7 @@ def select_clusters(
 
     kept: list[list[dict]] = []
     for members in grouped.values():
+        check_current_deadline()
         # The fusion prompt must see every member a persisted node attests.  The
         # clustering cap and prompt cap are independent knobs (15 vs 12 by
         # default), so partition oversized components here instead of slicing
@@ -623,8 +1072,8 @@ def select_clusters(
 # siblings under aggregation_max_members — cap it where it is visible (at
 # persist time, with a warning) instead of at the token ceiling where it
 # becomes a silent parse failure.
-_MAX_FUSION_TITLE_CHARS = 300
-_MAX_FUSION_SUMMARY_CHARS = 2000
+_MAX_FUSION_TITLE_CHARS = AGGREGATION_MAX_TITLE_CHARS
+_MAX_FUSION_SUMMARY_CHARS = AGGREGATION_MAX_SUMMARY_CHARS
 
 class _RebuildForecast(NamedTuple):
     """Structural account of one dream's rebuild. See `_forecast_rebuild`."""
@@ -640,7 +1089,7 @@ class _RebuildForecast(NamedTuple):
 
 
 def _forecast_rebuild(
-    rows: list[dict], prev_inputs: set[tuple]
+    rows: list[dict], prev_inputs: set[tuple],
 ) -> _RebuildForecast:
     """Predict this dream's rebuild from effective prompt inputs.
 
@@ -655,8 +1104,8 @@ def _forecast_rebuild(
     provenance (plus root anchors).  It is computable per dream instead of
     estimated across dreams. So:
 
-        predicted = nodes whose (level, member set, input fingerprint) is
-                    absent from the previous tree
+        predicted = nodes whose (level, member set, input fingerprint,
+                    generation, request) is absent from the previous tree
         actual    = nodes whose id missed the fusion cache
         residual  = actual - predicted
 
@@ -677,18 +1126,30 @@ def _forecast_rebuild(
     """
     predicted = actual = facts_rekey = 0
     lvl0 = rollup = root = 0
-    # Accept the historical two-tuple form in pure unit callers.  Persisted
-    # predecessor state uses the three-tuple form, which is what distinguishes
-    # a legitimate in-place episode rewrite from a cache-keying defect.
+    # Accept the historical two/three-tuple forms in pure unit callers.
+    # Persisted predecessor state uses the five-tuple form: any declared
+    # generation/request rotation is a deliberate cache boundary, not
+    # unexplained key drift. A key change *within* the same generation and
+    # request remains the residual this instrument exists to expose.
     membership_keys = {(item[0], item[1]) for item in prev_inputs}
     input_keys = {
-        (item[0], item[1], item[2] if len(item) > 2 else None)
+        (
+            item[0], item[1],
+            item[2] if len(item) > 2 else None,
+            item[3] if len(item) > 3 else None,
+            item[4] if len(item) > 4 else None,
+        )
         for item in prev_inputs
     }
     for r in rows:
-        membership_key = (r["level"], frozenset(r["member_ids"]))
+        membership_key = (r["level"], frozenset(r["member_ids_list"]))
         membership_is_new = membership_key not in membership_keys
-        input_is_new = (*membership_key, r.get("input_fingerprint")) not in input_keys
+        input_is_new = (
+            *membership_key,
+            r.get("input_fingerprint"),
+            r.get("aggregation_generation_key"),
+            r.get("aggregation_request_hash"),
+        ) not in input_keys
         was_rebuilt = not r.get("reused", False)
         if was_rebuilt:
             actual += 1
@@ -782,12 +1243,23 @@ def _fusion_max_tokens(prompt: str) -> int:
     8192 — the retry ladder (re-roll, then membership-preserving shrink)
     covers anything beyond.
     """
-    return min(8192, 2048 + len(prompt) // 2)
+    return aggregation_fusion_max_tokens(prompt)
+
+
+def _fusion_request(user_prompt: str, *, system: str) -> LLMRequest:
+    """Construct the sole request shape allowed to mint aggregation text."""
+
+    return LLMRequest(
+        system=system, user=user_prompt, response_format="json",
+        temperature=0.0, max_tokens=_fusion_max_tokens(user_prompt),
+    )
 
 
 def _llm_fuse(
     user_prompt: str, llm: LLMClient, *, system: str, kind: str = "fusion",
     shrink: Callable[[], str] | None = None,
+    verify_generation: Callable[[], None] | None = None,
+    prepared_request: LLMRequest | None = None,
 ) -> dict | None:
     """One LLM call fusing the prepared `user_prompt` into {title, summary}.
     Returns None when the call fails or yields nothing usable (so no empty
@@ -804,18 +1276,27 @@ def _llm_fuse(
     deepseek-v4-flash output variance at temperature=0.0 (measured 0.3x-4.8x
     output spread on identical input); it is NOT a Protocol guarantee — a
     deterministic backend turns it into a wasted call every time. The
-    terminating step, `shrink`, reduces the RENDERED input only (fewer chars
-    per member), never the member set: node_id = sha1(sorted(member_ids)),
-    so a different member set would produce a different node id and re-key
-    every ancestor permanently.
+    v55 deliberately does not execute ``shrink``. A reduced render is a
+    different effective input and cannot be published under the full-input
+    fingerprint. The parameter remains only for source compatibility with
+    older callers; a same-prompt re-roll remains safe.
     """
     def attempt(prompt: str) -> tuple[dict | None, str | None, str]:
-        request = LLMRequest(
-            system=system, user=prompt, response_format="json",
-            max_tokens=_fusion_max_tokens(prompt),
+        request = (
+            prepared_request
+            if prepared_request is not None else _fusion_request(
+                prompt, system=system
+            )
         )
+        if request.system != system or request.user != prompt:
+            raise ValueError("prepared aggregation request disagrees with prompt")
+        request_hash = aggregation_llm_request_hash(request)
         try:
+            if verify_generation is not None:
+                verify_generation()
             raw = llm.complete(request)
+            if verify_generation is not None:
+                verify_generation()
         except Exception:
             log.exception("aggregate.fusion_failure kind=%s stage=call", kind)
             return None, None, "call"
@@ -842,35 +1323,40 @@ def _llm_fuse(
             summary = summary[:_MAX_FUSION_SUMMARY_CHARS]
         if len(title) > _MAX_FUSION_TITLE_CHARS:
             title = title[:_MAX_FUSION_TITLE_CHARS]
-        return {"title": title, "summary": summary}, raw, "ok"
+        return {
+            "title": title, "summary": summary,
+            "_aggregation_request_hash": request_hash,
+        }, raw, "ok"
 
     fused, raw, stage = attempt(user_prompt)
     if fused is None and stage == "parse" and raw is not None and is_ceiling_cut(raw):
         # One re-roll of the SAME input — empirical license, see docstring.
         fused, raw, stage = attempt(user_prompt)
-    if fused is None and stage == "parse" and shrink is not None:
-        # Terminating step: membership-PRESERVING render shrink.
-        fused, _, _ = attempt(shrink())
+    del shrink
     return fused
 
 
 def _summarize_cluster(
-    members: list[dict], cfg: HyMemConfig, llm: LLMClient
+    members: list[dict], cfg: HyMemConfig, llm: LLMClient,
+    *, verify_generation: Callable[[], None] | None = None,
+    user_prompt: str | None = None,
+    prepared_request: LLMRequest | None = None,
 ) -> dict | None:
     """Fuse a level-0 cluster's episodes into {title, summary}."""
     def render(scale: float = 1.0) -> str:
         if scale >= 1.0:
             return "\n\n---\n\n".join(
-                f"[{m['session_id']}] {m['title']}\n{m['summary']}" for m in members
+                m["cluster_input_proof"].rendered_text for m in members
             )
         return "\n\n---\n\n".join(
             f"[{m['session_id']}] {m['title'][:int(len(m['title']) * scale)]}\n"
             f"{m['summary'][:int(len(m['summary']) * scale)]}" for m in members
         )
     return _llm_fuse(
-        AGGREGATE_USER_TEMPLATE.format(text=render()), llm,
+        user_prompt if user_prompt is not None else AGGREGATE_USER_TEMPLATE.format(text=render()), llm,
         system=AGGREGATE_SYSTEM, kind="cluster",
-        shrink=lambda: AGGREGATE_USER_TEMPLATE.format(text=render(0.5)),
+        verify_generation=verify_generation,
+        prepared_request=prepared_request,
     )
 
 
@@ -878,14 +1364,21 @@ def _items_text(items: list[dict], cfg: HyMemConfig, *, char_scale: float = 1.0)
     """Render hierarchy items (level-0 nodes / rollups / pass-through episodes,
     all carrying title+summary) as one fusion input block.
 
-    `char_scale` shrinks each member's rendered title/summary for the retry
-    ladder's terminating step — the MEMBER SET is untouched, so the node's
-    content-hash id is unchanged and a fused result stays cache-compatible.
+    `char_scale` remains a compatibility hook for direct formatting tests.
+    Published v55 fusion always uses 1.0: a shorter render is a different
+    effective input and may not reuse the full-input proof identity.
     """
     if len(items) > max(2, cfg.aggregation_max_members):
         raise ValueError("aggregation fusion input exceeds its member budget")
     if char_scale >= 1.0:
-        return "\n\n---\n\n".join(f"{m['title']}\n{m['summary']}" for m in items)
+        return "\n\n---\n\n".join(
+            (
+                item["input_proof"].rendered_text
+                if isinstance(item.get("input_proof"), AggregationInputProof)
+                else f"{item['title']}\n{item['summary']}"
+            )
+            for item in items
+        )
     parts = []
     for m in items:
         t = m["title"] or ""
@@ -897,41 +1390,9 @@ def _items_text(items: list[dict], cfg: HyMemConfig, *, char_scale: float = 1.0)
 
 
 def _anchor_facts(conn: sqlite3.Connection, cap: int) -> list[str]:
-    """ACTIVE typed user-profile rows (schema v18) followed by top ACTIVE,
-    non-derived, non-superseded knowledge-graph edges, rendered as one-line
-    facts — the VERIFIED FACTS block grounding the root digest fusion.
+    """Compatibility rendering of only exact, typed, source-backed anchors."""
 
-    Profile rows lead the block: they hold exactly the durable identity facts
-    (name, role, employer, location, ...) the tech-domain graph vocabulary can
-    never mint — the Stage-0 finding that motivated P4 — so they outrank graph
-    edges, and `cap` bounds the COMBINED list (graph edges fill the remainder).
-    Both sources come straight from conversation evidence (unlike the
-    machine-generated summaries the root fuses), so they give the model true
-    identity/preference signals and the authority to drop a summary claim that
-    conflicts — the countermeasure to hallucinations crystallized in cached
-    rollups. Edges strongest-evidence first. Because profile rows join the
-    returned list, they flow into the facts-block hash in the root's cache id,
-    so a profile change regenerates the digest just like a graph change."""
-    if cap <= 0:
-        return []
-    profile = [
-        render_profile_fact(entry) for entry in load_profile(conn, cap=cap)
-    ]
-    remaining = cap - len(profile)
-    if remaining <= 0:
-        return profile
-    rows = conn.execute(
-        f"""
-        SELECT subject_canonical AS s, predicate AS p, object_canonical AS o
-        FROM knowledge_graph
-        WHERE {live_edge_predicate()}
-        ORDER BY pos_evidence - neg_evidence DESC,
-                 {graph_clock_order_sql('last_seen')}, id
-        LIMIT ?
-        """,
-        (remaining,),
-    ).fetchall()
-    return profile + [f"{r['s']} {r['p']} {r['o']}" for r in rows]
+    return [item.rendered_text for item in load_root_anchor_inputs(conn, cap)]
 
 
 @dataclass
@@ -945,41 +1406,188 @@ class PendingAggregationNodeEmbeddings:
     cache_hits: int = 0
 
 
-def fetch_node_embeddings(
-    conn: sqlite3.Connection, embedder: EmbeddingClient
+def _prepare_candidate_node_embeddings(
+    conn: sqlite3.Connection,
+    rows: list[dict],
+    embedder: EmbeddingClient,
+    *, verify_material: Callable[[], None] | None = None,
 ) -> PendingAggregationNodeEmbeddings | None:
-    """Prepare current node vectors without holding a database write lock."""
+    """Embed an in-memory exact candidate before acquiring the write lock.
+
+    Every candidate row was produced from typed input proofs above. Existing
+    node vectors/cache entries are reusable only for the exact output-text hash
+    and provider identity. The returned batch contains *all* level-0 candidate
+    vectors, including reuse hits, because atomic replacement deletes the old
+    node rows (and therefore their FK-owned embedding mirrors).
+    """
+
     if conn.in_transaction:
-        raise RuntimeError("aggregation embedding fetch requires no transaction")
+        raise RuntimeError("candidate embedding fetch requires no transaction")
     model, initial_dim = _embedding_identity(embedder)
-    rows = conn.execute(
-        """
-        SELECT n.id, n.title, n.summary, ne.text_hash AS stored_hash,
-               ne.model AS stored_model, ne.dim AS stored_dim,
-               ne.vector_json AS stored_vector
-        FROM aggregation_nodes n
-        LEFT JOIN aggregation_node_embeddings ne ON ne.node_id = n.id
-        ORDER BY n.id
-        """
-    ).fetchall()
-    pending: list[tuple[str, str, str]] = []
-    for r in rows:
-        text = f"{r['title']}\n{r['summary']}"
-        text_hash = embedding_text_hash(text)
+    candidates = sorted(
+        (
+            row["id"], f"{row['title']}\n{row['summary']}",
+            embedding_text_hash(f"{row['title']}\n{row['summary']}"),
+        )
+        for row in rows
+        if row["node_kind"] == "cluster" and int(row["level"]) == 0
+    )
+    if not candidates:
+        return None
+
+    existing = {
+        str(row["node_id"]): row
+        for row in conn.execute(
+            "SELECT node_id,vector_json,model,dim,text_hash,"
+            "embedding_producer_key "
+            "FROM aggregation_node_embeddings WHERE model=? AND dim=?",
+            (model, initial_dim),
+        ).fetchall()
+    }
+    vectors: list[list[float] | None] = [None] * len(candidates)
+    from_cache = [False] * len(candidates)
+    for index, (node_id, _text, text_hash) in enumerate(candidates):
+        stored = existing.get(str(node_id))
         if (
-            r["stored_hash"] == text_hash
-            and r["stored_model"] == model
-            and r["stored_dim"] == initial_dim
+            stored is None or stored["text_hash"] != text_hash
+            or stored["embedding_producer_key"] != model
         ):
-            try:
-                stored = decode_vector(r["stored_vector"])
-            except (AttributeError, UnicodeError, TypeError, ValueError):
-                stored = None
-            if _finite_embedding_vector(
-                stored, expected_dim=initial_dim
-            ) is not None:
-                continue
-        pending.append((r["id"], text, text_hash))
+            continue
+        try:
+            decoded = decode_vector(stored["vector_json"])
+        except (AttributeError, UnicodeError, TypeError, ValueError):
+            continue
+        vector = _finite_embedding_vector(decoded, expected_dim=initial_dim)
+        if vector is not None:
+            vectors[index] = vector
+            from_cache[index] = True
+
+    hashes = [text_hash for _node_id, _text, text_hash in candidates]
+    missing_hashes = [
+        text_hash for index, text_hash in enumerate(hashes)
+        if vectors[index] is None
+    ]
+    cached = _fetch_cached_vectors(
+        conn, missing_hashes, model, expected_dim=initial_dim
+    )
+    miss_indices: list[int] = []
+    miss_texts: list[str] = []
+    for index, (_node_id, text, text_hash) in enumerate(candidates):
+        if vectors[index] is not None:
+            continue
+        cached_vector = cached.get(text_hash)
+        if cached_vector is None:
+            miss_indices.append(index)
+            miss_texts.append(text)
+        else:
+            vectors[index] = cached_vector
+            from_cache[index] = True
+
+    if miss_texts:
+        if verify_material is not None:
+            verify_material()
+        embedded = embedder.embed(miss_texts)
+        if verify_material is not None:
+            verify_material()
+        if len(embedded) != len(miss_texts):
+            raise RuntimeError(
+                f"embedding client returned {len(embedded)} vectors for "
+                f"{len(miss_texts)} aggregation nodes"
+            )
+        final_dim = _post_embed_identity(embedder, expected_model=model)
+        if final_dim != initial_dim and any(from_cache):
+            redo_indices = [index for index, hit in enumerate(from_cache) if hit]
+            if verify_material is not None:
+                verify_material()
+            redo = embedder.embed([candidates[index][1] for index in redo_indices])
+            if verify_material is not None:
+                verify_material()
+            if len(redo) != len(redo_indices):
+                raise RuntimeError(
+                    "embedding client returned the wrong number of node vectors"
+                )
+            redo_dim = _post_embed_identity(embedder, expected_model=model)
+            if redo_dim != final_dim:
+                raise RuntimeError(
+                    "embedding client changed dimension during node retry"
+                )
+            for index, vector in zip(redo_indices, redo):
+                vectors[index] = vector
+                from_cache[index] = False
+        for index, vector in zip(miss_indices, embedded):
+            vectors[index] = vector
+    else:
+        final_dim = initial_dim
+
+    validated = [
+        _finite_embedding_vector(vector, expected_dim=final_dim)
+        for vector in vectors
+    ]
+    if any(vector is None for vector in validated):
+        raise RuntimeError("embedding client returned malformed node vectors")
+    return PendingAggregationNodeEmbeddings(
+        node_ids=[str(node_id) for node_id, _text, _hash in candidates],
+        text_hashes=hashes,
+        vectors=[vector for vector in validated if vector is not None],
+        from_cache=from_cache,
+        model=model,
+        dim=final_dim,
+        cache_hits=sum(from_cache),
+    )
+
+
+def fetch_node_embeddings(
+    conn: sqlite3.Connection, embedder: EmbeddingClient,
+) -> PendingAggregationNodeEmbeddings | None:
+    """Prepare vectors only for the wholly proven current publication."""
+    if conn.in_transaction:
+        raise RuntimeError("current-publication embedding fetch requires no transaction")
+    model, initial_dim = _embedding_identity(embedder)
+    pending: list[tuple[str, str, str]] = []
+    # Capture publication proof, exact output bytes, and embedding mirror in
+    # one read snapshot. Provider work begins only after the snapshot is
+    # released, and it renders exclusively from the validated proof row.
+    conn.execute("BEGIN")
+    try:
+        current = load_current_aggregation_publication(
+            conn, embedding_client=embedder,
+        )
+        stored_by_id = {
+            str(row["node_id"]): row
+            for row in conn.execute(
+                "SELECT node_id,text_hash,model,dim,vector_json,"
+                "embedding_producer_key "
+                "FROM aggregation_node_embeddings"
+            ).fetchall()
+        }
+        if current is not None:
+            for node_id, proof in sorted(current.nodes.items()):
+                if proof.row["node_kind"] != "cluster":
+                    continue
+                text = f"{proof.row['title']}\n{proof.row['summary']}"
+                text_hash = embedding_text_hash(text)
+                stored_row = stored_by_id.get(node_id)
+                if (
+                    stored_row is not None
+                    and stored_row["text_hash"] == text_hash
+                    and stored_row["model"] == model
+                    and stored_row["dim"] == initial_dim
+                    and stored_row["embedding_producer_key"] == model
+                ):
+                    try:
+                        stored = decode_vector(stored_row["vector_json"])
+                    except (AttributeError, UnicodeError, TypeError, ValueError):
+                        stored = None
+                    if _finite_embedding_vector(
+                        stored, expected_dim=initial_dim
+                    ) is not None:
+                        continue
+                pending.append((node_id, text, text_hash))
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     if not pending:
         return None
 
@@ -1045,8 +1653,11 @@ def fetch_node_embeddings(
     )
 
 
+@core_db.embedding_writer
 def persist_node_embeddings(
-    conn: sqlite3.Connection, pending: PendingAggregationNodeEmbeddings
+    conn: sqlite3.Connection, pending: PendingAggregationNodeEmbeddings,
+    *, publication_id: str | None = None,
+    material_epoch_key: str | None = None,
 ) -> int:
     """Persist a validated node batch in the caller's short transaction."""
     persisted = 0
@@ -1059,13 +1670,22 @@ def persist_node_embeddings(
         vector = _finite_embedding_vector(candidate, expected_dim=pending.dim)
         if vector is None:
             continue
-        source = conn.execute(
-            "SELECT title, summary FROM aggregation_nodes WHERE id = ?",
-            (node_id,),
-        ).fetchone()
-        if source is None or embedding_text_hash(
-            f"{source['title']}\n{source['summary']}"
-        ) != text_hash:
+        proof = (
+            load_aggregation_node_proof(
+                conn, node_id,
+                expected_material_epoch_key=material_epoch_key,
+            )
+            if publication_id is not None
+            else load_current_aggregation_node_proof(conn, node_id)
+        )
+        if (
+            proof is None
+            or (publication_id is not None
+                and proof.row["publication_id"] != publication_id)
+            or embedding_text_hash(
+                f"{proof.row['title']}\n{proof.row['summary']}"
+            ) != text_hash
+        ):
             continue
         if not is_cached:
             conn.execute(
@@ -1081,17 +1701,19 @@ def persist_node_embeddings(
             )
         conn.execute(
             """
-            INSERT INTO aggregation_node_embeddings(node_id, vector_json, model, dim, text_hash)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO aggregation_node_embeddings(
+                node_id,vector_json,model,dim,text_hash,embedding_producer_key
+            ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(node_id) DO UPDATE SET
                 vector_json = excluded.vector_json,
                 model = excluded.model,
                 dim = excluded.dim,
-                text_hash = excluded.text_hash
+                text_hash = excluded.text_hash,
+                embedding_producer_key = excluded.embedding_producer_key
             """,
             (
                 node_id, encode_vector(vector), pending.model,
-                pending.dim, text_hash,
+                pending.dim, text_hash, pending.model,
             ),
         )
         persisted += 1
@@ -1103,30 +1725,140 @@ def _reusable_fusion(
     node_id: str,
     cached: dict | None,
     *,
-    input_fingerprint: str,
-    expected_sources: tuple | None,
+    expected_inputs: tuple[AggregationInputProof, ...],
+    expected_config_version: str,
+    expected_generation_key: str,
+    expected_request_hash: str,
 ) -> dict | None:
     """Return a cached fusion only when its exact effective input still agrees."""
 
-    if cached is None or cached.get("input_fingerprint") != input_fingerprint:
+    if cached is None:
         return None
-    if expected_sources is None:
-        source_count = conn.execute(
-            "SELECT COUNT(*) FROM aggregation_node_source_occurrences "
-            "WHERE node_id=?",
-            (node_id,),
-        ).fetchone()[0]
-        if (
-            cached.get("source_manifest_complete") != 0
-            or cached.get("source_manifest_count") != 0
-            or source_count != 0
-        ):
-            return None
-    elif load_aggregation_source_manifest(
-        conn, node_id, validate_level0_input=False
-    ) != expected_sources:
+    proof = load_aggregation_node_proof(
+        conn, node_id, expected_generation_key=expected_generation_key,
+        # Physical fusion reuse depends on the exact typed prompt, v56
+        # producer/request, and canonical output—not on whether the old tree's
+        # material epoch is still current.  Supplying the row's own immutable
+        # key authorizes validation of a process-scoped registry row without
+        # turning it into public read authority; the candidate is re-emitted
+        # under the newly captured epoch before publication.
+        expected_material_epoch_key=cached.get(
+            "aggregation_material_epoch_key"
+        ),
+    )
+    if (
+        proof is None
+        or proof.inputs != expected_inputs
+        or proof.row["build_config_version"] != expected_config_version
+        or proof.row["aggregation_generation_key"] != expected_generation_key
+        or proof.row["aggregation_request_hash"] != expected_request_hash
+    ):
         return None
-    return {"title": cached["title"], "summary": cached["summary"]}
+    return {
+        "title": proof.row["title"], "summary": proof.row["summary"],
+        "_aggregation_request_hash": proof.row["aggregation_request_hash"],
+    }
+
+
+def _candidate_node_row(
+    *, inputs: tuple[AggregationInputProof, ...], fused: dict,
+    node_kind: str, level: int, config_version: str,
+    generation_key: str, request_hash: str, material_epoch_key: str,
+    reused: bool,
+) -> dict:
+    """Create the exact DB-shaped, self-verifying header for one candidate."""
+
+    anchors_started = False
+    member_ids: list[str] = []
+    typed_member_keys: list[tuple[str, str]] = []
+    for item in inputs:
+        if item.kind in {"episode", "aggregation_node"}:
+            if anchors_started:
+                raise ValueError("aggregation members must precede anchors")
+            member_id = item.source_ref.get("id")
+            if not isinstance(member_id, str) or not member_id:
+                raise ValueError("aggregation member reference is malformed")
+            member_ids.append(member_id)
+            typed_member_keys.append((item.kind, member_id))
+        else:
+            anchors_started = True
+    if not member_ids or len(typed_member_keys) != len(set(typed_member_keys)):
+        raise ValueError("aggregation node requires unique typed members")
+    if node_kind == "rollup" and len(member_ids) < 2:
+        raise ValueError("aggregation rollup requires at least two members")
+    if node_kind != "root" and anchors_started:
+        raise ValueError("only an aggregation root may carry anchor inputs")
+    fingerprint = aggregation_typed_input_fingerprint(inputs)
+    node_id = aggregation_node_id(
+        member_ids, node_kind=node_kind, input_fingerprint=fingerprint,
+        generation_key=generation_key, request_hash=request_hash,
+    )
+    occurrences = combine_source_occurrences(item.occurrences for item in inputs)
+    sessions = sorted({item.session_id for item in occurrences})
+    title = str(fused["title"])
+    summary = str(fused["summary"])
+    if fused.get("_aggregation_request_hash") != request_hash:
+        raise ValueError("aggregation output/request proof disagrees")
+    if not aggregation_output_is_canonical(title, summary):
+        raise ValueError("aggregation fusion output is not canonical")
+    return {
+        "id": node_id,
+        "title": title,
+        "summary": summary,
+        "member_ids_list": member_ids,
+        "member_episode_ids": aggregation_canonical_json(member_ids),
+        "session_ids_list": sessions,
+        "session_ids": aggregation_canonical_json(sessions),
+        "n_members": len(member_ids),
+        "n_sessions": len(sessions),
+        "level": level,
+        "is_root": int(node_kind == "root"),
+        "node_kind": node_kind,
+        "output_hash": aggregation_output_hash(
+            node_kind, title, summary, request_hash,
+        ),
+        "aggregation_request_hash": request_hash,
+        "input_fingerprint": fingerprint,
+        "input_manifest_version": AGGREGATION_INPUT_MANIFEST_VERSION,
+        "input_manifest_count": len(inputs),
+        "input_manifest_hash": aggregation_input_manifest_hash(inputs),
+        "input_manifest_complete": 1,
+        "aggregation_generation_key": generation_key,
+        "aggregation_material_epoch_key": material_epoch_key,
+        "source_manifest_version": AGGREGATION_SOURCE_MANIFEST_VERSION,
+        "source_manifest_count": len(occurrences),
+        "source_manifest_hash": source_manifest_hash(
+            AGGREGATION_SOURCE_MANIFEST_VERSION, occurrences
+        ),
+        "source_manifest_complete": 1,
+        "build_config_version": config_version,
+        "publication_id": None,
+        "input_proofs": inputs,
+        "source_occurrences": occurrences,
+        "reused": reused,
+    }
+
+
+def _node_frontier_item(
+    row: dict, *, vector: list[float] | None, entities: set[str],
+) -> dict:
+    proof = make_aggregation_input_proof(
+        kind="aggregation_node", source_ref={"id": row["id"]},
+        rendered_text=f"{row['title']}\n{row['summary']}",
+        authority_hash=aggregation_node_authority_hash(row),
+        occurrences=row["source_occurrences"],
+    )
+    return {
+        "id": row["id"], "title": row["title"], "summary": row["summary"],
+        "_aggregation_cluster_key": f"aggregation_node:{row['id']}",
+        "_aggregation_level": int(row["level"]),
+        "vector": vector, "entities": entities,
+        "session_ids": set(row["session_ids_list"]),
+        "source_occurrences": row["source_occurrences"],
+        "source_provenance_complete": True,
+        "source_manifest_hash": row["source_manifest_hash"],
+        "input_proof": proof,
+    }
 
 
 def build_aggregation_nodes(
@@ -1136,6 +1868,61 @@ def build_aggregation_nodes(
     embedding_client: EmbeddingClient | None = None,
     *,
     episode_ceiling_rowid: int | None = None,
+    generation_binding: Mapping[str, object] | None = None,
+    health_managed: bool = False,
+    health_attempt_token: int | None = None,
+) -> AggregationResult:
+    """Build under one exact attempt, recording direct-call exceptions safely."""
+
+    attempt_token_sink: list[int] = []
+    try:
+        return _build_aggregation_nodes_attempt(
+            conn, cfg, llm, embedding_client,
+            episode_ceiling_rowid=episode_ceiling_rowid,
+            generation_binding=generation_binding,
+            health_managed=health_managed,
+            health_attempt_token=health_attempt_token,
+            _attempt_token_sink=attempt_token_sink,
+        )
+    except Exception as exc:
+        if not health_managed and attempt_token_sink:
+            token = attempt_token_sink[0]
+            pending = conn.execute(
+                "SELECT pending_config_version,pending_generation_key "
+                "FROM aggregation_build_health WHERE id=1 "
+                "AND pending_attempt_token=?",
+                (token,),
+            ).fetchone()
+            if pending is not None:
+                from hymem.dreaming.aggregation_health import (
+                    record_aggregation_build_failure,
+                )
+                try:
+                    record_aggregation_build_failure(
+                        conn, str(pending["pending_config_version"]),
+                        str(pending["pending_generation_key"]), token,
+                        caught_exceptions=1,
+                    )
+                except Exception as record_exc:
+                    if hasattr(exc, "add_note"):
+                        exc.add_note(
+                            "aggregation failure attribution also failed: "
+                            + type(record_exc).__name__
+                        )
+        raise
+
+
+def _build_aggregation_nodes_attempt(
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+    llm: LLMClient,
+    embedding_client: EmbeddingClient | None = None,
+    *,
+    episode_ceiling_rowid: int | None = None,
+    generation_binding: Mapping[str, object] | None = None,
+    health_managed: bool = False,
+    health_attempt_token: int | None = None,
+    _attempt_token_sink: list[int] | None = None,
 ) -> AggregationResult:
     """Rebuild the cross-session aggregation layer from the current episodes.
 
@@ -1155,8 +1942,164 @@ def build_aggregation_nodes(
     if not cfg.aggregation_nodes_enabled:
         return AggregationResult(0, 0)
 
-    episodes = load_clusterable_episodes(conn, max_rowid=episode_ceiling_rowid)
-    clusters = select_clusters(episodes, cfg, conn)
+    # The configuration object is mutable and provider hooks are arbitrary
+    # code.  Build exclusively from a private frozen copy, while every
+    # provider/final fence below proves that the caller-visible configuration
+    # has not drifted.  This prevents a callback from mixing two clustering,
+    # rollup, or publication policies under one config key.
+    live_cfg = cfg
+    cfg = copy.deepcopy(cfg)
+
+    # Arbitrary/process-scoped embedders have no durable mirror authority: a
+    # nonce distinguishes objects but cannot detect hidden route mutation
+    # inside the same object.  Aggregation therefore remains fully usable in
+    # deterministic entity/exact-blocking mode while treating that producer as
+    # disabled for clustering and node embeddings.
+    aggregation_embedding_client = embedding_client
+    if embedding_client is not None:
+        producer_snapshot, _producer_key, _producer_dim = (
+            embedding_execution_identity(embedding_client)
+        )
+        if not producer_snapshot["identity_exact"]:
+            aggregation_embedding_client = None
+
+    from hymem.dreaming.aggregation_generation import (
+        aggregation_generation_binding_for_contract,
+        aggregation_generation_contract,
+        register_aggregation_generation,
+        validate_aggregation_generation_binding,
+    )
+
+    generation_contract = aggregation_generation_contract(cfg)
+    resolved_generation = aggregation_generation_binding_for_contract(
+        generation_contract, llm,
+    )
+    if generation_binding is not None:
+        supplied_generation = validate_aggregation_generation_binding(
+            generation_binding
+        )
+        if supplied_generation["contract"] != generation_contract:
+            raise RuntimeError("aggregation executable contract changed before build")
+        if supplied_generation != resolved_generation:
+            raise RuntimeError("aggregation producer identity changed before build")
+        resolved_generation = supplied_generation
+    generation_key = str(resolved_generation["generation_key"])
+    config_version = aggregation_config_version(cfg)
+
+    # Withdraw before capture and ensure even a direct low-level caller owns a
+    # durable attempt.  Capture binds its material epoch to this row in the
+    # same transaction, so source invalidators have a live revision fence for
+    # the entire provider/candidate window (the runner normally creates it).
+    if not isinstance(health_managed, bool):
+        raise ValueError("health_managed must be a boolean")
+    owned_pending_attempt = not health_managed
+    attempt_token: int
+    with core_db.transaction(conn):
+        pending = conn.execute(
+            "SELECT pending_config_version,pending_generation_key "
+            "FROM aggregation_build_health WHERE id=1"
+        ).fetchone()
+        if health_managed:
+            if health_attempt_token is None:
+                raise ValueError(
+                    "managed aggregation build requires an attempt token"
+                )
+            from hymem.dreaming.aggregation_health import (
+                require_pending_aggregation_attempt,
+            )
+            if (
+                pending is None
+                or pending["pending_config_version"] != config_version
+                or pending["pending_generation_key"] != generation_key
+            ):
+                raise RuntimeError(
+                    "aggregation build has no matching managed health attempt"
+                )
+            attempt_token = health_attempt_token
+            require_pending_aggregation_attempt(
+                conn, config_version, generation_key, attempt_token,
+            )
+            conn.execute("DELETE FROM aggregation_publication_state")
+        else:
+            from hymem.dreaming.aggregation_health import begin_aggregation_build
+
+            if health_attempt_token is not None:
+                raise ValueError(
+                    "direct aggregation build cannot borrow an attempt token"
+                )
+
+            # A direct call owns its entire health lifecycle, including a
+            # retry after a contained failure. Starting a fresh attempt resets
+            # the prior material key before capture rather than inferring
+            # ownership from a stale same-generation pending row.
+            attempt_token = begin_aggregation_build(
+                conn, config_version, generation_binding=resolved_generation,
+            )
+        if _attempt_token_sink is not None:
+            _attempt_token_sink.append(attempt_token)
+
+    captured = capture_aggregation_material(
+        conn, cfg, aggregation_embedding_client,
+        episode_ceiling_rowid=episode_ceiling_rowid,
+        pending_generation_key=generation_key,
+        pending_attempt_token=attempt_token,
+    )
+    material_binding = validate_aggregation_material_binding(captured.binding)
+    if material_binding["config_version"] != aggregation_config_version(cfg):
+        raise RuntimeError("aggregation material config changed before build")
+    verify_aggregation_material_epoch(
+        conn, material_binding, embedding_client=aggregation_embedding_client,
+        anchor_cap=(
+            cfg.aggregation_digest_anchor_facts
+            if cfg.aggregation_digest_enabled else 0
+        ),
+    )
+    material_epoch_key = str(material_binding["material_epoch_key"])
+    if aggregation_config_version(live_cfg) != config_version:
+        raise RuntimeError("aggregation material config changed before build")
+
+    def verify_generation() -> None:
+        if aggregation_config_version(live_cfg) != config_version:
+            raise RuntimeError("aggregation material config changed during build")
+        if aggregation_generation_binding_for_contract(
+            generation_contract, llm,
+        ) != resolved_generation:
+            raise RuntimeError("aggregation producer identity changed during build")
+        verify_aggregation_material_epoch(
+            conn, material_binding,
+            embedding_client=aggregation_embedding_client,
+            anchor_cap=(
+                cfg.aggregation_digest_anchor_facts
+                if cfg.aggregation_digest_enabled else 0
+            ),
+        )
+        from hymem.dreaming.aggregation_health import (
+            require_pending_aggregation_attempt,
+        )
+        require_pending_aggregation_attempt(
+            conn, config_version, generation_key, attempt_token,
+            material_epoch_key=material_epoch_key,
+        )
+
+    # The runner normally withdraws publication together with its durable
+    # pending marker. Keep the lower-level build API equally fail closed for
+    # direct callers: all old rows remain available to the exact physical proof
+    # loader for cache reuse, but consumers see no tree until the candidate's
+    # final publication statement commits.
+    with core_db.transaction(conn):
+        from hymem.dreaming.aggregation_health import (
+            require_pending_aggregation_attempt,
+        )
+        require_pending_aggregation_attempt(
+            conn, config_version, generation_key, attempt_token,
+            material_epoch_key=material_epoch_key,
+        )
+        register_aggregation_generation(conn, resolved_generation)
+        conn.execute("DELETE FROM aggregation_publication_state")
+    episodes = list(captured.episodes)
+    clusters = select_clusters(
+        episodes, cfg, candidate_pairs=captured.candidate_pairs,
+    )
 
     # Attribution: which candidate generator clustered this dream. Node ids
     # are a function of membership, and membership can differ between the KNN
@@ -1164,14 +2107,7 @@ def build_aggregation_nodes(
     # trigger paths with different environments (one missing sqlite-vec)
     # silently alternate between two self-consistent trees, re-keying on every
     # switch. Persisting the mode makes that alternation visible in dream_runs.
-    if cfg.aggregation_blocking_top_k <= 0:
-        blocking = "exact:disabled"
-    elif not core_db._load_vec_extension(conn):
-        blocking = "exact:no_vec_extension"
-    elif not core_db.has_vec_table(conn, table="vec_episodes"):
-        blocking = "exact:no_vec_table"
-    else:
-        blocking = "knn"
+    blocking = f"{captured.blocking['mode']}:{captured.blocking['reason']}"
     vectorless = sum(1 for e in episodes if not e["vector"])
 
     # The content-hash node id makes the previous fusion reusable: an unchanged
@@ -1187,24 +2123,21 @@ def build_aggregation_nodes(
     # membership exist at this level". The two answers diverge exactly when id
     # keying is broken — a salt change, an unstable hash, a rowid/shadow
     # desync — which is the failure class the reuse watch keeps hitting.
-    prev_inputs: set[tuple[int, frozenset[str], str | None]] = set()
-    for row in conn.execute(
-        "SELECT id,title,summary,member_episode_ids,level,input_fingerprint,"
-        "source_manifest_complete,source_manifest_count FROM aggregation_nodes"
-    ):
-        existing[row["id"]] = {
-            "title": row["title"],
-            "summary": row["summary"],
-            "input_fingerprint": row["input_fingerprint"],
-            "source_manifest_complete": row["source_manifest_complete"],
-            "source_manifest_count": row["source_manifest_count"],
-        }
+    prev_inputs: set[
+        tuple[int, frozenset[str], str | None, str | None, str | None]
+    ] = set()
+    for row in conn.execute("SELECT * FROM aggregation_nodes"):
+        existing[row["id"]] = dict(row)
         try:
             members = json.loads(row["member_episode_ids"])
         except (TypeError, ValueError):
             continue
         prev_inputs.add(
-            (row["level"], frozenset(members), row["input_fingerprint"])
+            (
+                row["level"], frozenset(members), row["input_fingerprint"],
+                row["aggregation_generation_key"],
+                row["aggregation_request_hash"],
+            )
         )
 
     rows: list[dict] = []
@@ -1214,29 +2147,34 @@ def build_aggregation_nodes(
     failures = 0
     level0_missed = 0               # instrumentation: level-0 re-keys this dream
     for members in clusters:
+        check_current_deadline()
         member_ids = [m["id"] for m in members]
-        input_fingerprint = aggregation_input_fingerprint(members)
-        node_id = _node_id(
-            member_ids, salt=_CLUSTER_SALT,
+        inputs = tuple(m["cluster_input_proof"] for m in members)
+        input_fingerprint = aggregation_typed_input_fingerprint(inputs)
+        request = aggregation_llm_request(inputs, node_kind="cluster")
+        user_prompt = request.user
+        request_hash = aggregation_llm_request_hash(request)
+        node_id = aggregation_node_id(
+            member_ids, node_kind="cluster",
             input_fingerprint=input_fingerprint,
+            generation_key=generation_key, request_hash=request_hash,
         )
-        sources = None
-        if all(m["source_provenance_complete"] for m in members):
-            sources = combine_source_occurrences(
-                m["source_occurrences"] for m in members
-            )
         cached = existing.get(node_id)
         fused = _reusable_fusion(
-            conn, node_id, cached,
-            input_fingerprint=input_fingerprint,
-            expected_sources=sources,
+            conn, node_id, cached, expected_inputs=inputs,
+            expected_config_version=config_version,
+            expected_generation_key=generation_key,
+            expected_request_hash=request_hash,
         )
         level0_reused = fused is not None
         if fused is not None:
             reused += 1
         else:
             level0_missed += 1
-            fused = _summarize_cluster(members, cfg, llm)
+            fused = _summarize_cluster(
+                members, cfg, llm, verify_generation=verify_generation,
+                user_prompt=user_prompt, prepared_request=request,
+            )
             if fused is None:
                 # CONTAINMENT: the members still count as clustered so they do
                 # NOT leak into the digest leftovers. Before this, one failed
@@ -1250,27 +2188,18 @@ def build_aggregation_nodes(
                 failures += 1
                 clustered_ids.update(member_ids)
                 continue
-        session_ids = sorted({m["session_id"] for m in members})
-        rows.append({
-            "id": node_id, "title": fused["title"], "summary": fused["summary"],
-            "member_ids": member_ids, "session_ids": session_ids,
-            "level": 0, "is_root": 0, "reused": level0_reused,
-            "source_occurrences": sources,
-            "input_fingerprint": input_fingerprint,
-        })
+        row = _candidate_node_row(
+            inputs=inputs, fused=fused, node_kind="cluster", level=0,
+            config_version=config_version, generation_key=generation_key,
+            request_hash=request_hash, material_epoch_key=material_epoch_key,
+            reused=level0_reused,
+        )
+        rows.append(row)
         clustered_ids.update(member_ids)
-        items.append({
-            "id": node_id, "title": fused["title"], "summary": fused["summary"],
-            "vector": _centroid([m["vector"] for m in members]),
-            "entities": set().union(*(m["entities"] for m in members)),
-            "session_ids": set(session_ids),
-            "source_occurrences": sources or (),
-            "source_provenance_complete": sources is not None,
-            "source_manifest_hash": (
-                source_manifest_hash(AGGREGATION_SOURCE_MANIFEST_VERSION, sources)
-                if sources is not None else None
-            ),
-        })
+        items.append(_node_frontier_item(
+            row, vector=_centroid([m["vector"] for m in members]),
+            entities=set().union(*(m["entities"] for m in members)),
+        ))
 
     root_failed = False
     leaf_changed = -1               # instrumentation: -1 when digest disabled
@@ -1317,80 +2246,210 @@ def build_aggregation_nodes(
             leaf_changed = int(leaf_fingerprint != previous_fingerprint)
         items += [{
             "id": e["id"], "title": e["title"] or "", "summary": e["summary"] or "",
+            "_aggregation_cluster_key": f"episode:{e['id']}",
+            "_aggregation_level": 0,
             "vector": e["vector"], "entities": e["entities"],
             "session_ids": {e["session_id"]},
             "source_occurrences": e["source_occurrences"],
             "source_provenance_complete": e["source_provenance_complete"],
             "source_manifest_hash": e["source_manifest_hash"],
+            "input_proof": e["plain_input_proof"],
         } for e in leftovers]
+        anchor_inputs = list(captured.anchor_inputs)
         digest_rows, digest_reused, digest_failures, root_failed = _build_digest_levels(
             conn, items, cfg, llm, existing,
-            anchor_facts=_anchor_facts(conn, cfg.aggregation_digest_anchor_facts),
+            anchor_inputs=anchor_inputs, config_version=config_version,
+            generation_key=generation_key,
+            material_epoch_key=material_epoch_key,
+            verify_generation=verify_generation,
         )
         rows += digest_rows
         reused += digest_reused
         failures += digest_failures
 
-    with core_db.transaction(conn):
-        # Full replace: rows the new clustering no longer produces must not linger.
-        # ON DELETE CASCADE clears aggregation_node_embeddings for dropped nodes.
-        # Exception: when the ROOT fusion failed, the previous root survives —
-        # a one-dream-stale digest (its footer already names generated_at)
-        # beats HyMem.digest() returning nothing until the retry heals. Its
-        # member ids may point at replaced nodes; expand_node reports those as
-        # missing_member_ids rather than failing.
-        if root_failed:
-            log.warning("aggregate.root_fusion_failed keeping previous root")
-            # Compatibility keeps the last readable digest text, but its old
-            # tree members/proof no longer describe the just-built frontier.
-            # Quarantine that cache entry before deleting its children so no
-            # caller can mistake stale source rows for current provenance.
-            conn.execute(
-                "UPDATE aggregation_nodes SET source_manifest_version=?,"
-                "source_manifest_count=0,source_manifest_hash=NULL,"
-                "source_manifest_complete=0 WHERE is_root=1",
-                (AGGREGATION_SOURCE_MANIFEST_VERSION,),
+    if failures:
+        # A contained child/root failure is still an incomplete build. Keep the
+        # prior physical rows unchanged, but leave publication withdrawn; the
+        # failed candidate is never persisted and the watermark is not
+        # advanced.
+        log.warning(
+            "aggregate.unpublished failures=%d root_failed=%s",
+            failures, root_failed,
+        )
+    else:
+        roots = [r["id"] for r in rows if r["node_kind"] == "root"]
+        if len(roots) > 1:
+            raise RuntimeError("aggregation candidate has multiple roots")
+        root_id = roots[0] if roots else None
+        node_set_hash = aggregation_publication_node_set_hash(rows)
+
+        # Provider work must never hold SQLite's replacement write lock. The
+        # candidate is already exact in memory; a provider/cache failure leaves
+        # all prior physical rows untouched while the earlier publication fence
+        # keeps them unserved. The short transaction below revalidates every
+        # typed proof before making this prepared batch authoritative.
+        pending_node_embeddings = (
+            _prepare_candidate_node_embeddings(
+                conn, rows, aggregation_embedding_client,
+                verify_material=verify_generation,
             )
-            conn.execute(
-                "DELETE FROM aggregation_node_source_occurrences WHERE node_id IN "
-                "(SELECT id FROM aggregation_nodes WHERE is_root=1)"
+            if aggregation_embedding_client is not None and rows else None
+        )
+        candidate_embedding_rows = [] if pending_node_embeddings is None else [
+            {
+                "node_id": node_id,
+                "vector_json": encode_vector(vector),
+                "model": pending_node_embeddings.model,
+                "dim": pending_node_embeddings.dim,
+                "text_hash": text_hash,
+                "embedding_producer_key": pending_node_embeddings.model,
+            }
+            for node_id, vector, text_hash in zip(
+                pending_node_embeddings.node_ids,
+                pending_node_embeddings.vectors,
+                pending_node_embeddings.text_hashes,
             )
-            conn.execute("DELETE FROM aggregation_nodes WHERE is_root = 0")
-        else:
+        ]
+        node_embedding_count = len(candidate_embedding_rows)
+        node_embedding_set_hash = aggregation_node_embedding_set_hash(
+            candidate_embedding_rows
+        )
+        verify_generation()
+        published_at = str(conn.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0])
+        if not aggregation_publication_timestamp_is_canonical(published_at):
+            raise RuntimeError("SQLite returned a non-canonical publication clock")
+        publication_id = aggregation_publication_id(
+            config_version=config_version, root_id=root_id,
+            node_count=len(rows), node_set_hash=node_set_hash,
+            published_at=published_at,
+            cluster_min_members=cfg.aggregation_min_members,
+            cluster_min_sessions=cfg.aggregation_min_sessions,
+            anchor_fact_cap=cfg.aggregation_digest_anchor_facts,
+            generation_key=generation_key,
+            material_epoch_key=material_epoch_key,
+            material_revision=int(material_binding["material_revision"]),
+            node_embedding_count=node_embedding_count,
+            node_embedding_set_hash=node_embedding_set_hash,
+            request_contract_sha256=str(
+                resolved_generation["contract"]["request_policy_sha256"]
+            ),
+        )
+        for row in rows:
+            row["publication_id"] = publication_id
+
+        # Candidate replacement, optional embedding provider work, proof
+        # validation, and publication are one atomic write unit. Provider work
+        # was completed above; a later proof mismatch rolls this replacement
+        # DELETE back, retaining the prior physical tree for audit/recovery.
+        verify_generation()
+        with core_db.transaction(conn):
+            from hymem.dreaming.aggregation_health import (
+                require_pending_aggregation_attempt,
+            )
+            require_pending_aggregation_attempt(
+                conn, config_version, generation_key, attempt_token,
+                material_epoch_key=material_epoch_key,
+            )
+            conn.execute("DELETE FROM aggregation_publication_state")
             conn.execute("DELETE FROM aggregation_nodes")
-        for r in rows:
+            for r in rows:
+                check_current_deadline()
+                conn.execute(
+                    """
+                    INSERT INTO aggregation_nodes(
+                        id,title,summary,member_episode_ids,session_ids,
+                        n_members,n_sessions,level,is_root,input_fingerprint,
+                        node_kind,output_hash,publication_id,build_config_version,
+                        aggregation_generation_key,aggregation_request_hash
+                        ,aggregation_material_epoch_key
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        r["id"], r["title"], r["summary"],
+                        r["member_episode_ids"], r["session_ids"],
+                        r["n_members"], r["n_sessions"], r["level"],
+                        r["is_root"], r["input_fingerprint"], r["node_kind"],
+                        r["output_hash"], publication_id, config_version,
+                        generation_key,
+                        r["aggregation_request_hash"],
+                        material_epoch_key,
+                    ),
+                )
+                persist_aggregation_source_manifest(
+                    conn, r["id"], inputs=r["input_proofs"],
+                    node_kind=r["node_kind"], publication_id=publication_id,
+                    build_config_version=config_version,
+                    aggregation_generation_key=generation_key,
+                    aggregation_material_epoch_key=material_epoch_key,
+                )
+            if leaf_fingerprint is not None:
+                _write_leaf_fingerprint(
+                    conn, leaf_fingerprint, leaf_count, leaf_set
+                )
+            if pending_node_embeddings is not None:
+                embedded = persist_node_embeddings(
+                    conn, pending_node_embeddings,
+                    publication_id=publication_id,
+                    material_epoch_key=material_epoch_key,
+                )
+                if embedded != len(pending_node_embeddings.node_ids):
+                    raise RuntimeError(
+                        "aggregation embedding proof changed before persist"
+                    )
+
+            # Publication is the final statement, after every proof and
+            # optional embedding provider step succeeded.
+            verify_generation()
+            for r in rows:
+                proof = load_aggregation_node_proof(
+                    conn, r["id"], expected_generation_key=generation_key,
+                    expected_material_epoch_key=material_epoch_key,
+                )
+                if proof is None or proof.row["publication_id"] != publication_id:
+                    raise RuntimeError("aggregation candidate proof failed")
+            stored_rows = [dict(row) for row in conn.execute(
+                "SELECT * FROM aggregation_nodes WHERE publication_id=? ORDER BY id",
+                (publication_id,),
+            ).fetchall()]
+            if (
+                len(stored_rows) != len(rows)
+                or aggregation_publication_node_set_hash(stored_rows) != node_set_hash
+            ):
+                raise RuntimeError("aggregation candidate set changed before publication")
+            stored_embedding_rows = [dict(row) for row in conn.execute(
+                "SELECT e.* FROM aggregation_node_embeddings e "
+                "JOIN aggregation_nodes n ON n.id=e.node_id "
+                "WHERE n.publication_id=? ORDER BY e.node_id",
+                (publication_id,),
+            ).fetchall()]
+            if (
+                len(stored_embedding_rows) != node_embedding_count
+                or aggregation_node_embedding_set_hash(stored_embedding_rows)
+                != node_embedding_set_hash
+            ):
+                raise RuntimeError("aggregation node embedding set changed before publication")
+            verify_generation()
             conn.execute(
-                """
-                INSERT INTO aggregation_nodes(
-                    id, title, summary, member_episode_ids, session_ids,
-                    n_members, n_sessions, level, is_root, input_fingerprint
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                "INSERT INTO aggregation_publication_state("
+                "id,publication_id,config_version,cluster_min_members,"
+                "cluster_min_sessions,anchor_fact_cap,root_node_id,node_count,"
+                "node_set_hash,published_at,aggregation_generation_key,"
+                "request_contract_sha256,aggregation_material_epoch_key,"
+                "material_revision,node_embedding_count,node_embedding_set_hash) "
+                "VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    r["id"], r["title"], r["summary"],
-                    json.dumps(r["member_ids"]), json.dumps(r["session_ids"]),
-                    len(r["member_ids"]), len(r["session_ids"]),
-                    r["level"], r["is_root"], r["input_fingerprint"],
+                    publication_id, config_version, cfg.aggregation_min_members,
+                    cfg.aggregation_min_sessions,
+                    cfg.aggregation_digest_anchor_facts, root_id,
+                    len(rows), node_set_hash, published_at,
+                    generation_key,
+                    resolved_generation["contract"]["request_policy_sha256"],
+                    material_epoch_key,
+                    material_binding["material_revision"],
+                    node_embedding_count,
+                    node_embedding_set_hash,
                 ),
             )
-            persist_aggregation_source_manifest(
-                conn,
-                r["id"],
-                occurrences=r["source_occurrences"],
-                input_fingerprint=r["input_fingerprint"],
-            )
-        if leaf_fingerprint is not None:
-            # Same transaction as the nodes above: a dream that dies before
-            # persisting must not leave the watermark pointing at a leaf set no
-            # tree was ever built from, which would report the NEXT dream's
-            # genuine displacement as unchanged.
-            _write_leaf_fingerprint(conn, leaf_fingerprint, leaf_count, leaf_set)
-
-    if embedding_client is not None and rows:
-        pending_node_embeddings = fetch_node_embeddings(conn, embedding_client)
-        if pending_node_embeddings is not None:
-            with core_db.transaction(conn):
-                persist_node_embeddings(conn, pending_node_embeddings)
 
     forecast = _forecast_rebuild(rows, prev_inputs)
     log.info(
@@ -1435,19 +2494,50 @@ def build_aggregation_nodes(
                 "disagree; one of them is broken",
                 leaf_res, leaf_added + leaf_removed,
             )
-    return AggregationResult(
+    result = AggregationResult(
         len(rows), reused, failures, len(episodes), blocking,
         level0_missed, leaf_res,
         forecast.predicted, forecast.residual, forecast.facts_rekey,
         forecast.rebuilt_level0, forecast.rebuilt_rollup, forecast.rebuilt_root,
-        leaf_added, leaf_removed,
+        leaf_added, leaf_removed, material_epoch_key,
     )
+    if owned_pending_attempt:
+        from hymem.dreaming.aggregation_health import (
+            complete_aggregation_build,
+            record_aggregation_build_failure,
+        )
+
+        if failures:
+            from hymem.dreaming.aggregation_health import (
+                require_pending_aggregation_attempt,
+            )
+            require_pending_aggregation_attempt(
+                conn, config_version, generation_key, attempt_token,
+                material_epoch_key=material_epoch_key,
+            )
+            record_aggregation_build_failure(
+                conn, config_version, generation_key, attempt_token,
+                fusion_failures=failures,
+                material_epoch_key=material_epoch_key,
+            )
+        else:
+            complete_aggregation_build(
+                conn, config_version, generation_key, attempt_token,
+                expected_node_count=len(rows),
+                material_epoch_key=material_epoch_key,
+                embedding_client=aggregation_embedding_client,
+            )
+    return result
 
 
 def _build_digest_levels(
     conn: sqlite3.Connection,
     items: list[dict], cfg: HyMemConfig, llm: LLMClient,
-    existing: dict[str, dict], *, anchor_facts: list[str],
+    existing: dict[str, dict], *,
+    anchor_inputs: list[AggregationInputProof], config_version: str,
+    generation_key: str,
+    material_epoch_key: str,
+    verify_generation: Callable[[], None] | None = None,
 ) -> tuple[list[dict], int, int, bool]:
     """RAPTOR rollup: recursively cluster-and-fuse the frontier `items` (each
     {"id","title","summary","vector","entities","session_ids"}) until at most
@@ -1473,14 +2563,15 @@ def _build_digest_levels(
     render as a VERIFIED FACTS block the digest prompt treats as ground truth
     over the machine-generated summaries, and the block's hash joins the root's
     cache id so a changed graph regenerates the digest. `root_failed` tells the
-    caller the root specifically failed, so it can keep the previous root row
-    instead of leaving the store digest-less until the retry heals."""
+    caller which fusion failed for diagnostics; every incomplete candidate
+    remains unpublished while prior physical rows stay available for audit and
+    exact cache reuse."""
     rows: list[dict] = []
     reused = 0
     failures = 0
     fan_in = max(2, cfg.aggregation_max_members)
-    level = 1
     while len(items) > fan_in:
+        check_current_deadline()
         # Same chaining guard as level 0: a transitive mega-component among the
         # rollup frontier would otherwise fuse from a `aggregation_max_members`
         # truncation of itself, silently dropping every thread past the cut.
@@ -1492,7 +2583,8 @@ def _build_digest_levels(
         )
         grouped: dict[int, list[dict]] = {}
         for it in items:
-            grouped.setdefault(labels[it["id"]], []).append(it)
+            cluster_key = it.get("_aggregation_cluster_key", it["id"])
+            grouped.setdefault(labels[cluster_key], []).append(it)
         # First-seen order (dict insertion follows `items` order): stable under
         # membership churn. Sorting by size reordered the whole level whenever
         # any group's size changed, re-keying unrelated parents downstream.
@@ -1524,25 +2616,27 @@ def _build_digest_levels(
 
         next_items: list[dict] = []
         for g in groups:
+            check_current_deadline()
             if len(g) < 2:
                 next_items.append(g[0])
                 continue
             member_ids = [m["id"] for m in g]
-            input_fingerprint = aggregation_input_fingerprint(g)
-            node_id = _node_id(
-                member_ids, salt=_ROLLUP_SALT,
+            inputs = tuple(m["input_proof"] for m in g)
+            input_fingerprint = aggregation_typed_input_fingerprint(inputs)
+            request = aggregation_llm_request(inputs, node_kind="rollup")
+            user_prompt = request.user
+            request_hash = aggregation_llm_request_hash(request)
+            node_id = aggregation_node_id(
+                member_ids, node_kind="rollup",
                 input_fingerprint=input_fingerprint,
+                generation_key=generation_key, request_hash=request_hash,
             )
-            sources = None
-            if all(m.get("source_provenance_complete", False) for m in g):
-                sources = combine_source_occurrences(
-                    m["source_occurrences"] for m in g
-                )
             cached = existing.get(node_id)
             fused = _reusable_fusion(
-                conn, node_id, cached,
-                input_fingerprint=input_fingerprint,
-                expected_sources=sources,
+                conn, node_id, cached, expected_inputs=inputs,
+                expected_config_version=config_version,
+                expected_generation_key=generation_key,
+                expected_request_hash=request_hash,
             )
             rollup_reused = fused is not None
             if fused is not None:
@@ -1554,99 +2648,81 @@ def _build_digest_levels(
                 # here is gone from every level above, which is exactly how a
                 # whole-store digest degrades into a recap of one topic.
                 fused = _llm_fuse(
-                    ROLLUP_USER_TEMPLATE.format(text=_items_text(g, cfg)),
+                    user_prompt,
                     llm, system=ROLLUP_SYSTEM, kind="rollup",
-                    shrink=lambda: ROLLUP_USER_TEMPLATE.format(
-                        text=_items_text(g, cfg, char_scale=0.5)),
+                    verify_generation=verify_generation,
+                    prepared_request=request,
                 )
                 if fused is None:
                     # CONTAINMENT (see the level-0 twin): the group sits this
                     # dream out rather than leaking raw members upward.
                     failures += 1
                     continue
-            session_ids: set[str] = set().union(*(m["session_ids"] for m in g))
-            rows.append({
-                "id": node_id, "title": fused["title"], "summary": fused["summary"],
-                "member_ids": member_ids, "session_ids": sorted(session_ids),
-                "level": level, "is_root": 0, "reused": rollup_reused,
-                "source_occurrences": sources,
-                "input_fingerprint": input_fingerprint,
-            })
-            next_items.append({
-                "id": node_id, "title": fused["title"], "summary": fused["summary"],
-                "vector": _centroid([m["vector"] for m in g]),
-                "entities": set().union(*(m["entities"] for m in g)),
-                "session_ids": session_ids,
-                "source_occurrences": sources or (),
-                "source_provenance_complete": sources is not None,
-                "source_manifest_hash": (
-                    source_manifest_hash(
-                        AGGREGATION_SOURCE_MANIFEST_VERSION, sources
-                    ) if sources is not None else None
-                ),
-            })
+            row = _candidate_node_row(
+                inputs=inputs, fused=fused, node_kind="rollup",
+                level=max(int(m.get("_aggregation_level", 0)) for m in g) + 1,
+                config_version=config_version, generation_key=generation_key,
+                request_hash=request_hash,
+                material_epoch_key=material_epoch_key,
+                reused=rollup_reused,
+            )
+            rows.append(row)
+            next_items.append(_node_frontier_item(
+                row, vector=_centroid([m["vector"] for m in g]),
+                entities=set().union(*(m["entities"] for m in g)),
+            ))
         if len(next_items) >= len(items):    # no progress (fusions all failed)
             items = next_items
             break
         items = next_items
-        level += 1
 
     if not items:
         return rows, reused, failures, False
     member_ids = [m["id"] for m in items]
-    # The VERIFIED FACTS anchor is part of the root's INPUT, so it joins the
-    # cache key: a changed graph (new fact, supersession) regenerates the
-    # digest even when the tree's membership is unchanged — at most one extra
-    # LLM call per dream, and the price of NOT doing it is a digest pinned to
-    # stale ground truth.
-    facts_block = "\n".join(f"- {f}" for f in anchor_facts) if anchor_facts else "(none)"
-    facts_hash = hashlib.sha1(facts_block.encode("utf-8")).hexdigest()[:12]
-    input_fingerprint = aggregation_input_fingerprint(
-        items, extra_inputs=(facts_block,)
+    # Every effective fact is now a typed authoritative input with its own
+    # exact occurrence manifest. Invalid anchors were excluded before prompt
+    # construction and therefore cannot become unsourced model material.
+    facts_block = (
+        "\n".join(f"- {item.rendered_text}" for item in anchor_inputs)
+        if anchor_inputs else "(none)"
     )
-    root_id = _node_id(
-        member_ids, salt=f"{_ROOT_SALT}|{facts_hash}",
-        input_fingerprint=input_fingerprint,
+    inputs = tuple(
+        [item["input_proof"] for item in items] + list(anchor_inputs)
     )
-    # The verified-facts block currently returns rendered strings, not a source
-    # manifest. Never attest only the tree leaves when additional graph/profile
-    # claims entered the effective prompt. A future typed anchor DTO can make
-    # this complete; until then roots with anchors are explicitly quarantined.
-    root_sources = None
-    if not anchor_facts and all(
-        item.get("source_provenance_complete", False) for item in items
-    ):
-        root_sources = combine_source_occurrences(
-            item["source_occurrences"] for item in items
-        )
+    input_fingerprint = aggregation_typed_input_fingerprint(inputs)
+    request = aggregation_llm_request(inputs, node_kind="root")
+    user_prompt = request.user
+    request_hash = aggregation_llm_request_hash(request)
+    root_id = aggregation_node_id(
+        member_ids, node_kind="root", input_fingerprint=input_fingerprint,
+        generation_key=generation_key, request_hash=request_hash,
+    )
     cached = existing.get(root_id)
     fused = _reusable_fusion(
-        conn, root_id, cached,
-        input_fingerprint=input_fingerprint,
-        expected_sources=root_sources,
+        conn, root_id, cached, expected_inputs=inputs,
+        expected_config_version=config_version,
+        expected_generation_key=generation_key,
+        expected_request_hash=request_hash,
     )
     root_reused = fused is not None
     if fused is not None:
         reused += 1
     else:
         fused = _llm_fuse(
-            DIGEST_USER_TEMPLATE.format(facts=facts_block,
-                                        text=_items_text(items, cfg)),
+            user_prompt,
             llm, system=DIGEST_SYSTEM, kind="root",
-            shrink=lambda: DIGEST_USER_TEMPLATE.format(
-                facts=facts_block,
-                text=_items_text(items, cfg, char_scale=0.5)),
+            verify_generation=verify_generation,
+            prepared_request=request,
         )
     if fused is None:
         return rows, reused, failures + 1, True
-    session_ids = sorted(set().union(*(m["session_ids"] for m in items)))
-    rows.append({
-        "id": root_id, "title": fused["title"], "summary": fused["summary"],
-        "member_ids": member_ids, "session_ids": session_ids,
-        "level": level, "is_root": 1, "reused": root_reused,
-        "source_occurrences": root_sources,
-        "input_fingerprint": input_fingerprint,
-    })
+    rows.append(_candidate_node_row(
+        inputs=inputs, fused=fused, node_kind="root",
+        level=max(int(item.get("_aggregation_level", 0)) for item in items) + 1,
+        config_version=config_version, generation_key=generation_key,
+        request_hash=request_hash, material_epoch_key=material_epoch_key,
+        reused=root_reused,
+    ))
     return rows, reused, failures, False
 
 
@@ -1684,29 +2760,62 @@ class Digest:
         return f"## {self.title}\n\n{self.summary}\n\n{footer}"
 
 
-def load_digest(conn: sqlite3.Connection) -> Digest | None:
+def load_digest(
+    conn: sqlite3.Connection, *, expected_config_version: str | None = None,
+    expected_cluster_min_members: int | None = None,
+    expected_cluster_min_sessions: int | None = None,
+    expected_anchor_fact_cap: int | None = None,
+    expected_generation_key: str | None = None,
+    embedding_client: EmbeddingClient | None = None,
+) -> Digest | None:
     """Return the current root digest, or None when the aggregation layer is
     disabled, has not dreamed yet, or the store has no episodes. Read-only."""
-    row = conn.execute(
-        """
-        SELECT id, title, summary, n_sessions, created_at
-        FROM aggregation_nodes
-        WHERE is_root = 1
-        ORDER BY created_at DESC, id
-        LIMIT 1
-        """
-    ).fetchone()
-    if row is None:
+    owned_snapshot = not conn.in_transaction
+    try:
+        if owned_snapshot:
+            conn.execute("BEGIN")
+        publication = load_current_aggregation_publication(
+            conn, expected_config_version=expected_config_version,
+            expected_cluster_min_members=expected_cluster_min_members,
+            expected_cluster_min_sessions=expected_cluster_min_sessions,
+            expected_anchor_fact_cap=expected_anchor_fact_cap,
+            expected_generation_key=expected_generation_key,
+            embedding_client=embedding_client,
+        )
+        if publication is None or publication.root_node_id is None:
+            result = None
+        else:
+            proof = publication.nodes.get(publication.root_node_id)
+            if proof is None:
+                result = None
+            else:
+                row = proof.row
+                total = conn.execute(
+                    "SELECT COUNT(*) AS c FROM sessions"
+                ).fetchone()["c"]
+                result = Digest(
+                    title=row["title"], summary=row["summary"],
+                    n_sessions=row["n_sessions"], n_sessions_total=int(total),
+                    generated_at=publication.published_at, node_id=row["id"],
+                )
+        if owned_snapshot:
+            conn.execute("COMMIT")
+            if result is not None:
+                current = load_current_aggregation_publication(
+                    conn, expected_config_version=expected_config_version,
+                    expected_cluster_min_members=expected_cluster_min_members,
+                    expected_cluster_min_sessions=expected_cluster_min_sessions,
+                    expected_anchor_fact_cap=expected_anchor_fact_cap,
+                    expected_generation_key=expected_generation_key,
+                    embedding_client=embedding_client,
+                )
+                if current is None or current.root_node_id != result.node_id:
+                    result = None
+        return result
+    except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+        if owned_snapshot and conn.in_transaction:
+            conn.execute("ROLLBACK")
         return None
-    total = conn.execute("SELECT COUNT(*) AS c FROM sessions").fetchone()["c"]
-    return Digest(
-        title=row["title"],
-        summary=row["summary"],
-        n_sessions=row["n_sessions"],
-        n_sessions_total=int(total),
-        generated_at=row["created_at"] or "",
-        node_id=row["id"],
-    )
 
 
 @dataclass
@@ -1723,11 +2832,22 @@ class NodeChild:
 
 
 @dataclass
+class NodeSourceOccurrence:
+    """Public, lightweight coordinate for one exact aggregation source."""
+
+    message_id: int
+    session_id: str
+    source_peer_id: str | None
+    source_workspace_id: str | None
+
+
+@dataclass
 class NodeMemberEpisode:
     """A leaf inside a `NodeExpansion`: the per-session episode whose summary
-    fed the node's fusion. `start_message_id`/`end_message_id` bound the raw
-    turns it condenses, so a host can jump from any digest claim all the way
-    down to the original conversation."""
+    fed the node's fusion. `source_occurrences` / `source_message_ids` are the
+    exact ordered proof coordinates. `start_message_id`/`end_message_id` are a
+    compatibility envelope derived from those coordinates, never trusted from
+    the mutable episode range metadata."""
 
     id: str
     session_id: str
@@ -1735,6 +2855,8 @@ class NodeMemberEpisode:
     summary: str
     start_message_id: int
     end_message_id: int
+    source_message_ids: tuple[int, ...]
+    source_occurrences: tuple[NodeSourceOccurrence, ...]
 
 
 @dataclass
@@ -1743,10 +2865,10 @@ class NodeExpansion:
     the node itself plus its members, resolved one level down. Members of a
     level >= 1 node are a mix of child nodes and pass-through episodes (leaves
     no cluster absorbed); level-0 members are episodes only. Member order is
-    the persisted fusion-input order. `missing_member_ids` keeps the read
-    honest instead of silently shrinking: ids that resolved to neither a node
-    nor an episode (should not happen — nodes are rebuilt atomically each
-    dream — so anything here indicates store surgery)."""
+    the persisted fusion-input order. `missing_member_ids` is retained for API
+    compatibility and is empty on every successful v55 expansion: a missing,
+    malformed, or type-confused member invalidates the publication and the
+    expansion fails closed instead of returning a partial tree."""
 
     id: str
     title: str
@@ -1758,77 +2880,112 @@ class NodeExpansion:
     missing_member_ids: list[str]
 
 
-def expand_node(conn: sqlite3.Connection, node_id: str) -> NodeExpansion | None:
+def expand_node(
+    conn: sqlite3.Connection, node_id: str, *,
+    expected_config_version: str | None = None,
+    expected_cluster_min_members: int | None = None,
+    expected_cluster_min_sessions: int | None = None,
+    expected_anchor_fact_cap: int | None = None,
+    expected_generation_key: str | None = None,
+    embedding_client: EmbeddingClient | None = None,
+) -> NodeExpansion | None:
     """Resolve an aggregation node's members one level down — the Stage-4b
     drill-down behind "why does my digest say X?". Start from
     `Digest.node_id` (the root) or an `AggregationNodeHit.node_id` from the
     query tier, and recurse through `child_nodes` until everything is
     episodes. Returns None for an unknown id. Read-only; per-member point
     lookups (members are capped at fusion time, so the fan-out is small)."""
-    row = conn.execute(
-        """
-        SELECT id, title, summary, level, is_root, member_episode_ids
-        FROM aggregation_nodes
-        WHERE id = ?
-        """,
-        (node_id,),
-    ).fetchone()
-    if row is None:
+    owned_snapshot = not conn.in_transaction
+    try:
+        if owned_snapshot:
+            conn.execute("BEGIN")
+        publication = load_current_aggregation_publication(
+            conn, expected_config_version=expected_config_version,
+            expected_cluster_min_members=expected_cluster_min_members,
+            expected_cluster_min_sessions=expected_cluster_min_sessions,
+            expected_anchor_fact_cap=expected_anchor_fact_cap,
+            expected_generation_key=expected_generation_key,
+            embedding_client=embedding_client,
+        )
+        proof = publication.nodes.get(node_id) if publication is not None else None
+        if proof is None:
+            result = None
+        else:
+            row = proof.row
+            child_nodes: list[NodeChild] = []
+            episodes: list[NodeMemberEpisode] = []
+            for item in proof.inputs:
+                if item.kind == "aggregation_node":
+                    child = publication.nodes.get(str(item.source_ref["id"]))
+                    if child is None:
+                        result = None
+                        break
+                    child_nodes.append(NodeChild(
+                        id=str(child.row["id"]), title=str(child.row["title"]),
+                        summary=str(child.row["summary"]),
+                        level=int(child.row["level"]),
+                        n_members=int(child.row["n_members"]),
+                        n_sessions=int(child.row["n_sessions"]),
+                    ))
+                elif item.kind == "episode":
+                    ep_row = conn.execute(
+                        "SELECT e.id,e.session_id,e.title,e.summary FROM episodes e "
+                        "JOIN sessions s ON s.id=e.session_id WHERE e.id=? AND "
+                        "(e.digest_generation IS NULL OR "
+                        "e.digest_generation=s.digest_published_generation)",
+                        (item.source_ref["id"],),
+                    ).fetchone()
+                    if ep_row is None:
+                        result = None
+                        break
+                    source_coordinates = tuple(
+                        NodeSourceOccurrence(
+                            message_id=source.message_id,
+                            session_id=source.session_id,
+                            source_peer_id=source.source_peer_id,
+                            source_workspace_id=source.source_workspace_id,
+                        )
+                        for source in item.occurrences
+                    )
+                    source_ids = tuple(
+                        source.message_id for source in source_coordinates
+                    )
+                    episodes.append(NodeMemberEpisode(
+                        id=ep_row["id"], session_id=ep_row["session_id"],
+                        title=ep_row["title"], summary=ep_row["summary"],
+                        start_message_id=source_ids[0],
+                        end_message_id=source_ids[-1],
+                        source_message_ids=source_ids,
+                        source_occurrences=source_coordinates,
+                    ))
+            else:
+                result = NodeExpansion(
+                    id=str(row["id"]), title=str(row["title"]),
+                    summary=str(row["summary"]), level=int(row["level"]),
+                    is_root=bool(row["is_root"]), child_nodes=child_nodes,
+                    episodes=episodes, missing_member_ids=[],
+                )
+        if owned_snapshot:
+            conn.execute("COMMIT")
+            if result is not None and publication is not None:
+                current = load_current_aggregation_publication(
+                    conn,
+                    expected_config_version=expected_config_version,
+                    expected_cluster_min_members=expected_cluster_min_members,
+                    expected_cluster_min_sessions=expected_cluster_min_sessions,
+                    expected_anchor_fact_cap=expected_anchor_fact_cap,
+                    expected_generation_key=expected_generation_key,
+                    expected_material_epoch_key=publication.material_epoch_key,
+                    embedding_client=embedding_client,
+                )
+                if (
+                    current is None
+                    or current.publication_id != publication.publication_id
+                    or node_id not in current.nodes
+                ):
+                    result = None
+        return result
+    except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+        if owned_snapshot and conn.in_transaction:
+            conn.execute("ROLLBACK")
         return None
-
-    child_nodes: list[NodeChild] = []
-    episodes: list[NodeMemberEpisode] = []
-    missing: list[str] = []
-    for member_id in json.loads(row["member_episode_ids"]):
-        node_row = conn.execute(
-            """
-            SELECT id, title, summary, level, n_members, n_sessions
-            FROM aggregation_nodes
-            WHERE id = ?
-            """,
-            (member_id,),
-        ).fetchone()
-        if node_row is not None:
-            child_nodes.append(NodeChild(
-                id=node_row["id"],
-                title=node_row["title"],
-                summary=node_row["summary"],
-                level=node_row["level"],
-                n_members=node_row["n_members"],
-                n_sessions=node_row["n_sessions"],
-            ))
-            continue
-        ep_row = conn.execute(
-            """
-            SELECT e.id, e.session_id, e.title, e.summary,
-                   e.start_message_id, e.end_message_id
-            FROM episodes e
-            JOIN sessions s ON s.id = e.session_id
-            WHERE e.id = ?
-              AND (e.digest_generation IS NULL
-                   OR e.digest_generation = s.digest_published_generation)
-            """,
-            (member_id,),
-        ).fetchone()
-        if ep_row is not None:
-            episodes.append(NodeMemberEpisode(
-                id=ep_row["id"],
-                session_id=ep_row["session_id"],
-                title=ep_row["title"],
-                summary=ep_row["summary"],
-                start_message_id=ep_row["start_message_id"],
-                end_message_id=ep_row["end_message_id"],
-            ))
-            continue
-        missing.append(member_id)
-
-    return NodeExpansion(
-        id=row["id"],
-        title=row["title"],
-        summary=row["summary"],
-        level=row["level"],
-        is_root=bool(row["is_root"]),
-        child_nodes=child_nodes,
-        episodes=episodes,
-        missing_member_ids=missing,
-    )

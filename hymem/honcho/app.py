@@ -39,7 +39,11 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("pip install 'hymem[server]'") from exc
 
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
-from hymem.bootstrap import get_instance as _get_hy, set_instance as set_hy
+from hymem.bootstrap import (
+    get_instance as _get_hy,
+    set_instance as set_hy,
+    shutdown_instance as _shutdown_hy,
+)
 from hymem.core import db as core_db
 from hymem import session as session_log
 from hymem.dreaming.lossless import (
@@ -360,8 +364,27 @@ def _get_scheduler() -> DreamScheduler:
     test entry points (TestClient) that bypass startup events."""
     global _scheduler
     if _scheduler is None:
-        _scheduler = DreamScheduler(_get_hy(), _DREAM_COOLDOWN_SECONDS)
-        _scheduler.start()
+        candidate = DreamScheduler(_get_hy(), _DREAM_COOLDOWN_SECONDS)
+        try:
+            candidate.start()
+        except BaseException as primary:
+            # DreamScheduler rolls back its fork on ordinary startup failure.
+            # Retry its stop path here so custom/thread implementations cannot
+            # strand a partially started worker when lifespan startup aborts.
+            try:
+                candidate.stop()
+            except BaseException as cleanup:
+                try:
+                    primary.add_note(
+                        "dream scheduler startup rollback failed: "
+                        f"{type(cleanup).__name__}"
+                    )
+                except (AttributeError, TypeError):  # pragma: no cover
+                    pass
+            if bool(getattr(candidate, "shutdown_pending", False)):
+                _scheduler = candidate
+            raise
+        _scheduler = candidate
     return _scheduler
 
 
@@ -372,18 +395,44 @@ def set_scheduler(scheduler: DreamScheduler | None) -> None:
     _scheduler = scheduler
 
 
+def _stop_scheduler() -> None:
+    """Stop the owned worker, retaining it globally until cleanup succeeds."""
+
+    global _scheduler
+    scheduler = _scheduler
+    if scheduler is None:
+        return
+    scheduler.stop()
+    _scheduler = None
+
+
+def _add_lifecycle_note(primary: BaseException, cleanup: BaseException) -> None:
+    try:
+        primary.add_note(
+            f"HyMem server lifecycle cleanup failed: {type(cleanup).__name__}"
+        )
+    except (AttributeError, TypeError):  # pragma: no cover
+        pass
+
+
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    _get_scheduler()
+    primary: BaseException | None = None
     try:
+        _get_scheduler()
         yield
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        global _scheduler
-        if _scheduler is not None:
-            _scheduler.stop()
-            _scheduler = None
+        try:
+            _shutdown_hy(stop_background=_stop_scheduler)
+        except BaseException as cleanup:
+            if primary is None:
+                raise
+            _add_lifecycle_note(primary, cleanup)
 
 
 app = FastAPI(title="HyMem Honcho-compatible server", version="1.0.0", lifespan=_lifespan)
@@ -399,7 +448,8 @@ def dream_status() -> dict:
     """Operator visibility into the re-extraction backlog.
 
     Not workspace-scoped — dreaming is global to the HyMem instance, like
-    `/health`. Wraps `hy.dream_status()` (pure SQL, no LLM) so an operator can
+    `/health`. Wraps `hy.dream_status()` (coherent read-only SQLite snapshot,
+    no LLM) so an operator can
     see how many chunks are pending for the current prompt_version, whether a
     dream is in progress, and the last dream's outcome — making the surge after
     a prompt_version bump transparent rather than mysterious.
@@ -2290,7 +2340,21 @@ def peer_chat(workspace_id: str, peer_id: str, body: ChatRequest):
 def main() -> None:
     host = os.environ.get("HYMEM_HONCHO_HOST", "127.0.0.1")
     port = int(os.environ.get("HYMEM_HONCHO_PORT", "8765"))
-    uvicorn.run("hymem.honcho.app:app", host=host, port=port, log_level="info")
+    primary: BaseException | None = None
+    try:
+        uvicorn.run("hymem.honcho.app:app", host=host, port=port, log_level="info")
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        # Normally the ASGI lifespan already performed this. The entry-point
+        # guard also covers uvicorn failures before lifespan startup/teardown.
+        try:
+            _shutdown_hy(stop_background=_stop_scheduler)
+        except BaseException as cleanup:
+            if primary is None:
+                raise
+            _add_lifecycle_note(primary, cleanup)
 
 
 if __name__ == "__main__":

@@ -156,11 +156,14 @@ CREATE TABLE IF NOT EXISTS runs (
     evaluator_sha256           TEXT,
     reader_provider            TEXT,
     reader_base_url            TEXT,
+    reader_endpoint_sha256     TEXT,
     judge_provider             TEXT,
     judge_base_url             TEXT,
+    judge_endpoint_sha256      TEXT,
     pipeline_provider          TEXT,
     pipeline_model             TEXT,
     pipeline_base_url          TEXT,
+    pipeline_endpoint_sha256   TEXT,
     embedding_backend          TEXT,
     embedding_model            TEXT,
     embedding_base_url         TEXT,
@@ -191,9 +194,11 @@ ADDITIVE_COLUMNS = {
     "dataset_sha256": "TEXT", "source_ids_hash": "TEXT",
     "evaluator_commit": "TEXT", "evaluator_sha256": "TEXT",
     "reader_provider": "TEXT", "reader_base_url": "TEXT",
+    "reader_endpoint_sha256": "TEXT",
     "judge_provider": "TEXT", "judge_base_url": "TEXT",
+    "judge_endpoint_sha256": "TEXT",
     "pipeline_provider": "TEXT", "pipeline_model": "TEXT",
-    "pipeline_base_url": "TEXT",
+    "pipeline_base_url": "TEXT", "pipeline_endpoint_sha256": "TEXT",
     "embedding_backend": "TEXT", "embedding_model": "TEXT",
     "embedding_base_url": "TEXT",
     "embedding_dimension": "INTEGER", "embedding_quality": "TEXT",
@@ -689,15 +694,33 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         "evaluator_commit": cfg.get("evaluator_commit") if strict else None,
         "evaluator_sha256": cfg.get("evaluator_sha256") if strict else None,
         "reader_provider": reader_model.get("provider") if strict else None,
-        "reader_base_url": reader_model.get("base_url") if strict else None,
+        "reader_base_url": reader_model.get("endpoint_origin") if strict else None,
+        "reader_endpoint_sha256": (
+            reader_model.get("endpoint_sha256") if strict else None
+        ),
         "judge_provider": judge_model.get("provider") if strict else None,
-        "judge_base_url": judge_model.get("base_url") if strict else None,
+        "judge_base_url": judge_model.get("endpoint_origin") if strict else None,
+        "judge_endpoint_sha256": (
+            judge_model.get("endpoint_sha256") if strict else None
+        ),
         "pipeline_provider": pipeline_model.get("provider") if strict else None,
         "pipeline_model": pipeline_model.get("model") if strict else None,
-        "pipeline_base_url": pipeline_model.get("base_url") if strict else None,
+        "pipeline_base_url": (
+            pipeline_model.get("endpoint_origin") if strict else None
+        ),
+        "pipeline_endpoint_sha256": (
+            pipeline_model.get("endpoint_sha256") if strict else None
+        ),
         "embedding_backend": embedding.get("backend") if strict else None,
-        "embedding_model": embedding.get("model") if strict else None,
-        "embedding_base_url": embedding.get("base_url") if strict else None,
+        "embedding_model": (
+            embedding.get("vector_space_key") if strict else None
+        ),
+        "embedding_base_url": (
+            (embedding.get("producer_binding") or {}).get("declaration", {}).get(
+                "endpoint_origin"
+            )
+            if strict else None
+        ),
         "embedding_dimension": embedding.get("dimension") if strict else None,
         "embedding_quality": embedding.get("quality") if strict else None,
         "embedding_network_free": _to_int(

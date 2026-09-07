@@ -5,7 +5,9 @@ from hymem.dreaming.aggregate import (
     NodeChild,
     NodeExpansion,
     NodeMemberEpisode,
+    NodeSourceOccurrence,
 )
+from hymem.dreaming.runner import DreamLeaseLost
 from hymem.dreaming.user_profile import ProfileEntry
 from hymem.extraction.embeddings import (
     EmbeddingClient,
@@ -34,9 +36,11 @@ __all__ = [
     "pack_context",
     "AsOfGraphFact",
     "Digest",
+    "DreamLeaseLost",
     "NodeChild",
     "NodeExpansion",
     "NodeMemberEpisode",
+    "NodeSourceOccurrence",
     "ProfileEntry",
     "GraphEvidenceCitation",
     "LLMClient",

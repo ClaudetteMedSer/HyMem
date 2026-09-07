@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import unicodedata
@@ -12,7 +13,10 @@ from hymem.core.time import (
 )
 
 # Strip leading articles, trailing parentheticals like "(container)", and
-# punctuation. Lowercase. ASCII-fold. Collapse whitespace and underscores.
+# punctuation. Lowercase. ASCII-fold Latin surfaces and collapse whitespace
+# and underscores.  If that projection has no token at all, retain a bounded
+# NFKC/casefolded Unicode token instead of collapsing every non-Latin surface
+# onto the empty alias key.
 # Articles cover common Latin-script European languages; this runs after the
 # string is already lowercased and accent-folded.
 _LEADING_ARTICLES = re.compile(
@@ -28,6 +32,8 @@ _LEADING_ARTICLES = re.compile(
 )
 _TRAILING_PAREN = re.compile(r"\s*\([^)]*\)\s*$")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_NON_UNICODE_WORD = re.compile(r"[\W_]+", re.UNICODE)
+_MAX_UNICODE_CANONICAL_CHARS = 512
 
 
 def normalize(surface: str) -> str:
@@ -39,7 +45,21 @@ def normalize(surface: str) -> str:
     s = _TRAILING_PAREN.sub("", s)
     s = _LEADING_ARTICLES.sub("", s)
     s = _NON_ALNUM.sub("_", s).strip("_")
-    return s
+    if s:
+        return s
+
+    # ASCII-only behavior above stays byte-for-byte stable.  This fallback is
+    # solely for surfaces that previously collapsed to ``""`` (CJK, Cyrillic,
+    # Arabic, and similar scripts). NFKC removes compatibility spellings,
+    # casefold makes casing deterministic, and every punctuation/control run
+    # is a separator. Oversized values fail closed rather than truncating two
+    # distinct identities onto the same key.
+    unicode_key = _NON_UNICODE_WORD.sub(
+        "_", unicodedata.normalize("NFKC", surface).casefold()
+    ).strip("_")
+    if len(unicode_key) > _MAX_UNICODE_CANONICAL_CHARS:
+        return ""
+    return unicode_key
 
 
 def resolve(conn: sqlite3.Connection, surface: str) -> str:
@@ -52,10 +72,78 @@ def resolve(conn: sqlite3.Connection, surface: str) -> str:
 
 
 def register_alias(conn: sqlite3.Connection, surface: str, canonical: str) -> None:
-    """Map an additional surface form onto an existing canonical id."""
+    """Map a pure surface form onto an existing canonical id.
+
+    If the normalized surface already owns canonical state, this operation
+    would strand that state behind the new alias because ``resolve`` is
+    intentionally one hop.  Such identity changes must use :func:`merge`,
+    which rewrites and re-hashes every provenance-bearing domain.
+    """
+    if not isinstance(surface, str) or not isinstance(canonical, str):
+        raise ValueError("entity alias and canonical must be strings")
+    alias = normalize(surface)
+    if not alias:
+        raise ValueError("entity alias must not be empty")
+    if not canonical.strip() or normalize(canonical) != canonical:
+        raise ValueError("alias target must be a normalized canonical identity")
+    chained = conn.execute(
+        "SELECT canonical FROM entity_aliases WHERE alias=?", (canonical,),
+    ).fetchone()
+    if chained is not None and str(chained["canonical"]) != canonical:
+        raise ValueError("alias target must not itself be an alias")
+    existing_alias = conn.execute(
+        "SELECT canonical FROM entity_aliases WHERE alias=?", (alias,),
+    ).fetchone()
+    if (
+        existing_alias is not None
+        and str(existing_alias["canonical"]) != canonical
+    ):
+        raise ValueError("entity alias already maps to another canonical identity")
+    if alias != canonical:
+        owned = False
+        scalar_owners = (
+            ("entity_aliases", "canonical"),
+            ("entity_types", "entity_canonical"),
+            ("entity_properties", "entity_canonical"),
+            ("entity_type_observations", "entity_canonical"),
+            ("entity_property_observations", "entity_canonical"),
+            ("entity_mention_observations", "entity_canonical"),
+            ("entity_mentions", "entity_canonical"),
+            ("knowledge_graph", "subject_canonical"),
+            ("knowledge_graph", "object_canonical"),
+        )
+        for table, column in scalar_owners:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone() is None:
+                continue
+            if conn.execute(
+                f"SELECT 1 FROM {table} WHERE {column}=? LIMIT 1", (alias,),
+            ).fetchone() is not None:
+                owned = True
+                break
+        if not owned and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rules'"
+        ).fetchone() is not None:
+            for row in conn.execute(
+                "SELECT trigger_entities FROM rules WHERE scope='contextual'"
+            ).fetchall():
+                try:
+                    triggers = json.loads(row["trigger_entities"])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(triggers, list) and alias in triggers:
+                    owned = True
+                    break
+        if owned:
+            raise ValueError(
+                f"canonical identity {alias!r} already owns state; "
+                "use merge_canonical/merge"
+            )
     conn.execute(
         "INSERT OR REPLACE INTO entity_aliases(alias, canonical) VALUES (?, ?)",
-        (normalize(surface), canonical),
+        (alias, canonical),
     )
 
 
@@ -85,6 +173,40 @@ def find_canonical_drift(conn: sqlite3.Connection) -> list[tuple[str, str]]:
             v = row["v"]
             if v != normalize(v):
                 findings.append((location, v))
+    for table, column in (
+        ("entity_types", "entity_canonical"),
+        ("entity_properties", "entity_canonical"),
+        ("entity_type_observations", "entity_canonical"),
+        ("entity_property_observations", "entity_canonical"),
+        ("entity_mention_observations", "entity_canonical"),
+        ("entity_mentions", "entity_canonical"),
+    ):
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone() is None:
+            continue
+        for row in conn.execute(
+            f"SELECT DISTINCT {column} AS v FROM {table}"
+        ).fetchall():
+            value = row["v"]
+            if value != normalize(value):
+                findings.append((f"{table}.{column}", value))
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rules'"
+    ).fetchone() is not None:
+        for row in conn.execute(
+            "SELECT trigger_entities FROM rules WHERE scope='contextual'"
+        ).fetchall():
+            try:
+                triggers = json.loads(row["trigger_entities"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(triggers, list):
+                continue
+            for value in triggers:
+                if isinstance(value, str) and value != normalize(value):
+                    findings.append(("rules.trigger_entities", value))
     return findings
 
 
@@ -113,9 +235,16 @@ def repair_canonical_drift(conn: sqlite3.Connection) -> list[dict]:
             if v != normalize(v):
                 drifted_canonicals.add(v)
 
+    # V54 auxiliary ledgers and contextual rule triggers can be the only
+    # remaining owner of a canonical identity. Finder coverage without seeding
+    # those values here reported drift that repair could never actually reach.
+    for location, value in find_canonical_drift(conn):
+        if location != "entity_aliases.alias" and value != normalize(value):
+            drifted_canonicals.add(value)
+
     for drift in sorted(drifted_canonicals):
         target = normalize(drift)
-        merge(conn, keep=target, drop=drift)
+        merge(conn, keep=target, drop=drift, _allow_legacy_drop=True)
         # merge() preserves the drifted surface form as an alias key. We don't
         # want un-normalized alias keys in the table — drop that artifact.
         conn.execute("DELETE FROM entity_aliases WHERE alias = ?", (drift,))
@@ -143,13 +272,54 @@ def repair_canonical_drift(conn: sqlite3.Connection) -> list[dict]:
     return fixes
 
 
-def merge(conn: sqlite3.Connection, keep: str, drop: str) -> None:
+def merge(
+    conn: sqlite3.Connection,
+    keep: str,
+    drop: str,
+    *,
+    _allow_legacy_drop: bool = False,
+) -> None:
     """Fold all edges and aliases referencing `drop` into `keep`.
 
     Caller is responsible for being inside a transaction.
     """
+    if not isinstance(keep, str) or not isinstance(drop, str):
+        raise ValueError("canonical identities must be strings")
+    if not keep.strip() or normalize(keep) != keep:
+        raise ValueError("merge identities must be normalized canonical values")
+    if (
+        not _allow_legacy_drop
+        and (not drop.strip() or normalize(drop) != drop)
+    ):
+        raise ValueError("merge identities must be normalized canonical values")
     if keep == drop:
         return
+
+    # Two explicit user assertions are equal authority.  A differing value is
+    # therefore a real semantic conflict, not something the arbitrary
+    # keep/drop direction may resolve.  Detect it before touching aliases,
+    # observations, rules, or graph state so callers without an outer
+    # transaction also fail without a partial merge.
+    property_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(entity_properties)").fetchall()
+    }
+    if {"entity_canonical", "key", "value", "origin"}.issubset(
+        property_columns
+    ):
+        conflict = conn.execute(
+            "SELECT kept.key FROM entity_properties kept "
+            "JOIN entity_properties dropped ON dropped.key=kept.key "
+            "WHERE kept.entity_canonical=? AND dropped.entity_canonical=? "
+            "AND kept.origin='user' AND dropped.origin='user' "
+            "AND kept.value<>dropped.value LIMIT 1",
+            (keep, drop),
+        ).fetchone()
+        if conflict is not None:
+            raise ValueError(
+                "cannot merge conflicting manual entity property "
+                f"{conflict['key']!r}"
+            )
 
     conn.execute(
         "UPDATE OR IGNORE entity_aliases SET canonical = ? WHERE canonical = ?",
@@ -159,6 +329,219 @@ def merge(conn: sqlite3.Connection, keep: str, drop: str) -> None:
         "INSERT OR REPLACE INTO entity_aliases(alias, canonical) VALUES (?, ?)",
         (drop, keep),
     )
+
+    # Entity hints are source-owned publications too.  Move their observation
+    # identities under the same explicit canonical merge and rehash every
+    # affected auxiliary outcome below.  Older stores simply lack these tables.
+    auxiliary_identities: list[tuple[str, str]] = []
+    auxiliary_tables = {
+        "entity_type_observations": {
+            "chunk_id", "entity_canonical", "type", "confidence",
+            "phase1_generation_key", "observed_at",
+        },
+        "entity_property_observations": {
+            "chunk_id", "entity_canonical", "key", "value",
+            "phase1_generation_key", "observed_at",
+        },
+        "entity_mention_observations": {
+            "chunk_id", "entity_canonical", "phase1_generation_key",
+            "observed_at",
+        },
+        "phase1_auxiliary_outcomes": {
+            "chunk_id", "phase1_generation_key", "result_hash",
+        },
+    }
+    auxiliary_shape = all(
+        required.issubset({
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        })
+        for table, required in auxiliary_tables.items()
+    )
+    if auxiliary_shape:
+        auxiliary_identities = [
+            (str(row["chunk_id"]), str(row["phase1_generation_key"]))
+            for row in conn.execute(
+                "SELECT DISTINCT chunk_id,phase1_generation_key "
+                "FROM entity_type_observations WHERE entity_canonical=? "
+                "UNION SELECT DISTINCT chunk_id,phase1_generation_key "
+                "FROM entity_property_observations WHERE entity_canonical=? "
+                "UNION SELECT DISTINCT chunk_id,phase1_generation_key "
+                "FROM entity_mention_observations WHERE entity_canonical=?",
+                (drop, drop, drop),
+            ).fetchall()
+        ]
+        from hymem.core.db import evidence_mutation
+
+        with evidence_mutation(conn):
+            conn.execute(
+                "INSERT INTO entity_type_observations("
+                "chunk_id,entity_canonical,type,confidence,"
+                "phase1_generation_key,observed_at) "
+                "SELECT chunk_id,?,type,confidence,phase1_generation_key,"
+                "observed_at FROM entity_type_observations "
+                "WHERE entity_canonical=? AND 1 "
+                "ON CONFLICT(chunk_id,entity_canonical,type,"
+                "phase1_generation_key) DO UPDATE SET "
+                "confidence=MAX(entity_type_observations.confidence,"
+                "excluded.confidence)",
+                (keep, drop),
+            )
+            conn.execute(
+                "DELETE FROM entity_type_observations WHERE entity_canonical=?",
+                (drop,),
+            )
+            property_rows = conn.execute(
+                "SELECT chunk_id,key,value,phase1_generation_key,observed_at "
+                "FROM entity_property_observations WHERE entity_canonical=? "
+                "ORDER BY chunk_id,phase1_generation_key,key",
+                (drop,),
+            ).fetchall()
+            for row in property_rows:
+                identity = (
+                    row["chunk_id"], keep, row["key"],
+                    row["phase1_generation_key"],
+                )
+                existing = conn.execute(
+                    "SELECT value,observed_at FROM "
+                    "entity_property_observations WHERE chunk_id=? "
+                    "AND entity_canonical=? AND key=? "
+                    "AND phase1_generation_key=?",
+                    identity,
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO entity_property_observations("
+                        "chunk_id,entity_canonical,key,value,"
+                        "phase1_generation_key,observed_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            row["chunk_id"], keep, row["key"], row["value"],
+                            row["phase1_generation_key"], row["observed_at"],
+                        ),
+                    )
+                elif existing["value"] != row["value"]:
+                    # A post-extraction alias merge exposed an ambiguity that a
+                    # fresh extraction under the alias map would have omitted.
+                    # Preserve that equivalence; never invent a lexical winner.
+                    conn.execute(
+                        "DELETE FROM entity_property_observations "
+                        "WHERE chunk_id=? AND entity_canonical=? AND key=? "
+                        "AND phase1_generation_key=?",
+                        identity,
+                    )
+            conn.execute(
+                "DELETE FROM entity_property_observations "
+                "WHERE entity_canonical=?", (drop,)
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO entity_mention_observations("
+                "chunk_id,entity_canonical,phase1_generation_key,observed_at) "
+                "SELECT chunk_id,?,phase1_generation_key,observed_at "
+                "FROM entity_mention_observations WHERE entity_canonical=?",
+                (keep, drop),
+            )
+            conn.execute(
+                "DELETE FROM entity_mention_observations "
+                "WHERE entity_canonical=?", (drop,)
+            )
+
+    # Compatibility/manual projections use explicit origin; NULL source_chunk
+    # is never interpreted as manual.  A user row wins any collision.
+    try:
+        for row in conn.execute(
+            "SELECT type,confidence,source_chunk_id,origin FROM entity_types "
+            "WHERE entity_canonical=?",
+            (drop,),
+        ).fetchall():
+            existing = conn.execute(
+                "SELECT confidence,source_chunk_id,origin FROM entity_types "
+                "WHERE entity_canonical=? AND type=?",
+                (keep, row["type"]),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO entity_types(entity_canonical,type,confidence,"
+                    "source_chunk_id,origin) VALUES (?,?,?,?,?)",
+                    (keep, row["type"], row["confidence"],
+                     row["source_chunk_id"], row["origin"]),
+                )
+            elif existing["origin"] != "user" and row["origin"] == "user":
+                conn.execute(
+                    "UPDATE entity_types SET confidence=?,source_chunk_id=?,"
+                    "origin='user' WHERE entity_canonical=? AND type=?",
+                    (row["confidence"], row["source_chunk_id"], keep, row["type"]),
+                )
+        conn.execute("DELETE FROM entity_types WHERE entity_canonical=?", (drop,))
+        for row in conn.execute(
+            "SELECT key,value,source_chunk_id,origin FROM entity_properties "
+            "WHERE entity_canonical=?",
+            (drop,),
+        ).fetchall():
+            existing = conn.execute(
+                "SELECT value,source_chunk_id,origin FROM entity_properties "
+                "WHERE entity_canonical=? AND key=?",
+                (keep, row["key"]),
+            ).fetchone()
+            use_drop = existing is None or (
+                existing["origin"] != "user" and row["origin"] == "user"
+            )
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO entity_properties(entity_canonical,key,value,"
+                    "source_chunk_id,origin) VALUES (?,?,?,?,?)",
+                    (keep, row["key"], row["value"], row["source_chunk_id"],
+                     row["origin"]),
+                )
+            elif use_drop:
+                conn.execute(
+                    "UPDATE entity_properties SET value=?,source_chunk_id=?,"
+                    "origin=? WHERE entity_canonical=? AND key=?",
+                    (row["value"], row["source_chunk_id"], row["origin"],
+                     keep, row["key"]),
+                )
+        conn.execute(
+            "DELETE FROM entity_properties WHERE entity_canonical=?", (drop,)
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_mentions(chunk_id,entity_canonical) "
+            "SELECT chunk_id,? FROM entity_mentions WHERE entity_canonical=?",
+            (keep, drop),
+        )
+        conn.execute(
+            "DELETE FROM entity_mentions WHERE entity_canonical=?", (drop,)
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    # Contextual told rules carry canonical trigger ids.  Preserve their user
+    # authority while keeping a merge from silently disabling the rule.
+    try:
+        from hymem.core.db import evidence_mutation
+
+        with evidence_mutation(conn):
+            for row in conn.execute(
+                "SELECT id,trigger_entities FROM rules WHERE scope='contextual'"
+            ).fetchall():
+                try:
+                    triggers = json.loads(row["trigger_entities"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(triggers, list) or drop not in triggers:
+                    continue
+                replacement = sorted({
+                    keep if item == drop else item for item in triggers
+                })
+                conn.execute(
+                    "UPDATE rules SET trigger_entities=? WHERE id=?",
+                    (json.dumps(replacement), row["id"]),
+                )
+    except sqlite3.OperationalError:
+        pass
 
     # Migrate edges.  On a collision, provenance is moved and deduplicated by
     # source before cached counters are rebuilt; blindly summing the two caches
@@ -244,3 +627,10 @@ def merge(conn: sqlite3.Connection, keep: str, drop: str) -> None:
                 )
                 evidence.recanonicalize_lifecycle_keys(conn)
                 evidence.refresh_claim_extraction_outcomes(conn, outcome_chunks)
+
+    if auxiliary_identities:
+        from hymem.dreaming.phase1_auxiliary import (
+            refresh_phase1_auxiliary_outcomes,
+        )
+
+        refresh_phase1_auxiliary_outcomes(conn, auxiliary_identities)

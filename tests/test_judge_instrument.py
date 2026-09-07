@@ -3,7 +3,7 @@ function that produces every canonical benchmark number in this repo.
 
 Why this file exists
 --------------------
-`benchmarks/locomo_adapter.py:421` and `benchmarks/msc_adapter.py:502` both
+`benchmarks/locomo_adapter.py` and `benchmarks/msc_adapter.py` both
 import `judge_answer` from `longmemeval_adapter`. One function therefore scores
 LoCoMo (68.2%), LME (68.4%) and MSC (~84.0%). It is two lines::
 

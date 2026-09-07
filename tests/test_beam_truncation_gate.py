@@ -44,10 +44,9 @@ def test_finish_reason_alone_is_not_the_separator():
 
 def test_the_v4_flash_trap_is_not_classed_as_truncation():
     """Empty content + length is the trap. It arrives here already rewritten by
-    the falsy raise into an [LLM_ERROR string, and belongs in the explicit
-    bucket -- not excused as a long explanation."""
-    assert ba.is_truncation("[LLM_ERROR: empty content (finish=length, ...)]",
-                            "length") is False
+    the typed raise into a source-free [LLM_ERROR code, and belongs in the
+    explicit bucket -- not excused as a long explanation."""
+    assert ba.is_truncation(ba.LLM_EMPTY_CONTENT_SENTINEL, "length") is False
 
 
 def test_a_complete_stop_is_not_truncation():
@@ -71,7 +70,7 @@ def test_a_truncated_row_never_becomes_a_counted_score(captured):
     truncated reply; nothing downstream may treat it as the judge's verdict."""
     captured["reply"] = {"choices": [{"message": {"content": TRUNCATED},
                                       "finish_reason": "length"}]}
-    llm = ba.LLMClient("deepseek-chat", "k")
+    llm = ba.LLMClient("deepseek-v4-flash", "k")
     out = ba.judge_answer(llm, "q", "ideal", ["r"], "a", return_raw=True)
     assert out["score"] == 0.0 and out["scores"] == []       # the fabrication
     assert '"scores": [1]' in out["judge_raw"]               # what was really said

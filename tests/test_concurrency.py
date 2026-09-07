@@ -16,6 +16,7 @@ from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.extraction.llm import LLMClient, LLMRequest, StubLLMClient
 
 _ITERATIONS = 25
+_EMPTY_EXTRACTION = '{"triples":[],"markers":[],"complete":true}'
 
 
 def _seed(hy: HyMem, session_id: str, n: int) -> None:
@@ -29,13 +30,19 @@ def _seed(hy: HyMem, session_id: str, n: int) -> None:
 
 
 def test_dreaming_ingestion_and_reads_coexist(tmp_path: Path) -> None:
-    cfg = HyMemConfig(root=tmp_path)
+    cfg = HyMemConfig(
+        root=tmp_path,
+        profile_extraction_enabled=False,
+        facts_extraction_enabled=False,
+        aggregation_nodes_enabled=False,
+        episode_granularity_enabled=False,
+    )
 
     # Two independent instances on the same DB file == two SQLite connections,
     # exactly like the Honcho server + its background dream worker.
-    ingest = HyMem(cfg, llm=StubLLMClient(default="[]"),
+    ingest = HyMem(cfg, llm=StubLLMClient(default=_EMPTY_EXTRACTION),
                    embedding_client=StubEmbeddingClient())
-    dreamer = HyMem(cfg, llm=StubLLMClient(default="[]"),
+    dreamer = HyMem(cfg, llm=StubLLMClient(default=_EMPTY_EXTRACTION),
                     embedding_client=StubEmbeddingClient())
 
     _seed(ingest, "sess-seed", 12)
@@ -91,7 +98,7 @@ def test_dreaming_ingestion_and_reads_coexist(tmp_path: Path) -> None:
 class _SlowLLM:
     """LLM stub that sleeps on every call — mimics real provider latency."""
     delay_seconds: float = 0.2
-    default: str = "[]"
+    default: str = _EMPTY_EXTRACTION
     call_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -114,15 +121,22 @@ def test_ingestion_not_blocked_by_in_flight_dream(tmp_path: Path) -> None:
     writer lock for the brief persist step. Ingestion writes should complete
     in milliseconds even while the dream is mid-cycle.
     """
-    cfg = HyMemConfig(root=tmp_path)
+    cfg = HyMemConfig(
+        root=tmp_path,
+        profile_extraction_enabled=False,
+        facts_extraction_enabled=False,
+        aggregation_nodes_enabled=False,
+        episode_granularity_enabled=False,
+        dream_extraction_provider_attempt_budget=4,
+    )
     slow = _SlowLLM(delay_seconds=0.2)
 
-    ingest = HyMem(cfg, llm=StubLLMClient(default="[]"),
+    ingest = HyMem(cfg, llm=StubLLMClient(default=_EMPTY_EXTRACTION),
                    embedding_client=StubEmbeddingClient())
     dreamer: HyMem = HyMem(cfg, llm=slow, embedding_client=StubEmbeddingClient())
 
     # Seed enough chunks so the dream actually has phase1 work to do.
-    _seed(ingest, "sess-seed", 20)
+    _seed(ingest, "sess-seed", 4)
     ingest.conn
     dreamer.conn
 
@@ -160,8 +174,11 @@ def test_ingestion_not_blocked_by_in_flight_dream(tmp_path: Path) -> None:
     t_ingest = threading.Thread(target=ingest_runner)
     t_dream.start()
     t_ingest.start()
-    t_dream.join(timeout=30)
-    t_ingest.join(timeout=30)
+    t_dream.join(timeout=10)
+    t_ingest.join(timeout=10)
+
+    assert not t_dream.is_alive(), "dream worker did not stop"
+    assert not t_ingest.is_alive(), "ingest worker did not stop"
 
     ingest.close()
     dreamer.close()

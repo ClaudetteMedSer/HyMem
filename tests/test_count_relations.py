@@ -17,10 +17,7 @@ def _seed(hy, subj, pred, obj, *, status="active"):
 
 
 def _type(hy, entity, type_label):
-    hy.conn.execute(
-        "INSERT INTO entity_types(entity_canonical, type) VALUES (?, ?)",
-        (entity, type_label),
-    )
+    hy.set_entity_type(entity, type_label)
 
 
 def test_count_distinct_subjects_for_predicate_and_object(hy):

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 
+from hymem.dreaming.evidence import prompt_generation
 from hymem.extraction.triples import (
     extract_entity_properties,
     extract_entity_types,
@@ -122,7 +123,11 @@ def test_entity_properties_persisted_and_replaced_on_re_extraction(hy):
     ]
     # Force re-extraction by bumping prompt_version.
     from dataclasses import replace as dc_replace
-    new_cfg = dc_replace(hy.config, prompt_version="v14")
+    next_generation = prompt_generation(hy.config.prompt_version) + 1
+    new_cfg = dc_replace(
+        hy.config,
+        prompt_version=f"v{next_generation}",
+    )
     hy.config = new_cfg
     hy.set_llm(make_routed_llm(revised, []))
     hy.dream()
@@ -130,12 +135,18 @@ def test_entity_properties_persisted_and_replaced_on_re_extraction(hy):
     rows = {
         r["key"]: r["value"]
         for r in hy.conn.execute(
-            "SELECT key, value FROM entity_properties WHERE entity_canonical='uv'"
+            "SELECT key,value FROM current_entity_properties "
+            "WHERE entity_canonical='uv'"
         ).fetchall()
     }
-    assert rows["category"] == "dependency_manager"
-    # The previously-extracted language key remains — last write wins per (entity, key).
-    assert rows["language"] == "python"
+    assert rows == {"category": "dependency_manager"}
+    # The compatibility table may retain historical materialization, but an
+    # omission in the successful authoritative generation retracts it from all
+    # configured/current reads.
+    assert hy.conn.execute(
+        "SELECT value FROM entity_properties WHERE entity_canonical='uv' "
+        "AND key='language'"
+    ).fetchone()[0] == "python"
 
 
 def test_augment_expands_entities_from_free_text_type_query(hy):

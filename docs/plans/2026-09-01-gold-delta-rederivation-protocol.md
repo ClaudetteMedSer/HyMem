@@ -1,5 +1,10 @@
 # Analysis protocol: re-derive the BEAM gold-delta verdict from four arms — 2026-09-01
 
+> **Archived analysis.** The `deepseek-chat` values and filenames below are
+> provenance from experiments with the now-retired mutable alias, not current
+> configuration guidance. Live runs pin `deepseek-v4-flash` with thinking
+> disabled.
+
 **This is deliberately NOT titled a pre-registration.** §0 says why. Zero API
 calls; read-only arithmetic over five artifacts already on disk, so it falls
 inside standing permission. Step 2 (the rebase run) remains unauthorised and is

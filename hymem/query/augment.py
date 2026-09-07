@@ -9,15 +9,20 @@ import sqlite3
 import struct
 import unicodedata
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
 from hymem.config import HyMemConfig
 from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.core.vectors import decode_vector
-from hymem.dreaming.aggregate import Digest, load_digest
+from hymem.dreaming.aggregate import (
+    Digest, aggregation_config_version, load_digest,
+)
+from hymem.dreaming.embeddings import _embedding_identity
 from hymem.dreaming.aggregation_provenance import (
     BoundSourceOccurrence,
-    load_aggregation_source_manifest,
+    load_current_aggregation_publication,
+    load_current_aggregation_node_proof,
 )
 from hymem.dreaming.lossless import (
     COVERAGE_VALIDATION_COLUMNS,
@@ -55,6 +60,22 @@ from hymem.session import Message, recent_messages
 
 log = logging.getLogger("hymem.query.augment")
 _QUERY_VECTOR_UNSET = object()
+_MATERIAL_EMBEDDING_CLIENT_UNSET = object()
+
+
+@dataclass(frozen=True)
+class _BoundQueryVector:
+    """One query vector plus the exact vector space that produced it.
+
+    Raw numeric lists carry no producer authority.  Keeping this private type
+    across every semantic tier prevents a model/route change between the
+    one-shot provider call and a later mirror lookup from scoring space A
+    bytes against space B rows.
+    """
+
+    values: tuple[float, ...]
+    model: str
+    dim: int
 
 
 @dataclass
@@ -476,6 +497,7 @@ def augment(
     source_peer_id: str | None = None,
     source_workspace_id: str | None = None,
     ability: str | None = None,
+    aggregation_generation_key: str | None = None,
 ) -> AugmentedContext:
     if source_peer_id is not None and source_workspace_id is None:
         raise ValueError(
@@ -506,8 +528,30 @@ def augment(
     ctx = AugmentedContext()
     ctx.detected_ability = detected
     ctx.detected_rule = detected_rule
-    if cfg.user_md_path.exists():
-        ctx.user_md = cfg.user_md_path.read_text(encoding="utf-8")
+    if llm is not None:
+        from hymem.dreaming.aggregation_generation import (
+            aggregation_generation_binding,
+        )
+
+        live_aggregation_generation_key = str(
+            aggregation_generation_binding(cfg, llm)["generation_key"]
+        )
+        if (
+            aggregation_generation_key is not None
+            and aggregation_generation_key != live_aggregation_generation_key
+        ):
+            raise ValueError(
+                "aggregation generation key differs from the supplied LLM"
+            )
+        aggregation_generation_key = live_aggregation_generation_key
+    else:
+        # A bare caller-supplied key is not evidence that the corresponding
+        # process-instance producer is the live execution target. No-LLM reads
+        # retain only the durable-exact historical publication contract.
+        aggregation_generation_key = None
+    from hymem.dreaming.phase2 import authoritative_user_markdown
+
+    ctx.user_md = authoritative_user_markdown(conn, cfg)
     if cfg.memory_md_path.exists():
         ctx.memory_md = cfg.memory_md_path.read_text(encoding="utf-8")
 
@@ -572,7 +616,7 @@ def augment(
 
     # One validated query vector is shared by every semantic tier below.  A
     # provider or shape failure is recorded and all lexical tiers continue.
-    query_vector: list[float] | None = None
+    query_vector: _BoundQueryVector | None = None
     if embedding_client is not None:
         query_vector, ctx.semantic_status = _query_embedding_with_status(
             embedding_client, query
@@ -594,8 +638,19 @@ def augment(
     # Stage-5 single-call convenience: ship the standing root digest alongside
     # the per-query tiers. Off by default — the digest only changes at dream
     # time, so most hosts fetch it once via HyMem.digest() instead of here.
-    if cfg.augment_include_digest:
-        ctx.digest = load_digest(conn)
+    if (
+        cfg.augment_include_digest
+        and cfg.aggregation_nodes_enabled
+        and cfg.aggregation_digest_enabled
+    ):
+        ctx.digest = load_digest(
+            conn, expected_config_version=aggregation_config_version(cfg),
+            expected_cluster_min_members=cfg.aggregation_min_members,
+            expected_cluster_min_sessions=cfg.aggregation_min_sessions,
+            expected_anchor_fact_cap=cfg.aggregation_digest_anchor_facts,
+            expected_generation_key=aggregation_generation_key,
+            embedding_client=embedding_client,
+        )
 
     # Pull a wider candidate pool when reranking is likely so the reranker
     # has room to reorder beyond the top-fts_top_k window; the final result
@@ -629,7 +684,9 @@ def augment(
         # boundary before any LLM/cross-encoder reranker can observe it. The
         # same validation runs again at final assembly because the context DTO
         # remains mutable by design.
-        enrich_context_provenance(conn, ctx)
+        enrich_context_provenance(
+            conn, ctx, embedding_client=embedding_client,
+        )
         scope_context_in_place(
             ctx,
             source_session_id=source_session_id,
@@ -841,8 +898,9 @@ def augment(
             source_workspace_id=source_workspace_id,
         )
 
-    # Phase-2 RAPTOR additive tier: cross-session cluster summaries. Off by
-    # default; only runs when the layer is enabled AND the routed ability is in
+    # Phase-2 RAPTOR additive tier: cross-session cluster summaries. The master
+    # switch defaults on; this query tier runs only when the layer is enabled
+    # AND the routed ability is in
     # `aggregation_inject_abilities` (default TR-only — the G4 A/B showed broad
     # injection reshuffles ranking against gold message hits everywhere except
     # temporal reasoning). Never displaces the tiers above — it layers a
@@ -859,11 +917,17 @@ def augment(
                 conn, query,
                 top_k=cfg.aggregation_top_k,
                 embedding_client=semantic_client,
+                material_embedding_client=embedding_client,
                 query_vector=query_vector,
                 max_scan=cfg.embedding_max_scan,
                 source_session_id=source_session_id,
                 source_peer_id=source_peer_id,
                 source_workspace_id=source_workspace_id,
+                expected_config_version=aggregation_config_version(cfg),
+                expected_cluster_min_members=cfg.aggregation_min_members,
+                expected_cluster_min_sessions=cfg.aggregation_min_sessions,
+                expected_anchor_fact_cap=cfg.aggregation_digest_anchor_facts,
+                expected_generation_key=aggregation_generation_key,
             )
             # Provenance: chip ONLY the firings the fallback actually caused.
             # An ability-gated firing on a thin query is still an ability
@@ -884,21 +948,29 @@ def augment(
         ctx.procedures = _procedure_search(conn, query, top_k=proc_top_k)
 
     matched = match_known_entities(conn, query)
-    type_expanded, expansion_info = _expand_entities_by_type(conn, matched)
+    if scoped_request:
+        # Entity hint observations do not yet carry peer/workspace ownership.
+        # Keep exact literal/alias matches, but do not let global inferred
+        # topology broaden a source-scoped graph request.
+        type_expanded, expansion_info = list(matched), {}
+        query_type_expanded, query_type_info = [], {}
+        overlap_expanded, overlap_info = [], {}
+    else:
+        type_expanded, expansion_info = _expand_entities_by_type(conn, matched)
     # Free-text type/property expansion: the user may ask "what build tools
     # do we use?" without naming any specific entity. Map type/property
     # keywords in the message to canonicals tagged with that type or
     # property; merge into the entity set so Source 1 of the graph lookup
     # picks them up.
-    query_type_expanded, query_type_info = _expand_entities_from_query(
-        conn, query
-    )
-    overlap_expanded, overlap_info = _expand_entities_by_token_overlap(
-        conn, matched,
-        max_per_entity=cfg.graph_token_overlap_max_per_entity,
-        common_token_threshold=cfg.graph_token_overlap_threshold,
-        token_index=token_overlap_index,
-    )
+        query_type_expanded, query_type_info = _expand_entities_from_query(
+            conn, query
+        )
+        overlap_expanded, overlap_info = _expand_entities_by_token_overlap(
+            conn, matched,
+            max_per_entity=cfg.graph_token_overlap_max_per_entity,
+            common_token_threshold=cfg.graph_token_overlap_threshold,
+            token_index=token_overlap_index,
+        )
     combined = list(type_expanded)
     for e in query_type_expanded:
         if e not in combined:
@@ -917,6 +989,11 @@ def augment(
     # other tier's budget is touched. Degrades to [] on a pre-v23 store.
     if cfg.rules_enabled:
         ctx.rules = load_rules(conn, ctx.matched_entities, cap=cfg.rules_context_cap)
+        if scoped_request:
+            # Inferred rule links currently prove chunk/generation, not exact
+            # peer/workspace occurrence ownership. User/told rules are global
+            # authority; model-derived rules fail closed for scoped requests.
+            ctx.rules = [rule for rule in ctx.rules if rule.source == "user"]
 
     routed = route_predicates(query)
     ctx.graph_facts = _graph_lookup(
@@ -928,6 +1005,67 @@ def augment(
         source_peer_id=source_peer_id,
         source_workspace_id=source_workspace_id,
     )
+    if (
+        query_vector is not None
+        and embedding_client is not None
+        and not _bound_query_vector_is_current(embedding_client, query_vector)
+    ):
+        # A mutable producer changed vector space after the shared one-shot
+        # query call.  Earlier tiers may already contain A-space scores while
+        # later tiers selected B-space mirrors, so discard every result whose
+        # ordering can depend on semantic bytes.  Pure lexical/type retrieval
+        # remains available; aggregation lexical retrieval is recomputed under
+        # the live material producer fence.
+        aggregation_tier_was_present = bool(ctx.aggregation_nodes)
+        ctx.semantic_status = replace(
+            ctx.semantic_status, available=False, reason="identity_drift",
+        )
+        ctx.fts_hits = list(fts[:cfg.fts_top_k])
+        if cfg.message_fts_top_k > 0:
+            if source_workspace_id is not None:
+                ctx.message_hits = _coverage_message_fts_search(
+                    conn, query, top_k=cfg.message_fts_top_k,
+                    source_session_id=source_session_id,
+                    source_peer_id=source_peer_id,
+                    source_workspace_id=source_workspace_id,
+                )
+            else:
+                ctx.message_hits = _message_fts_search(
+                    conn, query, top_k=cfg.message_fts_top_k,
+                    source_session_id=source_session_id,
+                    source_peer_id=source_peer_id,
+                    source_workspace_id=source_workspace_id,
+                )
+        ctx.episodes = _episode_search(
+            conn, query, top_k=cfg.fts_top_k, embedding_client=None,
+        ) if not scoped_request else []
+        ctx.facts = _fact_search(
+            conn, query, top_k=cfg.facts_top_k, embedding_client=None,
+            source_session_id=source_session_id,
+            source_peer_id=source_peer_id,
+            source_workspace_id=source_workspace_id,
+        ) if cfg.facts_enabled and cfg.facts_top_k > 0 else []
+        ctx.aggregation_nodes = _aggregation_search(
+            conn, query, top_k=cfg.aggregation_top_k,
+            embedding_client=None,
+            material_embedding_client=embedding_client,
+            source_session_id=source_session_id,
+            source_peer_id=source_peer_id,
+            source_workspace_id=source_workspace_id,
+            expected_config_version=aggregation_config_version(cfg),
+            expected_cluster_min_members=cfg.aggregation_min_members,
+            expected_cluster_min_sessions=cfg.aggregation_min_sessions,
+            expected_anchor_fact_cap=cfg.aggregation_digest_anchor_facts,
+            expected_generation_key=aggregation_generation_key,
+        ) if aggregation_tier_was_present else []
+        ctx.graph_facts = _graph_lookup(
+            conn, cfg, query, ctx.matched_entities, expansion_info, routed,
+            overlap_info=overlap_info, embedding_client=None,
+            query_vector=None,
+            source_session_id=source_session_id,
+            source_peer_id=source_peer_id,
+            source_workspace_id=source_workspace_id,
+        )
     if any(
         value is not None
         for value in (source_session_id, source_peer_id, source_workspace_id)
@@ -953,7 +1091,11 @@ def augment(
     ctx.fusion_source_session_id = source_session_id
     ctx.fusion_source_peer_id = source_peer_id
     ctx.fusion_source_workspace_id = source_workspace_id
-    enrich_context_provenance(conn, ctx)
+    enrich_context_provenance(
+        conn, ctx,
+        expected_aggregation_generation_key=aggregation_generation_key,
+        embedding_client=embedding_client,
+    )
     scope_context_in_place(
         ctx,
         source_session_id=source_session_id,
@@ -1413,7 +1555,7 @@ def _coverage_message_vector_search(
     *,
     top_k: int,
     embedding_client: EmbeddingClient | None,
-    query_vector: list[float] | None,
+    query_vector: object,
     source_session_id: str | None = None,
     source_peer_id: str | None = None,
     source_workspace_id: str | None = None,
@@ -1431,19 +1573,21 @@ def _coverage_message_vector_search(
     if (
         top_k <= 0 or not isinstance(query, str) or not query.strip()
         or embedding_client is None or query_vector is None
-        or not query_vector
     ):
         return []
     try:
-        model = embedding_client.model
-        dim = embedding_client.dim
+        model, dim = _embedding_identity(embedding_client)
     except Exception:
         return []
     if (
         not isinstance(model, str) or not model
         or isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
-        or len(query_vector) != dim
     ):
+        return []
+    resolved_query = _resolved_query_vector(
+        embedding_client, query, query_vector, expected_dim=dim,
+    )
+    if resolved_query is None:
         return []
 
     clauses = [
@@ -1484,7 +1628,7 @@ def _coverage_message_vector_search(
     except sqlite3.OperationalError:
         return []
 
-    qnorm = math.sqrt(sum(value * value for value in query_vector))
+    qnorm = math.sqrt(sum(value * value for value in resolved_query))
     if not math.isfinite(qnorm) or qnorm <= 0.0:
         return []
     # Each side of the join is unique on message_id, so no unbounded seen-set
@@ -1509,7 +1653,7 @@ def _coverage_message_vector_search(
             continue
         vnorm = math.sqrt(sum(value * value for value in vector))
         similarity = sum(
-            left * right for left, right in zip(query_vector, vector)
+            left * right for left, right in zip(resolved_query, vector)
         ) / (qnorm * vnorm)
         if not math.isfinite(similarity) or similarity <= 0.0:
             continue
@@ -2192,16 +2336,20 @@ def _embeddings_compatible(conn: sqlite3.Connection, embedder: EmbeddingClient) 
     ).fetchall()
     if not rows:
         return True  # nothing stored yet — nothing to mismatch
+    try:
+        current_model, current_dim = _embedding_identity(embedder)
+    except Exception:
+        return False
     mismatched = [
         (r["model"], r["dim"])
         for r in rows
-        if r["model"] != embedder.model or r["dim"] != embedder.dim
+        if r["model"] != current_model or r["dim"] != current_dim
     ]
     if mismatched:
         log.warning(
             "vector search skipped: stored embeddings include model/dim %s but "
             "active client is model=%s dim=%s; re-embed to enable semantic recall",
-            mismatched, embedder.model, embedder.dim,
+            mismatched, current_model, current_dim,
         )
         return False
     return True
@@ -2264,8 +2412,7 @@ def _python_cosine_search(
     source_workspace_id: str | None = None,
 ) -> list[FtsHit]:
     try:
-        model = embedder.model
-        dim = embedder.dim
+        model, dim = _embedding_identity(embedder)
     except Exception:
         return []
     if (
@@ -2367,12 +2514,9 @@ def _python_cosine_search(
     if not rows:
         return []
 
-    if query_vector is _QUERY_VECTOR_UNSET:
-        qvec = _query_embedding(embedder, query)
-    elif isinstance(query_vector, list):
-        qvec = _finite_vector(query_vector, expected_dim=dim)
-    else:
-        qvec = None
+    qvec = _resolved_query_vector(
+        embedder, query, query_vector, expected_dim=dim,
+    )
     if qvec is None:
         return []
     qnorm = math.sqrt(sum(x * x for x in qvec))
@@ -3534,12 +3678,13 @@ def _semantic_edge_hits(
     rows = _compatible_edge_embedding_rows(conn, embedder, allowed_edge_ids)
     if not rows:
         return []
-    if query_vector is _QUERY_VECTOR_UNSET:
-        qvec = _query_embedding(embedder, query)
-    elif isinstance(query_vector, list):
-        qvec = _finite_vector(query_vector, expected_dim=embedder.dim)
-    else:
-        qvec = None
+    try:
+        _model, live_dim = _embedding_identity(embedder)
+    except Exception:
+        return []
+    qvec = _resolved_query_vector(
+        embedder, query, query_vector, expected_dim=live_dim,
+    )
     if qvec is None:
         return []
 
@@ -3581,7 +3726,12 @@ def _semantic_edge_hits(
     return _python_cosine_edge_search(
         conn, embedder, query,
         top_k=cfg.graph_semantic_top_k, max_scan=cfg.embedding_max_scan,
-        query_vector=qvec,
+        # Preserve the producer-bound DTO at the nested boundary.  Direct
+        # helper callers arrive with the private sentinel, so forwarding that
+        # would pay a second provider call after we already resolved ``qvec``.
+        query_vector=_BoundQueryVector(
+            values=tuple(qvec), model=_model, dim=live_dim,
+        ),
         allowed_edge_ids=allowed_edge_ids,
         return_all=True,
     )
@@ -3594,7 +3744,7 @@ def _python_cosine_edge_search(
     *,
     top_k: int,
     max_scan: int,
-    query_vector: list[float] | None = None,
+    query_vector: object = _QUERY_VECTOR_UNSET,
     allowed_edge_ids: frozenset[int] | None = None,
     return_all: bool = False,
 ) -> list[tuple[int, float]]:
@@ -3612,7 +3762,13 @@ def _python_cosine_edge_search(
     rows = _compatible_edge_embedding_rows(conn, embedder, allowed_edge_ids)
     if not rows:
         return []
-    qvec = query_vector if query_vector is not None else _query_embedding(embedder, query)
+    try:
+        _model, live_dim = _embedding_identity(embedder)
+    except Exception:
+        return []
+    qvec = _resolved_query_vector(
+        embedder, query, query_vector, expected_dim=live_dim,
+    )
     if qvec is None:
         return []
     limit = None if return_all else max(0, int(top_k))
@@ -3628,8 +3784,7 @@ def _compatible_edge_embedding_rows(
 ) -> list[sqlite3.Row]:
     """Load only vectors produced by the active embedding identity."""
     try:
-        model = embedder.model
-        dim = embedder.dim
+        model, dim = _embedding_identity(embedder)
     except Exception:
         return []
     if (
@@ -3661,22 +3816,38 @@ def _compatible_edge_embedding_rows(
 def _query_embedding(
     embedder: EmbeddingClient, query: str
 ) -> list[float] | None:
-    """Embed once and validate against the identity *after* the response.
+    """Embed once under an exact durable before/after producer snapshot.
 
-    OpenAI-compatible clients may learn their true dimension from the first
-    response, so snapshotting ``dim`` before ``embed`` rejects a valid first
-    call and then mysteriously succeeds on the second.
+    High-level semantic retrieval intentionally rejects adaptive/unattested
+    clients before dispatch because there is no authoritative durable corpus
+    in their vector space.  The low-level cached wrapper separately supports
+    fresh process-only adaptive calls without granting search/reuse authority.
     """
-    return _query_embedding_with_status(embedder, query)[0]
+    bound = _query_embedding_with_status(embedder, query)[0]
+    return None if bound is None else list(bound.values)
 
 
 def _query_embedding_with_status(
     embedder: EmbeddingClient, query: str
-) -> tuple[list[float] | None, SemanticStatus]:
-    backend = _safe_embedding_attr(embedder, "backend", "configured")
-    quality = _safe_embedding_attr(embedder, "quality", "semantic")
+) -> tuple[_BoundQueryVector | None, SemanticStatus]:
+    backend_value = _safe_embedding_attr(embedder, "backend", "configured")
+    backend = (
+        backend_value if backend_value in {
+            "configured", "local_feature_hash", "openai_compatible",
+        } else "configured"
+    )
+    quality_value = _safe_embedding_attr(embedder, "quality", "semantic")
+    quality = quality_value if quality_value in {"lexical", "semantic"} else "semantic"
     fallback_reason_value = _safe_embedding_attr(embedder, "fallback_reason", "")
-    fallback_reason = fallback_reason_value or None
+    fallback_reason = (
+        fallback_reason_value
+        if fallback_reason_value in {
+            "remote_embedding_credentials_missing",
+            "remote_embedding_endpoint_rejected",
+            "remote_embedding_client_unavailable",
+        }
+        else None
+    )
     if not isinstance(query, str) or not query.strip():
         return None, SemanticStatus(
             configured=True,
@@ -3690,8 +3861,7 @@ def _query_embedding_with_status(
     model: str | None = None
     dim: int | None = None
     try:
-        model_before = embedder.model
-        dim_before = embedder.dim
+        model_before, dim_before = _embedding_identity(embedder)
         model = model_before if isinstance(model_before, str) else None
         dim = (
             dim_before
@@ -3730,8 +3900,7 @@ def _query_embedding_with_status(
         )
 
     try:
-        model_after = embedder.model
-        expected_dim = embedder.dim
+        model_after, expected_dim = _embedding_identity(embedder)
         model = model_after if isinstance(model_after, str) else model
         dim = (
             expected_dim
@@ -3766,7 +3935,9 @@ def _query_embedding_with_status(
             reason="malformed_vector",
             fallback_reason=fallback_reason,
         )
-    return vector, SemanticStatus(
+    return _BoundQueryVector(
+        values=tuple(vector), model=str(model_after), dim=int(expected_dim),
+    ), SemanticStatus(
         configured=True,
         attempted=True,
         available=True,
@@ -3825,10 +3996,35 @@ def _resolved_query_vector(
     shared vector (legacy/direct helper use).
     """
     if supplied is _QUERY_VECTOR_UNSET:
-        return _query_embedding(embedder, query)
-    if not isinstance(supplied, list):
+        supplied = _query_embedding_with_status(embedder, query)[0]
+    if supplied is None:
         return None
-    return _finite_vector(supplied, expected_dim=expected_dim)
+    if not isinstance(supplied, _BoundQueryVector):
+        # A bare list has shape but no vector-space authority.  It may have
+        # been produced before a mutable client changed model/route, so never
+        # relabel it from the client's current properties.
+        return None
+    try:
+        live_model, live_dim = _embedding_identity(embedder)
+    except Exception:
+        return None
+    if (
+        live_model != supplied.model
+        or live_dim != supplied.dim
+        or expected_dim != supplied.dim
+    ):
+        return None
+    return _finite_vector(supplied.values, expected_dim=expected_dim)
+
+
+def _bound_query_vector_is_current(
+    embedder: EmbeddingClient, supplied: _BoundQueryVector,
+) -> bool:
+    try:
+        model, dim = _embedding_identity(embedder)
+    except Exception:
+        return False
+    return model == supplied.model and dim == supplied.dim
 
 
 def _durable_cosine(
@@ -4036,8 +4232,7 @@ def _episode_search(
     vec_hits: list[EpisodeHit] = []
     if embedding_client is not None:
         try:
-            model = embedding_client.model
-            dim = embedding_client.dim
+            model, dim = _embedding_identity(embedding_client)
             rows = conn.execute(
                 f"""
                 SELECT e.id, e.session_id, e.title, e.summary,
@@ -4273,8 +4468,7 @@ def _fact_search(
     vec_hits: list[FactHit] = []
     if embedding_client is not None:
         try:
-            model = embedding_client.model
-            dim = embedding_client.dim
+            model, dim = _embedding_identity(embedding_client)
             rows = []
         except (AttributeError, sqlite3.OperationalError, TypeError, ValueError):
             rows = []
@@ -4501,9 +4695,10 @@ def _scoped_aggregation_sources(
 ) -> tuple[SourceOccurrence, ...] | None:
     """Validate one composite before its text enters ranking or model hooks."""
 
-    occurrences = load_aggregation_source_manifest(conn, node_id)
-    if occurrences is None:
+    proof = load_current_aggregation_node_proof(conn, node_id)
+    if proof is None:
         return None
+    occurrences = proof.occurrences
     if not all(
         (source_session_id is None or item.session_id == source_session_id)
         and (source_peer_id is None or item.source_peer_id == source_peer_id)
@@ -4517,207 +4712,254 @@ def _scoped_aggregation_sources(
     return _query_source_occurrences(occurrences)
 
 
-def _aggregation_search(
+# v55 publication-scoped search core; the wrapper below owns one coherent
+# SQLite snapshot across validation and both ranking arms.
+def _aggregation_search_v55(
     conn: sqlite3.Connection,
     query: str,
     *,
     top_k: int = 3,
     embedding_client: EmbeddingClient | None = None,
+    material_embedding_client: object = _MATERIAL_EMBEDDING_CLIENT_UNSET,
     max_scan: int = 5000,
     query_vector: object = _QUERY_VECTOR_UNSET,
     source_session_id: str | None = None,
     source_peer_id: str | None = None,
     source_workspace_id: str | None = None,
+    expected_config_version: str | None = None,
+    expected_cluster_min_members: int | None = None,
+    expected_cluster_min_sessions: int | None = None,
+    expected_anchor_fact_cap: int | None = None,
+    expected_generation_key: str | None = None,
 ) -> list[AggregationNodeHit]:
-    """Phase-2 RAPTOR node retrieval. FTS over node title+summary, plus (when an
-    embedder is present) a Python-cosine scan over `aggregation_node_embeddings`
-    — the node count is small and the tier is off by default, so no vec0 table is
-    maintained. The two ranked lists are RRF-fused, mirroring `_episode_search`.
-    Returns [] cleanly when no node table/rows exist (un-dreamed clients).
-    Only level-0 nodes are candidates: the v17 rollup/digest levels are
-    host-facing standing context (`HyMem.digest()`), not retrieval competitors."""
+    """Search only the wholly validated current v55 publication.
+
+    Validation happens before candidate limits and before any quality hook sees
+    candidate text. Invalid physical history therefore cannot poison-prefix an
+    older valid publication or consume the vector scan budget.
+    """
+
     if top_k <= 0:
         return []
-    scoped = any(
-        value is not None
-        for value in (source_session_id, source_peer_id, source_workspace_id)
+    publication = load_current_aggregation_publication(
+        conn, expected_config_version=expected_config_version,
+        expected_cluster_min_members=expected_cluster_min_members,
+        expected_cluster_min_sessions=expected_cluster_min_sessions,
+        expected_anchor_fact_cap=expected_anchor_fact_cap,
+        expected_generation_key=expected_generation_key,
+        embedding_client=(
+            embedding_client
+            if material_embedding_client is _MATERIAL_EMBEDDING_CLIENT_UNSET
+            else material_embedding_client
+        ),
     )
+    if publication is None:
+        return []
+    candidates = {
+        node_id: proof for node_id, proof in publication.nodes.items()
+        if proof.row["node_kind"] == "cluster"
+    }
+    if not candidates:
+        return []
+
+    def sources_for(proof) -> tuple[SourceOccurrence, ...] | None:
+        occurrences = proof.occurrences
+        if not all(
+            (source_session_id is None or item.session_id == source_session_id)
+            and (source_peer_id is None or item.source_peer_id == source_peer_id)
+            and (
+                source_workspace_id is None
+                or item.source_workspace_id == source_workspace_id
+            )
+            for item in occurrences
+        ):
+            return None
+        return _query_source_occurrences(occurrences)
+
     candidate_k = max(1, top_k * 2)
     cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
     fts_hits: list[AggregationNodeHit] = []
-    if cleaned:
-        tokens = [t for t in cleaned.split() if len(t) >= 2]
-        if tokens:
-            fts_query = " OR ".join(f'"{t}"' for t in tokens)
-            chip = f'agg_fts("{" ".join(tokens)}")'
-            batch_size = max(32, candidate_k) if scoped else candidate_k
-            raw_scan_cap = max(1024, candidate_k * 64)
-            offset = scanned = 0
-            while len(fts_hits) < candidate_k and scanned < raw_scan_cap:
-                try:
-                    rows = conn.execute(
-                        """SELECT n.id, n.title, n.summary,
-                                  n.member_episode_ids, n.session_ids,
-                                  bm25(aggregation_nodes_fts) AS score
-                           FROM aggregation_nodes_fts
-                           JOIN aggregation_nodes n
-                             ON n.rowid = aggregation_nodes_fts.rowid
-                           WHERE aggregation_nodes_fts MATCH ? AND n.level = 0
-                           ORDER BY score, n.id
-                           LIMIT ? OFFSET ?""",
-                        (
-                            fts_query,
-                            min(batch_size, raw_scan_cap - scanned),
-                            offset,
-                        ),
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    rows = []
-                if not rows:
-                    break
-                for row in rows:
-                    sources: tuple[SourceOccurrence, ...] = ()
-                    if scoped:
-                        validated = _scoped_aggregation_sources(
-                            conn,
-                            row["id"],
-                            source_session_id=source_session_id,
-                            source_peer_id=source_peer_id,
-                            source_workspace_id=source_workspace_id,
-                        )
-                        if validated is None:
-                            continue
-                        sources = validated
-                    fts_hits.append(_aggregation_row_hit(
-                        row,
-                        score=row["score"],
-                        score_kind="bm25",
-                        chip=chip,
-                        source_occurrences=sources,
-                    ))
-                    if len(fts_hits) >= candidate_k:
-                        break
-                offset += len(rows)
-                scanned += len(rows)
-                if len(rows) < batch_size:
-                    break
-            if scoped and len(fts_hits) < candidate_k and scanned >= raw_scan_cap:
-                log.warning(
-                    "augment.scoped_aggregation_fts_validation_scan_exhausted "
-                    "accepted=%d top_k=%d scanned=%d",
-                    len(fts_hits), candidate_k, scanned,
-                )
+    tokens = [token for token in cleaned.split() if len(token) >= 2]
+    if tokens:
+        fts_query = " OR ".join(f'"{token}"' for token in tokens)
+        chip = f'agg_fts("{" ".join(tokens)}")'
+        try:
+            # Deliberately no raw LIMIT: proof filtering precedes top-k.
+            ranked = conn.execute(
+                "SELECT n.id,bm25(aggregation_nodes_fts) AS score "
+                "FROM aggregation_nodes_fts JOIN aggregation_nodes n "
+                "ON n.rowid=aggregation_nodes_fts.rowid "
+                "WHERE aggregation_nodes_fts MATCH ? AND n.level=0 "
+                "ORDER BY score,n.id",
+                (fts_query,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            ranked = []
+        for raw in ranked:
+            proof = candidates.get(str(raw["id"]))
+            if proof is None:
+                continue
+            sources = sources_for(proof)
+            if sources is None:
+                continue
+            fts_hits.append(_aggregation_row_hit(
+                proof.row, score=float(raw["score"]), score_kind="bm25",
+                chip=chip, source_occurrences=sources,
+            ))
+            if len(fts_hits) >= candidate_k:
+                break
 
     vec_hits: list[AggregationNodeHit] = []
-    if embedding_client is not None:
-        rows: list[sqlite3.Row] = []
-        proof_by_id: dict[str, tuple[SourceOccurrence, ...]] = {}
+    if embedding_client is not None and int(max_scan) > 0:
         try:
-            model = embedding_client.model
-            dim = embedding_client.dim
-            scan_limit = max(0, int(max_scan))
-            if not scoped:
-                rows = conn.execute(
-                    """
-                    SELECT n.id, n.title, n.summary, n.member_episode_ids,
-                           n.session_ids, ne.vector_json, ne.text_hash
-                    FROM aggregation_node_embeddings ne
-                    JOIN aggregation_nodes n ON n.id = ne.node_id
-                    WHERE n.level = 0 AND ne.model = ? AND ne.dim = ?
-                    ORDER BY n.created_at DESC, n.id
-                    LIMIT ?
-                    """,
-                    (model, dim, scan_limit),
-                ).fetchall()
-            elif scan_limit > 0:
-                # Count only proof-valid, in-scope rows against max_scan.  A
-                # newer corrupt/mixed-owner prefix cannot starve an older safe
-                # node, and candidate text reaches no provider quality hook
-                # until its exact manifest passes.
-                page_size = max(32, min(256, scan_limit * 2))
-                raw_scan_cap = max(1024, scan_limit * 64)
-                offset = scanned = 0
-                while len(rows) < scan_limit and scanned < raw_scan_cap:
-                    batch = conn.execute(
-                        """
-                        SELECT n.id, n.title, n.summary, n.member_episode_ids,
-                               n.session_ids, ne.vector_json, ne.text_hash
-                        FROM aggregation_node_embeddings ne
-                        JOIN aggregation_nodes n ON n.id = ne.node_id
-                        WHERE n.level = 0 AND ne.model = ? AND ne.dim = ?
-                        ORDER BY n.created_at DESC, n.id
-                        LIMIT ? OFFSET ?
-                        """,
-                        (
-                            model,
-                            dim,
-                            min(page_size, raw_scan_cap - scanned),
-                            offset,
-                        ),
-                    ).fetchall()
-                    if not batch:
-                        break
-                    for row in batch:
-                        sources = _scoped_aggregation_sources(
-                            conn,
-                            row["id"],
-                            source_session_id=source_session_id,
-                            source_peer_id=source_peer_id,
-                            source_workspace_id=source_workspace_id,
-                        )
-                        if sources is None:
-                            continue
-                        proof_by_id[str(row["id"])] = sources
-                        rows.append(row)
-                        if len(rows) >= scan_limit:
-                            break
-                    offset += len(batch)
-                    scanned += len(batch)
-                    if len(batch) < page_size:
-                        break
-                if len(rows) < scan_limit and scanned >= raw_scan_cap:
-                    log.warning(
-                        "augment.scoped_aggregation_vector_validation_scan_exhausted "
-                        "accepted=%d max_scan=%d scanned=%d",
-                        len(rows), scan_limit, scanned,
-                    )
+            model, dim = _embedding_identity(embedding_client)
+            stored_rows = conn.execute(
+                "SELECT node_id,vector_json,text_hash FROM "
+                "aggregation_node_embeddings WHERE model=? AND dim=? "
+                # Scan order is part of retrieval semantics when max_scan is
+                # finite.  created_at is deliberately operational/unattested,
+                # so it must never choose which proven candidate is examined.
+                "ORDER BY node_id",
+                (model, dim),
+            ).fetchall()
         except (AttributeError, sqlite3.OperationalError, TypeError, ValueError):
-            rows = []
-        if rows:
-            qvec = _resolved_query_vector(
-                embedding_client, query, query_vector,
-                expected_dim=dim,
+            stored_rows = []
+        # Establish every local eligibility condition before asking an
+        # external provider to embed the query.  An unpublished physical
+        # cache row, scope-mismatched candidate, stale text hash, or malformed
+        # vector must not be sufficient to trigger provider work.
+        eligible_rows: list[
+            tuple[Mapping[str, object], object, tuple[SourceOccurrence, ...], str]
+        ] = []
+        for stored in stored_rows:
+            proof = candidates.get(str(stored["node_id"]))
+            if proof is None:
+                continue
+            sources = sources_for(proof)
+            if sources is None:
+                continue
+            text = f"{proof.row['title']}\n{proof.row['summary']}"
+            if (
+                stored["text_hash"] != embedding_text_hash(text)
+                or _decode_finite_vector(
+                    stored["vector_json"], expected_dim=dim,
+                ) is None
+            ):
+                continue
+            eligible_rows.append((stored, proof, sources, text))
+        qvec = _resolved_query_vector(
+            embedding_client, query, query_vector, expected_dim=dim,
+        ) if eligible_rows else None
+        scored: list[tuple[float, Mapping[str, object], tuple[SourceOccurrence, ...]]] = []
+        valid_scanned = 0
+        if qvec is not None:
+            for stored, proof, sources, text in eligible_rows:
+                similarity = _durable_cosine(qvec, stored["vector_json"])
+                if similarity is None:
+                    continue
+                # Vector bytes must also validate before this potentially
+                # provider-defined hook observes candidate text.
+                if not _quality_allows_candidate(embedding_client, query, text):
+                    continue
+                valid_scanned += 1
+                scored.append((similarity, proof.row, sources))
+                if valid_scanned >= int(max_scan):
+                    break
+        scored.sort(key=lambda item: (-item[0], str(item[1]["id"])))
+        vec_hits = [
+            _aggregation_row_hit(
+                row, score=similarity, score_kind="vec",
+                chip=f"agg_vec(sim={similarity:.3f})",
+                source_occurrences=sources,
             )
-            scored: list[tuple[float, sqlite3.Row]] = []
-            if qvec is not None:
-                for r in rows:
-                    candidate_text = f"{r['title']}\n{r['summary']}"
-                    if r["text_hash"] != embedding_text_hash(candidate_text):
-                        continue
-                    if not _quality_allows_candidate(
-                        embedding_client, query, candidate_text
-                    ):
-                        continue
-                    similarity = _durable_cosine(qvec, r["vector_json"])
-                    if similarity is not None:
-                        scored.append((similarity, r))
-            scored.sort(key=lambda item: (-item[0], str(item[1]["id"])))
-            vec_hits = [
-                _aggregation_row_hit(
-                    r,
-                    score=sim,
-                    score_kind="vec",
-                    chip=f"agg_vec(sim={sim:.3f})",
-                    source_occurrences=proof_by_id.get(str(r["id"]), ()),
-                )
-                for sim, r in scored[:candidate_k]
-            ]
+            for similarity, row, sources in scored[:candidate_k]
+        ]
 
     if not vec_hits:
         return fts_hits[:top_k]
     if not fts_hits:
         return vec_hits[:top_k]
     return _rrf_merge_aggregation(fts_hits, vec_hits, top_k=top_k)
+
+
+def _aggregation_search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    top_k: int = 3,
+    embedding_client: EmbeddingClient | None = None,
+    material_embedding_client: object = _MATERIAL_EMBEDDING_CLIENT_UNSET,
+    max_scan: int = 5000,
+    query_vector: object = _QUERY_VECTOR_UNSET,
+    source_session_id: str | None = None,
+    source_peer_id: str | None = None,
+    source_workspace_id: str | None = None,
+    expected_config_version: str | None = None,
+    expected_cluster_min_members: int | None = None,
+    expected_cluster_min_sessions: int | None = None,
+    expected_anchor_fact_cap: int | None = None,
+    expected_generation_key: str | None = None,
+) -> list[AggregationNodeHit]:
+    """Run publication validation and both ranking arms in one snapshot."""
+
+    owned_snapshot = not conn.in_transaction
+    try:
+        if owned_snapshot:
+            conn.execute("BEGIN")
+        result = _aggregation_search_v55(
+            conn, query, top_k=top_k, embedding_client=embedding_client,
+            material_embedding_client=material_embedding_client,
+            max_scan=max_scan, query_vector=query_vector,
+            source_session_id=source_session_id,
+            source_peer_id=source_peer_id,
+            source_workspace_id=source_workspace_id,
+            expected_config_version=expected_config_version,
+            expected_cluster_min_members=expected_cluster_min_members,
+            expected_cluster_min_sessions=expected_cluster_min_sessions,
+            expected_anchor_fact_cap=expected_anchor_fact_cap,
+            expected_generation_key=expected_generation_key,
+        )
+        captured_state = conn.execute(
+            "SELECT publication_id,aggregation_material_epoch_key "
+            "FROM aggregation_publication_state WHERE id=1"
+        ).fetchone() if result else None
+        # Provider/property hooks run while the ranking helper is active.  A
+        # same-connection material mutation can withdraw the singleton after
+        # the search captured rows.  Absence is therefore a failed fence, not
+        # permission to skip the post-validation below.
+        if result and captured_state is None:
+            result = []
+        if owned_snapshot:
+            conn.execute("COMMIT")
+            if result and captured_state is not None:
+                current = load_current_aggregation_publication(
+                    conn,
+                    expected_config_version=expected_config_version,
+                    expected_cluster_min_members=expected_cluster_min_members,
+                    expected_cluster_min_sessions=expected_cluster_min_sessions,
+                    expected_anchor_fact_cap=expected_anchor_fact_cap,
+                    expected_generation_key=expected_generation_key,
+                    expected_material_epoch_key=(
+                        captured_state["aggregation_material_epoch_key"]
+                    ),
+                    embedding_client=(
+                        embedding_client
+                        if material_embedding_client
+                        is _MATERIAL_EMBEDDING_CLIENT_UNSET
+                        else material_embedding_client
+                    ),
+                )
+                if (
+                    current is None
+                    or current.publication_id != captured_state["publication_id"]
+                    or any(hit.node_id not in current.nodes for hit in result)
+                ):
+                    result = []
+        return result
+    except BaseException:
+        if owned_snapshot and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _rrf_merge_aggregation(
@@ -5021,7 +5263,8 @@ def _expand_entities_from_query(
 
     for type_label in sorted(matched_types):
         rows = conn.execute(
-            "SELECT entity_canonical FROM entity_types WHERE type = ? LIMIT ?",
+            "SELECT entity_canonical FROM current_entity_types "
+            "WHERE type = ? ORDER BY entity_canonical LIMIT ?",
             (type_label, max_per_type),
         ).fetchall()
         for r in rows:
@@ -5034,7 +5277,8 @@ def _expand_entities_from_query(
 
     for key, value in matched_props:
         rows = conn.execute(
-            "SELECT entity_canonical FROM entity_properties WHERE key = ? AND value = ? LIMIT ?",
+            "SELECT entity_canonical FROM current_entity_properties "
+            "WHERE key = ? AND value = ? ORDER BY entity_canonical LIMIT ?",
             (key, value, max_per_type),
         ).fetchall()
         for r in rows:
@@ -5064,7 +5308,8 @@ def _expand_entities_by_type(
 
     placeholders = ",".join("?" * len(entities))
     type_rows = conn.execute(
-        f"SELECT DISTINCT type FROM entity_types WHERE entity_canonical IN ({placeholders})",
+        f"SELECT DISTINCT type FROM current_entity_types "
+        f"WHERE entity_canonical IN ({placeholders})",
         entities,
     ).fetchall()
     if not type_rows:
@@ -5074,9 +5319,10 @@ def _expand_entities_by_type(
     type_placeholders = ",".join("?" * len(types))
 
     expanded_rows = conn.execute(
-        f"""SELECT DISTINCT entity_canonical, type FROM entity_types
+        f"""SELECT DISTINCT entity_canonical, type FROM current_entity_types
             WHERE type IN ({type_placeholders})
             AND entity_canonical NOT IN ({placeholders})
+            ORDER BY entity_canonical, type
             LIMIT ?""",
         types + entities + [max_expanded],
     ).fetchall()

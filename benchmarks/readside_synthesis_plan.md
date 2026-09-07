@@ -5,6 +5,9 @@
 > protocol. Do not quote its gap arithmetic as a present comparison. The current
 > orientation point is Hindsight's official March 2026 94.6 single-query result;
 > HyMem has not rerun a replacement score under the new strict LME envelope.
+> Every `deepseek-chat` setting below names the now-retired mutable alias used by
+> that historical experiment; it is provenance, not a runnable default or
+> recommendation. Current runs pin `deepseek-v4-flash` with thinking disabled.
 
 *Written 2026-07-24, branch `Beam-optimisation`. Companion to
 `benchmarks/raptor_digest_plan.md` (RAPTOR product thread),
@@ -17,7 +20,8 @@ nothing reads oracle labels at decision time, per-category LME deltas under
 **Motivating context (from the historical 2026-07 Hindsight review):** Hindsight
 (Vectorize.io, arXiv 2512.12818) then reported 91.4% LongMemEval (MS 79.7) on an
 OSS-120B-class reader with an agentic ≤10-iteration "reflect" answer loop.
-HyMem's then-local baseline was 70.0% full-dream (MS floor 51.9) on deepseek-chat with a
+HyMem's then-local baseline was 70.0% full-dream (MS floor 51.9) on the now-retired
+`deepseek-chat` alias with a
 single-shot answerer. Three independent closed HyMem investigations agree the
 residual is **answer-side synthesis, not retrieval**: LME retrieval CLOSED
 (floor audit: 14-floor unrecoverable, MS decomposition banks 20 synthesis
@@ -162,9 +166,9 @@ extend the watch instead of deciding — the gate needs at least 5 verdict rows.
 > unreachable guard reading PASS.
 
 
-1. `hymem/config.py:112` — `aggregation_nodes_enabled: bool = False` → `True`,
+1. `hymem/config.py` — `aggregation_nodes_enabled: bool = False` → `True`,
    docstring updated to record the flip date + gate evidence pointer.
-   Bootstrap semantics already do the right thing (`hymem/bootstrap.py:86`: an
+   Bootstrap semantics already do the right thing (`hymem/bootstrap.py`: an
    UNSET `HYMEM_AGGREGATION_NODES_ENABLED` leaves `None` and the dataclass
    default wins), so after the flip the env var becomes an explicit OFF switch
    — no bootstrap change needed. Verify the startup `log.info` still reports
@@ -207,8 +211,9 @@ cannot reach a non-DeepSeek endpoint. Changes:
 - New flags: `--answer-base-url` (default `DEEPSEEK_BASE_URL`) and
   `--answer-api-key` (default: fall back to `--api-key`). Thread them into
   the ANSWER client only.
-- **The judge client stays exactly as-is: `deepseek-chat` against
-  `DEEPSEEK_BASE_URL`, same per-type judge prompts.** Judge posture is the
+- **Historical protocol only:** the judge client was to stay exactly as it was,
+  using the now-retired `deepseek-chat` alias against
+  `DEEPSEEK_BASE_URL`, with the same per-type judge prompts. Judge posture is the
   comparability contract with the canonical 70.0 — never vary it in this plan.
 - Record `answer_base_url` in the output `metadata` block (answer_model is
   already recorded) so the run is self-describing.
@@ -348,7 +353,8 @@ verdict in `longmemeval_roadmap.md` and stop this phase.
 
 ### 2.4 Full LME A/B (one run; baseline is banked)
 
-- ON arm: `--sample 0 --seed 0 --distill`, canonical reader (deepseek-chat)
+- Historical ON arm: `--sample 0 --seed 0 --distill`, then-canonical reader
+  (the now-retired `deepseek-chat` alias)
   and canonical config (copied from the canonical run metadata, as in 1.3).
 - OFF arm: the banked canonical 70.0 run itself (same seed → paired). Only
   if any canonical-config flag has drifted since, rerun OFF first.

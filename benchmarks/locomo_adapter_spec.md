@@ -257,23 +257,115 @@ Ingest+dream over 19-32 sessions is the expensive step and is **per
 conversation, not per question** (10 stores serve 1986 questions):
 
 - `--db-dir DIR` persists per-conversation stores (`DIR/conv-26/hymem.sqlite`)
-  and **reuses them on later runs** (skips ingest+dream) — QA/prompt iterations
-  don't re-pay ingestion. The MSC arc took 5 scored passes; on LoCoMo each
-  re-ingest avoided saves ~10 conv × ~25 dreams of LLM calls. A reused store is
-  only valid for the same core/schema — `--fresh` (or clearing the dir) after
-  core changes, and any core-change regression run MUST be `--fresh`.
+  and **reuses them on later runs** (skips ingestion, but not verification): every
+  normal reuse first snapshots durable status and then runs bounded convergence.
+  This catches newly pending work, quarantine, terminal source loss, or coverage
+  failure before a question is scored. Historical one-cycle stores have no
+  immutable build receipt and are rejected with `--fresh` remediation rather
+  than being silently adopted. QA/prompt iterations against a newly receipted
+  store still avoid re-ingestion and usually pay one no-op convergence cycle.
+- Default end-of-history indexing and each `--dream-per-session` wave use
+  `--indexing-max-cycles 100` and `--indexing-timeout-s 3600`. Hitting either
+  bound fails before scoring with the durable failure summary. `--no-dream` and
+  `--sim` are explicit zero-pipeline-call, non-comparable paths; they refuse a
+  reused store because it may already contain dreamed tiers (`--fresh` or no
+  `--db-dir` gives the honest raw-only arm).
+- Scored runs use the shared strict protocol: before canary, provider-client,
+  or store construction, the adapter hashes the exact data/code surface and
+  binds the selected question ids in execution order, effective HyMem config,
+  provider identities/bodies, seed, split, and canary policy into an immutable
+  manifest. Each returned row is atomically checkpointed from both serial and
+  worker paths. Completed rows and, unless `--retry-failures` is explicit,
+  bounded failed rows are skipped on `--resume-from`; conversations with no
+  pending ids are not opened. A terminal resume can republish using only the
+  durable ledger (zero canary/indexing/reader/judge calls).
+- Each execution segment owns one cumulative indexing/embedding/pipeline
+  snapshot per conversation plus shared reader, judge, and canary usage. A
+  resumed process adds a new segment, so cumulative client counters are never
+  added once per question or double-counted across restarts.
+- A healthy fresh build atomically publishes a v6 secret-free immutable receipt
+  (`hymem-benchmark-store-build-v7`)
+  in its store. It binds the normalized memory-source hash, the AST identity of
+  the adapter's material construction/ingestion/convergence surface
+  (`MSCAdapter.open`, `ingest`, `dream`, and `_durable_status`), the portable
+  transitive HyMem import closure (including package initializers plus the
+  runtime-loaded schema and migrations), effective
+  exact canonical Phase-1 producer/effective-request and embedding identities,
+  material write-side config, and a canonical digest of
+  actual source/derived/retrieval rows (including logical FTS and vec contents).
+  Convergence evidence is `hymem-benchmark-indexing-v4` over coherent
+  `hymem-dream-status-v5` + `hymem-benchmark-indexing-status-v3` snapshots;
+  its per-run report counts, fixed `DreamReport` totals/flags, terminal cycles,
+  final statuses, and usage must reconcile. Receipt v6 embeds an exact sanitized
+  `hymem-benchmark-store-indexing-attestation-v2` projection and binds it with
+  `indexing_sha256`, so reduced/relabelled nested evidence cannot authorize reuse.
+  Embedding identity uses the immutable configured `HYMEM_EMBEDDING_DIM`, not
+  the transport's phase-dependent observed dimension. Every provider batch is
+  checked against that pin; one contradictory response permanently invalidates
+  the build, even if a best-effort ingest path catches it and a retry recovers.
+  A separate receipt section verifies all durable vector mirrors and optional
+  sqlite-vec metadata use the endpoint-namespaced model and pinned dimension.
+  Legacy/fake clients without the explicit pinned-integrity capability cannot
+  publish or validate a reusable store, and query-time semantic failure aborts
+  before scoring rather than silently degrading the embedding arm to FTS.
+  SQLite material is re-attested with `hymem-material-store-attestation-v5`,
+  while `hymem-material-code-closure-v3` binds the transitive write-side code.
+  SQLite pages/shadows and operational lock/run/retry/health counters, including
+  retention-bounded `extraction_feedback` audit rows, are excluded. Application
+  tables are explicitly classified, so an unknown future
+  table or view fails closed. Reuse validates identity and material state before
+  reconvergence, then validates them again immediately before scoring; a missing legacy receipt
+  or any mismatch fails with `--fresh` remediation instead of adopting the cache.
+- Cycle/timeout/health failures are materialized as bounded terminal-wrong rows
+  for every still-pending question in that conversation. They remain retryable
+  only under the explicit `--retry-failures` policy and retain the indexing
+  failure summary in the execution segment.
 - `--workers N` parallelizes **conversations** (each owns its store; ≤10
   useful). QA within a conversation stays sequential (one SQLite connection).
+- Before conversation workers start, extraction-canary policy v17
+  (`hymem-phase1-extraction-canary-v17`) forces two >5,000-character source
+  records through the production four-leaf path. A table-continuation claim
+  requires its exact v9 canonical header plus ATX-heading prelude context, and
+  a separate prose claim requires exact bounded context across a proven
+  paragraph cut. Actual request/response provenance proves neither claim was
+  self-contained, each exact claim was emitted on its context-bearing
+  continuation and never another leaf, both source IDs were seen, and complete
+  list/fenced-code decoy controls reached the provider without internal
+  fragment boundaries. A
+  policy-bound zero-provider splitter subprobe separately requires both exact
+  Markdown atoms to remain unsplittable. The canary validates exactly two
+  typed, exact-source claim evidence records, zero markers/duplicates, complete
+  bounded call/attempt/usage accounting (eight calls normally; at most 24
+  logical calls/72 provider attempts), successful dedicated-client closure,
+  and equality with the memory pipeline's model/endpoint/thinking/effective-body
+  identity. Stale-v16 evidence is unsupported. The same validated report is
+  copied into every emitted QA row; mixed, partial, or forged row reports are
+  rejected by current registry ingestion. `--sim`/`--no-dream` remain explicit
+  non-comparable zero-work states.
 - `--sample N` = global seeded QA cap (random ≈ category-proportional at
   n≥100); `--categories 1,2,4` / `--convs conv-26,…` for targeted slices.
+- On successful completion the checkpoint is finalized, provider clients and
+  its lease must close, and only then is an immutable `locomo-…-strict-….json`
+  archive created with `locomo-latest.json` as a small mutable pointer.
+  `--out` remains a legacy bare-list sidecar for `locomo_audit.py` and
+  `locomo_flip.py`; it is not the authoritative strict evidence. `--rejudge`
+  and `--diag-only` remain separate non-scored legacy workflows and reject
+  checkpoint/calibration/split controls.
 - `--sim` is fully offline including the report (local `compute_scores`
   fallback — importing the LME module pulls in `requests` at module level).
 
 Suggested first box run (before any full-1986 spend):
 
+The active defaults use exact `deepseek-v4-flash` identities for answer, judge,
+and memory extraction. The command pins them explicitly; retired
+`deepseek-chat`/`deepseek-reasoner` aliases are rejected.
+
 ```
 python benchmarks/locomo_adapter.py --data benchmarks/data/locomo10.json \
   --sample 200 --seed 0 --workers 10 --db-dir /tmp/locomo_dbs \
+  --checkpoint /tmp/locomo-run.checkpoint.json --results-dir /tmp/locomo-runs \
+  --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash \
+  --hymem-model deepseek-v4-flash --hymem-thinking disabled \
   --answer-extra-body '{"thinking":{"type":"disabled"}}' \
   --judge-extra-body  '{"thinking":{"type":"disabled"}}' \
   --out /tmp/locomo_results_v1.json

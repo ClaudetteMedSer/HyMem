@@ -14,17 +14,29 @@ Same bar as test_lme_registry.py:
 import json
 import sqlite3
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "benchmarks"))
 
+import beam_adapter  # noqa: E402
 import benchmarks.beam_registry  # noqa: E402
 import benchmarks.locomo_registry  # noqa: E402
 import benchmarks.run_registry  # noqa: E402
-from benchmarks.strictness import build_manifest  # noqa: E402
+from benchmarks.extraction_canary import extraction_canary_policy  # noqa: E402
+from hymem.extraction.contract import extraction_contract_binding  # noqa: E402
+from benchmarks.strictness import (  # noqa: E402
+    AtomicCheckpoint,
+    build_manifest,
+    prepare_checkpoint_artifact,
+    publish_prepared_artifact_after_cleanup,
+    read_artifact_or_pointer,
+    write_latest_pointer,
+)
 
 
 @pytest.fixture()
@@ -54,11 +66,128 @@ def _strict_usage(calls, prompt, completion, *, latency=1.0):
     }
 
 
-def _strict_local_embedding_usage():
+def _strict_passed_canary(pipeline):
+    policy = extraction_canary_policy()
+    completion_calls = policy["normal_pass_completion_calls"]
+    return {
+        **policy,
+        "status": "passed",
+        "client": {
+            "client_class": "fixture.CanaryClient",
+            "model": pipeline["model"],
+            "base_url": pipeline["base_url"],
+            "thinking_mode": pipeline["thinking_mode"],
+            "effective_extra_body": pipeline["effective_extra_body"],
+        },
+        "client_closed": True,
+        "completion_calls": completion_calls,
+        "provider_attempts": completion_calls,
+        "initial_prepartition_leaves": policy["expected_prepartition_leaves"],
+        "duplicate_triples_collapsed": 0,
+        "usage": _strict_usage(completion_calls, 10, 10),
+        "execution_path": deepcopy(policy["normal_execution_path"]),
+        "matched_supported_claims": 2,
+        "missing_expected_claim_indexes": [],
+        "valid_triples_returned": 2,
+        "valid_markers_returned": 0,
+        "claim_evidence": [
+            {"expected_claim_index": index, **claim}
+            for index, claim in enumerate(policy["expected_claims"])
+        ],
+    }
+
+
+def test_locomo_registry_validates_present_row_canary(tmp_path):
+    pipeline = {
+        "model": "pipeline-pinned",
+        "base_url": "https://pipeline.example/v1",
+        "thinking_mode": "off",
+        "effective_extra_body": {},
+    }
+    report = _strict_passed_canary(pipeline)
+    rows = [{
+        "question_id": "q1", "correct": True, "category": 1,
+        "extraction_canary": report,
+    }]
+    parsed = benchmarks.locomo_registry._locomo_row(
+        rows, tmp_path / "locomo.json",
+    )
+    assert parsed["count"] == 1
+
+    forged = json.loads(json.dumps(rows))
+    forged[0]["extraction_canary"]["claim_evidence"] = []
+    with pytest.raises(ValueError, match="extraction canary"):
+        benchmarks.locomo_registry._locomo_row(
+            forged, tmp_path / "locomo-forged.json",
+        )
+
+    with pytest.raises(ValueError, match="coverage"):
+        benchmarks.locomo_registry._locomo_row(
+            [*rows, {"question_id": "q2", "correct": False, "category": 2}],
+            tmp_path / "locomo-mixed.json",
+        )
+
+    for closed in (False, None):
+        unclosed = json.loads(json.dumps(rows))
+        unclosed[0]["extraction_canary"]["client_closed"] = closed
+        with pytest.raises(ValueError, match="extraction canary evidence"):
+            benchmarks.locomo_registry._locomo_row(
+                unclosed, tmp_path / "locomo-unclosed.json",
+            )
+
+    missing = json.loads(json.dumps(rows))
+    missing[0]["extraction_canary"].pop("client_closed")
+    with pytest.raises(ValueError, match="extraction canary evidence"):
+        benchmarks.locomo_registry._locomo_row(
+            missing, tmp_path / "locomo-missing-close.json",
+        )
+
+    stale = json.loads(json.dumps(rows))
+    stale[0]["extraction_canary"]["version"] = (
+        "hymem-phase1-extraction-canary-v16"
+    )
+    with pytest.raises(ValueError, match="extraction canary evidence"):
+        benchmarks.locomo_registry._locomo_row(
+            stale, tmp_path / "locomo-stale-v16.json",
+        )
+
+
+def test_locomo_registry_keeps_explicit_legacy_no_canary_compatibility(tmp_path):
+    rows = [{"question_id": "legacy-q", "correct": True, "category": 1}]
+
+    parsed = benchmarks.locomo_registry._locomo_row(
+        rows, tmp_path / "locomo-legacy.json",
+    )
+
+    assert parsed["count"] == 1
+    assert parsed["overall"] == 100.0
+
+
+def _strict_local_embedding_identity():
+    from hymem.dreaming.aggregation_material import (
+        embedding_producer_binding,
+        public_embedding_identity,
+    )
+    from hymem.extraction.embeddings import LocalHashEmbeddingClient
+
+    return public_embedding_identity(
+        embedding_producer_binding(LocalHashEmbeddingClient(
+            dim_value=384, model_name="feature-hash-v1",
+        )),
+        384,
+        fallback_policy="none",
+        fallback_reason=None,
+        transport_security="local-no-network",
+    )
+
+
+def _strict_local_embedding_usage(embedding=None):
+    embedding = embedding or _strict_local_embedding_identity()
     return {
         "configured": True, "backend": "local_feature_hash",
         "quality": "lexical", "network_free": True,
-        "model": "feature-hash-v1", "dimension": 384,
+        "model": embedding["vector_space_key"], "dimension": 384,
+        "identity_exact": True, "reuse_scope": "durable",
         "identity_consistent": True, "instances": 2,
         "calls": 6, "calls_available": True,
         "request_attempts": 0, "request_attempts_available": True,
@@ -231,13 +360,7 @@ def _make_beam_results(path: Path, date="2026-08-31T16:50:39.701802+00:00",
 
 
 def _make_strict_beam(path: Path, *, segment_status="complete"):
-    embedding = {
-        "configured": True, "backend": "local-hash",
-        "model": "feature-hash-v1", "base_url": "local://feature-hash",
-        "dimension": 384, "quality": "lexical-feature-hash",
-        "network_free": True, "fallback_policy": "none",
-        "fallback_reason": None,
-    }
+    embedding = _strict_local_embedding_identity()
     config = {
         "scales": ["100K", "500K"], "sample": 1,
         "sample_strategy": "seeded-label-blind-hash-v1",
@@ -248,6 +371,8 @@ def _make_strict_beam(path: Path, *, segment_status="complete"):
         "facts": True, "facts_extraction": False,
         "embedding": embedding,
         "effective_hymem_config": {
+            "prompt_version": "v20",
+            "extraction_contract": extraction_contract_binding("v20"),
             "facts_enabled": True,
             "facts_extraction_enabled": False,
             "graph_multihop_enabled": False,
@@ -287,6 +412,7 @@ def _make_strict_beam(path: Path, *, segment_status="complete"):
         "exploratory_label_steering": False,
         "exploratory_non_comparable": True,
         "scored_run": True,
+        "extraction_canary": extraction_canary_policy(),
     }
     models = {
         "reader": {
@@ -408,7 +534,11 @@ def _make_strict_beam(path: Path, *, segment_status="complete"):
                 "reader_usage": _strict_usage(39, 4, 6),
                 "judge_usage": _strict_usage(78, 12, 8),
                 "memory_pipeline_usage": _strict_usage(4, 10, 20),
-                "embedding_usage": _strict_local_embedding_usage(),
+                "embedding_usage": _strict_local_embedding_usage(embedding),
+                "indexing_runs": [],
+                "extraction_canary": _strict_passed_canary(
+                    models["memory_pipeline"]
+                ),
             }],
         },
         "per_question": rows,
@@ -470,6 +600,148 @@ def test_beam_strict_archive_discovery_multiscale_and_metadata(
     assert extras["execution_disclosure"]["segments_complete"] is True
     assert extras["execution"]["segments"][0]["segment_id"] == "process-a"
     assert extras["manifest"]["run_id"] == row[idx.index("run_id")]
+
+
+def test_beam_score_postprocess_failure_publishes_registry_recoverable_rows(
+    tmp_db, tmp_path, monkeypatch,
+):
+    """Derived-score failure must not invalidate the expensive row artifact."""
+
+    fixture_path = _make_strict_beam(tmp_path / "fixture-source.json")
+    source = json.loads(fixture_path.read_text())
+    expected_registry_row = benchmarks.beam_registry._beam_row(
+        source, fixture_path,
+    )
+    expected_ids = [row["question_id"] for row in source["per_question"]]
+    ledger = AtomicCheckpoint(
+        tmp_path / "beam.checkpoint.json",
+        manifest=source["manifest"], expected_ids=expected_ids,
+        verdict_key="result_valid",
+    )
+    for row in source["per_question"]:
+        ledger.record(row["question_id"], row=row)
+    segment = source["execution"]["segments"][0]
+    ledger.update_execution_segment(segment["segment_id"], segment)
+
+    selected = {}
+    for scale in source["config"]["scales"]:
+        scale_rows = [
+            row for row in source["per_question"] if row["scale"] == scale
+        ]
+        selected[scale] = [{
+            "id": scale_rows[0]["conv_id"],
+            "questions": [{
+                "question_id": row["question_id"],
+                "ability_short": row["ability"],
+            } for row in scale_rows],
+        }]
+
+    good_payload, good_summary, good_reconstruction = (
+        beam_adapter._strict_beam_payload(
+            ledger, selected, source["config"]["scales"],
+            label_free=True, judge_gold=True, official_judge_match=True,
+        )
+    )
+    assert good_payload["diagnostic_errors"] == []
+    assert set(good_payload["summary"]) == set(source["config"]["scales"])
+    assert set(good_payload["summary_counts"]) == set(
+        source["config"]["scales"]
+    )
+    assert len(good_reconstruction) == 2
+
+    partial = {
+        scale: {"OVERALL": dict(values["OVERALL"])}
+        for scale, values in good_summary.items()
+    }
+    unknown_ability = json.loads(json.dumps(good_summary))
+    unknown_ability["100K"]["UNKNOWN"] = unknown_ability["100K"].pop("IE")
+    wrong_count = json.loads(json.dumps(good_summary))
+    wrong_count["100K"]["IE"]["count"] += 1
+    wrong_average = json.loads(json.dumps(good_summary))
+    wrong_average["500K"]["ABS"]["avg"] = 0.125
+    for contradictory in (
+        partial, unknown_ability, wrong_count, wrong_average,
+    ):
+        monkeypatch.setattr(
+            beam_adapter, "compute_scores",
+            lambda _rows, value=contradictory: value,
+        )
+        rejected, rejected_summary, _ = beam_adapter._strict_beam_payload(
+            ledger, selected, source["config"]["scales"],
+            label_free=True, judge_gold=True, official_judge_match=True,
+        )
+        assert rejected_summary == {}
+        assert "summary" not in rejected
+        assert "summary_counts" not in rejected
+        assert rejected["diagnostic_errors"] == [{
+            "stage": "score_summary",
+            "exception_type": "BenchmarkIntegrityError",
+        }]
+
+    private_detail = "https://user:secret@example.invalid/private?token=bearer"
+    monkeypatch.setattr(
+        beam_adapter, "compute_scores",
+        lambda _rows: (_ for _ in ()).throw(RuntimeError(private_detail)),
+    )
+    payload, report_summary, reconstructed = beam_adapter._strict_beam_payload(
+        ledger, selected, source["config"]["scales"],
+        label_free=True, judge_gold=True, official_judge_match=True,
+    )
+    assert len(reconstructed) == 2
+    assert report_summary == {}
+    assert "summary" not in payload
+    assert "summary_counts" not in payload
+    assert payload["diagnostic_errors"] == [{
+        "stage": "score_summary", "exception_type": "RuntimeError",
+    }]
+    assert private_detail not in json.dumps(payload)
+    assert len(payload["diagnostic_errors"][0]["exception_type"]) <= 128
+
+    archive = tmp_path / "results_20260905T120000Z-strict-recovered.json"
+    artifact = prepare_checkpoint_artifact(ledger, payload=payload)
+    publish_prepared_artifact_after_cleanup(
+        archive, artifact,
+        cleanup_actions=[("checkpoint_close", ledger.close)],
+    )
+    write_latest_pointer(
+        tmp_path / "results_latest.json", archive=archive,
+        run_id=source["manifest"]["run_id"],
+    )
+    published = read_artifact_or_pointer(tmp_path / "results_latest.json")
+    assert [
+        (row["question_id"], row["score"], row["result_valid"])
+        for row in published["per_question"]
+    ] == [
+        (row["question_id"], row["score"], row["result_valid"])
+        for row in source["per_question"]
+    ]
+    assert "summary" not in published
+    assert "summary_counts" not in published
+
+    spec = dict(benchmarks.beam_registry.SPEC)
+    spec["builder"] = benchmarks.beam_registry._beam_row
+    benchmarks.run_registry.cmd_ingest(
+        spec, bench_dir=tmp_path, db_path=tmp_db,
+    )
+    con = sqlite3.connect(tmp_db)
+    columns = _cols(con)
+    registered = _row(con, archive.name)
+    assert registered is not None
+    for metric in (*benchmarks.beam_registry.BEAM_ABILITIES, "OVERALL"):
+        column = (
+            "overall" if metric == "OVERALL" else f"ability_{metric.lower()}"
+        )
+        assert registered[columns.index(column)] == pytest.approx(
+            expected_registry_row[column]
+        )
+    extras = json.loads(registered[columns.index("extras")])
+    assert extras["strict_summary"] is None
+    assert extras["strict_summary_counts"] is None
+    assert extras["summary_disclosure"] == {
+        "source": "recomputed_from_durable_rows",
+        "stored_summary_present": False,
+        "stored_summary_validated": False,
+    }
 
 
 def test_beam_strict_incomplete_segment_never_claims_exact_usage(

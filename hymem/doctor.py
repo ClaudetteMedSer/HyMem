@@ -14,6 +14,7 @@ import sys
 
 from hymem.bootstrap import EnvConfig, resolve_env
 from hymem.config import HyMemConfig
+from hymem.contrib.endpoint_policy import safe_endpoint_label
 from hymem.core import db as core_db
 from hymem.core.vectors import decode_vector, encode_vector
 
@@ -31,6 +32,45 @@ class _Result:
         return f"{_GLYPH[self.status]} {self.name}: {self.detail}"
 
 
+def _close_probe(
+    resource,
+    *,
+    primary_exception: BaseException | None,
+    reported_failure: Exception | None = None,
+) -> None:
+    """Close one doctor-owned transport with explicit failure precedence.
+
+    ``primary_exception`` is exception control flow currently propagating and
+    must never be replaced.  ``reported_failure`` is an ordinary connectivity
+    exception already converted into a FAIL result: an ordinary close fault is
+    secondary to it, but cleanup control flow must still propagate unchanged.
+    """
+
+    close = getattr(resource, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except BaseException as exc:
+        if primary_exception is not None:
+            try:
+                primary_exception.add_note(
+                    f"doctor probe cleanup failed: {type(exc).__name__}"
+                )
+            except (AttributeError, TypeError):  # pragma: no cover
+                pass
+            return
+        if reported_failure is not None and isinstance(exc, Exception):
+            try:
+                reported_failure.add_note(
+                    f"doctor probe cleanup failed: {type(exc).__name__}"
+                )
+            except (AttributeError, TypeError):  # pragma: no cover
+                pass
+            return
+        raise
+
+
 def _check_root(cfg: EnvConfig) -> _Result:
     try:
         cfg.root.mkdir(parents=True, exist_ok=True)
@@ -43,10 +83,20 @@ def _check_root(cfg: EnvConfig) -> _Result:
 
 
 def _check_llm(cfg: EnvConfig) -> _Result:
+    display_url = safe_endpoint_label(cfg.llm_base_url, label="LLM")
+    from hymem.contrib.model_policy import (
+        DeprecatedModelAliasError,
+        require_active_model,
+    )
+    try:
+        require_active_model(cfg.llm_model, role="HyMem doctor LLM")
+    except DeprecatedModelAliasError as exc:
+        return _Result(FAIL, "extraction LLM", str(exc))
     if not cfg.has_llm_key:
         return _Result(
             FAIL, "extraction LLM",
-            "no API key — set HYMEM_LLM_API_KEY (or DEEPSEEK_API_KEY / OPENAI_API_KEY)",
+            "no API key authorized for endpoint — set HYMEM_LLM_API_KEY or "
+            "the matching exact-origin provider key",
         )
     try:
         from hymem.contrib.openai_client import OpenAICompatibleClient
@@ -57,6 +107,8 @@ def _check_llm(cfg: EnvConfig) -> _Result:
     # Probe with a minimal chat completion — the capability HyMem actually
     # uses. /v1/models is not exposed by every OpenAI-compatible proxy, so a
     # models.list() failure would be a false negative.
+    client = None
+    failure: Exception | None = None
     try:
         client = OpenAICompatibleClient(
             api_key=cfg.llm_api_key, base_url=cfg.llm_base_url, model=cfg.llm_model,
@@ -64,21 +116,42 @@ def _check_llm(cfg: EnvConfig) -> _Result:
         client.complete(LLMRequest(
             system="", user="ping", response_format="text", max_tokens=1,
         ))
-        return _Result(OK, "extraction LLM",
-                       f"{cfg.llm_model} @ {cfg.llm_base_url} (reachable)")
+        result = _Result(OK, "extraction LLM",
+                         f"{cfg.llm_model} @ {display_url} (reachable)")
     except Exception as exc:  # noqa: BLE001
-        return _Result(FAIL, "extraction LLM",
-                       f"{cfg.llm_model} @ {cfg.llm_base_url} unreachable: {exc}")
+        failure = exc
+        result = _Result(FAIL, "extraction LLM",
+                         f"{cfg.llm_model} @ {display_url} unreachable: "
+                         f"{type(exc).__name__}")
+    finally:
+        _close_probe(
+            client,
+            # The connectivity exception is represented by ``result`` rather
+            # than re-raised, but it is still the authoritative probe failure:
+            # a secondary transport-close fault must not replace that result.
+            # If control flow (KeyboardInterrupt/SystemExit/DeadlineExceeded)
+            # is active, ``sys.exc_info`` supplies that exact primary instead.
+            primary_exception=(
+                sys.exc_info()[1] if failure is None else None
+            ),
+            reported_failure=failure,
+        )
+    return result
 
 
-def _check_embedding(cfg: EnvConfig) -> tuple[_Result, int | None]:
-    """Returns the check result and the live embedding dimension (or None)."""
+def _check_embedding(
+    cfg: EnvConfig,
+) -> tuple[_Result, int | None, str | None]:
+    """Return result plus the exact live storage-space identity."""
+    from hymem.dreaming.aggregation_material import embedding_execution_identity
+
     if cfg.embedding_backend == "local_feature_hash":
         from hymem.extraction.embeddings import LocalHashEmbeddingClient
         embedder = LocalHashEmbeddingClient(
             dim_value=cfg.embedding_dim, model_name=cfg.embedding_model
         )
         embedder.embed(["preflight probe"])
+        _binding, model_key, live_dim = embedding_execution_identity(embedder)
         status = OK
         if cfg.embedding_fallback_reason == "remote_embedding_credentials_missing":
             status = WARN
@@ -91,39 +164,74 @@ def _check_embedding(cfg: EnvConfig) -> tuple[_Result, int | None]:
         return (
             _Result(
                 status, "embeddings",
-                f"{cfg.embedding_model} (local deterministic lexical fallback, "
+                f"{model_key} (local deterministic lexical fallback, "
                 f"no network, dim={embedder.dim}{fallback_detail})",
             ),
-            embedder.dim,
+            live_dim,
+            model_key,
         )
     if not cfg.has_embedding_key:
-        return _Result(FAIL, "embeddings", "remote backend has no API key"), None
+        return _Result(FAIL, "embeddings", "remote backend has no API key"), None, None
+    if (
+        not cfg.embedding_pin_dimension
+        or not cfg.embedding_deployment_revision
+        or not cfg.embedding_deployment_tenant
+    ):
+        return (
+            _Result(
+                FAIL, "embeddings",
+                "remote backend lacks pinned dimension/deployment/tenant authority",
+            ),
+            None,
+            None,
+        )
     try:
         from hymem.contrib.openai_embedding_client import (
             OpenAICompatibleEmbeddingClient,
             safe_embedding_base_url,
         )
     except ImportError:
-        return _Result(WARN, "embeddings", "key present; openai package not installed"), None
+        return _Result(WARN, "embeddings", "key present; openai package not installed"), None, None
     display_url = safe_embedding_base_url(cfg.embedding_base_url)
+    embedder = None
+    failure: Exception | None = None
     try:
         embedder = OpenAICompatibleEmbeddingClient(
             api_key=cfg.embedding_api_key,
             base_url=cfg.embedding_base_url,
             model=cfg.embedding_model,
             dim=cfg.embedding_dim,
+            pin_dimension=cfg.embedding_pin_dimension,
+            deployment_revision=cfg.embedding_deployment_revision,
+            deployment_tenant=cfg.embedding_deployment_tenant,
         )
         embedder.embed(["preflight probe"])  # also resolves the true dimension
-        return (
+        _binding, model_key, live_dim = embedding_execution_identity(embedder)
+        result = (
             _Result(OK, "embeddings",
-                    f"{cfg.embedding_model} @ {display_url} "
-                    f"(reachable, dim={embedder.dim})"),
-            embedder.dim,
+                    f"exact producer {model_key} @ {display_url} "
+                    f"(reachable, dim={live_dim})"),
+            live_dim,
+            model_key,
         )
     except Exception as exc:  # noqa: BLE001
-        return _Result(FAIL, "embeddings",
-                       f"{cfg.embedding_model} @ {display_url} "
-                       f"unreachable ({type(exc).__name__})"), None
+        failure = exc
+        result = (
+            _Result(FAIL, "embeddings",
+                    f"configured producer @ {display_url} "
+                    f"unreachable ({type(exc).__name__})"),
+            None,
+            None,
+        )
+    finally:
+        _close_probe(
+            embedder,
+            primary_exception=(
+                sys.exc_info()[1] if failure is None else None
+            ),
+            reported_failure=failure,
+        )
+    return result
 
 
 def _check_sqlite_vec() -> _Result:
@@ -144,7 +252,9 @@ def _check_sqlite_vec() -> _Result:
                        f"failed to load ({exc}) — exact durable vector scoring remains available")
 
 
-def _check_schema_and_dim(cfg: EnvConfig, live_dim: int | None) -> list[_Result]:
+def _check_schema_and_dim(
+    cfg: EnvConfig, live_dim: int | None, live_model: str | None,
+) -> list[_Result]:
     results: list[_Result] = []
     hy_cfg = HyMemConfig(root=cfg.root)
     try:
@@ -221,10 +331,10 @@ def _check_schema_and_dim(cfg: EnvConfig, live_dim: int | None) -> list[_Result]
         results.append(_Result(WARN, "embedding identity",
                                f"stored model={stored_model} dim={stored_dim}; "
                                "embedding client not verified"))
-    elif live_dim != stored_dim or cfg.embedding_identity != stored_model:
+    elif live_dim != stored_dim or live_model != stored_model:
         results.append(_Result(
             FAIL, "embedding identity",
-            f"MISMATCH: configured identity={cfg.embedding_identity} dim={live_dim}; "
+            f"MISMATCH: configured identity={live_model} dim={live_dim}; "
             f"stored vec model={stored_model} dim={stored_dim}. Retrieval skips "
             "incompatible durable rows; run a dream to re-embed/rebuild shadows "
             "or restore the prior model.",
@@ -232,7 +342,7 @@ def _check_schema_and_dim(cfg: EnvConfig, live_dim: int | None) -> list[_Result]
     else:
         results.append(_Result(
             OK, "embedding identity",
-            f"configured identity={cfg.embedding_identity} dim={live_dim} matches stored shadows",
+            f"configured identity={live_model} dim={live_dim} matches stored shadows",
         ))
     return results
 
@@ -317,9 +427,13 @@ def run_doctor() -> int:
     print("─" * 60)
     print(f"  storage root      : {cfg.root}")
     print(f"  LLM model         : {cfg.llm_model}")
-    print(f"  LLM base URL      : {cfg.llm_base_url}")
+    print(f"  LLM base URL      : {safe_endpoint_label(cfg.llm_base_url, label='LLM')}")
     print(f"  LLM API key       : {'set' if cfg.has_llm_key else 'MISSING'}")
-    print(f"  embedding model   : {cfg.embedding_model}")
+    import hashlib
+    embedding_model_digest = "sha256:" + hashlib.sha256(
+        cfg.embedding_model.encode("utf-8")
+    ).hexdigest()
+    print(f"  embedding model   : {embedding_model_digest}")
     print(f"  embedding backend : {cfg.embedding_backend}")
     print(f"  embedding base URL: {safe_embedding_base_url(cfg.embedding_base_url)}")
     print(f"  embedding API key : {'set' if cfg.has_embedding_key else 'not needed'}")
@@ -327,9 +441,9 @@ def run_doctor() -> int:
     print("─" * 60)
 
     results: list[_Result] = [_check_root(cfg), _check_llm(cfg), _check_sqlite_vec()]
-    embedding_result, live_dim = _check_embedding(cfg)
+    embedding_result, live_dim, live_model = _check_embedding(cfg)
     results.append(embedding_result)
-    results.extend(_check_schema_and_dim(cfg, live_dim))
+    results.extend(_check_schema_and_dim(cfg, live_dim, live_model))
     results.append(_check_canonical_drift(cfg))
 
     for r in results:

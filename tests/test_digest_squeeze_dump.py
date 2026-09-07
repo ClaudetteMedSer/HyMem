@@ -31,7 +31,6 @@ import pytest
 from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.core import db as core_db
 from hymem.dreaming.aggregate import build_aggregation_nodes
-from hymem.extraction.llm import StubLLMClient
 from tests.test_aggregate import _agg_llm, _seed_episode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
@@ -45,9 +44,8 @@ from digest_squeeze_dump import (  # noqa: E402
 from digest_squeeze_probe import SnapshotMoved  # noqa: E402
 
 from tests.test_digest_squeeze_probe import (  # noqa: E402
+    _seed_exact_edges,
     _profile_rows,
-    _seed_edge,
-    _seed_profile,
 )
 
 
@@ -68,8 +66,7 @@ def _dreamed(cfg, conn, *, profile_rows: int = 0, edges: int = 0):
                       "Started cycling on weekends.", ["cycling"])
         if profile_rows:
             _profile_rows(conn, profile_rows)
-        for i in range(edges):
-            _seed_edge(conn, f"svc{i:02d}", "uses", "postgres")
+    _seed_exact_edges(conn, acfg, edges)
     llm = _agg_llm()
     build_aggregation_nodes(conn, acfg, llm, None)
     return acfg, llm
@@ -77,8 +74,9 @@ def _dreamed(cfg, conn, *, profile_rows: int = 0, edges: int = 0):
 
 @pytest.fixture
 def conn(cfg):
-    hy = HyMem(cfg, llm=StubLLMClient(default="[]"),
-               embedding_client=StubEmbeddingClient())
+    # No configured provider identity: direct exact phase-1 fixtures and the
+    # read-only dump connection then evaluate the same authority projection.
+    hy = HyMem(cfg, embedding_client=StubEmbeddingClient())
     yield hy.conn
     hy.close()
 
@@ -193,33 +191,51 @@ def test_a_root_whose_members_all_vanished_is_an_error(cfg, conn, capsys):
     an empty summaries half. Refused, not printed."""
     _dreamed(cfg, conn, profile_rows=21, edges=5)
     with core_db.transaction(conn):
+        conn.execute("DROP TRIGGER aggregation_source_bound_update_guard")
         conn.execute("UPDATE aggregation_nodes SET member_episode_ids = ? "
                      "WHERE is_root = 1", (json.dumps(["ghost1", "ghost2"]),))
 
-    with pytest.raises(NoRootDigest, match="resolves to no members"):
+    with pytest.raises(NoRootDigest, match="valid structural proof"):
         build_arms(conn, cap=20)
     assert main([str(cfg.db_path)]) == 1
     assert "VERIFIED FACTS" not in capsys.readouterr().out
 
 
-def test_unresolvable_members_are_counted_not_silently_dropped(cfg, conn, capsys):
-    """A root kept through a failed fusion can point at replaced nodes. The
-    dump reports the shortfall in its header so the scorer knows the summaries
-    half is incomplete, rather than shrinking it silently."""
+def test_unresolvable_members_suppress_the_dump(cfg, conn, capsys):
+    """A malformed member cannot be silently omitted from the scored prompt."""
     _dreamed(cfg, conn, profile_rows=21, edges=5)
     root = conn.execute(
         "SELECT member_episode_ids FROM aggregation_nodes WHERE is_root = 1"
     ).fetchone()
     members = json.loads(root["member_episode_ids"]) + ["ghost"]
     with core_db.transaction(conn):
+        conn.execute("DROP TRIGGER aggregation_source_bound_update_guard")
         conn.execute("UPDATE aggregation_nodes SET member_episode_ids = ? "
                      "WHERE is_root = 1", (json.dumps(members),))
 
-    items, missing = root_items(conn)
-    assert missing == ["ghost"]
+    with pytest.raises(NoRootDigest, match="valid structural proof"):
+        root_items(conn)
+    assert main([str(cfg.db_path)]) == 1
+    out = capsys.readouterr()
+    assert "VERIFIED FACTS" not in out.out
 
-    assert main([str(cfg.db_path)]) == 0
-    assert "unresolved member" in capsys.readouterr().out
+
+def test_requested_anchor_cap_must_match_published_policy(cfg, conn):
+    _dreamed(cfg, conn, profile_rows=21, edges=5)
+
+    with pytest.raises(NoRootDigest, match="anchor cap"):
+        build_arms(conn, cap=1)
+
+
+def test_new_top_anchor_suppresses_stale_dump(cfg, conn):
+    """ARM A cannot be relabeled current after its exact anchor set changes."""
+
+    _dreamed(cfg, conn, profile_rows=0, edges=5)
+    with core_db.transaction(conn):
+        _profile_rows(conn, 1)
+
+    with pytest.raises(NoRootDigest, match="valid structural proof"):
+        build_arms(conn, cap=20)
 
 
 def test_identical_facts_blocks_are_refused(cfg, conn, capsys):

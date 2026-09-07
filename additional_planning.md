@@ -8,6 +8,9 @@
 > protocol caveats: Honcho vendor 90.4 (Haiku 4.5) / 92.6 (Gemini 3 Pro),
 > Hindsight official March 2026 94.6 single-query, Mnemosyne 98.9
 > Recall@All@5 on 100 items (not end-to-end), and BEAM-100K 65.2 separately.
+> Any `deepseek-chat` reference below is historical artifact/model provenance
+> for the retired mutable alias, never a current setting; live defaults pin
+> `deepseek-v4-flash` with thinking disabled.
 
 Two ideas borrowed from [BrainDB](https://github.com/dimknaf/braindb), adapted to
 HyMem's embedded, edge-typed architecture, plus the episode-granularity plan
@@ -4238,7 +4241,7 @@ Also fixed: `judge_scored`'s docstring said five call sites (six), and
 > `MS floor 51.9`. Both numbers come from **one run** —
 > `longmemeval-v2-hymem-20260610T094858Z-seed0.json`, 2026-06-10, `deepseek-chat`
 > for BOTH answer and judge. `deepseek-chat` was **hard-deprecated 2026-07-24**
-> (`hymem/bootstrap.py:23`). The canonical is not reproducible, and it is being
+> (see `hymem/bootstrap.py`). The canonical is not reproducible, and it is being
 > used as a floor for runs on a different model.
 >
 > **Two independent noise estimates, which agree.** The failed run's accident

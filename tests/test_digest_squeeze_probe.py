@@ -15,9 +15,9 @@ Each branch is asserted on its VALUE (counts and lines), never on the verdict
 string alone, because a verdict string can be right for the wrong reason.
 
 `test_the_fixed_arm_renders_the_same_lines_when_the_cap_binds_nothing` is the
-parity control: the CURRENT arm is production `_anchor_facts` itself (no copy),
-so the only thing that can drift is the FIXED arm's rendering and ordering, and
-that test pins it against production on a store where the two must agree.
+parity control: the CURRENT arm uses the exact typed projection underlying
+production `_anchor_facts`, while the assertion compares both renderings on a
+store where the two must agree.
 """
 from __future__ import annotations
 
@@ -28,11 +28,14 @@ from pathlib import Path
 
 import pytest
 
-from hymem import HyMem, StubEmbeddingClient
+from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.core import db as core_db
+from hymem.dreaming import phase1
 from hymem.dreaming.aggregate import _anchor_facts
+from hymem.dreaming.chunks import Chunk, persist_chunks
 from hymem.dreaming.lossless import materialize_message_coverage
-from hymem.extraction.llm import StubLLMClient
+from hymem.dreaming.phase1 import ChunkExtraction
+from hymem.extraction.triples import Triple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 from digest_squeeze_probe import (  # noqa: E402
@@ -99,6 +102,73 @@ def _seed_edge(conn, subject: str, predicate: str = "uses",
     )
 
 
+def _seed_exact_kg_claims(
+    conn,
+    cfg,
+    claims: list[tuple[str, str, str]],
+    *,
+    source_tag: str,
+) -> None:
+    """Persist exact phase-1 KG evidence for controlled benchmark claims."""
+
+    if not claims:
+        return
+    session_id = f"digest-squeeze-edge-source-{source_tag}"
+    source_text = "; ".join(" ".join(claim) for claim in claims) + "."
+
+    def write() -> None:
+        conn.execute("INSERT INTO sessions(id) VALUES (?)", (session_id,))
+        message_id = int(conn.execute(
+            "INSERT INTO messages(session_id,role,content) VALUES (?,'user',?)",
+            (session_id, source_text),
+        ).lastrowid)
+        materialize_message_coverage(conn, session_id)
+        chunk = Chunk(
+            id=f"digest-squeeze-exact-edges-{source_tag}",
+            session_id=session_id,
+            start_message_id=message_id,
+            end_message_id=message_id,
+            salience_reason="exact digest-squeeze edge fixtures",
+            text=f"user: {source_text}",
+            source_message_ids=(message_id,),
+        )
+        persist_chunks(conn, [chunk])
+        sources = phase1._claim_sources_for_chunk(conn, chunk)
+        phase1.persist_chunk_results(
+            conn,
+            chunk,
+            ChunkExtraction(
+                triples=[
+                    Triple(
+                        subject, predicate, obj, 1,
+                        source_message_id=message_id,
+                    )
+                    for subject, predicate, obj in claims
+                ],
+                markers=[],
+                claim_sources={source.message_id: source for source in sources},
+                source_validated=True,
+            ),
+            prompt_version=cfg.prompt_version,
+            cfg=cfg,
+        )
+
+    if conn.in_transaction:
+        write()
+    else:
+        with core_db.transaction(conn):
+            write()
+
+
+def _seed_exact_edges(conn, cfg, count: int, *, first: int = 0) -> None:
+    _seed_exact_kg_claims(
+        conn,
+        cfg,
+        [(f"svc{i:02d}", "uses", "postgres") for i in range(first, first + count)],
+        source_tag=f"{first}-{count}",
+    )
+
+
 def _profile_rows(conn, n: int, *, first: int = 0) -> None:
     """`n` ACTIVE profile rows. 'possession' is outside SINGLE_VALUED_SLOTS
     (user_profile.py:80), which is exactly why a real profile accumulates past
@@ -108,14 +178,12 @@ def _profile_rows(conn, n: int, *, first: int = 0) -> None:
 
 
 def _edges(conn, n: int, *, first: int = 0) -> None:
-    for i in range(first, first + n):
-        _seed_edge(conn, f"svc{i:02d}")
+    _seed_exact_edges(conn, HyMemConfig(root=Path(".")), n, first=first)
 
 
 @pytest.fixture
 def conn(cfg):
-    hy = HyMem(cfg, llm=StubLLMClient(default="[]"),
-               embedding_client=StubEmbeddingClient())
+    hy = HyMem(cfg, embedding_client=StubEmbeddingClient())
     yield hy.conn
     hy.close()
 
@@ -143,15 +211,18 @@ def test_a_squeezed_store_restores_every_active_edge(conn):
 
 
 def test_the_fixed_arm_renders_the_same_lines_when_the_cap_binds_nothing(conn):
-    """PARITY CONTROL. The CURRENT arm is production `_anchor_facts` itself, so
-    the only thing that can drift is the FIXED arm's own rendering and ordering.
-    On a store the cap does not bind, the two must agree line for line -- and
-    they are produced by different code paths, so this is not a tautology."""
+    """PARITY CONTROL. CURRENT uses the same exact typed projection underlying
+    production `_anchor_facts`; FIXED applies independent caps to those loaders.
+    On a store where the shared cap binds nothing, both must agree line for line."""
     with core_db.transaction(conn):
         _seed_profile(conn, "name", "Atta")
         _seed_profile(conn, "role", "bedrijfsarts")
-        _seed_edge(conn, "atta", "part_of", "medflow", pos=9)
-        _seed_edge(conn, "medflow", "uses", "postgres", pos=5)
+        _seed_exact_kg_claims(
+            conn, HyMemConfig(root=Path(".")),
+            [("atta", "part_of", "medflow"),
+             ("medflow", "uses", "postgres")],
+            source_tag="parity",
+        )
 
     current = _anchor_facts(conn, 20)
     assert current == [
@@ -168,7 +239,10 @@ def test_ineligible_edges_are_never_restored(conn):
     BOTH arms -- otherwise `edges_restored` reports the size of the graph."""
     with core_db.transaction(conn):
         _profile_rows(conn, 21)
-        _seed_edge(conn, "good")
+        _seed_exact_kg_claims(
+            conn, HyMemConfig(root=Path(".")),
+            [("good", "uses", "postgres")], source_tag="eligible-good",
+        )
         _seed_edge(conn, "derived", derived=1)
         _seed_edge(conn, "margin", pos=1, neg=4)
         _seed_edge(conn, "gone", status="retracted")
@@ -197,6 +271,21 @@ def test_no_active_edges_reads_vacuous(conn):
     assert report["n_edges_active"] == 0
     assert report["edges_restored"] == 0
     assert report["edge_budget_today"] == 0          # also squeezed: guard order
+    assert report["verdict"] == "VACUOUS"
+
+
+def test_unattributed_raw_edge_cannot_consume_cap_or_report_restoration(conn):
+    with core_db.transaction(conn):
+        _profile_rows(conn, 19)
+        _seed_edge(conn, "unattributed", pos=99)
+
+    report = measure_squeeze(conn, cap=20)
+
+    assert report["n_profile_active"] == 19
+    assert report["n_edges_active"] == 0
+    assert report["edge_budget_today"] == 0
+    assert report["edges_restored"] == 0
+    assert report["restored_lines"] == []
     assert report["verdict"] == "VACUOUS"
 
 
@@ -353,7 +442,11 @@ def test_the_json_payload_carries_no_fact_text(conn, tmp_path):
     conversation content. The payload is counts and verdict only."""
     with core_db.transaction(conn):
         _profile_rows(conn, 21)
-        _seed_edge(conn, "distinctivesubject", "uses", "distinctiveobject")
+        _seed_exact_kg_claims(
+            conn, HyMemConfig(root=Path(".")),
+            [("distinctivesubject", "uses", "distinctiveobject")],
+            source_tag="json-content",
+        )
 
     payload = _json_payload(measure_squeeze(conn, cap=20))
     blob = json.dumps(payload)
@@ -371,7 +464,11 @@ def test_restored_lines_are_withheld_from_the_render_by_default(conn):
     `--show-restored` is the human's explicit opt-in."""
     with core_db.transaction(conn):
         _profile_rows(conn, 21)
-        _seed_edge(conn, "distinctivesubject", "uses", "distinctiveobject")
+        _seed_exact_kg_claims(
+            conn, HyMemConfig(root=Path(".")),
+            [("distinctivesubject", "uses", "distinctiveobject")],
+            source_tag="render-content",
+        )
 
     report = measure_squeeze(conn, cap=20)
 
@@ -387,7 +484,11 @@ def test_restored_lines_are_withheld_from_the_render_by_default(conn):
 def test_main_runs_read_only_and_writes_only_counts(cfg, conn, tmp_path, capsys):
     with core_db.transaction(conn):
         _profile_rows(conn, 21)
-        _seed_edge(conn, "distinctivesubject", "uses", "distinctiveobject")
+        _seed_exact_kg_claims(
+            conn, HyMemConfig(root=Path(".")),
+            [("distinctivesubject", "uses", "distinctiveobject")],
+            source_tag="main-content",
+        )
     out_json = tmp_path / "squeeze.json"
 
     rc = main([str(cfg.db_path), "--json", str(out_json)])

@@ -16,25 +16,22 @@ from hymem.core import db as core_db
 from hymem.dreaming import phase1
 from hymem.dreaming.phase1 import ChunkExtraction
 from hymem.dreaming.chunks import Chunk
+from hymem.dreaming.aggregation_material import embedding_storage_identity
+from hymem.extraction.embeddings import MappedStubEmbeddingClient
 from hymem.extraction.triples import Triple
 
 
-class FakeEmbedder:
+def FakeEmbedder(mapping: dict[str, list[float]]):
     """Maps exact triple-text strings to controlled vectors so cosine
     similarity is deterministic. Unmapped texts raise (the tests map every
     text they expect to be embedded)."""
 
-    model = "fake"
-    dim = 4
-
-    def __init__(self, mapping: dict[str, list[float]]):
-        self.mapping = mapping
-
-    def embed(self, texts):
-        return [self.mapping[t] for t in texts]
+    return MappedStubEmbeddingClient(
+        mapping, model="dedup-fixture-v1", dim=4, fail_on="unmapped-fixture",
+    )
 
 
-def _seed_existing_edge(hy: HyMem, subj, pred, obj, vector):
+def _seed_existing_edge(hy: HyMem, subj, pred, obj, vector, embedder):
     """Insert an active edge plus its cached edge_embeddings vector."""
     conn = hy.conn
     conn.execute(
@@ -42,11 +39,13 @@ def _seed_existing_edge(hy: HyMem, subj, pred, obj, vector):
         "pos_evidence, neg_evidence) VALUES (?, ?, ?, 0, 0)",
         (subj, pred, obj),
     )
-    conn.execute(
-        "INSERT INTO edge_embeddings(edge_text, vector_json, model, dim) "
-        "VALUES (?, ?, 'fake', 4)",
-        (f"{subj} {pred} {obj}", json.dumps(vector)),
-    )
+    model, dim = embedding_storage_identity(embedder)
+    with core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT INTO edge_embeddings(edge_text, vector_json, model, dim) "
+            "VALUES (?, ?, ?, ?)",
+            (f"{subj} {pred} {obj}", json.dumps(vector), model, dim),
+        )
 
 
 def _seed_chunk(hy: HyMem, chunk_id="c_dedup") -> Chunk:
@@ -88,10 +87,12 @@ def _persist(hy: HyMem, chunk: Chunk, triple: Triple, embedder):
 def test_near_duplicate_attaches_to_existing_edge(cfg):
     hy = HyMem(cfg)
     try:
-        _seed_existing_edge(hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0])
-        chunk = _seed_chunk(hy)
         # Candidate "app uses uv_pip" embeds identically to "app uses uv".
         embedder = FakeEmbedder({"app uses uv_pip": [1.0, 0.0, 0.0, 0.0]})
+        _seed_existing_edge(
+            hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0], embedder,
+        )
+        chunk = _seed_chunk(hy)
 
         _persist(hy, chunk, Triple("app", "uses", "uv_pip", 1), embedder)
 
@@ -114,10 +115,12 @@ def test_near_duplicate_attaches_to_existing_edge(cfg):
 def test_dissimilar_triple_creates_new_edge(cfg):
     hy = HyMem(cfg)
     try:
-        _seed_existing_edge(hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0])
-        chunk = _seed_chunk(hy)
         # Orthogonal vector → cosine 0 → below threshold → new edge.
         embedder = FakeEmbedder({"app uses mysql": [0.0, 1.0, 0.0, 0.0]})
+        _seed_existing_edge(
+            hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0], embedder,
+        )
+        chunk = _seed_chunk(hy)
 
         _persist(hy, chunk, Triple("app", "uses", "mysql", 1), embedder)
 
@@ -133,9 +136,11 @@ def test_predicate_gate_blocks_cross_predicate_dedup(cfg):
     `app avoids uv` means the opposite of `app uses uv`."""
     hy = HyMem(cfg)
     try:
-        _seed_existing_edge(hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0])
-        chunk = _seed_chunk(hy)
         embedder = FakeEmbedder({"app avoids uv": [1.0, 0.0, 0.0, 0.0]})
+        _seed_existing_edge(
+            hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0], embedder,
+        )
+        chunk = _seed_chunk(hy)
 
         _persist(hy, chunk, Triple("app", "avoids", "uv", 1), embedder)
 
@@ -153,9 +158,11 @@ def test_lexical_guard_blocks_false_merge(cfg):
     NOT merge — the lexical-sibling guard rejects them."""
     hy = HyMem(cfg)
     try:
-        _seed_existing_edge(hy, "app", "uses", "redis", [1.0, 0.0, 0.0, 0.0])
-        chunk = _seed_chunk(hy)
         embedder = FakeEmbedder({"app uses redash": [1.0, 0.0, 0.0, 0.0]})
+        _seed_existing_edge(
+            hy, "app", "uses", "redis", [1.0, 0.0, 0.0, 0.0], embedder,
+        )
+        chunk = _seed_chunk(hy)
 
         _persist(hy, chunk, Triple("app", "uses", "redash", 1), embedder)
 
@@ -171,9 +178,12 @@ def test_different_subject_not_merged(cfg):
     fact, not a sibling canonical — no merge even at cosine 1.0."""
     hy = HyMem(cfg)
     try:
-        _seed_existing_edge(hy, "med_flow", "uses", "fastapi", [1.0, 0.0, 0.0, 0.0])
-        chunk = _seed_chunk(hy)
         embedder = FakeEmbedder({"fractal uses fastapi": [1.0, 0.0, 0.0, 0.0]})
+        _seed_existing_edge(
+            hy, "med_flow", "uses", "fastapi",
+            [1.0, 0.0, 0.0, 0.0], embedder,
+        )
+        chunk = _seed_chunk(hy)
 
         _persist(hy, chunk, Triple("fractal", "uses", "fastapi", 1), embedder)
 
@@ -189,9 +199,11 @@ def test_dedup_disabled_by_config(cfg):
 
     hy = HyMem(dataclasses.replace(cfg, triple_dedup_enabled=False))
     try:
-        _seed_existing_edge(hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0])
-        chunk = _seed_chunk(hy)
         embedder = FakeEmbedder({"app uses uv_pip": [1.0, 0.0, 0.0, 0.0]})
+        _seed_existing_edge(
+            hy, "app", "uses", "uv", [1.0, 0.0, 0.0, 0.0], embedder,
+        )
+        chunk = _seed_chunk(hy)
 
         _persist(hy, chunk, Triple("app", "uses", "uv_pip", 1), embedder)
 

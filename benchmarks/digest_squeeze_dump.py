@@ -14,9 +14,9 @@ hand-scored, and its verdict must never be quoted as a score.
 This script renders both root-fusion prompts over the SAME tree on the SAME
 snapshot and prints them. You paste them into the box LLM yourself.
 
-  ARM A  CURRENT -- `_anchor_facts(conn, cap)` exactly as production calls it:
-                    one shared cap, profile rows first, early return at
-                    `aggregate.py:823-824`.
+  ARM A  CURRENT -- the root's exact persisted typed anchor proofs, after
+                    confirming they still equal current authority under the
+                    publication's bound shared cap.
   ARM B  FIXED   -- the counterfactual: independent profile and edge budgets,
                     no early return (`digest_squeeze_probe.fixed_facts`).
 
@@ -37,15 +37,15 @@ A ceiling instrument, a degenerate criterion and an unreachable code path all
 read as PASS. So the dump refuses rather than prints when it cannot pose the
 question:
 
-  no root digest / no member resolves -> an EMPTY prompt. A human scoring one
+  no valid root digest / no member resolves -> an EMPTY prompt. A human scoring one
       produces a confident constant. Refused (rc=1).
   the two facts blocks are IDENTICAL -> nothing to score; S1-C1 would read 0
       for a reason unrelated to the fix. This is what a zero-profile store
       does. Refused (rc=3).
   `PRAGMA data_version` moved -> the arms came off two snapshots and part of
       the difference is a dream landing mid-dump. Refused (rc=2).
-  members that resolve to neither a node nor an episode are COUNTED in the
-      header, so a scorer knows the summaries half is incomplete.
+  a member that does not resolve through its exact typed proof suppresses the
+      entire dump; partial summaries are never rendered.
 
 BANKED CRITERIA (fixed before this ever ran; printed with the prompts)
 -----------------------------------------------------------------------
@@ -83,9 +83,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hymem.config import HyMemConfig  # noqa: E402
 from hymem.dreaming.aggregate import (  # noqa: E402
-    _anchor_facts,
     _items_text,
-    load_digest,
+)
+from hymem.dreaming.aggregation_provenance import (  # noqa: E402
+    load_knowledge_graph_anchor_inputs,
+    load_current_aggregation_publication,
+    load_profile_anchor_inputs,
+    load_root_anchor_inputs,
 )
 from hymem.extraction.prompts import (  # noqa: E402
     DIGEST_SYSTEM,
@@ -99,8 +103,6 @@ from recovery_probe import open_store_readonly  # noqa: E402
 from digest_squeeze_probe import (  # noqa: E402
     SnapshotMoved,
     _data_version,
-    fixed_facts,
-    measure_squeeze,
 )
 
 DUMP_MODULE_PATH = str(Path(__file__).resolve())
@@ -138,49 +140,62 @@ class NoRootDigest(RuntimeError):
     hand-scores as a confident constant. The dump refuses rather than prints."""
 
 
+def _root_material(conn: sqlite3.Connection):
+    publication = load_current_aggregation_publication(conn)
+    if publication is None or publication.root_node_id is None:
+        raise NoRootDigest(
+            "this store has no root digest node with a valid structural proof"
+        )
+    root = publication.nodes.get(publication.root_node_id)
+    if root is None:
+        raise NoRootDigest("root aggregation publication fails structural proof")
+    items: list[dict] = []
+    anchors = []
+    for proof in root.inputs:
+        if proof.kind == "aggregation_node":
+            node = publication.nodes.get(str(proof.source_ref["id"]))
+            if node is None:  # Defensive; publication validation already rejects it.
+                raise NoRootDigest("root child disappeared from its publication")
+            items.append({
+                "id": node.row["id"], "title": node.row["title"],
+                "summary": node.row["summary"], "input_proof": proof,
+            })
+        elif proof.kind == "episode":
+            title, separator, summary = proof.rendered_text.partition("\n")
+            if not separator:
+                raise NoRootDigest("root episode input has malformed rendered text")
+            items.append({
+                "id": proof.source_ref["id"], "title": title,
+                "summary": summary, "input_proof": proof,
+            })
+        else:
+            anchors.append(proof)
+    if not items:
+        raise NoRootDigest("the proven root resolves to no member inputs")
+    return publication, root, items, tuple(anchors)
+
+
 def root_items(conn: sqlite3.Connection) -> tuple[list[dict], list[str]]:
     """The root's fusion inputs, in the PERSISTED MEMBER ORDER.
 
-    Member order is fusion-input order and `_items_text` joins in that order,
-    so the order is part of the prompt. `expand_node` is deliberately NOT
-    reused: it splits members into `child_nodes` and `episodes`, which loses
-    the interleaving. The resolution order (aggregation node first, then
-    episode) is the same as `expand_node:1396-1434`.
+    Member order is fusion-input order and `_items_text` joins the persisted
+    typed input proofs in that order. A successful v55 publication has no
+    unresolved member: any missing/type-confused input suppresses the root.
 
     Returns (items, unresolved_member_ids). Read-only.
     """
-    digest = load_digest(conn)
-    if digest is None:
-        raise NoRootDigest("this store has no root digest node")
-    row = conn.execute(
-        "SELECT member_episode_ids FROM aggregation_nodes WHERE id = ?",
-        (digest.node_id,),
-    ).fetchone()
-    member_ids = json.loads(row["member_episode_ids"]) if row is not None else []
-
-    items: list[dict] = []
-    missing: list[str] = []
-    for member_id in member_ids:
-        node = conn.execute(
-            "SELECT id, title, summary FROM aggregation_nodes WHERE id = ?",
-            (member_id,),
-        ).fetchone()
-        if node is not None:
-            items.append({"id": node["id"], "title": node["title"] or "",
-                          "summary": node["summary"] or ""})
-            continue
-        ep = conn.execute(
-            "SELECT id, title, summary FROM episodes WHERE id = ?",
-            (member_id,),
-        ).fetchone()
-        if ep is not None:
-            items.append({"id": ep["id"], "title": ep["title"] or "",
-                          "summary": ep["summary"] or ""})
-            continue
-        # A root kept through a failed fusion can point at replaced nodes
-        # (aggregate.py's root_failed branch). Counted, never silently dropped.
-        missing.append(member_id)
-    return items, missing
+    owned_snapshot = not conn.in_transaction
+    try:
+        if owned_snapshot:
+            conn.execute("BEGIN")
+        _publication, _root, items, _anchors = _root_material(conn)
+        if owned_snapshot:
+            conn.execute("COMMIT")
+        return items, []
+    except BaseException:
+        if owned_snapshot and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _facts_block(facts: list[str]) -> str:
@@ -205,41 +220,75 @@ def build_arms(
     no `__post_init__` and no config validation anywhere in `hymem/`), and
     `max_members` overrides it for a box whose config is not the default.
     """
-    items, missing = root_items(conn)
-    if not items:
-        raise NoRootDigest(
-            f"the root digest resolves to no members ({len(missing)} member id(s) "
-            "match neither an aggregation node nor an episode)"
+    owned_snapshot = not conn.in_transaction
+    try:
+        if owned_snapshot:
+            conn.execute("BEGIN")
+        publication, root, items, persisted_anchors = _root_material(conn)
+        if cap != publication.anchor_fact_cap:
+            raise NoRootDigest(
+                "requested anchor cap does not match the published root policy"
+            )
+        fresh_anchors = tuple(load_root_anchor_inputs(conn, cap))
+        if fresh_anchors != persisted_anchors:
+            raise NoRootDigest(
+                "published root anchors no longer match current exact authority"
+            )
+
+        cfg = HyMemConfig(root=Path("."))
+        if max_members is not None:
+            cfg = replace(cfg, aggregation_max_members=max_members)
+        text = _items_text(items, cfg)
+
+        effective_edge_cap = cap if edge_cap is None else edge_cap
+        effective_profile_cap = cap if profile_cap is None else profile_cap
+        profile_proofs = load_profile_anchor_inputs(conn, effective_profile_cap)
+        edge_proofs = load_knowledge_graph_anchor_inputs(conn, effective_edge_cap)
+        fixed_proofs = tuple([*profile_proofs, *edge_proofs])
+        current = _facts_block([proof.rendered_text for proof in persisted_anchors])
+        fixed = _facts_block([proof.rendered_text for proof in fixed_proofs])
+        current_identities = {
+            (proof.kind, proof.source_key, proof.proof_hash)
+            for proof in persisted_anchors
+        }
+        edges_restored = sum(
+            (proof.kind, proof.source_key, proof.proof_hash) not in current_identities
+            for proof in edge_proofs
         )
-
-    cfg = HyMemConfig(root=Path("."))
-    if max_members is not None:
-        cfg = replace(cfg, aggregation_max_members=max_members)
-    text = _items_text(items, cfg)
-
-    current = _facts_block(_anchor_facts(conn, cap))
-    fixed = _facts_block(fixed_facts(
-        conn,
-        edge_cap=cap if edge_cap is None else edge_cap,
-        profile_cap=cap if profile_cap is None else profile_cap,
-    ))
-    sizing = measure_squeeze(conn, cap=cap, edge_cap=edge_cap,
-                             profile_cap=profile_cap)
-    return {
-        "root_id": load_digest(conn).node_id,
-        "items": items,
-        "missing": missing,
-        "text": text,
-        "current_facts": current,
-        "fixed_facts": fixed,
-        "current_prompt": DIGEST_USER_TEMPLATE.format(facts=current, text=text),
-        "fixed_prompt": DIGEST_USER_TEMPLATE.format(facts=fixed, text=text),
-        "edges_restored": sizing["edges_restored"],
-        "verdict": sizing["verdict"],
-        "cap": sizing["cap"],
-        "edge_cap": sizing["edge_cap"],
-        "profile_cap": sizing["profile_cap"],
-    }
+        all_profiles = load_profile_anchor_inputs(conn, 2_147_483_647)
+        all_edges = load_knowledge_graph_anchor_inputs(conn, 2_147_483_647)
+        if cap <= 0:
+            verdict = "DISABLED"
+        elif not all_edges:
+            verdict = "VACUOUS"
+        elif not all_profiles:
+            verdict = "ZERO-PROFILE"
+        elif len(all_profiles) < cap:
+            verdict = "NOT-SQUEEZED"
+        else:
+            verdict = "SQUEEZED"
+        result = {
+            "root_id": root.row["id"],
+            "items": items,
+            "missing": [],
+            "text": text,
+            "current_facts": current,
+            "fixed_facts": fixed,
+            "current_prompt": DIGEST_USER_TEMPLATE.format(facts=current, text=text),
+            "fixed_prompt": DIGEST_USER_TEMPLATE.format(facts=fixed, text=text),
+            "edges_restored": edges_restored,
+            "verdict": verdict,
+            "cap": cap,
+            "edge_cap": effective_edge_cap,
+            "profile_cap": effective_profile_cap,
+        }
+        if owned_snapshot:
+            conn.execute("COMMIT")
+        return result
+    except BaseException:
+        if owned_snapshot and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _print_dump(arms: dict, *, path: str) -> None:

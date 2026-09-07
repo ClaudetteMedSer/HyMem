@@ -10,7 +10,9 @@ from pathlib import Path
 import pytest
 
 from benchmarks import beam_registry, run_registry
+from benchmarks.extraction_canary import extraction_canary_policy
 from benchmarks.strictness import build_manifest, content_hash
+from hymem.extraction.contract import extraction_contract_binding
 
 
 def _usage(calls: int, prompt: int, completion: int, *, latency: float = 1.0):
@@ -32,14 +34,57 @@ def _usage(calls: int, prompt: int, completion: int, *, latency: float = 1.0):
     }
 
 
-def _local_embedding_usage(*, instances: int = 2):
+def _local_embedding_identity():
+    from hymem.dreaming.aggregation_material import (
+        embedding_producer_binding,
+        public_embedding_identity,
+    )
+    from hymem.extraction.embeddings import LocalHashEmbeddingClient
+
+    return public_embedding_identity(
+        embedding_producer_binding(LocalHashEmbeddingClient(
+            dim_value=384, model_name="feature-hash-v1",
+        )),
+        384,
+        fallback_policy="none",
+        fallback_reason=None,
+        transport_security="local-no-network",
+    )
+
+
+def _remote_embedding_identity():
+    from hymem.dreaming.aggregation_material import (
+        configured_openai_embedding_producer_binding,
+        public_embedding_identity,
+    )
+
+    return public_embedding_identity(
+        configured_openai_embedding_producer_binding(
+            base_url="https://api.openai.com/v1",
+            request_model="text-embedding-3-small",
+            dimension=1536,
+            pin_dimension=True,
+            deployment_revision="fixture-release-2026-09",
+            deployment_tenant="fixture-tenant",
+        ),
+        1536,
+        fallback_policy="fail-closed",
+        fallback_reason=None,
+        transport_security="https",
+    )
+
+
+def _local_embedding_usage(*, instances: int = 2, embedding=None):
+    embedding = embedding or _local_embedding_identity()
     return {
         "configured": True,
         "backend": "local_feature_hash",
         "quality": "lexical",
         "network_free": True,
-        "model": "feature-hash-v1",
+        "model": embedding["vector_space_key"],
         "dimension": 384,
+        "identity_exact": True,
+        "reuse_scope": "durable",
         "identity_consistent": True,
         "instances": instances,
         "calls": 6,
@@ -94,18 +139,39 @@ def _unavailable_embedding_usage():
     }
 
 
-def _strict_artifact() -> dict:
-    embedding = {
-        "configured": True,
-        "backend": "local-hash",
-        "model": "feature-hash-v1",
-        "base_url": "local://feature-hash",
-        "dimension": 384,
-        "quality": "lexical-feature-hash",
-        "network_free": True,
-        "fallback_policy": "none",
-        "fallback_reason": None,
+def _passed_canary(pipeline: dict) -> dict:
+    policy = extraction_canary_policy()
+    completion_calls = policy["normal_pass_completion_calls"]
+    return {
+        **policy,
+        "status": "passed",
+        "client": {
+            "client_class": "fixture.CanaryClient",
+            "model": pipeline["model"],
+            "base_url": pipeline["base_url"],
+            "thinking_mode": pipeline["thinking_mode"],
+            "effective_extra_body": pipeline["effective_extra_body"],
+        },
+        "client_closed": True,
+        "completion_calls": completion_calls,
+        "provider_attempts": completion_calls,
+        "initial_prepartition_leaves": policy["expected_prepartition_leaves"],
+        "duplicate_triples_collapsed": 0,
+        "usage": _usage(completion_calls, 10, 10),
+        "execution_path": deepcopy(policy["normal_execution_path"]),
+        "matched_supported_claims": 2,
+        "missing_expected_claim_indexes": [],
+        "valid_triples_returned": 2,
+        "valid_markers_returned": 0,
+        "claim_evidence": [
+            {"expected_claim_index": index, **claim}
+            for index, claim in enumerate(policy["expected_claims"])
+        ],
     }
+
+
+def _strict_artifact() -> dict:
+    embedding = _local_embedding_identity()
     config = {
         "scales": ["100K", "500K"],
         "sample": 1,
@@ -141,6 +207,8 @@ def _strict_artifact() -> dict:
         "facts": True,
         "facts_extraction": False,
         "effective_hymem_config": {
+            "prompt_version": "v20",
+            "extraction_contract": extraction_contract_binding("v20"),
             "facts_enabled": True,
             "facts_extraction_enabled": False,
             "graph_multihop_enabled": False,
@@ -154,6 +222,7 @@ def _strict_artifact() -> dict:
         "exploratory_label_steering": False,
         "exploratory_non_comparable": True,
         "scored_run": True,
+        "extraction_canary": extraction_canary_policy(),
     }
     models = {
         "reader": {
@@ -291,6 +360,8 @@ def _strict_artifact() -> dict:
                 "judge_usage": _usage(78, 120, 80),
                 "memory_pipeline_usage": _usage(4, 20, 30),
                 "embedding_usage": _local_embedding_usage(),
+                "indexing_runs": [],
+                "extraction_canary": _passed_canary(models["memory_pipeline"]),
             }],
         },
         "per_question": rows,
@@ -411,6 +482,50 @@ def test_strict_registry_recomputes_continuous_scores_and_protocol_posture(tmp_p
         "stored_summary_validated": True,
     }
     assert extras["manifest"] == data["manifest"]
+
+
+def test_strict_registry_rejects_rehashed_forged_passed_canary(tmp_path):
+    data = _strict_artifact()
+    report = data["execution"]["segments"][0]["extraction_canary"]
+    report.update(
+        claim_evidence=[], matched_supported_claims=0,
+        missing_expected_claim_indexes=[0, 1],
+        valid_triples_returned=0,
+    )
+    _rehash_manifest(data)
+    with pytest.raises(ValueError, match="extraction canary"):
+        beam_registry._beam_row(data, tmp_path / "forged-strict.json")
+
+
+def test_strict_registry_rejects_stale_v16_canary_report(tmp_path):
+    data = _strict_artifact()
+    data["execution"]["segments"][0]["extraction_canary"]["version"] = (
+        "hymem-phase1-extraction-canary-v16"
+    )
+    _rehash_manifest(data)
+
+    with pytest.raises(ValueError, match="extraction canary"):
+        beam_registry._beam_row(data, tmp_path / "stale-v16-strict.json")
+
+
+@pytest.mark.parametrize("mutation", ["drift", "missing"])
+def test_strict_registry_rejects_effective_extraction_contract_tamper(
+    tmp_path, mutation,
+):
+    data = _strict_artifact()
+    binding = data["config"]["effective_hymem_config"][
+        "extraction_contract"
+    ]
+    if mutation == "missing":
+        binding.pop("identity")
+    else:
+        binding["identity"] = (
+            "hymem-extraction-contract-sha256-v1:" + "0" * 64
+        )
+    _rebind_manifest(data)
+
+    with pytest.raises(ValueError, match="extraction canary"):
+        beam_registry._beam_row(data, tmp_path / "contract-tamper.json")
 
 
 def test_strict_registry_cannot_downgrade_missing_envelope_to_legacy(tmp_path):
@@ -784,6 +899,7 @@ def test_strict_registry_rejects_shortened_subset_denominator(tmp_path):
         ("quality", "semantic"),
         ("network_free", False),
         ("fallback_policy", "silent"),
+        ("transport_security", "https"),
     ],
 )
 def test_strict_registry_rejects_malformed_embedding_schema(tmp_path, field, value):
@@ -1032,17 +1148,7 @@ def test_strict_registry_requires_integral_reconciled_remote_embedding_tokens(
     tmp_path, field, value, message,
 ):
     data = _strict_artifact()
-    remote = {
-        "configured": True,
-        "backend": "openai-compatible",
-        "model": "text-embedding-3-small",
-        "base_url": "https://api.openai.com/v1",
-        "dimension": 1536,
-        "quality": "semantic",
-        "network_free": False,
-        "fallback_policy": "fail-closed",
-        "fallback_reason": None,
-    }
+    remote = _remote_embedding_identity()
     data["config"]["embedding"] = deepcopy(remote)
     data["models"]["embedding"] = deepcopy(remote)
     usage = data["execution"]["segments"][0]["embedding_usage"]
@@ -1053,6 +1159,8 @@ def test_strict_registry_requires_integral_reconciled_remote_embedding_tokens(
         "network_free": False,
         "model": beam_registry._manifested_embedding_execution_identity(remote)[1],
         "dimension": 1536,
+        "identity_exact": True,
+        "reuse_scope": "durable",
         "identity_consistent": True,
         "instances": 2,
         "calls": 6,
@@ -1111,6 +1219,10 @@ def test_strict_registry_allows_unavailable_zero_attempt_recovery_segment(tmp_pa
         "judge_usage": _unavailable_usage(),
         "memory_pipeline_usage": _unavailable_usage(),
         "embedding_usage": _unavailable_embedding_usage(),
+        "indexing_runs": [],
+        "extraction_canary": {
+            **extraction_canary_policy(), "status": "pending",
+        },
     })
     row = beam_registry._beam_row(data, tmp_path / "results_strict.json")
     assert row["answer_calls"] is None

@@ -4,9 +4,10 @@
 Connected-components over OR-links (cosine over episode embeddings OR jaccard
 over key entities — `hymem.dreaming.aggregate._linked`) chains TRANSITIVELY:
 A~B and B~C put A and C in one cluster even when A and C share nothing. On a
-real store that can snowball into one mega-cluster whose fusion is mush. Before
-`aggregation_nodes_enabled` flips on in prod (raptor_digest_plan.md, Stage 3a),
-this probe measures the cluster-size distribution on the PROD store:
+real store that can snowball into one mega-cluster whose fusion is mush. When
+the project considered flipping `aggregation_nodes_enabled` on in production
+(raptor_digest_plan.md, Stage 3a), this probe measured the cluster-size
+distribution on the production store:
 
   max cluster size < --cap (default 15, the plan's mega-cluster line)
       → chaining is bounded in practice → the guard is moot at this cap.
@@ -20,6 +21,10 @@ components into recency-ordered windows, governed by the config knob
 This probe deliberately keeps calling the clusterer UNCAPPED so it measures RAW
 transitive chaining — i.e. what the guard would split — not the post-guard
 distribution.
+
+Historical-state note: the probe predates the 2026-08-26 shipped-default flip.
+Current `HyMemConfig` enables aggregation by default; set the master switch to
+False only for an explicit control/opt-out.
 
 Offline, LLM-less, and READ-ONLY: the store is opened via sqlite URI mode=ro,
 so the probe can point at the live prod file without any risk of writing to it.
@@ -131,7 +136,23 @@ def probe_cluster_sizes(
     distinct session ids, so a mega-cluster is inspectable without re-running),
     a per-cluster list (for --json dumps), `guard_needed`, and `verdict`.
     """
-    episodes = load_clusterable_episodes(conn)
+    identities = conn.execute(
+        "SELECT DISTINCT model,dim FROM episode_embeddings "
+        "WHERE embedding_producer_key=model "
+        "ORDER BY model,dim"
+    ).fetchall()
+    if len(identities) > 1:
+        raise RuntimeError(
+            "store contains multiple episode vector spaces; select or repair "
+            "one exact producer before probing"
+        )
+    embedding_model = identities[0]["model"] if identities else None
+    embedding_dim = int(identities[0]["dim"]) if identities else None
+    episodes = load_clusterable_episodes(
+        conn,
+        embedding_model=embedding_model,
+        embedding_dim=embedding_dim,
+    )
     labels = cluster_episodes(episodes, emb_threshold, ent_threshold)
 
     grouped: dict[int, list[dict]] = {}

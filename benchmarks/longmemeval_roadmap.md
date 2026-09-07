@@ -9,6 +9,9 @@
 > (Haiku 4.5) / 92.6 (Gemini 3 Pro), Hindsight official March 2026 94.6
 > single-query, Mnemosyne 98.9 Recall@All@5 on 100 items (not end-to-end), and
 > BEAM-100K 65.2 on a separate workload.
+> Any `deepseek-chat` reference below is historical artifact/model provenance
+> for the retired mutable alias, never a current setting; live defaults pin
+> `deepseek-v4-flash` with thinking disabled.
 
 Single source of truth for HyMem retrieval-quality work against LongMemEval (LME)
 and BEAM. **Read this before proposing a change — most "obvious" ideas have already
@@ -24,6 +27,14 @@ rejected on sight.
 
 **Standing process:** do NOT commit or push — the user commits themselves. All work
 lives on branch `Beam-optimisation`, uncommitted.
+
+**Current runnable protocol:** active answer, legacy-judge, and memory-pipeline
+defaults use exact `deepseek-v4-flash`; mutable `deepseek-chat` and
+`deepseek-reasoner` aliases are rejected. Strict indexing requires coherent
+`hymem-dream-status-v5` + `hymem-benchmark-indexing-status-v3` snapshots and
+persists `hymem-lme-indexing-summary-v4`. Any command below that is retained as
+historical evidence remains governed by the archival warning above; for a new
+run, pin every selected model identity explicitly.
 
 ---
 
@@ -46,9 +57,13 @@ lives on branch `Beam-optimisation`, uncommitted.
 **Run the baseline:**
 ```bash
 # Historical oracle-label diagnostic (exploratory)
-python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8 --no-auto-ability --no-prereg
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 8 \
+  --no-auto-ability --no-prereg --answer-model deepseek-v4-flash \
+  --judge-model deepseek-v4-flash --hymem-model deepseek-v4-flash
 # Label-free development run
-python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 4 --auto-ability --no-prereg
+python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --workers 4 \
+  --auto-ability --no-prereg --answer-model deepseek-v4-flash \
+  --judge-model deepseek-v4-flash --hymem-model deepseek-v4-flash
 ```
 `--auto-ability` OOMs at `--workers 8` (dual 50-session haystacks → ~16 concurrent
 dream cycles); use `--workers 4`.

@@ -18,12 +18,14 @@ never PASS.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
+import fact_probe as fact_probe_module  # noqa: E402
 from fact_probe import (  # noqa: E402
     FACTS_PROMPT_V1,
     FACTS_PROMPTS,
@@ -236,6 +238,22 @@ def test_sim_run_finds_gold_and_spends_nothing() -> None:
     # The dump carries the source turns alongside the facts so the faithfulness
     # hand-score is self-contained.
     assert all("source_turns" in d for d in out["dump"])
+
+
+def test_question_failure_diagnostic_drops_exception_path_and_secret(
+    monkeypatch,
+) -> None:
+    secret = "Bearer sk-private-fact-token"
+    private_path = "/home/node/private/facts.sqlite"
+
+    def fail_extract(*_args, **_kwargs):
+        raise RuntimeError(f"{secret} at {private_path}: " + "x" * 20_000)
+
+    monkeypatch.setattr(fact_probe_module, "sim_extract", fail_extract)
+    out = run_question(_q_data(), llm=None, sim=True, max_sessions=0)
+    assert out["error"] == "execution_failure:RuntimeError"
+    encoded = json.dumps(out)
+    assert secret not in encoded and private_path not in encoded
 
 
 def test_sim_run_misses_when_no_fact_carries_the_gold() -> None:

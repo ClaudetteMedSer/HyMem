@@ -137,14 +137,16 @@ class PromptSourceAwareStub(StubLLMClient):
 def make_routed_llm(triples: list[dict], markers: list[dict]) -> StubLLMClient:
     """Stub for the merged per-chunk extraction call.
 
-    Phase 1 now issues a SINGLE call whose prompt returns a JSON object with
-    both "triples" and "markers". The combined prompt contains both distinctive
-    substrings ("structured technical relationships" and "EXPLICIT behavioral
-    signals"), so a single fixture keyed on either routes to the combined object.
-    The separate-key fixtures are retained so any code still issuing the old
-    standalone triple/marker prompts continues to route correctly.
+    Phase 1's primary and one-shot omission verifier each use a JSON object with
+    both "triples" and "markers". This fixture repeats the primary result during
+    verification, exercising deterministic dedup. The combined prompt contains
+    both distinctive substrings ("structured technical relationships" and
+    "EXPLICIT behavioral signals"), so a fixture keyed on either routes to the
+    combined object. Separate-key fixtures retain standalone-parser coverage.
     """
-    combined = json.dumps({"triples": triples, "markers": markers})
+    combined = json.dumps({
+        "triples": triples, "markers": markers, "complete": True,
+    })
     return PromptSourceAwareStub(
         fixtures={
             # Combined chunk-extraction prompt -> object with both keys.

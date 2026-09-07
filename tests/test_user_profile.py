@@ -89,7 +89,9 @@ def _profile_llm(answer: str) -> StubLLMClient:
     return StubLLMClient(
         fixtures={
             _NEEDLE: answer,
-            "single pass": json.dumps({"triples": [], "markers": []}),
+            "single pass": json.dumps({
+                "triples": [], "markers": [], "complete": True,
+            }),
             "Return the JSON object now": json.dumps({
                 "episodes": [], "summary": "", "procedures": [],
             }),
@@ -125,7 +127,9 @@ class _CapturingProfileLLM:
             items = self.item_factory(len(self.fragments)) if self.item_factory else []
             return _answer(items)
         if "single pass" in request.system:
-            return json.dumps({"triples": [], "markers": []})
+            return json.dumps({
+                "triples": [], "markers": [], "complete": True,
+            })
         if request.system.startswith((
             "You analyze one conversation session",
             "You re-read one conversation session",
@@ -957,7 +961,7 @@ def test_profile_persistence_rejects_assistant_or_uncovered_provenance(conn):
 # ── consumer 1: the VERIFIED FACTS anchor ────────────────────────────────────
 
 
-def test_anchor_profile_rows_precede_graph_edges_with_combined_cap(conn):
+def test_anchor_excludes_unattributed_graph_rows_and_caps_exact_profile(conn):
     with core_db.transaction(conn):
         seed_edge(conn, "atta", "part_of", "medflow", pos=9)
         seed_edge(conn, "medflow", "uses", "postgres", pos=5)
@@ -968,13 +972,13 @@ def test_anchor_profile_rows_precede_graph_edges_with_combined_cap(conn):
     ])
 
     facts = _anchor_facts(conn, 4)
-    # Profile first (identity-first slot order: name before role), then edges.
-    assert facts[:2] == ["user name Atta", "user role bedrijfsarts"]
-    assert facts[2:] == ["atta part_of medflow", "medflow uses postgres"]
+    # Manual counter-only graph rows have no exact authoritative evidence and
+    # therefore cannot enter a root prompt. Exact profile sources remain.
+    assert facts == ["user name Atta", "user role bedrijfsarts"]
 
-    # The cap bounds the COMBINED list; profile rows win the contested slots.
+    # The cap is applied only after invalid/unproved inputs are excluded.
     assert _anchor_facts(conn, 3) == [
-        "user name Atta", "user role bedrijfsarts", "atta part_of medflow",
+        "user name Atta", "user role bedrijfsarts",
     ]
     assert _anchor_facts(conn, 1) == ["user name Atta"]
     assert _anchor_facts(conn, 0) == []
@@ -985,14 +989,12 @@ def test_profile_change_regenerates_digest(cfg, conn):
     id, so a profile change must force a fresh root fusion (same mechanism as
     a graph change — a digest pinned to a stale identity is the P4 failure)."""
     acfg = replace(cfg, aggregation_nodes_enabled=True, aggregation_digest_enabled=True)
-    with core_db.transaction(conn):
-        conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('s1')")
-        conn.execute(
-            """INSERT INTO episodes(id, session_id, title, summary, participants,
-                                    start_message_id, end_message_id, outcome, key_entities)
-               VALUES ('e1', 's1', 'Weekend cycling', 'Started cycling.', '[]',
-                       1, 2, NULL, '["cycling"]')""",
-        )
+    from tests.test_aggregation_provenance import _seed_native_episode
+
+    _seed_native_episode(
+        conn, "s1", title="Weekend cycling", summary="Started cycling.",
+        entity="cycling",
+    )
     first = StubLLMClient(
         fixtures={"standing digest of everything known": json.dumps(
             {"title": "First", "summary": "No identity yet."})},
@@ -1683,7 +1685,7 @@ def _has_table(conn, name) -> bool:
 def test_fresh_store_lands_at_current_version_with_user_profile(tmp_path: Path):
     conn = core_db.connect(tmp_path / "fresh.sqlite")
     core_db.initialize(conn)
-    assert core_db.schema_version(conn) == 46 == core_db.EXPECTED_SCHEMA_VERSION
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     assert _has_table(conn, "user_profile")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(user_profile)")}
     assert {"slot", "slot_key", "value", "evidence_message_id", "confidence",
@@ -1789,7 +1791,7 @@ def test_migration_019_purges_v1_rows_and_adds_session_stamp(tmp_path: Path):
 
     core_db._run_migrations(conn)  # from v18: migrations 019-020 apply
 
-    assert core_db.schema_version(conn) == 46 == core_db.EXPECTED_SCHEMA_VERSION
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     # The ~8%-precision profile.v1 rows are gone…
     assert conn.execute("SELECT COUNT(*) AS c FROM user_profile").fetchone()["c"] == 0
     # …the per-session stamp column exists (and starts NULL)…

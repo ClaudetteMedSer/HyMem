@@ -37,6 +37,23 @@ def prune_chunks(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
         "SELECT DISTINCT chunk_id FROM kg_claim_extraction_outcomes"
     ).fetchall()
     keep_ids.update(r["chunk_id"] for r in rows)
+    # Failed/quarantined extraction is durable scheduling state. Deleting its
+    # chunk would cascade the attempt row, silently reset the retry counter,
+    # and let a permanently malformed source burn the provider budget again.
+    # Untouched chunks need no such pin: their deterministic source manifest
+    # can be rebuilt from the protected lossless per-message stream even after
+    # opt-in raw-message pruning.
+    rows = conn.execute(
+        "SELECT DISTINCT chunk_id FROM chunk_extraction_attempts"
+    ).fetchall()
+    keep_ids.update(r["chunk_id"] for r in rows)
+    # Terminal source-loss rows are operator-visible audit state, not a cache.
+    # Retaining their owning chunks keeps that loss durable until an operator
+    # explicitly resolves or removes it.
+    rows = conn.execute(
+        "SELECT chunk_id FROM chunk_extraction_terminal_losses"
+    ).fetchall()
+    keep_ids.update(r["chunk_id"] for r in rows)
 
     rows = conn.execute(
         "SELECT id FROM chunks WHERE chunk_kind = 'extraction' "
@@ -286,8 +303,8 @@ def prune_episodes_and_procedures(conn: sqlite3.Connection, cfg: HyMemConfig) ->
 
 def prune_bookkeeping(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
     """Cap the append-only bookkeeping tables, keeping only the newest rows.
-    dream_runs grows one row per cycle; extraction_feedback grows per retraction
-    though only the 10 newest are ever read."""
+    ``dream_runs`` grows once per cycle and ``extraction_feedback`` retains
+    source-linked correction audit rows. Neither table drives extraction."""
     pruned = 0
 
     cur = conn.execute(
@@ -305,7 +322,8 @@ def prune_bookkeeping(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
         """
         DELETE FROM extraction_feedback
         WHERE id NOT IN (
-            SELECT id FROM extraction_feedback ORDER BY created_at DESC LIMIT ?
+            SELECT id FROM extraction_feedback
+            ORDER BY created_at DESC, id DESC LIMIT ?
         )
         """,
         (int(cfg.extraction_feedback_keep),),

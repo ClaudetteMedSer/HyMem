@@ -33,6 +33,80 @@ from hymem.dreaming.lossless import validate_message_coverage_artifact
 GRAPH_CITATION_LIMIT = 5
 
 
+def _phase1_publication_sql(
+    conn: sqlite3.Connection, evidence_alias: str,
+) -> str:
+    """Return migration-safe current publication authority SQL.
+
+    During a pre-v53 forward migration the generation columns do not exist
+    yet, but lifecycle backfills still need the released prompt-only ledger.
+    Once v53 is present, only a coherent authorized producer generation can
+    publish current evidence.
+    """
+
+    tables = {
+        str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    outcome_columns = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(kg_claim_extraction_outcomes)"
+        ).fetchall()
+    }
+    observation_columns = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(kg_claim_observations)"
+        ).fetchall()
+    }
+    producer_aware = (
+        "phase1_generations" in tables
+        and "phase1_generation_key" in outcome_columns
+        and "phase1_generation_key" in observation_columns
+    )
+    generation_join = ""
+    generation_conditions = ""
+    if producer_aware:
+        generation_join = (
+            "JOIN phase1_generations generation "
+            "ON generation.generation_key=outcome.phase1_generation_key "
+            "AND generation.extraction_cache_key=outcome.prompt_version"
+        )
+        generation_conditions = (
+            "AND outcome.phase1_generation_key IS NOT NULL "
+            "AND outcome.phase1_generation_key="
+            "observation.phase1_generation_key "
+            "AND hymem_phase1_generation_is_current("
+            "generation.generation_key,generation.identity_exact)=1"
+        )
+    return f"""
+        (
+          SELECT MIN(hymem_normalize_iso_timestamp(outcome.succeeded_at))
+          FROM kg_claim_observations observation
+          JOIN kg_claim_extraction_outcomes outcome
+            ON outcome.chunk_id=observation.chunk_id
+           AND outcome.prompt_version=observation.prompt_version
+           AND outcome.prompt_generation=observation.prompt_generation
+          {generation_join}
+          WHERE observation.evidence_id={evidence_alias}.id
+            AND observation.edge_id={evidence_alias}.edge_id
+            AND observation.source_session_id={evidence_alias}.source_session_id
+            AND observation.source_message_id={evidence_alias}.source_message_id
+            AND observation.evidence_kind={evidence_alias}.evidence_kind
+            AND observation.polarity={evidence_alias}.polarity
+            AND observation.interpretation_key={evidence_alias}.interpretation_key
+            {generation_conditions}
+            AND hymem_normalize_iso_timestamp(observation.observed_at) IS NOT NULL
+            AND hymem_normalize_iso_timestamp(outcome.succeeded_at) IS NOT NULL
+            AND hymem_timestamp_at_or_before(
+                  {evidence_alias}.extracted_at,observation.observed_at)=1
+            AND hymem_timestamp_gap_within(
+                  observation.observed_at,outcome.succeeded_at,
+                  {EVENT_CLOCK_SKEW_SECONDS})=1
+        )
+    """
+
+
 @dataclass(frozen=True)
 class GraphEvidenceCitation:
     """One exact source behind a graph fact.
@@ -146,33 +220,7 @@ def _current_authoritative_evidence(
                    AS event_jd,
                kg.subject_canonical AS s, kg.predicate AS p,
                kg.object_canonical AS o, kg.derived,
-               (
-                 SELECT MIN(hymem_normalize_iso_timestamp(
-                                  outcome.succeeded_at))
-                 FROM kg_claim_observations observation
-                 JOIN kg_claim_extraction_outcomes outcome
-                   ON outcome.chunk_id=observation.chunk_id
-                  AND outcome.prompt_version=observation.prompt_version
-                  AND outcome.prompt_generation=observation.prompt_generation
-                 WHERE observation.evidence_id=ev.id
-                   AND observation.edge_id=ev.edge_id
-                   AND observation.source_session_id=ev.source_session_id
-                   AND observation.source_message_id=ev.source_message_id
-                   AND observation.evidence_kind=ev.evidence_kind
-                   AND observation.polarity=ev.polarity
-                   AND observation.interpretation_key=ev.interpretation_key
-                   AND hymem_normalize_iso_timestamp(
-                         observation.observed_at) IS NOT NULL
-                   AND hymem_normalize_iso_timestamp(
-                         outcome.succeeded_at) IS NOT NULL
-                   AND hymem_timestamp_at_or_before(
-                         ev.extracted_at, observation.observed_at
-                       ) = 1
-                   AND hymem_timestamp_gap_within(
-                         observation.observed_at, outcome.succeeded_at,
-                         {EVENT_CLOCK_SKEW_SECONDS}
-                       ) = 1
-               ) AS current_publication_at
+               {_phase1_publication_sql(conn, "ev")} AS current_publication_at
         FROM kg_evidence ev
         JOIN knowledge_graph kg ON kg.id = ev.edge_id
         WHERE {' AND '.join(clauses)}
@@ -485,35 +533,7 @@ def _eligible_lifecycle_events(
                    interpretation_key, chunk_id, is_current, extracted_at,
                    published_at, superseded_at, source_event_at,
                    source_peer_id, source_workspace_id,
-                   (
-                     SELECT MIN(hymem_normalize_iso_timestamp(
-                                      outcome.succeeded_at))
-                     FROM kg_claim_observations observation
-                     JOIN kg_claim_extraction_outcomes outcome
-                       ON outcome.chunk_id=observation.chunk_id
-                      AND outcome.prompt_version=observation.prompt_version
-                      AND outcome.prompt_generation=observation.prompt_generation
-                     WHERE observation.evidence_id=ev.id
-                       AND observation.edge_id=ev.edge_id
-                       AND observation.source_session_id=ev.source_session_id
-                       AND observation.source_message_id=ev.source_message_id
-                       AND observation.evidence_kind=ev.evidence_kind
-                       AND observation.polarity=ev.polarity
-                       AND observation.interpretation_key=ev.interpretation_key
-                       AND hymem_normalize_iso_timestamp(
-                             observation.observed_at) IS NOT NULL
-                       AND hymem_normalize_iso_timestamp(
-                             outcome.succeeded_at) IS NOT NULL
-                       AND hymem_timestamp_at_or_before(
-                             ev.extracted_at,
-                             observation.observed_at
-                           ) = 1
-                       AND hymem_timestamp_gap_within(
-                             observation.observed_at,
-                             outcome.succeeded_at,
-                             {EVENT_CLOCK_SKEW_SECONDS}
-                           ) = 1
-                   ) AS current_publication_at
+                   {_phase1_publication_sql(conn, "ev")} AS current_publication_at
             FROM kg_evidence ev
             WHERE edge_id = ? OR id IN (
                 SELECT dependency.evidence_id

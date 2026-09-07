@@ -40,11 +40,13 @@ import json
 import logging
 from dataclasses import dataclass, replace
 
+from hymem.contrib.implementation_identity import import_time_source_sha256
 from hymem.extraction.jsonio import loads_lenient
 from hymem.extraction.llm import LLMClient, LLMRequest
 from hymem.rules import is_rule_eligible_kind, rule_scope_for_marker
 
 log = logging.getLogger("hymem.rules_extract")
+RULES_EXTRACTION_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
 
 # Bump when the durability prompt wording changes materially, so a re-run is
 # distinguishable in experiment logs (mirrors PROFILE_PROMPT_VERSION).
@@ -53,6 +55,20 @@ log = logging.getLogger("hymem.rules_extract")
 DURABILITY_PROMPT_VERSION = 2
 
 RULES_EXTRACTION_MODES = frozenset({"lexical", "llm", "llm_fastpath"})
+_RULE_EXTRACTION_IMPORTED_HELPERS = (
+    loads_lenient, is_rule_eligible_kind, rule_scope_for_marker,
+)
+
+
+def rule_extraction_support_integrity() -> bool:
+    """Detect non-concurrent drift in imported routing/parser helpers."""
+
+    return (
+        loads_lenient, is_rule_eligible_kind, rule_scope_for_marker,
+    ) == _RULE_EXTRACTION_IMPORTED_HELPERS
+
+
+_RULE_EXTRACTION_INTEGRITY_FUNCTION = rule_extraction_support_integrity
 
 
 @dataclass(frozen=True)
@@ -71,6 +87,7 @@ class DurabilityJudgment:
     rule: str | None = None
     index: int = -1
     rationale: str = ""
+    complete: bool = True
 
 
 DURABILITY_SYSTEM = """You decide whether each behavioral signal from a user is a STANDING RULE or a ONE-OFF.
@@ -157,7 +174,13 @@ def _parse_batch(raw: str, n: int) -> list[DurabilityJudgment]:
     standing verdict with no confidence or no canonical rewrite still routes: an
     absent confidence on a crisp verdict defaults high, and the raw statement is
     the fallback rule text downstream."""
-    out = [DurabilityJudgment(standing=False, confidence=0.0, rule=None, index=i) for i in range(n)]
+    out = [
+        DurabilityJudgment(
+            standing=False, confidence=0.0, rule=None, index=i,
+            complete=False,
+        )
+        for i in range(n)
+    ]
     # DURABILITY_SYSTEM asks for a bare JSON array; fences/prose around it are
     # tolerated (dream 1013 — json_object mode is a request, not a contract).
     data = loads_lenient(raw, expect="array")
@@ -194,6 +217,7 @@ def _parse_batch(raw: str, n: int) -> list[DurabilityJudgment]:
             rule=rule if standing else None,
             index=idx,
             rationale=rationale,
+            complete=True,
         )
     return out
 
@@ -226,7 +250,10 @@ def _judge_one_batch(
         raw = llm.complete(request)
     except Exception as exc:  # noqa: BLE001 - a bad tag pass must never break dreaming
         log.warning("rules_extract.durability_call_failed n=%d err=%s", len(sub), exc)
-        return [DurabilityJudgment(standing=False, confidence=0.0, rule=None, index=i)
+        return [DurabilityJudgment(
+                    standing=False, confidence=0.0, rule=None, index=i,
+                    complete=False,
+                )
                 for i in range(len(sub))]
     return _parse_batch(raw, len(sub))
 
@@ -269,6 +296,7 @@ class RouteDecision:
     scope: str = "always_on"
     confidence: float = 1.0
     source_mode: str = "lexical"
+    complete: bool = True
 
 
 def route_decisions(
@@ -320,7 +348,9 @@ def route_decisions(
     out: list[RouteDecision] = []
     for i, (_, stmt) in enumerate(markers):
         if not eligible[i]:  # ineligible kind (e.g. preference) never mints a rule
-            out.append(RouteDecision(route=False, text=stmt, source_mode=mode))
+            out.append(RouteDecision(
+                route=False, text=stmt, source_mode=mode, complete=True
+            ))
             continue
         if mode == "llm_fastpath" and lexical[i] is not None:
             out.append(RouteDecision(route=True, text=stmt, scope="always_on",
@@ -328,7 +358,9 @@ def route_decisions(
             continue
         j = judged.get(i)
         if j is None:  # no llm available → precision-safe drop
-            out.append(RouteDecision(route=False, text=stmt, source_mode=mode))
+            out.append(RouteDecision(
+                route=False, text=stmt, source_mode=mode, complete=False
+            ))
             continue
         route = j.standing and j.confidence >= confidence_min
         out.append(RouteDecision(
@@ -337,5 +369,6 @@ def route_decisions(
             scope="always_on",
             confidence=j.confidence,
             source_mode=mode,
+            complete=j.complete,
         ))
     return out

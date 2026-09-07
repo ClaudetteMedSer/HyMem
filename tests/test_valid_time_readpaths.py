@@ -15,7 +15,10 @@ from hymem.dreaming import phase3
 from hymem.dreaming.bitemporal import record_lifecycle_event
 from hymem.dreaming.canonicalize import merge
 from hymem.dreaming.chunks import Chunk, persist_chunks
-from hymem.dreaming.embeddings import fetch_edge_embeddings
+from hymem.dreaming.embeddings import (
+    fetch_edge_embeddings,
+    persist_edge_embeddings,
+)
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.dreaming.retention import prune_retracted_edges
 from hymem.dreaming.runner import run_dreaming
@@ -524,12 +527,8 @@ def test_live_reader_parity_rejects_invalid_derived_and_negative_dominant(tmp_pa
         assert pending is not None
         assert set(pending.edge_text_by_id.values()) == {"live uses sqlite"}
         edge_id = next(iter(pending.edge_text_by_id))
-        vector = pending.new_text_vectors["live uses sqlite"]
-        conn.execute(
-            "INSERT INTO edge_embeddings(edge_text,model,dim,vector_json) "
-            "VALUES (?,?,?,?)",
-            ("live uses sqlite", embedder.model, embedder.dim, json.dumps(vector)),
-        )
+        with core_db.transaction(conn):
+            assert persist_edge_embeddings(conn, pending) == 1
         hits = _python_cosine_edge_search(
             conn, embedder, "live", top_k=10, max_scan=100
         )
@@ -580,8 +579,8 @@ def test_entity_matching_requires_live_alias_and_live_object_shape(tmp_path):
         # otherwise prove that the object is entity-shaped.
         edge("owner_future", "outer_future", valid_at="2100-01-01T00:00:00Z")
         conn.execute(
-            "INSERT INTO entity_types(entity_canonical,type,confidence) "
-            "VALUES ('outer_future','database',1.0)"
+            "INSERT INTO entity_types(entity_canonical,type,confidence,origin) "
+            "VALUES ('outer_future','database',1.0,'user')"
         )
 
         # Graph-shape support is live-filtered too: stale second uses do not
@@ -598,8 +597,8 @@ def test_entity_matching_requires_live_alias_and_live_object_shape(tmp_path):
         # fact still passes through the live predicate.
         edge("owner_typed", "typed_object")
         conn.execute(
-            "INSERT INTO entity_types(entity_canonical,type,confidence) "
-            "VALUES ('typed_object','database',1.0)"
+            "INSERT INTO entity_types(entity_canonical,type,confidence,origin) "
+            "VALUES ('typed_object','database',1.0,'user')"
         )
 
         matched = set(match_known_entities(

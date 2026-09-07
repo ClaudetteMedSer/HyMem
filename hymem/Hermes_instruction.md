@@ -36,6 +36,10 @@ only needed while running an **older** HyMem server.
    The v25 `dream_runs.digest_failures` / `episodes_created` columns are the
    place to check this (a run of `episodes_created = 0` against a rising
    `chunks_seen` is the signature).
+   Current HyMem rejects the retired `deepseek-chat` and
+   `deepseek-reasoner` aliases at client construction. Set
+   `HYMEM_LLM_MODEL=deepseek-v4-flash` and `HYMEM_LLM_THINKING=auto` (or
+   `disabled`) in the actual service environment before restarting.
 4. Verify — server first with `curl`, then the harness **in a fresh session**; an existing session's cached base context serves a stale block (§Verification).
 
 **Checklist (HyMem older than 2026-07-06):** as above, plus apply the two-part
@@ -144,7 +148,12 @@ operational notes:
   window-alignment fix) rebuilds the aggregation tree — a one-time LLM cost.**
   Subsequent dreams on a quiescent store reuse cached fusions (keyed by
   member-set hash), so re-dreaming a stable store costs zero digest LLM calls.
-- `GET /dream-status` shows the extraction backlog; the `hymem_digest` MCP
+- `GET /dream-status` returns the current `hymem-dream-status-v3` contract from
+  one coherent SQLite snapshot. Completion requires every source-materialization,
+  extraction, digest, profile, fact, aggregation, quarantine, malformed-state,
+  terminal-loss, and coverage-integrity gate to be healthy; `pending_chunks=0`
+  alone is not completion. A partial fusion failure or total build exception
+  stays pending across restarts until a clean applicable build heals it. The `hymem_digest` MCP
   tool (or `HyMem.digest()`) returns the digest with a coverage +
   generated-at footer, or an explanatory message if none is built yet.
 

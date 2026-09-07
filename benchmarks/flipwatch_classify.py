@@ -96,6 +96,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from strictness import bounded_exception_type
+
 # The watch is anchored to the bb96057 deploy (2026-07-12 19:06 +0200), which
 # bumped _CLUSTER_SALT v3->v4 and _ROLLUP_SALT v2->v3 — the four reuse fixes
 # being validated. Any other start date is a restart, not a longer watch.
@@ -240,7 +242,11 @@ def check_episodes(db: Path, since: str) -> dict:
             try:
                 out[key] = dict(conn.execute(sql, (since,)).fetchone())
             except sqlite3.OperationalError as exc:
-                out[key] = {"error": str(exc)}
+                out[key] = {
+                    "error": (
+                        f"execution_failure:{bounded_exception_type(exc)}"
+                    )
+                }
     finally:
         conn.close()
     return out
@@ -891,13 +897,12 @@ def render(rows: list[dict], verdict: str, checks: list[str], advisories: list[s
 
     if verdict == "PASS":
         lines += [
-            "Next per §0.4: flip `aggregation_nodes_enabled` in `hymem/config.py:112` "
-            "to `True` (docstring records the flip date + this block), full suite "
-            "green, doc ripple (this RESULT + \"FLIPPED <date>\", "
-            "`hymem/Hermes_instruction.md` item 2 -> legacy note, "
-            "`additional_planning.md` Plan C -> \"UNBLOCKED <date>\"). No salt is "
-            "bumped by the flip, so the post-deploy verification dream must show "
-            "high reuse — a refusion there is itself a red flag.",
+            "The shipped default already has `aggregation_nodes_enabled=True` "
+            "(flipped 2026-08-26 after the Stage 3c gate passed). Treat this PASS "
+            "as confirmation, not authorization for another config change. Keep "
+            "the variable unset for the shipped default or set it to `false` only "
+            "for an explicit opt-out/control arm. A verification dream should show "
+            "high reuse — unexpected refusion is itself a red flag.",
         ]
     elif verdict == "FAIL":
         lines += [

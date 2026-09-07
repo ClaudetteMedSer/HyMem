@@ -4,10 +4,12 @@ import json
 import logging
 import math
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 
 from hymem.config import HyMemConfig
+from hymem.contrib.implementation_identity import import_time_source_sha256
 from hymem.dreaming import canonicalize
 from hymem.dreaming import evidence
 from hymem.dreaming.chunks import Chunk
@@ -17,15 +19,62 @@ from hymem.dreaming.lossless import (
     validate_message_coverage_artifact,
 )
 from hymem.dreaming.message_coverage import LOSSLESS_COVERAGE_VERSION
-from hymem.extraction.chunk import extract_chunk
+from hymem.dreaming.embeddings import _embedding_identity
+from hymem.extraction.chunk import extract_chunk, safe_failure_diagnostics
+from hymem.extraction.contract import extraction_cache_key
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
+from hymem.extraction.producer import (
+    phase1_generation_binding,
+    register_phase1_generation,
+    validate_current_phase1_generation_binding,
+)
 from hymem.extraction.markers import Marker
 from hymem.extraction.triples import Triple
 from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.core.time import normalize_iso_timestamp
+from hymem.dreaming.phase1_auxiliary import publish_phase1_auxiliaries
 
 log = logging.getLogger("hymem.dreaming.phase1")
+PHASE1_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
+
+class _DirectPhase1Producer:
+    """Stable identity for already-materialized, source-validated input.
+
+    This is a maintained HyMem writer, not an arbitrary custom LLM. Its result
+    hash still binds the supplied observations; the declaration identifies the
+    executable persistence policy so portable manual/test publications remain
+    durable without being mistaken for pre-v53 legacy rows.
+    """
+
+    def phase1_producer_declaration(self):
+        from hymem.extraction.producer import Phase1ProducerDeclaration
+
+        if persist_chunk_results is not _DIRECT_PHASE1_PERSIST_FUNCTION:
+            raise RuntimeError("direct Phase-1 persistence identity changed")
+
+        return Phase1ProducerDeclaration(
+            client_id="hymem.dreaming.phase1.DirectPhase1Producer",
+            implementation=PHASE1_IMPLEMENTATION_SHA256,
+            model="source-validated-materialized-input",
+            endpoint=None,
+            effective_request={
+                "network_request": False,
+                "input_contract": "ChunkExtraction.source_validated-v1",
+            },
+            retry_policy={"owner": "caller", "attempts": 1},
+        )
+
+
+_DIRECT_PHASE1_PRODUCER = _DirectPhase1Producer()
+
+
+class Phase1ProducerDriftError(RuntimeError):
+    """The effective producer changed while one extraction was in flight."""
+
+
+class Phase1ProducerGenerationConflictError(Phase1ProducerDriftError):
+    """The selected producer already has a newer successful prompt result."""
 
 
 @dataclass
@@ -40,8 +89,13 @@ class ChunkExtraction:
     entity_type_hints: dict[str, str] = field(default_factory=dict)
     entity_property_hints: dict[str, dict[str, str]] = field(default_factory=dict)
     failed: bool = False
+    failure_reason: str | None = None
+    failure_details: tuple[str, ...] = ()
+    completion_calls: int = 0
+    provider_attempts: int = 0
     claim_sources: dict[int, CoveredMessage] = field(default_factory=dict)
     source_validated: bool = False
+    phase1_generation: dict[str, object] | None = None
 
 
 def _is_exact_published_replay(
@@ -50,6 +104,7 @@ def _is_exact_published_replay(
     extraction: ChunkExtraction,
     *,
     prompt_version: str,
+    phase1_generation_key: str | None,
     cfg: HyMemConfig | None,
     dedup_vectors: dict[str, list[float]] | None,
     in_cycle_edges: list[_InCycleEdge] | None,
@@ -68,6 +123,7 @@ def _is_exact_published_replay(
     """
     outcome = conn.execute(
         "SELECT outcome.prompt_version,outcome.prompt_generation,"
+        "outcome.phase1_generation_key,"
         "outcome.result_hash,outcome.succeeded_at,chunk.created_at "
         "FROM kg_claim_extraction_outcomes outcome "
         "JOIN chunks chunk ON chunk.id=outcome.chunk_id "
@@ -77,6 +133,7 @@ def _is_exact_published_replay(
     if (
         outcome is None
         or outcome["prompt_version"] != prompt_version
+        or outcome["phase1_generation_key"] != phase1_generation_key
         or int(outcome["prompt_generation"])
         != evidence.prompt_generation(prompt_version)
         or outcome["result_hash"]
@@ -151,6 +208,8 @@ def _is_exact_published_replay(
           ON outcome.chunk_id=observation.chunk_id
          AND outcome.prompt_version=observation.prompt_version
          AND outcome.prompt_generation=observation.prompt_generation
+         AND outcome.phase1_generation_key IS NOT NULL
+         AND outcome.phase1_generation_key=observation.phase1_generation_key
         WHERE observation.chunk_id=?
         """,
         (chunk.id,),
@@ -227,66 +286,57 @@ def _is_exact_published_replay(
 
 
 def _persist_replay_auxiliary(
-    conn: sqlite3.Connection, chunk: Chunk, extraction: ChunkExtraction
+    conn: sqlite3.Connection,
+    chunk: Chunk,
+    extraction: ChunkExtraction,
+    *,
+    phase1_generation_key: str | None,
 ) -> None:
-    """Heal idempotent non-claim projections without touching claim clocks."""
-    for entity_name, entity_type in extraction.entity_type_hints.items():
-        entity = canonicalize.resolve(conn, entity_name)
-        conn.execute(
-            "INSERT OR IGNORE INTO entity_types("
-            "entity_canonical,type,confidence,source_chunk_id) "
-            "VALUES (?,?,1.0,?)",
-            (entity, entity_type, chunk.id),
-        )
-    for entity_name, values in extraction.entity_property_hints.items():
-        entity = canonicalize.resolve(conn, entity_name)
-        for key, value in values.items():
-            conn.execute(
-                """
-                INSERT INTO entity_properties(
-                    entity_canonical,key,value,source_chunk_id,updated_at
-                ) VALUES (?,?,?,?,CURRENT_TIMESTAMP)
-                ON CONFLICT(entity_canonical,key) DO UPDATE SET
-                    value=excluded.value,
-                    source_chunk_id=excluded.source_chunk_id,
-                    updated_at=CURRENT_TIMESTAMP
-                WHERE entity_properties.value IS NOT excluded.value
-                   OR entity_properties.source_chunk_id IS NOT
-                      excluded.source_chunk_id
-                """,
-                (entity, key, value, chunk.id),
-            )
+    """Replace whole-chunk auxiliaries without touching exact claim clocks."""
+    if phase1_generation_key is None:
+        raise ValueError("source-validated replay has no producer generation")
     mentioned = {
         canonicalize.resolve(conn, name)
         for triple in extraction.triples
         for name in (triple.subject, triple.object)
     }
-    conn.executemany(
-        "INSERT OR IGNORE INTO entity_mentions(chunk_id,entity_canonical) "
-        "VALUES (?,?)",
-        [(chunk.id, entity) for entity in sorted(mentioned)],
-    )
-    for marker in extraction.markers:
-        conn.execute(
-            """
-            INSERT INTO behavioral_markers(kind,statement,chunk_id)
-            SELECT ?,?,? WHERE NOT EXISTS (
-                SELECT 1 FROM behavioral_markers
-                WHERE chunk_id=? AND kind=? AND statement=?
-            )
-            """,
-            (
-                marker.kind, marker.statement, chunk.id,
-                chunk.id, marker.kind, marker.statement,
-            ),
+    existing_mentions = {
+        str(row["entity_canonical"])
+        for row in conn.execute(
+            "SELECT entity_canonical FROM entity_mentions WHERE chunk_id=?",
+            (chunk.id,),
+        ).fetchall()
+    }
+    if existing_mentions != mentioned:
+        conn.execute("DELETE FROM entity_mentions WHERE chunk_id=?", (chunk.id,))
+        conn.executemany(
+            "INSERT OR IGNORE INTO entity_mentions(chunk_id,entity_canonical) "
+            "VALUES (?,?)",
+            [(chunk.id, entity) for entity in sorted(mentioned)],
         )
-    conn.execute(
-        "INSERT OR IGNORE INTO processed_chunks(chunk_id,prompt_version) "
-        "VALUES (?,?)",
-        (chunk.id, conn.execute(
+    publish_phase1_auxiliaries(
+        conn,
+        chunk_id=chunk.id,
+        phase1_generation_key=phase1_generation_key,
+        extraction_cache_key=str(conn.execute(
             "SELECT prompt_version FROM kg_claim_extraction_outcomes "
             "WHERE chunk_id=?", (chunk.id,),
         ).fetchone()[0]),
+        entity_type_hints=extraction.entity_type_hints,
+        entity_property_hints=extraction.entity_property_hints,
+        entity_mentions=sorted(mentioned),
+        markers=extraction.markers,
+    )
+    conn.execute(
+        "INSERT INTO processed_chunks("
+        "chunk_id,prompt_version,phase1_generation_key) VALUES (?,?,?) "
+        "ON CONFLICT(chunk_id,prompt_version) DO UPDATE SET "
+        "phase1_generation_key=excluded.phase1_generation_key,"
+        "processed_at=CURRENT_TIMESTAMP",
+        (chunk.id, conn.execute(
+            "SELECT prompt_version FROM kg_claim_extraction_outcomes "
+            "WHERE chunk_id=?", (chunk.id,),
+        ).fetchone()[0], phase1_generation_key),
     )
     conn.execute(
         "DELETE FROM chunk_extraction_attempts WHERE chunk_id=? AND "
@@ -380,18 +430,49 @@ def extract_chunk_results(
     llm: LLMClient,
     *,
     prompt_version: str,
-    negative_examples: str = "",
+    phase1_generation: Mapping[str, object] | None = None,
 ) -> ChunkExtraction | None:
     """Run phase-1 LLM extraction for a chunk. Returns None if already processed
-    under the same prompt_version. No write transaction held; the LLM call
-    runs outside any BEGIN IMMEDIATE so concurrent writers aren't blocked.
+    under the same prompt and producer generation. No write transaction is
+    held; the LLM call runs outside BEGIN IMMEDIATE so writers aren't blocked.
     """
+    prompt_version = extraction_cache_key(prompt_version)
+    effective_generation = phase1_generation_binding(
+        prompt_version, llm
+    )
+    generation = validate_current_phase1_generation_binding(
+        phase1_generation if phase1_generation is not None
+        else effective_generation,
+        prompt_version=prompt_version,
+    )
+    if generation["extraction_cache_key"] != prompt_version:
+        raise ValueError("Phase-1 generation uses another extraction contract")
+    if generation != effective_generation:
+        raise ValueError(
+            "supplied Phase-1 generation does not match the effective client"
+        )
+    generation_key = str(generation["generation_key"])
     already = conn.execute(
-        "SELECT 1 FROM processed_chunks WHERE chunk_id = ? AND prompt_version = ?",
-        (chunk.id, prompt_version),
+        "SELECT 1 FROM current_phase1_publications publication "
+        "WHERE publication.chunk_id=? AND publication.prompt_version=? "
+        "AND publication.phase1_generation_key=?",
+        (chunk.id, prompt_version, generation_key),
     ).fetchone()
     if already:
         return None
+
+    if evidence.claim_extraction_prompt_is_stale(
+        conn,
+        chunk_id=chunk.id,
+        prompt_version=prompt_version,
+        producer_identity_sha256=str(
+            generation["producer"]["identity_sha256"]
+        ),
+    ):
+        raise Phase1ProducerGenerationConflictError(
+            "selected Phase-1 producer already published this chunk under a "
+            "newer prompt generation"
+        )
 
     try:
         sources = _claim_sources_for_chunk(conn, chunk)
@@ -404,13 +485,20 @@ def extract_chunk_results(
         log.warning(
             "phase1.source_coverage_missing chunk_id=%s action=held", chunk.id
         )
-        return ChunkExtraction(triples=[], markers=[], failed=True)
+        return ChunkExtraction(
+            triples=[], markers=[], failed=True,
+            failure_reason="source_coverage_failure",
+            failure_details=("source_manifest:missing_or_invalid",),
+            phase1_generation=generation,
+        )
     source_records = tuple(
         (source.message_id, _claim_source_record(source)) for source in sources
     )
-    result = extract_chunk(
-        llm, chunk.text, negative_examples, source_records=source_records
-    )
+    result = extract_chunk(llm, chunk.text, source_records=source_records)
+    if phase1_generation_binding(prompt_version, llm) != generation:
+        raise Phase1ProducerDriftError(
+            "Phase-1 producer identity changed during extraction"
+        )
     if not result.failed:
         polarities: dict[tuple[str, str, str, int], int] = {}
         unique: dict[tuple[str, str, str, int, int], Triple] = {}
@@ -437,6 +525,10 @@ def extract_chunk_results(
                 chunk.id,
             )
             result.failed = True
+            result.failure_reason = "response_conflict"
+            result.failure_details = (
+                "triples:canonical_polarity_conflict",
+            )
         else:
             result.triples = list(unique.values())
     return ChunkExtraction(
@@ -445,8 +537,13 @@ def extract_chunk_results(
         entity_type_hints=result.entity_type_hints,
         entity_property_hints=result.entity_property_hints,
         failed=result.failed,
+        failure_reason=result.failure_reason,
+        failure_details=result.failure_details,
+        completion_calls=result.completion_calls,
+        provider_attempts=result.provider_attempts,
         claim_sources={source.message_id: source for source in sources},
         source_validated=True,
+        phase1_generation=generation,
     )
 
 
@@ -533,8 +630,7 @@ def prepare_dedup_vectors(
         return {}
 
     try:
-        model = embedding_client.model
-        dim = embedding_client.dim
+        model, dim = _embedding_identity(embedding_client)
     except Exception:
         log.warning("phase1.dedup_embedding_identity_unavailable")
         return {}
@@ -567,10 +663,16 @@ def prepare_dedup_vectors(
         return {}
     try:
         vectors = embedding_client.embed(texts)
-        stable_model = embedding_client.model
-        stable_dim = embedding_client.dim
-    except Exception:
-        log.warning("phase1.dedup_embedding_failed", exc_info=True)
+        stable_model, stable_dim = _embedding_identity(embedding_client)
+    except Exception as exc:
+        # Provider exception text and tracebacks may contain the full private
+        # request route, query credentials, or response payloads.  This is a
+        # best-effort boundary, so expose only a bounded diagnostic code and
+        # the exception class.
+        log.warning(
+            "phase1.dedup_embedding_failed error_type=%s",
+            type(exc).__name__,
+        )
         return {}
     if stable_model != model or stable_dim != dim:
         log.warning("phase1.dedup_embedding_identity_changed")
@@ -597,7 +699,10 @@ def _record_failed_attempt(
     chunk: Chunk,
     *,
     prompt_version: str,
+    phase1_generation_key: str | None,
     cfg: HyMemConfig | None,
+    failure_reason: str | None,
+    failure_details: tuple[str, ...],
 ) -> None:
     """Count a held failure and audibly quarantine at the retry bound.
 
@@ -608,19 +713,41 @@ def _record_failed_attempt(
     forever.
     """
     row = conn.execute(
-        "SELECT attempts FROM chunk_extraction_attempts "
+        "SELECT attempts,phase1_generation_key FROM chunk_extraction_attempts "
         "WHERE chunk_id = ? AND prompt_version = ?",
         (chunk.id, prompt_version),
     ).fetchone()
-    attempts = (row[0] if row else 0) + 1
+    attempts = (
+        int(row["attempts"]) + 1
+        if row is not None
+        and row["phase1_generation_key"] == phase1_generation_key
+        else 1
+    )
+    safe_reason, sanitized_details = safe_failure_diagnostics(
+        failure_reason, failure_details
+    )
+    safe_details = json.dumps(
+        list(sanitized_details),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
     conn.execute(
         """INSERT INTO chunk_extraction_attempts(chunk_id, prompt_version, attempts,
-                                                 last_failure_at)
-           VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                                                 last_failure_at,
+                                                 last_failure_reason,
+                                                 last_failure_details,
+                                                 phase1_generation_key)
+           VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
            ON CONFLICT(chunk_id, prompt_version)
            DO UPDATE SET attempts = excluded.attempts,
-                         last_failure_at = excluded.last_failure_at""",
-        (chunk.id, prompt_version, attempts),
+                         last_failure_at = excluded.last_failure_at,
+                         last_failure_reason = excluded.last_failure_reason,
+                         last_failure_details = excluded.last_failure_details,
+                         phase1_generation_key = excluded.phase1_generation_key""",
+        (
+            chunk.id, prompt_version, attempts, safe_reason, safe_details,
+            phase1_generation_key,
+        ),
     )
 
     max_attempts = cfg.chunk_extraction_max_attempts if cfg is not None else 0
@@ -666,6 +793,31 @@ def persist_chunk_results(
     A brand-new triple is checked only against authoritative entries. Pass
     ``None`` to disable same-wave collapse (cross-cycle dedup is unaffected).
     """
+    prompt_version = extraction_cache_key(prompt_version)
+    generation = (
+        validate_current_phase1_generation_binding(
+            extraction.phase1_generation,
+            prompt_version=prompt_version,
+        )
+        if extraction.phase1_generation is not None else None
+    )
+    if generation is None and extraction.source_validated:
+        generation = phase1_generation_binding(
+            prompt_version, _DIRECT_PHASE1_PRODUCER
+        )
+    if generation is not None and generation["extraction_cache_key"] != prompt_version:
+        raise ValueError("extraction producer generation uses another contract")
+    if generation is not None:
+        register_phase1_generation(conn, generation)
+    phase1_generation_key = (
+        str(generation["generation_key"]) if generation is not None else None
+    )
+
+    def _prune_process_identities() -> None:
+        from hymem.core.db import prune_unreferenced_inexact_phase1_generations
+
+        prune_unreferenced_inexact_phase1_generations(conn)
+
     # Work on a detached registry. The caller publishes it only after the
     # surrounding SQLite transaction commits, so rollback cannot leak a stale
     # edge id/vector into the next chunk's same-wave decisions.
@@ -680,13 +832,22 @@ def persist_chunk_results(
     # deterministic way to remove items omitted by the healed reply.  Record only
     # the attempt.  The next successful extraction is applied atomically below.
     if extraction.failed:
-        _record_failed_attempt(conn, chunk, prompt_version=prompt_version, cfg=cfg)
+        _record_failed_attempt(
+            conn,
+            chunk,
+            prompt_version=prompt_version,
+            phase1_generation_key=phase1_generation_key,
+            cfg=cfg,
+            failure_reason=extraction.failure_reason,
+            failure_details=extraction.failure_details,
+        )
         log.debug(
             "phase1.chunk_failed_not_persisted chunk_id=%s triples=%d markers=%d",
             chunk.id,
             len(extraction.triples),
             len(extraction.markers),
         )
+        _prune_process_identities()
         return staged_in_cycle_edges
 
     if extraction.source_validated:
@@ -711,25 +872,33 @@ def persist_chunk_results(
     # Replaying an older prompt must not first delete that result's observations
     # and only discover the stale generation after the damage is done.
     if extraction.source_validated and evidence.claim_extraction_prompt_is_stale(
-        conn, chunk_id=chunk.id, prompt_version=prompt_version
+        conn,
+        chunk_id=chunk.id,
+        prompt_version=prompt_version,
+        producer_identity_sha256=str(
+            generation["producer"]["identity_sha256"]
+        ),
     ):
-        conn.execute(
-            "INSERT OR IGNORE INTO processed_chunks(chunk_id, prompt_version) "
-            "VALUES (?, ?)",
-            (chunk.id, prompt_version),
-        )
+        # A lower public prompt generation is historical. It must not replace
+        # the current producer marker or masquerade as a cache hit for itself.
         conn.execute(
             "DELETE FROM chunk_extraction_attempts "
             "WHERE chunk_id = ? AND prompt_version = ?",
             (chunk.id, prompt_version),
         )
+        _prune_process_identities()
         return staged_in_cycle_edges
 
     if extraction.source_validated and _is_exact_published_replay(
-        conn, chunk, extraction, prompt_version=prompt_version, cfg=cfg,
+        conn, chunk, extraction, prompt_version=prompt_version,
+        phase1_generation_key=phase1_generation_key, cfg=cfg,
         dedup_vectors=dedup_vectors, in_cycle_edges=staged_in_cycle_edges,
     ):
-        _persist_replay_auxiliary(conn, chunk, extraction)
+        _persist_replay_auxiliary(
+            conn, chunk, extraction,
+            phase1_generation_key=phase1_generation_key,
+        )
+        _prune_process_identities()
         return staged_in_cycle_edges
 
     role_weights = cfg.evidence_role_weights if cfg is not None else {}
@@ -739,29 +908,31 @@ def persist_chunk_results(
             conn, chunk_id=chunk.id, prompt_version=prompt_version
         )
         conn.execute("DELETE FROM entity_mentions WHERE chunk_id = ?", (chunk.id,))
-    for entity_name, entity_type in extraction.entity_type_hints.items():
-        entity_canon = canonicalize.resolve(conn, entity_name)
-        conn.execute(
-            """INSERT OR IGNORE INTO entity_types(entity_canonical, type, confidence, source_chunk_id)
-               VALUES (?, ?, 1.0, ?)""",
-            (entity_canon, entity_type, chunk.id),
-        )
-
-    for entity_name, kv in extraction.entity_property_hints.items():
-        if not kv:
-            continue
-        entity_canon = canonicalize.resolve(conn, entity_name)
-        for key, value in kv.items():
+    if not extraction.source_validated:
+        for entity_name, entity_type in extraction.entity_type_hints.items():
+            entity_canon = canonicalize.resolve(conn, entity_name)
             conn.execute(
-                """INSERT INTO entity_properties(
-                       entity_canonical, key, value, source_chunk_id, updated_at
-                   ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                   ON CONFLICT(entity_canonical, key) DO UPDATE SET
-                       value = excluded.value,
-                       source_chunk_id = excluded.source_chunk_id,
-                       updated_at = CURRENT_TIMESTAMP""",
-                (entity_canon, key, value, chunk.id),
+                """INSERT OR IGNORE INTO entity_types(
+                       entity_canonical,type,confidence,source_chunk_id
+                   ) VALUES (?, ?, 1.0, ?)""",
+                (entity_canon, entity_type, chunk.id),
             )
+        for entity_name, kv in extraction.entity_property_hints.items():
+            if not kv:
+                continue
+            entity_canon = canonicalize.resolve(conn, entity_name)
+            for key, value in kv.items():
+                conn.execute(
+                    """INSERT INTO entity_properties(
+                           entity_canonical,key,value,source_chunk_id,updated_at
+                       ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                       ON CONFLICT(entity_canonical,key) DO UPDATE SET
+                           value=excluded.value,
+                           source_chunk_id=excluded.source_chunk_id,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE entity_properties.origin<>'user'""",
+                    (entity_canon, key, value, chunk.id),
+                )
 
     mentioned: set[str] = set()
     for t in extraction.triples:
@@ -793,6 +964,7 @@ def persist_chunk_results(
                 source_message_id=claim_source.message_id,
                 polarity=t.polarity,
                 prompt_version=prompt_version,
+                phase1_generation_key=phase1_generation_key,
                 evidence_id=evidence_id,
             )
     if mentioned:
@@ -800,7 +972,7 @@ def persist_chunk_results(
             "INSERT OR IGNORE INTO entity_mentions(chunk_id, entity_canonical) VALUES (?, ?)",
             [(chunk.id, e) for e in mentioned],
         )
-    for m in extraction.markers:
+    for m in (() if extraction.source_validated else extraction.markers):
         # Write idempotence: re-extracting a chunk re-attaches its markers
         # without duplicating them, the way the v36 source-key constraint
         # protects kg_evidence. Enforced here rather than by a unique
@@ -808,18 +980,55 @@ def persist_chunk_results(
         # legacy-safe (see migration 028). Dreams hold a lock, so the
         # check-then-insert is not racing another writer.
         conn.execute(
-            """INSERT INTO behavioral_markers(kind, statement, chunk_id)
-               SELECT ?, ?, ?
+            """INSERT INTO behavioral_markers(
+                   kind, statement, chunk_id, phase1_generation_key
+               ) SELECT ?, ?, ?, ?
                WHERE NOT EXISTS (
                    SELECT 1 FROM behavioral_markers
                    WHERE chunk_id = ? AND kind = ? AND statement = ?
                )""",
-            (m.kind, m.statement, chunk.id, chunk.id, m.kind, m.statement),
+            (
+                m.kind, m.statement, chunk.id, phase1_generation_key,
+                chunk.id, m.kind, m.statement,
+            ),
         )
 
     if extraction.source_validated:
         evidence.record_claim_extraction_outcome(
-            conn, chunk_id=chunk.id, prompt_version=prompt_version
+            conn,
+            chunk_id=chunk.id,
+            prompt_version=prompt_version,
+            phase1_generation_key=phase1_generation_key,
+        )
+        if phase1_generation_key is None:
+            raise ValueError("source-validated extraction has no generation")
+        claim = conn.execute(
+            "SELECT prompt_version,phase1_generation_key FROM "
+            "kg_claim_extraction_outcomes WHERE chunk_id=?",
+            (chunk.id,),
+        ).fetchone()
+        if (
+            claim is None
+            or claim["prompt_version"] != prompt_version
+            or claim["phase1_generation_key"] != phase1_generation_key
+        ):
+            # Defensive postcondition: a swallowed/monkeypatched claim writer
+            # must not let the auxiliary projection or processed gate publish.
+            # Draft evidence can remain physically staged and will be ignored
+            # by every authoritative read until a later exact retry succeeds.
+            if staged_in_cycle_edges is not None:
+                for entry in staged_in_cycle_edges:
+                    entry.authoritative = False
+            return staged_in_cycle_edges
+        publish_phase1_auxiliaries(
+            conn,
+            chunk_id=chunk.id,
+            phase1_generation_key=phase1_generation_key,
+            extraction_cache_key=prompt_version,
+            entity_type_hints=extraction.entity_type_hints,
+            entity_property_hints=extraction.entity_property_hints,
+            entity_mentions=sorted(mentioned),
+            markers=extraction.markers,
         )
         evidence.finalize_chunk_extraction_reconciliation(
             conn, affected_edge_ids
@@ -846,8 +1055,12 @@ def persist_chunk_results(
     # digest (v24 watermark), facts (v26 watermark) and fusion paths all do.
     # A clean parse that yielded nothing IS marked: that is the real floor.
     conn.execute(
-        "INSERT OR IGNORE INTO processed_chunks(chunk_id, prompt_version) VALUES (?, ?)",
-        (chunk.id, prompt_version),
+        "INSERT INTO processed_chunks("
+        "chunk_id,prompt_version,phase1_generation_key) VALUES (?,?,?) "
+        "ON CONFLICT(chunk_id,prompt_version) DO UPDATE SET "
+        "phase1_generation_key=excluded.phase1_generation_key,"
+        "processed_at=CURRENT_TIMESTAMP",
+        (chunk.id, prompt_version, phase1_generation_key),
     )
     # Consecutive-failure count, so a chunk that heals starts fresh.
     conn.execute(
@@ -861,6 +1074,7 @@ def persist_chunk_results(
         len(extraction.triples),
         len(extraction.markers),
     )
+    _prune_process_identities()
     return staged_in_cycle_edges
 
 
@@ -1526,3 +1740,6 @@ def _normalized_source_event_at(
         )
     except ValueError:
         return "0001-01-01T00:00:00.000Z"
+
+
+_DIRECT_PHASE1_PERSIST_FUNCTION = persist_chunk_results

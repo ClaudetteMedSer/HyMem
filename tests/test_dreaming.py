@@ -99,6 +99,7 @@ def test_phase3_decay_only_affects_re_mentioned_topics(hy):
         "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, salience_reason, text) "
         "VALUES ('c1', 's_decay', 1, 1, 'long_user_turn', 'we redesigned the api but didn t change the database choice')"
     )
+    _publish_recent_mentions(hy, "c1", ["api"])
     conn.execute(
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
         "pos_evidence, neg_evidence, last_reinforced) "
@@ -176,8 +177,8 @@ def test_phase3_negative_dominance_retracts_gray_zone(hy):
 
 def test_phase3_retraction_feedback_falls_back_to_negative_evidence(hy):
     """Auto-retracted zombie edges only have polarity=-1 evidence rows.
-    extraction_feedback must still get populated so the prompt has few-shot
-    negatives — the prior bug skipped these entirely."""
+    The audit row must still retain a source rather than silently disappearing.
+    It remains retention data and is never fed back into extraction prompts."""
     conn = hy.conn
     conn.execute("INSERT INTO sessions(id) VALUES ('s_zombie')")
     conn.execute(
@@ -218,10 +219,55 @@ def test_phase3_retraction_feedback_falls_back_to_negative_evidence(hy):
 # --- predicate-aware decay (Feature B) -------------------------------------
 
 
-def _seed_aged_edge_with_recent_mention(conn, subject, predicate, obj, days_ago):
+def _publish_recent_mentions(hy, chunk_id, entities):
+    """Publish a minimal exact Phase-1 mention projection for decay tests."""
+    from hymem.core import db as core_db
+    from hymem.dreaming import evidence
+    from hymem.dreaming.phase1_auxiliary import publish_phase1_auxiliaries
+    from hymem.extraction.producer import register_phase1_generation
+
+    conn = hy.conn
+    binding = hy._phase1_generation
+    assert binding is not None
+    generation_key = binding["generation_key"]
+    cache_key = binding["extraction_cache_key"]
+    with core_db.transaction(conn):
+        register_phase1_generation(conn, binding)
+        with core_db.evidence_mutation(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO kg_claim_extraction_outcomes("
+                "chunk_id,prompt_version,prompt_generation,result_hash,"
+                "phase1_generation_key) VALUES (?,?,?,?,?)",
+                (
+                    chunk_id,
+                    cache_key,
+                    evidence.prompt_generation(cache_key),
+                    evidence.claim_result_hash([]),
+                    generation_key,
+                ),
+            )
+        publish_phase1_auxiliaries(
+            conn,
+            chunk_id=chunk_id,
+            phase1_generation_key=generation_key,
+            extraction_cache_key=cache_key,
+            entity_type_hints={},
+            entity_property_hints={},
+            entity_mentions=entities,
+            markers=[],
+        )
+        conn.execute(
+            "INSERT INTO processed_chunks("
+            "chunk_id,prompt_version,phase1_generation_key) VALUES (?,?,?)",
+            (chunk_id, cache_key, generation_key),
+        )
+
+
+def _seed_aged_edge_with_recent_mention(hy, subject, predicate, obj, days_ago):
     """Seed an active edge last reinforced `days_ago` days ago plus a fresh
     chunk that mentions both endpoints (without producing kg_evidence), so the
     decay recency probe sees a re-mention."""
+    conn = hy.conn
     conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('s_pred')")
     chunk_id = f"c_{subject}_{obj}"
     conn.execute(
@@ -230,12 +276,7 @@ def _seed_aged_edge_with_recent_mention(conn, subject, predicate, obj, days_ago)
         "'still discussing it today')",
         (chunk_id,),
     )
-    for ent in (subject, obj):
-        conn.execute(
-            "INSERT OR IGNORE INTO entity_mentions(chunk_id, entity_canonical) "
-            "VALUES (?, ?)",
-            (chunk_id, ent),
-        )
+    _publish_recent_mentions(hy, chunk_id, [subject, obj])
     conn.execute(
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
         "pos_evidence, neg_evidence, last_reinforced) "
@@ -259,8 +300,8 @@ def test_phase3_decay_is_predicate_aware(hy):
     volatile `uses` edge (30-day window) accrues a negative while the sticky
     `prefers` edge (90-day window) stays protected."""
     conn = hy.conn
-    _seed_aged_edge_with_recent_mention(conn, "user", "prefers", "uv", days_ago=60)
-    _seed_aged_edge_with_recent_mention(conn, "gateway", "uses", "ruff", days_ago=60)
+    _seed_aged_edge_with_recent_mention(hy, "user", "prefers", "uv", days_ago=60)
+    _seed_aged_edge_with_recent_mention(hy, "gateway", "uses", "ruff", days_ago=60)
 
     from hymem.dreaming.phase3 import decay
     decay(conn, hy.config)
@@ -275,8 +316,8 @@ def test_phase3_depends_on_protected_longer_than_uses(hy):
     while volatile `uses` (default 30d) decays — dependencies shouldn't accrue
     soft-contradiction negatives before they're reinforced."""
     conn = hy.conn
-    _seed_aged_edge_with_recent_mention(conn, "app", "depends_on", "redis", days_ago=40)
-    _seed_aged_edge_with_recent_mention(conn, "gateway", "uses", "kafka", days_ago=40)
+    _seed_aged_edge_with_recent_mention(hy, "app", "depends_on", "redis", days_ago=40)
+    _seed_aged_edge_with_recent_mention(hy, "gateway", "uses", "kafka", days_ago=40)
 
     from hymem.dreaming.phase3 import decay
     decay(conn, hy.config)
@@ -292,7 +333,7 @@ def test_phase3_decay_falls_back_to_default_window(hy):
     import dataclasses
 
     conn = hy.conn
-    _seed_aged_edge_with_recent_mention(conn, "user", "prefers", "uv", days_ago=60)
+    _seed_aged_edge_with_recent_mention(hy, "user", "prefers", "uv", days_ago=60)
 
     cfg = dataclasses.replace(hy.config, predicate_half_life_days={})
     from hymem.dreaming.phase3 import decay

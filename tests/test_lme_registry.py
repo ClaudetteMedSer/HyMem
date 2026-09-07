@@ -21,12 +21,30 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 import benchmarks.lme_registry as reg  # noqa: E402
+from benchmarks.extraction_canary import (  # noqa: E402
+    extraction_canary_policy,
+    skipped_extraction_canary,
+)
 from benchmarks.strictness import build_manifest, content_hash  # noqa: E402
+from hymem.contrib.endpoint_policy import secret_free_endpoint_identity  # noqa: E402
+from hymem.contrib.openai_client import (  # noqa: E402
+    llm_attestation_sha256,
+    openai_compatible_producer_declaration,
+)
+from hymem.dreaming.aggregation_material import (  # noqa: E402
+    embedding_producer_binding,
+    public_embedding_identity,
+)
+from hymem.extraction.contract import extraction_contract_binding  # noqa: E402
+from hymem.extraction.producer import (  # noqa: E402
+    producer_binding_from_typed_declaration,
+)
 from benchmarks.lme_protocol import (  # noqa: E402
     LME_EVALUATOR_COMMIT,
     LME_EVALUATOR_SHA256,
     LME_EVALUATOR_URL,
     LME_LOCAL_RETRY_POLICY,
+    LME_OFFICIAL_JUDGE_BASE_URL,
     LME_UPSTREAM_RETRY_POLICY,
 )
 
@@ -67,6 +85,13 @@ def make_run(path: Path, date="2026-08-05T05:49:14", **cfg):
 
 
 def make_strict_run(path: Path, *, segment_status="complete"):
+    embedding_identity = public_embedding_identity(
+        embedding_producer_binding(None),
+        None,
+        fallback_policy="none",
+        fallback_reason=None,
+        transport_security="none",
+    )
     config = {
         "scales": "S", "sample": 2, "seed": 3, "top_k": 15,
         "workers": 2, "auto_ability": True, "no_dream": False,
@@ -121,19 +146,30 @@ def make_strict_run(path: Path, *, segment_status="complete"):
         "official_transport_exact": False,
         "retrieval_usage_owner": "none",
         "answer_model": "reader-pinned",
-        "answer_base_url": "https://reader.example/v1",
+        **{
+            "answer_" + key: value
+            for key, value in secret_free_endpoint_identity(
+                "https://reader.example/v1", label="reader"
+            ).items()
+        },
         "answer_extra_body_obj": {},
         "judge_model": "judge-pinned",
-        "judge_base_url": "https://judge.example/v1",
+        **{
+            "judge_" + key: value
+            for key, value in secret_free_endpoint_identity(
+                "https://judge.example/v1", label="judge"
+            ).items()
+        },
         "judge_extra_body_obj": {},
         "hymem_model": "pipeline-pinned",
-        "hymem_base_url": "https://pipeline.example/v1",
-        "hymem_thinking": "off",
-        "embedding_runtime": {
-            "configured": False, "backend": "none", "quality": "none",
-            "network_free": True, "model": None, "base_url": None,
-            "dimension": None, "fallback_policy": "none",
+        **{
+            "hymem_" + key: value
+            for key, value in secret_free_endpoint_identity(
+                "https://pipeline.example/v1", label="memory pipeline"
+            ).items()
         },
+        "hymem_thinking": "off",
+        "embedding_runtime": embedding_identity,
         "aggregation_nodes": False,
         "aggregation_broad": False,
         "episode_granularity": True,
@@ -148,7 +184,15 @@ def make_strict_run(path: Path, *, segment_status="complete"):
         "evaluator_commit": LME_EVALUATOR_COMMIT,
         "evaluator_sha256": LME_EVALUATOR_SHA256,
         "evaluator_url": LME_EVALUATOR_URL,
+        **{
+            "official_judge_" + key: value
+            for key, value in secret_free_endpoint_identity(
+                LME_OFFICIAL_JUDGE_BASE_URL, label="official judge"
+            ).items()
+        },
         "effective_hymem_config": {
+            "prompt_version": "v20",
+            "extraction_contract": extraction_contract_binding("v20"),
             "message_fts_top_k": 15, "fts_top_k": 10,
             "graph_top_k": 10,
             "aggregation_nodes_enabled": False,
@@ -167,17 +211,30 @@ def make_strict_run(path: Path, *, segment_status="complete"):
             "facts_enabled": True,
             "facts_extraction_enabled": True,
         },
+        "extraction_canary": extraction_canary_policy(),
     }
     config["no_dream"] = True
+    pipeline_revision_sha256 = llm_attestation_sha256(
+        "fixture-revision-v1", label="fixture deployment revision",
+    )
+    pipeline_tenant_sha256 = llm_attestation_sha256(
+        "fixture-tenant-v1", label="fixture deployment tenant",
+    )
     models = {
         "reader": {
             "provider": "openai-compatible", "model": "reader-pinned",
-            "base_url": "https://reader.example/v1", "temperature": 0.0,
+            **secret_free_endpoint_identity(
+                "https://reader.example/v1", label="reader"
+            ),
+            "temperature": 0.0,
             "max_tokens": 1024, "extra_body": {},
         },
         "judge": {
             "provider": "openai-compatible", "model": "judge-pinned",
-            "base_url": "https://judge.example/v1", "temperature": 0.0,
+            **secret_free_endpoint_identity(
+                "https://judge.example/v1", label="judge"
+            ),
+            "temperature": 0.0,
             "max_tokens": 10, "n": None, "extra_body": {},
             "protocol": "legacy-custom",
             "evaluator_commit": LME_EVALUATOR_COMMIT,
@@ -188,8 +245,27 @@ def make_strict_run(path: Path, *, segment_status="complete"):
         },
         "memory_pipeline": {
             "provider": "openai-compatible", "model": "pipeline-pinned",
-            "base_url": "https://pipeline.example/v1",
+            **secret_free_endpoint_identity(
+                "https://pipeline.example/v1", label="memory pipeline"
+            ),
             "thinking_mode": "off", "effective_extra_body": {},
+            "aggregation_producer": producer_binding_from_typed_declaration(
+                openai_compatible_producer_declaration(
+                    model="pipeline-pinned",
+                    endpoint="https://pipeline.example/v1",
+                    thinking_mode="off", effective_extra_body={},
+                    transport_package_version="test-openai-1",
+                    request_timeout_seconds=120.0,
+                    deployment_revision_sha256=pipeline_revision_sha256,
+                    deployment_tenant_sha256=pipeline_tenant_sha256,
+                    require_consistent_thinking=True,
+                ),
+                declaration_hook="aggregation_producer_declaration",
+            ),
+            "deployment_revision_sha256": pipeline_revision_sha256,
+            "deployment_tenant_sha256": pipeline_tenant_sha256,
+            "transport_package_version": "test-openai-1",
+            "request_timeout_seconds": 120.0,
         },
         "embedding": config["embedding_runtime"],
     }
@@ -211,6 +287,7 @@ def make_strict_run(path: Path, *, segment_status="complete"):
         "configured": False, "backend": "none", "quality": "none",
         "network_free": True, "model": None, "dimension": None,
         "identity_available": True,
+        "identity_exact": True, "reuse_scope": "durable",
         "calls": 0, "calls_available": True,
         "request_attempts": 0, "request_attempts_available": True,
         "successful_responses": 0, "successful_responses_available": True,
@@ -250,6 +327,7 @@ def make_strict_run(path: Path, *, segment_status="complete"):
                 "memory_pipeline_usage": usage(3, 25, 5),
                 "embedding_usage": embedding_usage,
                 "indexing_runs": [],
+                "extraction_canary": skipped_extraction_canary("no_dream"),
             }],
         },
         "per_question": [
@@ -319,12 +397,21 @@ def test_strict_lme_archive_discovery_and_nested_metadata(tmp_db):
     assert row["evaluator_commit"] == LME_EVALUATOR_COMMIT
     assert row["evaluator_sha256"] == LME_EVALUATOR_SHA256
     assert row["reader_provider"] == "openai-compatible"
-    assert row["reader_base_url"] == "https://reader.example/v1"
+    assert row["reader_base_url"] == "https://reader.example"
+    assert row["reader_endpoint_sha256"] == secret_free_endpoint_identity(
+        "https://reader.example/v1", label="reader"
+    )["endpoint_sha256"]
     assert row["judge_provider"] == "openai-compatible"
-    assert row["judge_base_url"] == "https://judge.example/v1"
+    assert row["judge_base_url"] == "https://judge.example"
+    assert row["judge_endpoint_sha256"] == secret_free_endpoint_identity(
+        "https://judge.example/v1", label="judge"
+    )["endpoint_sha256"]
     assert row["pipeline_provider"] == "openai-compatible"
     assert row["pipeline_model"] == "pipeline-pinned"
-    assert row["pipeline_base_url"] == "https://pipeline.example/v1"
+    assert row["pipeline_base_url"] == "https://pipeline.example"
+    assert row["pipeline_endpoint_sha256"] == secret_free_endpoint_identity(
+        "https://pipeline.example/v1", label="memory pipeline"
+    )["endpoint_sha256"]
     assert row["embedding_backend"] == "none"
     assert row["embedding_model"] is None
     assert row["embedding_base_url"] is None

@@ -94,15 +94,34 @@ def claim_observation_result_hash(
 
 
 def claim_extraction_prompt_is_stale(
-    conn: sqlite3.Connection, *, chunk_id: str, prompt_version: str
+    conn: sqlite3.Connection,
+    *,
+    chunk_id: str,
+    prompt_version: str,
+    producer_identity_sha256: str,
 ) -> bool:
-    """Return whether a newer successful whole-chunk result already exists."""
+    """Return whether this producer already published a newer result.
+
+    Numeric prompt ordering is meaningful only within one producer identity.
+    A target producer must replace a screening/legacy producer even when the
+    latter used a numerically larger public prompt label.
+    """
     row = conn.execute(
-        "SELECT prompt_generation FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
+        "SELECT outcome.prompt_generation,"
+        "generation.producer_identity_sha256 AS prior_producer "
+        "FROM kg_claim_extraction_outcomes outcome "
+        "JOIN phase1_generations generation "
+        "ON generation.generation_key=outcome.phase1_generation_key "
+        "AND generation.extraction_cache_key=outcome.prompt_version "
+        "WHERE outcome.chunk_id=? "
+        "AND outcome.phase1_generation_key IS NOT NULL "
+        "AND hymem_phase1_generation_is_authorized("
+        "generation.generation_key,generation.identity_exact)=1",
         (chunk_id,),
     ).fetchone()
     return bool(
         row is not None
+        and row["prior_producer"] == producer_identity_sha256
         and int(row["prompt_generation"]) > prompt_generation(prompt_version)
     )
 
@@ -110,8 +129,15 @@ def claim_extraction_prompt_is_stale(
 def _publish_chunk_evidence(conn: sqlite3.Connection, chunk_id: str) -> int:
     """Write each observed revision's immutable first publication clock."""
     outcome = conn.execute(
-        "SELECT prompt_version,prompt_generation,succeeded_at "
-        "FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
+        "SELECT outcome.prompt_version,outcome.prompt_generation,"
+        "outcome.succeeded_at,outcome.phase1_generation_key "
+        "FROM kg_claim_extraction_outcomes outcome "
+        "JOIN phase1_generations generation "
+        "ON generation.generation_key=outcome.phase1_generation_key "
+        "AND generation.extraction_cache_key=outcome.prompt_version "
+        "WHERE outcome.chunk_id=? "
+        "AND hymem_phase1_generation_is_authorized("
+        "generation.generation_key,generation.identity_exact)=1",
         (chunk_id,),
     ).fetchone()
     if outcome is None:
@@ -126,11 +152,16 @@ def _publish_chunk_evidence(conn: sqlite3.Connection, chunk_id: str) -> int:
         WHERE observation.chunk_id=?
           AND observation.prompt_version=?
           AND observation.prompt_generation=?
+          AND observation.phase1_generation_key IS NOT NULL
+          AND observation.phase1_generation_key IS ?
           AND ev.provenance_status='canonical'
           AND ev.published_at IS NULL
         LIMIT 1
         """,
-        (chunk_id, outcome["prompt_version"], outcome["prompt_generation"]),
+        (
+            chunk_id, outcome["prompt_version"], outcome["prompt_generation"],
+            outcome["phase1_generation_key"],
+        ),
     ).fetchone()
     if pending is not None:
         # A staged revision may be repaired after the outcome row was first
@@ -145,10 +176,11 @@ def _publish_chunk_evidence(conn: sqlite3.Connection, chunk_id: str) -> int:
             conn.execute(
                 "UPDATE kg_claim_observations SET observed_at=? "
                 "WHERE chunk_id=? AND prompt_version=? "
-                "AND prompt_generation=?",
+                "AND prompt_generation=? AND phase1_generation_key IS ?",
                 (
                     published_at, chunk_id, outcome["prompt_version"],
                     int(outcome["prompt_generation"]),
+                    outcome["phase1_generation_key"],
                 ),
             )
             conn.execute(
@@ -174,6 +206,12 @@ def _publish_chunk_evidence(conn: sqlite3.Connection, chunk_id: str) -> int:
                   WHERE observation.chunk_id = ?
                     AND observation.prompt_version = ?
                     AND observation.prompt_generation = ?
+                    AND observation.phase1_generation_key IS NOT NULL
+                    AND observation.phase1_generation_key IS (
+                        SELECT current.phase1_generation_key
+                        FROM kg_claim_extraction_outcomes current
+                        WHERE current.chunk_id=observation.chunk_id
+                    )
               )
             """,
             (
@@ -186,7 +224,11 @@ def _publish_chunk_evidence(conn: sqlite3.Connection, chunk_id: str) -> int:
 
 @_atomic_evidence_helper("hymem_record_claim_extraction_outcome")
 def record_claim_extraction_outcome(
-    conn: sqlite3.Connection, *, chunk_id: str, prompt_version: str
+    conn: sqlite3.Connection,
+    *,
+    chunk_id: str,
+    prompt_version: str,
+    phase1_generation_key: str | None = None,
 ) -> bool:
     """Publish the latest successful, source-validated result for a chunk.
 
@@ -197,6 +239,36 @@ def record_claim_extraction_outcome(
     """
     if not isinstance(prompt_version, str) or not prompt_version.strip():
         raise ValueError("claim extraction prompt version must be nonempty")
+    from hymem.extraction.contract import (
+        EXTRACTION_CACHE_SCHEMA,
+        extraction_cache_key,
+    )
+
+    # This is a live Phase-1 publication primitive, not the portability
+    # importer.  A bare public label or stale derived namespace must never
+    # become fresh outcome authority through a direct caller.  Historical wire
+    # imports retain their exact audit values through the dedicated importer,
+    # while every live write is bound to the code executing now.
+    if (
+        not prompt_version.startswith(f"{EXTRACTION_CACHE_SCHEMA}:")
+        or extraction_cache_key(prompt_version) != prompt_version
+    ):
+        raise ValueError(
+            "claim extraction outcome requires the active contract cache key"
+        )
+    if phase1_generation_key is not None:
+        generation_row = conn.execute(
+            "SELECT extraction_cache_key,producer_identity_sha256 "
+            "FROM phase1_generations "
+            "WHERE generation_key=? AND "
+            "hymem_phase1_generation_is_authorized("
+            "generation_key,identity_exact)=1",
+            (phase1_generation_key,),
+        ).fetchone()
+        if generation_row is None or generation_row[0] != prompt_version:
+            raise ValueError(
+                "claim extraction outcome has an unregistered producer generation"
+            )
     generation = prompt_generation(prompt_version)
     manifest = conn.execute(
         "SELECT source_manifest_version,source_manifest_count," 
@@ -220,6 +292,7 @@ def record_claim_extraction_outcome(
         WHERE observation.chunk_id=? AND (
             observation.prompt_version<>?
             OR observation.prompt_generation<>?
+            OR observation.phase1_generation_key IS NOT ?
             OR ev.provenance_status<>'canonical'
             OR ev.edge_id<>observation.edge_id
             OR ev.source_session_id<>observation.source_session_id
@@ -237,61 +310,108 @@ def record_claim_extraction_outcome(
             )
         ) LIMIT 1
         """,
-        (chunk_id, prompt_version, generation),
+        (chunk_id, prompt_version, generation, phase1_generation_key),
     ).fetchone()
     if invalid_observation is not None:
         raise ValueError(
             "claim extraction outcome disagrees with its observation authority"
         )
+    if phase1_generation_key is None:
+        raise ValueError(
+            "claim extraction outcome requires a producer generation"
+        )
     result_hash = claim_observation_result_hash(conn, chunk_id)
     existing = conn.execute(
-        "SELECT prompt_version,prompt_generation,result_hash,succeeded_at "
-        "FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
+        "SELECT outcome.prompt_version,outcome.prompt_generation,"
+        "outcome.result_hash,outcome.succeeded_at,"
+        "outcome.phase1_generation_key,"
+        "CASE WHEN generation.generation_key IS NULL THEN 0 ELSE 1 END "
+        "AS generation_authorized "
+        "FROM kg_claim_extraction_outcomes outcome "
+        "LEFT JOIN phase1_generations generation "
+        "ON generation.generation_key=outcome.phase1_generation_key "
+        "AND generation.extraction_cache_key=outcome.prompt_version "
+        "AND hymem_phase1_generation_is_authorized("
+        "generation.generation_key,generation.identity_exact)=1 "
+        "WHERE outcome.chunk_id=?",
         (chunk_id,),
     ).fetchone()
-    if existing is not None:
+    if existing is not None and int(existing["generation_authorized"]):
         old_generation = int(existing["prompt_generation"])
-        if generation < old_generation:
+        prior_producer = conn.execute(
+            "SELECT producer_identity_sha256 FROM phase1_generations "
+            "WHERE generation_key=?",
+            (existing["phase1_generation_key"],),
+        ).fetchone()
+        same_producer = bool(
+            prior_producer is not None
+            and prior_producer[0] == generation_row["producer_identity_sha256"]
+        )
+        if same_producer and generation < old_generation:
             return False
-        if generation == old_generation and existing["result_hash"] != result_hash:
+        same_identity = (
+            existing["prompt_version"] == prompt_version
+            and existing["phase1_generation_key"] == phase1_generation_key
+        )
+        if (
+            generation == old_generation
+            and existing["result_hash"] != result_hash
+            and same_identity
+        ):
             raise ValueError(
                 "same prompt generation claim extraction outcomes disagree"
             )
-        if generation == old_generation:
-            winner_version = max(str(existing["prompt_version"]), prompt_version)
-            if winner_version == existing["prompt_version"]:
-                return bool(_publish_chunk_evidence(conn, chunk_id))
-            from hymem.core.db import evidence_mutation
+        if generation == old_generation and same_identity:
+            # Re-extraction under the *active derived contract* supersedes a
+            # stale namespace even when the operator retained the same public
+            # version. Portable history is merged by the dedicated importer;
+            # this live primitive accepts only the current derived namespace.
+            if existing["result_hash"] == result_hash:
+                winner_version = max(
+                    str(existing["prompt_version"]), prompt_version
+                )
+                if winner_version == existing["prompt_version"]:
+                    return bool(_publish_chunk_evidence(conn, chunk_id))
+                from hymem.core.db import evidence_mutation
 
-            with evidence_mutation(conn):
-                conn.execute(
-                    "UPDATE kg_claim_extraction_outcomes SET prompt_version=? "
-                    "WHERE chunk_id=?",
-                    (winner_version, chunk_id),
-                )
-                conn.execute(
-                    "UPDATE kg_claim_observations SET prompt_version=? "
-                    "WHERE chunk_id=? AND prompt_generation=?",
-                    (winner_version, chunk_id, generation),
-                )
-            _publish_chunk_evidence(conn, chunk_id)
-            return True
+                with evidence_mutation(conn):
+                    conn.execute(
+                        "UPDATE kg_claim_extraction_outcomes SET prompt_version=? "
+                        "WHERE chunk_id=?",
+                        (winner_version, chunk_id),
+                    )
+                    conn.execute(
+                        "UPDATE kg_claim_observations SET prompt_version=? "
+                        "WHERE chunk_id=? AND prompt_generation=?",
+                        (winner_version, chunk_id, generation),
+                    )
+                _publish_chunk_evidence(conn, chunk_id)
+                return True
+            # A changed result from another derived contract intentionally
+            # falls through to the normal whole-outcome replacement below.
     from hymem.core.db import evidence_history_mutation
 
     with evidence_history_mutation(conn):
         if existing is None:
             conn.execute(
                 "INSERT INTO kg_claim_extraction_outcomes(" 
-                "chunk_id,prompt_version,prompt_generation,result_hash) "
-                "VALUES (?,?,?,?)",
-                (chunk_id, prompt_version, generation, result_hash),
+                "chunk_id,prompt_version,prompt_generation,result_hash,"
+                "phase1_generation_key) VALUES (?,?,?,?,?)",
+                (
+                    chunk_id, prompt_version, generation, result_hash,
+                    phase1_generation_key,
+                ),
             )
         else:
             conn.execute(
                 "UPDATE kg_claim_extraction_outcomes SET prompt_version=?,"
-                "prompt_generation=?,result_hash=?,succeeded_at=CURRENT_TIMESTAMP "
+                "prompt_generation=?,result_hash=?,phase1_generation_key=?,"
+                "succeeded_at=CURRENT_TIMESTAMP "
                 "WHERE chunk_id=?",
-                (prompt_version, generation, result_hash, chunk_id),
+                (
+                    prompt_version, generation, result_hash,
+                    phase1_generation_key, chunk_id,
+                ),
             )
     _publish_chunk_evidence(conn, chunk_id)
     return True
@@ -330,7 +450,13 @@ def claim_retirement_authority(
                    AS normalized_succeeded_at
         FROM kg_claim_extraction_outcomes outcome
         JOIN chunk_message_sources member ON member.chunk_id=outcome.chunk_id
+        JOIN phase1_generations generation
+          ON generation.generation_key=outcome.phase1_generation_key
+         AND generation.extraction_cache_key=outcome.prompt_version
         WHERE member.source_session_id=? AND member.source_message_id=?
+          AND outcome.phase1_generation_key IS NOT NULL
+          AND hymem_phase1_generation_is_authorized(
+                generation.generation_key,generation.identity_exact)=1
           AND hymem_normalize_iso_timestamp(outcome.succeeded_at) IS NOT NULL
         """,
         (source_session_id, int(source_message_id)),
@@ -1135,10 +1261,37 @@ def record_claim_observation(
     source_message_id: int,
     polarity: int,
     prompt_version: str,
+    phase1_generation_key: str | None = None,
     evidence_id: int,
     evidence_kind: str = "extraction",
 ) -> None:
     """Attach one validated chunk authority to a globally deduped proof."""
+    from hymem.extraction.contract import (
+        EXTRACTION_CACHE_SCHEMA,
+        extraction_cache_key,
+    )
+
+    if (
+        not isinstance(prompt_version, str)
+        or not prompt_version.startswith(f"{EXTRACTION_CACHE_SCHEMA}:")
+        or extraction_cache_key(prompt_version) != prompt_version
+    ):
+        raise ValueError(
+            "claim observation requires the active contract cache key"
+        )
+    if phase1_generation_key is None:
+        raise ValueError("claim observation requires a producer generation")
+    generation_row = conn.execute(
+        "SELECT extraction_cache_key FROM phase1_generations "
+        "WHERE generation_key=? AND "
+        "hymem_phase1_generation_is_authorized("
+        "generation_key,identity_exact)=1",
+        (phase1_generation_key,),
+    ).fetchone()
+    if generation_row is None or generation_row[0] != prompt_version:
+        raise ValueError(
+            "claim observation has an unregistered producer generation"
+        )
     generation = prompt_generation(prompt_version)
     evidence_row = conn.execute(
         "SELECT interpretation_key FROM kg_evidence WHERE id = ?",
@@ -1152,12 +1305,13 @@ def record_claim_observation(
         SELECT 1 FROM kg_claim_observations
         WHERE edge_id = ? AND source_session_id = ? AND source_message_id = ?
           AND evidence_kind = ? AND prompt_generation = ?
+          AND phase1_generation_key IS ?
           AND (polarity <> ? OR interpretation_key <> ?)
         LIMIT 1
         """,
         (
             edge_id, source_session_id, source_message_id, evidence_kind,
-            generation, polarity, interpretation_key,
+            generation, phase1_generation_key, polarity, interpretation_key,
         ),
     ).fetchone()
     if conflict is not None:
@@ -1170,14 +1324,15 @@ def record_claim_observation(
         INSERT INTO kg_claim_observations(
             chunk_id, edge_id, source_session_id, source_message_id,
             evidence_kind, polarity, prompt_version, prompt_generation
-            , evidence_id, interpretation_key
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            , phase1_generation_key, evidence_id, interpretation_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(
             chunk_id, edge_id, source_session_id, source_message_id, evidence_kind
         ) DO UPDATE SET
             polarity = excluded.polarity,
             prompt_version = excluded.prompt_version,
             prompt_generation = excluded.prompt_generation,
+            phase1_generation_key = excluded.phase1_generation_key,
             evidence_id = excluded.evidence_id,
             interpretation_key = excluded.interpretation_key,
             observed_at = CURRENT_TIMESTAMP
@@ -1185,7 +1340,7 @@ def record_claim_observation(
             (
                 chunk_id, edge_id, source_session_id, source_message_id,
                 evidence_kind, polarity, prompt_version, generation,
-                evidence_id, interpretation_key,
+                phase1_generation_key, evidence_id, interpretation_key,
             ),
         )
 
@@ -1217,52 +1372,91 @@ def finalize_chunk_extraction_reconciliation(
         ).fetchall()
         ids = list(dict.fromkeys([*ids, *(int(row[0]) for row in dependents)]))
     for edge_id in ids:
-        groups = conn.execute(
+        authority_rows = conn.execute(
             """
-            SELECT source_session_id, source_message_id, evidence_kind,
-                   MAX(prompt_generation) AS winning_generation
-            FROM kg_claim_observations
-            WHERE edge_id = ?
-            GROUP BY source_session_id, source_message_id, evidence_kind
+            SELECT observation.source_session_id,
+                   observation.source_message_id,
+                   observation.evidence_kind, observation.polarity,
+                   observation.interpretation_key, observation.evidence_id,
+                   observation.chunk_id, observation.prompt_version,
+                   observation.prompt_generation,
+                   observation.phase1_generation_key,
+                   hymem_normalize_iso_timestamp(outcome.succeeded_at)
+                       AS normalized_succeeded_at
+            FROM kg_claim_observations observation
+            JOIN kg_claim_extraction_outcomes outcome
+              ON outcome.chunk_id=observation.chunk_id
+             AND outcome.prompt_version=observation.prompt_version
+             AND outcome.prompt_generation=observation.prompt_generation
+             AND outcome.phase1_generation_key IS NOT NULL
+             AND outcome.phase1_generation_key=
+                 observation.phase1_generation_key
+            JOIN phase1_generations generation
+              ON generation.generation_key=outcome.phase1_generation_key
+             AND generation.extraction_cache_key=outcome.prompt_version
+            WHERE observation.edge_id = ?
+              AND hymem_phase1_generation_is_authorized(
+                    generation.generation_key,generation.identity_exact)=1
+              AND hymem_event_clock_is_valid(outcome.succeeded_at,?)=1
+            ORDER BY observation.source_session_id,
+                     observation.source_message_id,
+                     observation.evidence_kind, observation.chunk_id,
+                     observation.evidence_id
             """,
-            (edge_id,),
+            (edge_id, reconciliation_at),
         ).fetchall()
-        for group in groups:
-            interpretations = conn.execute(
-                """
-                SELECT DISTINCT polarity, interpretation_key
-                FROM kg_claim_observations
-                WHERE edge_id = ? AND source_session_id = ?
-                  AND source_message_id = ? AND evidence_kind = ?
-                  AND prompt_generation = ?
-                """,
-                (
-                    edge_id, group["source_session_id"],
-                    group["source_message_id"], group["evidence_kind"],
-                    group["winning_generation"],
-                ),
-            ).fetchall()
-            if len(interpretations) != 1:
-                raise ValueError(
-                    "same-generation claim observations disagree semantically"
+        grouped: dict[tuple[str, int, str], list[sqlite3.Row]] = {}
+        for row in authority_rows:
+            natural_source = (
+                str(row["source_session_id"]),
+                int(row["source_message_id"]),
+                str(row["evidence_kind"]),
+            )
+            grouped.setdefault(natural_source, []).append(row)
+        for natural_source, candidates in grouped.items():
+            by_producer: dict[str, list[sqlite3.Row]] = {}
+            for row in candidates:
+                by_producer.setdefault(
+                    str(row["phase1_generation_key"]), []
+                ).append(row)
+
+            def producer_rank(item: tuple[str, list[sqlite3.Row]]) -> tuple:
+                producer_key, rows = item
+                return max(
+                    (
+                        int(row["prompt_generation"]),
+                        str(row["normalized_succeeded_at"]),
+                        str(row["prompt_version"]),
+                        producer_key,
+                    )
+                    for row in rows
                 )
-            desired = int(interpretations[0]["polarity"])
-            desired_key = str(interpretations[0]["interpretation_key"])
-            selected = conn.execute(
-                """
-                SELECT evidence_id FROM kg_claim_observations
-                WHERE edge_id = ? AND source_session_id = ?
-                  AND source_message_id = ? AND evidence_kind = ?
-                  AND prompt_generation = ?
-                  AND polarity = ? AND interpretation_key = ?
-                ORDER BY chunk_id, prompt_version, evidence_id LIMIT 1
-                """,
-                (
-                    edge_id, group["source_session_id"],
-                    group["source_message_id"], group["evidence_kind"],
-                    group["winning_generation"], desired, desired_key,
+
+            winning_key, winners = max(
+                by_producer.items(), key=producer_rank
+            )
+            semantics = {
+                (int(row["polarity"]), str(row["interpretation_key"]))
+                for row in winners
+            }
+            if len(semantics) != 1:
+                raise ValueError(
+                    "same-producer claim observations disagree semantically"
+                )
+            desired, desired_key = next(iter(semantics))
+            selected = min(
+                winners,
+                key=lambda row: (
+                    str(row["chunk_id"]), str(row["prompt_version"]),
+                    int(row["evidence_id"]),
                 ),
-            ).fetchone()
+            )
+            group = {
+                "source_session_id": natural_source[0],
+                "source_message_id": natural_source[1],
+                "evidence_kind": natural_source[2],
+                "winning_phase1_generation_key": winning_key,
+            }
             current = conn.execute(
                 """
                 SELECT id, polarity, interpretation_key FROM kg_evidence
@@ -1367,20 +1561,43 @@ def finalize_chunk_extraction_reconciliation(
                     WHERE edge_id=? AND source_session_id=?
                       AND source_message_id=? AND evidence_kind=?
                       AND polarity=? AND interpretation_key=?
+                      AND phase1_generation_key=?
                     """,
                     (
                         replacement_id, reconciliation_at, edge_id,
                         group["source_session_id"],
                         group["source_message_id"], group["evidence_kind"],
                         desired, desired_key,
+                        group["winning_phase1_generation_key"],
                     ),
                 )
                 authority_chunks = [
                     str(row["chunk_id"])
                     for row in conn.execute(
-                        "SELECT DISTINCT chunk_id FROM kg_claim_observations "
-                        "WHERE evidence_id=? ORDER BY chunk_id",
-                        (replacement_id,),
+                        "SELECT DISTINCT observation.chunk_id "
+                        "FROM kg_claim_observations observation "
+                        "JOIN kg_claim_extraction_outcomes outcome "
+                        "ON outcome.chunk_id=observation.chunk_id "
+                        "AND outcome.prompt_version=observation.prompt_version "
+                        "AND outcome.prompt_generation="
+                        "observation.prompt_generation "
+                        "AND outcome.phase1_generation_key IS NOT NULL "
+                        "AND outcome.phase1_generation_key="
+                        "observation.phase1_generation_key "
+                        "JOIN phase1_generations generation "
+                        "ON generation.generation_key="
+                        "outcome.phase1_generation_key "
+                        "WHERE observation.evidence_id=? "
+                        "AND observation.phase1_generation_key=? "
+                        "AND generation.extraction_cache_key="
+                        "outcome.prompt_version "
+                        "AND hymem_phase1_generation_is_authorized("
+                        "generation.generation_key,generation.identity_exact)=1 "
+                        "ORDER BY observation.chunk_id",
+                        (
+                            replacement_id,
+                            group["winning_phase1_generation_key"],
+                        ),
                     ).fetchall()
                 ]
                 if not authority_chunks:
@@ -1391,13 +1608,28 @@ def finalize_chunk_extraction_reconciliation(
                 coherent_outcomes = int(conn.execute(
                     "SELECT COUNT(*) FROM kg_claim_extraction_outcomes outcome "
                     "WHERE outcome.chunk_id IN (" + placeholders + ") "
+                    "AND outcome.phase1_generation_key=? "
                     "AND EXISTS (SELECT 1 FROM kg_claim_observations observation "
                     "WHERE observation.chunk_id=outcome.chunk_id "
                     "AND observation.evidence_id=? "
                     "AND observation.prompt_version=outcome.prompt_version "
                     "AND observation.prompt_generation="
-                    "outcome.prompt_generation)",
-                    (*authority_chunks, replacement_id),
+                    "outcome.prompt_generation "
+                    "AND observation.phase1_generation_key IS NOT NULL "
+                    "AND observation.phase1_generation_key="
+                    "outcome.phase1_generation_key "
+                    "AND EXISTS (SELECT 1 FROM phase1_generations generation "
+                    "WHERE generation.generation_key="
+                    "outcome.phase1_generation_key "
+                    "AND generation.extraction_cache_key="
+                    "outcome.prompt_version "
+                    "AND hymem_phase1_generation_is_authorized("
+                    "generation.generation_key,generation.identity_exact)=1))",
+                    (
+                        *authority_chunks,
+                        group["winning_phase1_generation_key"],
+                        replacement_id,
+                    ),
                 ).fetchone()[0])
                 if coherent_outcomes != len(authority_chunks):
                     raise ValueError(
@@ -1438,17 +1670,31 @@ def finalize_chunk_extraction_reconciliation(
 
         orphaned = conn.execute(
             """
-            SELECT id,source_session_id,source_message_id,source_event_at
+            SELECT id,source_session_id,source_message_id,source_event_at,
+                   published_at
             FROM kg_evidence
             WHERE edge_id = ? AND evidence_kind = 'extraction'
               AND provenance_status = 'canonical' AND is_current = 1
               AND NOT EXISTS (
                   SELECT 1 FROM kg_claim_observations observation
+                  JOIN kg_claim_extraction_outcomes outcome
+                    ON outcome.chunk_id=observation.chunk_id
+                   AND outcome.prompt_version=observation.prompt_version
+                   AND outcome.prompt_generation=observation.prompt_generation
+                   AND outcome.phase1_generation_key IS NOT NULL
+                   AND outcome.phase1_generation_key=
+                       observation.phase1_generation_key
+                  JOIN phase1_generations generation
+                    ON generation.generation_key=outcome.phase1_generation_key
+                   AND generation.extraction_cache_key=outcome.prompt_version
                   WHERE observation.edge_id = kg_evidence.edge_id
                     AND observation.source_session_id = kg_evidence.source_session_id
                     AND observation.source_message_id = kg_evidence.source_message_id
                     AND observation.evidence_kind = kg_evidence.evidence_kind
                     AND observation.polarity = kg_evidence.polarity
+                    AND hymem_phase1_generation_is_authorized(
+                          generation.generation_key,
+                          generation.identity_exact)=1
               )
             """,
             (edge_id,),
@@ -1460,10 +1706,22 @@ def finalize_chunk_extraction_reconciliation(
                     source_session_id=orphan["source_session_id"],
                     source_message_id=int(orphan["source_message_id"]),
                 )
-                superseded_at, reason = authority or (
-                    orphan["source_event_at"],
-                    "successful_reextract:no_current_authority",
+                publication_floor = (
+                    normalize_iso_timestamp(
+                        orphan["published_at"],
+                        context="orphan claim publication",
+                    )
+                    if orphan["published_at"] is not None else None
                 )
+                if authority is None:
+                    superseded_at = publication_floor or reconciliation_at
+                    reason = "successful_reextract:no_current_authority"
+                else:
+                    superseded_at, reason = authority
+                    if publication_floor is not None:
+                        superseded_at = max(
+                            str(superseded_at), publication_floor
+                        )
                 conn.execute(
                     "UPDATE kg_evidence SET is_current=0,superseded_at=?,"
                     "superseded_reason=? WHERE id=?",
@@ -1628,16 +1886,27 @@ def move_edge_provenance(
         "SELECT observation.source_session_id,observation.source_message_id,"
         "observation.evidence_kind,observation.polarity,"
         "observation.interpretation_key,observation.prompt_generation,"
+        "observation.prompt_version,observation.phase1_generation_key,"
         "observation.evidence_id,observation.observed_at,"
-        "outcome.succeeded_at "
+        "outcome.succeeded_at,"
+        "hymem_normalize_iso_timestamp(outcome.succeeded_at) "
+        "AS normalized_succeeded_at "
         "FROM kg_claim_observations observation "
         "JOIN kg_claim_extraction_outcomes outcome "
         "ON outcome.chunk_id=observation.chunk_id "
         "AND outcome.prompt_version=observation.prompt_version "
         "AND outcome.prompt_generation=observation.prompt_generation "
+        "AND outcome.phase1_generation_key IS NOT NULL "
+        "AND outcome.phase1_generation_key="
+        "observation.phase1_generation_key "
+        "JOIN phase1_generations generation "
+        "ON generation.generation_key=outcome.phase1_generation_key "
+        "AND generation.extraction_cache_key=outcome.prompt_version "
         "WHERE observation.edge_id IN ("
         + ",".join("?" for _ in all_ids) + ") "
-        "AND hymem_event_clock_is_valid(outcome.succeeded_at,?)=1",
+        "AND hymem_event_clock_is_valid(outcome.succeeded_at,?)=1 "
+        "AND hymem_phase1_generation_is_authorized("
+        "generation.generation_key,generation.identity_exact)=1",
         (*all_ids, merge_at),
     ).fetchall()
     grouped_authority: dict[tuple[str, int, str], list[sqlite3.Row]] = {}
@@ -1649,20 +1918,36 @@ def move_edge_provenance(
         )
         grouped_authority.setdefault(key, []).append(observation)
     for key, observations in grouped_authority.items():
-        generation = max(int(item["prompt_generation"]) for item in observations)
-        winners = [
-            item for item in observations
-            if int(item["prompt_generation"]) == generation
-        ]
+        by_producer: dict[str, list[sqlite3.Row]] = {}
+        for item in observations:
+            by_producer.setdefault(
+                str(item["phase1_generation_key"]), []
+            ).append(item)
+
+        def producer_rank(item: tuple[str, list[sqlite3.Row]]) -> tuple:
+            producer_key, rows = item
+            return max(
+                (
+                    int(row["prompt_generation"]),
+                    str(row["normalized_succeeded_at"]),
+                    str(row["prompt_version"]),
+                    producer_key,
+                )
+                for row in rows
+            )
+
+        _winning_key, winners = max(
+            by_producer.items(), key=producer_rank
+        )
         semantics = {
             (int(item["polarity"]), str(item["interpretation_key"]))
             for item in winners
         }
         if len(semantics) != 1:
-            raise ValueError(
-                "canonical edge merge found conflicting same-generation "
-                "prompt authority"
-            )
+                raise ValueError(
+                    "canonical edge merge found conflicting same-generation "
+                    "producer prompt authority"
+                )
         clocks = []
         for item in winners:
             try:
@@ -2003,7 +2288,7 @@ def move_edge_provenance(
             collision = conn.execute(
                 """
                 SELECT rowid, polarity, prompt_version, prompt_generation,
-                       evidence_id, interpretation_key
+                       phase1_generation_key, evidence_id, interpretation_key
                 FROM kg_claim_observations
                 WHERE chunk_id = ? AND edge_id = ?
                   AND source_session_id = ? AND source_message_id = ?
@@ -2019,12 +2304,14 @@ def move_edge_provenance(
             if collision is not None:
                 expected = (
                     int(observation["polarity"]), observation["prompt_version"],
-                    int(observation["prompt_generation"]), mapped_evidence,
+                    int(observation["prompt_generation"]),
+                    observation["phase1_generation_key"], mapped_evidence,
                     observation["interpretation_key"],
                 )
                 actual = (
                     int(collision["polarity"]), collision["prompt_version"],
                     int(collision["prompt_generation"]),
+                    collision["phase1_generation_key"],
                     int(collision["evidence_id"]),
                     collision["interpretation_key"],
                 )

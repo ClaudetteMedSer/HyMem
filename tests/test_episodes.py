@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 from hymem import HyMem, StubEmbeddingClient
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.dreaming.episodes import (
     EpisodesExtraction,
     extract_episodes_for_session,
@@ -298,7 +299,7 @@ def test_dream_populates_episode_embeddings_and_vec(cfg):
             "SELECT episode_id, model, dim FROM episode_embeddings"
         ).fetchall()
         assert len(ee_rows) == 1
-        assert ee_rows[0]["model"] == "stub"
+        assert ee_rows[0]["model"] == embedding_storage_identity(embed)[0]
         assert ee_rows[0]["dim"] == 16
         vec_count = hy.conn.execute(
             "SELECT COUNT(*) AS c FROM vec_episodes"

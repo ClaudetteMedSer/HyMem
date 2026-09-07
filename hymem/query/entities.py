@@ -83,7 +83,7 @@ def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
                 AND {live_shape_subject}
             )
             OR EXISTS (
-              SELECT 1 FROM entity_types
+              SELECT 1 FROM current_entity_types
               WHERE entity_canonical = kg.object_canonical
             )
             OR EXISTS (
@@ -276,14 +276,14 @@ def count_relations(
         params.extend(predicate_list)
     if subject_type is not None:
         where.append(
-            "EXISTS (SELECT 1 FROM entity_types et "
+            "EXISTS (SELECT 1 FROM current_entity_types et "
             "WHERE et.entity_canonical = knowledge_graph.subject_canonical "
             "AND et.type = ?)"
         )
         params.append(subject_type)
     if object_type is not None:
         where.append(
-            "EXISTS (SELECT 1 FROM entity_types et "
+            "EXISTS (SELECT 1 FROM current_entity_types et "
             "WHERE et.entity_canonical = knowledge_graph.object_canonical "
             "AND et.type = ?)"
         )

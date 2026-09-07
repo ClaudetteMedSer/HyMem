@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import unicodedata
+
+import pytest
+
 from hymem.dreaming.canonicalize import (
     find_canonical_drift,
     merge,
@@ -16,6 +20,27 @@ def test_normalize_strips_articles_punct_and_paren():
     assert normalize("Local Dev Environment") == "local_dev_environment"
     assert normalize("Postgres 18") == "postgres_18"
     assert normalize("Café") == "cafe"
+
+
+def test_normalize_preserves_bounded_unicode_when_ascii_projection_is_empty():
+    assert normalize("東京") == "東京"
+    assert normalize("МОСКВА") == "москва"
+    assert normalize("Καφέ") == normalize(
+        unicodedata.normalize("NFD", "Καφέ")
+    )
+    assert normalize("東京\x00駅") == "東京_駅"
+    assert normalize("😀 — !!!") == ""
+    assert normalize("東" * 513) == ""
+
+
+def test_unicode_alias_collision_fails_without_rebinding(hy):
+    register_alias(hy.conn, "東京", "tokyo_city")
+    assert resolve(hy.conn, "東京") == "tokyo_city"
+
+    with pytest.raises(ValueError, match="already maps"):
+        register_alias(hy.conn, "東京", "tokyo_metropolis")
+
+    assert resolve(hy.conn, "東京") == "tokyo_city"
 
 
 def test_normalize_strips_latin_script_articles():
@@ -86,8 +111,8 @@ def test_match_known_entities_keeps_object_with_entity_type(hy):
         "pos_evidence) VALUES ('backend', 'uses', 'redis', 1)"
     )
     conn.execute(
-        "INSERT INTO entity_types(entity_canonical, type, confidence) "
-        "VALUES ('redis', 'database', 0.9)"
+        "INSERT INTO entity_types(entity_canonical, type, confidence,origin) "
+        "VALUES ('redis', 'database', 0.9,'user')"
     )
     hits = match_known_entities(conn, "tell me about redis")
     assert "redis" in hits

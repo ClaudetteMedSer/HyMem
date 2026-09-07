@@ -52,7 +52,7 @@ NEW_OBJECT = "april_5_2024"
 def _chunk_extraction_response(triples: list[dict]) -> str:
     """The combined phase-1 chunk-extraction call expects a JSON object with
     `triples` and `markers` keys (see hymem/extraction/chunk.py)."""
-    return json.dumps({"triples": triples, "markers": []})
+    return json.dumps({"triples": triples, "markers": [], "complete": True})
 
 
 def _update_routed_llm() -> StubLLMClient:

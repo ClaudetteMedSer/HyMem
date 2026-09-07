@@ -2,6 +2,7 @@
 redaction, ingest size limits, query cap, embedding model/dim guard, retry."""
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -9,6 +10,8 @@ import pytest
 from hymem import redaction
 from hymem.api import HyMem
 from hymem.config import HyMemConfig
+from hymem.core import db as core_db
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.extraction.embeddings import StubEmbeddingClient
 from hymem.extraction.retry import with_retry
 from hymem.query.augment import _embeddings_compatible
@@ -150,7 +153,9 @@ def test_oversized_query_does_not_crash(tmp_path):
 
 # ---- embedding model/dim guard ---------------------------------------------
 
-def _seed_chunk_embedding(conn: sqlite3.Connection, model: str, dim: int) -> None:
+def _seed_chunk_embedding(
+    conn: sqlite3.Connection, client: StubEmbeddingClient,
+) -> None:
     conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('s1')")
     mid = conn.execute(
         "INSERT INTO messages(session_id, role, content) VALUES ('s1', 'user', 'hello')"
@@ -160,25 +165,28 @@ def _seed_chunk_embedding(conn: sqlite3.Connection, model: str, dim: int) -> Non
         "salience_reason, text) VALUES ('c1', 's1', ?, ?, 'test', 'hello')",
         (mid, mid),
     )
-    conn.execute(
-        "INSERT INTO chunk_embeddings(chunk_id, vector_json, model, dim) "
-        "VALUES ('c1', '[0.0]', ?, ?)",
-        (model, dim),
-    )
+    model, dim = embedding_storage_identity(client)
+    with core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT INTO chunk_embeddings(chunk_id, vector_json, model, dim) "
+            "VALUES ('c1', ?, ?, ?)",
+            (json.dumps([1.0] + [0.0] * (dim - 1)), model, dim),
+        )
 
 
 def test_embeddings_compatible_matches(tmp_path):
     hy = HyMem(HyMemConfig(root=tmp_path))
     conn = hy.conn
-    _seed_chunk_embedding(conn, "stub", 16)
-    assert _embeddings_compatible(conn, StubEmbeddingClient(dim_value=16)) is True
+    client = StubEmbeddingClient(dim_value=16)
+    _seed_chunk_embedding(conn, client)
+    assert _embeddings_compatible(conn, client) is True
     hy.close()
 
 
 def test_embeddings_incompatible_on_dim_change(tmp_path):
     hy = HyMem(HyMemConfig(root=tmp_path))
     conn = hy.conn
-    _seed_chunk_embedding(conn, "stub", 16)
+    _seed_chunk_embedding(conn, StubEmbeddingClient(dim_value=16))
     assert _embeddings_compatible(conn, StubEmbeddingClient(dim_value=8)) is False
     hy.close()
 
@@ -186,7 +194,9 @@ def test_embeddings_incompatible_on_dim_change(tmp_path):
 def test_embeddings_incompatible_on_model_change(tmp_path):
     hy = HyMem(HyMemConfig(root=tmp_path))
     conn = hy.conn
-    _seed_chunk_embedding(conn, "old-model", 16)
+    _seed_chunk_embedding(
+        conn, StubEmbeddingClient(model_name="old-model", dim_value=16),
+    )
     client = StubEmbeddingClient(model_name="new-model", dim_value=16)
     assert _embeddings_compatible(conn, client) is False
     hy.close()
@@ -203,7 +213,8 @@ def test_embeddings_incompatible_on_mixed_corpus(tmp_path):
     though one row matches the active client."""
     hy = HyMem(HyMemConfig(root=tmp_path))
     conn = hy.conn
-    _seed_chunk_embedding(conn, "stub", 16)  # matches active client
+    active = StubEmbeddingClient(dim_value=16)
+    _seed_chunk_embedding(conn, active)  # matches active client
     # A second chunk embedded by an older model still lingers in the corpus.
     mid = conn.execute(
         "INSERT INTO messages(session_id, role, content) VALUES ('s1', 'user', 'old')"
@@ -213,11 +224,20 @@ def test_embeddings_incompatible_on_mixed_corpus(tmp_path):
         "salience_reason, text) VALUES ('c2', 's1', ?, ?, 'test', 'old')",
         (mid, mid),
     )
-    conn.execute(
-        "INSERT INTO chunk_embeddings(chunk_id, vector_json, model, dim) "
-        "VALUES ('c2', '[0.0]', 'old-model', 16)"
+    old_model, old_dim = embedding_storage_identity(
+        StubEmbeddingClient(model_name="old-model", dim_value=16)
     )
-    assert _embeddings_compatible(conn, StubEmbeddingClient(dim_value=16)) is False
+    with core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT INTO chunk_embeddings(chunk_id, vector_json, model, dim) "
+            "VALUES ('c2', ?, ?, ?)",
+            (
+                json.dumps([1.0] + [0.0] * (old_dim - 1)),
+                old_model,
+                old_dim,
+            ),
+        )
+    assert _embeddings_compatible(conn, active) is False
     hy.close()
 
 

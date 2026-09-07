@@ -69,17 +69,27 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import os
 import random
 import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root))
@@ -89,29 +99,83 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling benchmark im
 # LME feeding parity from one shared implementation instead of a third copy.
 # msc_adapter's module level is stdlib-only, so this import stays --sim-safe;
 # longmemeval_adapter pieces are imported lazily inside functions, MSC-style.
-from msc_adapter import MSCAdapter, _lex_match
+from msc_adapter import (
+    DEFAULT_INDEXING_MAX_CYCLES,
+    DEFAULT_INDEXING_TIMEOUT_S,
+    MSCAdapter,
+    _indexing_limits,
+    _lex_match,
+    model_identity_fields,
+    parse_extra_body_arg,
+    prepare_indexing,
+    run_or_record_indexing_failure,
+)
 from benchmarks.strictness import (
     AtomicCheckpoint,
+    BenchmarkCleanupError,
     BenchmarkIntegrityError,
+    IndexingConvergenceError,
+    OwnedResourceScope,
+    PythonSourceSlice,
+    aggregate_embedding_usage_snapshots,
+    aggregate_usage_snapshots,
     add_strict_run_arguments,
+    benchmark_hymem_source_paths,
+    bounded_exception_type,
     build_manifest,
     code_hash,
     content_hash,
+    embedding_usage_snapshot,
+    effective_hymem_config_identity,
     file_hash,
     freeze_calibration,
+    is_structural_benchmark_error,
     load_calibration,
-    publish_checkpoint_artifact,
+    prepare_checkpoint_artifact,
+    publish_prepared_artifact_after_cleanup,
+    python_file_imported_symbols,
+    python_slice_imported_symbols,
     resolve_checkpoint_path,
+    run_cleanup_actions,
+    sanitize_for_artifact,
     select_protocol_ids,
+    strict_accuracy,
     usage_snapshot,
     validate_ids,
     write_latest_pointer,
+)
+from benchmarks.extraction_canary import (
+    ExtractionCanaryError,
+    extraction_canary_client_policy,
+    extraction_canary_policy,
+    print_extraction_canary,
+    run_configured_extraction_canary,
+    skipped_extraction_canary,
+    validate_extraction_canary_config_binding,
+    validate_extraction_canary_report,
+)
+from hymem.contrib.endpoint_policy import validate_http_endpoint
+from hymem.contrib.model_policy import (
+    DeprecatedModelAliasError,
+    require_active_model,
 )
 
 _ANSWER_MODEL = "deepseek-v4-flash"
 _JUDGE_MODEL = "deepseek-v4-flash"
 _HYMEM_MODEL = "deepseek-v4-flash"
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+_MAX_CONVERSATION_ID_LENGTH = 128
+_MAX_QUESTION_ID_LENGTH = 256
+_SAFE_CONVERSATION_BASENAME_RE = re.compile(
+    rf"[A-Za-z0-9][A-Za-z0-9._-]{{0,{_MAX_CONVERSATION_ID_LENGTH - 1}}}\Z",
+    re.ASCII,
+)
+_WINDOWS_RESERVED_BASENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{n}" for n in range(1, 10)),
+    *(f"LPT{n}" for n in range(1, 10)),
+}
 
 
 # ── category contract ───────────────────────────────────────────────────────
@@ -182,6 +246,178 @@ _SESSION_KEY_RE = re.compile(r"session_(\d+)$")
 _DT_FORMATS = ("%I:%M %p on %d %B, %Y", "%H:%M on %d %B, %Y", "%d %B, %Y")
 
 
+def _contains_control_characters(value: str) -> bool:
+    # ``isprintable`` also catches Unicode format/control characters (for
+    # example bidi overrides), not just the ASCII C0/C1 ranges.
+    return any(not char.isprintable() for char in value)
+
+
+def _validate_conversation_id(raw: object, *, index: int | str) -> str:
+    """Validate the exact dataset id used as a persistent-store basename.
+
+    IDs are deliberately not stripped, slugged, or otherwise normalized: two
+    dataset records must never alias after sampling or at the filesystem
+    boundary.  The portable ASCII policy preserves LoCoMo's existing
+    ``conv-26``-style directory names while excluding path syntax and platform
+    reserved basenames.
+    """
+    label = f"LoCoMo conversation id at index {index}"
+    if not isinstance(raw, str) or not raw or not raw.strip():
+        raise BenchmarkIntegrityError(f"{label} must be a non-empty string")
+    if raw != raw.strip():
+        raise BenchmarkIntegrityError(f"{label} must use its exact trimmed form")
+    if len(raw) > _MAX_CONVERSATION_ID_LENGTH:
+        raise BenchmarkIntegrityError(
+            f"{label} exceeds {_MAX_CONVERSATION_ID_LENGTH} characters"
+        )
+    if _contains_control_characters(raw):
+        raise BenchmarkIntegrityError(f"{label} contains control characters")
+    if raw in {".", ".."} or Path(raw).is_absolute() or "/" in raw or "\\" in raw:
+        raise BenchmarkIntegrityError(f"{label} is not a safe basename")
+    if not _SAFE_CONVERSATION_BASENAME_RE.fullmatch(raw):
+        raise BenchmarkIntegrityError(f"{label} is not a safe basename")
+    windows_stem = raw.rstrip(" .").split(".", 1)[0].upper()
+    if windows_stem in _WINDOWS_RESERVED_BASENAMES or raw.endswith((".", " ")):
+        raise BenchmarkIntegrityError(f"{label} is not a portable safe basename")
+    return raw
+
+
+def _conversation_alias_key(value: str) -> str:
+    """Portable filesystem identity (ASCII policy makes casefold sufficient)."""
+    return value.casefold()
+
+
+def _validate_question_id(raw: object, *, location: str) -> str:
+    """Validate an exact result/checkpoint identifier without leaking its text."""
+    label = f"LoCoMo question id at {location}"
+    if not isinstance(raw, str) or not raw or not raw.strip():
+        raise BenchmarkIntegrityError(f"{label} must be a non-empty string")
+    if raw != raw.strip():
+        raise BenchmarkIntegrityError(f"{label} must use its exact trimmed form")
+    if len(raw) > _MAX_QUESTION_ID_LENGTH:
+        raise BenchmarkIntegrityError(
+            f"{label} exceeds {_MAX_QUESTION_ID_LENGTH} characters"
+        )
+    if _contains_control_characters(raw):
+        raise BenchmarkIntegrityError(f"{label} contains control characters")
+    return raw
+
+
+def _raw_question_id(q: dict, sample_id: str, ci: int, qi: int) -> str:
+    """Return a validated explicit id, or LoCoMo's stable generated id."""
+    keys = [key for key in ("question_id", "qa_id") if key in q]
+    location = f"conversation {ci}, question {qi}"
+    if not keys:
+        return _validate_question_id(f"{sample_id}_q{qi}", location=location)
+    values = [
+        _validate_question_id(q[key], location=location)
+        for key in keys
+    ]
+    if len(values) == 2 and values[0] != values[1]:
+        raise BenchmarkIntegrityError(
+            f"LoCoMo question identifiers disagree at {location}"
+        )
+    return values[0]
+
+
+def _validate_normalized_conversations(convs: list[dict]) -> None:
+    """Fail closed on aliases before sampling, grouping, or store mutation."""
+    seen_conversations: dict[str, int] = {}
+    seen_questions: dict[str, tuple[int, int]] = {}
+    for ci, conv in enumerate(convs):
+        if not isinstance(conv, dict):
+            raise BenchmarkIntegrityError(
+                f"LoCoMo normalized conversation {ci} must be an object"
+            )
+        sample_id = _validate_conversation_id(conv.get("id"), index=ci)
+        alias_key = _conversation_alias_key(sample_id)
+        if alias_key in seen_conversations:
+            raise BenchmarkIntegrityError(
+                "duplicate LoCoMo conversation id or filesystem alias at indices "
+                f"{seen_conversations[alias_key]} and {ci}"
+            )
+        seen_conversations[alias_key] = ci
+        qa = conv.get("qa")
+        if not isinstance(qa, list):
+            raise BenchmarkIntegrityError(
+                f"LoCoMo normalized conversation {ci} qa must be a list"
+            )
+        for qi, question in enumerate(qa):
+            if not isinstance(question, dict):
+                raise BenchmarkIntegrityError(
+                    f"LoCoMo normalized question at conversation {ci}, "
+                    f"question {qi} must be an object"
+                )
+            location = f"conversation {ci}, question {qi}"
+            question_id = _validate_question_id(
+                question.get("question_id"), location=location
+            )
+            qa_id = _validate_question_id(question.get("qa_id"), location=location)
+            if question_id != qa_id:
+                raise BenchmarkIntegrityError(
+                    f"LoCoMo question identifiers disagree at {location}"
+                )
+            if question_id in seen_questions:
+                first_ci, first_qi = seen_questions[question_id]
+                raise BenchmarkIntegrityError(
+                    "duplicate LoCoMo question id at conversation/question indices "
+                    f"{first_ci}/{first_qi} and {ci}/{qi}"
+                )
+            seen_questions[question_id] = (ci, qi)
+
+
+def resolve_locomo_store_root(db_dir: str | Path, conversation_id: object) -> Path:
+    """Resolve a persistent store to one strict, non-symlink direct child.
+
+    The returned path is safe to inspect or remove only because both the exact
+    basename policy and resolved-parent equality hold.  In particular, it can
+    never equal ``db_dir`` itself.
+    """
+    sample_id = _validate_conversation_id(conversation_id, index="evaluation")
+    raw_base = Path(db_dir)
+    raw_candidate = raw_base / sample_id
+    try:
+        base = raw_base.resolve(strict=False)
+        if raw_candidate.is_symlink():
+            raise BenchmarkIntegrityError(
+                "LoCoMo store root must not be a symbolic link"
+            )
+        candidate = raw_candidate.resolve(strict=False)
+    except BenchmarkIntegrityError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise BenchmarkIntegrityError(
+            "LoCoMo store root could not be resolved safely"
+        ) from exc
+    if candidate == base or candidate.parent != base:
+        raise BenchmarkIntegrityError(
+            "LoCoMo store root is not a strict direct child of --db-dir"
+        )
+    return candidate
+
+
+def _validate_store_database_path(root: Path) -> Path:
+    """Keep the reusable SQLite artifact inside its already-safe store root."""
+    db_path = root / "hymem.sqlite"
+    try:
+        if db_path.is_symlink():
+            raise BenchmarkIntegrityError(
+                "LoCoMo store database must not be a symbolic link"
+            )
+        resolved = db_path.resolve(strict=False)
+    except BenchmarkIntegrityError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise BenchmarkIntegrityError(
+            "LoCoMo store database could not be resolved safely"
+        ) from exc
+    if resolved.parent != root or resolved == root:
+        raise BenchmarkIntegrityError(
+            "LoCoMo store database escapes its conversation root"
+        )
+    return resolved
+
+
 def _parse_session_dt(raw: str | None) -> datetime | None:
     s = re.sub(r"\s+", " ", (raw or "").strip())
     for fmt in _DT_FORMATS:
@@ -239,12 +475,51 @@ def load_locomo_data(path: str | None, *, user_speaker: str = "a",
     if not isinstance(raw, list):
         raise ValueError("LoCoMo data must be a JSON array of conversations")
 
-    out = []
+    # Preflight the complete identifier namespace before normalizing any
+    # conversation.  Sampling groups by conversation id and strict artifacts
+    # key by question id, so accepting aliases here would silently merge rows
+    # long before evaluate_conversation sees them.
+    sample_ids: list[str] = []
+    raw_question_ids: dict[tuple[int, int], str] = {}
+    seen_conversations: dict[str, int] = {}
+    seen_questions: dict[str, tuple[int, int]] = {}
     for ci, rec in enumerate(raw):
         if not isinstance(rec, dict):
             raise BenchmarkIntegrityError(
                 f"LoCoMo conversation {ci} must be an object"
             )
+        sample_id = _validate_conversation_id(rec.get("sample_id"), index=ci)
+        alias_key = _conversation_alias_key(sample_id)
+        if alias_key in seen_conversations:
+            raise BenchmarkIntegrityError(
+                "duplicate LoCoMo conversation id or filesystem alias at indices "
+                f"{seen_conversations[alias_key]} and {ci}"
+            )
+        seen_conversations[alias_key] = ci
+        sample_ids.append(sample_id)
+        raw_qa = rec.get("qa") or []
+        if not isinstance(raw_qa, list):
+            raise BenchmarkIntegrityError(
+                f"LoCoMo conversation {ci} qa must be a list"
+            )
+        for qi, question in enumerate(raw_qa):
+            if not isinstance(question, dict):
+                raise BenchmarkIntegrityError(
+                    f"LoCoMo question at conversation {ci}, question {qi} "
+                    "must be an object"
+                )
+            question_id = _raw_question_id(question, sample_id, ci, qi)
+            if question_id in seen_questions:
+                first_ci, first_qi = seen_questions[question_id]
+                raise BenchmarkIntegrityError(
+                    "duplicate LoCoMo question id at conversation/question indices "
+                    f"{first_ci}/{first_qi} and {ci}/{qi}"
+                )
+            seen_questions[question_id] = (ci, qi)
+            raw_question_ids[(ci, qi)] = question_id
+
+    out = []
+    for ci, rec in enumerate(raw):
         conv = rec.get("conversation") or {}
         if not isinstance(conv, dict):
             raise BenchmarkIntegrityError(
@@ -285,7 +560,7 @@ def load_locomo_data(path: str | None, *, user_speaker: str = "a",
                 f"LoCoMo conversation {ci} contains no usable sessions"
             )
 
-        sample_id = str(rec.get("sample_id") or f"locomo_{ci}")
+        sample_id = sample_ids[ci]
         qa = []
         raw_qa = rec.get("qa") or []
         if not isinstance(raw_qa, list):
@@ -319,7 +594,7 @@ def load_locomo_data(path: str | None, *, user_speaker: str = "a",
                 raise BenchmarkIntegrityError(
                     f"LoCoMo {sample_id} adversarial question {qi} has no trap answer"
                 )
-            question_id = f"{sample_id}_q{qi}"
+            question_id = raw_question_ids[(ci, qi)]
             qa.append({
                 "qa_id": question_id,
                 "question_id": question_id,
@@ -341,6 +616,7 @@ def load_locomo_data(path: str | None, *, user_speaker: str = "a",
             "n_sessions": len(sessions), "evidence_map": evidence_map,
             "qa": qa,
         })
+    _validate_normalized_conversations(out)
     return out
 
 
@@ -349,6 +625,7 @@ def sample_questions(convs: list[dict], sample: int, seed: int) -> list[dict]:
     keeps `sample` of them (0 = all), and drops conversations left with no
     questions — those are never ingested. Random-at-n≥100 approximates the
     category mix; use --categories for a targeted slice instead."""
+    _validate_normalized_conversations(convs)
     rng = random.Random(seed)
     refs = [(c["id"], q) for c in convs for q in c["qa"]]
     rng.shuffle(refs)
@@ -365,6 +642,314 @@ def sample_questions(convs: list[dict], sample: int, seed: int) -> list[dict]:
             c = dict(c, qa=sorted(keep[c["id"]], key=lambda q: q["qa_id"]))
             out.append(c)
     return out
+
+
+def _select_questions_by_id(
+    convs: list[dict], selected_ids: tuple[str, ...]
+) -> list[dict]:
+    """Project conversations onto an exact protocol id sequence.
+
+    The source/within-conversation order is part of the checkpoint identity.
+    This deliberately refuses to reorder rows to match a malformed receipt.
+    """
+
+    selected = set(selected_ids)
+    out: list[dict] = []
+    for conv in convs:
+        questions = [
+            question for question in conv["qa"]
+            if question["question_id"] in selected
+        ]
+        if questions:
+            out.append({**conv, "qa": questions})
+    actual = tuple(
+        question["question_id"]
+        for conv in out for question in conv["qa"]
+    )
+    if actual != selected_ids:
+        raise BenchmarkIntegrityError("selected LoCoMo id order drifted")
+    return out
+
+
+def _effective_pipeline_body(args) -> dict[str, Any]:
+    """Mirror OpenAICompatibleClient's pure thinking-body decision."""
+
+    from urllib.parse import urlsplit
+
+    mode = str(args.hymem_thinking).strip().lower()
+    if mode not in {"auto", "disabled", "off", "enabled"}:
+        raise BenchmarkIntegrityError("memory-pipeline thinking mode is invalid")
+    host = (urlsplit(args.hymem_base_url).hostname or "").casefold()
+    send = mode == "disabled" or (
+        mode == "auto"
+        and ("deepseek" in host or "deepseek" in args.hymem_model.casefold())
+    )
+    return {"thinking": {"type": "disabled"}} if send else {}
+
+
+def _effective_hymem_config(args):
+    """Return the adapter's exact config object and public serialized identity."""
+    from hymem import HyMemConfig
+
+    overrides: dict[str, Any] = {
+        **MSCAdapter.APERTURE,
+        **{key: value for key, value in _aperture(args).items()
+           if value is not None},
+        # MSCAdapter pins aggregation off for the historical LoCoMo baseline.
+        "aggregation_nodes_enabled": False,
+    }
+    if args.rules_extraction is not None:
+        overrides["rules_extraction_enabled"] = args.rules_extraction
+    if args.graph_multihop:
+        overrides["graph_multihop_enabled"] = True
+    if args.facts is not None:
+        overrides["facts_enabled"] = args.facts
+    if args.facts_extraction is not None:
+        overrides["facts_extraction_enabled"] = args.facts_extraction
+    cfg = HyMemConfig(root=Path("/benchmark-identity"), **overrides)
+    effective_cfg = effective_hymem_config_identity(cfg)
+    # This is a boolean feature switch, not a credential.  Rename it before
+    # strict artifact sanitization so its exact score-affecting value survives
+    # the generic secret-key scrubber.
+    effective_cfg["content_redaction_enabled"] = effective_cfg.pop(
+        "redact_secrets"
+    )
+    return cfg, effective_cfg
+
+
+def _strict_identity(args) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return score-affecting config and provider identities without clients.
+
+    This function is intentionally pure with respect to benchmark state: it
+    may validate local configuration, but creates no store, provider transport,
+    or canary.  Resume mismatches can therefore fail before any paid work.
+    """
+
+    from longmemeval_adapter import (
+        _provider_for_url,
+        resolve_embedding_identity,
+    )
+
+    cfg, effective_cfg = _effective_hymem_config(args)
+
+    # LoCoMo inherits MSC's environment-selected embedding transport. Resolve
+    # exactly that public vector-space identity, never its credential.  The
+    # simulation branch creates no embedding client and is rejected if the
+    # operator asks for one, so its manifested identity is always disabled.
+    embedding_args = SimpleNamespace(
+        embeddings=bool(args.embeddings and not args.sim),
+        embedding_base_url=None,
+        embedding_model=None,
+        embedding_dim=None,
+    )
+    embedding = resolve_embedding_identity(embedding_args)
+    if args.sim:
+        models = {
+            "reader": {
+                "configured": False, "client_class": None,
+                "provider": "none", "model": None, "base_url": None,
+            },
+            "judge": {
+                "configured": False, "client_class": None,
+                "provider": "none", "model": None, "base_url": None,
+            },
+            "memory_pipeline": {
+                "configured": True,
+                "client_class": "hymem.extraction.llm.StubLLMClient",
+                "provider": "local_stub", "model": None, "base_url": None,
+                "response_policy": "constant-empty-json-list-v1",
+            },
+            "embedding": embedding,
+        }
+    else:
+        models = {
+            "reader": {
+                "client_class": "longmemeval_adapter.LLMClient",
+                "provider": _provider_for_url(args.answer_base_url),
+                "model": args.answer_model,
+                "base_url": args.answer_base_url,
+                "temperature": 0.0,
+                "max_tokens": 1024,
+                "extra_body": copy.deepcopy(args.answer_extra_body_obj),
+            },
+            "judge": {
+                "client_class": "longmemeval_adapter.LLMClient",
+                "provider": _provider_for_url(_DEEPSEEK_BASE_URL),
+                "model": args.judge_model,
+                "base_url": _DEEPSEEK_BASE_URL,
+                "temperature": 0.0,
+                "max_tokens": 10,
+                "extra_body": copy.deepcopy(args.judge_extra_body_obj),
+                "protocol": "longmemeval-local-judge",
+            },
+            "memory_pipeline": {
+                "client_class": (
+                    "hymem.contrib.openai_client.OpenAICompatibleClient"
+                ),
+                "provider": _provider_for_url(args.hymem_base_url),
+                "model": args.hymem_model,
+                "base_url": args.hymem_base_url,
+                "thinking_mode": args.hymem_thinking,
+                "effective_extra_body": _effective_pipeline_body(args),
+            },
+            "embedding": embedding,
+        }
+    category_steering = bool(getattr(args, "category_steering", False))
+    subset_run = bool(args.sample)
+    config = {
+        "sample": args.sample,
+        "sample_strategy": (
+            "seeded-shuffle-then-source-conversation-order-v1"
+            if subset_run else "all-source-order"
+        ),
+        "seed": args.seed,
+        "categories": (
+            sorted(int(item) for item in args.categories.split(","))
+            if args.categories else None
+        ),
+        "conversations": (
+            [item.strip() for item in args.convs.split(",")]
+            if args.convs else None
+        ),
+        "workers": args.workers,
+        "top_k": args.top_k,
+        "max_context_chars": args.max_context_chars,
+        "user_speaker": args.user_speaker,
+        "name_prefix": bool(args.name_prefix),
+        "answerable_clause": bool(args.answerable_clause),
+        "category_steering": category_steering,
+        "embeddings": bool(args.embeddings),
+        "rules_extraction": args.rules_extraction,
+        "facts": args.facts,
+        "facts_extraction": args.facts_extraction,
+        "graph_multihop": bool(args.graph_multihop),
+        "no_dream": bool(args.no_dream),
+        "dream_per_session": bool(args.dream_per_session),
+        "indexing_max_cycles": args.indexing_max_cycles,
+        "indexing_timeout_s": float(args.indexing_timeout_s),
+        "fresh_store": bool(args.fresh),
+        "persistent_store": bool(args.db_dir),
+        "dump_context": bool(args.dump_context),
+        "dump_topk": bool(args.dump_topk),
+        "sim": bool(args.sim),
+        "effective_hymem_config": effective_cfg,
+        "extraction_canary": extraction_canary_policy(
+            prompt_version=cfg.prompt_version
+        ),
+        "label_free_answer_path": not category_steering,
+        "scored_run": not args.sim,
+        "exploratory_label_steering": category_steering,
+        "exploratory_non_comparable": bool(
+            subset_run or args.sim or args.no_dream
+            or args.answerable_clause or category_steering
+        ),
+    }
+    validate_extraction_canary_config_binding(
+        config["extraction_canary"], effective_cfg
+    )
+    return config, models
+
+
+def locomo_code_hash(
+    *,
+    adapter_path: Path | None = None,
+    strictness_path: Path | None = None,
+    msc_adapter_path: Path | None = None,
+    lme_adapter_path: Path | None = None,
+    lme_protocol_path: Path | None = None,
+    extraction_canary_path: Path | None = None,
+    store_attestation_path: Path | None = None,
+    hymem_path: Path | None = None,
+    root: Path | None = None,
+) -> str:
+    """Hash exact direct and transitive executable LoCoMo dependencies."""
+
+    root_path = Path(root or _repo_root).resolve()
+    benchmark_dir = Path(__file__).resolve().parent
+    adapter = Path(adapter_path or __file__)
+    msc_adapter = Path(msc_adapter_path or benchmark_dir / "msc_adapter.py")
+    lme_adapter = Path(
+        lme_adapter_path or benchmark_dir / "longmemeval_adapter.py"
+    )
+    msc_symbols = python_file_imported_symbols(
+        adapter,
+        module_names=("benchmarks.msc_adapter", "msc_adapter"),
+    )
+    dependency_slices: list[PythonSourceSlice] = []
+    lme_symbols = set(python_file_imported_symbols(
+        adapter,
+        module_names=("benchmarks.longmemeval_adapter", "longmemeval_adapter"),
+    ))
+    msc_slice: PythonSourceSlice | None = None
+    if msc_symbols:
+        msc_slice = PythonSourceSlice(msc_adapter, msc_symbols)
+        dependency_slices.append(msc_slice)
+        lme_symbols.update(python_slice_imported_symbols(
+            msc_slice,
+            module_names=(
+                "benchmarks.longmemeval_adapter", "longmemeval_adapter",
+            ),
+        ))
+    if lme_symbols:
+        lme_slice = PythonSourceSlice(lme_adapter, tuple(lme_symbols))
+        dependency_slices.append(lme_slice)
+        protocol_symbols = python_slice_imported_symbols(
+            lme_slice,
+            module_names=("benchmarks.lme_protocol", "lme_protocol"),
+        )
+        if protocol_symbols:
+            dependency_slices.append(PythonSourceSlice(
+                Path(lme_protocol_path or benchmark_dir / "lme_protocol.py"),
+                protocol_symbols,
+            ))
+    canary = Path(extraction_canary_path or benchmark_dir / "extraction_canary.py")
+    canary_symbols = python_file_imported_symbols(
+        adapter,
+        module_names=("benchmarks.extraction_canary", "extraction_canary"),
+    )
+    if canary_symbols:
+        dependency_slices.append(PythonSourceSlice(canary, canary_symbols))
+    store_symbols: set[str] = set(python_file_imported_symbols(
+        adapter,
+        module_names=("benchmarks.store_attestation", "store_attestation"),
+    ))
+    if msc_slice is not None:
+        store_symbols.update(python_slice_imported_symbols(
+            msc_slice,
+            module_names=("benchmarks.store_attestation", "store_attestation"),
+        ))
+    if store_symbols:
+        dependency_slices.append(PythonSourceSlice(
+            Path(store_attestation_path or benchmark_dir / "store_attestation.py"),
+            tuple(store_symbols),
+        ))
+    strictness = Path(strictness_path or benchmark_dir / "strictness.py")
+    strictness_modules = ("benchmarks.strictness", "strictness")
+    strictness_symbols = set(python_file_imported_symbols(
+        adapter, module_names=strictness_modules
+    ))
+    for source_slice in dependency_slices:
+        strictness_symbols.update(python_slice_imported_symbols(
+            source_slice, module_names=strictness_modules
+        ))
+    if not strictness_symbols:
+        raise BenchmarkIntegrityError("LoCoMo code identity lacks strictness imports")
+    dependency_slices.append(PythonSourceSlice(
+        strictness, tuple(strictness_symbols)
+    ))
+    dependency_sources: list[Path | PythonSourceSlice] = [
+        adapter, *dependency_slices,
+    ]
+    inputs: list[Path | PythonSourceSlice] = [
+        adapter,
+        *dependency_slices,
+        *benchmark_hymem_source_paths(
+            Path(hymem_path or root_path / "hymem"),
+            root=root_path,
+            dependency_sources=dependency_sources,
+        ),
+    ]
+    return code_hash(inputs, root=root_path)
 
 
 # ── per-question evaluation ─────────────────────────────────────────────────
@@ -579,59 +1164,183 @@ def _aperture(args) -> dict:
             "graph_top_k": args.graph_top_k}
 
 
+class _ParallelConversationStopped(BaseException):
+    """Internal cooperative cancellation; never convert this into QA rows."""
+
+
 def evaluate_conversation(
     conv: dict, args, answer_llm, judge_llm, *,
-    pending_ids: set[str] | None = None, on_result=None,
+    pending_ids: set[str] | None = None, on_result=None, on_checkpoint=None,
+    _parallel_stop: threading.Event | None = None, _on_fatal_abort=None,
+    _on_attempt=None, _on_runtime_snapshot=None,
 ) -> list[dict]:
     """Ingest one conversation into its own store, then answer its questions.
     With --db-dir the store persists and is REUSED on later runs (ingest+dream
     over 19-32 sessions is the expensive step; QA/prompt iterations shouldn't
     re-pay it). A reused store is only valid for the same core/schema —
     --fresh rebuilds after core changes."""
+    def _raise_if_parallel_stopped() -> None:
+        if _parallel_stop is not None and _parallel_stop.is_set():
+            raise _ParallelConversationStopped()
+
+    def _notify_fatal_abort(exc: BaseException) -> None:
+        if _on_fatal_abort is None or isinstance(
+            exc, _ParallelConversationStopped
+        ):
+            return
+        if not isinstance(exc, Exception) or is_structural_benchmark_error(exc):
+            _on_fatal_abort(exc)
+
+    # This must precede mkdtemp, exists(), reuse detection, mkdir(), and above
+    # all --fresh rmtree().  evaluate_conversation is also a public test/probe
+    # seam, so it cannot rely only on load_locomo_data having run in main().
+    _raise_if_parallel_stopped()
+    _validate_normalized_conversations([conv])
     if args.db_dir:
-        root = Path(args.db_dir) / conv["id"]
+        root = resolve_locomo_store_root(args.db_dir, conv["id"])
+        # Validate a pre-existing database link before --fresh, too: deleting
+        # that store may be safe on today's shutil implementation, but a
+        # benchmark boundary should not depend on platform rmtree semantics.
+        _validate_store_database_path(root)
         if args.fresh and root.exists():
             shutil.rmtree(root)
-        reuse = (root / "hymem.sqlite").exists()
+        # Re-resolve after a deletion and after creation so a swapped symlink
+        # cannot silently turn later reuse/open operations into an escape.
+        root = resolve_locomo_store_root(args.db_dir, conv["id"])
         root.mkdir(parents=True, exist_ok=True)
+        root = resolve_locomo_store_root(args.db_dir, conv["id"])
+        db_path = _validate_store_database_path(root)
+        reuse = not args.fresh and db_path.exists()
         cleanup = False
     else:
         root = Path(tempfile.mkdtemp(prefix=f"locomo_{conv['id']}_"))
         reuse, cleanup = False, not args.keep_db
+        db_path = root / "hymem.sqlite"
 
-    adapter = MSCAdapter(root / "hymem.sqlite", api_key=args.api_key, sim=args.sim,
+    adapter = MSCAdapter(db_path, api_key=args.api_key, sim=args.sim,
                          hymem_model=args.hymem_model, hymem_base_url=args.hymem_base_url,
+                         hymem_thinking=args.hymem_thinking,
                          embeddings=args.embeddings, rules_extraction=args.rules_extraction,
                          graph_multihop=args.graph_multihop,
                          facts_enabled=args.facts,
                          facts_extraction=args.facts_extraction,
-                         aperture=_aperture(args)).open()
+                         aperture=_aperture(args))
+    indexing: dict[str, Any] | None = None
+
+    def _conversation_runtime_snapshot() -> dict[str, Any]:
+        return {
+            "scope_id": f"locomo:{conv['id']}",
+            "indexing": dict(indexing) if isinstance(indexing, dict) else None,
+            "memory_pipeline_usage": usage_snapshot(
+                getattr(adapter, "pipeline_llm", None)
+            ),
+            "embedding_usage": embedding_usage_snapshot(
+                getattr(adapter, "embedding_client", None),
+                configured=bool(args.embeddings),
+            ),
+        }
+
     try:
+        adapter.open()
+        _raise_if_parallel_stopped()
         if reuse:
             print(f"  [{conv['id']}] reusing store at {root}", flush=True)
-        else:
-            dream_each = args.dream_per_session and not args.no_dream
-            adapter.ingest(conv, dream_each=dream_each)
-            if not args.no_dream and not dream_each:
-                adapter.dream()
+        indexing = prepare_indexing(
+            adapter,
+            conv,
+            args,
+            scope_id=f"locomo:{conv['id']}",
+            reuse=reuse,
+        )
         results = []
         for k, q in enumerate(conv["qa"], 1):
+            # A conversation can contain many provider-backed QA items.  Stop
+            # an already-running sibling at the next safe item boundary.
+            _raise_if_parallel_stopped()
             if pending_ids is not None and q["question_id"] not in pending_ids:
                 continue
+            # Count the attempt before provider-backed QA begins.  A sibling
+            # checkpoint fault can cancel this conversation before its row is
+            # publishable, but the work (and its spend) still belongs to the
+            # execution segment that is drained during the abort.
+            if _on_attempt is not None:
+                _on_attempt(q["question_id"])
             try:
                 row = evaluate_qa(q, conv, adapter, args, answer_llm, judge_llm)
             except Exception as exc:
+                if is_structural_benchmark_error(exc):
+                    _notify_fatal_abort(exc)
+                    raise
                 row = {
                     "id": q["qa_id"], "question_id": q["question_id"],
                     "conv_id": conv["id"], "question_type": q["qtype"],
                     "category": q["category"], "question": q["question"],
                     "correct": False, "judge_raw": "", "judge_error": False,
                     "benchmark_failure": (
-                        f"execution_failure: {type(exc).__name__}: {exc}"
+                        f"execution_failure:{bounded_exception_type(exc)}"
                     ),
                 }
+            if args.sim:
+                row.update({
+                    "answer_model": None,
+                    "answer_base_url": None,
+                    "answer_extra_body": None,
+                    "judge_model": None,
+                    "judge_base_url": None,
+                    "judge_extra_body": None,
+                    "hymem_model": None,
+                    "hymem_base_url": None,
+                    "hymem_thinking": None,
+                    "hymem_extra_body": {},
+                    "hymem_client_class": (
+                        "hymem.extraction.llm.StubLLMClient"
+                    ),
+                })
+            else:
+                row.update(model_identity_fields(
+                    args, answer_llm, judge_llm, adapter.pipeline_llm
+                ))
+            benchmark_non_comparable = (
+                indexing.get("skip_reason")
+                or ("diagnostics_only" if args.diag_only else None)
+                or (
+                    "label_leaky_answerable_clause"
+                    if getattr(args, "answerable_clause", False) else None
+                )
+            )
+            row.update({
+                # LoCoMo artifacts are bare row lists, not config envelopes.
+                # Record the effective bodies (after automatic DeepSeek-v4
+                # resolution), never the raw CLI None that did not hit the wire.
+                "model_identity_recorded": True,
+                "indexing_scope_id": indexing["scope_id"],
+                "indexing_complete": bool(indexing["complete"]),
+                "indexing_healthy": bool(indexing["healthy"]),
+                "indexing_comparable": bool(indexing["comparable"]),
+                "benchmark_comparable": bool(
+                    indexing["comparable"] and benchmark_non_comparable is None
+                ),
+                "non_comparable_reason": benchmark_non_comparable,
+            })
+            # Usage is cumulative per pipeline client, so persist exactly one
+            # owning receipt per conversation. Other QA rows carry a stable
+            # reference instead of multiplying the same calls/tokens/cost.
+            if not results:
+                row["indexing"] = indexing
+            else:
+                row["indexing_ref"] = indexing["scope_id"]
             results.append(row)
-            if on_result is not None:
+            if on_checkpoint is not None:
+                # The strict runner persists the row and the cumulative
+                # conversation-local provider snapshots in one checkpoint
+                # replacement.  A crash immediately after this callback can
+                # therefore neither lose the score nor silently lose the spend
+                # needed to produce it.  ``on_result`` remains the legacy
+                # one-argument seam used by probes and older callers.
+                on_checkpoint(row, {
+                    **_conversation_runtime_snapshot(),
+                })
+            elif on_result is not None:
                 on_result(row)
             if k % 20 == 0:
                 print(f"  [{conv['id']}] {k}/{len(conv['qa'])}", flush=True)
@@ -652,10 +1361,33 @@ def evaluate_conversation(
                   + f", {acc*100:.1f}%"
                   f" ({conv['n_sessions']} sessions)", flush=True)
         return results
+    except BaseException as exc:
+        # Notify before adapter/temp-store cleanup so sibling workers cannot
+        # start another item while this structural/control failure unwinds.
+        _notify_fatal_abort(exc)
+        raise
     finally:
-        adapter.close()
+        cleanup_actions = []
+        if _on_runtime_snapshot is not None:
+            # This conversation-keyed handoff runs before adapter teardown.
+            # The runner overwrites its earlier per-row snapshot for the same
+            # scope, so a stopped peer contributes final usage without ever
+            # publishing its aborted row.
+            cleanup_actions.append((
+                "runtime_usage_handoff",
+                lambda: _on_runtime_snapshot(
+                    _conversation_runtime_snapshot()
+                ),
+            ))
+        cleanup_actions.append(("adapter_close", adapter.close))
         if cleanup:
-            shutil.rmtree(root, ignore_errors=True)
+            cleanup_actions.append((
+                "temporary_store_cleanup",
+                lambda: shutil.rmtree(root, ignore_errors=False),
+            ))
+        run_cleanup_actions(
+            cleanup_actions, primary_exception=sys.exc_info()[1],
+        )
 
 
 # ── reporting ───────────────────────────────────────────────────────────────
@@ -673,7 +1405,8 @@ def _compute_scores_local(results: list[dict]) -> dict:
         verdict = r.get("correct")
         if verdict is not None and not isinstance(verdict, bool):
             raise BenchmarkIntegrityError("LoCoMo result has malformed verdict")
-        by_type[r["question_type"].replace("_abs", "")].append(bool(verdict))
+        qtype = str(r.get("question_type") or "unknown").replace("_abs", "")
+        by_type[qtype].append(bool(verdict))
     scores = {t: {"accuracy": sum(c) / len(c), "count": len(c)}
               for t, c in by_type.items()}
     all_c = [c for cs in by_type.values() for c in cs]
@@ -811,7 +1544,9 @@ def _print_report(results: list[dict], args) -> None:
 _TRAP_RE = re.compile(r"^\[unanswerable; trap: (.*)\]$", re.S)
 
 
-def _rejudge_file(args, judge_llm) -> None:
+def _rejudge_file(
+    args, judge_llm, owned_clients: OwnedResourceScope | None = None,
+) -> None:
     """Re-judge a stored `--out` file, writing a flip-compatible copy."""
     from longmemeval_adapter import is_llm_error, judge_scored
 
@@ -820,8 +1555,9 @@ def _rejudge_file(args, judge_llm) -> None:
         sys.exit(f"{args.rejudge}: expected a non-empty list of per-question results")
 
     print(f"\n=== LoCoMo RE-JUDGE — {Path(args.rejudge).name} ===")
+    effective_judge_body = copy.deepcopy(judge_llm.extra_body)
     print(f"  rows: {len(rows)}   judge: {args.judge_model}"
-          + (f"  +extra_body={args.judge_extra_body}" if args.judge_extra_body else ""))
+          f"  +extra_body={effective_judge_body or '{}'}")
     print("  reader output is held FIXED — every flip below is judge nondeterminism\n",
           flush=True)
 
@@ -847,6 +1583,9 @@ def _rejudge_file(args, judge_llm) -> None:
         return {**r, "correct": new, "correct_original": r.get("correct"),
                 "judge_raw": judge_raw,
                 "judge_error": bool(judge_raw) and is_llm_error(judge_raw),
+                "judge_model": args.judge_model,
+                "judge_base_url": _DEEPSEEK_BASE_URL,
+                "judge_extra_body": copy.deepcopy(effective_judge_body),
                 "_rejudged": judged}
 
     out_rows: list[dict] = [None] * len(rows)
@@ -861,6 +1600,8 @@ def _rejudge_file(args, judge_llm) -> None:
         for i, r in enumerate(rows):
             out_rows[i] = _rj(r)
 
+    if owned_clients is not None:
+        owned_clients.close()
     judged = [r for r in out_rows if r["_rejudged"]]
     flipped = [r for r in judged if bool(r["correct"]) != bool(r["correct_original"])]
     t_to_f = [r for r in flipped if r["correct_original"]]
@@ -885,19 +1626,22 @@ def _rejudge_file(args, judge_llm) -> None:
     # Written in the SAME bare-list shape as --out, so locomo_flip.py compares
     # this against the source file directly: that flip run IS the judge share.
     dest = args.out or str(Path(args.rejudge).with_suffix(".rejudged.json"))
-    Path(dest).write_text(json.dumps(out_rows, indent=2), encoding="utf-8")
+    Path(dest).write_text(
+        json.dumps(sanitize_for_artifact(out_rows), indent=2), encoding="utf-8"
+    )
     print(f"\n  re-judged results → {dest}")
     print(f"  compare: python locomo_flip.py {args.rejudge} {dest}")
 
 
 def _build_llm(model, base_url, api_key, extra_body):
+    """Build a raw benchmark client with LME's endpoint-safe body defaults."""
     import os
     from longmemeval_adapter import LLMClient
     return LLMClient(model=model, api_key=api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
                      base_url=base_url, extra_body=extra_body)
 
 
-def main() -> None:
+def _run_main(owned_clients: OwnedResourceScope) -> None:
     ap = argparse.ArgumentParser(description="HyMem LoCoMo benchmark adapter.")
     ap.add_argument("--data", default=None, help="locomo10.json (snap-research/locomo shape)")
     ap.add_argument("--sample", type=int, default=0,
@@ -944,11 +1688,20 @@ def main() -> None:
     ap.add_argument("--answer-base-url", default=_DEEPSEEK_BASE_URL)
     ap.add_argument("--answer-api-key", default=None)
     ap.add_argument("--answer-extra-body", default=None, metavar="JSON",
-                    help='e.g. \'{"thinking":{"type":"disabled"}}\' for v4-flash')
+                    help="optional provider body; omitted DeepSeek v4-flash "
+                         "requests disable thinking automatically")
     ap.add_argument("--judge-model", default=_JUDGE_MODEL)
-    ap.add_argument("--judge-extra-body", default=None, metavar="JSON")
+    ap.add_argument(
+        "--judge-api-key", default=None,
+        help="judge-specific API key (never inherited from --answer-api-key)",
+    )
+    ap.add_argument("--judge-extra-body", default=None, metavar="JSON",
+                    help="optional provider body; omitted DeepSeek v4-flash "
+                         "requests disable thinking automatically")
     ap.add_argument("--hymem-model", default=_HYMEM_MODEL, help="HyMem's dream LLM")
     ap.add_argument("--hymem-base-url", default=_DEEPSEEK_BASE_URL)
+    ap.add_argument("--hymem-thinking", choices=("auto", "disabled", "off", "enabled"),
+                    default="auto", help="memory-pipeline thinking policy")
     ap.add_argument("--api-key", default="", help="HyMem dream LLM key")
     ap.add_argument("--embeddings", action="store_true")
     ap.add_argument("--rules-extraction", action=argparse.BooleanOptionalAction, default=None)
@@ -964,18 +1717,43 @@ def main() -> None:
                          "rebuild, so never mix it into a read-side A/B.")
     ap.add_argument("--graph-multihop", action="store_true",
                     help="Track-A BFS — cat 1 (multi-hop) is the A/B target")
-    ap.add_argument("--no-dream", action="store_true")
+    ap.add_argument(
+        "--no-dream", action="store_true",
+        help="skip indexing (explicit non-comparable message-only development "
+             "path; reused --db-dir stores are refused unless rebuilt --fresh)",
+    )
+    ap.add_argument(
+        "--indexing-max-cycles", type=int,
+        default=DEFAULT_INDEXING_MAX_CYCLES,
+        help="per-wave dream-cycle safety cap before failing closed (default 100)",
+    )
+    ap.add_argument(
+        "--indexing-timeout-s", type=float,
+        default=DEFAULT_INDEXING_TIMEOUT_S,
+        help="per-wave wall-clock convergence bound in seconds (default 3600)",
+    )
     ap.add_argument("--dream-per-session", action="store_true",
-                    help="dream after EACH of the 19-32 sessions (live-store "
-                         "posture; expensive — default is one dream at the end)")
+                    help="fully converge after EACH of the 19-32 sessions "
+                         "(live-store posture; expensive — default converges "
+                         "the complete history at the end)")
     ap.add_argument("--db-dir", default=None,
                     help="persist per-conversation stores here and REUSE them on "
-                         "later runs (skips ingest+dream). Clear or --fresh after "
-                         "core/schema changes")
+                         "later runs (skips ingest, validates the immutable build "
+                         "receipt, then reconverges). Use --fresh after material "
+                         "core/config changes or for legacy receiptless stores")
     ap.add_argument("--fresh", action="store_true",
                     help="with --db-dir: rebuild stores instead of reusing")
     ap.add_argument("--keep-db", action="store_true")
-    ap.add_argument("--out", default=None, help="write per-question results JSON here")
+    ap.add_argument(
+        "--results-dir", default=None,
+        help=("strict immutable archive/checkpoint directory (default: the "
+              "--out directory when supplied, otherwise ./locomo_results)"),
+    )
+    ap.add_argument(
+        "--out", default=None,
+        help=("legacy bare per-question JSON sidecar; strict scored evidence is "
+              "always archived separately and this path remains mutable"),
+    )
     ap.add_argument("--dump-context", action="store_true",
                     help="include the exact rendered answer context in each result")
     ap.add_argument("--dump-topk", action="store_true",
@@ -993,7 +1771,95 @@ def main() -> None:
                          "writes a flip-compatible copy to --out or *.rejudged.json")
     ap.add_argument("--sim", action="store_true", help="offline: StubLLM, no API")
     ap.add_argument("--json", action="store_true")
+    add_strict_run_arguments(ap)
     args = ap.parse_args()
+
+    try:
+        _indexing_limits(args)
+        if isinstance(args.sample, bool) or args.sample < 0:
+            raise BenchmarkIntegrityError("sample must be a non-negative integer")
+        if isinstance(args.workers, bool) or args.workers <= 0:
+            raise BenchmarkIntegrityError("workers must be a positive integer")
+        if isinstance(args.top_k, bool) or args.top_k <= 0:
+            raise BenchmarkIntegrityError("top-k must be a positive integer")
+        if args.max_context_chars is not None and args.max_context_chars <= 0:
+            raise BenchmarkIntegrityError(
+                "max-context-chars must be a positive integer"
+            )
+        args.answer_base_url = validate_http_endpoint(
+            args.answer_base_url, label="reader"
+        ).url
+        args.hymem_base_url = validate_http_endpoint(
+            args.hymem_base_url, label="memory pipeline"
+        ).url
+    except BenchmarkIntegrityError as exc:
+        ap.error(str(exc))
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    strict_controls = bool(
+        args.checkpoint or args.resume_from or args.retry_failures
+        or args.calibration_receipt or args.freeze_calibration
+        or args.protocol_split != "full"
+    )
+    if args.sim and args.embeddings:
+        ap.error("--sim does not construct an embedding client; drop --embeddings")
+    if (args.rejudge or args.diag_only) and strict_controls:
+        ap.error(
+            "checkpoint/calibration/protocol flags are only valid for the "
+            "strict benchmark run, not --rejudge or --diag-only"
+        )
+    if args.retry_failures and not args.resume_from:
+        ap.error("--retry-failures requires --resume-from")
+    if args.freeze_calibration and (args.checkpoint or args.resume_from):
+        ap.error("--freeze-calibration cannot create or resume a checkpoint")
+    if (args.freeze_calibration or args.protocol_split != "full") and args.sample:
+        ap.error(
+            "--freeze-calibration and dev/holdout runs require --sample 0"
+        )
+    if args.out:
+        out_resolved = Path(args.out).resolve(strict=False)
+        for label, raw in (
+            ("--checkpoint", args.checkpoint),
+            ("--resume-from", args.resume_from),
+        ):
+            if raw and Path(raw).resolve(strict=False) == out_resolved:
+                ap.error(f"--out must not overwrite {label}")
+
+    try:
+        from longmemeval_adapter import resolve_model_extra_body
+
+        parsed_answer_body = parse_extra_body_arg(
+            args.answer_extra_body, "answer"
+        )
+        parsed_judge_body = parse_extra_body_arg(
+            args.judge_extra_body, "judge"
+        )
+        args.answer_extra_body_obj, _ = resolve_model_extra_body(
+            args.answer_model, args.answer_base_url, parsed_answer_body
+        )
+        args.judge_extra_body_obj, _ = resolve_model_extra_body(
+            args.judge_model, _DEEPSEEK_BASE_URL, parsed_judge_body
+        )
+    except (BenchmarkIntegrityError, ValueError) as exc:
+        ap.error(str(exc))
+
+    if not args.sim:
+        if args.rejudge:
+            active_models = (("LoCoMo judge", args.judge_model),)
+        elif args.diag_only:
+            active_models = (("LoCoMo memory pipeline", args.hymem_model),)
+        else:
+            active_models = (
+                ("LoCoMo reader", args.answer_model),
+                ("LoCoMo judge", args.judge_model),
+                ("LoCoMo memory pipeline", args.hymem_model),
+            )
+        try:
+            for role, active_model in active_models:
+                require_active_model(active_model, role=role)
+        except DeprecatedModelAliasError as exc:
+            ap.error(str(exc))
 
     if args.diag_only:
         # --sim leaves `rendered` None, which is the one surface this pass exists
@@ -1005,73 +1871,822 @@ def main() -> None:
     if args.rejudge:
         if args.sim:
             sys.exit("--rejudge needs a real judge; drop --sim.")
-        jb = json.loads(args.judge_extra_body) if args.judge_extra_body else None
-        _rejudge_file(args, _build_llm(args.judge_model, _DEEPSEEK_BASE_URL,
-                                       args.answer_api_key, jb))
+        judge_llm = owned_clients.own(
+            _build_llm(
+                args.judge_model, _DEEPSEEK_BASE_URL,
+                args.judge_api_key, args.judge_extra_body_obj,
+            ),
+            label="rejudge client",
+        )
+        _rejudge_file(args, judge_llm, owned_clients)
         return
 
-    categories = ({int(c) for c in args.categories.split(",")}
-                  if args.categories else None)
-    convs = load_locomo_data(args.data, user_speaker=args.user_speaker,
-                             categories=categories, name_prefix=args.name_prefix)
+    try:
+        categories = ({int(c) for c in args.categories.split(",")}
+                      if args.categories else None)
+    except ValueError as exc:
+        ap.error(f"--categories must be comma-separated integers: {exc}")
+    if categories is not None and not categories <= set(CATEGORY_NAME):
+        ap.error("--categories may contain only 1,2,3,4,5")
+
+    source_convs = load_locomo_data(
+        args.data, user_speaker=args.user_speaker,
+        categories=categories, name_prefix=args.name_prefix,
+    )
     if args.convs:
-        keep = {c.strip() for c in args.convs.split(",")}
-        convs = [c for c in convs if c["id"] in keep]
-    convs = sample_questions(convs, args.sample, args.seed)
-    n_q = sum(len(c["qa"]) for c in convs)
-    if not n_q:
+        keep = {item.strip() for item in args.convs.split(",") if item.strip()}
+        source_convs = [conv for conv in source_convs if conv["id"] in keep]
+    if not any(conv.get("qa") for conv in source_convs):
         print("No LoCoMo questions selected.")
         sys.exit(1)
-    print(f"Loaded {len(convs)} conversations, {n_q} questions "
-          f"({sum(c['n_sessions'] for c in convs)} sessions total)"
-          f"{'  [SIM]' if args.sim else ''}", flush=True)
+    source_ids = validate_ids(
+        (q["question_id"] for conv in source_convs for q in conv["qa"]),
+        label="LoCoMo eligible dataset",
+    )
+    convs = (
+        list(source_convs)
+        if args.freeze_calibration or args.protocol_split != "full"
+        else sample_questions(source_convs, args.sample, args.seed)
+    )
+    if args.sample > len(source_ids):
+        ap.error(
+            f"--sample {args.sample} exceeds the eligible dataset size "
+            f"({len(source_ids)})"
+        )
+    all_ids = validate_ids(
+        (q["question_id"] for conv in convs for q in conv["qa"]),
+        label="LoCoMo selected dataset",
+    )
+    data_sha = (
+        file_hash(args.data) if args.data
+        else content_hash(_SIM_FIXTURE)
+    )
+    extraction_cfg, extraction_effective_cfg = _effective_hymem_config(args)
+    extraction_prompt_version = extraction_cfg.prompt_version
+    runtime_extraction_binding = validate_extraction_canary_config_binding(
+        extraction_canary_policy(
+            prompt_version=extraction_prompt_version
+        ),
+        extraction_effective_cfg,
+    )
 
-    answer_llm = judge_llm = None
-    if args.max_context_chars:
-        _MAX_CTX[0] = args.max_context_chars
-        if not args.sim:
-            # MAX_CONTEXT_CHARS is read as a module global inside
-            # _render_answer_context, so rebinding it here covers both the
-            # answer path and the diagnostic re-render.
+    # Retrieval-only diagnostics retain their historical bare-list contract.
+    # They do not produce verdicts and are deliberately outside the scored
+    # checkpoint/calibration protocol.
+    if args.diag_only:
+        n_q = len(all_ids)
+        print(f"Loaded {len(convs)} conversations, {n_q} questions "
+              f"({sum(c['n_sessions'] for c in convs)} sessions total)", flush=True)
+        extraction_canary_report = (
+            skipped_extraction_canary(
+                "no_dream", prompt_version=extraction_prompt_version
+            ) if args.no_dream
+            else run_configured_extraction_canary(
+                api_key=args.api_key, base_url=args.hymem_base_url,
+                model=args.hymem_model, thinking=args.hymem_thinking,
+                prompt_version=extraction_prompt_version,
+            )
+        )
+        mode = "no_dream" if args.no_dream else "required"
+        validate_extraction_canary_report(
+            extraction_canary_report, expected_mode=mode,
+            expected_client=(
+                extraction_canary_client_policy(
+                    base_url=args.hymem_base_url, model=args.hymem_model,
+                    thinking=args.hymem_thinking,
+                ) if mode == "required" else None
+            ),
+            require_client_closed=mode == "required",
+            expected_prompt_version=extraction_prompt_version,
+        )
+        print_extraction_canary(extraction_canary_report)
+        if args.max_context_chars:
+            _MAX_CTX[0] = args.max_context_chars
             import longmemeval_adapter as _lme
             _lme.MAX_CONTEXT_CHARS = args.max_context_chars
-    if not args.sim and not args.diag_only:
-        ab = json.loads(args.answer_extra_body) if args.answer_extra_body else None
-        jb = json.loads(args.judge_extra_body) if args.judge_extra_body else None
-        answer_llm = _build_llm(args.answer_model, args.answer_base_url, args.answer_api_key, ab)
-        judge_llm = _build_llm(args.judge_model, _DEEPSEEK_BASE_URL, args.answer_api_key, jb)
-
-    results: list[dict] = []
-    t0 = time.time()
-    if args.workers > 1:
-        with ThreadPoolExecutor(max_workers=min(args.workers, len(convs))) as pool:
-            futs = [pool.submit(evaluate_conversation, c, args, answer_llm, judge_llm)
-                    for c in convs]
-            for fut in as_completed(futs):
-                results.extend(fut.result())
-    else:
-        for c in convs:
-            results.extend(evaluate_conversation(c, args, answer_llm, judge_llm))
-    print(f"  done in {time.time()-t0:.0f}s")
-
-    if args.json:
-        print(json.dumps(results, indent=2))
-    elif args.diag_only:
+        results: list[dict] = []
+        for conv in convs:
+            results.extend(run_or_record_indexing_failure(
+                lambda conv=conv: evaluate_conversation(
+                    conv, args, None, None
+                ),
+                benchmark="locomo", out_path=args.out,
+                extraction_canary=extraction_canary_report,
+            ))
+        for row in results:
+            row["extraction_canary"] = dict(extraction_canary_report)
+        owned_clients.close()
         ans = [r for r in results if r["category"] != 5]
         n = len(ans) or 1
         print(f"\n  ── diagnostics-only pass ({len(ans)} answerable-cat questions, "
               f"no reader, no judge) ──")
-        for k in ("gold_in_pool", "gold_in_topk", "gold_in_render"):
-            print(f"  {k:<16} {sum(bool(r[k]) for r in ans)/n*100:>5.1f}%  (tau=0.6)")
-        print("  These are the LEXICAL surfaces and they are NESTED — read them "
-              "only after\n  a strict re-score. Join onto a real run:\n"
-              f"    python locomo_audit.py REAL_RUN.json --data {args.data} "
-              f"--topk-dump {args.out}")
-    else:
-        _print_report(results, args)
-    if args.out:
-        Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
-        print(f"\n  per-question results → {args.out}")
+        for key in ("gold_in_pool", "gold_in_topk", "gold_in_render"):
+            print(f"  {key:<16} {sum(bool(r[key]) for r in ans)/n*100:>5.1f}%  (tau=0.6)")
+        Path(args.out).write_text(
+            json.dumps(sanitize_for_artifact(results), indent=2),
+            encoding="utf-8",
+        )
+        print(f"\n  diagnostic results → {args.out}")
+        return
+
+    strict_config, strict_models = _strict_identity(args)
+    if args.freeze_calibration:
+        receipt = freeze_calibration(
+            args.freeze_calibration,
+            benchmark="LoCoMo",
+            dataset_hash=data_sha,
+            ids=source_ids,
+            config=strict_config,
+            models=strict_models,
+            seed=args.seed,
+            dev_fraction=args.dev_fraction,
+        )
+        print(f"Frozen LoCoMo calibration: dev={len(receipt['dev_ids'])}, "
+              f"holdout={len(receipt['holdout_ids'])}")
+        return
+
+    calibration = None
+    if args.calibration_receipt:
+        calibration = load_calibration(
+            args.calibration_receipt,
+            benchmark="LoCoMo",
+            dataset_hash=data_sha,
+            config=strict_config,
+            models=strict_models,
+            ids=source_ids,
+        )
+    selected_ids = select_protocol_ids(
+        all_ids, split=args.protocol_split, receipt=calibration
+    )
+    convs = _select_questions_by_id(convs, selected_ids)
+    manifest = build_manifest(
+        benchmark="LoCoMo",
+        code_sha256=locomo_code_hash(),
+        data_sha256=data_sha,
+        config=strict_config,
+        models=strict_models,
+        seed=args.seed,
+        expected_ids=selected_ids,
+        protocol_split=args.protocol_split,
+        calibration=calibration,
+    )
+    manifest_extraction_binding = validate_extraction_canary_config_binding(
+        manifest["config"].get("extraction_canary"),
+        manifest["config"].get("effective_hymem_config"),
+    )
+    if manifest_extraction_binding != runtime_extraction_binding:
+        raise BenchmarkIntegrityError(
+            "LoCoMo manifest extraction contract differs from runtime config"
+        )
+    extraction_prompt_version = manifest_extraction_binding["prompt_version"]
+
+    results_dir = Path(
+        args.results_dir
+        or (Path(args.out).parent if args.out else Path.cwd() / "locomo_results")
+    )
+    latest_path = results_dir / "locomo-latest.json"
+    if args.out and Path(args.out).resolve(strict=False) == latest_path.resolve(strict=False):
+        ap.error("--out must not overwrite the strict latest pointer")
+    for label, raw in (
+        ("--checkpoint", args.checkpoint),
+        ("--resume-from", args.resume_from),
+    ):
+        if (
+            raw
+            and Path(raw).resolve(strict=False)
+            == latest_path.resolve(strict=False)
+        ):
+            ap.error(f"{label} must not alias the strict latest pointer")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path, is_resume = resolve_checkpoint_path(
+        checkpoint=args.checkpoint,
+        resume_from=args.resume_from,
+        base_dir=results_dir,
+        benchmark="locomo",
+        run_id=manifest["run_id"],
+    )
+
+    ledger: AtomicCheckpoint | None = None
+    try:
+        ledger = AtomicCheckpoint(
+            checkpoint_path,
+            manifest=manifest,
+            expected_ids=selected_ids,
+            resume=is_resume,
+            retry_failures=args.retry_failures,
+            scored=not args.sim,
+        )
+        pending = set(ledger.pending_ids)
+        work_convs = [
+            {**conv, "qa": [q for q in conv["qa"]
+                              if q["question_id"] in pending]}
+            for conv in convs
+            if any(q["question_id"] in pending for q in conv["qa"])
+        ]
+        print(f"Loaded {len(convs)} conversations, {len(selected_ids)} questions "
+              f"({sum(c['n_sessions'] for c in convs)} sessions total)"
+              f"{'  [SIM]' if args.sim else ''}", flush=True)
+        print(f"  Strict checkpoint: {checkpoint_path} "
+              f"({len(pending)} pending / {len(selected_ids)} expected)")
+
+        start_time = time.time()
+        segment_id = (
+            f"process-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-"
+            f"{os.getpid()}"
+        )
+        answer_llm = judge_llm = None
+        attempted = 0
+        started_ids: set[str] = set()
+        attempted_ids: set[str] = set()
+        runtime_lock = threading.RLock()
+        pipeline_by_scope: dict[str, dict[str, Any]] = {}
+        embedding_by_scope: dict[str, dict[str, Any]] = {}
+        indexing_by_scope: dict[str, dict[str, Any]] = {}
+        indexing_failures: dict[str, dict[str, Any]] = {}
+        extraction_canary_report: dict[str, Any] = (
+            skipped_extraction_canary(
+                "no_pending_work", prompt_version=extraction_prompt_version
+            )
+            if not pending else
+            skipped_extraction_canary(
+                "simulation", prompt_version=extraction_prompt_version
+            )
+            if args.sim else
+            skipped_extraction_canary(
+                "no_dream", prompt_version=extraction_prompt_version
+            )
+            if args.no_dream else
+            {
+                **extraction_canary_policy(
+                    prompt_version=extraction_prompt_version
+                ),
+                "status": "pending",
+            }
+        )
+
+        def _zero_embedding_usage() -> dict[str, Any]:
+            identity = manifest["models"]["embedding"]
+            return {
+                "configured": identity["configured"],
+                "backend": identity["backend"],
+                "quality": identity["quality"],
+                "network_free": identity["network_free"],
+                "model": identity["vector_space_key"],
+                "dimension": identity["dimension"],
+                "identity_available": True,
+                "identity_exact": identity["identity_exact"],
+                "reuse_scope": identity["reuse_scope"],
+                "calls": 0, "calls_available": True,
+                "request_attempts": 0,
+                "request_attempts_available": True,
+                "successful_responses": 0,
+                "successful_responses_available": True,
+                "input_count": 0, "input_count_available": True,
+                "input_characters": 0,
+                "input_characters_available": True,
+                "prompt_tokens": None, "total_tokens": None,
+                "provider_token_usage_available": False,
+                "latency_s": 0.0, "latency_available": True,
+                "cost_usd": None, "cost_available": False,
+            }
+
+        def _segment(status: str) -> dict[str, Any]:
+            with runtime_lock:
+                if embedding_by_scope:
+                    embedding_usage = aggregate_embedding_usage_snapshots(
+                        embedding_by_scope.values()
+                    )
+                elif pending:
+                    embedding_usage = embedding_usage_snapshot(
+                        None, configured=bool(args.embeddings)
+                    )
+                else:
+                    embedding_usage = _zero_embedding_usage()
+                return {
+                    "segment_id": segment_id,
+                    "status": status,
+                    "elapsed_s": time.time() - start_time,
+                    "attempted_attempts": attempted,
+                    "model_identities": manifest["models"],
+                    "reader_usage": usage_snapshot(answer_llm),
+                    "judge_usage": usage_snapshot(judge_llm),
+                    "memory_pipeline_usage": aggregate_usage_snapshots(
+                        pipeline_by_scope.values()
+                    ),
+                    "embedding_usage": embedding_usage,
+                    "indexing_runs": [
+                        {"scope_id": scope, "summary": dict(summary)}
+                        for scope, summary in sorted(indexing_by_scope.items())
+                    ],
+                    "indexing_failures": [
+                        {"scope_id": scope, "summary": dict(summary)}
+                        for scope, summary in sorted(indexing_failures.items())
+                    ],
+                    "extraction_canary": dict(extraction_canary_report),
+                }
+
+        class _CheckpointPersistenceAbort(BaseException):
+            """Never reinterpret structural/checkpoint failure as conversation failure."""
+
+            def __init__(
+                self, *, restore_cause_on_exit: bool = False,
+            ) -> None:
+                super().__init__()
+                self.restore_cause_on_exit = restore_cause_on_exit
+
+        parallel_stop = threading.Event()
+        parallel_primary: list[BaseException] = []
+
+        def _checkpoint_abort(
+            cause: BaseException, *, restore_cause_on_exit: bool = False,
+        ) -> BaseException:
+            abort = _CheckpointPersistenceAbort(
+                restore_cause_on_exit=restore_cause_on_exit,
+            )
+            abort.__cause__ = cause
+            abort.__suppress_context__ = True
+            return abort
+
+        def _external_abort_primary(exc: BaseException) -> BaseException:
+            if (
+                isinstance(exc, _CheckpointPersistenceAbort)
+                and exc.restore_cause_on_exit
+                and exc.__cause__ is not None
+            ):
+                return exc.__cause__
+            return exc
+
+        def _signal_parallel_abort(exc: BaseException) -> BaseException:
+            # ``runtime_lock`` is also the persistence gate.  Setting the stop
+            # signal while holding it prevents any concurrent callback from
+            # beginning a later ledger record after the first fatal fault.
+            with runtime_lock:
+                if not parallel_primary:
+                    parallel_primary.append(exc)
+                parallel_stop.set()
+                return parallel_primary[0]
+
+        def _parallel_abort_for(exc: BaseException) -> BaseException | None:
+            if isinstance(exc, _ParallelConversationStopped):
+                with runtime_lock:
+                    return parallel_primary[0] if parallel_primary else None
+            if isinstance(exc, _CheckpointPersistenceAbort):
+                candidate = exc
+            elif isinstance(exc, BenchmarkCleanupError):
+                candidate = exc
+            elif isinstance(exc, Exception):
+                if not is_structural_benchmark_error(exc):
+                    return None
+                candidate = _checkpoint_abort(exc)
+            else:
+                candidate = exc
+            return _signal_parallel_abort(candidate)
+
+        def _raise_checkpoint_abort(
+            cause: BaseException, *, restore_cause_on_exit: bool = False,
+        ) -> None:
+            abort = _checkpoint_abort(
+                cause, restore_cause_on_exit=restore_cause_on_exit,
+            )
+            primary = _signal_parallel_abort(abort)
+            if primary is abort:
+                raise abort from cause
+            raise _ParallelConversationStopped()
+
+        def _mark_attempt(item_id: str) -> None:
+            """Own each started question once, even if its row is cancelled."""
+
+            nonlocal attempted
+            with runtime_lock:
+                if parallel_stop.is_set():
+                    raise _ParallelConversationStopped()
+                if item_id in started_ids:
+                    _raise_checkpoint_abort(BenchmarkIntegrityError(
+                        "LoCoMo started one question more than once in an "
+                        "execution segment"
+                    ))
+                started_ids.add(item_id)
+                attempted += 1
+
+        def _capture_runtime(runtime: dict[str, Any]) -> None:
+            with runtime_lock:
+                scope = str(runtime["scope_id"])
+                pipeline_by_scope[scope] = dict(
+                    runtime["memory_pipeline_usage"]
+                )
+                embedding_by_scope[scope] = dict(runtime["embedding_usage"])
+                indexing = runtime.get("indexing")
+                if isinstance(indexing, dict):
+                    indexing_by_scope[scope] = dict(indexing)
+
+        def _persist_aborted_segment(
+            primary_exception: BaseException,
+        ) -> None:
+            """Freeze post-drain spend without replacing the abort primary."""
+
+            def persist_segment_snapshot() -> None:
+                ledger.update_execution_segment(
+                    segment_id, _segment("complete")
+                )
+
+            run_cleanup_actions(
+                [("execution_segment_snapshot", persist_segment_snapshot)],
+                primary_exception=primary_exception,
+            )
+
+        def _persist(row: dict, runtime: dict[str, Any] | None = None) -> None:
+            nonlocal attempted
+            safe_row = dict(row)
+            safe_row["extraction_canary"] = dict(extraction_canary_report)
+            with runtime_lock:
+                if parallel_stop.is_set():
+                    # An in-flight sibling may finish provider work after the
+                    # primary record fault.  Retain its cumulative meters, but
+                    # never admit its now-aborted row into the checkpoint.
+                    if runtime is not None:
+                        _capture_runtime(runtime)
+                    raise _ParallelConversationStopped()
+                item_id = safe_row.get("question_id")
+                if item_id in attempted_ids:
+                    duplicate = BenchmarkIntegrityError(
+                        "LoCoMo emitted one question more than once in an "
+                        "execution segment"
+                    )
+                    _raise_checkpoint_abort(duplicate)
+                attempted_ids.add(item_id)
+                if item_id not in started_ids:
+                    # Backward-compatible evaluator seam: injected/legacy
+                    # implementations may only announce work via the result
+                    # callback rather than the pre-provider attempt callback.
+                    started_ids.add(item_id)
+                    attempted += 1
+                if runtime is not None:
+                    _capture_runtime(runtime)
+                try:
+                    ledger.record(
+                        item_id, row=safe_row,
+                        execution_segment=_segment("running"),
+                    )
+                except BaseException as exc:
+                    _raise_checkpoint_abort(
+                        exc, restore_cause_on_exit=True,
+                    )
+
+        def _record_returned(rows: object) -> None:
+            if not isinstance(rows, list):
+                _raise_checkpoint_abort(
+                    BenchmarkIntegrityError(
+                        "LoCoMo conversation returned malformed rows"
+                    )
+                )
+            for row in rows:
+                if not isinstance(row, dict):
+                    _raise_checkpoint_abort(
+                        BenchmarkIntegrityError(
+                            "LoCoMo conversation returned a malformed row"
+                        )
+                    )
+                # Actual evaluate_conversation calls the checkpoint callback
+                # before returning its rows. This fallback exists for older
+                # injected evaluators only and must not interpret a just-failed
+                # retried row as pending work a second time.
+                if row.get("question_id") not in attempted_ids:
+                    _persist(row)
+
+        def _record_conversation_failure(conv: dict, exc: Exception) -> None:
+            if isinstance(exc, BenchmarkCleanupError):
+                _signal_parallel_abort(exc)
+                raise exc
+            if (
+                isinstance(exc, BenchmarkIntegrityError)
+                and not isinstance(exc, IndexingConvergenceError)
+            ):
+                _raise_checkpoint_abort(exc)
+            scope = f"locomo:{conv['id']}"
+            summary = (
+                dict(exc.summary)
+                if isinstance(exc, IndexingConvergenceError) else
+                {"status": "failed_before_scoring",
+                 "failure_reason": f"conversation_failure:{bounded_exception_type(exc)}"}
+            )
+            with runtime_lock:
+                indexing_failures[scope] = sanitize_for_artifact(
+                    summary, _preserve_evidence_text=False
+                )
+            remaining = set(ledger.pending_ids)
+            for question in conv["qa"]:
+                qid = question["question_id"]
+                if qid not in remaining or qid in attempted_ids:
+                    continue
+                _persist({
+                    "id": question.get("qa_id", qid),
+                    "question_id": qid,
+                    "conv_id": conv["id"],
+                    "question_type": question.get("qtype", "unknown"),
+                    "category": question.get("category"),
+                    "question": question.get("question", ""),
+                    "correct": False,
+                    "judge_raw": "",
+                    "judge_error": False,
+                    "benchmark_failure": (
+                        f"conversation_failure:{bounded_exception_type(exc)}"
+                    ),
+                })
+
+        if pending:
+            ledger.update_execution_segment(segment_id, _segment("running"))
+            if args.sim:
+                extraction_canary_mode = "simulation"
+            elif args.no_dream:
+                extraction_canary_mode = "no_dream"
+            else:
+                extraction_canary_mode = "required"
+                try:
+                    extraction_canary_report = run_configured_extraction_canary(
+                        api_key=args.api_key,
+                        base_url=args.hymem_base_url,
+                        model=args.hymem_model,
+                        thinking=args.hymem_thinking,
+                        prompt_version=extraction_prompt_version,
+                    )
+                except ExtractionCanaryError as exc:
+                    extraction_canary_report = dict(exc.report)
+                    ledger.update_execution_segment(
+                        segment_id, _segment("running")
+                    )
+                    raise
+            validate_extraction_canary_report(
+                extraction_canary_report,
+                expected_mode=extraction_canary_mode,
+                expected_client=(
+                    extraction_canary_client_policy(
+                        base_url=args.hymem_base_url,
+                        model=args.hymem_model,
+                        thinking=args.hymem_thinking,
+                    ) if extraction_canary_mode == "required" else None
+                ),
+                require_client_closed=extraction_canary_mode == "required",
+                expected_prompt_version=extraction_prompt_version,
+            )
+            ledger.update_execution_segment(segment_id, _segment("running"))
+            print_extraction_canary(extraction_canary_report)
+
+            if args.max_context_chars:
+                _MAX_CTX[0] = args.max_context_chars
+                if not args.sim:
+                    import longmemeval_adapter as _lme
+                    _lme.MAX_CONTEXT_CHARS = args.max_context_chars
+            if not args.sim:
+                answer_llm = owned_clients.own(
+                    _build_llm(
+                        args.answer_model, args.answer_base_url,
+                        args.answer_api_key, args.answer_extra_body_obj,
+                    ),
+                    label="reader client",
+                )
+                judge_llm = owned_clients.own(
+                    _build_llm(
+                        args.judge_model, _DEEPSEEK_BASE_URL,
+                        args.judge_api_key, args.judge_extra_body_obj,
+                    ),
+                    label="judge client",
+                )
+                ledger.update_execution_segment(
+                    segment_id, _segment("running")
+                )
+
+            if args.workers > 1:
+                def _raise_parallel_primary() -> None:
+                    with runtime_lock:
+                        if parallel_stop.is_set():
+                            if parallel_primary:
+                                raise parallel_primary[0]
+                            raise _ParallelConversationStopped()
+
+                def _parallel_evaluate(index: int, conv: dict) -> list[dict]:
+                    if parallel_stop.is_set():
+                        raise _ParallelConversationStopped()
+                    try:
+                        return evaluate_conversation(
+                            conv, args, answer_llm, judge_llm,
+                            pending_ids={
+                                q["question_id"] for q in conv["qa"]
+                            },
+                            on_checkpoint=_persist,
+                            _parallel_stop=parallel_stop,
+                            _on_fatal_abort=_parallel_abort_for,
+                            _on_attempt=_mark_attempt,
+                            _on_runtime_snapshot=_capture_runtime,
+                        )
+                    except _ParallelConversationStopped:
+                        raise
+                    except BaseException as exc:
+                        primary = _parallel_abort_for(exc)
+                        if primary is None:
+                            # Ordinary provider/conversation failures are still
+                            # materialized by the coordinator below.
+                            raise
+                        if primary is exc:
+                            raise
+                        raise primary
+
+                worker_count = min(args.workers, len(work_convs))
+                pool = ThreadPoolExecutor(max_workers=worker_count)
+                work_iter = iter(enumerate(work_convs))
+                futures: dict[Any, tuple[int, dict]] = {}
+
+                def _fill_parallel_window() -> None:
+                    while (
+                        len(futures) < worker_count
+                        and not parallel_stop.is_set()
+                    ):
+                        try:
+                            index, conv = next(work_iter)
+                        except StopIteration:
+                            return
+                        future = pool.submit(_parallel_evaluate, index, conv)
+                        futures[future] = (index, conv)
+
+                try:
+                    _fill_parallel_window()
+                    while futures:
+                        _raise_parallel_primary()
+                        ready, _pending_futures = wait(
+                            tuple(futures), return_when=FIRST_COMPLETED,
+                        )
+                        _raise_parallel_primary()
+                        ordered_ready = sorted(
+                            ready, key=lambda future: futures[future][0]
+                        )
+                        for future in ordered_ready:
+                            _index, conv = futures.pop(future)
+                            _raise_parallel_primary()
+                            try:
+                                _record_returned(future.result())
+                            except _ParallelConversationStopped:
+                                _raise_parallel_primary()
+                                raise
+                            except _CheckpointPersistenceAbort:
+                                raise
+                            except Exception as exc:
+                                _record_conversation_failure(conv, exc)
+                        # Refill only after the whole ready batch has been
+                        # persisted/reconciled.  There is never an eager queue
+                        # of expensive conversations left to drain on abort.
+                        _fill_parallel_window()
+                except BaseException as exc:
+                    primary = _parallel_abort_for(exc)
+                    if primary is None:
+                        primary = _signal_parallel_abort(exc)
+                    for future in futures:
+                        future.cancel()
+                    external_primary = _external_abort_primary(primary)
+                    if external_primary is exc:
+                        raise
+                    raise external_primary from None
+                finally:
+                    primary_exception = sys.exc_info()[1]
+                    if primary_exception is not None:
+                        parallel_stop.set()
+                        for future in futures:
+                            future.cancel()
+                    with runtime_lock:
+                        record_abort = bool(
+                            parallel_primary
+                            and isinstance(
+                                parallel_primary[0],
+                                _CheckpointPersistenceAbort,
+                            )
+                            and parallel_primary[0].restore_cause_on_exit
+                        )
+                    cleanup_actions = [
+                        ("resource_close", lambda: pool.shutdown(
+                            wait=True, cancel_futures=True,
+                        )),
+                    ]
+                    if record_abort:
+                        # Freeze only after every already-running worker has
+                        # unwound.  This includes its final shared-client usage
+                        # and any runtime snapshot offered by a blocked row.
+                        cleanup_actions.append((
+                            "execution_segment_snapshot",
+                            lambda: ledger.update_execution_segment(
+                                segment_id, _segment("complete")
+                            ),
+                        ))
+                    run_cleanup_actions(
+                        cleanup_actions,
+                        primary_exception=primary_exception,
+                    )
+            else:
+                try:
+                    for conv in work_convs:
+                        try:
+                            rows = evaluate_conversation(
+                                conv, args, answer_llm, judge_llm,
+                                pending_ids={
+                                    q["question_id"] for q in conv["qa"]
+                                },
+                                on_checkpoint=_persist,
+                                _on_attempt=_mark_attempt,
+                                _on_runtime_snapshot=_capture_runtime,
+                            )
+                            _record_returned(rows)
+                        except _CheckpointPersistenceAbort:
+                            raise
+                        except Exception as exc:
+                            _record_conversation_failure(conv, exc)
+                except _CheckpointPersistenceAbort as exc:
+                    # evaluate_conversation has already released its adapter,
+                    # so no further spend can race this final segment image.
+                    primary = _external_abort_primary(exc)
+                    try:
+                        if primary is exc:
+                            raise
+                        raise primary from None
+                    except BaseException as active_primary:
+                        _persist_aborted_segment(active_primary)
+                        raise
+            ledger.update_execution_segment(
+                segment_id, _segment("complete")
+            )
+        elif is_resume:
+            # Recover a crash after its last row without constructing provider
+            # clients or repeating canary/indexing work. A finalized checkpoint
+            # is already terminal and intentionally remains byte-stable.
+            try:
+                ledger.update_execution_segment(
+                    segment_id, _segment("complete")
+                )
+            except BenchmarkIntegrityError as exc:
+                if "cannot mutate a finalized checkpoint" not in str(exc):
+                    raise
+
+        results = list(ledger.reconcile().rows)
+        elapsed = time.time() - start_time
+        scores = _compute_scores_local(results)
+        payload = {
+            "benchmark": "LoCoMo",
+            "version": "strict-v1",
+            "date": datetime.now(timezone.utc).isoformat(),
+            "scores": scores,
+            "strict_accuracy": (
+                strict_accuracy(results) if not args.sim else None
+            ),
+            "result_digest": content_hash(sanitize_for_artifact(results)),
+            "legacy_bare_out": bool(args.out),
+        }
+        archive_now = datetime.now(timezone.utc)
+        stamp = archive_now.strftime("%Y%m%dT%H%M%SZ")
+        nonce = archive_now.strftime("%f")
+        archive_path = results_dir / (
+            f"locomo-{stamp}-{nonce}-seed{args.seed}-strict-"
+            f"{manifest['run_id'].removeprefix('sha256:')[:12]}.json"
+        )
+        artifact = prepare_checkpoint_artifact(ledger, payload=payload)
+        publish_prepared_artifact_after_cleanup(
+            archive_path,
+            artifact,
+            cleanup_actions=[
+                ("resource_close", owned_clients.close),
+                ("checkpoint_close", ledger.close),
+            ],
+        )
+        write_latest_pointer(
+            latest_path,
+            archive=archive_path,
+            run_id=manifest["run_id"],
+            artifact_digest=content_hash(artifact),
+        )
+        print(f"  done in {elapsed:.0f}s")
+        print(f"  strict archive → {archive_path}")
+
+        # Compatibility output for locomo_audit.py / locomo_flip.py. It is
+        # deliberately not the authoritative evidence and is written only
+        # after provider/checkpoint teardown and immutable publication.
+        if args.out:
+            Path(args.out).write_text(
+                json.dumps(sanitize_for_artifact(results), indent=2),
+                encoding="utf-8",
+            )
+            print(f"  legacy per-question sidecar → {args.out}")
+        if args.json:
+            print(json.dumps(results, indent=2))
+        elif not args.sim:
+            _print_report(results, args)
+    finally:
+        if ledger is not None:
+            run_cleanup_actions(
+                [("checkpoint_close", ledger.close)],
+                primary_exception=sys.exc_info()[1],
+            )
+
+
+def main() -> None:
+    """CLI entry point owning shared clients through worker completion."""
+
+    with OwnedResourceScope("LoCoMo shared provider clients") as owned_clients:
+        return _run_main(owned_clients)
 
 
 # A tiny in-schema fixture: 2 speakers, 3 dated sessions, one photo-share turn,

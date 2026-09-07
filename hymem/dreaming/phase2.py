@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import inspect
 import sqlite3
+import textwrap
 from pathlib import Path
 
 from hymem.config import HyMemConfig
@@ -10,27 +13,60 @@ from hymem.core import markdown_io
 
 log = logging.getLogger("hymem.dreaming.phase2")
 
-
 def confidence(pos: int, neg: int) -> float:
     """Laplace-smoothed positive evidence ratio."""
     return (pos + 1) / (pos + neg + 2)
 
 
-def consolidate_profile(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
+def consolidate_profile(
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+    *,
+    phase1_generation_key: str | None = None,
+    allow_legacy_unscoped: bool = False,
+) -> None:
     """Promote unconsolidated markers into structured profile entries.
 
     Deterministic, no LLM call required. Each marker statement becomes a
     profile entry keyed on its text — repeats reinforce, contradictions get
     surfaced as a separate entry rather than silently overwriting.
+
+    Runner calls are generation-filtered so a newly selected producer cannot
+    consume an older producer's fresh marker. Existing ``profile_entries`` are
+    intentionally not rewritten here: those denormalized Phase-2 projections
+    predate source linkage and require their own producer-aware provenance and
+    replay migration rather than an incomplete Phase-1 cleanup.
     """
-    rows = conn.execute(
-        """
-        SELECT id, kind, statement
-        FROM behavioral_markers
-        WHERE consolidated_at IS NULL
-        ORDER BY id
-        """
-    ).fetchall()
+    validate_profile_materialization_policy()
+    if phase1_generation_key is None and not allow_legacy_unscoped:
+        # A v53 neutral connection can authorize several exact historical
+        # producers.  With no selected generation there is no safe way to pick
+        # which producer's fresh markers may drive a new Phase-2 projection.
+        # Legacy repair/tests must opt into the old unscoped behavior loudly.
+        rows = []
+    elif phase1_generation_key is None:
+        rows = conn.execute(
+            "SELECT id,kind,statement,phase1_generation_key "
+            "FROM behavioral_markers "
+            "WHERE consolidated_at IS NULL "
+            "AND phase1_generation_key IS NULL ORDER BY id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT marker.id,marker.kind,marker.statement,"
+            "marker.phase1_generation_key "
+            "FROM behavioral_markers marker "
+            "JOIN current_phase1_publications publication "
+            "ON publication.chunk_id=marker.chunk_id "
+            "AND publication.phase1_generation_key=marker.phase1_generation_key "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM profile_marker_decisions decision "
+            "WHERE decision.marker_id=marker.id "
+            "AND decision.profile_policy_key=?) "
+            "AND marker.phase1_generation_key=? "
+            "ORDER BY marker.id",
+            (PROFILE_MATERIALIZATION_POLICY_KEY, phase1_generation_key),
+        ).fetchall()
     if not rows:
         _rewrite_profile_md(conn, cfg)
         return
@@ -42,47 +78,162 @@ def consolidate_profile(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         "style": "style",
     }
 
-    for row in rows:
-        profile_kind = kind_to_profile.get(row["kind"], "context")
-        text = row["statement"]
-        existing = conn.execute(
-            "SELECT id, pos_evidence FROM profile_entries WHERE text = ?",
-            (text,),
-        ).fetchone()
-        if existing:
-            conn.execute(
-                """
-                UPDATE profile_entries
-                SET pos_evidence = pos_evidence + 1,
-                    last_updated = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (existing["id"],),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO profile_entries(kind, text) VALUES (?, ?)",
-                (profile_kind, text),
-            )
-        conn.execute(
-            "UPDATE behavioral_markers SET consolidated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (row["id"],),
-        )
+    from hymem.core.db import evidence_mutation
 
-    # Cap profile size: drop weakest entries when over the limit.
-    conn.execute(
-        """
-        DELETE FROM profile_entries
-        WHERE id IN (
-            SELECT id FROM profile_entries
-            ORDER BY pos_evidence ASC, last_updated ASC
-            LIMIT MAX(0, (SELECT COUNT(*) FROM profile_entries) - ?)
-        )
-        """,
-        (cfg.profile_max_entries,),
-    )
+    with evidence_mutation(conn):
+        for row in rows:
+            profile_kind = kind_to_profile.get(row["kind"], "context")
+            text = row["statement"]
+            generation_key = row["phase1_generation_key"]
+            existing = conn.execute(
+                "SELECT id,kind,source FROM profile_entries WHERE text=?",
+                (text,),
+            ).fetchone()
+            if generation_key is None:
+                # Explicit legacy compatibility never upgrades an unattributed
+                # marker into current producer authority.
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO profile_entries(kind,text,source) "
+                        "VALUES (?,?,'legacy_unattributed')",
+                        (profile_kind, text),
+                    )
+            elif existing is not None and existing["source"] == "user":
+                # A manual/told row dominates an identical inferred signal.
+                # Still record a completed non-materializing decision so the
+                # marker does not loop forever on every dream.
+                conn.execute(
+                    "DELETE FROM profile_entry_marker_evidence WHERE marker_id=?",
+                    (int(row["id"]),),
+                )
+                conn.execute(
+                    "DELETE FROM profile_marker_decisions WHERE marker_id=?",
+                    (int(row["id"]),),
+                )
+                conn.execute(
+                    "INSERT INTO profile_marker_decisions("
+                    "marker_id,phase1_generation_key,profile_policy_key,"
+                    "decision,profile_entry_id) "
+                    "VALUES (?,?,?,'manual_authority',?)",
+                    (
+                        int(row["id"]), generation_key,
+                        PROFILE_MATERIALIZATION_POLICY_KEY, int(existing["id"]),
+                    ),
+                )
+            else:
+                if existing is None:
+                    cursor = conn.execute(
+                        "INSERT INTO profile_entries(kind,text,source) "
+                        "VALUES (?,?,'agent_inferred')",
+                        (profile_kind, text),
+                    )
+                    entry_id = int(cursor.lastrowid)
+                elif existing["kind"] != profile_kind:
+                    # The UNIQUE text row already has another semantic kind;
+                    # do not forge a link that contradicts marker lineage, but
+                    # record the deterministic non-materializing outcome.
+                    entry_id = -1
+                else:
+                    entry_id = int(existing["id"])
+                    if existing["source"] == "legacy_unattributed":
+                        conn.execute(
+                            "UPDATE profile_entries SET source='agent_inferred',"
+                            "last_updated=CURRENT_TIMESTAMP WHERE id=?",
+                            (entry_id,),
+                        )
+                marker_id = int(row["id"])
+                conn.execute(
+                    "DELETE FROM profile_entry_marker_evidence WHERE marker_id=?",
+                    (marker_id,),
+                )
+                conn.execute(
+                    "DELETE FROM profile_marker_decisions WHERE marker_id=?",
+                    (marker_id,),
+                )
+                if entry_id >= 0:
+                    conn.execute(
+                        "INSERT INTO profile_entry_marker_evidence("
+                        "profile_entry_id,marker_id,phase1_generation_key) "
+                        "VALUES (?,?,?)",
+                        (entry_id, marker_id, generation_key),
+                    )
+                    conn.execute(
+                        "INSERT INTO profile_marker_decisions("
+                        "marker_id,phase1_generation_key,profile_policy_key,"
+                        "decision,profile_entry_id) "
+                        "VALUES (?,?,?,'materialized',?)",
+                        (
+                            marker_id, generation_key,
+                            PROFILE_MATERIALIZATION_POLICY_KEY, entry_id,
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE profile_entries SET pos_evidence=("
+                        "SELECT COUNT(*) FROM profile_entry_marker_evidence "
+                        "WHERE profile_entry_id=?),last_updated=CURRENT_TIMESTAMP "
+                        "WHERE id=?",
+                        (entry_id, entry_id),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO profile_marker_decisions("
+                        "marker_id,phase1_generation_key,profile_policy_key,"
+                        "decision,profile_entry_id) "
+                        "VALUES (?,?,?,'identity_conflict',?)",
+                        (
+                            marker_id, generation_key,
+                            PROFILE_MATERIALIZATION_POLICY_KEY, int(existing["id"]),
+                        ),
+                    )
+            conn.execute(
+                "UPDATE behavioral_markers SET "
+                "consolidated_at=COALESCE(consolidated_at,CURRENT_TIMESTAMP) "
+                "WHERE id=?",
+                (row["id"],),
+            )
+
+    # profile_max_entries is a read/render budget.  Deleting a supported row
+    # after stamping its marker consolidated made the signal impossible to
+    # replay; retain the ledger and apply the cap in `_rewrite_profile_md`.
 
     _rewrite_profile_md(conn, cfg)
+
+
+# Bind completed marker decisions to a pinned, runtime-independent executable
+# policy.  A deliberate semantic edit must mint a new key and retain older
+# decisions as history; an accidental edit fails closed instead of silently
+# treating old marker materializations as current.
+PROFILE_MATERIALIZATION_POLICY_KEY = "marker-profile-materialization-v4"
+PROFILE_MATERIALIZATION_POLICY_SHA256 = (
+    "sha256:e9ced99351fb9a4aa08634d551712877769eebfec740ac302de40eb6134a36ac"
+)
+
+
+def profile_materialization_policy_sha256() -> str:
+    """Return the source commitment captured at module import.
+
+    A rolling deploy may replace this file while an old worker remains alive.
+    Late source reads would let that worker stamp NEW source while executing
+    its already-loaded OLD function.
+    """
+
+    if (
+        consolidate_profile is not _PROFILE_MATERIALIZATION_FUNCTION
+        or _rewrite_profile_md is not _PROFILE_REWRITE_FUNCTION
+    ):
+        return "sha256:" + hashlib.sha256(
+            b"profile-materialization-runtime-drift"
+        ).hexdigest()
+    return _PROFILE_MATERIALIZATION_IMPORT_SHA256
+
+
+def validate_profile_materialization_policy() -> None:
+    actual = profile_materialization_policy_sha256()
+    if actual != PROFILE_MATERIALIZATION_POLICY_SHA256:
+        raise RuntimeError(
+            "profile materialization policy changed without a new policy key "
+            f"(expected {PROFILE_MATERIALIZATION_POLICY_SHA256}, got {actual})"
+        )
 
 
 def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
@@ -162,10 +313,22 @@ def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
 
 def _rewrite_profile_md(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
+    body = current_profile_body(conn, cfg)
+    markdown_io.write_section(
+        cfg.user_md_path,
+        "behavioral_profile",
+        body,
+        header="## Behavioral Profile (auto, do not edit manually)",
+    )
+
+
+def current_profile_body(conn: sqlite3.Connection, cfg: HyMemConfig) -> str:
+    """Render only the producer-authorized behavioral profile projection."""
+
     rows = conn.execute(
         """
         SELECT kind, text, pos_evidence, neg_evidence
-        FROM profile_entries
+        FROM current_profile_entries
         ORDER BY pos_evidence DESC, last_updated DESC
         LIMIT ?
         """,
@@ -173,17 +336,46 @@ def _rewrite_profile_md(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
     ).fetchall()
 
     if not rows:
-        body = "_No behavioral signals collected yet._"
-    else:
-        lines = []
-        for r in rows:
-            conf = confidence(r["pos_evidence"], r["neg_evidence"])
-            lines.append(f"- [{r['kind']}] {r['text']} _(confidence {conf:.2f})_")
-        body = "\n".join(lines)
+        return "_No behavioral signals collected yet._"
+    lines = []
+    for r in rows:
+        conf = confidence(r["pos_evidence"], r["neg_evidence"])
+        lines.append(f"- [{r['kind']}] {r['text']} _(confidence {conf:.2f})_")
+    return "\n".join(lines)
 
-    markdown_io.write_section(
-        cfg.user_md_path,
-        "behavioral_profile",
-        body,
-        header="## Behavioral Profile (auto, do not edit manually)",
+
+def authoritative_user_markdown(
+    conn: sqlite3.Connection,
+    cfg: HyMemConfig,
+) -> str:
+    """Return USER.md with its managed section refreshed in memory.
+
+    The file remains a compatibility/inspection sidecar.  A producer switch is
+    connection-local and can happen before another dream rewrites that file, so
+    query paths must never trust its auto section as read authority.
+    """
+
+    existing = (
+        cfg.user_md_path.read_text(encoding="utf-8")
+        if cfg.user_md_path.exists() else ""
     )
+    return markdown_io.render_section(
+        existing,
+        "behavioral_profile",
+        current_profile_body(conn, cfg),
+        header="## Behavioral Profile (auto, do not edit manually)",
+        insert_if_missing=True,
+    )
+
+
+_PROFILE_MATERIALIZATION_FUNCTION = consolidate_profile
+_PROFILE_REWRITE_FUNCTION = _rewrite_profile_md
+_PROFILE_MATERIALIZATION_SOURCE_AT_IMPORT = (
+    textwrap.dedent(inspect.getsource(consolidate_profile))
+    .replace("\r\n", "\n").replace("\r", "\n").strip()
+)
+_PROFILE_MATERIALIZATION_IMPORT_SHA256 = (
+    "sha256:" + hashlib.sha256(
+        _PROFILE_MATERIALIZATION_SOURCE_AT_IMPORT.encode("utf-8")
+    ).hexdigest()
+)

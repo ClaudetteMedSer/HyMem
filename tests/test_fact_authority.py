@@ -24,7 +24,10 @@ from hymem.dreaming.message_coverage import (
     LOSSLESS_COVERAGE_VERSION,
     coverage_chunk_id,
 )
-from hymem.extraction.embeddings import embedding_text_hash
+from hymem.extraction.embeddings import (
+    MappedStubEmbeddingClient,
+    embedding_text_hash,
+)
 from hymem.extraction.llm import LLMRequest, StubLLMClient
 from hymem.query import augment as augment_module
 from hymem.query.augment import _fact_search
@@ -311,7 +314,7 @@ class _AdaptiveFactLLM(StubLLMClient):
             fixtures={
                 "Return the JSON object now":
                     '{"episodes":[],"summary":"","procedures":[]}',
-                "single pass": '{"triples":[],"markers":[]}',
+                "single pass": '{"triples":[],"markers":[],"complete":true}',
             },
             default="[]",
         )
@@ -993,10 +996,13 @@ def test_fact_query_keysets_past_old_cap_with_bounded_heap_and_caches(monkeypatc
         max_heap = max(max_heap, len(heap))
 
     monkeypatch.setattr(augment_module.heapq, "heappush", counted_push)
+    # Let the maintained exact producer create the private vector-space-bound
+    # query value.  A bare list deliberately has no v57 producer authority.
     hits = _fact_search(
         vector_conn, "x", top_k=1,
-        embedding_client=StubEmbeddingClient(dim_value=2),
-        query_vector=[1.0, 0.0],
+        embedding_client=MappedStubEmbeddingClient(
+            {"x": [1.0, 0.0]}, model="fact-page-fixture-v1", dim=2,
+        ),
     )
     assert [hit.fact_id for hit in hits] == [total]
     assert max(proof_page_sizes) <= 64

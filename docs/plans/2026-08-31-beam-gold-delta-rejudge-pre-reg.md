@@ -1,5 +1,10 @@
 # Pre-registration: BEAM gold-delta rejudge (B−A) — 2026-08-31 (v0.2)
 
+> **Archived protocol.** This document preserves an executed experiment against
+> the now-retired mutable `deepseek-chat` alias. Its model flags and commands
+> are provenance, not current instructions. Live runs pin
+> `deepseek-v4-flash` with thinking disabled.
+
 Status: **EXECUTED 2026-08-31** — amendments incorporated, run complete,
 readout in §8. Branch: Beam-optimisation.
 Supersedes the draft "three-arm + pin" pre-registration (v0.1, unexecutable: no

@@ -17,11 +17,14 @@ benchmark datasets, model SDKs, or network access.
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import json
 import os
 import argparse
 import math
+import sys
 import tempfile
 import threading
 import re
@@ -30,21 +33,113 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - benchmark runners are POSIX today
     fcntl = None
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+from hymem.deadline import DeadlineExceeded, MonotonicDeadline
+from hymem.dreaming.status import (
+    DREAM_STATUS_SCHEMA_VERSION,
+    DREAM_STATUS_PHASE1_AUTHORITY_FIELDS,
+    DURABLE_MALFORMED_FIELDS,
+    DURABLE_PENDING_FIELDS,
+)
 
 
 STRICT_PROTOCOL_VERSION = "hymem-benchmark-strict-v1"
 CHECKPOINT_VERSION = "hymem-benchmark-checkpoint-v1"
 CALIBRATION_VERSION = "hymem-benchmark-calibration-v1"
-_CODE_SUFFIXES = {".py", ".sql", ".md", ".json", ".yaml", ".yml", ".toml", ".txt"}
+CODE_IDENTITY_VERSION = "hymem-benchmark-code-v2"
+BENCHMARK_INDEXING_STATUS_VERSION = "hymem-benchmark-indexing-status-v3"
+_EMBEDDING_PENDING_FIELDS = (
+    "pending_chunk_embeddings",
+    "pending_message_embeddings",
+    "pending_edge_embeddings",
+    "pending_episode_embeddings",
+    "pending_fact_embeddings",
+)
+_DURABLE_QUARANTINE_FIELDS = (
+    "quarantined_chunks",
+    "quarantined_digests",
+    "quarantined_profiles",
+    "quarantined_facts",
+    "quarantined_facts_malformed",
+)
+
+
+def _phase1_authority_status_reason(status: Mapping[str, Any]) -> str | None:
+    """Validate the current status schema's Phase-1 producer authority."""
+
+    if not set(DREAM_STATUS_PHASE1_AUTHORITY_FIELDS).issubset(status):
+        return "malformed_status_shape"
+    backlog_status = status.get("phase1_backlog_status")
+    authoritative = status.get("pending_chunks_authoritative")
+    generation_key = status.get("phase1_generation_key")
+    if not isinstance(authoritative, bool) or backlog_status not in {
+        "current_producer", "producer_unavailable",
+    }:
+        return "malformed_status_shape"
+    if authoritative:
+        if (
+            backlog_status != "current_producer"
+            or not isinstance(generation_key, str)
+            or not generation_key
+        ):
+            return "malformed_status_shape"
+        return None
+    if backlog_status != "producer_unavailable" or generation_key is not None:
+        return "malformed_status_shape"
+    return "phase1_producer_unavailable"
+_CURRENT_DREAM_REPORT_FAILURE_FIELDS = (
+    "chunk_extraction_failures",
+    "coverage_integrity_failures",
+    "digest_failures",
+    "digest_quarantined",
+    "profile_failures",
+    "fact_failures",
+    "aggregation_fusion_failures",
+    "aggregation_build_exceptions",
+)
+_CURRENT_DREAM_REPORT_BOOLEAN_FIELDS = (
+    "budget_exhausted",
+    "extraction_provider_attempt_budget_exhausted",
+    "skipped_locked",
+)
+# Directory expansion is deliberately limited to executable Python and SQL.
+# Data/config inputs are still hashable when a caller names the exact file;
+# incidental prose in a package directory is never benchmark code.
+_CODE_DIRECTORY_SUFFIXES = {".py", ".sql"}
+_CHECKPOINT_COMMON_ROOT_FIELDS = (
+    "schema",
+    "run_id",
+    "manifest",
+    "expected_ids",
+    "scored",
+    "verdict_key",
+    "entries",
+    "execution_segments",
+    "status",
+)
+_CHECKPOINT_FINAL_ROOT_FIELDS = ("counts", "failure_ids")
+_CHECKPOINT_COUNT_FIELDS = (
+    "expected",
+    "attempted",
+    "unique_attempted",
+    "total_attempts",
+    "completed",
+    "failed",
+    "missing",
+)
 
 
 class BenchmarkIntegrityError(ValueError):
     """The benchmark evidence is incomplete, ambiguous, or inconsistent."""
+
+
+class BenchmarkCleanupError(BenchmarkIntegrityError):
+    """Caller-owned benchmark resources did not close cleanly."""
 
 
 class IndexingConvergenceError(BenchmarkIntegrityError):
@@ -53,6 +148,342 @@ class IndexingConvergenceError(BenchmarkIntegrityError):
     def __init__(self, message: str, summary: Mapping[str, Any]):
         super().__init__(message)
         self.summary = dict(summary)
+
+
+def is_structural_benchmark_error(exc: BaseException) -> bool:
+    """Whether an item boundary must abort instead of emitting a score row.
+
+    Benchmark integrity and cleanup failures describe the validity of the run,
+    not the quality of one model answer.  Indexing convergence is the deliberate
+    exception: strict adapters retain it as an explicit, score-zero indexing row
+    with its bounded health evidence.
+    """
+
+    return isinstance(exc, BenchmarkIntegrityError) and not isinstance(
+        exc, IndexingConvergenceError
+    )
+
+
+_SAFE_EXCEPTION_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,127}")
+_SAFE_DIAGNOSTIC_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,127}")
+_SAFE_FAILURE_CODES = frozenset({
+    "branch_incomplete",
+    "call_failure",
+    "clean_empty",
+    "contract_failure",
+    "coverage_integrity_failure",
+    "corrupt_store_build_receipt",
+    "execution_did_not_produce_a_row",
+    "incomplete_response",
+    "input_contract_failure",
+    "internal_validation_failure",
+    "incompatible_store_build_receipt_version",
+    "item_validation_failure",
+    "judge_or_reader_returned_no_valid_verdict",
+    "malformed_store_build_receipt",
+    "materialization_failure",
+    "malformed_aggregation_failure_report",
+    "malformed_cycle_failure_report",
+    "malformed_coverage_integrity_state",
+    "malformed_durable_state",
+    "malformed_pending_backlog",
+    "malformed_quarantine_state",
+    "malformed_status_shape",
+    "malformed_terminal_loss_state",
+    "max_cycles_exhausted",
+    "missing_prediction",
+    "missing_store_build_receipt",
+    "no_digest_input",
+    "no_valid_prediction_verdict",
+    "output_limit_exceeded",
+    "oversized_store_build_receipt",
+    "parse_failure",
+    "quarantined_extraction",
+    "reader_transport_or_content_failure",
+    "reader_transport_or_empty_response",
+    "resource_limit",
+    "response_conflict",
+    "shape_failure",
+    "source_coverage_failure",
+    "source_stream_invalid",
+    "skipped_indexing_reused_store",
+    "store_build_identity_unavailable",
+    "store_build_identity_mismatch",
+    "store_build_receipt_changed_during_reuse",
+    "store_build_receipt_publication_failed",
+    "store_embedding_attestation_failed",
+    "store_embedding_state_mismatch",
+    "store_material_attestation_failed",
+    "store_material_state_mismatch",
+    "supported_claim_evidence_missing",
+    "supported_claim_missing",
+    "terminal_extraction_source_loss",
+    "timeout",
+    "timeout_after_cycle",
+    "timeout_before_cycle",
+    "timeout_during_cycle",
+    "unexpected_canary_output",
+    "unspecified_failure",
+})
+_EXCEPTION_FAILURE_CODES = frozenset({
+    "answer_containment",
+    "conversation_failure",
+    "cycle_exception",
+    "embedding_usage",
+    "execution_failure",
+    "memory_pipeline_usage",
+    "probe_failure",
+    "reader_usage",
+    "recall_gold_turns",
+    "retrieval_usage",
+    "worker_failure",
+})
+_INDEXING_FAILURE_CODES = frozenset({
+    code for code in _SAFE_FAILURE_CODES
+    if code in {
+        "coverage_integrity_failure",
+        "malformed_aggregation_failure_report",
+        "malformed_cycle_failure_report",
+        "malformed_coverage_integrity_state",
+        "malformed_durable_state",
+        "malformed_pending_backlog",
+        "malformed_quarantine_state",
+        "malformed_status_shape",
+        "malformed_terminal_loss_state",
+        "max_cycles_exhausted",
+        "quarantined_extraction",
+        "terminal_extraction_source_loss",
+        "timeout_after_cycle",
+        "timeout_before_cycle",
+        "timeout_during_cycle",
+    }
+} | {"cycle_exception"})
+_CLEANUP_ACTIONS = frozenset({
+    "adapter_close",
+    "checkpoint_close",
+    "dream_fork_close",
+    "embedding_usage_snapshot",
+    "execution_segment_snapshot",
+    "runtime_usage_handoff",
+    "gc_collect",
+    "indexing_summary_snapshot",
+    "pipeline_usage_snapshot",
+    "query_cache_invalidation",
+    "resource_close",
+    "temporary_store_cleanup",
+})
+
+
+def bounded_exception_type(exc: BaseException) -> str:
+    """Return a bounded class identity safe for durable benchmark evidence."""
+
+    name = type(exc).__name__
+    return name if _SAFE_EXCEPTION_TYPE.fullmatch(name) else "Exception"
+
+
+def bounded_failure_text(value: object) -> str:
+    """Project operational failure detail onto a small, source-free schema.
+
+    Durable benchmark failures are machine evidence, not logs.  This accepts
+    the codes emitted by the strict adapters, optionally followed by one
+    bounded exception class, and deliberately discards every free-form tail.
+    Question/answer/evidence fields are handled separately and remain exact.
+    """
+
+    text = str(value or "").strip()
+    if ";" in text:
+        parts = [part.strip() for part in text.split(";")]
+        if 1 < len(parts) <= 4 and all(parts):
+            normalized = [bounded_failure_text(part) for part in parts]
+            if all(part != "unspecified_failure" for part in normalized):
+                return ";".join(normalized)
+    if text in _SAFE_FAILURE_CODES:
+        return text
+    if re.fullmatch(
+        r"judge_(?:transport_or_parse_failure|parse_failure|missing_rubric|"
+        r"malformed|unreadable|criterion_[0-9]{1,6}_"
+        r"(?:transport|unreadable|invalid_score|invalid_reason))",
+        text,
+    ):
+        return text
+
+    # ``indexing_failure`` carries another closed reason code, never an
+    # exception message.  A cycle exception's class lives in the versioned
+    # indexing summary instead of being smuggled into this row-level code.
+    indexing = re.fullmatch(r"indexing_failure:([a-z][a-z0-9_]{0,127})", text)
+    if indexing is not None and indexing.group(1) in _INDEXING_FAILURE_CODES:
+        return text
+
+    # Read both the new compact form and legacy ``code: Type: raw message``
+    # while emitting only ``code:Type``.  This makes checkpoint recovery safe
+    # without retaining a credential/path-bearing historical message.
+    exception = re.match(
+        r"^([a-z][a-z0-9_]{0,127})\s*:\s*"
+        r"([A-Za-z_][A-Za-z0-9_.]{0,127})(?:\s*:.*)?$",
+        text,
+        flags=re.DOTALL,
+    )
+    if exception is not None and exception.group(1) in _EXCEPTION_FAILURE_CODES:
+        return f"{exception.group(1)}:{exception.group(2)}"
+
+    # Legacy callers passed prose such as ``transport failed`` to the generic
+    # checkpoint API.  Keeping that prose would make the checkpoint/history a
+    # second exception log, so retain only the fact that the attempt failed.
+    return "unspecified_failure"
+
+
+def _cleanup_evidence(action: str, exc: BaseException) -> dict[str, str]:
+    if action not in _CLEANUP_ACTIONS:
+        raise ValueError("unknown benchmark cleanup action")
+    return {
+        "stage": action,
+        "exception_type": bounded_exception_type(exc),
+    }
+
+
+def _attach_cleanup_note(
+    primary: BaseException, failures: Sequence[Mapping[str, str]],
+) -> None:
+    """Attach bounded evidence without changing the primary exception identity."""
+
+    detail = json.dumps(list(failures), sort_keys=True, separators=(",", ":"))
+    try:
+        primary.add_note(f"benchmark cleanup failures: {detail}")
+    except (AttributeError, TypeError):  # pragma: no cover - pre-3.11 fallback
+        pass
+
+
+def run_cleanup_actions(
+    actions: Sequence[tuple[str, Callable[[], object]]],
+    *,
+    primary_exception: BaseException | None = None,
+    evidence_sink: list[dict[str, str]] | None = None,
+) -> tuple[dict[str, str], ...]:
+    """Attempt independent cleanup actions and preserve failure precedence.
+
+    Every action is attempted, even when an earlier action fails.  Evidence is
+    deliberately limited to a closed action enum and a bounded exception class;
+    exception messages, paths, endpoints and credentials never enter artifacts.
+
+    An already-active primary exception always remains authoritative.  With no
+    primary, an ordinary cleanup failure is a benchmark-integrity failure, while
+    a control-flow ``BaseException`` (including ``DeadlineExceeded``) is re-raised
+    unchanged after the remaining cleanup actions have been attempted.
+    """
+
+    failures: list[dict[str, str]] = []
+    failure_exceptions: list[BaseException] = []
+    for action, cleanup in actions:
+        if action not in _CLEANUP_ACTIONS:
+            raise ValueError("unknown benchmark cleanup action")
+        try:
+            cleanup()
+        except BaseException as exc:
+            failures.append(_cleanup_evidence(action, exc))
+            failure_exceptions.append(exc)
+
+    if evidence_sink is not None:
+        evidence_sink.extend(dict(item) for item in failures)
+    if not failures:
+        return ()
+
+    if primary_exception is not None:
+        _attach_cleanup_note(primary_exception, failures)
+        print(
+            "WARNING: benchmark cleanup failures: "
+            + json.dumps(failures, sort_keys=True, separators=(",", ":")),
+            file=sys.stderr,
+        )
+        return tuple(failures)
+
+    # ``Exception`` failures are ordinary cleanup faults.  Anything outside
+    # that hierarchy is control flow and must not be converted or swallowed.
+    for exc in failure_exceptions:
+        if not isinstance(exc, Exception):
+            _attach_cleanup_note(exc, failures)
+            raise exc
+
+    detail = ", ".join(
+        f"{item['stage']}:{item['exception_type']}" for item in failures
+    )
+    error = BenchmarkCleanupError(f"benchmark cleanup failed ({detail})")
+    error.cleanup_errors = tuple(dict(item) for item in failures)
+    raise error
+
+
+class OwnedResourceScope:
+    """Close caller-owned resources once without masking primary failures.
+
+    Benchmark provider clients are often shared by several logical roles and
+    worker threads.  This scope records object identity (rather than role),
+    closes in reverse construction order, and is itself idempotent.  Cleanup
+    failures are fatal when the benchmark otherwise succeeded; when another
+    exception is already in flight they are attached and printed while the
+    original exception remains authoritative.
+
+    Resources without a callable ``close`` are deliberately ignored.  This
+    lets simulation stubs and injected non-owning counters pass through without
+    pretending that the scope owns a transport they do not expose.
+    """
+
+    def __init__(self, label: str = "benchmark resources") -> None:
+        self.label = str(label)
+        self._resources: list[tuple[Callable[[], object], str]] = []
+        self._identities: set[int] = set()
+        self._closed = False
+
+    def own(self, resource: object, *, label: str | None = None):
+        """Register and return one explicitly caller-owned resource."""
+
+        close = None if resource is None else getattr(resource, "close", None)
+        if not callable(close):
+            return resource
+        if self._closed:
+            raise RuntimeError(f"{self.label} scope is already closed")
+        identity = id(resource)
+        if identity not in self._identities:
+            self._identities.add(identity)
+            self._resources.append((
+                close,
+                label or type(resource).__name__,
+            ))
+        return resource
+
+    def close(
+        self, *, primary_exception: BaseException | None = None,
+    ) -> tuple[dict[str, str], ...]:
+        """Close all registered resources, preserving ``primary_exception``."""
+
+        if self._closed:
+            return ()
+        self._closed = True
+        actions = [
+            ("resource_close", close)
+            for close, _resource_label in reversed(self._resources)
+        ]
+        return run_cleanup_actions(
+            actions, primary_exception=primary_exception,
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, exc, _traceback) -> bool:
+        self.close(primary_exception=exc)
+        return False
+
+
+def close_preserving_primary(
+    resource: object,
+    *,
+    label: str,
+    primary_exception: BaseException | None = None,
+) -> tuple[dict[str, str], ...]:
+    """Close one explicitly owned resource with scope cleanup semantics."""
+
+    scope = OwnedResourceScope(label)
+    scope.own(resource, label=type(resource).__name__)
+    return scope.close(primary_exception=primary_exception)
 
 
 _SECRET_KEY_PARTS = (
@@ -66,15 +497,49 @@ _SECRET_QUERY_KEYS = frozenset({
     "client_assertion", "assertion", "id_token", "saml_response",
 })
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_FILE_PATH_URI_IN_TEXT_RE = re.compile(
+    r"(?i)\b(?:file|sqlite):(?://)?/[^\s'\"<>]+"
+)
+_SCHEME_URI_IN_TEXT_RE = re.compile(
+    r"(?i)\b([A-Za-z][A-Za-z0-9+.-]*)://[^\s'\"<>]+"
+)
+_ABSOLUTE_PATH_IN_TEXT_RE = re.compile(
+    # Drive-qualified paths may use either separator even when the benchmark
+    # runner itself is POSIX, so ``Path.is_absolute`` is insufficient here.
+    r"(?<![A-Za-z0-9_.:/\\-])[A-Za-z]:[\\/][^\s'\"<>]+"
+    # Likewise accept both slash forms of UNC paths.  The negative lookbehind
+    # prevents the ``//host/path`` portion of an HTTP(S) URL from matching.
+    r"|(?<![A-Za-z0-9_.:/\\-])(?:\\\\|//)"
+    r"[^\\/\s'\"<>]+[\\/][^\\/\s'\"<>]+"
+    r"(?:[\\/][^\s'\"<>]+)*"
+    r"|(?<![A-Za-z0-9_.:/\\-])(?:/[A-Za-z0-9_.~%+-]+)+"
+)
+_SAFE_FAILURE_DETAIL_TEXT = re.compile(
+    r"^[a-z0-9_.\[\]-]+:[a-z0-9_]+$"
+)
 _EVIDENCE_TEXT_KEYS = frozenset({
     "answer", "content", "context", "gold", "gold_text", "hypothesis",
     "ideal_answer", "ideal_response", "prediction", "question", "response",
     "rubric", "summary", "text",
 })
+_OPERATIONAL_FAILURE_TEXT_KEYS = frozenset({
+    "benchmark_failure",
+    "error",
+    "failure",
+    "failure_reason",
+    "instrumentation_errors",
+    "probe_error",
+    "recall_diagnostic_error",
+})
 
 
 def _is_secret_key(value: str) -> bool:
     normalized = value.casefold().replace("-", "_")
+    if normalized in {"credentials_redacted", "path_redacted"}:
+        # These are fixed boolean sanitizer markers, never caller-supplied
+        # credential material.  Treating the marker itself as a secret makes
+        # sanitization non-idempotent and breaks checkpoint manifest recovery.
+        return False
     return (
         normalized in _SECRET_QUERY_KEYS
         or any(part in normalized for part in _SECRET_KEY_PARTS)
@@ -104,14 +569,12 @@ def _sanitized_url(value: str) -> str | dict[str, Any]:
                 "credentials_redacted": True,
             }
         netloc = host + (f":{port}" if port is not None else "")
-        redacted_query: list[tuple[str, str]] = []
-        query_redacted = False
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
-            if _is_secret_key(key):
-                redacted_query.append((key, "<redacted>"))
-                query_redacted = True
-            else:
-                redacted_query.append((key, item))
+        # Endpoint query values are impossible to classify exhaustively: a
+        # secret may sit under an innocuous key such as ``opaque``.  Active
+        # provider endpoints reject queries entirely; incidental URLs in
+        # artifacts therefore drop the complete query rather than attempting
+        # a credential-name allow/deny list.
+        query_redacted = bool(parsed.query)
         has_userinfo = parsed.username is not None or parsed.password is not None
         fragment_redacted = bool(parsed.fragment)
         if not has_userinfo and not query_redacted and not fragment_redacted:
@@ -120,7 +583,7 @@ def _sanitized_url(value: str) -> str | dict[str, Any]:
             parsed.scheme,
             netloc,
             parsed.path,
-            urlencode(redacted_query, doseq=True),
+            "",
             "",
         ))
         result: dict[str, Any] = {
@@ -129,11 +592,25 @@ def _sanitized_url(value: str) -> str | dict[str, Any]:
         }
         return result
     except (TypeError, ValueError):
+        # A malformed absolute HTTP URL is still credential-shaped input.  Do
+        # not preserve it just because URL parsing failed before userinfo or a
+        # query could be separated safely.
+        if isinstance(value, str) and re.match(r"(?i)^https?://", value):
+            return {
+                "url": "<redacted-invalid-url>",
+                "credentials_redacted": True,
+            }
         return value
 
 
 def _sanitize_failure_text(value: object) -> str:
-    """Scrub credentials from exception text while keeping it human-readable."""
+    """Return only a bounded operational code/type, never exception prose."""
+
+    return bounded_failure_text(value)
+
+
+def _scrub_sensitive_text(value: object) -> str:
+    """Redact credential syntax from ordinary non-evidence lifecycle text."""
 
     text = str(value)
 
@@ -142,9 +619,6 @@ def _sanitize_failure_text(value: object) -> str:
         return sanitized if isinstance(sanitized, str) else str(sanitized["url"])
 
     text = _URL_IN_TEXT_RE.sub(replace_url, text)
-    # Header values may contain a scheme plus credential, or several cookie
-    # pairs separated by semicolons. Redacting only the first token leaves the
-    # credential/tail behind, so treat the complete header line as opaque.
     text = re.sub(
         r"(?im)\b(proxy-authorization|authorization|set-cookie|cookie)"
         r"\s*:\s*[^\r\n]*",
@@ -183,7 +657,46 @@ def _sanitize_incidental_url_text(value: str) -> str | dict[str, Any]:
     return _URL_IN_TEXT_RE.sub(replace, value)
 
 
-def sanitize_for_artifact(value: Any, *, key_hint: str = "") -> Any:
+def _sanitize_incidental_path_text(value: str) -> str | dict[str, Any]:
+    """Remove host filesystem locations from non-evidence lifecycle text."""
+
+    if re.match(r"^(?:file|sqlite):", value, flags=re.IGNORECASE):
+        return {"path_redacted": True}
+    uri = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", value)
+    if uri is not None:
+        scheme = uri.group(1).casefold()
+        if scheme in {"http", "https"} or value == "local://feature-hash":
+            return value
+        # Unknown URI schemes are not part of current benchmark identity and
+        # may be wrappers around host paths. Fail closed on artifact output.
+        return {"path_redacted": True}
+    if Path(value).is_absolute():
+        return {"path_redacted": True}
+
+    def replace_uri(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        scheme = match.group(1).casefold()
+        if scheme in {"http", "https"} or candidate == "local://feature-hash":
+            return candidate
+        return "<redacted-path-uri>"
+
+    # Unknown URI schemes can wrap host paths just as file/sqlite URIs can.
+    # HTTP(S) has already had credentials/query material stripped above, and
+    # the one closed local identity token is deliberately stable.
+    scrubbed = _SCHEME_URI_IN_TEXT_RE.sub(replace_uri, value)
+    scrubbed = _FILE_PATH_URI_IN_TEXT_RE.sub("<redacted-path-uri>", scrubbed)
+    scrubbed = _ABSOLUTE_PATH_IN_TEXT_RE.sub("<redacted-path>", scrubbed)
+    return scrubbed
+
+
+def sanitize_for_artifact(
+    value: Any,
+    *,
+    key_hint: str = "",
+    _preserve_evidence_text: bool = True,
+    _bound_unknown_text: bool = False,
+    _execution_segment_scope: bool = False,
+) -> Any:
     """Remove credentials recursively while preserving score-relevant identity.
 
     Secret values are replaced by one opaque marker. Credentials deliberately
@@ -196,28 +709,76 @@ def sanitize_for_artifact(value: Any, *, key_hint: str = "") -> Any:
     if key_hint and _is_secret_key(key_hint):
         return {"redacted": True}
     if isinstance(value, Mapping):
-        return {
-            str(key): sanitize_for_artifact(item, key_hint=str(key))
-            for key, item in value.items()
-        }
+        sanitized_mapping: dict[str, Any] = {}
+        for key, item in value.items():
+            child_key = str(key)
+            child_folded = child_key.casefold().replace("-", "_")
+            segment_scope = (
+                _execution_segment_scope
+                or child_folded == "execution_segments"
+                or (key_folded == "execution" and child_folded == "segments")
+            )
+            sanitized_mapping[child_key] = sanitize_for_artifact(
+                item,
+                key_hint=child_key,
+                _preserve_evidence_text=(
+                    False if segment_scope else _preserve_evidence_text
+                ),
+                _bound_unknown_text=(
+                    True if segment_scope else _bound_unknown_text
+                ),
+                _execution_segment_scope=segment_scope,
+            )
+        return sanitized_mapping
     if isinstance(value, (list, tuple)):
-        return [sanitize_for_artifact(item, key_hint=key_hint) for item in value]
+        return [
+            sanitize_for_artifact(
+                item,
+                key_hint=key_hint,
+                _preserve_evidence_text=_preserve_evidence_text,
+                _bound_unknown_text=_bound_unknown_text,
+                _execution_segment_scope=_execution_segment_scope,
+            )
+            for item in value
+        ]
     if isinstance(value, str):
-        if any(part in key_folded for part in ("error", "failure", "exception")):
+        if key_folded == "exception_type":
+            return value if _SAFE_EXCEPTION_TYPE.fullmatch(value) else "Exception"
+        if key_folded in {"stage", "code"}:
+            return value if _SAFE_DIAGNOSTIC_TOKEN.fullmatch(value) else "unknown"
+        if key_folded == "failure_details":
+            return (
+                value if len(value) <= 256
+                and _SAFE_FAILURE_DETAIL_TEXT.fullmatch(value)
+                else "diagnostic:invalid"
+            )
+        if key_folded in _OPERATIONAL_FAILURE_TEXT_KEYS or key_folded.endswith(
+            ("_error", "_errors", "_exception", "_exceptions")
+        ):
             return _sanitize_failure_text(value)
-        if key_folded in _EVIDENCE_TEXT_KEYS:
+        if _preserve_evidence_text and key_folded in _EVIDENCE_TEXT_KEYS:
             return value
+        if _bound_unknown_text and len(value) > 4096:
+            # Execution telemetry has no score-bearing prose.  A giant string
+            # under an unanticipated key is therefore neither useful identity
+            # nor safe diagnostics; importantly, it cannot become a durable
+            # copy of an exception/provider response just because its producer
+            # called the field ``summary`` or ``detail``.
+            return "<redacted-oversized-text>"
         # Configuration and lifecycle strings can carry credential-shaped
         # headers even under an innocuous key (for example {"detail":
         # "Authorization: Bearer ..."}). Evidence-bearing text keys above
         # remain byte-for-byte untouched for rejudging.
-        scrubbed = _sanitize_failure_text(value)
-        if scrubbed != value:
-            return scrubbed
-        sanitized = _sanitize_incidental_url_text(value)
-        if sanitized != value:
+        # Run all three transforms.  Returning after the first credential
+        # match used to leave an absolute path later in the same diagnostic.
+        # Scrubbing URLs first also preserves the historical string type of
+        # endpoint identity fields required by strict canary/registry schemas.
+        scrubbed = _scrub_sensitive_text(value)
+        sanitized = _sanitize_incidental_url_text(scrubbed)
+        if not isinstance(sanitized, str):
             return sanitized
-        return value
+        sanitized_path = _sanitize_incidental_path_text(sanitized)
+        return sanitized_path
     return value
 
 
@@ -344,6 +905,20 @@ def dataclass_identity(value: object, *, exclude: Iterable[str] = ()) -> dict[st
     }
 
 
+def effective_hymem_config_identity(value: object) -> dict[str, Any]:
+    """Score/material identity for a resolved ``HyMemConfig``.
+
+    ``root`` is runtime placement. ``extraction_feedback_keep`` bounds a local
+    retraction-audit table that neither enters prompts nor material-store
+    attestation. Including either would split otherwise identical benchmark
+    arms on operational state rather than memory behavior.
+    """
+
+    return dataclass_identity(
+        value, exclude={"root", "extraction_feedback_keep"}
+    )
+
+
 def converge_indexing(
     dream,
     *,
@@ -351,14 +926,32 @@ def converge_indexing(
     max_cycles: int,
     timeout_s: float,
     require_healthy: bool = True,
+    _clock=None,
 ) -> dict[str, Any]:
     """Run bounded dream cycles until the durable extraction backlog is empty.
 
     ``dream`` returns a DreamReport-like dataclass or mapping. ``status`` is an
     optional read-only durable backlog callback. A single non-exhausted report
-    is insufficient when durable pending work remains. Quarantined work makes
+    is insufficient when durable pending work remains. Quarantined work,
+    prompt-independent terminal source loss, and unestablished lossless
+    coverage integrity, and an enabled aggregation build without a clean
+    config-matched acknowledgement make
     canonical/healthy completion fail loudly rather than masquerading as a
-    completed index.
+    completed index. Coverage corruption is durable but can be healed by a
+    later complete source walk, so cycle-local coverage failures consume the
+    same bounded retry loop as every other transient report failure. After an
+    operator resolves a cause or the next walk succeeds, the durable signal is
+    cleared before completion.
+
+    The bound is one absolute monotonic deadline, not a fresh timeout per
+    cycle/attempt. Shipped network clients cap every request and retry sleep to
+    its remaining time. This is necessarily cooperative: an injected provider
+    that ignores its request timeout cannot safely be killed in-process; when
+    it eventually returns, its result is rejected before semantic publication
+    and the convergence call reports ``timeout_during_cycle``. Deadline-bound
+    runs deliberately avoid the normal background embedding worker for the
+    same reason. Rollback, lease release, and terminal run telemetry are the
+    only writes permitted after expiry.
     """
 
     if isinstance(max_cycles, bool) or not isinstance(max_cycles, int) or max_cycles <= 0:
@@ -371,6 +964,10 @@ def converge_indexing(
     ):
         raise BenchmarkIntegrityError("indexing timeout_s must be positive and finite")
 
+    clock = time.monotonic if _clock is None else _clock
+    if not callable(clock):
+        raise BenchmarkIntegrityError("indexing monotonic clock must be callable")
+
     def normalize_report(report: object) -> dict[str, Any]:
         if isinstance(report, Mapping):
             return dict(report)
@@ -378,12 +975,53 @@ def converge_indexing(
             return dataclass_identity(report)
         raise BenchmarkIntegrityError("dream returned a malformed report")
 
-    started = time.monotonic()
+    started = float(clock())
+    if not math.isfinite(started):
+        raise BenchmarkIntegrityError("indexing monotonic clock is malformed")
+    deadline = MonotonicDeadline(
+        started + float(timeout_s), clock=clock,
+    )
     reports: list[dict[str, Any]] = []
     latest_status: dict[str, Any] = {}
 
+    def call_dream():
+        """Pass the one absolute deadline to capable dream callbacks.
+
+        Signature inspection avoids a catch-and-retry-on-TypeError pattern,
+        which could execute a side-effecting callback twice.  Legacy/custom
+        callbacks with no deadline parameter remain source-compatible, but
+        shipped benchmark adapters all route through ``HyMem.dream`` and thus
+        receive the deadline.
+        """
+
+        try:
+            signature = inspect.signature(dream)
+        except (TypeError, ValueError):
+            return dream()
+        parameters = signature.parameters
+        deadline_parameter = parameters.get("deadline")
+        if (
+            deadline_parameter is not None
+            and deadline_parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+        ):
+            return dream(deadline)
+        accepts_deadline = (
+            (
+                deadline_parameter is not None
+                and deadline_parameter.kind in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+            )
+            or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        )
+        return dream(deadline=deadline) if accepts_deadline else dream()
+
     def summary(*, complete: bool, reason: str | None = None) -> dict[str, Any]:
-        elapsed = time.monotonic() - started
+        elapsed = max(0.0, float(clock()) - started)
         quarantined = {
             key: value for key, value in latest_status.items()
             if "quarantined" in key
@@ -391,13 +1029,38 @@ def converge_indexing(
             and not isinstance(value, bool)
             and value > 0
         }
+        terminal_losses = {
+            key: value for key, value in latest_status.items()
+            if key.startswith("terminal_loss_")
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+        }
+        coverage_integrity_failure = latest_status.get(
+            "coverage_integrity_failures", 0
+        )
+        malformed = {
+            key: value for key, value in latest_status.items()
+            if key in DURABLE_MALFORMED_FIELDS
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+        }
+        in_progress = latest_status.get("in_progress", False)
         return {
             "cycles": len(reports),
             "max_cycles": max_cycles,
             "timeout_s": float(timeout_s),
             "elapsed_s": elapsed,
             "complete": bool(complete),
-            "healthy": bool(complete and not quarantined),
+            "healthy": bool(
+                complete
+                and not quarantined
+                and not terminal_losses
+                and not malformed
+                and coverage_integrity_failure == 0
+                and in_progress is False
+            ),
             "failure_reason": reason,
             "reports": reports,
             "final_status": latest_status,
@@ -405,39 +1068,165 @@ def converge_indexing(
         }
 
     for _cycle in range(max_cycles):
-        if time.monotonic() - started >= timeout_s:
+        if deadline.expired:
             current = summary(complete=False, reason="timeout_before_cycle")
             raise IndexingConvergenceError(
                 "memory indexing did not converge before its timeout", current
             )
+        dream_returned = False
+        report_appended = False
+        report_obj: object = None
         try:
-            report_obj = dream()
+            report_obj = call_dream()
+            dream_returned = True
+            # A legacy/custom callback may ignore the propagated deadline.
+            # Check before normalizing its result or making the status call.
+            deadline.check()
             report = normalize_report(report_obj)
             reports.append(report)
+            report_appended = True
             if status is not None:
+                deadline.check()
                 status_obj = status()
+                deadline.check()
                 if not isinstance(status_obj, Mapping):
                     raise BenchmarkIntegrityError(
                         "indexing status callback returned a malformed value"
                     )
                 latest_status = dict(status_obj)
+        except DeadlineExceeded as exc:
+            if dream_returned and not report_appended:
+                # The callback completed after its bound (for example a custom
+                # provider ignored its timeout).  Its DreamReport is safe,
+                # bounded evidence, but no subsequent status callback runs.
+                reports.append(normalize_report(report_obj))
+            reason = (
+                "timeout_after_cycle"
+                if dream_returned else "timeout_during_cycle"
+            )
+            current = summary(
+                complete=False, reason=reason,
+            )
+            raise IndexingConvergenceError(
+                "memory indexing exceeded its deadline",
+                current,
+            ) from exc
         except Exception as exc:
+            if deadline.expired:
+                current = summary(
+                    complete=False, reason="timeout_during_cycle",
+                )
+                raise IndexingConvergenceError(
+                    "memory indexing exceeded its deadline during a cycle",
+                    current,
+                ) from exc
             current = summary(
                 complete=False,
-                reason=f"cycle_exception: {type(exc).__name__}: {exc}",
+                reason=f"cycle_exception:{bounded_exception_type(exc)}",
             )
             raise IndexingConvergenceError(
                 "memory indexing cycle failed", current
             ) from exc
-        elapsed = time.monotonic() - started
-        pending_values = {
-            key: value for key, value in latest_status.items()
-            if key.startswith("pending_")
-        }
+        current_status = (
+            latest_status.get("dream_status_schema")
+            == DREAM_STATUS_SCHEMA_VERSION
+        )
+        if (
+            "dream_status_schema" in latest_status
+            and not current_status
+        ):
+            current = summary(complete=False, reason="malformed_status_shape")
+            raise IndexingConvergenceError(
+                "memory indexing status has an unsupported schema", current
+            )
+        benchmark_status = latest_status.get("benchmark_indexing_status_schema")
+        if benchmark_status not in (None, BENCHMARK_INDEXING_STATUS_VERSION):
+            current = summary(complete=False, reason="malformed_status_shape")
+            raise IndexingConvergenceError(
+                "memory indexing benchmark status has an unsupported schema",
+                current,
+            )
+        if benchmark_status is not None and not current_status:
+            current = summary(complete=False, reason="malformed_status_shape")
+            raise IndexingConvergenceError(
+                "benchmark indexing status lacks its durable dream schema",
+                current,
+            )
+        if (
+            benchmark_status is None
+            and any(key in latest_status for key in _EMBEDDING_PENDING_FIELDS)
+        ):
+            current = summary(complete=False, reason="malformed_status_shape")
+            raise IndexingConvergenceError(
+                "embedding backlog lacks its benchmark status schema",
+                current,
+            )
+        schema_only_fields = (
+            set(DURABLE_PENDING_FIELDS) - {"pending_chunks", "pending_aggregation"}
+        ) | set(DURABLE_MALFORMED_FIELDS)
+        if not current_status and schema_only_fields.intersection(latest_status):
+            current = summary(complete=False, reason="malformed_status_shape")
+            raise IndexingConvergenceError(
+                "unversioned indexing status carries current-only health fields",
+                current,
+            )
+
+        if current_status:
+            authority_reason = _phase1_authority_status_reason(latest_status)
+            if authority_reason is not None:
+                current = summary(complete=False, reason=authority_reason)
+                raise IndexingConvergenceError(
+                    "memory indexing lacks exact Phase-1 producer authority",
+                    current,
+                )
+            required_pending = set(DURABLE_PENDING_FIELDS)
+            if benchmark_status == BENCHMARK_INDEXING_STATUS_VERSION:
+                required_pending.update(_EMBEDDING_PENDING_FIELDS)
+            allowed_pending = set(DURABLE_PENDING_FIELDS) | set(
+                _EMBEDDING_PENDING_FIELDS
+            ) | {"pending_chunks_authoritative"}
+            unknown_pending = {
+                key for key in latest_status
+                if isinstance(key, str)
+                and key.startswith("pending_")
+                and key not in allowed_pending
+            }
+            missing_pending = required_pending - set(latest_status)
+            if unknown_pending or missing_pending:
+                current = summary(
+                    complete=False, reason="malformed_status_shape"
+                )
+                raise IndexingConvergenceError(
+                    "memory indexing status has an incomplete pending schema",
+                    current,
+                )
+            pending_values = {
+                key: latest_status[key]
+                for key in sorted(required_pending)
+            }
+        else:
+            # Explicit schema-less compatibility contract: only the historical
+            # pending_chunks field is authoritative. Canonical benchmark
+            # receipts reject this shape; it is retained for custom callbacks.
+            if status is not None and "pending_chunks" not in latest_status:
+                current = summary(
+                    complete=False, reason="malformed_status_shape"
+                )
+                raise IndexingConvergenceError(
+                    "legacy memory indexing status is missing pending_chunks",
+                    current,
+                )
+            pending_values = {
+                key: value for key, value in latest_status.items()
+                if isinstance(key, str) and key.startswith("pending_")
+            }
         if any(
             isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
+            or not isinstance(value, int if current_status else (int, float))
+            or (
+                not current_status
+                and not math.isfinite(float(value))
+            )
             or value < 0
             for value in pending_values.values()
         ):
@@ -446,18 +1235,257 @@ def converge_indexing(
                 "memory indexing status has malformed pending backlog", current
             )
         pending = sum(pending_values.values())
-        exhausted = report.get("budget_exhausted") is True
-        skipped_locked = report.get("skipped_locked") is True
-        complete = not exhausted and not skipped_locked and pending == 0
-        if complete:
-            current = summary(complete=True)
-            if require_healthy and not current["healthy"]:
-                current["failure_reason"] = "quarantined_extraction"
+        if current_status:
+            missing_quarantine = set(_DURABLE_QUARANTINE_FIELDS) - set(
+                latest_status
+            )
+            unknown_quarantine = {
+                key for key in latest_status
+                if isinstance(key, str)
+                and "quarantined" in key
+                and key not in _DURABLE_QUARANTINE_FIELDS
+            }
+            if missing_quarantine or unknown_quarantine:
+                current = summary(
+                    complete=False, reason="malformed_status_shape"
+                )
                 raise IndexingConvergenceError(
-                    "memory indexing completed with quarantined extraction",
+                    "memory indexing status has an incomplete quarantine schema",
                     current,
                 )
-            if elapsed > timeout_s:
+            quarantine_values = {
+                key: latest_status[key] for key in _DURABLE_QUARANTINE_FIELDS
+            }
+        else:
+            quarantine_values = {
+                key: value for key, value in latest_status.items()
+                if isinstance(key, str) and "quarantined" in key
+            }
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int if current_status else (int, float))
+            or (
+                not current_status
+                and not math.isfinite(float(value))
+            )
+            or value < 0
+            for value in quarantine_values.values()
+        ):
+            current = summary(complete=False, reason="malformed_quarantine_state")
+            raise IndexingConvergenceError(
+                "memory indexing status has malformed quarantine state", current
+            )
+        terminal_loss_values = {
+            "terminal_loss_chunks": latest_status["terminal_loss_chunks"]
+        } if "terminal_loss_chunks" in latest_status else {}
+        if current_status and not terminal_loss_values:
+            current = summary(
+                complete=False, reason="malformed_status_shape"
+            )
+            raise IndexingConvergenceError(
+                "memory indexing status is missing terminal loss state", current
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+            for value in terminal_loss_values.values()
+        ):
+            current = summary(complete=False, reason="malformed_terminal_loss_state")
+            raise IndexingConvergenceError(
+                "memory indexing status has malformed terminal loss state", current
+            )
+        coverage_integrity_failure = latest_status.get(
+            "coverage_integrity_failures", None if current_status else 0
+        )
+        if (
+            isinstance(coverage_integrity_failure, bool)
+            or not isinstance(coverage_integrity_failure, int)
+            or coverage_integrity_failure < 0
+        ):
+            current = summary(
+                complete=False, reason="malformed_coverage_integrity_state"
+            )
+            raise IndexingConvergenceError(
+                "memory indexing status has malformed coverage integrity state",
+                current,
+            )
+        if current_status:
+            malformed_fields = set(DURABLE_MALFORMED_FIELDS) - set(latest_status)
+            unknown_malformed = {
+                key for key in latest_status
+                if isinstance(key, str)
+                and key.startswith("malformed_")
+                and key not in DURABLE_MALFORMED_FIELDS
+            }
+            if malformed_fields or unknown_malformed:
+                current = summary(
+                    complete=False, reason="malformed_status_shape"
+                )
+                raise IndexingConvergenceError(
+                    "memory indexing status has an incomplete malformed-state schema",
+                    current,
+                )
+            malformed_values = {
+                key: latest_status[key] for key in DURABLE_MALFORMED_FIELDS
+            }
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in malformed_values.values()
+            ):
+                current = summary(
+                    complete=False, reason="malformed_durable_state"
+                )
+                raise IndexingConvergenceError(
+                    "memory indexing status has malformed durable state", current
+                )
+            in_progress = latest_status.get("in_progress")
+            if not isinstance(in_progress, bool):
+                current = summary(
+                    complete=False, reason="malformed_status_shape"
+                )
+                raise IndexingConvergenceError(
+                    "memory indexing status has malformed in-progress state",
+                    current,
+                )
+            missing_report = (
+                set(_CURRENT_DREAM_REPORT_FAILURE_FIELDS)
+                | set(_CURRENT_DREAM_REPORT_BOOLEAN_FIELDS)
+            ) - set(report)
+            if missing_report:
+                current = summary(
+                    complete=False, reason="malformed_cycle_failure_report"
+                )
+                raise IndexingConvergenceError(
+                    "memory indexing report lacks current failure fields", current
+                )
+            report_failure_values = {
+                key: report[key] for key in _CURRENT_DREAM_REPORT_FAILURE_FIELDS
+            }
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in report_failure_values.values()
+            ) or any(
+                not isinstance(report[key], bool)
+                for key in _CURRENT_DREAM_REPORT_BOOLEAN_FIELDS
+            ):
+                current = summary(
+                    complete=False, reason="malformed_cycle_failure_report"
+                )
+                raise IndexingConvergenceError(
+                    "memory indexing report has malformed current failure fields",
+                    current,
+                )
+        else:
+            malformed_values = {}
+            in_progress = latest_status.get("in_progress", False)
+            if not isinstance(in_progress, bool):
+                current = summary(
+                    complete=False, reason="malformed_status_shape"
+                )
+                raise IndexingConvergenceError(
+                    "legacy memory indexing status has malformed in-progress state",
+                    current,
+                )
+            report_failure_values = {
+                key: report[key]
+                for key in (
+                    "aggregation_fusion_failures",
+                    "aggregation_build_exceptions",
+                )
+                if key in report
+            }
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+            for value in report_failure_values.values()
+        ):
+            current = summary(
+                complete=False,
+                reason="malformed_aggregation_failure_report",
+            )
+            raise IndexingConvergenceError(
+                "memory indexing report has malformed aggregation failures",
+                current,
+            )
+        report_failures = sum(report_failure_values.values())
+        exhausted = report.get("budget_exhausted") is True
+        provider_exhausted = (
+            report.get("extraction_provider_attempt_budget_exhausted") is True
+        )
+        skipped_locked = report.get("skipped_locked") is True
+        quarantine_total = sum(quarantine_values.values())
+        terminal_loss_total = sum(terminal_loss_values.values())
+        malformed_total = sum(malformed_values.values())
+        complete = bool(
+            not exhausted
+            and not provider_exhausted
+            and not skipped_locked
+            and not in_progress
+            and pending == 0
+            and report_failures == 0
+        )
+        if deadline.expired:
+            current = summary(
+                complete=False, reason="timeout_after_cycle",
+            )
+            raise IndexingConvergenceError(
+                "memory indexing exceeded its timeout", current
+            )
+        if require_healthy and malformed_total > 0:
+            current = summary(
+                complete=complete, reason="malformed_durable_state"
+            )
+            raise IndexingConvergenceError(
+                "memory indexing has malformed durable cursor or authority state",
+                current,
+            )
+        if require_healthy and terminal_loss_total > 0:
+            current = summary(
+                complete=complete, reason="terminal_extraction_source_loss"
+            )
+            raise IndexingConvergenceError(
+                "memory indexing has terminal extraction source loss", current
+            )
+        if require_healthy and quarantine_total > 0:
+            current = summary(
+                complete=complete, reason="quarantined_extraction"
+            )
+            raise IndexingConvergenceError(
+                "memory indexing has current-policy quarantined work", current
+            )
+        if complete:
+            current = summary(complete=True)
+            if require_healthy and coverage_integrity_failure > 0:
+                # Coverage repair is local and the runner clears this durable
+                # record after a later complete producer walk. Keep spending
+                # the caller's finite cycle bound, but never certify the
+                # mechanically drained snapshot as healthy in the meantime.
+                continue
+            if require_healthy and not current["healthy"]:
+                has_terminal_loss = any(
+                    key.startswith("terminal_loss_")
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and value > 0
+                    for key, value in latest_status.items()
+                )
+                current["failure_reason"] = (
+                    "terminal_extraction_source_loss"
+                    if has_terminal_loss else "quarantined_extraction"
+                )
+                raise IndexingConvergenceError(
+                    "memory indexing completed with unresolved extraction loss",
+                    current,
+                )
+            if deadline.expired:
                 current["complete"] = False
                 current["healthy"] = False
                 current["failure_reason"] = "timeout_after_cycle"
@@ -466,10 +1494,917 @@ def converge_indexing(
                 )
             return current
 
-    current = summary(complete=False, reason="max_cycles_exhausted")
+    if deadline.expired:
+        current = summary(complete=False, reason="timeout_after_cycle")
+        raise IndexingConvergenceError(
+            "memory indexing exceeded its timeout", current
+        )
+    terminal_reason = (
+        "coverage_integrity_failure"
+        if isinstance(latest_status.get("coverage_integrity_failures"), int)
+        and not isinstance(latest_status.get("coverage_integrity_failures"), bool)
+        and latest_status["coverage_integrity_failures"] > 0
+        else "max_cycles_exhausted"
+    )
+    current = summary(complete=False, reason=terminal_reason)
     raise IndexingConvergenceError(
         "memory indexing did not converge within max_cycles", current
     )
+
+
+def embedding_backlog_status(conn, client: object | None) -> dict[str, int]:
+    """Count absent, stale, wrong-identity, or invalid vector mirrors.
+
+    All corpus work stays in SQLite and every query returns one integer.  The
+    message query uses immutable lossless coverage proofs, so the audit remains
+    valid after opt-in raw-message pruning.  ``client is None`` means
+    embeddings are disabled, not that every source row is a backlog item.
+    """
+
+    if client is None:
+        return {
+            "pending_chunk_embeddings": 0,
+            "pending_message_embeddings": 0,
+            "pending_edge_embeddings": 0,
+            "pending_episode_embeddings": 0,
+            "pending_fact_embeddings": 0,
+        }
+
+    from hymem.core.graph import live_edge_predicate
+    from hymem.core.message_records import message_record_proof_valid
+    from hymem.core.db import register_read_authority_functions
+    from hymem.core.vectors import decode_vector
+    from hymem.dreaming.aggregation_material import embedding_execution_identity
+    from hymem.extraction.embeddings import embedding_text_hash
+
+    try:
+        producer, model, dim = embedding_execution_identity(client)
+    except Exception as exc:
+        raise BenchmarkIntegrityError(
+            "embedding client identity is unavailable"
+        ) from exc
+    if (
+        producer.get("identity_exact") is not True
+        or producer.get("reuse_scope") != "durable"
+        or not isinstance(model, str) or not model
+        or isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
+    ):
+        raise BenchmarkIntegrityError("embedding client identity is invalid")
+
+    conn.create_function(
+        "hymem_benchmark_embedding_hash", 1,
+        lambda value: embedding_text_hash(str(value)), deterministic=True,
+    )
+    conn.create_function(
+        "hymem_message_record_proof_valid", 4,
+        message_record_proof_valid, deterministic=True,
+    )
+    register_read_authority_functions(conn)
+
+    def valid_vector(value: object, expected_dim: object) -> int:
+        try:
+            vector = decode_vector(value)
+            return int(
+                len(vector) == int(expected_dim)
+                and all(math.isfinite(float(item)) for item in vector)
+                and math.sqrt(sum(float(item) ** 2 for item in vector)) > 0.0
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return 0
+
+    conn.create_function(
+        "hymem_benchmark_vector_valid", 2, valid_vector, deterministic=True,
+    )
+
+    def invalid_vector(alias: str) -> str:
+        return (
+            f"({alias}.vector_json IS NULL OR {alias}.model<>? OR {alias}.dim<>? "
+            f"OR hymem_benchmark_vector_valid({alias}.vector_json,?)<>1)"
+        )
+
+    def count(sql: str, params: tuple[Any, ...]) -> int:
+        row = conn.execute(sql, params).fetchone()
+        if row is None:
+            raise BenchmarkIntegrityError("embedding backlog query returned no row")
+        value = row[0]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise BenchmarkIntegrityError(
+                "embedding backlog query returned a malformed count"
+            )
+        return value
+
+    vector_params = (model, dim, dim)
+    pending_chunks = count(
+        "SELECT COUNT(*) FROM chunks c "
+        "LEFT JOIN chunk_embeddings e ON e.chunk_id=c.id "
+        "WHERE c.chunk_kind='extraction' AND (e.text_hash<>"
+        "hymem_benchmark_embedding_hash(c.text) OR e.text_hash IS NULL OR "
+        + invalid_vector("e") + ")",
+        vector_params,
+    )
+    pending_messages = count(
+        "SELECT COUNT(*) FROM message_retention_coverage mc "
+        "JOIN sessions s ON s.id=mc.source_session_id "
+        "JOIN chunks c ON c.id=mc.chunk_id "
+        "LEFT JOIN message_embeddings e ON e.message_id=mc.message_id "
+        "WHERE mc.coverage_version='dream-lossless-message-v1' "
+        "AND mc.source_role IN ('user','assistant') "
+        "AND s.coverage_message_id IS NOT NULL "
+        "AND typeof(mc.message_id)='integer' "
+        "AND mc.message_id<=s.coverage_message_id "
+        "AND c.session_id=mc.source_session_id "
+        "AND c.start_message_id=mc.message_id "
+        "AND c.end_message_id=mc.message_id AND c.chunk_kind='coverage' "
+        "AND hymem_message_record_proof_valid(c.text,mc.message_content_hash,"
+        "mc.hash_version,mc.record_version)=1 "
+        "AND (e.source_coverage_chunk_id<>mc.chunk_id "
+        "OR e.source_coverage_version<>mc.coverage_version "
+        "OR e.text_hash<>hymem_benchmark_embedding_hash("
+        "json_extract(c.text,'$.content')) OR e.text_hash IS NULL OR "
+        + invalid_vector("e") + ")",
+        vector_params,
+    )
+    edge_text = (
+        "(k.subject_canonical || ' ' || k.predicate || ' ' || "
+        "k.object_canonical)"
+    )
+    pending_edges = count(
+        "SELECT COUNT(*) FROM knowledge_graph k "
+        f"LEFT JOIN edge_embeddings e ON e.edge_text={edge_text} "
+        f"WHERE {live_edge_predicate('k')} AND " + invalid_vector("e"),
+        vector_params,
+    )
+    pending_episodes = count(
+        "SELECT COUNT(*) FROM episodes ep JOIN sessions s ON s.id=ep.session_id "
+        "LEFT JOIN episode_embeddings e ON e.episode_id=ep.id "
+        "WHERE (ep.digest_generation IS NULL OR "
+        "ep.digest_generation=s.digest_published_generation) "
+        "AND (e.text_hash<>hymem_benchmark_embedding_hash("
+        "ep.title || char(10) || ep.summary) OR e.text_hash IS NULL OR "
+        + invalid_vector("e") + ")",
+        vector_params,
+    )
+    pending_facts = count(
+        "SELECT COUNT(*) FROM narrative_facts f "
+        "JOIN fact_extraction_outcomes o ON o.slice_key=f.source_outcome_key "
+        "LEFT JOIN narrative_fact_embeddings e ON e.fact_id=f.id "
+        "WHERE f.source_outcome_key IS NOT NULL "
+        "AND f.lifecycle_status='active' AND f.invalid_at IS NULL "
+        "AND o.outcome_status='success' AND o.source_manifest_complete=1 "
+        "AND o.source_manifest_version='fact-source-manifest-v1' "
+        "AND o.source_manifest_count>0 "
+        "AND (e.text_hash<>hymem_benchmark_embedding_hash(f.text) "
+        "OR e.text_hash IS NULL OR " + invalid_vector("e") + ")",
+        vector_params,
+    )
+    return {
+        "pending_chunk_embeddings": pending_chunks,
+        "pending_message_embeddings": pending_messages,
+        "pending_edge_embeddings": pending_edges,
+        "pending_episode_embeddings": pending_episodes,
+        "pending_fact_embeddings": pending_facts,
+    }
+
+
+def durable_indexing_status(
+    memory: object, embedding_client: object | None,
+) -> dict[str, Any]:
+    """Compose one benchmark-safe, read-only durable completion snapshot."""
+
+    snapshot_status = getattr(memory, "dream_status_with_snapshot", None)
+    try:
+        if callable(snapshot_status):
+            raw_status = snapshot_status(
+                lambda conn: embedding_backlog_status(conn, embedding_client)
+            )
+            composed_snapshot = True
+        else:
+            # Explicit compatibility path for legacy/custom test doubles. Real
+            # HyMem instances expose dream_status_with_snapshot. A disabled
+            # embedding policy needs no second database read and is therefore
+            # the only safe schema-v2 fallback.
+            if embedding_client is not None:
+                raise BenchmarkIntegrityError(
+                    "memory lacks coherent benchmark status snapshot support"
+                )
+            raw_status = memory.dream_status()
+            composed_snapshot = False
+    except Exception as exc:
+        raise BenchmarkIntegrityError(
+            "memory indexing status is unavailable"
+        ) from exc
+    if not isinstance(raw_status, Mapping):
+        raise BenchmarkIntegrityError(
+            "memory indexing status callback returned a malformed value"
+        )
+    config = getattr(memory, "config", None)
+    if config is None:
+        raise BenchmarkIntegrityError(
+            "memory indexing status is missing its effective configuration"
+        )
+    if raw_status.get("dream_status_schema") != DREAM_STATUS_SCHEMA_VERSION:
+        raise BenchmarkIntegrityError(
+            "memory indexing status has an unsupported durable schema"
+        )
+    authority_reason = _phase1_authority_status_reason(raw_status)
+    if authority_reason == "phase1_producer_unavailable":
+        raise BenchmarkIntegrityError(
+            "memory indexing status lacks an exact Phase-1 producer"
+        )
+    if authority_reason is not None:
+        raise BenchmarkIntegrityError(
+            "memory indexing status has malformed Phase-1 producer authority"
+        )
+    required_counts = (
+        *DURABLE_PENDING_FIELDS,
+        *DURABLE_MALFORMED_FIELDS,
+        *_DURABLE_QUARANTINE_FIELDS,
+        "terminal_loss_chunks",
+        "coverage_integrity_failures",
+    )
+    for key in required_counts:
+        reported = raw_status.get(key)
+        if (
+            isinstance(reported, bool)
+            or not isinstance(reported, int)
+            or reported < 0
+        ):
+            raise BenchmarkIntegrityError(
+                f"memory indexing status has malformed {key}"
+            )
+    if not isinstance(raw_status.get("in_progress"), bool):
+        raise BenchmarkIntegrityError(
+            "memory indexing status has malformed in_progress"
+        )
+
+    status = dict(raw_status)
+    if not composed_snapshot:
+        status.update(embedding_backlog_status(None, None))
+    status["benchmark_indexing_status_schema"] = (
+        BENCHMARK_INDEXING_STATUS_VERSION
+    )
+    return status
+
+
+@dataclass(frozen=True)
+class PythonSourceSlice:
+    """Exact transitive top-level symbols selected from a Python source file."""
+
+    path: Path
+    symbols: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", Path(self.path))
+        raw_symbols = tuple(self.symbols)
+        if not raw_symbols or any(
+            not isinstance(symbol, str) or not symbol.isidentifier()
+            for symbol in raw_symbols
+        ):
+            raise BenchmarkIntegrityError(
+                "Python source slices require one or more identifier symbols"
+            )
+        normalized = tuple(sorted(set(raw_symbols)))
+        object.__setattr__(self, "symbols", normalized)
+
+
+@dataclass(frozen=True)
+class BenchmarkIdentityData:
+    """An explicitly classified non-code input to benchmark execution."""
+
+    path: Path
+    kind: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", Path(self.path))
+        if self.kind not in {"config", "data", "evaluator", "prompt"}:
+            raise BenchmarkIntegrityError(
+                "benchmark identity data kind must be config/data/evaluator/prompt"
+            )
+
+
+@dataclass(frozen=True)
+class _PythonBinding:
+    names: tuple[str, ...]
+    node: ast.AST
+    import_spec: tuple[str, str, int, str, str | None] | None = None
+
+
+def _assignment_names(node: ast.AST) -> tuple[str, ...]:
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        targets = [node.target]
+    else:
+        return ()
+    names: list[str] = []
+    for target in targets:
+        names.extend(
+            child.id for child in ast.walk(target)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+        )
+    return tuple(dict.fromkeys(names))
+
+
+def _target_names(target: ast.AST | None) -> tuple[str, ...]:
+    if target is None:
+        return ()
+    return tuple(dict.fromkeys(
+        child.id for child in ast.walk(target)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+    ))
+
+
+def _compound_binding_names(statements: Iterable[ast.stmt]) -> tuple[str, ...]:
+    """Names bound by module-level control flow, excluding nested scopes."""
+
+    names: list[str] = []
+    for statement in statements:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(statement.name)
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            names.extend(_assignment_names(statement))
+        elif isinstance(statement, ast.Import):
+            names.extend(
+                alias.asname or alias.name.split(".", 1)[0]
+                for alias in statement.names
+            )
+        elif isinstance(statement, ast.ImportFrom):
+            if any(alias.name == "*" for alias in statement.names):
+                raise BenchmarkIntegrityError(
+                    "Python source slices do not permit module-level star imports"
+                )
+            names.extend(alias.asname or alias.name for alias in statement.names)
+        elif isinstance(statement, ast.Try):
+            branches = [statement.body, statement.orelse, statement.finalbody]
+            branches.extend(handler.body for handler in statement.handlers)
+            for branch in branches:
+                names.extend(_compound_binding_names(branch))
+        elif isinstance(statement, ast.If):
+            names.extend(_compound_binding_names(statement.body))
+            names.extend(_compound_binding_names(statement.orelse))
+        elif isinstance(statement, (ast.For, ast.AsyncFor)):
+            names.extend(_target_names(statement.target))
+            names.extend(_compound_binding_names(statement.body))
+            names.extend(_compound_binding_names(statement.orelse))
+        elif isinstance(statement, ast.While):
+            names.extend(_compound_binding_names(statement.body))
+            names.extend(_compound_binding_names(statement.orelse))
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                names.extend(_target_names(item.optional_vars))
+            names.extend(_compound_binding_names(statement.body))
+    return tuple(dict.fromkeys(names))
+
+
+def _module_bindings(
+    tree: ast.Module,
+) -> tuple[dict[str, _PythonBinding], tuple[ast.AST, ...]]:
+    bindings: dict[str, _PythonBinding] = {}
+    future_nodes: list[ast.AST] = []
+
+    def register(name: str, binding: _PythonBinding) -> None:
+        previous = bindings.get(name)
+        if previous is not None and previous.node is not binding.node:
+            raise BenchmarkIntegrityError(
+                f"Python source slice has ambiguous top-level binding: {name!r}"
+            )
+        bindings[name] = binding
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            register(node.name, _PythonBinding((node.name,), node))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            names = _assignment_names(node)
+            binding = _PythonBinding(names, node)
+            for name in names:
+                register(name, binding)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                register(
+                    bound,
+                    _PythonBinding(
+                        (bound,), node,
+                        ("import", alias.name, 0, alias.name, alias.asname),
+                    ),
+                )
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                future_nodes.append(node)
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    raise BenchmarkIntegrityError(
+                        "Python source slices do not permit top-level star imports"
+                    )
+                bound = alias.asname or alias.name
+                register(
+                    bound,
+                    _PythonBinding(
+                        (bound,), node,
+                        (
+                            "from", node.module or "", node.level,
+                            alias.name, alias.asname,
+                        ),
+                    ),
+                )
+        elif isinstance(
+            node,
+            (ast.Try, ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith),
+        ):
+            # Package/direct-script fallback imports and optional-platform
+            # assignments (for example ``fcntl`` or ``None``) are one logical
+            # executable binding surface. Select the complete control group.
+            normalized = _compound_binding_names((node,))
+            if normalized:
+                binding = _PythonBinding(normalized, node)
+                for name in normalized:
+                    register(name, binding)
+    return bindings, tuple(future_nodes)
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return False
+    values = [test.left, *test.comparators]
+    return (
+        isinstance(test.ops[0], ast.Eq)
+        and any(isinstance(value, ast.Name) and value.id == "__name__" for value in values)
+        and any(isinstance(value, ast.Constant) and value.value == "__main__" for value in values)
+    )
+
+
+class _ImportTimeLoadVisitor(ast.NodeVisitor):
+    """Collect names evaluated at module import without entering function bodies."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802 - ast API
+        if isinstance(node.ctx, ast.Load):
+            self.names.add(node.id)
+
+    def _visit_definition_header(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+        if node.returns is not None:
+            self.visit(node.returns)
+        for argument in (
+            *node.args.posonlyargs, *node.args.args,
+            *node.args.kwonlyargs,
+        ):
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+        if node.args.vararg is not None and node.args.vararg.annotation is not None:
+            self.visit(node.args.vararg.annotation)
+        if node.args.kwarg is not None and node.args.kwarg.annotation is not None:
+            self.visit(node.args.kwarg.annotation)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        self._visit_definition_header(node)
+
+    def visit_AsyncFunctionDef(  # noqa: N802
+        self, node: ast.AsyncFunctionDef,
+    ) -> None:
+        self._visit_definition_header(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        # A class body executes at import time. Its methods are skipped by the
+        # definition visitors, while assignments/invariants remain visible.
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_Lambda(self, _node: ast.Lambda) -> None:  # noqa: N802
+        return
+
+
+def _import_time_load_names(node: ast.AST) -> set[str]:
+    visitor = _ImportTimeLoadVisitor()
+    visitor.visit(node)
+    return visitor.names
+
+
+def _python_slice_selection(
+    source_slice: PythonSourceSlice,
+) -> tuple[str, tuple[_PythonBinding, ...], tuple[ast.AST, ...]]:
+    path = source_slice.path.resolve()
+    if not path.is_file():
+        raise BenchmarkIntegrityError(f"code file does not exist: {path}")
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=path.name)
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        raise BenchmarkIntegrityError(
+            f"cannot parse Python source slice: {path.name}"
+        ) from exc
+    bindings, future_nodes = _module_bindings(tree)
+    missing = sorted(
+        symbol for symbol in source_slice.symbols if symbol not in bindings
+    )
+    if missing:
+        raise BenchmarkIntegrityError(
+            f"Python source slice lacks requested symbols: {', '.join(missing)}"
+        )
+
+    pending = list(source_slice.symbols)
+    seen_names: set[str] = set()
+    selected: dict[int, _PythonBinding] = {}
+    selected_nodes: set[int] = set()
+    side_effect_candidates = tuple(
+        node for node in tree.body
+        if not isinstance(
+            node,
+            (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                ast.Assign, ast.AnnAssign, ast.AugAssign,
+                ast.Import, ast.ImportFrom,
+            ),
+        )
+        and not _is_main_guard(node)
+    )
+    while True:
+        while pending:
+            name = pending.pop()
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            binding = bindings.get(name)
+            if binding is None:
+                continue
+            selected[id(binding)] = binding
+            selected_nodes.add(id(binding.node))
+            if binding.import_spec is not None:
+                continue
+            pending.extend(
+                child.id for child in ast.walk(binding.node)
+                if (
+                    isinstance(child, ast.Name)
+                    and isinstance(child.ctx, ast.Load)
+                    and child.id in bindings
+                    and child.id not in seen_names
+                )
+            )
+        added_side_effect = False
+        for node in side_effect_candidates:
+            if id(node) in selected_nodes:
+                continue
+            if not (_import_time_load_names(node) & seen_names):
+                continue
+            binding = _PythonBinding((), node)
+            selected[id(binding)] = binding
+            selected_nodes.add(id(node))
+            pending.extend(
+                name for name in _import_time_load_names(node)
+                if name in bindings and name not in seen_names
+            )
+            added_side_effect = True
+        if not pending and not added_side_effect:
+            break
+    ordered = tuple(sorted(
+        selected.values(),
+        key=lambda binding: (
+            getattr(binding.node, "lineno", -1),
+            getattr(binding.node, "col_offset", -1),
+            binding.names,
+        ),
+    ))
+    return source, ordered, future_nodes
+
+
+def _python_source_slice_bytes(source_slice: PythonSourceSlice) -> bytes:
+    _source, selected, future_nodes = _python_slice_selection(source_slice)
+    chunks: list[dict[str, Any]] = []
+    for node in future_nodes:
+        chunks.append({
+            "kind": "future",
+            "ast": ast.dump(node, annotate_fields=True, include_attributes=False),
+        })
+    for binding in selected:
+        if binding.import_spec is not None:
+            chunks.append({
+                "kind": "import",
+                "names": binding.names,
+                "spec": binding.import_spec,
+            })
+            continue
+        chunks.append({
+            "kind": "definition",
+            "names": binding.names,
+            # Normalized AST includes decorators/defaults/annotations while
+            # excluding comments and source-location/checkout noise.
+            "ast": ast.dump(
+                binding.node, annotate_fields=True, include_attributes=False
+            ),
+        })
+    return json.dumps(
+        {
+            "schema": "python-source-slice-v1",
+            "roots": source_slice.symbols,
+            "chunks": chunks,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _symbols_imported_from_nodes(
+    nodes: Iterable[ast.AST], *, module_names: Iterable[str],
+) -> tuple[str, ...]:
+    accepted = {module.lstrip(".") for module in module_names if module}
+    imported: set[str] = set()
+    module_aliases: set[str] = set()
+    node_list = tuple(nodes)
+    for node in node_list:
+        for child in ast.walk(node):
+            if isinstance(child, ast.ImportFrom):
+                if (child.module or "").lstrip(".") not in accepted:
+                    continue
+                for alias in child.names:
+                    if alias.name == "*":
+                        raise BenchmarkIntegrityError(
+                            "benchmark dependencies cannot use star imports"
+                        )
+                    imported.add(alias.name)
+            elif isinstance(child, ast.Import):
+                for alias in child.names:
+                    if alias.name.lstrip(".") in accepted:
+                        module_aliases.add(
+                            alias.asname or alias.name.split(".", 1)[0]
+                        )
+    for node in node_list:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and child.value.id in module_aliases
+            ):
+                imported.add(child.attr)
+    return tuple(sorted(imported))
+
+
+def python_file_imported_symbols(
+    path: str | os.PathLike[str], *, module_names: Iterable[str],
+) -> tuple[str, ...]:
+    """Return exact attributes imported from target modules anywhere in a file."""
+
+    source = Path(path)
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=source.name)
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        raise BenchmarkIntegrityError(
+            f"cannot inspect Python benchmark dependencies: {source.name}"
+        ) from exc
+    return _symbols_imported_from_nodes(tree.body, module_names=module_names)
+
+
+def python_slice_imported_symbols(
+    source_slice: PythonSourceSlice, *, module_names: Iterable[str],
+) -> tuple[str, ...]:
+    """Return dependency symbols reachable from a selected Python source slice."""
+
+    _source, selected, _future = _python_slice_selection(source_slice)
+    accepted = {module.lstrip(".") for module in module_names if module}
+    imported: set[str] = set()
+    module_aliases: set[str] = set()
+    definitions: list[ast.AST] = []
+    for binding in selected:
+        spec = binding.import_spec
+        if spec is None:
+            definitions.append(binding.node)
+            continue
+        kind, module, _level, name, asname = spec
+        if module.lstrip(".") not in accepted:
+            continue
+        if kind == "from":
+            imported.add(name)
+        else:
+            module_aliases.add(asname or module.split(".", 1)[0])
+    imported.update(
+        _symbols_imported_from_nodes(definitions, module_names=module_names)
+    )
+    for node in definitions:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and child.value.id in module_aliases
+            ):
+                imported.add(child.attr)
+    return tuple(sorted(imported))
+
+
+def _imported_modules_from_nodes(nodes: Iterable[ast.AST]) -> tuple[str, ...]:
+    modules: set[str] = set()
+    for node in nodes:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Import):
+                modules.update(alias.name for alias in child.names)
+            elif isinstance(child, ast.ImportFrom):
+                if child.level:
+                    continue
+                base = child.module or ""
+                if base:
+                    modules.add(base)
+                    modules.update(
+                        f"{base}.{alias.name}"
+                        for alias in child.names if alias.name != "*"
+                    )
+    return tuple(sorted(modules))
+
+
+def python_file_imported_modules(
+    path: str | os.PathLike[str],
+) -> tuple[str, ...]:
+    """Return absolute module candidates imported anywhere in a Python file."""
+
+    source = Path(path)
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=source.name)
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        raise BenchmarkIntegrityError(
+            f"cannot inspect Python benchmark dependencies: {source.name}"
+        ) from exc
+    return _imported_modules_from_nodes(tree.body)
+
+
+def python_slice_imported_modules(
+    source_slice: PythonSourceSlice,
+) -> tuple[str, ...]:
+    """Return absolute module candidates reachable from a source slice."""
+
+    _source, selected, _future = _python_slice_selection(source_slice)
+    return _imported_modules_from_nodes(binding.node for binding in selected)
+
+
+def _resolve_local_python_module(root: Path, module: str) -> tuple[Path, ...]:
+    parts = module.split(".")
+    relative = Path(*parts)
+    candidates = (root / f"{relative}.py", root / relative / "__init__.py")
+    resolved = [path.resolve() for path in candidates if path.is_file()]
+    if not resolved:
+        return ()
+    # Importing ``pkg.child.module`` executes both package initializers before
+    # the leaf. They are executable dependencies even if the leaf never names
+    # them explicitly.
+    for depth in range(1, len(parts)):
+        initializer = root.joinpath(*parts[:depth], "__init__.py")
+        if initializer.is_file():
+            resolved.append(initializer.resolve())
+    return tuple(dict.fromkeys(resolved))
+
+
+def _absolute_import_module(
+    node: ast.ImportFrom, *, current_package: str,
+) -> str:
+    if node.level == 0:
+        return node.module or ""
+    base = current_package.split(".") if current_package else []
+    climb = node.level - 1
+    if climb > len(base):
+        return ""
+    base = base[: len(base) - climb]
+    if node.module:
+        base.extend(node.module.split("."))
+    return ".".join(base)
+
+
+def local_python_dependency_paths(
+    entry_paths: Iterable[str | os.PathLike[str]],
+    *,
+    root: Path,
+    package_prefixes: Iterable[str],
+) -> tuple[Path, ...]:
+    """Resolve a deterministic local import closure for selected packages."""
+
+    root = root.resolve()
+    prefixes = tuple(sorted(set(package_prefixes)))
+    pending = [Path(path).resolve() for path in entry_paths]
+    found: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in found:
+            continue
+        if not path.is_file():
+            raise BenchmarkIntegrityError(f"code file does not exist: {path}")
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise BenchmarkIntegrityError(
+                "local Python dependency lies outside the identity root"
+            ) from exc
+        module_parts = list(relative.with_suffix("").parts)
+        is_package = bool(module_parts and module_parts[-1] == "__init__")
+        if is_package:
+            module_parts.pop()
+        current_module = ".".join(module_parts)
+        current_package = (
+            current_module if is_package
+            else current_module.rpartition(".")[0]
+        )
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
+        except (OSError, SyntaxError, UnicodeError) as exc:
+            raise BenchmarkIntegrityError(
+                f"cannot inspect local Python dependency: {relative.as_posix()}"
+            ) from exc
+        found.add(path)
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                base = _absolute_import_module(
+                    node, current_package=current_package
+                )
+                if base:
+                    modules.add(base)
+                    modules.update(
+                        f"{base}.{alias.name}"
+                        for alias in node.names if alias.name != "*"
+                    )
+        for module in modules:
+            if any(
+                module == prefix or module.startswith(f"{prefix}.")
+                for prefix in prefixes
+            ):
+                pending.extend(_resolve_local_python_module(root, module))
+    return tuple(sorted(
+        found, key=lambda item: item.relative_to(root).as_posix()
+    ))
+
+
+def benchmark_hymem_source_paths(
+    package_path: Path,
+    *,
+    root: Path,
+    dependency_sources: Iterable[
+        str | os.PathLike[str] | PythonSourceSlice
+    ],
+) -> tuple[Path, ...]:
+    """Exact HyMem import closure plus runtime-loaded database resources.
+
+    ``local_python_dependency_paths`` follows ordinary, aliased, relative and
+    function-local imports (including imports under ``try``/``if`` blocks).
+    The database schema and migrations are discovered at runtime through
+    :mod:`importlib.resources`, so they have no import edge for the AST walker
+    to follow and are attached explicitly whenever ``hymem.core.db`` is in the
+    executable closure.  Importing the migrations resource package executes
+    its ``__init__.py`` too, making that initializer part of the identity.
+    """
+
+    package = Path(package_path).resolve()
+    root = Path(root).resolve()
+    if not package.is_dir():
+        raise BenchmarkIntegrityError(f"HyMem package does not exist: {package}")
+    imported_modules: set[str] = set()
+    for source in dependency_sources:
+        if isinstance(source, PythonSourceSlice):
+            imported_modules.update(python_slice_imported_modules(source))
+        else:
+            imported_modules.update(python_file_imported_modules(source))
+    prefix = package.name
+    seeds: set[Path] = set()
+    for module in imported_modules:
+        if module == prefix or module.startswith(f"{prefix}."):
+            seeds.update(_resolve_local_python_module(root, module))
+    if not seeds:
+        raise BenchmarkIntegrityError(
+            "benchmark code identity found no imported HyMem implementation"
+        )
+    python_paths = local_python_dependency_paths(
+        seeds, root=root, package_prefixes=(prefix,)
+    )
+    resources: list[Path] = []
+    core_db = package / "core/db.py"
+    if core_db.resolve() in python_paths:
+        schema = package / "core/schema.sql"
+        if schema.is_file():
+            resources.append(schema.resolve())
+        migrations = package / "core/migrations"
+        if migrations.is_dir():
+            initializer = migrations / "__init__.py"
+            if initializer.is_file():
+                resources.append(initializer.resolve())
+            resources.extend(path.resolve() for path in migrations.glob("*.sql"))
+    return tuple(sorted(
+        {*python_paths, *resources},
+        key=lambda item: item.relative_to(root).as_posix(),
+    ))
 
 
 def file_hash(path: str | os.PathLike[str]) -> str:
@@ -485,37 +2420,105 @@ def file_hash(path: str | os.PathLike[str]) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def code_hash(paths: Iterable[str | os.PathLike[str]], *, root: Path) -> str:
-    """Hash exact source bytes plus stable repo-relative path names.
+def code_hash(
+    paths: Iterable[
+        str | os.PathLike[str] | PythonSourceSlice | BenchmarkIdentityData
+    ],
+    *,
+    root: Path,
+    identity_version: str | None = None,
+) -> str:
+    """Hash executable files/symbol slices under stable repo-relative names.
 
-    Directories are expanded recursively, excluding generated/cache/VCS files.
-    The caller chooses the code surface; adapters pass their own file and the
-    ``hymem`` package so a resume cannot cross an implementation change.
+    Directories expand only Python/SQL and exclude generated/cache/VCS files.
+    Non-code inputs require :class:`BenchmarkIdentityData`, preventing prose
+    from becoming code accidentally. Paths outside ``root`` fail closed so
+    checkout location can never enter a digest. ``identity_version`` lets a
+    narrower artifact (such as a material store) share this framing without
+    becoming coupled to the full benchmark-code identity protocol.
     """
 
+    resolved_identity_version = (
+        CODE_IDENTITY_VERSION if identity_version is None else identity_version
+    )
+    if not isinstance(resolved_identity_version, str) or re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,96}", resolved_identity_version
+    ) is None:
+        raise BenchmarkIntegrityError("code identity version is invalid")
     root = root.resolve()
     files: set[Path] = set()
+    slices: set[PythonSourceSlice] = set()
+    data_inputs: set[BenchmarkIdentityData] = set()
     for raw in paths:
+        if isinstance(raw, PythonSourceSlice):
+            slices.add(PythonSourceSlice(raw.path.resolve(), raw.symbols))
+            continue
+        if isinstance(raw, BenchmarkIdentityData):
+            data_inputs.add(BenchmarkIdentityData(raw.path.resolve(), raw.kind))
+            continue
         path = Path(raw).resolve()
         if path.is_dir():
-            files.update(
-                candidate for candidate in path.rglob("*")
-                if candidate.is_file()
-                and "__pycache__" not in candidate.parts
-                and ".git" not in candidate.parts
-                and candidate.suffix.casefold() in _CODE_SUFFIXES
-            )
-        elif path.is_file():
+            for candidate in path.rglob("*"):
+                if (
+                    not candidate.is_file()
+                    or "__pycache__" in candidate.parts
+                    or ".git" in candidate.parts
+                    or candidate.suffix.casefold() not in _CODE_DIRECTORY_SUFFIXES
+                ):
+                    continue
+                if candidate.is_symlink():
+                    raise BenchmarkIntegrityError(
+                        "code directories must not contain executable symlinks"
+                    )
+                files.add(candidate.resolve())
+        elif path.is_file() and path.suffix.casefold() in _CODE_DIRECTORY_SUFFIXES:
             files.add(path)
+        elif path.is_file():
+            raise BenchmarkIntegrityError(
+                "non-code benchmark identity inputs require explicit data classification"
+            )
         else:
             raise BenchmarkIntegrityError(f"code path does not exist: {path}")
     digest = hashlib.sha256()
-    for path in sorted(files, key=lambda item: str(item)):
+    # v2 changes both the directory inventory and cross-adapter slicing. The
+    # explicit salt guarantees old checkpoints fail closed even in the
+    # contrived event that the component bytes otherwise collide.
+    digest.update(resolved_identity_version.encode("ascii"))
+    entries: list[tuple[str, bytes]] = []
+    for path in files:
         try:
             name = path.relative_to(root).as_posix()
-        except ValueError:
-            name = path.as_posix()
-        payload = path.read_bytes()
+        except ValueError as exc:
+            raise BenchmarkIntegrityError(
+                "code path lies outside the identity root"
+            ) from exc
+        entries.append((f"file:{name}", path.read_bytes()))
+    for source_slice in slices:
+        try:
+            name = source_slice.path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise BenchmarkIntegrityError(
+                "Python source slice lies outside the identity root"
+            ) from exc
+        entries.append((
+            f"python-slice:{name}:{','.join(source_slice.symbols)}",
+            _python_source_slice_bytes(source_slice),
+        ))
+    for data_input in data_inputs:
+        if not data_input.path.is_file():
+            raise BenchmarkIntegrityError(
+                f"benchmark identity data file does not exist: {data_input.path}"
+            )
+        try:
+            name = data_input.path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise BenchmarkIntegrityError(
+                "benchmark identity data lies outside the identity root"
+            ) from exc
+        entries.append((
+            f"{data_input.kind}:{name}", data_input.path.read_bytes()
+        ))
+    for name, payload in sorted(entries, key=lambda item: item[0]):
         digest.update(len(name.encode("utf-8")).to_bytes(8, "big"))
         digest.update(name.encode("utf-8"))
         digest.update(len(payload).to_bytes(8, "big"))
@@ -603,8 +2606,12 @@ def freeze_calibration(
     dev_ids, holdout_ids = deterministic_split(
         all_ids, seed=seed, dev_fraction=dev_fraction
     )
-    config_obj = sanitize_for_artifact(dict(config))
-    model_obj = sanitize_for_artifact(dict(models))
+    config_obj = sanitize_for_artifact(
+        dict(config), _preserve_evidence_text=False
+    )
+    model_obj = sanitize_for_artifact(
+        dict(models), _preserve_evidence_text=False
+    )
     receipt: dict[str, Any] = {
         "schema": CALIBRATION_VERSION,
         "benchmark": str(benchmark),
@@ -661,8 +2668,12 @@ def load_calibration(
     checks = {
         "benchmark": str(benchmark),
         "dataset_hash": str(dataset_hash),
-        "config_hash": content_hash(sanitize_for_artifact(dict(config))),
-        "model_hash": content_hash(sanitize_for_artifact(dict(models))),
+        "config_hash": content_hash(sanitize_for_artifact(
+            dict(config), _preserve_evidence_text=False
+        )),
+        "model_hash": content_hash(sanitize_for_artifact(
+            dict(models), _preserve_evidence_text=False
+        )),
         "all_ids_hash": content_hash(list(all_ids)),
     }
     for key, expected in checks.items():
@@ -744,8 +2755,12 @@ def build_manifest(
         raise BenchmarkIntegrityError(
             f"unknown protocol split: {protocol_split!r}"
         )
-    config_obj = sanitize_for_artifact(dict(config))
-    model_obj = sanitize_for_artifact(dict(models))
+    config_obj = sanitize_for_artifact(
+        dict(config), _preserve_evidence_text=False
+    )
+    model_obj = sanitize_for_artifact(
+        dict(models), _preserve_evidence_text=False
+    )
     if protocol_split in {"dev", "holdout"}:
         if not isinstance(calibration, Mapping):
             raise BenchmarkIntegrityError(
@@ -1105,11 +3120,30 @@ class AtomicCheckpoint:
         scored: bool = True,
         verdict_key: str = "correct",
     ) -> None:
+        if type(resume) is not bool:
+            raise BenchmarkIntegrityError(
+                "checkpoint resume policy must be a boolean"
+            )
+        if type(retry_failures) is not bool:
+            raise BenchmarkIntegrityError(
+                "checkpoint retry_failures policy must be a boolean"
+            )
         self.path = Path(path)
         self.manifest = dict(manifest)
+        safe_manifest = sanitize_for_artifact(
+            self.manifest, _preserve_evidence_text=False
+        )
+        if not isinstance(safe_manifest, dict) or safe_manifest != self.manifest:
+            raise BenchmarkIntegrityError(
+                "checkpoint manifest contains unsafe operational data"
+            )
         self.expected_ids = validate_ids(expected_ids)
-        self.retry_failures = bool(retry_failures)
-        self.scored = bool(scored)
+        self.retry_failures = retry_failures
+        if type(scored) is not bool:
+            raise BenchmarkIntegrityError(
+                "checkpoint scored mode must be a boolean"
+            )
+        self.scored = scored
         if not isinstance(verdict_key, str) or not verdict_key.strip():
             raise BenchmarkIntegrityError("checkpoint verdict key must be non-empty")
         self.verdict_key = verdict_key.strip()
@@ -1119,11 +3153,35 @@ class AtomicCheckpoint:
             {k: v for k, v in self.manifest.items() if k != "run_id"}
         ):
             raise BenchmarkIntegrityError("manifest run_id is invalid")
+        manifest_expected_count = self.manifest.get("expected_count")
+        if (
+            type(manifest_expected_count) is not int
+            or manifest_expected_count != len(self.expected_ids)
+            or self.manifest.get("expected_ids_hash")
+            != content_hash(list(self.expected_ids))
+        ):
+            raise BenchmarkIntegrityError(
+                "checkpoint expected ids do not match its manifest identity"
+            )
+        manifest_scored = self.manifest.get("scored_run")
+        if type(manifest_scored) is not bool or manifest_scored is not self.scored:
+            raise BenchmarkIntegrityError(
+                "checkpoint scored mode does not match its manifest identity"
+            )
         self._lease = _CheckpointLease(self.path)
         try:
             if resume:
                 self._state = self._load()
                 self._validate_state()
+                # Recovery of an older checkpoint may encounter free-form
+                # failure messages or unsanitized execution instrumentation.
+                # Validate immutable identity first, then rewrite only those
+                # mutable runtime surfaces to the current bounded schema.
+                self._state = self._sanitize_runtime_state(self._state)
+                # Validation can reopen a finalized checkpoint for explicit
+                # failed-row retry.  Persist that transition only together
+                # with the bounded runtime rewrite, never in a prior raw write.
+                _atomic_json(self.path, self._state)
             else:
                 if self.path.exists():
                     raise BenchmarkIntegrityError(
@@ -1182,19 +3240,162 @@ class AtomicCheckpoint:
             raise BenchmarkIntegrityError("checkpoint root must be an object")
         return state
 
+    @staticmethod
+    def _sanitize_runtime_state(state: Mapping[str, Any]) -> dict[str, Any]:
+        """Project a validated checkpoint onto its exact durable root schema.
+
+        Runtime recovery must never turn an arbitrary legacy top-level field
+        into newly written evidence. Finalization metadata is legitimate only
+        while the checkpoint is terminal; retry reopening deliberately drops
+        it so no stale denominator can coexist with mutable rows.
+        """
+
+        root_fields = list(_CHECKPOINT_COMMON_ROOT_FIELDS)
+        if state.get("status") == "complete":
+            root_fields.extend(_CHECKPOINT_FINAL_ROOT_FIELDS)
+        result = {
+            field_name: state[field_name]
+            for field_name in root_fields
+            if field_name in state
+        }
+        entries_raw = state.get("entries")
+        if isinstance(entries_raw, Mapping):
+            entries: dict[str, Any] = {}
+            for item_id, original in entries_raw.items():
+                if not isinstance(original, Mapping):
+                    entries[str(item_id)] = original
+                    continue
+                # Entry and history objects are a closed checkpoint schema.
+                # Project onto it rather than copying arbitrary legacy keys,
+                # which could otherwise turn recovery into a durable rewrite
+                # of raw provider diagnostics.
+                entry: dict[str, Any] = {
+                    "status": original.get("status"),
+                    "attempts": original.get("attempts"),
+                }
+                if original.get("status") == "failed":
+                    entry["failure"] = bounded_failure_text(original["failure"])
+                row = original.get("row")
+                if isinstance(row, Mapping):
+                    entry["row"] = sanitize_for_artifact(dict(row))
+                history = original.get("attempt_history")
+                if isinstance(history, list):
+                    bounded_history: list[dict[str, Any]] = []
+                    last_index = len(history) - 1
+                    verdict_key = state.get("verdict_key", "correct")
+                    if not isinstance(verdict_key, str) or not verdict_key:
+                        verdict_key = "correct"
+                    for index, original_event in enumerate(history):
+                        is_last = index == last_index
+                        event_status = (
+                            str(original.get("status"))
+                            if is_last else "failed"
+                        )
+                        if event_status not in {"completed", "failed"}:
+                            event_status = "failed"
+                        source_failure: object | None = None
+                        event_row: object = None
+                        if isinstance(original_event, Mapping):
+                            source_failure = original_event.get("failure")
+                            event_row = original_event.get("row")
+                            if (
+                                source_failure is None
+                                and isinstance(event_row, Mapping)
+                            ):
+                                source_failure = event_row.get(
+                                    "benchmark_failure"
+                                )
+                        if source_failure is None and is_last:
+                            source_failure = original.get("failure")
+                        event_failure = (
+                            bounded_failure_text(
+                                source_failure or "unspecified_failure"
+                            )
+                            if event_status == "failed" else None
+                        )
+                        if isinstance(event_row, Mapping):
+                            safe_event_row = sanitize_for_artifact(dict(event_row))
+                        elif is_last and isinstance(entry.get("row"), Mapping):
+                            safe_event_row = dict(entry["row"])
+                        else:
+                            safe_event_row = {
+                                "question_id": str(item_id),
+                                "correct": False,
+                                verdict_key: False,
+                            }
+                        if not isinstance(safe_event_row, dict):
+                            safe_event_row = {
+                                "question_id": str(item_id),
+                                "correct": False,
+                                verdict_key: False,
+                            }
+                        safe_event_row["question_id"] = str(item_id)
+                        if event_status == "failed":
+                            safe_event_row[verdict_key] = False
+                            safe_event_row["benchmark_failure"] = event_failure
+                        else:
+                            safe_event_row.pop("benchmark_failure", None)
+                        bounded_history.append({
+                            "attempt": index + 1,
+                            "status": event_status,
+                            "failure": event_failure,
+                            "row": safe_event_row,
+                        })
+                    entry["attempt_history"] = bounded_history
+                entries[str(item_id)] = entry
+            result["entries"] = entries
+        segments = state.get("execution_segments")
+        if isinstance(segments, list):
+            result["execution_segments"] = [
+                sanitize_for_artifact(
+                    dict(segment),
+                    _preserve_evidence_text=False,
+                    _bound_unknown_text=True,
+                )
+                if isinstance(segment, Mapping) else segment
+                for segment in segments
+            ]
+        if state.get("status") == "complete":
+            counts = state.get("counts")
+            if isinstance(counts, Mapping):
+                result["counts"] = {
+                    field_name: counts[field_name]
+                    for field_name in _CHECKPOINT_COUNT_FIELDS
+                    if field_name in counts
+                }
+            else:
+                result.pop("counts", None)
+            failure_ids = state.get("failure_ids")
+            if (
+                isinstance(failure_ids, list)
+                and all(isinstance(item_id, str) for item_id in failure_ids)
+            ):
+                result["failure_ids"] = list(failure_ids)
+            else:
+                result.pop("failure_ids", None)
+        return result
+
     def _validate_state(self) -> None:
         state = self._state
         if state.get("schema") != CHECKPOINT_VERSION:
             raise BenchmarkIntegrityError("unsupported checkpoint schema")
         if state.get("run_id") != self.manifest.get("run_id"):
             raise BenchmarkIntegrityError("checkpoint run identity mismatch")
-        if state.get("manifest") != self.manifest:
+        embedded_manifest = state.get("manifest")
+        if (
+            not isinstance(embedded_manifest, dict)
+            or _canonical_bytes(embedded_manifest)
+            != _canonical_bytes(self.manifest)
+        ):
             raise BenchmarkIntegrityError("checkpoint manifest was modified")
         if state.get("expected_ids") != list(self.expected_ids):
             raise BenchmarkIntegrityError("checkpoint expected-id set/order mismatch")
-        if state.get("scored", True) is not self.scored:
+        if type(state.get("scored")) is not bool or state["scored"] is not self.scored:
             raise BenchmarkIntegrityError("checkpoint scored/diagnostic mode mismatch")
-        if state.get("verdict_key", "correct") != self.verdict_key:
+        if (
+            not isinstance(state.get("verdict_key"), str)
+            or state["verdict_key"] != self.verdict_key
+        ):
             raise BenchmarkIntegrityError("checkpoint verdict-key mismatch")
         status = state.get("status")
         if status not in {"running", "complete"}:
@@ -1272,6 +3473,33 @@ class AtomicCheckpoint:
                 )
             segment_ids.add(segment_id)
 
+        if status == "complete":
+            canonical_counts, canonical_failure_ids = (
+                self._canonical_finalization_fields()
+            )
+            stored_counts = state.get("counts")
+            if (
+                not isinstance(stored_counts, dict)
+                or set(stored_counts) != set(_CHECKPOINT_COUNT_FIELDS)
+                or any(type(value) is not int for value in stored_counts.values())
+                or stored_counts != canonical_counts
+            ):
+                raise BenchmarkIntegrityError(
+                    "checkpoint finalized counts are invalid"
+                )
+            stored_failure_ids = state.get("failure_ids")
+            if (
+                not isinstance(stored_failure_ids, list)
+                or any(
+                    not isinstance(item_id, str)
+                    for item_id in stored_failure_ids
+                )
+                or stored_failure_ids != canonical_failure_ids
+            ):
+                raise BenchmarkIntegrityError(
+                    "checkpoint finalized failure ids are invalid"
+                )
+
         # A finalized checkpoint is terminal by default. Explicit retry may
         # reopen it only when failed or missing work actually remains, while
         # preserving the existing attempt history.
@@ -1283,7 +3511,6 @@ class AtomicCheckpoint:
             )
             if has_retriable:
                 self._state["status"] = "running"
-                _atomic_json(self.path, self._state)
 
     @property
     def pending_ids(self) -> tuple[str, ...]:
@@ -1375,20 +3602,21 @@ class AtomicCheckpoint:
                     "row": copied,
                 }
                 if failed:
-                    entry["failure"] = _sanitize_failure_text(
+                    entry["failure"] = bounded_failure_text(
                         copied.get("benchmark_failure")
-                        or "no valid prediction verdict"
+                        or "no_valid_prediction_verdict"
                     )
             else:
+                bounded_failure = bounded_failure_text(failure)
                 entry = {
                     "status": "failed",
                     "attempts": attempts,
-                    "failure": _sanitize_failure_text(failure),
+                    "failure": bounded_failure,
                     "row": {
                         "question_id": item_id,
                         "correct": False,
                         self.verdict_key: False,
-                        "benchmark_failure": _sanitize_failure_text(failure),
+                        "benchmark_failure": bounded_failure,
                     },
                 }
             history.append({
@@ -1398,15 +3626,37 @@ class AtomicCheckpoint:
                 "row": dict(entry["row"]),
             })
             entry["attempt_history"] = history
-            self._state["entries"][item_id] = entry
-            if execution_segment is not None:
-                self._upsert_execution_segment_locked(execution_segment)
-            _atomic_json(self.path, self._state)
+            entries = self._state["entries"]
+            had_prior_entry = item_id in entries
+            prior_entry = entries.get(item_id)
+            prior_segments = list(self._state["execution_segments"])
+            try:
+                entries[item_id] = entry
+                if execution_segment is not None:
+                    self._upsert_execution_segment_locked(execution_segment)
+                _atomic_json(self.path, self._state)
+            except BaseException:
+                # A failure can occur after the in-memory row was installed (or
+                # even after os.replace but before directory fsync).  Restore the
+                # last acknowledged image so a best-effort abort-segment write
+                # cannot accidentally publish the rejected row.
+                if had_prior_entry:
+                    entries[item_id] = prior_entry
+                else:
+                    entries.pop(item_id, None)
+                self._state["execution_segments"] = prior_segments
+                raise
 
     def _upsert_execution_segment_locked(
         self, metrics: Mapping[str, Any]
     ) -> None:
-        segment = dict(metrics)
+        segment = sanitize_for_artifact(
+            dict(metrics),
+            _preserve_evidence_text=False,
+            _bound_unknown_text=True,
+        )
+        if not isinstance(segment, dict):  # pragma: no cover - mapping invariant
+            raise BenchmarkIntegrityError("execution segment sanitization failed")
         segment_id = segment.get("segment_id")
         if not isinstance(segment_id, str) or not segment_id:
             raise BenchmarkIntegrityError(
@@ -1437,10 +3687,15 @@ class AtomicCheckpoint:
                 raise BenchmarkIntegrityError(
                     "execution segment metrics cannot override segment_id"
                 )
-            self._upsert_execution_segment_locked(
-                {**dict(metrics), "segment_id": segment_id}
-            )
-            _atomic_json(self.path, self._state)
+            prior_segments = list(self._state["execution_segments"])
+            try:
+                self._upsert_execution_segment_locked(
+                    {**dict(metrics), "segment_id": segment_id}
+                )
+                _atomic_json(self.path, self._state)
+            except BaseException:
+                self._state["execution_segments"] = prior_segments
+                raise
 
     def add_execution_segment(self, metrics: Mapping[str, Any]) -> None:
         """Compatibility wrapper; prefer ``update_execution_segment``."""
@@ -1494,26 +3749,50 @@ class AtomicCheckpoint:
                 self.expected_ids, rows, verdict_key=self.verdict_key
             )
 
+    def _canonical_finalization_fields(
+        self,
+    ) -> tuple[dict[str, int], list[str]]:
+        """Derive terminal metadata from durable rows and segment counters."""
+
+        result = self.reconcile()
+        durable_row_attempts = sum(
+            int(entry["attempts"])
+            for entry in self._state["entries"].values()
+        )
+        # A provider-capable attempt can finish before the atomic row commit
+        # fails.  Adapters persist that otherwise orphaned spend in a completed
+        # execution segment and rerun the still-pending row on resume.  Use the
+        # larger independently durable counter: summing both would double-count
+        # every normally committed attempt.
+        segment_attempts = sum(
+            int(segment.get("attempted_attempts", 0))
+            for segment in self._state.get("execution_segments", [])
+            if (
+                isinstance(segment, Mapping)
+                and type(segment.get("attempted_attempts")) is int
+                and segment["attempted_attempts"] >= 0
+            )
+        )
+        counts = {
+            "expected": result.expected,
+            "attempted": result.attempted,
+            "unique_attempted": result.attempted,
+            "total_attempts": max(durable_row_attempts, segment_attempts),
+            "completed": result.completed,
+            "failed": result.failed,
+            "missing": result.missing,
+        }
+        return counts, list(result.failure_ids)
+
     def finalize(self) -> dict[str, Any]:
         """Mark complete and return an artifact-ready checkpoint snapshot."""
 
         with self._lock:
             self._require_open()
-            result = self.reconcile()
+            counts, failure_ids = self._canonical_finalization_fields()
             self._state["status"] = "complete"
-            self._state["counts"] = {
-                "expected": result.expected,
-                "attempted": result.attempted,
-                "unique_attempted": result.attempted,
-                "total_attempts": sum(
-                    int(entry["attempts"])
-                    for entry in self._state["entries"].values()
-                ),
-                "completed": result.completed,
-                "failed": result.failed,
-                "missing": result.missing,
-            }
-            self._state["failure_ids"] = list(result.failure_ids)
+            self._state["counts"] = counts
+            self._state["failure_ids"] = failure_ids
             _atomic_json(self.path, self._state)
             return json.loads(json.dumps(self._state))
 
@@ -1652,6 +3931,8 @@ def embedding_usage_snapshot(
             "model": None,
             "dimension": None,
             "identity_available": not configured,
+            "identity_exact": True if not configured else None,
+            "reuse_scope": "durable" if not configured else None,
             "calls": 0 if not configured else None,
             "calls_available": not configured,
             "request_attempts": 0 if not configured else None,
@@ -1682,21 +3963,38 @@ def embedding_usage_snapshot(
             return None
         return value
 
-    backend = str(getattr(client, "backend", "configured"))
-    quality = str(getattr(client, "quality", "unknown"))
+    try:
+        backend_raw = str(getattr(client, "backend", "configured"))
+    except Exception:
+        backend_raw = "configured"
+    backend = backend_raw if backend_raw in {
+        "configured", "local_feature_hash", "openai_compatible",
+    } else "configured"
+    try:
+        quality_raw = str(getattr(client, "quality", "unknown"))
+    except Exception:
+        quality_raw = "unknown"
+    quality = quality_raw if quality_raw in {"lexical", "semantic"} else "unknown"
     network_free_raw = getattr(client, "network_free", None)
     network_free = (
         network_free_raw if isinstance(network_free_raw, bool) else None
     )
     try:
-        model_raw = getattr(client, "model", None)
+        from hymem.dreaming.aggregation_material import (
+            embedding_execution_identity,
+        )
+
+        binding, model, resolved_dimension = embedding_execution_identity(client)
+        dimension = resolved_dimension
+        identity_exact = bool(binding["identity_exact"])
+        reuse_scope = str(binding["reuse_scope"])
+        identity_available = bool(model and dimension)
     except Exception:
-        model_raw = None
-    model = model_raw if isinstance(model_raw, str) and model_raw else None
-    dimension = number("dim")
-    if dimension is not None and not float(dimension).is_integer():
+        model = None
         dimension = None
-    identity_available = bool(model is not None and dimension is not None)
+        identity_exact = None
+        reuse_scope = None
+        identity_available = False
     calls = number("call_count")
     attempts = number("request_attempts")
     successes = number("successful_responses")
@@ -1718,6 +4016,8 @@ def embedding_usage_snapshot(
         "model": model,
         "dimension": int(dimension) if dimension is not None else None,
         "identity_available": identity_available,
+        "identity_exact": identity_exact,
+        "reuse_scope": reuse_scope,
         "calls": int(calls) if calls is not None else None,
         "calls_available": calls is not None,
         "request_attempts": int(attempts) if attempts is not None else None,
@@ -1784,13 +4084,14 @@ def aggregate_embedding_usage_snapshots(
     identities = {
         (
             row.get("backend"), row.get("quality"), row.get("network_free"),
-            row.get("model"), row.get("dimension"),
+            row.get("model"), row.get("dimension"), row.get("identity_exact"),
+            row.get("reuse_scope"),
         )
         for row in rows
     }
-    backend, quality, network_free, model, dimension = (
+    backend, quality, network_free, model, dimension, identity_exact, reuse_scope = (
         next(iter(identities)) if len(identities) == 1
-        else ("mixed", "mixed", None, None, None)
+        else ("mixed", "mixed", None, None, None, None, None)
     )
     identity_consistent = bool(
         len(identities) == 1
@@ -1804,6 +4105,8 @@ def aggregate_embedding_usage_snapshots(
         "network_free": network_free,
         "model": model,
         "dimension": dimension,
+        "identity_exact": identity_exact,
+        "reuse_scope": reuse_scope,
         "identity_consistent": identity_consistent,
         "instances": len(rows),
         "calls": int(calls) if calls_ok else None,
@@ -1851,13 +4154,12 @@ def write_latest_pointer(
     _atomic_json(Path(path), pointer)
 
 
-def publish_checkpoint_artifact(
+def prepare_checkpoint_artifact(
     ledger: AtomicCheckpoint,
-    path: str | os.PathLike[str],
     *,
     payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Finalize durable rows and publish an artifact before presentation work.
+    """Build a validated artifact while its checkpoint lease is still open.
 
     Reserved lifecycle fields always come from the validated checkpoint. An
     adapter may attach benchmark-specific scores/diagnostics through ``payload``
@@ -1882,12 +4184,59 @@ def publish_checkpoint_artifact(
         "execution": {
             "counts": snapshot["counts"],
             "segments": snapshot["execution_segments"],
-            "checkpoint": str(ledger.path),
+            # A host path is neither portable evidence nor needed for
+            # recovery (the operator already supplied the checkpoint).  Bind
+            # the archive to the exact finalized state with an opaque digest.
+            "checkpoint": {
+                "schema": CHECKPOINT_VERSION,
+                "state_sha256": content_hash(snapshot),
+            },
         },
         "per_question": list(reconciled.rows),
     }
+    return artifact
+
+
+def publish_checkpoint_artifact(
+    ledger: AtomicCheckpoint,
+    path: str | os.PathLike[str],
+    *,
+    payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Finalize durable rows and publish, leaving resource ownership to caller.
+
+    Production runners that require cleanup as a publication precondition use
+    ``prepare_checkpoint_artifact`` plus
+    ``publish_prepared_artifact_after_cleanup``.  This low-level helper remains
+    for callers/tests that deliberately manage the checkpoint lifecycle around
+    publication themselves.
+    """
+
+    artifact = prepare_checkpoint_artifact(ledger, payload=payload)
     write_immutable_artifact(path, artifact)
     return sanitize_for_artifact(artifact)
+
+
+def publish_prepared_artifact_after_cleanup(
+    path: str | os.PathLike[str],
+    artifact: Mapping[str, Any],
+    *,
+    cleanup_actions: Sequence[tuple[str, Callable[[], object]]],
+) -> dict[str, Any]:
+    """Publish a prepared artifact only after all run owners close cleanly.
+
+    Callers prepare while the checkpoint lease is live, transfer ownership of
+    each cleanup action to this function, and retain the checkpoint file as the
+    recovery surface.  A cleanup failure happens before exclusive creation, so
+    no apparently successful archive can survive a failed teardown.
+    """
+
+    run_cleanup_actions(cleanup_actions)
+    write_immutable_artifact(path, artifact)
+    sanitized = sanitize_for_artifact(dict(artifact))
+    if not isinstance(sanitized, dict):  # pragma: no cover - guarded on write
+        raise BenchmarkIntegrityError("artifact root must remain an object")
+    return sanitized
 
 
 def export_checkpoint_without_recompute(
@@ -1922,9 +4271,8 @@ def export_checkpoint_without_recompute(
         verdict_key=str(raw.get("verdict_key", "correct")),
     )
     try:
-        return publish_checkpoint_artifact(
+        artifact = prepare_checkpoint_artifact(
             ledger,
-            artifact_path,
             payload={
                 "benchmark": manifest.get("benchmark"),
                 "version": "strict-checkpoint-recovery-v1",
@@ -1934,8 +4282,17 @@ def export_checkpoint_without_recompute(
                 ),
             },
         )
-    finally:
-        ledger.close()
+    except BaseException as exc:
+        run_cleanup_actions(
+            [("checkpoint_close", ledger.close)],
+            primary_exception=exc,
+        )
+        raise
+    return publish_prepared_artifact_after_cleanup(
+        artifact_path,
+        artifact,
+        cleanup_actions=[("checkpoint_close", ledger.close)],
+    )
 
 
 def read_artifact_or_pointer(path: str | os.PathLike[str]) -> dict[str, Any]:

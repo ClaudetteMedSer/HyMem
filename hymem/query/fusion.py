@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable
 
 from hymem.dreaming.aggregation_provenance import (
     BoundSourceOccurrence,
-    load_aggregation_source_manifest,
+    load_current_aggregation_publication,
 )
 from hymem.dreaming.lossless import validate_message_coverage_artifact
 from hymem.dreaming.facts import load_fact_source_manifests
@@ -614,7 +614,11 @@ def fuse_context(
     return [*protected, *ranked]
 
 
-def enrich_context_provenance(conn: sqlite3.Connection, ctx: Any) -> None:
+def enrich_context_provenance(
+    conn: sqlite3.Connection, ctx: Any, *,
+    expected_aggregation_generation_key: str | None = None,
+    embedding_client: object | None = None,
+) -> None:
     """Attach exact source occurrences to selected tier DTOs, in place.
 
     This is one bounded read pass over already-selected artifacts. It neither
@@ -772,16 +776,57 @@ def enrich_context_provenance(conn: sqlite3.Connection, ctx: Any) -> None:
         ))
     ctx.facts = enriched_facts
 
+    original_nodes = list(getattr(ctx, "aggregation_nodes", ()))
+    digest = getattr(ctx, "digest", None)
+    publication = None
+    if original_nodes or digest is not None:
+        publication = load_current_aggregation_publication(
+            conn,
+            expected_generation_key=expected_aggregation_generation_key,
+            embedding_client=embedding_client,
+        )
+
     enriched_nodes = []
-    for node in getattr(ctx, "aggregation_nodes", ()):
-        sources = load_aggregation_source_manifest(conn, node.node_id)
-        occurrences = public_sources(sources)
-        enriched_nodes.append(replace(
-            node,
-            source_occurrences=occurrences,
-            source_provenance_complete=sources is not None,
-        ))
+    if publication is not None:
+        for node in original_nodes:
+            proof = publication.nodes.get(node.node_id)
+            if proof is None:
+                continue
+            occurrences = public_sources(proof.occurrences)
+            enriched_nodes.append(replace(
+                node,
+                source_occurrences=occurrences,
+                source_provenance_complete=True,
+            ))
     ctx.aggregation_nodes = enriched_nodes
+
+    if digest is not None:
+        if (
+            publication is None
+            or publication.root_node_id != getattr(digest, "node_id", None)
+        ):
+            ctx.digest = None
+
+    # Treat the aggregate DTOs as one publication-scoped unit.  A material
+    # mutation between two node lookups must not leave the earlier node (or an
+    # early-loaded digest) in the final context.  The public loader includes
+    # its own post-snapshot fence; this second load also covers a caller-owned
+    # outer snapshot/provider interval between capture and final assembly.
+    if publication is not None:
+        final_publication = load_current_aggregation_publication(
+            conn,
+            expected_generation_key=expected_aggregation_generation_key,
+            expected_material_epoch_key=publication.material_epoch_key,
+            embedding_client=embedding_client,
+        )
+        if (
+            final_publication is None
+            or final_publication.publication_id != publication.publication_id
+            or final_publication.material_epoch_key
+            != publication.material_epoch_key
+        ):
+            ctx.aggregation_nodes = []
+            ctx.digest = None
 
 
 def scope_context_in_place(

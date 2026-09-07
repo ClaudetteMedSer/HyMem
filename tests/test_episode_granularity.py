@@ -595,7 +595,7 @@ def test_v35_adds_the_session_stamp_to_a_pre_v35_store(tmp_path):
 
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
     assert "episodes_prompt_version" in cols
-    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     row = conn.execute("SELECT * FROM sessions WHERE id = 'old'").fetchone()
     assert row["summary"] == "a pre-v35 session"
     assert row["episodes_prompt_version"] is None, (

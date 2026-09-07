@@ -42,6 +42,10 @@ import sys
 from pathlib import Path
 
 from hymem import rules_extract
+from hymem.contrib.model_policy import (
+    DeprecatedModelAliasError,
+    require_active_model,
+)
 from hymem.rules_extract import route_decisions
 
 sys.path.insert(0, str(Path(__file__).parent))  # sibling benchmark imports
@@ -98,6 +102,17 @@ def main() -> None:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    if not args.sim:
+        try:
+            require_active_model(
+                args.answer_model, role="rule-extraction tagger"
+            )
+            require_active_model(
+                args.judge_model, role="rule-extraction adjudicator"
+            )
+        except DeprecatedModelAliasError as exc:
+            ap.error(str(exc))
 
     corpus = load_corpus(args.labels)
     markers = [(c["kind"], c["statement"]) for c in corpus]

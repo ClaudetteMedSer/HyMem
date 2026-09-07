@@ -3,8 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from hymem.extraction.contract import (
+    ACTIVE_EXTRACTION_PROMPT_VERSION,
+    extraction_contract_binding,
+)
+
 
 MAX_FACTS_PER_EXTRACTION_UNIT = 256
+SQLITE_MAX_INTEGER = 2**63 - 1
 
 
 def _default_evidence_role_weights() -> dict[str, int]:
@@ -45,6 +51,11 @@ class HyMemConfig:
     """Directory holding hymem.sqlite, MEMORY.md, USER.md."""
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "extraction_contract",
+            extraction_contract_binding(self.prompt_version),
+        )
         value = self.dream_max_facts_per_session
         if (
             not isinstance(value, int) or isinstance(value, bool)
@@ -54,9 +65,42 @@ class HyMemConfig:
                 "dream_max_facts_per_session must be between 1 and "
                 f"{MAX_FACTS_PER_EXTRACTION_UNIT}"
             )
+        call_budget = self.dream_extraction_provider_attempt_budget
+        if (
+            not isinstance(call_budget, int)
+            or isinstance(call_budget, bool)
+            or call_budget < 0
+        ):
+            raise ValueError(
+                "dream_extraction_provider_attempt_budget must be a "
+                "non-negative integer"
+            )
+        baseline_budget = self.dream_baseline_budget
+        if (
+            not isinstance(baseline_budget, int)
+            or isinstance(baseline_budget, bool)
+            or baseline_budget < 0
+        ):
+            raise ValueError(
+                "dream_baseline_budget must be a non-negative integer"
+            )
+        feedback_keep = self.extraction_feedback_keep
+        if (
+            not isinstance(feedback_keep, int) or isinstance(feedback_keep, bool)
+            or not 0 <= feedback_keep <= SQLITE_MAX_INTEGER
+        ):
+            raise ValueError(
+                "extraction_feedback_keep must be an integer between 0 and "
+                f"{SQLITE_MAX_INTEGER}"
+            )
 
     salience_min_chars: int = 30
-    """Minimum chunk size before extraction is attempted."""
+    """User-turn length that enters the high-priority extraction tier.
+
+    Shorter non-blank, non-trigger turns remain eligible through the bounded
+    baseline tier; this threshold controls priority, not whether a source can
+    ever reach extraction.
+    """
 
     # ---- ingest limits & privacy ------------------------------------------
     redact_secrets: bool = True
@@ -629,28 +673,61 @@ class HyMemConfig:
     profile_max_entries: int = 16
     insights_max_entries: int = 12
 
-    # v13 adds exact source_message_id citations to every Phase-1 graph claim.
-    # Re-offer v12 chunks so message-level provenance is populated from their
-    # durable source manifests instead of preserving chunk-first attribution.
-    # after a malformed optional hint or an assertion split exactly at the
-    # retry midpoint. The v39 validator and overlap semantics must replay old
-    # extraction chunks too, including after raw-message pruning.
-    prompt_version: str = "v13"
+    # v20 retains v19's bounded omission-focused verification. The mechanically
+    # derived extraction contract additionally binds the current source-split
+    # policy: ambiguous sentence shapes fail closed, while valid prose cuts
+    # carry bounded, labelled preceding same-source context so a cross-boundary
+    # claim cannot disappear from both independently checked fragments.
+    # Prompt-independent v47 terminal source losses remain closed because no
+    # prompt can reconstruct evidence.
+    prompt_version: str = ACTIVE_EXTRACTION_PROMPT_VERSION
+    extraction_contract: dict[str, str] = field(init=False)
+    """Derived binding to the prompt, validator, parser, and recovery code.
+
+    This is intentionally not operator supplied.  It makes serialized
+    effective configs self-authenticating against the executing Phase-1
+    contract while ``prompt_version`` remains the human generation label.
+    """
 
     dream_budget: int = 50
     """Maximum number of chunks to process per dreaming cycle."""
 
+    dream_extraction_provider_attempt_budget: int = 200
+    """Soft per-cycle ceiling on Phase-1 provider request attempts only.
+
+    The runner stops starting chunks after reaching this value, but never
+    interrupts an in-flight chunk or publishes a partial result. Consequently
+    a cycle may overshoot by one in-flight chunk. That chunk has at most 96
+    logical completion calls, or exactly 288 HTTP attempts with the shipped
+    three-attempt OpenAI-compatible retry policy (SDK retries are disabled). A
+    custom client must expose exact request accounting and keep its own internal
+    retries bounded. Digest, profile, and fact calls are independent and do not
+    count here. Set to 0 for unlimited Phase-1 provider attempts (the chunk-count
+    ``dream_budget`` still applies). A normal sparse v20 chunk makes two
+    provider requests when both calls succeed first try, or at most six when
+    both exhaust the shipped retry allowance. The default provides an average
+    planning envelope of four provider attempts for each of 50 chunks.
+    """
+
     dream_baseline_budget: int = 10
-    """If the salience tier leaves budget unspent, drain up to this many
-    non-salience-marked chunks (newest first) per cycle. Guarantees every chunk
-    eventually flows through extraction even if it didn't trip the regexes."""
+    """If the salience tier leaves budget unspent, drain up to this many short,
+    non-trigger user-turn chunks (newest first within a session) across the
+    entire cycle. Session order rotates between cycles to prevent a busy old
+    session from starving later ones. Candidates and exact source manifests are
+    made durable before provider calls, while this bound and the shared
+    chunk/provider ceilings control inference cost. Spending a positive bound
+    while actionable baseline work remains sets ``DreamReport.budget_exhausted``
+    so callers know another cycle is required. Set to 0 to retain candidates
+    without scheduling inference or reporting baseline-budget exhaustion."""
 
     chunk_extraction_max_attempts: int = 3
     """Consecutive failures before an extraction chunk is quarantined.
     Quarantine never creates a ``processed_chunks`` success marker and does not
     consume later dream budgets, so malformed provider output is visible
     without permanently starving healthy work or becoming a silent memory
-    hole. A prompt-version/retry-policy change reopens it; set to 0 to retry
+    hole. A prompt-version/retry-policy change reopens provider-output
+    quarantine; irrecoverably missing source manifests instead enter a durable,
+    prompt-independent terminal-loss state. Set to 0 to retry provider failures
     indefinitely."""
 
     dream_digest_max_tokens: int = 3072
@@ -703,16 +780,18 @@ class HyMemConfig:
     """Max dream_runs rows retained; older rows are pruned (newest kept)."""
 
     extraction_feedback_keep: int = 200
-    """Max extraction_feedback rows retained (newest kept). Comfortably above
-    the 10 the runner injects as negative examples."""
+    """Max retraction-audit rows retained (newest kept). These records are
+    never inserted into extraction prompts; 0 removes all during pruning. The
+    value must fit SQLite's signed 64-bit integer range."""
 
     vacuum_after_prune: bool = True
-    """Run VACUUM after a dream cycle whose sweeps deleted rows, to return freed
-    pages to the OS (plain DELETE leaves the file size flat)."""
+    """Request a VACUUM maintenance signal after a pruning dream. Automatic
+    in-dream VACUUM is deliberately deferred because it cannot participate in
+    the cross-process lease fence; operators must run VACUUM followed by rowid
+    shadow resync while the store is quiesced."""
 
     vacuum_min_pruned: int = 100
-    """Minimum rows pruned in a cycle before VACUUM fires, so trivial sweeps
-    don't pay the full-rewrite cost."""
+    """Minimum rows pruned before the deferred VACUUM signal is emitted."""
 
     rerank_ambiguity_threshold: float = 0.6
     """Minimum RRF score drop between #1/#2 results to consider them clear

@@ -35,6 +35,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
+import episode_probe as episode_probe_module  # noqa: E402
 from episode_probe import (  # noqa: E402
     _MAX_CONTROL_MEDIAN_EPISODES,
     _MIN_SUBSTANTIVE_CHARS,
@@ -318,7 +319,34 @@ def test_backend_failure_is_a_parse_failure_not_a_crash(tmp_path):
         conn.close()
     assert row["parse_failed"] is True
     assert row["episodes"] == []
-    assert llm.last_error and "upstream 500" in llm.last_error
+    assert llm.last_error == "execution_failure:RuntimeError"
+
+
+def test_probe_failure_diagnostic_drops_exception_path_and_secret(
+    tmp_path, monkeypatch,
+):
+    secret = "Bearer sk-private-probe-token"
+    private_path = "/home/node/private/probe.sqlite"
+
+    def fail_extract(*_args, **_kwargs):
+        raise RuntimeError(f"{secret} at {private_path}: " + "x" * 20_000)
+
+    monkeypatch.setattr(
+        episode_probe_module, "extract_session_digest", fail_extract
+    )
+    cfg = HyMemConfig(root=tmp_path)
+    entries = [_entry("s1", "target")]
+    conn = build_store(tmp_path / "probe.sqlite", entries, cfg)
+    try:
+        row = extract_one(
+            conn, entries[0], CapturingLLM(sim_backend), cfg, granular=True
+        )
+    finally:
+        conn.close()
+
+    assert row["error"] == "execution_failure:RuntimeError"
+    encoded = json.dumps(row)
+    assert secret not in encoded and private_path not in encoded
 
 
 # ── smaller units ───────────────────────────────────────────────────────────

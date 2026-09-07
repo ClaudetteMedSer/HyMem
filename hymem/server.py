@@ -1,6 +1,6 @@
 """MCP server for HyMem.
 
-Exposes eleven tools to the Hermes Agent platform:
+Exposes twelve tools to the Hermes Agent platform:
   hymem_capture    — log a full conversation at once + optionally dream (preferred)
   hymem_log        — log one conversational turn (fallback for turn-by-turn use)
   hymem_dream      — run a dreaming cycle (extract, consolidate, decay)
@@ -27,6 +27,9 @@ Key variables:
     HYMEM_LLM_API_KEY        API key for the extraction LLM (or DEEPSEEK_API_KEY)
     HYMEM_LLM_BASE_URL       Base URL (default: https://api.deepseek.com)
     HYMEM_LLM_MODEL          Model name (default: deepseek-v4-flash)
+                             Retired deepseek-chat/deepseek-reasoner aliases
+                             are rejected before the server opens its store.
+    HYMEM_LLM_THINKING       Thinking-body policy (default: auto)
     HYMEM_EMBEDDING_API_KEY  API key for an explicitly configured remote embedder
                              (OPENAI_API_KEY is used only for api.openai.com)
     HYMEM_EMBEDDING_BASE_URL HTTPS OpenAI-compatible endpoint (HTTP only loopback)
@@ -37,10 +40,8 @@ Key variables:
     HYMEM_ROOT               Directory for hymem.sqlite, MEMORY.md, USER.md
                              (default: ~/.hermes)
     HYMEM_AGGREGATION_NODES_ENABLED
-                             Turn on the RAPTOR aggregation/digest layer at dream
-                             time (default: off). Set true to gather steady-state
-                             nodes/reused cost data before flipping the shipped
-                             default (raptor_digest_plan.md 3c).
+                             RAPTOR aggregation/digest master switch at dream
+                             time (default: on). Set false to opt out.
     HYMEM_AGGREGATION_DIGEST_ENABLED
                              Override the digest sub-switch independently (default:
                              on whenever aggregation is enabled). Set false to
@@ -57,11 +58,38 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from dataclasses import dataclass
 
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
 # Re-exported here under the historical names used by tests and tool helpers.
-from hymem.bootstrap import get_instance as _get_hy, set_instance as set_hy
+from hymem.bootstrap import (
+    get_instance as _get_hy,
+    set_instance as set_hy,
+    shutdown_instance as _shutdown_hy,
+)
 from hymem.query.augment import format_graph_fact_sources
+from hymem.dreaming.runner import (
+    DREAM_REPORT_BOOLEAN_GATE_FIELDS,
+    DREAM_REPORT_COUNT_FIELDS,
+    DREAM_REPORT_ERROR_FIELDS,
+    DREAM_REPORT_FIELD_NAMES,
+    DREAM_REPORT_NULLABLE_COUNT_FIELDS,
+    DREAM_REPORT_TEXT_FIELDS,
+)
+from hymem.dreaming.status import (
+    DREAM_STATUS_BLOCKING_COUNT_FIELDS,
+    DREAM_STATUS_BOOLEAN_GATE_FIELDS,
+    DREAM_STATUS_DIAGNOSTIC_BOOLEAN_FIELDS,
+    DREAM_STATUS_DIAGNOSTIC_CONFIG_VERSION_FIELDS,
+    DREAM_STATUS_DIAGNOSTIC_COUNT_FIELDS,
+    DREAM_STATUS_DIAGNOSTIC_NULLABLE_TEXT_FIELDS,
+    DREAM_STATUS_HEALTH_DETAIL_FIELDS,
+    DREAM_STATUS_RECOGNIZED_HEALTH_FIELDS,
+    DREAM_STATUS_SCHEMA_VERSION,
+    is_health_like_dream_status_field,
+)
+from hymem.dreaming.lossless import COVERAGE_INTEGRITY_CONFIG_VERSION
 
 
 def _get_mcp():
@@ -75,6 +103,564 @@ def _get_mcp():
 
 
 mcp = None
+
+_MAX_REPORTED_COUNT = (1 << 63) - 1
+_AGGREGATION_CONFIG_VERSION_PREFIX = "aggregation-build-config-v1:"
+_PHASE1_GENERATION_KEY_RE = re.compile(
+    r"hymem-phase1-generation-v1:[0-9a-f]{64}\Z"
+)
+
+
+@dataclass(frozen=True)
+class _DreamCompletionAssessment:
+    state: str
+    blockers: tuple[str, ...] = ()
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return bool(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _MAX_REPORTED_COUNT
+    )
+
+
+def _report_skipped_hint(report) -> bool:
+    try:
+        return getattr(report, "skipped_locked", None) is True
+    except Exception:
+        return False
+
+
+def _bounded_field_names(field_names: set[str]) -> str:
+    """Render schema drift without allowing an unbounded MCP response."""
+
+    ordered = sorted(field_names)
+    shown = ordered[:6]
+    rendered = ",".join(name[:80] for name in shown)
+    if len(ordered) > len(shown):
+        rendered += f",...(+{len(ordered) - len(shown)})"
+    return rendered
+
+
+def _bounded_blocker_text(blockers: tuple[str, ...]) -> str:
+    """Keep an actionable prefix while deduplicating and bounding output."""
+
+    unique = tuple(dict.fromkeys(blockers))
+    shown = unique[:10]
+    rendered = ", ".join(shown)
+    if len(unique) > len(shown):
+        rendered += f", ... (+{len(unique) - len(shown)} more)"
+    return rendered
+
+
+def _reason_counts_match(value: object, expected: int) -> bool:
+    if type(value) is not dict:
+        return False
+    counts = list(value.values())
+    return bool(
+        all(isinstance(key, str) and key.strip() for key in value)
+        and all(_is_nonnegative_int(count) and count > 0 for count in counts)
+        and sum(counts) == expected
+    )
+
+
+def _is_aggregation_config_version(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    digest = value.removeprefix(_AGGREGATION_CONFIG_VERSION_PREFIX)
+    return bool(
+        value.startswith(_AGGREGATION_CONFIG_VERSION_PREFIX)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+    )
+
+
+def _coverage_details_are_shaped(value: object) -> bool:
+    if type(value) is not list or len(value) > 100:
+        return False
+    required = {
+        "session_id",
+        "config_version",
+        "failure_reason",
+        "occurrences",
+        "first_detected_at",
+        "last_detected_at",
+    }
+    for detail in value:
+        if type(detail) is not dict or not required.issubset(detail):
+            return False
+        if not all(
+            isinstance(detail[name], str) and detail[name].strip()
+            for name in (
+                "session_id",
+                "config_version",
+                "failure_reason",
+                "first_detected_at",
+                "last_detected_at",
+            )
+        ):
+            return False
+        if (
+            not _is_nonnegative_int(detail["occurrences"])
+            or detail["occurrences"] == 0
+            or detail["config_version"] != COVERAGE_INTEGRITY_CONFIG_VERSION
+        ):
+            return False
+    return True
+
+
+def _assess_dream_completion(hy, report) -> _DreamCompletionAssessment:
+    """Classify one run against a fresh, store-wide reported-health snapshot.
+
+    Both objects are strict trust boundaries. Missing or malformed fields can
+    never be interpreted as zero/healthy, because this text is exposed to
+    agents that may otherwise stop scheduling recovery.
+    """
+
+    try:
+        status = hy.dream_status()
+    except Exception:
+        return _DreamCompletionAssessment(
+            (
+                "skipped_unverified"
+                if _report_skipped_hint(report)
+                else "unverified"
+            ),
+            ("dream_status:unavailable",),
+        )
+    if type(status) is not dict:
+        return _DreamCompletionAssessment(
+            (
+                "skipped_unverified"
+                if _report_skipped_hint(report)
+                else "unverified"
+            ),
+            ("dream_status:malformed",),
+        )
+
+    if status.get("dream_status_schema") != DREAM_STATUS_SCHEMA_VERSION:
+        return _DreamCompletionAssessment(
+            (
+                "skipped_unverified"
+                if _report_skipped_hint(report)
+                else "unverified"
+            ),
+            ("status.dream_status_schema:missing_or_invalid",),
+        )
+
+    malformed: list[str] = []
+    status_field_names = {
+        name for name in status if isinstance(name, str)
+    }
+    if len(status_field_names) != len(status):
+        malformed.append("status.health_schema:non_string_field")
+    unknown_health_fields = {
+        name for name in status_field_names
+        if (
+            is_health_like_dream_status_field(name)
+            and name not in DREAM_STATUS_RECOGNIZED_HEALTH_FIELDS
+        )
+    }
+    if unknown_health_fields:
+        malformed.append(
+            "status.health_schema:unknown="
+            + _bounded_field_names(unknown_health_fields)
+        )
+
+    status_counts: dict[str, int] = {}
+    for field_name in DREAM_STATUS_BLOCKING_COUNT_FIELDS:
+        value = status.get(field_name)
+        if not _is_nonnegative_int(value):
+            malformed.append(f"status.{field_name}:missing_or_invalid")
+        else:
+            status_counts[field_name] = value
+
+    status_flags: dict[str, bool] = {}
+    for field_name in DREAM_STATUS_BOOLEAN_GATE_FIELDS:
+        value = status.get(field_name)
+        if not isinstance(value, bool):
+            malformed.append(f"status.{field_name}:missing_or_invalid")
+        else:
+            status_flags[field_name] = value
+
+    phase1_backlog_status = status.get("phase1_backlog_status")
+    pending_chunks_authoritative = status.get(
+        "pending_chunks_authoritative"
+    )
+    phase1_generation_key = status.get("phase1_generation_key")
+    if phase1_backlog_status not in {
+        "current_producer", "producer_unavailable",
+    }:
+        malformed.append("status.phase1_backlog_status:missing_or_invalid")
+    if not isinstance(pending_chunks_authoritative, bool):
+        malformed.append(
+            "status.pending_chunks_authoritative:missing_or_invalid"
+        )
+    if phase1_generation_key is not None and (
+        type(phase1_generation_key) is not str
+        or _PHASE1_GENERATION_KEY_RE.fullmatch(phase1_generation_key) is None
+    ):
+        malformed.append("status.phase1_generation_key:missing_or_invalid")
+    if (
+        phase1_backlog_status == "current_producer"
+        and (
+            pending_chunks_authoritative is not True
+            or phase1_generation_key is None
+        )
+    ) or (
+        phase1_backlog_status == "producer_unavailable"
+        and (
+            pending_chunks_authoritative is not False
+            or phase1_generation_key is not None
+        )
+    ):
+        malformed.append("status.phase1_authority:inconsistent")
+
+    diagnostic_counts: dict[str, int] = {}
+    for field_name in DREAM_STATUS_DIAGNOSTIC_COUNT_FIELDS:
+        value = status.get(field_name)
+        if not _is_nonnegative_int(value):
+            malformed.append(f"status.{field_name}:missing_or_invalid")
+        else:
+            diagnostic_counts[field_name] = value
+    diagnostic_flags: dict[str, bool] = {}
+    for field_name in DREAM_STATUS_DIAGNOSTIC_BOOLEAN_FIELDS:
+        value = status.get(field_name)
+        if not isinstance(value, bool):
+            malformed.append(f"status.{field_name}:missing_or_invalid")
+        else:
+            diagnostic_flags[field_name] = value
+    diagnostic_text: dict[str, str | None] = {}
+    for field_name in DREAM_STATUS_DIAGNOSTIC_NULLABLE_TEXT_FIELDS:
+        value = status.get(field_name)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            malformed.append(f"status.{field_name}:missing_or_invalid")
+        elif field_name not in status:
+            malformed.append(f"status.{field_name}:missing_or_invalid")
+        else:
+            diagnostic_text[field_name] = value
+    for field_name in DREAM_STATUS_DIAGNOSTIC_CONFIG_VERSION_FIELDS:
+        value = diagnostic_text.get(field_name)
+        if value is not None and not _is_aggregation_config_version(value):
+            malformed.append(f"status.{field_name}:missing_or_invalid")
+
+    for field_name in DREAM_STATUS_HEALTH_DETAIL_FIELDS:
+        if field_name not in status:
+            malformed.append(f"status.{field_name}:missing_or_invalid")
+    terminal_loss_reasons = status.get("terminal_loss_reasons")
+    if (
+        "terminal_loss_reasons" in status
+        and "terminal_loss_chunks" in status_counts
+        and not _reason_counts_match(
+            terminal_loss_reasons,
+            status_counts["terminal_loss_chunks"],
+        )
+    ):
+        malformed.append("status.terminal_loss_reasons:missing_or_invalid")
+    coverage_failure_reasons = status.get(
+        "coverage_integrity_failure_reasons"
+    )
+    if (
+        "coverage_integrity_failure_reasons" in status
+        and "coverage_integrity_failures" in status_counts
+        and not _reason_counts_match(
+            coverage_failure_reasons,
+            status_counts["coverage_integrity_failures"],
+        )
+    ):
+        malformed.append(
+            "status.coverage_integrity_failure_reasons:missing_or_invalid"
+        )
+    if (
+        "coverage_integrity_failure_details" in status
+        and not _coverage_details_are_shaped(
+            status.get("coverage_integrity_failure_details")
+        )
+    ):
+        malformed.append(
+            "status.coverage_integrity_failure_details:missing_or_invalid"
+        )
+    if (
+        "coverage_integrity_failure_details_truncated" in status
+        and not isinstance(
+            status.get("coverage_integrity_failure_details_truncated"), bool
+        )
+    ):
+        malformed.append(
+            "status.coverage_integrity_failure_details_truncated:"
+            "missing_or_invalid"
+        )
+    if (
+        "coverage_integrity_config_version" in status
+        and status.get("coverage_integrity_config_version")
+        != COVERAGE_INTEGRITY_CONFIG_VERSION
+    ):
+        malformed.append(
+            "status.coverage_integrity_config_version:missing_or_invalid"
+        )
+
+    coverage_count = status_counts.get("coverage_integrity_failures")
+    coverage_details = status.get("coverage_integrity_failure_details")
+    coverage_truncated = status.get(
+        "coverage_integrity_failure_details_truncated"
+    )
+    if (
+        coverage_count is not None
+        and type(coverage_details) is list
+        and isinstance(coverage_truncated, bool)
+        and (
+            len(coverage_details) != min(coverage_count, 100)
+            or coverage_truncated is not (coverage_count > 100)
+        )
+    ):
+        malformed.append("status.coverage_integrity_details:inconsistent")
+
+    pending_aggregation = status_counts.get("pending_aggregation")
+    active_aggregation_fields = (
+        "aggregation_active_build_attempts",
+        "aggregation_active_caught_exceptions",
+        "aggregation_active_fusion_failures",
+    )
+    if (
+        pending_aggregation == 0
+        and all(
+            field_name in diagnostic_counts
+            for field_name in active_aggregation_fields
+        )
+        and any(
+            diagnostic_counts[field_name] != 0
+            for field_name in active_aggregation_fields
+        )
+    ):
+        malformed.append("status.aggregation_active_diagnostics:inconsistent")
+    if (
+        "aggregation_active_caught_exceptions" in diagnostic_counts
+        and "aggregation_total_caught_exceptions" in diagnostic_counts
+        and diagnostic_counts["aggregation_active_caught_exceptions"]
+        > diagnostic_counts["aggregation_total_caught_exceptions"]
+    ):
+        malformed.append("status.aggregation_exception_counts:inconsistent")
+    if (
+        "aggregation_active_fusion_failures" in diagnostic_counts
+        and "aggregation_total_fusion_failures" in diagnostic_counts
+        and diagnostic_counts["aggregation_active_fusion_failures"]
+        > diagnostic_counts["aggregation_total_fusion_failures"]
+    ):
+        malformed.append("status.aggregation_fusion_counts:inconsistent")
+
+    aggregation_enabled = diagnostic_flags.get("aggregation_enabled")
+    aggregation_config = diagnostic_text.get("aggregation_config_version")
+    if (
+        aggregation_enabled is False
+        and (aggregation_config is not None or pending_aggregation != 0)
+    ) or (aggregation_enabled is True and aggregation_config is None):
+        malformed.append("status.aggregation_configuration:inconsistent")
+
+    success_metadata = (
+        diagnostic_text.get("aggregation_last_success_config_version"),
+        diagnostic_text.get("aggregation_last_success_at"),
+    )
+    if any(value is None for value in success_metadata) != all(
+        value is None for value in success_metadata
+    ):
+        malformed.append("status.aggregation_success_metadata:inconsistent")
+    if (
+        aggregation_enabled is True
+        and pending_aggregation == 0
+        and success_metadata[0] != aggregation_config
+    ):
+        malformed.append("status.aggregation_success_metadata:stale")
+    failure_metadata = (
+        diagnostic_text.get("aggregation_last_failure_config_version"),
+        diagnostic_text.get("aggregation_last_failure_kind"),
+        diagnostic_text.get("aggregation_last_failure_at"),
+    )
+    if any(value is None for value in failure_metadata) != all(
+        value is None for value in failure_metadata
+    ):
+        malformed.append("status.aggregation_failure_metadata:inconsistent")
+    failure_kind = diagnostic_text.get("aggregation_last_failure_kind")
+    if failure_kind not in {
+        None,
+        "exception",
+        "fusion_failure",
+        "exception_and_fusion",
+    }:
+        malformed.append("status.aggregation_last_failure_kind:invalid")
+
+    report_counts: dict[str, int] = {}
+    report_flags: dict[str, bool] = {}
+    try:
+        report_values = vars(report)
+        if type(report_values) is not dict:
+            raise TypeError("dream report has no attribute dictionary")
+        report_field_names = set(report_values)
+        required_report_fields = set(DREAM_REPORT_FIELD_NAMES)
+        missing_report_fields = required_report_fields - report_field_names
+        extra_report_fields = report_field_names - required_report_fields
+        if missing_report_fields:
+            malformed.append(
+                "report.schema:missing="
+                + _bounded_field_names(missing_report_fields)
+            )
+        if extra_report_fields:
+            malformed.append(
+                "report.schema:extra="
+                + _bounded_field_names(extra_report_fields)
+            )
+        for field_name in (
+            *DREAM_REPORT_COUNT_FIELDS,
+            *DREAM_REPORT_ERROR_FIELDS,
+        ):
+            if field_name not in report_values:
+                continue
+            value = report_values.get(field_name)
+            if not _is_nonnegative_int(value):
+                malformed.append(f"report.{field_name}:missing_or_invalid")
+            elif field_name in DREAM_REPORT_ERROR_FIELDS:
+                report_counts[field_name] = value
+        for field_name in DREAM_REPORT_NULLABLE_COUNT_FIELDS:
+            if field_name not in report_values:
+                continue
+            value = report_values.get(field_name)
+            if value is not None and not _is_nonnegative_int(value):
+                malformed.append(f"report.{field_name}:missing_or_invalid")
+        for field_name in DREAM_REPORT_TEXT_FIELDS:
+            if field_name not in report_values:
+                continue
+            if not isinstance(report_values.get(field_name), str):
+                malformed.append(f"report.{field_name}:missing_or_invalid")
+        for field_name in DREAM_REPORT_BOOLEAN_GATE_FIELDS:
+            if field_name not in report_values:
+                continue
+            value = report_values.get(field_name)
+            if not isinstance(value, bool):
+                malformed.append(f"report.{field_name}:missing_or_invalid")
+            else:
+                report_flags[field_name] = value
+    except Exception:
+        return _DreamCompletionAssessment(
+            "unverified", ("dream_report:malformed",)
+        )
+
+    if malformed:
+        return _DreamCompletionAssessment(
+            (
+                "skipped_unverified"
+                if report_flags.get("skipped_locked") is True
+                else "unverified"
+            ),
+            tuple(malformed),
+        )
+
+    blockers = [
+        f"status.{field_name}={value}"
+        for field_name, value in status_counts.items()
+        if value > 0
+    ]
+    blockers.extend(
+        f"report.{field_name}={value}"
+        for field_name, value in report_counts.items()
+        if value > 0
+    )
+    blockers.extend(
+        f"report.{field_name}=true"
+        for field_name in (
+            "budget_exhausted",
+            "extraction_provider_attempt_budget_exhausted",
+        )
+        if report_flags[field_name]
+    )
+    if phase1_backlog_status == "producer_unavailable":
+        blockers.append("status.phase1_backlog_status=producer_unavailable")
+
+    in_progress = status_flags["in_progress"]
+    if report_flags["skipped_locked"]:
+        if in_progress:
+            return _DreamCompletionAssessment(
+                "skipped_in_progress", tuple(blockers)
+            )
+        return _DreamCompletionAssessment(
+            "skipped", ("report.skipped_locked=true", *blockers)
+        )
+    if in_progress:
+        return _DreamCompletionAssessment(
+            "in_progress", ("status.in_progress=true", *blockers)
+        )
+    if blockers:
+        return _DreamCompletionAssessment("incomplete", tuple(blockers))
+    return _DreamCompletionAssessment("complete")
+
+
+def _safe_report_count(report, field_name: str) -> str:
+    try:
+        value = getattr(report, field_name, None)
+    except Exception:
+        return "unknown"
+    return str(value) if _is_nonnegative_int(value) else "unknown"
+
+
+def _dream_run_summary(report) -> str:
+    return (
+        f"{_safe_report_count(report, 'sessions_processed')} sessions, "
+        f"{_safe_report_count(report, 'chunks_processed')} chunks newly completed "
+        f"this run ({_safe_report_count(report, 'chunks_seen')} seen), "
+        f"{_safe_report_count(report, 'triples_extracted')} triples, "
+        f"{_safe_report_count(report, 'markers_extracted')} markers extracted"
+    )
+
+
+def _format_dream_completion(hy, report, *, targeted: bool) -> str:
+    """Render the shared, fail-closed completion statement for MCP tools."""
+
+    assessment = _assess_dream_completion(hy, report)
+    if assessment.state == "complete":
+        headline = (
+            "targeted dreaming cycle finished cleanly — store-wide durable "
+            "blockers were clear at the coherent post-run snapshot; later "
+            "arrivals may reopen work"
+            if targeted else
+            "dreaming cycle finished cleanly — store-wide durable blockers "
+            "were clear at the coherent post-run snapshot; later arrivals "
+            "may reopen work"
+        )
+    elif assessment.state == "skipped_in_progress":
+        headline = (
+            "dreaming skipped (another cycle owns the lease) — "
+            "store-wide indexing is in progress"
+        )
+    elif assessment.state == "in_progress":
+        headline = (
+            "dreaming run finished — store-wide indexing is in progress "
+            "(another cycle now owns the lease)"
+        )
+    elif assessment.state == "skipped":
+        headline = (
+            "dreaming skipped (lease was busy) — "
+            "store-wide reported indexing health is incomplete"
+        )
+    elif assessment.state in {"unverified", "skipped_unverified"}:
+        headline = (
+            (
+                "dreaming skipped — "
+                if assessment.state == "skipped_unverified"
+                else "dreaming incomplete/unverified — "
+            )
+            + "store-wide reported indexing health is incomplete/unverified"
+        )
+    else:
+        headline = (
+            "dreaming incomplete — "
+            "store-wide reported indexing health is incomplete"
+        )
+    if assessment.blockers:
+        headline += "; blockers: " + _bounded_blocker_text(
+            assessment.blockers
+        )
+    return f"{headline}; {_dream_run_summary(report)}"
 
 
 # ── tool implementations (callable directly in tests) ────────────────────────
@@ -106,16 +692,8 @@ def _do_capture(session_id: str, messages: str, dream: bool = True) -> str:
         return f"logged {logged} turns for session {session_id!r}"
 
     report = hy.dream(session_ids=[session_id])
-    if report.skipped_locked:
-        return (
-            f"logged {logged} turns for session {session_id!r}; "
-            "dreaming skipped (another cycle is running — will pick up via cron)"
-        )
-    return (
-        f"logged {logged} turns for session {session_id!r}; "
-        f"dreaming complete — {report.chunks_processed}/{report.chunks_seen} chunks, "
-        f"{report.triples_extracted} triples, {report.markers_extracted} markers"
-    )
+    completion = _format_dream_completion(hy, report, targeted=True)
+    return f"logged {logged} turns for session {session_id!r}; {completion}"
 
 
 def _do_log(session_id: str, role: str, content: str) -> str:
@@ -124,16 +702,9 @@ def _do_log(session_id: str, role: str, content: str) -> str:
 
 
 def _do_dream() -> str:
-    report = _get_hy().dream()
-    if report.skipped_locked:
-        return "skipped: another dreaming cycle is already running"
-    return (
-        f"dreaming complete — "
-        f"{report.sessions_processed} sessions, "
-        f"{report.chunks_processed}/{report.chunks_seen} chunks processed, "
-        f"{report.triples_extracted} triples, "
-        f"{report.markers_extracted} markers extracted"
-    )
+    hy = _get_hy()
+    report = hy.dream()
+    return _format_dream_completion(hy, report, targeted=False)
 
 
 def _do_augment(message: str) -> str:
@@ -179,7 +750,9 @@ def _do_ask(question: str) -> str:
 def _do_profile() -> str:
     hy = _get_hy()
     cfg = hy.config
-    user = cfg.user_md_path.read_text(encoding="utf-8") if cfg.user_md_path.exists() else ""
+    from hymem.dreaming.phase2 import authoritative_user_markdown
+
+    user = authoritative_user_markdown(hy.read_conn, cfg)
     memory = cfg.memory_md_path.read_text(encoding="utf-8") if cfg.memory_md_path.exists() else ""
     parts: list[str] = []
     if user.strip():
@@ -416,20 +989,41 @@ def main() -> None:
         level=os.environ.get("HYMEM_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    mcp_instance = _get_mcp()
-    mcp_instance.tool()(hymem_capture)
-    mcp_instance.tool()(hymem_log)
-    mcp_instance.tool()(hymem_dream)
-    mcp_instance.tool()(hymem_augment)
-    mcp_instance.tool()(hymem_ask)
-    mcp_instance.tool()(hymem_profile)
-    mcp_instance.tool()(hymem_digest)
-    mcp_instance.tool()(hymem_alias)
-    mcp_instance.tool()(hymem_retract)
-    mcp_instance.tool()(hymem_add_rule)
-    mcp_instance.tool()(hymem_list_rules)
-    mcp_instance.tool()(hymem_suggest_rules)
-    mcp_instance.run()
+    primary: BaseException | None = None
+    try:
+        mcp_instance = _get_mcp()
+        # Fail during process startup (with bootstrap rollback) instead of on
+        # the first tool call after the MCP transport has advertised itself.
+        _get_hy()
+        mcp_instance.tool()(hymem_capture)
+        mcp_instance.tool()(hymem_log)
+        mcp_instance.tool()(hymem_dream)
+        mcp_instance.tool()(hymem_augment)
+        mcp_instance.tool()(hymem_ask)
+        mcp_instance.tool()(hymem_profile)
+        mcp_instance.tool()(hymem_digest)
+        mcp_instance.tool()(hymem_alias)
+        mcp_instance.tool()(hymem_retract)
+        mcp_instance.tool()(hymem_add_rule)
+        mcp_instance.tool()(hymem_list_rules)
+        mcp_instance.tool()(hymem_suggest_rules)
+        mcp_instance.run()
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            _shutdown_hy()
+        except BaseException as cleanup:
+            if primary is None:
+                raise
+            try:
+                primary.add_note(
+                    "HyMem MCP lifecycle cleanup failed: "
+                    f"{type(cleanup).__name__}"
+                )
+            except (AttributeError, TypeError):  # pragma: no cover
+                pass
 
 
 if __name__ == "__main__":

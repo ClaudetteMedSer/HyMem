@@ -23,12 +23,47 @@ silently narrow it to its first element.
 """
 from __future__ import annotations
 
+from hymem.contrib.implementation_identity import import_time_source_sha256
+
+EXTRACTION_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
+
 import json
 import math
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 _DELIMS = {"object": ("{", "}"), "array": ("[", "]")}
+
+# This policy is embedded in the Phase-1 extraction contract.  Changing the
+# classifier therefore invalidates durable extraction cache hits and benchmark
+# canary reports even when the human-facing prompt version is unchanged.
+JSON_CEILING_CUT_POLICY_VERSION = "hymem-json-ceiling-cut-grammar-v1"
+
+_JSON_WHITESPACE = frozenset(" \t\r\n")
+_JSON_SIMPLE_ESCAPES = frozenset('"\\/bfnrt')
+_JSON_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_OPENING_JSON_FENCE = re.compile(
+    r"```[ \t]*(?:json[ \t]*)?(?:\r\n|\r|\n)",
+    flags=re.IGNORECASE,
+)
+
+_PREFIX_COMPLETE = "complete"
+_PREFIX_INCOMPLETE = "incomplete"
+_PREFIX_INVALID = "invalid"
+
+
+@dataclass
+class _JSONContainerFrame:
+    kind: str
+    state: str
+    keys: set[str] = field(default_factory=set)
+
+
+def _new_json_container_frame(opener: str) -> _JSONContainerFrame:
+    if opener == "{":
+        return _JSONContainerFrame("object", "key_or_end")
+    return _JSONContainerFrame("array", "value_or_end")
 
 
 def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -92,19 +127,270 @@ def loads_exact_or_fenced(raw: object) -> Any | None:
         return None
 
 
-def is_ceiling_cut(raw: str) -> bool:
-    """Structural cut detector: a reply that opens a JSON object and ends
-    with an unclosed brace — the signature of a reply truncated at the token
-    ceiling (finish_reason="length"). Provider-agnostic: computed from the
-    string in hand, no API signal needed. A prose refusal doesn't open with
-    '{' and a complete object parses (so the caller's lenient parse wouldn't
-    have failed) — the brace scan only ever runs on a payload that already
-    failed to parse.
+def is_ceiling_cut(raw: object) -> bool:
+    """Return whether *raw* ends while still a legal JSON-container prefix.
+
+    This is deliberately narrower than "has more opening than closing
+    braces".  Braces inside strings are data, arrays are valid roots, and a
+    syntactically impossible fragment is malformed rather than evidence that
+    the provider hit its output ceiling.  The scanner accepts the same useful
+    envelopes seen from chat-tuned providers: leading whitespace/prose and a
+    whole-response Markdown JSON fence.  It does not require a closing fence,
+    because a ceiling cut necessarily may remove it; the JSON value itself
+    must still be incomplete.  Conversely, reaching a complete root makes the
+    answer non-truncated even if prose follows or a fence remains unclosed.
+
+    Only object/array roots are relevant to HyMem's structured calls.  The
+    iterative recognizer is deterministic and linear in the reply length; it
+    tracks container grammar, strings and escapes, literals, and JSON numbers.
     """
-    s = raw.lstrip()
-    if not s.startswith("{"):
+    if not isinstance(raw, str):
         return False
-    return s.count("{") > s.count("}")
+    for start in _json_container_starts(raw):
+        state = _scan_json_container_prefix(raw, start)
+        if state == _PREFIX_COMPLETE:
+            return False
+        if state == _PREFIX_INCOMPLETE:
+            return True
+    return False
+
+
+def _json_container_starts(text: str) -> tuple[int, ...]:
+    """Locate at most one object and one array candidate, in source order."""
+    offset = len(text) - len(text.lstrip())
+    if offset >= len(text):
+        return ()
+    if text[offset] in "{[":
+        return (offset,)
+
+    # A Markdown fence is an envelope, not reply content.  Permit a bare fence
+    # or a case-insensitive ``json`` info string, with horizontal whitespace;
+    # this is at least as tolerant as ``loads_exact_or_fenced`` while remaining
+    # unambiguous about where the payload begins.
+    fence = _OPENING_JSON_FENCE.match(text, offset)
+    if fence is not None:
+        body = fence.end()
+        while body < len(text) and text[body] in _JSON_WHITESPACE:
+            body += 1
+        if body < len(text) and text[body] in "{[":
+            return (body,)
+        offset = body
+
+    # ``loads_lenient`` tolerates prose before a structured payload.  Use the
+    # first opener of each supported root kind, just as its outermost-span
+    # recovery does. All current ceiling-aware calls request objects, so once
+    # an object begins it is authoritative; an array inside a malformed object
+    # must not be reinterpreted as a second reply. An earlier prose ``[note]``
+    # may fail before a later object begins. Trying at most those two candidates
+    # preserves O(n) behavior. A same-kind brace in prose still fails closed
+    # rather than authorizing an ambiguous recovery classification.
+    object_start = text.find("{", offset)
+    array_start = text.find("[", offset)
+    if object_start < 0:
+        return (array_start,) if array_start >= 0 else ()
+    if array_start < 0 or object_start < array_start:
+        return (object_start,)
+    return (array_start, object_start)
+
+
+def _scan_json_container_prefix(text: str, start: int) -> str:
+    """Classify a top-level object/array as complete, incomplete, or invalid."""
+    root = text[start]
+    if root not in "{[":
+        return _PREFIX_INVALID
+
+    # Object states: key_or_end, key, colon, value, comma_or_end.
+    # Array states: value_or_end, value, comma_or_end.
+    stack = [_new_json_container_frame(root)]
+    index = start + 1
+    length = len(text)
+
+    while True:
+        while index < length and text[index] in _JSON_WHITESPACE:
+            index += 1
+        if index >= length:
+            return _PREFIX_INCOMPLETE
+
+        frame = stack[-1]
+        kind, state = frame.kind, frame.state
+        char = text[index]
+
+        if kind == "object" and state in {"key_or_end", "key"}:
+            if char == "}" and state == "key_or_end":
+                index += 1
+                if _close_container(stack):
+                    return _PREFIX_COMPLETE
+                continue
+            if char != '"':
+                return _PREFIX_INVALID
+            key_start = index
+            token, index = _scan_json_string(text, index)
+            if token != _PREFIX_COMPLETE:
+                return token
+            # ``loads_exact_or_fenced`` rejects duplicate keys. Decode each
+            # completed key once so escape-equivalent spellings (``"a"`` and
+            # ``"\u0061"``) cannot make an irreparable contract violation look
+            # like an output-ceiling cut.
+            try:
+                key = loads_strict_json(text[key_start:index])
+            except ValueError:
+                return _PREFIX_INVALID
+            if key in frame.keys:
+                return _PREFIX_INVALID
+            frame.keys.add(key)
+            frame.state = "colon"
+            continue
+
+        if kind == "object" and state == "colon":
+            if char != ":":
+                return _PREFIX_INVALID
+            frame.state = "value"
+            index += 1
+            continue
+
+        if state in {"value_or_end", "value"}:
+            if kind == "array" and char == "]" and state == "value_or_end":
+                index += 1
+                if _close_container(stack):
+                    return _PREFIX_COMPLETE
+                continue
+
+            if char in "{[":
+                stack.append(_new_json_container_frame(char))
+                index += 1
+                continue
+            if char == '"':
+                token, index = _scan_json_string(text, index)
+            elif char in "tfn":
+                token, index = _scan_json_literal(text, index)
+            elif char == "-" or char.isdigit() and char.isascii():
+                number_start = index
+                token, index = _scan_json_number(text, index)
+                if token == _PREFIX_COMPLETE:
+                    try:
+                        loads_strict_json(text[number_start:index])
+                    except ValueError:
+                        return _PREFIX_INVALID
+            else:
+                return _PREFIX_INVALID
+            if token != _PREFIX_COMPLETE:
+                return token
+            frame.state = "comma_or_end"
+            continue
+
+        if state == "comma_or_end":
+            closer = "}" if kind == "object" else "]"
+            if char == closer:
+                index += 1
+                if _close_container(stack):
+                    return _PREFIX_COMPLETE
+                continue
+            if char != ",":
+                return _PREFIX_INVALID
+            frame.state = "key" if kind == "object" else "value"
+            index += 1
+            continue
+
+        return _PREFIX_INVALID
+
+
+def _close_container(stack: list[_JSONContainerFrame]) -> bool:
+    """Pop a completed container; return True when the root is complete."""
+    stack.pop()
+    if not stack:
+        return True
+    # A nested container can only have been opened where its parent expected a
+    # value.  Mark that value complete without re-reading any input.
+    if stack[-1].state not in {"value", "value_or_end"}:
+        return False
+    stack[-1].state = "comma_or_end"
+    return False
+
+
+def _scan_json_string(text: str, start: int) -> tuple[str, int]:
+    """Scan one JSON string, distinguishing a cut prefix from bad escaping."""
+    index = start + 1
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == '"':
+            return _PREFIX_COMPLETE, index + 1
+        if char == "\\":
+            index += 1
+            if index >= length:
+                return _PREFIX_INCOMPLETE, index
+            escape = text[index]
+            if escape in _JSON_SIMPLE_ESCAPES:
+                index += 1
+                continue
+            if escape != "u":
+                return _PREFIX_INVALID, index
+            for _ in range(4):
+                index += 1
+                if index >= length:
+                    return _PREFIX_INCOMPLETE, index
+                if text[index] not in _JSON_HEX_DIGITS:
+                    return _PREFIX_INVALID, index
+            index += 1
+            continue
+        if ord(char) < 0x20:
+            return _PREFIX_INVALID, index
+        index += 1
+    return _PREFIX_INCOMPLETE, index
+
+
+def _scan_json_literal(text: str, start: int) -> tuple[str, int]:
+    expected = {"t": "true", "f": "false", "n": "null"}[text[start]]
+    for offset, char in enumerate(expected):
+        index = start + offset
+        if index >= len(text):
+            return _PREFIX_INCOMPLETE, index
+        if text[index] != char:
+            return _PREFIX_INVALID, index
+    return _PREFIX_COMPLETE, start + len(expected)
+
+
+def _scan_json_number(text: str, start: int) -> tuple[str, int]:
+    """Scan the RFC 8259 number grammar, retaining valid EOF prefixes."""
+    index = start
+    length = len(text)
+    if text[index] == "-":
+        index += 1
+        if index >= length:
+            return _PREFIX_INCOMPLETE, index
+
+    if text[index] == "0":
+        index += 1
+    elif text[index] in "123456789":
+        index += 1
+        while index < length and text[index].isdigit() and text[index].isascii():
+            index += 1
+    else:
+        return _PREFIX_INVALID, index
+
+    if index < length and text[index] == ".":
+        index += 1
+        if index >= length:
+            return _PREFIX_INCOMPLETE, index
+        if not (text[index].isdigit() and text[index].isascii()):
+            return _PREFIX_INVALID, index
+        while index < length and text[index].isdigit() and text[index].isascii():
+            index += 1
+
+    if index < length and text[index] in "eE":
+        index += 1
+        if index >= length:
+            return _PREFIX_INCOMPLETE, index
+        if text[index] in "+-":
+            index += 1
+            if index >= length:
+                return _PREFIX_INCOMPLETE, index
+        if not (text[index].isdigit() and text[index].isascii()):
+            return _PREFIX_INVALID, index
+        while index < length and text[index].isdigit() and text[index].isascii():
+            index += 1
+
+    return _PREFIX_COMPLETE, index
 
 
 def loads_lenient(raw: str, *, expect: str = "object") -> Any | None:

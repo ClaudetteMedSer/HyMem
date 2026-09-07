@@ -33,37 +33,45 @@ from cluster_size_probe import (  # noqa: E402
 from hymem import HyMem, HyMemConfig, StubEmbeddingClient  # noqa: E402
 from hymem.core import db as core_db  # noqa: E402
 from hymem.core.vectors import encode_vector  # noqa: E402
+from hymem.dreaming.aggregation_material import (  # noqa: E402
+    embedding_storage_identity,
+)
+from hymem.extraction.embeddings import embedding_text_hash  # noqa: E402
 from hymem.extraction.llm import StubLLMClient  # noqa: E402
+from tests.test_aggregate import _seed_episode as _seed_exact_episode  # noqa: E402
 
 
 def _make_store(tmp_path: Path, episodes: list[tuple]) -> Path:
-    """Create a real hymem store (full schema via HyMem + StubLLM) and seed
-    `episodes` = [(eid, sid, entities, vector|None), ...] with direct SQL —
-    the same shape a dream pass would have left behind. Returns the db path."""
+    """Create a real store with exact source-backed episode fixtures."""
     cfg = HyMemConfig(root=tmp_path)
+    embedding_client = StubEmbeddingClient(
+        model_name="cluster-probe-fixture-v1", dim_value=2,
+    )
+    model, dim = embedding_storage_identity(embedding_client)
     hy = HyMem(cfg, llm=StubLLMClient(default="[]"),
-               embedding_client=StubEmbeddingClient())
+               embedding_client=embedding_client)
     try:
         with core_db.transaction(hy.conn):
             for eid, sid, entities, vector in episodes:
-                hy.conn.execute(
-                    "INSERT OR IGNORE INTO sessions(id) VALUES (?)", (sid,))
-                hy.conn.execute(
-                    """INSERT INTO episodes(id, session_id, title, summary,
-                                            participants, start_message_id,
-                                            end_message_id, key_entities)
-                       VALUES (?, ?, ?, ?, '[]', 1, 2, ?)""",
-                    (eid, sid, f"title {eid}", f"summary {eid}",
-                     json.dumps(entities)),
+                _seed_exact_episode(
+                    hy.conn, eid, sid, f"title {eid}", f"summary {eid}",
+                    entities,
                 )
                 if vector is not None:
-                    hy.conn.execute(
-                        """INSERT INTO episode_embeddings(episode_id, vector_json,
-                                                          model, dim, text_hash)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (eid, encode_vector(vector), "stub", len(vector),
-                         f"hash-{eid}"),
-                    )
+                    with core_db.embedding_mutation(hy.conn):
+                        hy.conn.execute(
+                            """INSERT INTO episode_embeddings(
+                                   episode_id, vector_json, model, dim,
+                                   text_hash, embedding_producer_key
+                               ) VALUES (?, ?, ?, ?, ?, ?)""",
+                            (
+                                eid, encode_vector(vector), model, dim,
+                                embedding_text_hash(
+                                    f"title {eid}\nsummary {eid}"
+                                ),
+                                model,
+                            ),
+                        )
     finally:
         hy.close()
     return cfg.db_path

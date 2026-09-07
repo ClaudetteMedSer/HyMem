@@ -33,7 +33,6 @@ from hymem import HyMem
 from hymem.core import db as core_db
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.dreaming.user_profile import ProfileExtraction, persist_user_profile
-from hymem.extraction.llm import StubLLMClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 from state_anchor_probe import run_probe  # noqa: E402
@@ -102,7 +101,10 @@ def _count_writes(conn) -> dict[str, int]:
 
 @pytest.fixture
 def conn(cfg):
-    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    # No configured provider scope: direct exact source fixtures remain the
+    # active read authority instead of being hidden behind an unrelated Stub
+    # generation selected only by test setup.
+    hy = HyMem(cfg)
     yield hy.conn
     hy.close()
 
@@ -332,20 +334,31 @@ def test_each_cap_is_respected_independently(conn):
     assert len(profiles) == 3 and edges == []
 
 
-def test_the_predicate_matches_the_digest_anchor_row_for_row(conn):
+def test_the_predicate_matches_the_digest_anchor_row_for_row(conn, cfg):
     """CONTROL on the copied predicate: the selector must agree with
     `_anchor_facts`' EDGE leg exactly. If the digest's clause ever changes,
     this fails and the copy is re-decided deliberately rather than drifting."""
     from hymem.dreaming.aggregate import _anchor_facts
+    from hymem.dreaming.bitemporal import stamp_validity
     from hymem.query.state_anchor import select_anchor_edges
+    from tests.test_digest_squeeze_probe import _seed_exact_kg_claims
 
     with core_db.transaction(conn):
-        _seed_edge(conn, "a", "uses", "postgres", pos=5, neg=0)
+        # The digest leg is proof-bearing in v57. Seed its two positive rows
+        # through the real source/outcome/evidence path, while the excluded
+        # controls can remain malformed legacy rows because they must never be
+        # selected by either predicate.
+        _seed_exact_kg_claims(
+            conn,
+            cfg,
+            [("a", "uses", "postgres"), ("e", "uses", "sqlite")],
+            source_tag="state-anchor-parity",
+        )
+        stamp_validity(conn)
         _seed_edge(conn, "b", "uses", "redis", pos=2, neg=4)          # margin <= 0
         _seed_edge(conn, "c", "uses", "kafka", pos=3, neg=0, derived=1)
         _seed_edge(conn, "d", "uses", "mysql", pos=3, neg=0,
                    invalid_at="2024-02-01 00:00:00")
-        _seed_edge(conn, "e", "uses", "sqlite", pos=4, neg=1)
 
     rendered = [f"{r['subject_canonical']} {r['predicate']} {r['object_canonical']}"
                 for r in select_anchor_edges(conn, cap=50)]

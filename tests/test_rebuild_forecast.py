@@ -32,6 +32,8 @@ from hymem.core import db as core_db
 from hymem.dreaming import aggregate as agg_mod
 from hymem.dreaming.aggregate import _forecast_rebuild, build_aggregation_nodes
 from hymem.extraction.llm import StubLLMClient
+from tests.test_aggregate import _seed_episode as _seed_exact_episode
+from tests.test_digest_squeeze_probe import _seed_profile
 
 _NODE_JSON = json.dumps({"title": "Postgres", "summary": "Postgres everywhere."})
 _ROLLUP_JSON = json.dumps({"title": "Mixed", "summary": "Several threads."})
@@ -55,12 +57,8 @@ def _cfg(cfg):
 
 
 def _seed_episode(conn, eid, sid, entities):
-    conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES (?)", (sid,))
-    conn.execute(
-        """INSERT INTO episodes(id, session_id, title, summary, participants,
-                                start_message_id, end_message_id, outcome, key_entities)
-           VALUES (?, ?, ?, ?, '[]', 1, 2, NULL, ?)""",
-        (eid, sid, f"Topic {eid}", f"Notes about {eid}.", json.dumps(entities)),
+    _seed_exact_episode(
+        conn, eid, sid, f"Topic {eid}", f"Notes about {eid}.", entities,
     )
 
 
@@ -90,8 +88,8 @@ def _dream(conn, cfg):
 def test_forecast_counts_new_membership_as_predicted():
     prev = {(0, frozenset({"e1", "e2"}))}
     rows = [
-        {"level": 0, "member_ids": ["e1", "e2"], "is_root": 0, "reused": True},
-        {"level": 0, "member_ids": ["e3", "e4"], "is_root": 0, "reused": False},
+        {"level": 0, "member_ids_list": ["e1", "e2"], "is_root": 0, "reused": True},
+        {"level": 0, "member_ids_list": ["e3", "e4"], "is_root": 0, "reused": False},
     ]
     f = _forecast_rebuild(rows, prev)
     assert (f.predicted, f.actual, f.residual, f.facts_rekey) == (1, 1, 0, 0)
@@ -101,7 +99,7 @@ def test_forecast_flags_membership_identical_rebuilds():
     """Same members, still rebuilt, and not the root — nothing in the build
     explains it. This is the whole point of the instrument."""
     prev = {(0, frozenset({"e1", "e2"}))}
-    rows = [{"level": 0, "member_ids": ["e1", "e2"], "is_root": 0, "reused": False}]
+    rows = [{"level": 0, "member_ids_list": ["e1", "e2"], "is_root": 0, "reused": False}]
     f = _forecast_rebuild(rows, prev)
     assert (f.predicted, f.actual, f.residual) == (0, 1, 1)
 
@@ -111,7 +109,7 @@ def test_forecast_charges_an_unchanged_root_to_the_facts_hash():
     membership-identical root rebuild is a known cause and must NOT inflate the
     residual — otherwise the detector fires once per graph edit."""
     prev = {(1, frozenset({"n1", "n2"}))}
-    rows = [{"level": 1, "member_ids": ["n1", "n2"], "is_root": 1, "reused": False}]
+    rows = [{"level": 1, "member_ids_list": ["n1", "n2"], "is_root": 1, "reused": False}]
     f = _forecast_rebuild(rows, prev)
     assert (f.predicted, f.actual, f.residual, f.facts_rekey) == (1, 1, 0, 1)
 
@@ -121,7 +119,7 @@ def test_forecast_is_level_aware():
     still a new node; keying membership without the level would silently
     excuse it."""
     prev = {(0, frozenset({"a", "b"}))}
-    rows = [{"level": 1, "member_ids": ["a", "b"], "is_root": 0, "reused": False}]
+    rows = [{"level": 1, "member_ids_list": ["a", "b"], "is_root": 0, "reused": False}]
     assert _forecast_rebuild(rows, prev).residual == 0
 
 
@@ -163,23 +161,39 @@ def test_a_salt_bump_shows_up_as_pure_keying_residual(conn, cfg, monkeypatch):
     _dream(conn, cfg)
     assert _dream(conn, cfg).keying_residual == 0        # quiet before
 
-    monkeypatch.setattr(agg_mod, "_CLUSTER_SALT", "cluster.vTEST")
-    result = _dream(conn, cfg)
+    stored = dict(conn.execute(
+        "SELECT * FROM aggregation_nodes WHERE level=0 ORDER BY id LIMIT 1"
+    ).fetchone())
+    members = frozenset(json.loads(stored["member_episode_ids"]))
+    predecessor = {(
+        stored["level"], members, stored["input_fingerprint"],
+        stored["aggregation_generation_key"],
+        stored["aggregation_request_hash"],
+    )}
+    # Model an unexplained salt/id miss while all declared reuse inputs remain
+    # identical. The production proof validator would also reject such a
+    # forged key; this pins the telemetry classifier itself independently.
+    candidate = {
+        "level": stored["level"], "member_ids_list": sorted(members),
+        "input_fingerprint": stored["input_fingerprint"],
+        "aggregation_generation_key": stored["aggregation_generation_key"],
+        "aggregation_request_hash": stored["aggregation_request_hash"],
+        "is_root": 0, "reused": False,
+    }
+    result = _forecast_rebuild([candidate], predecessor)
+    assert result.residual > 0
+    assert result.predicted < result.actual
 
-    assert result.keying_residual > 0
-    # Every level-0 node re-keyed, and nothing about membership changed.
-    assert result.predicted_rebuild < result.nodes - result.reused
 
-
-def test_a_changed_facts_anchor_is_attributed_not_residual(conn, cfg, monkeypatch):
-    """A changed knowledge graph legitimately re-keys the root over an
+def test_a_changed_facts_anchor_is_attributed_not_residual(conn, cfg):
+    """A changed exact profile anchor legitimately re-keys the root over an
     unchanged tree. It must land in facts_rekey, leaving the residual clean."""
     _seed_pairs(conn, 3)
     _dream(conn, cfg)
     assert _dream(conn, cfg).keying_residual == 0
 
-    monkeypatch.setattr(agg_mod, "_anchor_facts",
-                        lambda conn_, cap: ["a brand new verified fact"])
+    with core_db.transaction(conn):
+        _seed_profile(conn, "possession", "a brand new verified fact")
     result = _dream(conn, cfg)
 
     assert result.facts_rekey == 1
@@ -223,7 +237,7 @@ def _forecast(rows, prev):
 
 
 def _row(node_id, level, members, *, is_root=0, reused=False):
-    return {"id": node_id, "level": level, "member_ids": list(members),
+    return {"id": node_id, "level": level, "member_ids_list": list(members),
             "is_root": is_root, "reused": reused}
 
 

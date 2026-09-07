@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from hymem.contrib.implementation_identity import import_time_source_sha256
+
+EXTRACTION_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
+
 import logging
 from dataclasses import dataclass
 
@@ -12,15 +16,36 @@ log = logging.getLogger("hymem.extraction.markers")
 _ALLOWED_KINDS = ("correction", "preference", "rejection", "style")
 
 
+def normalize_combined_marker_item(
+    item: object,
+) -> tuple[dict | None, tuple[str, ...]]:
+    """Validate one marker without exposing model values in diagnostics."""
+    if not isinstance(item, dict):
+        return None, ("item:not_object",)
+    errors: list[str] = []
+    keys = set(item)
+    for key in sorted({"kind", "statement"} - keys):
+        errors.append(f"{key}:missing")
+    if keys - {"kind", "statement"}:
+        errors.append("item:unexpected_keys")
+    raw_kind = item.get("kind")
+    kind = raw_kind.strip().casefold() if isinstance(raw_kind, str) else raw_kind
+    if kind not in _ALLOWED_KINDS:
+        errors.append("kind:not_allowed")
+    statement = item.get("statement")
+    if not isinstance(statement, str):
+        errors.append("statement:not_string")
+    elif not statement.strip():
+        errors.append("statement:empty")
+    if errors:
+        return None, tuple(errors)
+    return {"kind": kind, "statement": statement.strip()}, ()
+
+
 def combined_marker_item_is_valid(item: object) -> bool:
     """Exact marker-item shape for the combined cursor-authorizing reply."""
-    return bool(
-        isinstance(item, dict)
-        and set(item) == {"kind", "statement"}
-        and item.get("kind") in _ALLOWED_KINDS
-        and isinstance(item.get("statement"), str)
-        and item["statement"].strip()
-    )
+    normalized, errors = normalize_combined_marker_item(item)
+    return normalized is not None and not errors
 
 
 @dataclass(frozen=True)
@@ -65,7 +90,11 @@ def markers_from_list(data: list) -> list[Marker]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        kind = item.get("kind")
+        raw_kind = item.get("kind")
+        kind = (
+            raw_kind.strip().casefold()
+            if isinstance(raw_kind, str) else raw_kind
+        )
         statement = item.get("statement")
         if kind not in _ALLOWED_KINDS:
             continue

@@ -1,5 +1,12 @@
 # RAPTOR / Digest carry-over plan
 
+> **Historical engineering ledger, not current configuration guidance.**
+> Statements below that say aggregation is off by default, remains off until a
+> flip, or needs `HYMEM_AGGREGATION_NODES_ENABLED=true` record the pre-flip
+> deployment state. The Stage 3c gate later passed and `HyMemConfig` has
+> defaulted `aggregation_nodes_enabled=True` since 2026-08-26; set it to False
+> only for an explicit opt-out/control arm.
+
 *Written 2026-06-11. Companion to `longmemeval_roadmap.md` (which stays the LME record);
 this doc tracks the RAPTOR→digest product thread after RAPTOR was closed as an LME lever.
 Same contract as the roadmap: front-run gate before any build, additive-only, mechanism >
@@ -582,7 +589,7 @@ flip: the classifier keeps running on the post-flip window against the same
 bar, and an append below 90% later is a finding to act on — actionable
 precisely because the bar was not moved to avoid it.
 
-**FLIPPED 2026-08-26** — `hymem/config.py:112`
+**FLIPPED 2026-08-26** — `hymem/config.py`
 `aggregation_nodes_enabled: bool = False → True`.
 
 Two scope limits written into the docstring, because the flip is narrower than

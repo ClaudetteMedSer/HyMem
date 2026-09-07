@@ -301,6 +301,27 @@ def profile_retry_state_is_valid(
     return bool(quarantined) == bool(maximum > 0 and retry_count >= maximum)
 
 
+def profile_retry_is_quarantined(
+    retry_count: object,
+    retry_config_version: object,
+    *,
+    retry_key: str,
+    max_attempts: int,
+) -> bool:
+    """Return the exact current scheduling gate independent of audit flag."""
+    return bool(
+        isinstance(retry_count, int)
+        and not isinstance(retry_count, bool)
+        and retry_count >= 0
+        and isinstance(retry_config_version, str)
+        and retry_config_version == retry_key
+        and isinstance(max_attempts, int)
+        and not isinstance(max_attempts, bool)
+        and max_attempts > 0
+        and retry_count >= max_attempts
+    )
+
+
 def record_profile_failure(
     conn: sqlite3.Connection,
     session_id: str,

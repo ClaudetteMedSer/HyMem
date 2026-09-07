@@ -32,6 +32,7 @@ from hymem.rules import (
     retract_rule,
     route_markers_to_rules,
     rule_scope_for_marker,
+    suggest_rules_from_markers,
 )
 from tests.conftest import make_routed_llm, seed_edge
 
@@ -322,7 +323,9 @@ def _suggest(cfg, judge, seed):
     with transaction(inst.conn):
         seed(inst.conn)
     # read via the write conn so freshly-seeded rows are visible in one process
-    return inst, suggest_rules_from_markers(inst.conn, inst.config, judge)
+    return inst, suggest_rules_from_markers(
+        inst.conn, inst.config, judge, allow_legacy_unscoped=True
+    )
 
 
 def test_suggest_groups_paraphrases_and_counts_sessions(cfg):
@@ -361,7 +364,12 @@ def test_suggest_flags_already_active_and_ranks_novel_first(cfg):
         from hymem.core.db import transaction
         with transaction(inst.conn):
             seed(inst.conn)
-        cands = inst.suggest_rules()
+        # These legacy unit fixtures seed pre-v53 NULL-generation markers
+        # directly. Exercise the unfiltered compatibility helper here; the
+        # public API's fail-closed generation filter is covered separately.
+        cands = suggest_rules_from_markers(
+            inst.conn, inst.config, judge, allow_legacy_unscoped=True
+        )
         by_text = {c.text: c for c in cands}
         assert by_text["Never use MongoDB"].already_active is True
         assert by_text["Never suggest Docker"].already_active is False
@@ -391,7 +399,10 @@ def test_suggest_requires_llm_and_respects_limit(cfg, stub_llm):
         from hymem.core.db import transaction
         with transaction(inst.conn):
             seed(inst.conn)
-        assert len(inst.suggest_rules(limit=1)) == 1
+        assert len(suggest_rules_from_markers(
+            inst.conn, inst.config, judge, limit=1,
+            allow_legacy_unscoped=True,
+        )) == 1
     finally:
         inst.close()
 

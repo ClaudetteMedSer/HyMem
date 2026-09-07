@@ -1,8 +1,50 @@
 from __future__ import annotations
 
 from hymem.core import db as core_db
+from hymem.dreaming import evidence
+from hymem.dreaming.phase1_auxiliary import publish_phase1_auxiliaries
 from hymem.dreaming.phase3 import decay
+from hymem.extraction.producer import register_phase1_generation
 from tests.conftest import make_routed_llm
+
+
+def _publish_current_mentions(hy, chunk_id: str, entities: list[str]) -> None:
+    """Publish an exact current Phase-1 mention projection for a fixture."""
+
+    binding = hy._phase1_generation
+    assert binding is not None
+    generation_key = str(binding["generation_key"])
+    cache_key = str(binding["extraction_cache_key"])
+    with core_db.transaction(hy.conn):
+        register_phase1_generation(hy.conn, binding)
+        with core_db.evidence_mutation(hy.conn):
+            hy.conn.execute(
+                "INSERT OR REPLACE INTO kg_claim_extraction_outcomes("
+                "chunk_id,prompt_version,prompt_generation,result_hash,"
+                "phase1_generation_key) VALUES (?,?,?,?,?)",
+                (
+                    chunk_id,
+                    cache_key,
+                    evidence.prompt_generation(cache_key),
+                    evidence.claim_result_hash([]),
+                    generation_key,
+                ),
+            )
+        publish_phase1_auxiliaries(
+            hy.conn,
+            chunk_id=chunk_id,
+            phase1_generation_key=generation_key,
+            extraction_cache_key=cache_key,
+            entity_type_hints={},
+            entity_property_hints={},
+            entity_mentions=entities,
+            markers=[],
+        )
+        hy.conn.execute(
+            "INSERT INTO processed_chunks("
+            "chunk_id,prompt_version,phase1_generation_key) VALUES (?,?,?)",
+            (chunk_id, cache_key, generation_key),
+        )
 
 
 def test_entity_mentions_populated_after_dream(hy):
@@ -76,9 +118,7 @@ def test_phase3_decay_uses_index_for_re_mentioned_topics(hy):
         "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, salience_reason, text) "
         "VALUES ('c1', 's_decay', 1, 1, 'long_user_turn', 'we redesigned the api')"
     )
-    conn.execute(
-        "INSERT INTO entity_mentions(chunk_id, entity_canonical) VALUES ('c1', 'api')"
-    )
+    _publish_current_mentions(hy, "c1", ["api"])
     conn.execute(
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
         "pos_evidence, neg_evidence, last_reinforced) "

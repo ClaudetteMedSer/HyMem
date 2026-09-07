@@ -7,7 +7,9 @@ from dataclasses import fields
 import pytest
 
 import hymem
+from hymem import StubEmbeddingClient
 from hymem.dreaming.aggregate import Digest
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.core import db as core_db
 from hymem.config import HyMemConfig
 from hymem.dreaming.chunks import Chunk, persist_chunks
@@ -24,6 +26,7 @@ from hymem.query.augment import (
     ProcedureHit,
     _finite_vector,
     _python_cosine_search,
+    _BoundQueryVector,
 )
 from hymem.query.fusion import SourceOccurrence, estimate_tokens, fuse_context
 from hymem.query.graph_state import GraphEvidenceCitation
@@ -529,12 +532,8 @@ def test_semantic_vector_validator_is_strict_and_no_raise(vector):
 
 
 def test_scoped_vector_scan_counts_only_proof_and_embedding_valid_rows(hy):
-    class Embedder:
-        model = "strict-vector"
-        dim = 2
-
-        def embed(self, texts):
-            raise AssertionError("supplied query vector must be reused")
+    embedder = StubEmbeddingClient(model_name="strict-vector", dim_value=2)
+    model, dim = embedding_storage_identity(embedder)
 
     session_id = "scoped-vector"
     hy.open_session(session_id, source_workspace_id="w")
@@ -576,26 +575,32 @@ def test_scoped_vector_scan_counts_only_proof_and_embedding_valid_rows(hy):
         text_hash = (
             embedding_text_hash(chunk.text) if index % 2 == 0 else "0" * 64
         )
+        with core_db.embedding_mutation(hy.conn):
+            hy.conn.execute(
+                "INSERT INTO chunk_embeddings("
+                "chunk_id,vector_json,model,dim,text_hash) VALUES (?,?,?,?,?)",
+                (chunk.id, vector, model, dim, text_hash),
+            )
+    with core_db.embedding_mutation(hy.conn):
         hy.conn.execute(
             "INSERT INTO chunk_embeddings(chunk_id,vector_json,model,dim,text_hash) "
             "VALUES (?,?,?,?,?)",
-            (chunk.id, vector, "strict-vector", 2, text_hash),
+            (
+                valid.id, json.dumps([1.0, 0.0]), model, dim,
+                embedding_text_hash(valid.text),
+            ),
         )
-    hy.conn.execute(
-        "INSERT INTO chunk_embeddings(chunk_id,vector_json,model,dim,text_hash) "
-        "VALUES (?,?,?,?,?)",
-        (
-            valid.id, json.dumps([1.0, 0.0]), "strict-vector", 2,
-            embedding_text_hash(valid.text),
-        ),
-    )
 
     hits = _python_cosine_search(
-        hy.conn, Embedder(), "vector needle", top_k=1, max_scan=1,
-        query_vector=[1.0, 0.0], source_session_id=session_id,
+        hy.conn, embedder, "vector needle", top_k=1, max_scan=1,
+        query_vector=_BoundQueryVector(
+            values=(1.0, 0.0), model=model, dim=dim,
+        ),
+        source_session_id=session_id,
         source_peer_id="p", source_workspace_id="w",
     )
     assert [hit.chunk_id for hit in hits] == ["z-valid"]
+    assert embedder.calls == []
 
 
 def test_hymem_config_adds_token_budget_only_at_end_of_positional_fields():

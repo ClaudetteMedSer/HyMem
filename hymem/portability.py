@@ -43,6 +43,7 @@ from hymem.core.message_records import (
 from hymem.core.time import (
     earliest_timestamp_spelling,
     event_clock_is_valid,
+    latest_timestamp_spelling,
     normalize_iso_timestamp,
     validate_timestamp_order,
 )
@@ -56,12 +57,22 @@ from hymem.dreaming.aggregation_provenance import (
     BoundSourceOccurrence,
     EPISODE_SOURCE_MANIFEST_VERSION,
     combine_source_occurrences,
+    episode_input_proof,
+    load_knowledge_graph_anchor_inputs,
+    load_profile_anchor_inputs,
     load_episode_source_manifest,
     source_manifest_hash,
 )
 from hymem.dreaming.lossless import (
+    COVERAGE_INTEGRITY_CONFIG_VERSION,
+    COVERAGE_INTEGRITY_FAILURE_REASONS,
+    MAX_COVERAGE_INTEGRITY_OCCURRENCES,
     covered_messages_after,
     validate_message_coverage_artifact,
+)
+from hymem.dreaming.phase1_auxiliary import (
+    SUPPORTED_AUXILIARY_CONTRACT_KEYS,
+    canonical_auxiliary_result,
 )
 from hymem.dreaming.facts import (
     FACT_MAX_ACTIVE_ITEMS_PER_OUTCOME,
@@ -83,6 +94,11 @@ from hymem.dreaming.facts import (
 )
 from hymem.dreaming.message_coverage import LOSSLESS_READ_VERSIONS
 from hymem.extraction.jsonio import loads_strict_json
+from hymem.extraction.producer import (
+    canonical_phase1_generation_json,
+    register_phase1_generation,
+    validate_phase1_generation_binding,
+)
 from hymem.extraction.prompts import ALLOWED_PREDICATES
 from hymem.dreaming.user_profile import (
     ProfileExtraction,
@@ -108,14 +124,32 @@ log = logging.getLogger("hymem.portability")
 # workspace-qualified external peer/session provenance without changing v7.
 # v9 carries exact episode source manifests. v10 carries authoritative fact
 # extraction outcomes, exact source occurrences, all revisions/lifecycle
-# events, and the current projection. Fact embeddings and FTS shadows remain
+# events, and the current projection. v11 carries prompt-independent terminal
+# loss records for legacy chunks whose exact extraction input is unrecoverable.
+# v12 carries bounded, structural coverage-integrity health state; it contains
+# session/config identity and reason codes but never source or exception text.
+# v13 binds claim publications to an exact, credential-free Phase-1 producer
+# declaration. v14 carries the complete producer-bound auxiliary projection
+# (types, properties, mentions, markers and their profile/rule decisions) plus
+# explicit manual authority. Imports preserve those exact ledgers but still do
+# not synthesize a processed/cache acknowledgement: a source replay in the
+# destination must atomically republish the whole Phase-1 result before it can
+# become current. Pre-v13 and process-instance producer rows likewise remain
+# portable audit history.
+# Fact embeddings and FTS shadows remain
 # rebuildable local caches. Aggregation nodes remain a
 # reproducible cache and are rebuilt after import from those portable episodes.
+# The v51 aggregation-build attempt ledger is intentionally local operational
+# state rather than portable evidence: imported material invalidates any local
+# clean-build acknowledgement while retaining the target's bounded audit
+# totals, so an import cannot create false success or inject donor failures.
 # Incomplete profile
 # staging is deliberately omitted and its cursor is rewound for safe replay.
 # Import stays backward-compatible: older exports simply omit newer record
 # kinds/columns.
-EXPORT_VERSION = 10
+# v15 keeps aggregation material local/rebuildable, but import invalidation now
+# includes the v55 structural-publication singleton and typed proof cache.
+EXPORT_VERSION = 15
 _MAX_SQLITE_ROWID = 2**63 - 1
 _ROWID_RESERVE_HEADROOM = 1_000_000
 
@@ -329,7 +363,117 @@ _V10_EXPORT_SPEC.extend([
     ]),
 ])
 
-_EXPORT_SPEC = _V10_EXPORT_SPEC
+_V11_EXPORT_SPEC: list[tuple[str, str, list[str]]] = [
+    *_V10_EXPORT_SPEC,
+    (
+        "chunk_extraction_terminal_loss",
+        "chunk_extraction_terminal_losses",
+        ["chunk_id", "reason", "detected_at"],
+    ),
+]
+
+_V12_EXPORT_SPEC: list[tuple[str, str, list[str]]] = [
+    *_V11_EXPORT_SPEC,
+    (
+        "coverage_integrity_failure",
+        "coverage_integrity_failures",
+        [
+            "session_id", "config_version", "failure_reason", "occurrences",
+            "first_detected_at", "last_detected_at",
+        ],
+    ),
+]
+
+def _v13_columns(kind: str, columns: list[str]) -> list[str]:
+    result = list(columns)
+    if kind == "claim_extraction_outcome":
+        result.insert(result.index("succeeded_at"), "phase1_generation_key")
+    elif kind == "claim_observation":
+        result.insert(result.index("evidence_id"), "phase1_generation_key")
+    return result
+
+
+_V13_EXPORT_SPEC: list[tuple[str, str, list[str]]] = []
+for _kind, _table, _columns in _V12_EXPORT_SPEC:
+    if _kind == "claim_extraction_outcome":
+        _V13_EXPORT_SPEC.append((
+            "phase1_generation",
+            "phase1_generations",
+            [
+                "generation_key", "extraction_cache_key",
+                "producer_identity_sha256", "identity_exact", "reuse_scope",
+                "binding_json",
+            ],
+        ))
+    _V13_EXPORT_SPEC.append((_kind, _table, _v13_columns(_kind, _columns)))
+
+
+def _v14_columns(kind: str, columns: list[str]) -> list[str]:
+    result = list(columns)
+    if kind == "profile_entry":
+        result.append("source")
+    return result
+
+
+_V14_EXPORT_SPEC: list[tuple[str, str, list[str]]] = [
+    (kind, table, _v14_columns(kind, columns))
+    for kind, table, columns in _V13_EXPORT_SPEC
+]
+_V14_EXPORT_SPEC.extend([
+    ("entity_type", "entity_types", [
+        "entity_canonical", "type", "confidence", "source_chunk_id",
+        "origin",
+    ]),
+    ("entity_property", "entity_properties", [
+        "entity_canonical", "key", "value", "source_chunk_id",
+        "updated_at", "origin",
+    ]),
+    ("behavioral_marker", "behavioral_markers", [
+        "id", "kind", "statement", "chunk_id", "created_at",
+        "consolidated_at", "phase1_generation_key",
+    ]),
+    ("entity_type_observation", "entity_type_observations", [
+        "chunk_id", "entity_canonical", "type", "confidence",
+        "phase1_generation_key", "observed_at",
+    ]),
+    ("entity_property_observation", "entity_property_observations", [
+        "chunk_id", "entity_canonical", "key", "value",
+        "phase1_generation_key", "observed_at",
+    ]),
+    ("entity_mention_observation", "entity_mention_observations", [
+        "chunk_id", "entity_canonical", "phase1_generation_key",
+        "observed_at",
+    ]),
+    ("phase1_auxiliary_outcome", "phase1_auxiliary_outcomes", [
+        "chunk_id", "phase1_generation_key", "extraction_cache_key",
+        "auxiliary_contract_key", "result_hash", "entity_type_count",
+        "entity_property_count", "entity_mention_count", "marker_count",
+        "published_at",
+    ]),
+    ("rule", "rules", [
+        "id", "text", "scope", "trigger_entities", "source",
+        "pos_evidence", "neg_evidence", "valid_at", "invalid_at",
+        "status", "created_at",
+    ]),
+    ("profile_entry_marker_evidence", "profile_entry_marker_evidence", [
+        "profile_entry_id", "marker_id", "phase1_generation_key",
+        "created_at",
+    ]),
+    ("profile_marker_decision", "profile_marker_decisions", [
+        "marker_id", "phase1_generation_key", "profile_policy_key",
+        "decision", "profile_entry_id", "decided_at",
+    ]),
+    ("rule_marker_evidence", "rule_marker_evidence", [
+        "rule_id", "marker_id", "phase1_generation_key", "created_at",
+    ]),
+    ("rule_marker_decision", "rule_marker_decisions", [
+        "marker_id", "phase1_generation_key", "routing_key", "decision",
+        "rule_id", "decided_at",
+    ]),
+])
+
+
+_EXPORT_SPEC = _V14_EXPORT_SPEC
 _V6_TABLE_BY_KIND = {kind: table for kind, table, _ in _V6_EXPORT_SPEC}
 _V6_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V6_EXPORT_SPEC}
 _V7_TABLE_BY_KIND = {kind: table for kind, table, _ in _V7_EXPORT_SPEC}
@@ -340,17 +484,28 @@ _V9_TABLE_BY_KIND = {kind: table for kind, table, _ in _V9_EXPORT_SPEC}
 _V9_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V9_EXPORT_SPEC}
 _V10_TABLE_BY_KIND = {kind: table for kind, table, _ in _V10_EXPORT_SPEC}
 _V10_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V10_EXPORT_SPEC}
-_TABLE_BY_KIND = _V10_TABLE_BY_KIND
-_COLS_BY_KIND = _V10_COLS_BY_KIND
+_V11_TABLE_BY_KIND = {kind: table for kind, table, _ in _V11_EXPORT_SPEC}
+_V11_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V11_EXPORT_SPEC}
+_V12_TABLE_BY_KIND = {kind: table for kind, table, _ in _V12_EXPORT_SPEC}
+_V12_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V12_EXPORT_SPEC}
+_V13_TABLE_BY_KIND = {kind: table for kind, table, _ in _V13_EXPORT_SPEC}
+_V13_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V13_EXPORT_SPEC}
+_V14_TABLE_BY_KIND = {kind: table for kind, table, _ in _V14_EXPORT_SPEC}
+_V14_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V14_EXPORT_SPEC}
+_TABLE_BY_KIND = _V14_TABLE_BY_KIND
+_COLS_BY_KIND = _V14_COLS_BY_KIND
 # Sessions must import before rows that FK-reference them.
 _IMPORT_ORDER = [
     "session", "peer", "session_peer", "chunk",
     "message_retention_coverage", "user_profile_fact",
     "episode", "episode_source_occurrence", "procedure", "edge", "profile_entry",
+    "rule",
+    "chunk_extraction_terminal_loss",
+    "coverage_integrity_failure",
 ]
 # Autoincrement-id tables: drop the id on import so it can't collide with rows
 # already present; they dedupe on their natural unique key instead.
-_DROP_ID_ON_IMPORT = {"edge", "profile_entry"}
+_DROP_ID_ON_IMPORT = {"edge", "profile_entry", "rule"}
 _SESSION_FACT_FIELDS = {
     "facts_message_id", "facts_cursor_message_id",
     "facts_cursor_partial_message_id", "facts_cursor_offset",
@@ -469,12 +624,90 @@ def _portable_record_sort_key(record: dict) -> str:
     )
 
 
-def _collect_v10_records(conn) -> dict[str, list[dict]]:
+def _collect_current_records(conn) -> dict[str, list[dict]]:
     """Collect one self-consistent current snapshot and canonicalize keys."""
     grouped: dict[str, list[dict]] = defaultdict(list)
-    for kind, table, cols in _V10_EXPORT_SPEC:
+    for kind, table, cols in _EXPORT_SPEC:
         if kind == "chunk_source_manifest":
             where = " WHERE source_manifest_version IS NOT NULL"
+        elif kind == "phase1_generation":
+            # Process-instance nonces are useful only to make one live process
+            # idempotent. Exporting them as reusable declarations would turn an
+            # unknown custom client into false cross-process authority.
+            where = " WHERE identity_exact=1 AND reuse_scope='durable'"
+        elif kind == "phase1_auxiliary_outcome":
+            # A process-instance identity has no portable producer authority.
+            # Claim outcomes retain one generation per chunk, so export only
+            # the auxiliary publication whose claim authority is also on wire;
+            # older exact branches remain local audit history and require a
+            # real extraction before they can become current again.
+            where = (
+                " WHERE phase1_generation_key IN ("
+                "SELECT generation_key FROM phase1_generations "
+                "WHERE identity_exact=1 AND reuse_scope='durable') "
+                "AND EXISTS (SELECT 1 FROM kg_claim_extraction_outcomes claim "
+                "WHERE claim.chunk_id=phase1_auxiliary_outcomes.chunk_id "
+                "AND claim.phase1_generation_key="
+                "phase1_auxiliary_outcomes.phase1_generation_key "
+                "AND claim.prompt_version="
+                "phase1_auxiliary_outcomes.extraction_cache_key)"
+            )
+        elif kind in {
+            "entity_type_observation", "entity_property_observation",
+            "entity_mention_observation",
+        }:
+            where = (
+                " WHERE EXISTS (SELECT 1 FROM phase1_auxiliary_outcomes aux "
+                "JOIN phase1_generations generation "
+                "ON generation.generation_key=aux.phase1_generation_key "
+                "JOIN kg_claim_extraction_outcomes claim "
+                "ON claim.chunk_id=aux.chunk_id "
+                "AND claim.phase1_generation_key=aux.phase1_generation_key "
+                "AND claim.prompt_version=aux.extraction_cache_key "
+                f"WHERE aux.chunk_id={table}.chunk_id "
+                f"AND aux.phase1_generation_key={table}.phase1_generation_key "
+                "AND generation.identity_exact=1 "
+                "AND generation.reuse_scope='durable')"
+            )
+        elif kind in {"entity_type", "entity_property"}:
+            # Upgrade rows are ambiguous compatibility cache, not portable
+            # authority.  Export only fresh explicit/manual assertions; exact
+            # producer hints travel through their observation ledgers.
+            where = " WHERE origin='user'"
+        elif kind == "behavioral_marker":
+            where = (
+                " WHERE phase1_generation_key IN ("
+                "SELECT generation_key FROM phase1_generations "
+                "WHERE identity_exact=1 AND reuse_scope='durable') "
+                "AND EXISTS (SELECT 1 FROM phase1_auxiliary_outcomes outcome "
+                "JOIN kg_claim_extraction_outcomes claim "
+                "ON claim.chunk_id=outcome.chunk_id "
+                "AND claim.phase1_generation_key=outcome.phase1_generation_key "
+                "AND claim.prompt_version=outcome.extraction_cache_key "
+                "WHERE outcome.chunk_id=behavioral_markers.chunk_id "
+                "AND outcome.phase1_generation_key="
+                "behavioral_markers.phase1_generation_key)"
+            )
+        elif kind in {
+            "profile_entry_marker_evidence", "profile_marker_decision",
+            "rule_marker_evidence", "rule_marker_decision",
+        }:
+            where = (
+                " WHERE marker_id IN (SELECT marker.id "
+                "FROM behavioral_markers marker "
+                "JOIN phase1_generations generation "
+                "ON generation.generation_key=marker.phase1_generation_key "
+                "JOIN phase1_auxiliary_outcomes outcome "
+                "ON outcome.chunk_id=marker.chunk_id "
+                "AND outcome.phase1_generation_key="
+                "marker.phase1_generation_key "
+                "JOIN kg_claim_extraction_outcomes claim "
+                "ON claim.chunk_id=outcome.chunk_id "
+                "AND claim.phase1_generation_key=outcome.phase1_generation_key "
+                "AND claim.prompt_version=outcome.extraction_cache_key "
+                "WHERE generation.identity_exact=1 "
+                "AND generation.reuse_scope='durable')"
+            )
         elif kind == "narrative_fact":
             # v26 rows have only a numeric range and are deliberately not
             # promoted or exported as authoritative memory.
@@ -501,8 +734,38 @@ def _collect_v10_records(conn) -> dict[str, list[dict]]:
             ).fetchall()
         grouped[kind] = [{column: row[column] for column in cols} for row in rows]
 
+    portable_generation_keys = {
+        str(record["generation_key"])
+        for record in grouped.get("phase1_generation", [])
+    }
+    generation_posture = {
+        str(row["generation_key"]): (
+            int(row["identity_exact"]), str(row["reuse_scope"])
+        )
+        for row in conn.execute(
+            "SELECT generation_key,identity_exact,reuse_scope "
+            "FROM phase1_generations"
+        ).fetchall()
+    }
+    for kind in ("claim_extraction_outcome", "claim_observation"):
+        for record in grouped.get(kind, []):
+            key = record.get("phase1_generation_key")
+            if key is None or str(key) in portable_generation_keys:
+                continue
+            if generation_posture.get(str(key)) != (0, "process_instance"):
+                raise ValueError(
+                    "cannot export claim state with an invalid producer binding"
+                )
+            # Preserve the outcome/observation as explicit legacy audit state,
+            # but do not let a process-local nonce authorize destination reuse.
+            record["phase1_generation_key"] = None
+
     interpretation_by_wire_id: dict[int, str] = {}
     for record in grouped["edge_evidence"]:
+        # Import stores this transaction clock in canonical event spelling.
+        # Emit the same spelling initially so a fresh import/re-export is
+        # byte-stable rather than changing only a semantically equal timestamp.
+        record["extracted_at"] = _normalized_wire_event(record["extracted_at"])
         record["interpretation_key"] = _portable_interpretation_key(record)
         interpretation_by_wire_id[int(record["id"])] = record["interpretation_key"]
     for record in grouped["claim_observation"]:
@@ -603,6 +866,452 @@ def _upgrade_pre_v10_fact_fields(grouped: dict[str, list[dict]]) -> None:
         record["facts_retry_count"] = 0
         record["facts_retry_config_version"] = None
         record["facts_quarantined"] = 0
+
+
+def _upgrade_pre_v13_phase1_fields(grouped: dict[str, list[dict]]) -> None:
+    """Mark prompt-only claim publications as producer-untrusted history."""
+
+    grouped.setdefault("phase1_generation", [])
+    for kind in ("claim_extraction_outcome", "claim_observation"):
+        for record in grouped.get(kind, []):
+            record["phase1_generation_key"] = None
+
+
+def _upgrade_pre_v14_auxiliary_fields(grouped: dict[str, list[dict]]) -> None:
+    """Keep pre-v14 profile rows as visible-to-history but non-authoritative.
+
+    Older wires did not record whether a behavioral profile entry was directly
+    authored or inferred. Absence cannot be upgraded into user authority.
+    Likewise, absence of the auxiliary kinds means no destination cache gate
+    can be reconstructed without an exact source replay.
+    """
+
+    for record in grouped.get("profile_entry", []):
+        record["source"] = "legacy_unattributed"
+    for kind in set(_V14_TABLE_BY_KIND) - set(_V13_TABLE_BY_KIND):
+        grouped.setdefault(kind, [])
+
+
+def _validate_v13_phase1_records(grouped: dict[str, list[dict]]) -> None:
+    """Validate exact portable producer declarations and claim bindings."""
+
+    generations: dict[str, dict] = {}
+    for record in grouped.get("phase1_generation", []):
+        if (
+            not _wire_text(record.get("generation_key"), nonempty=True)
+            or not _wire_text(record.get("extraction_cache_key"), nonempty=True)
+            or not _wire_text(
+                record.get("producer_identity_sha256"), nonempty=True
+            )
+            or record.get("identity_exact") not in (1, True)
+            or record.get("reuse_scope") != "durable"
+            or not _wire_text(record.get("binding_json"), nonempty=True)
+        ):
+            raise ValueError("portable Phase-1 generation has invalid state")
+        try:
+            decoded = loads_strict_json(record["binding_json"])
+            binding = validate_phase1_generation_binding(decoded)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "portable Phase-1 generation binding is invalid"
+            ) from exc
+        producer = binding["producer"]
+        if (
+            not producer["identity_exact"]
+            or producer["reuse_scope"] != "durable"
+            or binding["generation_key"] != record["generation_key"]
+            or binding["extraction_cache_key"]
+            != record["extraction_cache_key"]
+            or producer["identity_sha256"]
+            != record["producer_identity_sha256"]
+            or canonical_phase1_generation_json(binding)
+            != record["binding_json"]
+        ):
+            raise ValueError(
+                "portable Phase-1 generation registry fields disagree"
+            )
+        key = str(record["generation_key"])
+        if key in generations:
+            raise ValueError("portable Phase-1 generation is duplicated")
+        generations[key] = binding
+
+    for kind in ("claim_extraction_outcome", "claim_observation"):
+        for record in grouped.get(kind, []):
+            key = record.get("phase1_generation_key")
+            if key is None:
+                continue
+            binding = generations.get(str(key))
+            if (
+                binding is None
+                or binding["extraction_cache_key"]
+                != record.get("prompt_version")
+            ):
+                raise ValueError(
+                    f"portable {kind} has no exact producer generation"
+                )
+
+
+def _validate_v14_auxiliary_records(grouped: dict[str, list[dict]]) -> None:
+    """Validate the complete auxiliary/result and marker decision ledgers."""
+
+    def unique(kind: str, records: list[dict], key_fn):
+        result = {}
+        for record in records:
+            try:
+                key = key_fn(record)
+                hash(key)
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"portable {kind} has an invalid identity"
+                ) from exc
+            if key in result:
+                raise ValueError(f"portable {kind} contains a duplicate identity")
+            result[key] = record
+        return result
+
+    chunks = {str(row["id"]) for row in grouped.get("chunk", [])}
+    generations = {
+        str(row["generation_key"]): row
+        for row in grouped.get("phase1_generation", [])
+    }
+    claims = {
+        str(row["chunk_id"]): row
+        for row in grouped.get("claim_extraction_outcome", [])
+    }
+    profiles = unique(
+        "profile entry", grouped.get("profile_entry", []),
+        lambda row: int(row["id"]),
+    )
+    rules = unique(
+        "rule", grouped.get("rule", []), lambda row: int(row["id"]),
+    )
+
+    for record in grouped.get("profile_entry", []):
+        if record.get("source") not in {
+            "user", "agent_inferred", "legacy_unattributed",
+        }:
+            raise _invalid_wire("profile_entry", "source")
+    for record in grouped.get("entity_type", []):
+        if (
+            not _wire_text(record.get("entity_canonical"), nonempty=True)
+            or canonicalize.normalize(record["entity_canonical"])
+            != record["entity_canonical"]
+            or not _wire_text(record.get("type"), nonempty=True)
+            or not _wire_number(
+                record.get("confidence"), minimum=0.0, maximum=1.0
+            )
+            or record.get("origin") not in {"user", "legacy_unattributed"}
+            or not _wire_text(record.get("source_chunk_id"), nullable=True)
+            or (
+                record.get("origin") == "user"
+                and record.get("source_chunk_id") is not None
+            )
+        ):
+            raise ValueError("portable entity type has invalid authority")
+    unique(
+        "entity type", grouped.get("entity_type", []),
+        lambda row: (row["entity_canonical"], row["type"]),
+    )
+    for record in grouped.get("entity_property", []):
+        if (
+            not _wire_text(record.get("entity_canonical"), nonempty=True)
+            or canonicalize.normalize(record["entity_canonical"])
+            != record["entity_canonical"]
+            or not _wire_text(record.get("key"), nonempty=True)
+            or not isinstance(record.get("value"), str)
+            or record.get("origin") not in {"user", "legacy_unattributed"}
+            or not _wire_text(record.get("source_chunk_id"), nullable=True)
+            or not _wire_text(record.get("updated_at"), nullable=True)
+            or (
+                record.get("origin") == "user"
+                and record.get("source_chunk_id") is not None
+            )
+        ):
+            raise ValueError("portable entity property has invalid authority")
+    unique(
+        "entity property", grouped.get("entity_property", []),
+        lambda row: (row["entity_canonical"], row["key"]),
+    )
+
+    for record in grouped.get("rule", []):
+        if (
+            not _wire_int(record.get("id"), minimum=1)
+            or not _wire_text(record.get("text"), nonempty=True)
+            or record.get("scope") not in {"always_on", "contextual"}
+            or record.get("source") not in {"user", "agent_inferred"}
+            or not _wire_json_array(record.get("trigger_entities"))
+            or not _wire_int(record.get("pos_evidence"), minimum=0)
+            or not _wire_int(record.get("neg_evidence"), minimum=0)
+            or record.get("status") not in {"active", "retracted"}
+            or not _wire_text(record.get("valid_at"), nullable=True)
+            or not _wire_text(record.get("invalid_at"), nullable=True)
+            or not _wire_text(record.get("created_at"), nullable=True)
+        ):
+            raise ValueError("portable rule has invalid state")
+        try:
+            triggers = loads_strict_json(record["trigger_entities"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("portable rule has invalid triggers") from None
+        if (
+            not all(isinstance(item, str) and item for item in triggers)
+            or any(canonicalize.normalize(item) != item for item in triggers)
+            or (record["scope"] == "always_on" and triggers)
+            or (record["scope"] == "contextual" and not triggers)
+        ):
+            raise ValueError("portable rule has invalid triggers")
+    unique("rule text", grouped.get("rule", []), lambda row: row["text"])
+
+    markers = unique(
+        "behavioral marker", grouped.get("behavioral_marker", []),
+        lambda row: int(row["id"]),
+    )
+    unique(
+        "behavioral marker semantic identity",
+        grouped.get("behavioral_marker", []),
+        lambda row: (
+            row["chunk_id"], row["phase1_generation_key"], row["kind"],
+            row["statement"],
+        ),
+    )
+    for marker in markers.values():
+        if (
+            not _wire_int(marker.get("id"), minimum=1)
+            or marker.get("kind") not in {
+                "correction", "preference", "rejection", "style",
+            }
+            or not _wire_text(marker.get("statement"), nonempty=True)
+            or str(marker.get("chunk_id")) not in chunks
+            or str(marker.get("phase1_generation_key")) not in generations
+            or not _wire_text(marker.get("created_at"), nullable=True)
+            or not _wire_text(marker.get("consolidated_at"), nullable=True)
+        ):
+            raise ValueError("portable behavioral marker has invalid lineage")
+
+    outcomes = unique(
+        "Phase-1 auxiliary outcome",
+        grouped.get("phase1_auxiliary_outcome", []),
+        lambda row: (row["chunk_id"], row["phase1_generation_key"]),
+    )
+    type_rows = unique(
+        "entity type observation",
+        grouped.get("entity_type_observation", []),
+        lambda row: (
+            row["chunk_id"], row["entity_canonical"], row["type"],
+            row["phase1_generation_key"],
+        ),
+    )
+    property_rows = unique(
+        "entity property observation",
+        grouped.get("entity_property_observation", []),
+        lambda row: (
+            row["chunk_id"], row["entity_canonical"], row["key"],
+            row["phase1_generation_key"],
+        ),
+    )
+    mention_rows = unique(
+        "entity mention observation",
+        grouped.get("entity_mention_observation", []),
+        lambda row: (
+            row["chunk_id"], row["entity_canonical"],
+            row["phase1_generation_key"],
+        ),
+    )
+    for kind, observations in (
+        ("entity type observation", type_rows.values()),
+        ("entity property observation", property_rows.values()),
+        ("entity mention observation", mention_rows.values()),
+    ):
+        for record in observations:
+            identity = (record["chunk_id"], record["phase1_generation_key"])
+            if (
+                identity not in outcomes
+                or not _wire_text(record.get("entity_canonical"), nonempty=True)
+                or canonicalize.normalize(record["entity_canonical"])
+                != record["entity_canonical"]
+                or not _wire_text(record.get("observed_at"), nonempty=True)
+            ):
+                raise ValueError(f"portable {kind} has invalid lineage")
+            if kind == "entity type observation" and (
+                not _wire_text(record.get("type"), nonempty=True)
+                or not _wire_number(
+                    record.get("confidence"), minimum=0.0, maximum=1.0
+                )
+            ):
+                raise ValueError(f"portable {kind} has invalid value")
+            if kind == "entity property observation" and (
+                not _wire_text(record.get("key"), nonempty=True)
+                or not isinstance(record.get("value"), str)
+            ):
+                raise ValueError(f"portable {kind} has invalid value")
+
+    markers_by_outcome: dict[tuple[object, object], list[dict]] = defaultdict(list)
+    for marker in markers.values():
+        identity = (marker["chunk_id"], marker["phase1_generation_key"])
+        if identity not in outcomes:
+            raise ValueError("portable behavioral marker lacks auxiliary outcome")
+        markers_by_outcome[identity].append(marker)
+    types_by_outcome: dict[tuple[object, object], list[dict]] = defaultdict(list)
+    for row in type_rows.values():
+        types_by_outcome[(row["chunk_id"], row["phase1_generation_key"])].append(row)
+    properties_by_outcome: dict[tuple[object, object], list[dict]] = defaultdict(list)
+    for row in property_rows.values():
+        properties_by_outcome[(row["chunk_id"], row["phase1_generation_key"])].append(row)
+    mentions_by_outcome: dict[tuple[object, object], list[dict]] = defaultdict(list)
+    for row in mention_rows.values():
+        mentions_by_outcome[(row["chunk_id"], row["phase1_generation_key"])].append(row)
+
+    for identity, outcome in outcomes.items():
+        chunk_id, generation_key = map(str, identity)
+        generation = generations.get(generation_key)
+        claim = claims.get(chunk_id)
+        if (
+            generation is None
+            or claim is None
+            or claim.get("phase1_generation_key") != generation_key
+            or claim.get("prompt_version") != outcome.get("extraction_cache_key")
+            or generation.get("extraction_cache_key")
+            != outcome.get("extraction_cache_key")
+            or outcome.get("auxiliary_contract_key")
+            not in SUPPORTED_AUXILIARY_CONTRACT_KEYS
+            or not _wire_text(outcome.get("published_at"), nonempty=True)
+            or not isinstance(outcome.get("result_hash"), str)
+            or _CLAIM_RESULT_HASH_RE.fullmatch(outcome["result_hash"]) is None
+        ):
+            raise ValueError("portable Phase-1 auxiliary outcome is invalid")
+        canonical = canonical_auxiliary_result(
+            chunk_id=chunk_id,
+            phase1_generation_key=generation_key,
+            extraction_cache_key=str(outcome["extraction_cache_key"]),
+            auxiliary_contract_key=str(outcome["auxiliary_contract_key"]),
+            entity_types=[
+                (row["entity_canonical"], row["type"], float(row["confidence"]))
+                for row in types_by_outcome[identity]
+            ],
+            entity_properties=[
+                (row["entity_canonical"], row["key"], row["value"])
+                for row in properties_by_outcome[identity]
+            ],
+            entity_mentions=[
+                row["entity_canonical"] for row in mentions_by_outcome[identity]
+            ],
+            markers=[
+                (row["kind"], row["statement"])
+                for row in markers_by_outcome[identity]
+            ],
+        )
+        for field in (
+            "entity_type_count", "entity_property_count",
+            "entity_mention_count", "marker_count",
+        ):
+            if not _wire_int(outcome.get(field), minimum=0):
+                raise ValueError("portable Phase-1 auxiliary count is invalid")
+        if (
+            outcome["result_hash"] != canonical["result_hash"]
+            or any(outcome[field] != canonical[field] for field in (
+                "entity_type_count", "entity_property_count",
+                "entity_mention_count", "marker_count",
+            ))
+        ):
+            raise ValueError("portable Phase-1 auxiliary result hash disagrees")
+
+    profile_links = unique(
+        "profile marker evidence",
+        grouped.get("profile_entry_marker_evidence", []),
+        lambda row: int(row["marker_id"]),
+    )
+    profile_decisions = unique(
+        "profile marker decision", grouped.get("profile_marker_decision", []),
+        lambda row: int(row["marker_id"]),
+    )
+    kind_map = {
+        "preference": "preference", "rejection": "avoidance",
+        "style": "style", "correction": "context",
+    }
+    for marker_id, decision in profile_decisions.items():
+        marker = markers.get(marker_id)
+        raw_profile_id = decision.get("profile_entry_id")
+        entry = (
+            profiles.get(int(raw_profile_id))
+            if _wire_int(raw_profile_id, minimum=1) else None
+        )
+        link = profile_links.get(marker_id)
+        if (
+            marker is None or entry is None
+            or decision.get("phase1_generation_key")
+            != marker.get("phase1_generation_key")
+            or not _wire_text(decision.get("profile_policy_key"), nonempty=True)
+            or decision.get("decision") not in {
+                "materialized", "manual_authority", "identity_conflict",
+            }
+            or not _wire_text(decision.get("decided_at"), nonempty=True)
+            or entry.get("text") != marker.get("statement")
+        ):
+            raise ValueError("portable profile marker decision is invalid")
+        expected_kind = kind_map[str(marker["kind"])]
+        if decision["decision"] == "materialized":
+            if (
+                entry.get("source") != "agent_inferred"
+                or entry.get("kind") != expected_kind
+                or link is None
+                or int(link.get("profile_entry_id", -1)) != int(entry["id"])
+                or link.get("phase1_generation_key")
+                != marker.get("phase1_generation_key")
+            ):
+                raise ValueError("portable materialized profile link is invalid")
+        elif link is not None or (
+            decision["decision"] == "manual_authority"
+            and entry.get("source") != "user"
+        ) or (
+            decision["decision"] == "identity_conflict"
+            and (
+                entry.get("source") == "user"
+                or entry.get("kind") == expected_kind
+            )
+        ):
+            raise ValueError("portable non-materialized profile decision is invalid")
+    if set(profile_links) - set(profile_decisions):
+        raise ValueError("portable profile evidence lacks its exact decision")
+    for link in profile_links.values():
+        if not _wire_text(link.get("created_at"), nonempty=True):
+            raise ValueError("portable profile marker evidence has invalid time")
+
+    rule_links = unique(
+        "rule marker evidence", grouped.get("rule_marker_evidence", []),
+        lambda row: int(row["marker_id"]),
+    )
+    rule_decisions = unique(
+        "rule marker decision", grouped.get("rule_marker_decision", []),
+        lambda row: int(row["marker_id"]),
+    )
+    for marker_id, decision in rule_decisions.items():
+        marker = markers.get(marker_id)
+        rule_id = decision.get("rule_id")
+        rule = rules.get(int(rule_id)) if _wire_int(rule_id, minimum=1) else None
+        link = rule_links.get(marker_id)
+        if (
+            marker is None
+            or decision.get("phase1_generation_key")
+            != marker.get("phase1_generation_key")
+            or not _wire_text(decision.get("routing_key"), nonempty=True)
+            or decision.get("decision") not in {"routed", "no_rule"}
+            or not _wire_text(decision.get("decided_at"), nonempty=True)
+        ):
+            raise ValueError("portable rule marker decision is invalid")
+        if decision["decision"] == "routed":
+            if (
+                rule is None or rule.get("source") != "agent_inferred"
+                or link is None or int(link.get("rule_id", -1)) != int(rule["id"])
+                or link.get("phase1_generation_key")
+                != marker.get("phase1_generation_key")
+            ):
+                raise ValueError("portable routed rule link is invalid")
+        elif rule_id is not None or link is not None:
+            raise ValueError("portable no-rule decision is invalid")
+    if set(rule_links) - set(rule_decisions):
+        raise ValueError("portable rule evidence lacks its exact decision")
+    for link in rule_links.values():
+        if not _wire_text(link.get("created_at"), nonempty=True):
+            raise ValueError("portable rule marker evidence has invalid time")
 
 
 def _validate_v9_records(grouped: dict[str, list[dict]]) -> None:
@@ -1389,6 +2098,98 @@ def _validate_v10_fact_records(grouped: dict[str, list[dict]]) -> None:
             raise ValueError("portable fact cursor lacks a recognized generation")
 
 
+def _validate_v11_terminal_loss_records(grouped: dict[str, list[dict]]) -> None:
+    """Validate the complete, mutually exclusive chunk scheduling state."""
+    chunks = {
+        str(record["id"]): record for record in grouped.get("chunk", [])
+    }
+    manifested = {
+        str(record["id"])
+        for record in grouped.get("chunk_source_manifest", [])
+    }
+    losses: dict[str, dict] = {}
+    for record in grouped.get("chunk_extraction_terminal_loss", []):
+        chunk_id = record.get("chunk_id")
+        if not _wire_text(chunk_id, nonempty=True) or chunk_id in losses:
+            raise ValueError("portable terminal extraction loss has invalid identity")
+        if record.get("reason") != "source_manifest_unrecoverable":
+            raise _invalid_wire("chunk_extraction_terminal_loss", "reason")
+        if not _wire_text(record.get("detected_at"), nonempty=True):
+            raise _invalid_wire("chunk_extraction_terminal_loss", "detected_at")
+        chunk = chunks.get(str(chunk_id))
+        if (
+            chunk is None
+            or chunk.get("chunk_kind") != "extraction"
+            or chunk.get("salience_reason") == "short_session_fallback"
+            or str(chunk_id) in manifested
+        ):
+            raise ValueError(
+                "portable terminal extraction loss conflicts with chunk provenance"
+            )
+        validate_timestamp_order(
+            chunk.get("created_at"),
+            record.get("detected_at"),
+            context="portable terminal extraction loss",
+        )
+        losses[str(chunk_id)] = record
+
+    expected = {
+        chunk_id
+        for chunk_id, chunk in chunks.items()
+        if (
+            chunk.get("chunk_kind") == "extraction"
+            and chunk.get("salience_reason") != "short_session_fallback"
+            and chunk_id not in manifested
+        )
+    }
+    if set(losses) != expected:
+        raise ValueError(
+            "portable extraction chunks lack complete manifest-or-loss state"
+        )
+
+
+def _validate_v12_coverage_integrity_records(
+    grouped: dict[str, list[dict]],
+) -> None:
+    """Validate bounded structural health state without accepting free text."""
+    sessions = {
+        str(record["id"]) for record in grouped.get("session", [])
+    }
+    seen: set[str] = set()
+    for record in grouped.get("coverage_integrity_failure", []):
+        session_id = record.get("session_id")
+        if (
+            not _wire_text(session_id, nonempty=True)
+            or str(session_id) in seen
+            or str(session_id) not in sessions
+        ):
+            raise ValueError(
+                "portable coverage integrity failure has invalid session identity"
+            )
+        if record.get("config_version") != COVERAGE_INTEGRITY_CONFIG_VERSION:
+            raise _invalid_wire("coverage_integrity_failure", "config_version")
+        if record.get("failure_reason") not in COVERAGE_INTEGRITY_FAILURE_REASONS:
+            raise _invalid_wire("coverage_integrity_failure", "failure_reason")
+        occurrences = record.get("occurrences")
+        if (
+            not _wire_int(occurrences, minimum=1)
+            or occurrences > MAX_COVERAGE_INTEGRITY_OCCURRENCES
+        ):
+            raise _invalid_wire("coverage_integrity_failure", "occurrences")
+        first = record.get("first_detected_at")
+        last = record.get("last_detected_at")
+        if not _wire_text(first, nonempty=True) or not _wire_text(last, nonempty=True):
+            raise ValueError(
+                "portable coverage integrity failure has invalid timestamps"
+            )
+        validate_timestamp_order(
+            first,
+            last,
+            context="portable coverage integrity failure",
+        )
+        seen.add(str(session_id))
+
+
 def _validate_v6_record_scalars(grouped: dict[str, list[dict]]) -> None:
     """Validate v6 values before the first destination write.
 
@@ -2089,6 +2890,7 @@ def _validate_v7_records(grouped: dict[str, list[dict]]) -> None:
             record["edge_id"], record["source_session_id"],
             record["source_message_id"], record["evidence_kind"],
             record["prompt_generation"],
+            record.get("phase1_generation_key"),
         )
         semantic = (record["polarity"], record["interpretation_key"])
         previous = generation_semantics.setdefault(generation_key, semantic)
@@ -2110,6 +2912,8 @@ def _validate_v7_records(grouped: dict[str, list[dict]]) -> None:
             record["prompt_version"] != outcome["prompt_version"]
             or int(record["prompt_generation"])
             != int(outcome["prompt_generation"])
+            or record.get("phase1_generation_key")
+            != outcome.get("phase1_generation_key")
             for record in observations
         ):
             raise ValueError(
@@ -2134,13 +2938,22 @@ def _validate_v7_records(grouped: dict[str, list[dict]]) -> None:
             if currents:
                 raise ValueError("portable orphaned canonical evidence is current")
             continue
-        winning_generation = max(
-            int(record["prompt_generation"]) for record in observations
-        )
+        def observation_authority_rank(record: dict) -> tuple[object, ...]:
+            outcome = outcomes[record["chunk_id"]]
+            return (
+                record.get("phase1_generation_key") is not None,
+                int(record["prompt_generation"]),
+                _normalized_wire_event(outcome["succeeded_at"]),
+                str(outcome["succeeded_at"]),
+                str(record["prompt_version"]),
+                str(record.get("phase1_generation_key") or ""),
+            )
+
+        winning_rank = max(map(observation_authority_rank, observations))
         winning_semantics = {
             (int(record["polarity"]), record["interpretation_key"])
             for record in observations
-            if int(record["prompt_generation"]) == winning_generation
+            if observation_authority_rank(record) == winning_rank
         }
         if len(winning_semantics) != 1 or len(currents) != 1:
             raise ValueError("portable claim prompt authority is inconsistent")
@@ -2618,6 +3431,17 @@ def _v6_existing_row_is_identical(conn, kind: str, record: dict) -> bool:
         key_params = (
             record["message_id"], record["chunk_id"], record["coverage_version"],
         )
+    elif kind == "chunk_extraction_terminal_loss":
+        key_sql, key_params = "chunk_id = ?", (record["chunk_id"],)
+        # Detection time is local operational history.  Two stores can
+        # independently discover the same immutable source loss; the reason
+        # and chunk identity are the portable semantic state.
+        compare_cols.remove("detected_at")
+    elif kind == "coverage_integrity_failure":
+        key_sql, key_params = "session_id = ?", (record["session_id"],)
+        # Detection times/counts are local retry history. The structural
+        # validator identity and enum reason are the portable health state.
+        compare_cols = ["session_id", "config_version", "failure_reason"]
     elif kind == "edge":
         key_sql = (
             "subject_canonical = ? AND predicate = ? AND object_canonical = ?"
@@ -2628,6 +3452,9 @@ def _v6_existing_row_is_identical(conn, kind: str, record: dict) -> bool:
         )
         compare_cols.remove("id")
     elif kind == "profile_entry":
+        key_sql, key_params = "text = ?", (record["text"],)
+        compare_cols.remove("id")
+    elif kind == "rule":
         key_sql, key_params = "text = ?", (record["text"],)
         compare_cols.remove("id")
     else:
@@ -2662,15 +3489,24 @@ def _v6_existing_row_is_identical(conn, kind: str, record: dict) -> bool:
 
 
 def _preflight_v6_target_collisions(
-    conn, grouped: dict[str, list[dict]], *, merge_v7_edges: bool = False
+    conn, grouped: dict[str, list[dict]], *, merge_v7_edges: bool = False,
+    merge_v14_authority: bool = False,
 ) -> None:
     for kind in (
         "session", "peer", "session_peer", "chunk",
         "message_retention_coverage", "episode",
         "episode_source_occurrence",
-        "procedure", "edge", "profile_entry",
+        "procedure", "edge", "profile_entry", "rule",
+        "chunk_extraction_terminal_loss",
+        "coverage_integrity_failure",
     ):
         for record in grouped.get(kind, []):
+            if merge_v14_authority and kind in {"profile_entry", "rule"}:
+                # These text-keyed domains have an explicit authority lattice:
+                # user rows win inferred/legacy rows. The transactional import
+                # branch below applies that monotonic merge and rejects peers
+                # at the same authority when their semantic state differs.
+                continue
             if merge_v7_edges and kind == "edge":
                 # A v7 edge row is a materialized view over the history that
                 # follows it. Same-natural direct edges merge those histories;
@@ -2689,11 +3525,14 @@ def _preflight_v6_target_collisions(
 
 
 def _preflight_v7_target_aliases(conn, grouped: dict[str, list[dict]]) -> None:
-    """Reject an import whose edge identities would resolve differently.
+    """Reject an import whose canonical identities resolve differently.
 
-    Re-keying a graph endpoint also requires rewriting every evidence and
-    lifecycle natural identity. Until that is explicitly requested, fail
-    closed instead of creating a split edge that normal queries cannot reach.
+    Re-keying a graph endpoint or v14 auxiliary identity also requires
+    rewriting every evidence/lifecycle natural identity and, for an auxiliary
+    result, its canonical result hash. Until that is explicitly requested,
+    fail closed instead of creating split state that normal queries cannot
+    reach.  This check intentionally runs before the import transaction makes
+    any destination mutation.
     """
     mappings = {
         str(row["alias"]): str(row["canonical"])
@@ -2717,6 +3556,66 @@ def _preflight_v7_target_aliases(conn, grouped: dict[str, list[dict]]) -> None:
         next_value = mappings.get(canonical)
         if next_value is not None and next_value != canonical:
             raise ValueError("combined entity aliases are cyclic or chained")
+
+    # Alias insertion is bidirectional with respect to canonical ownership:
+    # it is just as unsafe for an incoming alias to capture a destination row
+    # as it is for a destination alias to capture an incoming row.  Inventory
+    # every durable target surface before mutation so `foo -> bar` cannot
+    # strand an existing canonical `foo` property/observation/edge/rule.
+    target_identities: list[tuple[str, str]] = []
+    for table, column, label in (
+        ("entity_types", "entity_canonical", "target entity type"),
+        ("entity_properties", "entity_canonical", "target entity property"),
+        ("entity_mentions", "entity_canonical", "target entity mention"),
+        (
+            "entity_type_observations", "entity_canonical",
+            "target entity type observation",
+        ),
+        (
+            "entity_property_observations", "entity_canonical",
+            "target entity property observation",
+        ),
+        (
+            "entity_mention_observations", "entity_canonical",
+            "target entity mention observation",
+        ),
+    ):
+        if not core_db._table_exists(conn, table):
+            continue
+        target_identities.extend(
+            (label, str(row[column]))
+            for row in conn.execute(
+                f"SELECT DISTINCT {column} FROM {table} ORDER BY {column}"
+            ).fetchall()
+        )
+    if core_db._table_exists(conn, "knowledge_graph"):
+        for row in conn.execute(
+            "SELECT subject_canonical,object_canonical FROM knowledge_graph "
+            "ORDER BY id"
+        ).fetchall():
+            target_identities.extend((
+                ("target edge endpoint", str(row["subject_canonical"])),
+                ("target edge endpoint", str(row["object_canonical"])),
+            ))
+    if core_db._table_exists(conn, "rules"):
+        for row in conn.execute(
+            "SELECT trigger_entities FROM rules ORDER BY id"
+        ).fetchall():
+            try:
+                triggers = loads_strict_json(row["trigger_entities"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError(
+                    "target rule has invalid trigger identities"
+                ) from None
+            target_identities.extend(
+                ("target rule trigger", str(trigger)) for trigger in triggers
+            )
+    for kind, identity in target_identities:
+        if mappings.get(identity, identity) != identity:
+            raise ValueError(
+                f"portable entity alias captures {kind} canonical identity"
+            )
+
     for edge in grouped.get("edge", []):
         for endpoint in (
             edge["subject_canonical"], edge["object_canonical"],
@@ -2725,6 +3624,30 @@ def _preflight_v7_target_aliases(conn, grouped: dict[str, list[dict]]) -> None:
                 raise ValueError(
                     "portable edge endpoint resolves differently in target aliases"
                 )
+    auxiliary_identities: list[tuple[str, str]] = []
+    for kind in ("entity_type", "entity_property"):
+        auxiliary_identities.extend(
+            (kind, str(record["entity_canonical"]))
+            for record in grouped.get(kind, [])
+        )
+    for kind in (
+        "entity_type_observation", "entity_property_observation",
+        "entity_mention_observation",
+    ):
+        auxiliary_identities.extend(
+            (kind, str(record["entity_canonical"]))
+            for record in grouped.get(kind, [])
+        )
+    for rule in grouped.get("rule", []):
+        triggers = loads_strict_json(rule["trigger_entities"])
+        auxiliary_identities.extend(
+            ("rule trigger", str(trigger)) for trigger in triggers
+        )
+    for kind, identity in auxiliary_identities:
+        if mappings.get(identity, identity) != identity:
+            raise ValueError(
+                f"portable {kind} identity resolves differently in target aliases"
+            )
 
 
 _FACT_WIRE_KINDS = (
@@ -3264,7 +4187,58 @@ def _import_v10_fact_state(
             raise ValueError("portable fact history failed runtime validation")
 
 
-def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
+class _IdentityPortableScrubber:
+    """No-op text scrubber used to canonicalize current outbound wire state."""
+
+    @staticmethod
+    def redact(value):
+        return value
+
+    @staticmethod
+    def redact_preserving_length(value):
+        return value
+
+    @staticmethod
+    def sensitive_fragments(_value):
+        return ()
+
+
+def _aggregation_material_authority_hash(conn: sqlite3.Connection) -> str:
+    """Hash every exact source/anchor proof that aggregation may consume.
+
+    Import merge helpers may strengthen an existing row in place (for example
+    ``MAX(confidence, imported_confidence)``) while correctly reporting zero
+    inserted rows. Comparing this validated projection before/after the atomic
+    merge detects those authority changes without invalidating an exact
+    idempotent re-import.
+    """
+
+    proofs = []
+    for row in conn.execute("SELECT id FROM episodes ORDER BY id"):
+        proof = episode_input_proof(
+            conn, str(row["id"]), with_session_prefix=False,
+        )
+        if proof is not None:
+            proofs.append(proof)
+    cap = 2_147_483_647
+    proofs.extend(load_profile_anchor_inputs(conn, cap))
+    proofs.extend(load_knowledge_graph_anchor_inputs(conn, cap))
+    records = sorted(
+        (
+            proof.kind,
+            proof.source_key,
+            proof.proof_hash,
+        )
+        for proof in proofs
+    )
+    return hashlib.sha256(json.dumps(
+        records, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _redact_portable_records(
+    grouped: dict[str, list[dict]], *, redact_values: bool = True
+) -> None:
     """Scrub all portable text before any destination SQL is executed.
 
     Coverage chunks need a semantic transform rather than a blind regex over
@@ -3273,6 +4247,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
     v37 chunks may contain surrounding text, which is scrubbed while their
     exact record line remains valid.
     """
+    scrubber = redaction if redact_values else _IdentityPortableScrubber
     source_time_by_coverage: dict[tuple[int, str, str], object] = {}
     source_time_by_message: dict[tuple[str, int], object] = {}
 
@@ -3288,7 +4263,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
             surface = evidence.get(field)
             if not isinstance(surface, str):
                 continue
-            safe_surface = redaction.redact(surface)
+            safe_surface = scrubber.redact(surface)
             if safe_surface == surface:
                 continue
             normalized = canonicalize.normalize(surface)
@@ -3352,7 +4327,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                     content=payload["content"],
                 )
                 if line == expected:
-                    safe_content = redaction.redact(payload["content"])
+                    safe_content = scrubber.redact(payload["content"])
                     if (
                         safe_content != payload["content"]
                         and (chunk_id, payload["id"]) in partial_fact_artifacts
@@ -3362,7 +4337,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                         # spans at their original lengths so those coordinates
                         # stay exact without discarding the surrounding benign
                         # evidence.
-                        safe_content = redaction.redact_preserving_length(
+                        safe_content = scrubber.redact_preserving_length(
                             payload["content"]
                         )
                     canonical = encode_message_record(
@@ -3405,12 +4380,12 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                     source_workspace_id=payload["source_workspace_id"],
                 )
                 if line == expected:
-                    safe_content = redaction.redact(payload["content"])
+                    safe_content = scrubber.redact(payload["content"])
                     if (
                         safe_content != payload["content"]
                         and (chunk_id, payload["id"]) in partial_fact_artifacts
                     ):
-                        safe_content = redaction.redact_preserving_length(
+                        safe_content = scrubber.redact_preserving_length(
                             payload["content"]
                         )
                     canonical = encode_provenance_message_record(
@@ -3438,7 +4413,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
         # private keys) cannot survive between physical lines. Canonical JSONL
         # records are protected and reinserted after their decoded content has
         # been independently scrubbed and re-encoded above.
-        safe_text = redaction.redact("\n".join(protected_lines))
+        safe_text = scrubber.redact("\n".join(protected_lines))
         if replacements:
             protected_pattern = re.compile(
                 r"__HYMEM_PROTECTED_RECORD_[0-9]+_[0-9a-f]{64}__"
@@ -3447,7 +4422,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                 lambda match: replacements.get(match.group(0), match.group(0)),
                 safe_text,
             )
-        if redaction.redact(safe_text) != safe_text:
+        if scrubber.redact(safe_text) != safe_text:
             raise ValueError("portable chunk redaction did not reach a fixed point")
         chunk["text"] = safe_text
 
@@ -3541,13 +4516,13 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
         message_id = int(proof["message_id"])
         chunk_id = str(proof["chunk_id"])
         old_version = str(proof["coverage_version"])
-        safe_version = redaction.redact(old_version)
+        safe_version = scrubber.redact(old_version)
         if safe_version != old_version:
             suffix = "#" + hashlib.sha256(
                 old_version.encode("utf-8")
             ).hexdigest()[:12]
             safe_version = safe_version[: max(0, 128 - len(suffix))] + suffix
-        if not safe_version or redaction.redact(safe_version) != safe_version:
+        if not safe_version or scrubber.redact(safe_version) != safe_version:
             raise ValueError("portable coverage version redaction is invalid")
         old_key = (message_id, chunk_id, old_version)
         new_key = (message_id, chunk_id, safe_version)
@@ -3664,7 +4639,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
             source["source_coverage_chunk_id"], source["source_message_id"]
         ))
         if redacted_source is not None and redacted_source[1] != redacted_source[2]:
-            for fragment in redaction.sensitive_fragments(redacted_source[1]):
+            for fragment in scrubber.sensitive_fragments(redacted_source[1]):
                 normalized_fragment = canonicalize.normalize(fragment)
                 if normalized_fragment:
                     sensitive_fact_identities_by_slice[source_slice_key].add(
@@ -3714,21 +4689,21 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
     for fact in grouped.get("narrative_fact", []):
         old_key = str(fact["fact_key"])
         old_text = str(fact["text"])
-        safe_text = redaction.redact(old_text)
+        safe_text = scrubber.redact(old_text)
         text_was_redacted = safe_text != old_text
         if text_was_redacted:
             suffix = "#" + hashlib.sha256(
                 old_text.encode("utf-8")
             ).hexdigest()[:12]
             safe_text = safe_text[: max(0, 600 - len(suffix))] + suffix
-        if redaction.redact(safe_text) != safe_text:
+        if scrubber.redact(safe_text) != safe_text:
             raise ValueError("portable fact text redaction did not reach a fixed point")
         entities = loads_strict_json(fact["entities"])
         safe_entities: list[str] = []
         sensitive_identities = set(sensitive_fact_identities_by_slice.get(
             str(fact["source_outcome_key"]), ()
         ))
-        for fragment in redaction.sensitive_fragments(old_text):
+        for fragment in scrubber.sensitive_fragments(old_text):
             normalized_fragment = canonicalize.normalize(fragment)
             if normalized_fragment:
                 sensitive_identities.add(normalized_fragment)
@@ -3739,12 +4714,12 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                     entity.encode("utf-8")
                 ).hexdigest()[:12]
             else:
-                safe_entity = redaction.redact(entity)
+                safe_entity = scrubber.redact(entity)
                 if safe_entity != entity:
                     safe_entity += "#" + hashlib.sha256(
                         entity.encode("utf-8")
                     ).hexdigest()[:12]
-            if redaction.redact(safe_entity) != safe_entity:
+            if scrubber.redact(safe_entity) != safe_entity:
                 raise ValueError(
                     "portable fact entity redaction did not reach a fixed point"
                 )
@@ -3815,7 +4790,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
 
     def redact_json_node(value: object) -> object:
         if isinstance(value, str):
-            return redaction.redact(value)
+            return scrubber.redact(value)
         if isinstance(value, list):
             return [redact_json_node(item) for item in value]
         if isinstance(value, dict):
@@ -3823,7 +4798,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
             for key, item in value.items():
                 if not isinstance(key, str):
                     raise ValueError("portable JSON redaction found a non-text key")
-                safe_key = redaction.redact(key)
+                safe_key = scrubber.redact(key)
                 if safe_key in result:
                     raise ValueError("portable JSON redaction collapsed distinct keys")
                 result[safe_key] = redact_json_node(item)
@@ -3850,7 +4825,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
         try:
             decoded = loads_strict_json(value)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return redaction.redact(value)
+            return scrubber.redact(value)
         safe = redact_json_node(decoded)
         return json.dumps(
             safe, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -3887,7 +4862,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                 value is None
                 or (
                     digest_generation_is_recognized(value)
-                    and redaction.redact(value) == value
+                    and scrubber.redact(value) == value
                 )
                 for value in digest_generations
             )
@@ -3896,7 +4871,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                 or (
                     isinstance(digest_prompt, str)
                     and re.fullmatch(r"v[1-9][0-9]{0,5}", digest_prompt)
-                    and redaction.redact(digest_prompt) == digest_prompt
+                    and scrubber.redact(digest_prompt) == digest_prompt
                 )
             )
             and (
@@ -3907,7 +4882,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                         r"episodes\.granular\.v[1-9][0-9]{0,5}",
                         episode_prompt,
                     )
-                    and redaction.redact(episode_prompt) == episode_prompt
+                    and scrubber.redact(episode_prompt) == episode_prompt
                 )
             )
         )
@@ -3936,7 +4911,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                 value is None
                 or (
                     profile_generation_is_recognized(value)
-                    and redaction.redact(value) == value
+                    and scrubber.redact(value) == value
                 )
                 for value in profile_generations
             )
@@ -3945,7 +4920,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                 or (
                     isinstance(profile_prompt, str)
                     and re.fullmatch(r"profile\.v[1-9][0-9]{0,5}", profile_prompt)
-                    and redaction.redact(profile_prompt) == profile_prompt
+                    and scrubber.redact(profile_prompt) == profile_prompt
                 )
             )
         )
@@ -3963,7 +4938,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
         for prefix in ("digest", "profile"):
             config_field = f"{prefix}_retry_config_version"
             retry_value = record.get(config_field)
-            if isinstance(retry_value, str) and redaction.redact(retry_value) != retry_value:
+            if isinstance(retry_value, str) and scrubber.redact(retry_value) != retry_value:
                 record[f"{prefix}_retry_count"] = 0
                 record[config_field] = None
                 record[f"{prefix}_quarantined"] = 0
@@ -3983,8 +4958,8 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
                     digest_generation_is_recognized(generation)
                     and isinstance(slice_key, str)
                     and digest_slice_re.fullmatch(slice_key)
-                    and redaction.redact(generation) == generation
-                    and redaction.redact(slice_key) == slice_key
+                    and scrubber.redact(generation) == generation
+                    and scrubber.redact(slice_key) == slice_key
                 )
             )
         )
@@ -4002,7 +4977,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
         for record in grouped.get(kind, []):
             for field in fields:
                 if isinstance(record.get(field), str):
-                    record[field] = redaction.redact(record[field])
+                    record[field] = scrubber.redact(record[field])
     def redact_canonical_identity(value: object) -> object:
         if not isinstance(value, str):
             return value
@@ -4011,7 +4986,7 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
         )
         if mapped is not None:
             return mapped
-        safe = redaction.redact(value)
+        safe = scrubber.redact(value)
         if safe != value:
             fingerprint = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
             safe = f"{canonicalize.normalize(safe)}_{fingerprint}"
@@ -4030,23 +5005,54 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
         value = record.get("text")
         if not isinstance(value, str):
             continue
-        safe = redaction.redact(value)
+        safe = scrubber.redact(value)
         if safe != value:
             safe += "#" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
         record["text"] = safe
     for record in grouped.get("user_profile_fact", []):
         if isinstance(record.get("value"), str):
-            record["value"] = redaction.redact(record["value"])
+            record["value"] = scrubber.redact(record["value"])
         if record.get("slot") == "relationship":
-            record["slot_key"] = _redact_profile_key(record.get("slot_key"))
+            if redact_values:
+                record["slot_key"] = _redact_profile_key(record.get("slot_key"))
 
     def redact_identity_text(value: object) -> object:
         if not isinstance(value, str):
             return value
-        safe = redaction.redact(value)
+        safe = scrubber.redact(value)
         if safe != value:
             safe += "#" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
         return safe
+
+    for kind in (
+        "entity_type", "entity_property", "entity_type_observation",
+        "entity_property_observation", "entity_mention_observation",
+    ):
+        for record in grouped.get(kind, []):
+            record["entity_canonical"] = redact_canonical_identity(
+                record.get("entity_canonical")
+            )
+    for kind in ("entity_type", "entity_type_observation"):
+        for record in grouped.get(kind, []):
+            record["type"] = redact_identity_text(record.get("type"))
+    for kind in ("entity_property", "entity_property_observation"):
+        for record in grouped.get(kind, []):
+            record["key"] = redact_identity_text(record.get("key"))
+            record["value"] = redact_identity_text(record.get("value"))
+    for record in grouped.get("behavioral_marker", []):
+        record["statement"] = redact_identity_text(record.get("statement"))
+    for record in grouped.get("rule", []):
+        record["text"] = redact_identity_text(record.get("text"))
+        try:
+            triggers = loads_strict_json(record.get("trigger_entities"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("portable rule triggers are malformed") from None
+        record["trigger_entities"] = json.dumps(
+            [redact_canonical_identity(item) for item in triggers],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     # Claim semantic fields feed interpretation/natural identities.  Stable
     # fingerprints keep two redacted secrets distinct while revealing neither.
@@ -4098,6 +5104,58 @@ def _redact_portable_records(grouped: dict[str, list[dict]]) -> None:
         record["result_hash"] = _wire_claim_result_hash(
             observations_by_chunk.get(str(record["chunk_id"]), []), edge_by_wire
         )
+
+    auxiliary_types: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    auxiliary_properties: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    auxiliary_mentions: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    auxiliary_markers: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for record in grouped.get("entity_type_observation", []):
+        auxiliary_types[(
+            str(record["chunk_id"]), str(record["phase1_generation_key"]),
+        )].append(record)
+    for record in grouped.get("entity_property_observation", []):
+        auxiliary_properties[(
+            str(record["chunk_id"]), str(record["phase1_generation_key"]),
+        )].append(record)
+    for record in grouped.get("entity_mention_observation", []):
+        auxiliary_mentions[(
+            str(record["chunk_id"]), str(record["phase1_generation_key"]),
+        )].append(record)
+    for record in grouped.get("behavioral_marker", []):
+        auxiliary_markers[(
+            str(record["chunk_id"]), str(record["phase1_generation_key"]),
+        )].append(record)
+    for outcome in grouped.get("phase1_auxiliary_outcome", []):
+        identity = (
+            str(outcome["chunk_id"]),
+            str(outcome["phase1_generation_key"]),
+        )
+        canonical = canonical_auxiliary_result(
+            chunk_id=identity[0],
+            phase1_generation_key=identity[1],
+            extraction_cache_key=str(outcome["extraction_cache_key"]),
+            auxiliary_contract_key=str(outcome["auxiliary_contract_key"]),
+            entity_types=[
+                (row["entity_canonical"], row["type"], float(row["confidence"]))
+                for row in auxiliary_types[identity]
+            ],
+            entity_properties=[
+                (row["entity_canonical"], row["key"], row["value"])
+                for row in auxiliary_properties[identity]
+            ],
+            entity_mentions=[
+                row["entity_canonical"] for row in auxiliary_mentions[identity]
+            ],
+            markers=[
+                (row["kind"], row["statement"])
+                for row in auxiliary_markers[identity]
+            ],
+        )
+        for field in (
+            "result_hash", "entity_type_count", "entity_property_count",
+            "entity_mention_count", "marker_count",
+        ):
+            outcome[field] = canonical[field]
     manual_signal_keys: dict[tuple[int, str], str] = {}
     for record in grouped.get("edge_evidence_signal", []):
         old_signal_key = record["signal_key"]
@@ -4224,11 +5282,24 @@ def _preflight_v7_export(conn) -> dict[str, list[dict]]:
     mismatches = evidence_ledger.count_mismatches(conn)
     if mismatches:
         raise ValueError("cannot export knowledge graph with stale evidence counters")
-    grouped = _collect_v10_records(conn)
+    grouped = _collect_current_records(conn)
+    # The exported canonical identities must not resolve through this store's
+    # own alias map. Such a split snapshot cannot be restored without re-keying
+    # its evidence hashes, so reject it before emitting bytes.
+    _preflight_v7_target_aliases(conn, grouped)
     _validate_v6_record_scalars(grouped)
+    _validate_v13_phase1_records(grouped)
+    from hymem.dreaming.phase1_auxiliary import (
+        validate_phase1_auxiliary_registry,
+    )
+
+    validate_phase1_auxiliary_registry(conn)
+    _validate_v14_auxiliary_records(grouped)
     _validate_v7_records(grouped)
     _validate_v9_records(grouped)
     _validate_v10_fact_records(grouped)
+    _validate_v11_terminal_loss_records(grouped)
+    _validate_v12_coverage_integrity_records(grouped)
     for episode in grouped.get("episode", []):
         if (
             episode["source_manifest_complete"] == 1
@@ -4416,6 +5487,107 @@ def _merged_timestamp(left: object, right: object, *, latest: bool) -> object:
     return chooser(values, key=lambda value: (_normalized_wire_event(value), value))
 
 
+def _merge_same_source_profile_or_rule(
+    conn: sqlite3.Connection,
+    kind: str,
+    existing: sqlite3.Row,
+    incoming: dict,
+) -> bool:
+    """Join independent copies of the same profile/rule assertion.
+
+    Portable integer ids and wall-clock spellings are not authority.  Two
+    stores may therefore contain the same manually asserted profile/rule row
+    with different counters and clocks.  Merge those operational fields with
+    an idempotent, commutative join while continuing to reject genuinely
+    different semantics.  A rule retraction is monotonic: one explicit close
+    is sufficient to keep the merged rule closed.
+
+    Inferred rows use marker links (not the base counter) as current positive
+    evidence, so joining their base clocks/counters here does not invent
+    authority; the independently imported links are unioned later.  Returns
+    true when this function handled the same-source collision (whether or not
+    an UPDATE was needed).
+    """
+    if existing["source"] != incoming["source"]:
+        return False
+
+    if kind == "profile_entry":
+        if existing["kind"] != incoming["kind"]:
+            raise ValueError(
+                "portable profile_entry collides with different target state"
+            )
+        merged = {
+            "pos_evidence": max(
+                int(existing["pos_evidence"]), int(incoming["pos_evidence"])
+            ),
+            "neg_evidence": max(
+                int(existing["neg_evidence"]), int(incoming["neg_evidence"])
+            ),
+            "first_seen": _merged_timestamp(
+                existing["first_seen"], incoming["first_seen"], latest=False
+            ),
+            "last_updated": _merged_timestamp(
+                existing["last_updated"], incoming["last_updated"], latest=True
+            ),
+        }
+    elif kind == "rule":
+        try:
+            existing_triggers = loads_strict_json(existing["trigger_entities"])
+            incoming_triggers = loads_strict_json(incoming["trigger_entities"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError(
+                "portable rule collides with invalid target state"
+            ) from None
+        existing_trigger_set = tuple(sorted(set(existing_triggers)))
+        incoming_trigger_set = tuple(sorted(set(incoming_triggers)))
+        if (
+            existing["scope"] != incoming["scope"]
+            or existing_trigger_set != incoming_trigger_set
+        ):
+            raise ValueError("portable rule collides with different target state")
+        merged_status = (
+            "retracted"
+            if "retracted" in {existing["status"], incoming["status"]}
+            else "active"
+        )
+        merged = {
+            "scope": existing["scope"],
+            "trigger_entities": json.dumps(list(existing_trigger_set)),
+            "pos_evidence": max(
+                int(existing["pos_evidence"]), int(incoming["pos_evidence"])
+            ),
+            "neg_evidence": max(
+                int(existing["neg_evidence"]), int(incoming["neg_evidence"])
+            ),
+            "valid_at": _merged_timestamp(
+                existing["valid_at"], incoming["valid_at"], latest=False
+            ),
+            "invalid_at": (
+                _merged_timestamp(
+                    existing["invalid_at"], incoming["invalid_at"], latest=False
+                )
+                if merged_status == "retracted"
+                else None
+            ),
+            "status": merged_status,
+            "created_at": _merged_timestamp(
+                existing["created_at"], incoming["created_at"], latest=False
+            ),
+        }
+    else:  # pragma: no cover - private caller has a closed kind set
+        return False
+
+    if all(existing[column] == value for column, value in merged.items()):
+        return True
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            f"UPDATE {'profile_entries' if kind == 'profile_entry' else 'rules'} "
+            "SET " + ",".join(f"{column}=?" for column in merged) + " WHERE id=?",
+            [*merged.values(), int(existing["id"])],
+        )
+    return True
+
+
 def _canonical_evidence_base(
     edge_id: int, record: dict | sqlite3.Row
 ) -> tuple[object, ...]:
@@ -4445,6 +5617,22 @@ def _import_v7_claim_state(
 ) -> None:
     """Restore v7 graph history through natural-key ID maps."""
     from hymem.core.time import validate_event_clock
+
+    generation_inserted = 0
+    for record in sorted(
+        grouped.get("phase1_generation", []),
+        key=lambda row: row["generation_key"],
+    ):
+        binding = validate_phase1_generation_binding(
+            loads_strict_json(record["binding_json"])
+        )
+        existed = conn.execute(
+            "SELECT 1 FROM phase1_generations WHERE generation_key=?",
+            (record["generation_key"],),
+        ).fetchone()
+        register_phase1_generation(conn, binding)
+        generation_inserted += int(existed is None)
+    inserted["phase1_generation"] = generation_inserted
 
     # Validate the wire's two clocks before mutating claim state. Relative
     # source/transaction comparisons make replay deterministic. In addition,
@@ -4677,6 +5865,25 @@ def _import_v7_claim_state(
     outcome_affected_edge_ids: set[int] = set()
     outcome_inserted = 0
     outcome_changed = False
+
+    def outcome_rank(
+        *, prompt_generation: int, prompt_version: str,
+        succeeded_at: object, generation_key: object,
+        producer_authority: int,
+    ) -> tuple[object, ...]:
+        # Producer-known authority always outranks legacy prompt-only history.
+        # Within exact authority, prompt generation remains primary and the
+        # portable publication clock makes independently evolved stores
+        # converge. The digest key is only the final deterministic tie-breaker.
+        return (
+            int(producer_authority),
+            int(prompt_generation),
+            _normalized_wire_event(succeeded_at),
+            str(succeeded_at),
+            str(prompt_version),
+            str(generation_key or ""),
+        )
+
     with core_db.evidence_mutation(conn):
         for record in sorted(
             grouped.get("claim_extraction_outcome", []),
@@ -4684,42 +5891,72 @@ def _import_v7_claim_state(
         ):
             chunk_id = str(record["chunk_id"])
             existing = conn.execute(
-                "SELECT prompt_version,prompt_generation,result_hash,succeeded_at "
-                "FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
+                "SELECT prompt_version,prompt_generation,result_hash,succeeded_at,"
+                "outcome.phase1_generation_key,"
+                "CASE WHEN generation.generation_key IS NULL THEN 0 "
+                "WHEN generation.identity_exact=1 THEN 2 ELSE 1 END "
+                "AS _producer_authority "
+                "FROM kg_claim_extraction_outcomes outcome "
+                "LEFT JOIN phase1_generations generation "
+                "ON generation.generation_key=outcome.phase1_generation_key "
+                "AND generation.extraction_cache_key=outcome.prompt_version "
+                "AND hymem_phase1_generation_is_authorized("
+                "generation.generation_key,generation.identity_exact)=1 "
+                "WHERE outcome.chunk_id=?",
                 (chunk_id,),
             ).fetchone()
             incoming_generation = int(record["prompt_generation"])
+            incoming_key = record.get("phase1_generation_key")
+            invalidate_processed = False
             if existing is not None:
                 target_generation = int(existing["prompt_generation"])
-                if incoming_generation < target_generation:
-                    stale_outcome_chunks.add(chunk_id)
-                elif incoming_generation == target_generation:
-                    if existing["result_hash"] != record["result_hash"]:
-                        raise ValueError(
-                            "same prompt generation claim extraction outcomes disagree"
-                        )
-                    winner_version = max(
-                        str(existing["prompt_version"]),
-                        str(record["prompt_version"]),
+                same_identity = bool(
+                    existing["prompt_version"] == record["prompt_version"]
+                    and existing["phase1_generation_key"] == incoming_key
+                )
+                if same_identity and existing["result_hash"] != record["result_hash"]:
+                    raise ValueError(
+                        "same Phase-1 producer prompt generation outcomes disagree"
                     )
+                if same_identity:
+                    if evidence_ledger.claim_observation_result_hash(
+                        conn, chunk_id
+                    ) != existing["result_hash"]:
+                        # The marker alone cannot authenticate a target whose
+                        # observation set drifted. Rebuild that chunk from the
+                        # already wire-validated exact generation instead of
+                        # certifying its stale/corrupt projection.
+                        outcome_affected_edge_ids.update(
+                            evidence_ledger.begin_chunk_extraction_reconciliation(
+                                conn,
+                                chunk_id=chunk_id,
+                                prompt_version=str(record["prompt_version"]),
+                            )
+                        )
+                        outcome_changed = True
+                        invalidate_processed = True
                     winner_succeeded = _merged_timestamp(
                         existing["succeeded_at"], record["succeeded_at"], latest=True
                     )
-                    if (
-                        winner_version != existing["prompt_version"]
-                        or winner_succeeded != existing["succeeded_at"]
-                    ):
+                    if winner_succeeded != existing["succeeded_at"]:
                         conn.execute(
                             "UPDATE kg_claim_extraction_outcomes SET "
-                            "prompt_version=?,succeeded_at=? WHERE chunk_id=?",
-                            (winner_version, winner_succeeded, chunk_id),
+                            "succeeded_at=? WHERE chunk_id=?",
+                            (winner_succeeded, chunk_id),
                         )
-                        conn.execute(
-                            "UPDATE kg_claim_observations SET prompt_version=? "
-                            "WHERE chunk_id=? AND prompt_generation=?",
-                            (winner_version, chunk_id, target_generation),
-                        )
-                else:
+                elif outcome_rank(
+                    prompt_generation=incoming_generation,
+                    prompt_version=str(record["prompt_version"]),
+                    succeeded_at=record["succeeded_at"],
+                    generation_key=incoming_key,
+                    producer_authority=(2 if incoming_key is not None else 0),
+                ) > outcome_rank(
+                    prompt_generation=target_generation,
+                    prompt_version=str(existing["prompt_version"]),
+                    succeeded_at=existing["succeeded_at"],
+                    generation_key=existing["phase1_generation_key"],
+                    producer_authority=int(existing["_producer_authority"]),
+                ):
                     outcome_affected_edge_ids.update(
                         evidence_ledger.begin_chunk_extraction_reconciliation(
                             conn,
@@ -4729,14 +5966,19 @@ def _import_v7_claim_state(
                     )
                     conn.execute(
                         "UPDATE kg_claim_extraction_outcomes SET prompt_version=?,"
-                        "prompt_generation=?,result_hash=?,succeeded_at=? "
+                        "prompt_generation=?,result_hash=?,succeeded_at=?,"
+                        "phase1_generation_key=? "
                         "WHERE chunk_id=?",
                         (
                             record["prompt_version"], incoming_generation,
-                            record["result_hash"], record["succeeded_at"], chunk_id,
+                            record["result_hash"], record["succeeded_at"],
+                            incoming_key, chunk_id,
                         ),
                     )
                     outcome_changed = True
+                    invalidate_processed = True
+                else:
+                    stale_outcome_chunks.add(chunk_id)
             else:
                 # Initialized v40 stores were conservatively backfilled by v41;
                 # absence therefore means no proven prior whole-chunk outcome.
@@ -4751,24 +5993,30 @@ def _import_v7_claim_state(
                 )
                 conn.execute(
                     "INSERT INTO kg_claim_extraction_outcomes("
-                    "chunk_id,prompt_version,prompt_generation,result_hash,succeeded_at) "
-                    "VALUES (?,?,?,?,?)",
+                    "chunk_id,prompt_version,prompt_generation,result_hash,succeeded_at,"
+                    "phase1_generation_key) VALUES (?,?,?,?,?,?)",
                     (
                         chunk_id, record["prompt_version"], incoming_generation,
-                        record["result_hash"], record["succeeded_at"],
+                        record["result_hash"], record["succeeded_at"], incoming_key,
                     ),
                 )
                 outcome_inserted += 1
                 outcome_changed = True
-            # The outcome itself proves this exact prompt completed. Preserve
-            # the runtime selection gate even though processed_chunks is not a
-            # durable semantic record in older wire versions.
-            conn.execute(
-                "INSERT INTO processed_chunks(chunk_id,prompt_version,processed_at) "
-                "VALUES (?,?,?) ON CONFLICT(chunk_id,prompt_version) DO UPDATE SET "
-                "processed_at=MIN(processed_at,excluded.processed_at)",
-                (chunk_id, record["prompt_version"], record["succeeded_at"]),
-            )
+                invalidate_processed = True
+            # A claim outcome authenticates only kg_claim_observations. V14
+            # carries auxiliary history separately, but import still cannot
+            # prove that this destination atomically ran the exact producer.
+            # Never create a cache hit from claim-only material. If this import
+            # replaces/inserts claim authority (or detects a corrupt target
+            # projection), clear any conflicting target gate and force live
+            # replay. An exact no-op reimport preserves a locally earned gate;
+            # a stale lower-authority wire cannot invalidate it.
+            if invalidate_processed:
+                conn.execute(
+                    "DELETE FROM processed_chunks "
+                    "WHERE chunk_id=? AND prompt_version=?",
+                    (chunk_id, record["prompt_version"]),
+                )
     inserted["claim_extraction_outcome"] = outcome_inserted
     if outcome_changed:
         inserted["_claim_extraction_outcome_changed"] = 1
@@ -4791,13 +6039,23 @@ def _import_v7_claim_state(
         target_observations = [
             {**dict(row), "_origin": "target"}
             for row in conn.execute(
-                "SELECT observation.*,outcome.succeeded_at AS _publication_at "
+                "SELECT observation.*,outcome.succeeded_at AS _publication_at,"
+                "CASE WHEN generation.identity_exact=1 THEN 2 ELSE 1 END "
+                "AS _producer_authority "
                 "FROM kg_claim_observations observation "
                 "JOIN kg_claim_extraction_outcomes outcome "
                 "ON outcome.chunk_id=observation.chunk_id "
                 "AND outcome.prompt_version=observation.prompt_version "
                 "AND outcome.prompt_generation=observation.prompt_generation "
-                f"WHERE observation.edge_id IN ({placeholders})",
+                "AND outcome.phase1_generation_key IS NOT NULL "
+                "AND outcome.phase1_generation_key="
+                "observation.phase1_generation_key "
+                "JOIN phase1_generations generation "
+                "ON generation.generation_key=outcome.phase1_generation_key "
+                "AND generation.extraction_cache_key=outcome.prompt_version "
+                f"WHERE observation.edge_id IN ({placeholders}) "
+                "AND hymem_phase1_generation_is_authorized("
+                "generation.generation_key,generation.identity_exact)=1",
                 affected_edge_ids,
             ).fetchall()
         ]
@@ -4805,6 +6063,7 @@ def _import_v7_claim_state(
         (
             str(record["chunk_id"]), str(record["prompt_version"]),
             int(record["prompt_generation"]),
+            record.get("phase1_generation_key"),
         ): record["succeeded_at"]
         for record in grouped.get("claim_extraction_outcome", [])
     }
@@ -4815,10 +6074,14 @@ def _import_v7_claim_state(
         mapped = dict(record)
         mapped["edge_id"] = edge_ids[int(record["edge_id"])]
         mapped["_origin"] = "wire"
+        mapped["_producer_authority"] = (
+            2 if mapped.get("phase1_generation_key") is not None else 0
+        )
         mapped["_wire_evidence_id"] = int(record["evidence_id"])
         outcome_key = (
             str(record["chunk_id"]), str(record["prompt_version"]),
             int(record["prompt_generation"]),
+            record.get("phase1_generation_key"),
         )
         if outcome_key not in wire_outcomes:
             raise ValueError(
@@ -4829,6 +6092,18 @@ def _import_v7_claim_state(
     supported_wire_evidence_ids = {
         int(record["_wire_evidence_id"]) for record in wire_observations
     }
+
+    def observation_authority_rank(record) -> tuple[object, ...]:
+        return (
+            int(record.get("_producer_authority", 0)),
+            int(record["prompt_generation"]),
+            _normalized_wire_event(record.get("_publication_at")),
+            str(record.get("_publication_at") or ""),
+            str(record["prompt_version"]),
+            str(record.get("phase1_generation_key") or ""),
+            _normalized_wire_event(record.get("observed_at")),
+            str(record.get("observed_at") or ""),
+        )
 
     def first_occurrence_audit_rank(record) -> tuple:
         """Choose one coherent immutable first-occurrence audit snapshot."""
@@ -4854,23 +6129,15 @@ def _import_v7_claim_state(
         candidate_generation = int(candidate["prompt_generation"])
         if (
             previous_generation == candidate_generation
+            and previous.get("phase1_generation_key")
+            == candidate.get("phase1_generation_key")
             and _observation_semantic(previous) != _observation_semantic(candidate)
         ):
             raise ValueError(
                 "portable observations diverge at one prompt generation"
             )
-        previous_rank = (
-            previous_generation,
-            str(previous["prompt_version"]),
-            _normalized_wire_event(previous.get("observed_at")),
-            str(previous.get("observed_at") or ""),
-        )
-        candidate_rank = (
-            candidate_generation,
-            str(candidate["prompt_version"]),
-            _normalized_wire_event(candidate.get("observed_at")),
-            str(candidate.get("observed_at") or ""),
-        )
+        previous_rank = observation_authority_rank(previous)
+        candidate_rank = observation_authority_rank(candidate)
         if candidate_rank > previous_rank:
             merged_observations[identity] = candidate
 
@@ -4883,12 +6150,10 @@ def _import_v7_claim_state(
         observations_by_base[base].append(observation)
     authority: dict[tuple[object, ...], tuple[tuple[int, str], str]] = {}
     for base, observations in observations_by_base.items():
-        winning_generation = max(
-            int(record["prompt_generation"]) for record in observations
-        )
+        winning_rank = max(map(observation_authority_rank, observations))
         winners = [
             record for record in observations
-            if int(record["prompt_generation"]) == winning_generation
+            if observation_authority_rank(record) == winning_rank
         ]
         semantics = {_observation_semantic(record) for record in winners}
         if len(semantics) != 1:
@@ -5380,7 +6645,7 @@ def _import_v7_claim_state(
     inserted["edge_evidence_signal"] = signal_inserted
 
     observation_inserted = 0
-    observation_columns = list(_V7_COLS_BY_KIND["claim_observation"])
+    observation_columns = list(_V13_COLS_BY_KIND["claim_observation"])
     with core_db.evidence_history_mutation(conn):
         for record in sorted(
             grouped.get("claim_observation", []),
@@ -5396,8 +6661,26 @@ def _import_v7_claim_state(
             mapped["edge_id"] = edge_ids[int(record["edge_id"])]
             mapped["evidence_id"] = evidence_id_map[int(record["evidence_id"])]
             existing = conn.execute(
-                "SELECT * FROM kg_claim_observations WHERE chunk_id=? AND edge_id=? "
-                "AND source_session_id=? AND source_message_id=? AND evidence_kind=?",
+                "SELECT observation.*,CASE "
+                "WHEN generation.generation_key IS NULL THEN 0 "
+                "WHEN generation.identity_exact=1 THEN 2 ELSE 1 END "
+                "AS _producer_authority "
+                "FROM kg_claim_observations observation "
+                "LEFT JOIN kg_claim_extraction_outcomes outcome "
+                "ON outcome.chunk_id=observation.chunk_id "
+                "AND outcome.prompt_version=observation.prompt_version "
+                "AND outcome.prompt_generation=observation.prompt_generation "
+                "AND outcome.phase1_generation_key="
+                "observation.phase1_generation_key "
+                "LEFT JOIN phase1_generations generation "
+                "ON generation.generation_key=outcome.phase1_generation_key "
+                "AND generation.extraction_cache_key=outcome.prompt_version "
+                "AND hymem_phase1_generation_is_authorized("
+                "generation.generation_key,generation.identity_exact)=1 "
+                "WHERE observation.chunk_id=? AND observation.edge_id=? "
+                "AND observation.source_session_id=? "
+                "AND observation.source_message_id=? "
+                "AND observation.evidence_kind=?",
                 (
                     mapped["chunk_id"], mapped["edge_id"],
                     mapped["source_session_id"], mapped["source_message_id"],
@@ -5409,30 +6692,39 @@ def _import_v7_claim_state(
                 incoming_generation = int(mapped["prompt_generation"])
                 if (
                     existing_generation == incoming_generation
+                    and existing["phase1_generation_key"]
+                    == mapped.get("phase1_generation_key")
                     and _observation_semantic(existing)
                     != _observation_semantic(mapped)
                 ):
                     raise ValueError("portable claim observation collides with target")
                 incoming_rank = (
+                    2 if mapped.get("phase1_generation_key") is not None else 0,
                     incoming_generation, str(mapped["prompt_version"]),
+                    str(mapped.get("phase1_generation_key") or ""),
                     _normalized_wire_event(mapped.get("observed_at")),
                     str(mapped.get("observed_at") or ""),
                 )
                 existing_rank = (
+                    int(existing["_producer_authority"]),
                     existing_generation, str(existing["prompt_version"]),
+                    str(existing["phase1_generation_key"] or ""),
                     _normalized_wire_event(existing["observed_at"]),
                     str(existing["observed_at"] or ""),
                 )
                 if incoming_rank > existing_rank:
                     conn.execute(
                         "UPDATE kg_claim_observations SET polarity=?,prompt_version=?,"
-                        "prompt_generation=?,evidence_id=?,interpretation_key=?,"
+                        "prompt_generation=?,phase1_generation_key=?,evidence_id=?,"
+                        "interpretation_key=?,"
                         "observed_at=? WHERE chunk_id=? AND edge_id=? "
                         "AND source_session_id=? AND source_message_id=? "
                         "AND evidence_kind=?",
                         (
                             mapped["polarity"], mapped["prompt_version"],
-                            mapped["prompt_generation"], mapped["evidence_id"],
+                            mapped["prompt_generation"],
+                            mapped.get("phase1_generation_key"),
+                            mapped["evidence_id"],
                             mapped["interpretation_key"], mapped["observed_at"],
                             mapped["chunk_id"], mapped["edge_id"],
                             mapped["source_session_id"],
@@ -5636,6 +6928,483 @@ def _import_v7_claim_state(
     evidence_ledger.finalize_chunk_extraction_reconciliation(conn, affected)
 
 
+def _import_v14_auxiliary_state(
+    conn: sqlite3.Connection,
+    grouped: dict[str, list[dict]],
+    inserted: dict[str, int],
+    *,
+    config=None,
+) -> None:
+    """Restore validated v14 history without minting a processed cache gate."""
+
+    # V7 has already selected one authoritative claim outcome per chunk.  A
+    # lower-ranked snapshot's auxiliary branch is part of that losing atomic
+    # extraction and must not be appended independently: doing so turns a
+    # reverse evolving-snapshot import into new history and can later confuse
+    # replay/cache reconciliation.  Only the wire auxiliary identity whose
+    # exact claim won (or already matched) is eligible below.
+    accepted_auxiliary_identities: set[tuple[str, str]] = set()
+    for outcome in grouped.get("phase1_auxiliary_outcome", []):
+        claim = conn.execute(
+            "SELECT prompt_version,phase1_generation_key FROM "
+            "kg_claim_extraction_outcomes WHERE chunk_id=?",
+            (outcome["chunk_id"],),
+        ).fetchone()
+        if (
+            claim is not None
+            and claim["prompt_version"] == outcome["extraction_cache_key"]
+            and claim["phase1_generation_key"]
+            == outcome["phase1_generation_key"]
+        ):
+            accepted_auxiliary_identities.add((
+                str(outcome["chunk_id"]),
+                str(outcome["phase1_generation_key"]),
+            ))
+
+    def merge_manual_table(
+        *, kind: str, table: str, identity_columns: tuple[str, ...],
+    ) -> int:
+        changed = 0
+        columns = list(_V14_COLS_BY_KIND[kind])
+        for record in grouped.get(kind, []):
+            where = " AND ".join(f"{column}=?" for column in identity_columns)
+            existing = conn.execute(
+                f"SELECT {', '.join(columns)} FROM {table} WHERE {where}",
+                [record[column] for column in identity_columns],
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    f"INSERT INTO {table}({', '.join(columns)}) VALUES ("
+                    + ",".join("?" for _ in columns) + ")",
+                    [record[column] for column in columns],
+                )
+                changed += 1
+                continue
+            if all(existing[column] == record[column] for column in columns):
+                continue
+            target_user = existing["origin"] == "user"
+            incoming_user = record["origin"] == "user"
+            if kind == "entity_property" and target_user and incoming_user:
+                semantic_columns = [
+                    column for column in columns if column != "updated_at"
+                ]
+                if not all(
+                    existing[column] == record[column]
+                    for column in semantic_columns
+                ):
+                    raise ValueError(
+                        "portable entity_property collides with different "
+                        "target state"
+                    )
+                timestamps = [
+                    value for value in (
+                        existing["updated_at"], record["updated_at"],
+                    ) if isinstance(value, str)
+                ]
+                latest = (
+                    latest_timestamp_spelling(*timestamps)
+                    if timestamps else None
+                )
+                if existing["updated_at"] != latest:
+                    conn.execute(
+                        f"UPDATE {table} SET updated_at=? WHERE {where}",
+                        [latest]
+                        + [record[column] for column in identity_columns],
+                    )
+                continue
+            if target_user and not incoming_user:
+                continue
+            if incoming_user and not target_user:
+                assignments = [
+                    column for column in columns if column not in identity_columns
+                ]
+                conn.execute(
+                    f"UPDATE {table} SET "
+                    + ",".join(f"{column}=?" for column in assignments)
+                    + f" WHERE {where}",
+                    [record[column] for column in assignments]
+                    + [record[column] for column in identity_columns],
+                )
+                continue
+            raise ValueError(f"portable {kind} collides with different target state")
+        return changed
+
+    inserted["entity_type"] = merge_manual_table(
+        kind="entity_type", table="entity_types",
+        identity_columns=("entity_canonical", "type"),
+    )
+    inserted["entity_property"] = merge_manual_table(
+        kind="entity_property", table="entity_properties",
+        identity_columns=("entity_canonical", "key"),
+    )
+
+    marker_ids: dict[int, int] = {}
+    with core_db.evidence_mutation(conn):
+        marker_inserted = 0
+        for record in grouped.get("behavioral_marker", []):
+            if (
+                str(record["chunk_id"]),
+                str(record["phase1_generation_key"]),
+            ) not in accepted_auxiliary_identities:
+                continue
+            existing = conn.execute(
+                "SELECT id FROM behavioral_markers WHERE chunk_id=? "
+                "AND phase1_generation_key=? AND kind=? AND statement=?",
+                (
+                    record["chunk_id"], record["phase1_generation_key"],
+                    record["kind"], record["statement"],
+                ),
+            ).fetchone()
+            if existing is None:
+                cursor = conn.execute(
+                    "INSERT INTO behavioral_markers("
+                    "kind,statement,chunk_id,created_at,consolidated_at,"
+                    "phase1_generation_key) VALUES (?,?,?,?,?,?)",
+                    (
+                        record["kind"], record["statement"], record["chunk_id"],
+                        record["created_at"], record["consolidated_at"],
+                        record["phase1_generation_key"],
+                    ),
+                )
+                local_id = int(cursor.lastrowid)
+                marker_inserted += 1
+            else:
+                local_id = int(existing["id"])
+            marker_ids[int(record["id"])] = local_id
+        inserted["behavioral_marker"] = marker_inserted
+
+        for kind, table, columns, identity_columns in (
+            (
+                "entity_type_observation", "entity_type_observations",
+                _V14_COLS_BY_KIND["entity_type_observation"],
+                ("chunk_id", "entity_canonical", "type", "phase1_generation_key"),
+            ),
+            (
+                "entity_property_observation", "entity_property_observations",
+                _V14_COLS_BY_KIND["entity_property_observation"],
+                ("chunk_id", "entity_canonical", "key", "phase1_generation_key"),
+            ),
+            (
+                "entity_mention_observation", "entity_mention_observations",
+                _V14_COLS_BY_KIND["entity_mention_observation"],
+                ("chunk_id", "entity_canonical", "phase1_generation_key"),
+            ),
+        ):
+            n = 0
+            for record in grouped.get(kind, []):
+                if (
+                    str(record["chunk_id"]),
+                    str(record["phase1_generation_key"]),
+                ) not in accepted_auxiliary_identities:
+                    continue
+                where = " AND ".join(
+                    f"{column}=?" for column in identity_columns
+                )
+                existing = conn.execute(
+                    f"SELECT {', '.join(columns)} FROM {table} WHERE {where}",
+                    [record[column] for column in identity_columns],
+                ).fetchone()
+                if existing is not None:
+                    semantic = [column for column in columns if column != "observed_at"]
+                    if not all(existing[column] == record[column] for column in semantic):
+                        raise ValueError(
+                            f"portable {kind} collides with different target state"
+                        )
+                    continue
+                conn.execute(
+                    f"INSERT INTO {table}({', '.join(columns)}) VALUES ("
+                    + ",".join("?" for _ in columns) + ")",
+                    [record[column] for column in columns],
+                )
+                n += 1
+            inserted[kind] = n
+
+        outcome_inserted = 0
+        outcome_columns = _V14_COLS_BY_KIND["phase1_auxiliary_outcome"]
+        for record in grouped.get("phase1_auxiliary_outcome", []):
+            if (
+                str(record["chunk_id"]),
+                str(record["phase1_generation_key"]),
+            ) not in accepted_auxiliary_identities:
+                continue
+            existing = conn.execute(
+                "SELECT " + ",".join(outcome_columns)
+                + " FROM phase1_auxiliary_outcomes WHERE chunk_id=? "
+                "AND phase1_generation_key=?",
+                (record["chunk_id"], record["phase1_generation_key"]),
+            ).fetchone()
+            if existing is not None:
+                semantic = [
+                    column for column in outcome_columns
+                    if column != "published_at"
+                ]
+                if not all(existing[column] == record[column] for column in semantic):
+                    raise ValueError(
+                        "portable Phase-1 auxiliary outcome collides with target"
+                    )
+                continue
+            conn.execute(
+                "INSERT INTO phase1_auxiliary_outcomes("
+                + ",".join(outcome_columns) + ") VALUES ("
+                + ",".join("?" for _ in outcome_columns) + ")",
+                [record[column] for column in outcome_columns],
+            )
+            # The wire proves durable history, not that this destination has
+            # atomically executed the exact Phase-1 producer. A pre-v54/stale
+            # acknowledgement must not become live merely because import just
+            # supplied the previously missing auxiliary row.
+            conn.execute(
+                "DELETE FROM processed_chunks WHERE chunk_id=? "
+                "AND prompt_version=? AND (phase1_generation_key IS NULL "
+                "OR phase1_generation_key=?)",
+                (
+                    record["chunk_id"], record["extraction_cache_key"],
+                    record["phase1_generation_key"],
+                ),
+            )
+            outcome_inserted += 1
+        inserted["phase1_auxiliary_outcome"] = outcome_inserted
+
+        profile_by_wire = {
+            int(record["id"]): conn.execute(
+                "SELECT id,source,kind FROM profile_entries WHERE text=?",
+                (record["text"],),
+            ).fetchone()
+            for record in grouped.get("profile_entry", [])
+        }
+        rule_by_wire = {
+            int(record["id"]): conn.execute(
+                "SELECT id,source FROM rules WHERE text=?", (record["text"],),
+            ).fetchone()
+            for record in grouped.get("rule", [])
+        }
+        if any(row is None for row in [*profile_by_wire.values(), *rule_by_wire.values()]):
+            raise ValueError("portable materialization target mapping disappeared")
+
+        profile_links_by_marker = {
+            int(record["marker_id"]): record
+            for record in grouped.get("profile_entry_marker_evidence", [])
+        }
+        profile_link_inserted = 0
+        profile_decision_inserted = 0
+        marker_by_wire = {
+            int(record["id"]): record
+            for record in grouped.get("behavioral_marker", [])
+        }
+        profile_kind_for_marker = {
+            "preference": "preference", "rejection": "avoidance",
+            "style": "style", "correction": "context",
+        }
+        from hymem.dreaming.phase2 import PROFILE_MATERIALIZATION_POLICY_KEY
+
+        for decision in grouped.get("profile_marker_decision", []):
+            wire_marker = int(decision["marker_id"])
+            if wire_marker not in marker_ids:
+                continue
+            local_marker = marker_ids[wire_marker]
+            profile_row = profile_by_wire[int(decision["profile_entry_id"])]
+            local_profile = int(profile_row["id"])
+            link = profile_links_by_marker.get(wire_marker)
+            expected_kind = profile_kind_for_marker[
+                str(marker_by_wire[wire_marker]["kind"])
+            ]
+            if profile_row["source"] == "user":
+                desired_decision = "manual_authority"
+                link = None
+            elif profile_row["kind"] == expected_kind:
+                desired_decision = "materialized"
+            else:
+                desired_decision = "identity_conflict"
+                link = None
+            existing_decision = conn.execute(
+                "SELECT phase1_generation_key,profile_policy_key,decision,"
+                "profile_entry_id FROM profile_marker_decisions WHERE marker_id=?",
+                (local_marker,),
+            ).fetchone()
+            desired = (
+                decision["phase1_generation_key"], decision["profile_policy_key"],
+                desired_decision, local_profile,
+            )
+            if existing_decision is not None:
+                current = tuple(existing_decision)
+                if current == desired:
+                    continue
+                # Explicit user authority is monotonic. Never replace its
+                # decision with an inferred materialization from another store.
+                if existing_decision["decision"] == "manual_authority":
+                    continue
+                existing_is_current = (
+                    existing_decision["profile_policy_key"]
+                    == PROFILE_MATERIALIZATION_POLICY_KEY
+                )
+                incoming_is_current = (
+                    decision["profile_policy_key"]
+                    == PROFILE_MATERIALIZATION_POLICY_KEY
+                )
+                if existing_is_current:
+                    if incoming_is_current:
+                        raise ValueError(
+                            "portable current profile marker decision collides "
+                            "with target"
+                        )
+                    continue
+                if not incoming_is_current:
+                    # Two obsolete policies are incomparable. Import order
+                    # must not choose which stale decision later appears to be
+                    # the marker's unique history.
+                    raise ValueError(
+                        "portable stale profile marker policies collide"
+                    )
+                conn.execute(
+                    "DELETE FROM profile_marker_decisions WHERE marker_id=?",
+                    (local_marker,),
+                )
+                conn.execute(
+                    "DELETE FROM profile_entry_marker_evidence WHERE marker_id=?",
+                    (local_marker,),
+                )
+            if desired_decision == "materialized" and link is None:
+                # Authority merging can map a donor identity-conflict row onto
+                # a stronger, correctly typed target materialization.  The
+                # donor has no evidence link for that new meaning, so leave the
+                # marker pending for a real local consolidation instead of
+                # forging lineage or rejecting an otherwise additive history.
+                continue
+            if link is not None:
+                conn.execute(
+                    "INSERT INTO profile_entry_marker_evidence("
+                    "profile_entry_id,marker_id,phase1_generation_key,created_at) "
+                    "VALUES (?,?,?,?)",
+                    (
+                        local_profile, local_marker,
+                        link["phase1_generation_key"], link["created_at"],
+                    ),
+                )
+                profile_link_inserted += 1
+            conn.execute(
+                "INSERT INTO profile_marker_decisions("
+                "marker_id,phase1_generation_key,profile_policy_key,decision,"
+                "profile_entry_id,decided_at) VALUES (?,?,?,?,?,?)",
+                (
+                    local_marker, decision["phase1_generation_key"],
+                    decision["profile_policy_key"], desired_decision,
+                    local_profile, decision["decided_at"],
+                ),
+            )
+            profile_decision_inserted += 1
+        inserted["profile_entry_marker_evidence"] = profile_link_inserted
+        inserted["profile_marker_decision"] = profile_decision_inserted
+
+        rule_links_by_marker = {
+            int(record["marker_id"]): record
+            for record in grouped.get("rule_marker_evidence", [])
+        }
+        rule_link_inserted = 0
+        rule_decision_inserted = 0
+        from hymem.rules import rule_routing_key
+
+        for decision in grouped.get("rule_marker_decision", []):
+            wire_marker = int(decision["marker_id"])
+            if wire_marker not in marker_ids:
+                continue
+            local_marker = marker_ids[wire_marker]
+            wire_rule = decision.get("rule_id")
+            rule_row = (
+                rule_by_wire[int(wire_rule)] if wire_rule is not None else None
+            )
+            local_rule = int(rule_row["id"]) if rule_row is not None else None
+            desired_decision = str(decision["decision"])
+            link = rule_links_by_marker.get(wire_marker)
+            if (
+                rule_row is not None and rule_row["source"] == "user"
+                and desired_decision == "routed"
+            ):
+                desired_decision = "no_rule"
+                local_rule = None
+                link = None
+            existing_decision = conn.execute(
+                "SELECT phase1_generation_key,routing_key,decision,rule_id "
+                "FROM rule_marker_decisions WHERE marker_id=?", (local_marker,),
+            ).fetchone()
+            desired = (
+                decision["phase1_generation_key"], decision["routing_key"],
+                desired_decision, local_rule,
+            )
+            if existing_decision is not None:
+                if tuple(existing_decision) == desired:
+                    continue
+                configured_routing_key = (
+                    rule_routing_key(
+                        config, str(decision["phase1_generation_key"])
+                    )
+                    if config is not None else None
+                )
+                existing_is_current = bool(
+                    configured_routing_key is not None
+                    and existing_decision["routing_key"]
+                    == configured_routing_key
+                )
+                incoming_is_current = bool(
+                    configured_routing_key is not None
+                    and decision["routing_key"] == configured_routing_key
+                )
+                if existing_is_current:
+                    if incoming_is_current:
+                        raise ValueError(
+                            "portable current rule marker decision collides "
+                            "with target"
+                        )
+                    continue
+                if not incoming_is_current:
+                    raise ValueError(
+                        "portable stale rule marker policies collide"
+                    )
+                conn.execute(
+                    "DELETE FROM rule_marker_decisions WHERE marker_id=?",
+                    (local_marker,),
+                )
+                conn.execute(
+                    "DELETE FROM rule_marker_evidence WHERE marker_id=?",
+                    (local_marker,),
+                )
+            if desired_decision == "routed" and (
+                link is None or local_rule is None
+            ):
+                # As with profile authority remapping, only an exact imported
+                # evidence association may materialize a routed decision.
+                continue
+            if link is not None and local_rule is not None:
+                conn.execute(
+                    "INSERT INTO rule_marker_evidence("
+                    "rule_id,marker_id,phase1_generation_key,created_at) "
+                    "VALUES (?,?,?,?)",
+                    (
+                        local_rule, local_marker,
+                        link["phase1_generation_key"], link["created_at"],
+                    ),
+                )
+                rule_link_inserted += 1
+            conn.execute(
+                "INSERT INTO rule_marker_decisions("
+                "marker_id,phase1_generation_key,routing_key,decision,rule_id,"
+                "decided_at) VALUES (?,?,?,?,?,?)",
+                (
+                    local_marker, decision["phase1_generation_key"],
+                    decision["routing_key"], desired_decision, local_rule,
+                    decision["decided_at"],
+                ),
+            )
+            rule_decision_inserted += 1
+        inserted["rule_marker_evidence"] = rule_link_inserted
+        inserted["rule_marker_decision"] = rule_decision_inserted
+
+    from hymem.dreaming.phase1_auxiliary import (
+        validate_phase1_auxiliary_registry,
+    )
+
+    validate_phase1_auxiliary_registry(conn)
+
+
 def _materialize_v6_graph_state(
     conn, grouped: dict[str, list[dict]], inserted: dict[str, int]
 ) -> None:
@@ -5778,6 +7547,22 @@ def export_jsonl(conn, path: str | Path) -> dict[str, int]:
         conn.execute("BEGIN")
         snapshot_started = True
         grouped = _preflight_v7_export(conn)
+        # v15 emits the same canonical source-coordinate spelling that a
+        # privacy-preserving import stores.  The transform is deliberately
+        # text-neutral here: it normalizes clocks/derived proof hashes and
+        # canonical JSON only, without redacting the caller's backup.  This
+        # makes export -> import -> re-export byte stable while preserving the
+        # exact typed evidence behind every portable manifest.
+        _redact_portable_records(grouped, redact_values=False)
+        _validate_v7_records(grouped)
+        _validate_v13_phase1_records(grouped)
+        _validate_v14_auxiliary_records(grouped)
+        _validate_v9_records(grouped)
+        _validate_v10_fact_records(grouped)
+        _validate_v11_terminal_loss_records(grouped)
+        _validate_v12_coverage_integrity_records(grouped)
+        for records in grouped.values():
+            records.sort(key=_portable_record_sort_key)
         meta = {
             "type": "_meta",
             "format": "hymem-jsonl",
@@ -5940,7 +7725,11 @@ def import_jsonl(
                     if not _wire_int(obj.get("schema_version"), minimum=1):
                         raise ValueError("portable header has invalid schema version")
             elif kind in (
-                _V10_TABLE_BY_KIND if (meta_version or 0) >= 10
+                _V14_TABLE_BY_KIND if (meta_version or 0) >= 14
+                else _V13_TABLE_BY_KIND if (meta_version or 0) >= 13
+                else _V12_TABLE_BY_KIND if (meta_version or 0) >= 12
+                else _V11_TABLE_BY_KIND if (meta_version or 0) >= 11
+                else _V10_TABLE_BY_KIND if (meta_version or 0) >= 10
                 else _V9_TABLE_BY_KIND if (meta_version or 0) >= 9
                 else _V8_TABLE_BY_KIND if (meta_version or 0) >= 8
                 else _V7_TABLE_BY_KIND if (meta_version or 0) >= 7
@@ -5961,14 +7750,22 @@ def import_jsonl(
         raise ValueError("portable export is missing its header")
     if meta_version >= 6:
         version_tables = (
-            _V10_TABLE_BY_KIND if meta_version >= 10
+            _V14_TABLE_BY_KIND if meta_version >= 14
+            else _V13_TABLE_BY_KIND if meta_version >= 13
+            else _V12_TABLE_BY_KIND if meta_version >= 12
+            else _V11_TABLE_BY_KIND if meta_version >= 11
+            else _V10_TABLE_BY_KIND if meta_version >= 10
             else _V9_TABLE_BY_KIND if meta_version >= 9
             else _V8_TABLE_BY_KIND if meta_version >= 8
             else _V7_TABLE_BY_KIND if meta_version >= 7
             else _V6_TABLE_BY_KIND
         )
         version_columns = (
-            _V10_COLS_BY_KIND if meta_version >= 10
+            _V14_COLS_BY_KIND if meta_version >= 14
+            else _V13_COLS_BY_KIND if meta_version >= 13
+            else _V12_COLS_BY_KIND if meta_version >= 12
+            else _V11_COLS_BY_KIND if meta_version >= 11
+            else _V10_COLS_BY_KIND if meta_version >= 10
             else _V9_COLS_BY_KIND if meta_version >= 9
             else _V8_COLS_BY_KIND if meta_version >= 8
             else _V7_COLS_BY_KIND if meta_version >= 7
@@ -6003,6 +7800,10 @@ def import_jsonl(
             _upgrade_pre_v9_episode_fields(grouped)
         if meta_version < 10:
             _upgrade_pre_v10_fact_fields(grouped)
+        if meta_version < 13:
+            _upgrade_pre_v13_phase1_fields(grouped)
+        if meta_version < 14:
+            _upgrade_pre_v14_auxiliary_fields(grouped)
         if meta_version >= 7:
             interpretation_by_wire_id: dict[int, str] = {}
             for record in grouped.get("edge_evidence", []):
@@ -6033,10 +7834,18 @@ def import_jsonl(
                 )
         if meta_version >= 7:
             _validate_v7_records(grouped)
+        if meta_version >= 13:
+            _validate_v13_phase1_records(grouped)
+        if meta_version >= 14:
+            _validate_v14_auxiliary_records(grouped)
         if meta_version >= 9:
             _validate_v9_records(grouped)
         if meta_version >= 10:
             _validate_v10_fact_records(grouped)
+        if meta_version >= 11:
+            _validate_v11_terminal_loss_records(grouped)
+        if meta_version >= 12:
+            _validate_v12_coverage_integrity_records(grouped)
         for record in grouped.get("session", []):
             if not digest_retry_state_is_valid(
                 record.get("digest_retry_count"),
@@ -6061,10 +7870,18 @@ def import_jsonl(
         _redact_portable_records(grouped)
         if meta_version >= 7:
             _validate_v7_records(grouped)
+        if meta_version >= 13:
+            _validate_v13_phase1_records(grouped)
+        if meta_version >= 14:
+            _validate_v14_auxiliary_records(grouped)
         if meta_version >= 9:
             _validate_v9_records(grouped)
         if meta_version >= 10:
             _validate_v10_fact_records(grouped)
+        if meta_version >= 11:
+            _validate_v11_terminal_loss_records(grouped)
+        if meta_version >= 12:
+            _validate_v12_coverage_integrity_records(grouped)
     if meta_version >= 7:
         _preflight_v7_target_aliases(conn, grouped)
     fact_session_relations: dict[str, int] = {}
@@ -6092,6 +7909,12 @@ def import_jsonl(
         if record.get("summary") and not record.get("summary_source"):
             record["summary_source"] = "legacy"
     with core_db.transaction(conn):
+        aggregation_authority_before = _aggregation_material_authority_hash(conn)
+        if meta_version >= 7:
+            # Repeat under BEGIN IMMEDIATE.  The earlier check is a cheap
+            # fail-fast optimization only; authority must be decided after a
+            # concurrent alias writer has been excluded.
+            _preflight_v7_target_aliases(conn, grouped)
         if meta_version >= 10:
             # Derive the fact-history relation only after BEGIN IMMEDIATE has
             # excluded a concurrent target advance. For a fresh session this
@@ -6133,7 +7956,8 @@ def import_jsonl(
                             [(edge_id,) for edge_id in derived_ids],
                         )
             _preflight_v6_target_collisions(
-                conn, grouped, merge_v7_edges=meta_version >= 7
+                conn, grouped, merge_v7_edges=meta_version >= 7,
+                merge_v14_authority=meta_version >= 14,
             )
         for kind in _IMPORT_ORDER:
             table = _TABLE_BY_KIND[kind]
@@ -6393,6 +8217,72 @@ def import_jsonl(
                 ]
                 if not cols:
                     continue
+                if meta_version >= 14 and kind in {"profile_entry", "rule"}:
+                    existing_authority = conn.execute(
+                        f"SELECT {', '.join(_COLS_BY_KIND[kind])} "
+                        f"FROM {table} WHERE text=?",
+                        (record["text"],),
+                    ).fetchone()
+                    if existing_authority is not None:
+                        compare = [
+                            column for column in _COLS_BY_KIND[kind]
+                            if column != "id"
+                        ]
+                        if all(
+                            existing_authority[column] == record[column]
+                            for column in compare
+                        ):
+                            continue
+                        source_rank = {
+                            "legacy_unattributed": 0,
+                            "agent_inferred": 1,
+                            "user": 2,
+                        }
+                        target_rank = source_rank[str(existing_authority["source"])]
+                        incoming_rank = source_rank[str(record["source"])]
+                        if target_rank == incoming_rank:
+                            if _merge_same_source_profile_or_rule(
+                                conn, kind, existing_authority, record
+                            ):
+                                continue
+                            raise ValueError(
+                                f"portable {kind} collides with different target state"
+                            )
+                        if target_rank > incoming_rank:
+                            # A derived/legacy import can neither overwrite nor
+                            # reinforce explicit local user authority.
+                            continue
+                        local_id = int(existing_authority["id"])
+                        with core_db.evidence_mutation(conn):
+                            if kind == "profile_entry":
+                                conn.execute(
+                                    "DELETE FROM profile_marker_decisions "
+                                    "WHERE profile_entry_id=?", (local_id,),
+                                )
+                                conn.execute(
+                                    "DELETE FROM profile_entry_marker_evidence "
+                                    "WHERE profile_entry_id=?", (local_id,),
+                                )
+                            else:
+                                conn.execute(
+                                    "DELETE FROM rule_marker_decisions "
+                                    "WHERE rule_id=?", (local_id,),
+                                )
+                                conn.execute(
+                                    "DELETE FROM rule_marker_evidence "
+                                    "WHERE rule_id=?", (local_id,),
+                                )
+                            assignments = [
+                                column for column in compare if column != "text"
+                            ]
+                            conn.execute(
+                                f"UPDATE {table} SET "
+                                + ",".join(f"{column}=?" for column in assignments)
+                                + " WHERE id=?",
+                                [record[column] for column in assignments]
+                                + [local_id],
+                            )
+                        continue
                 if meta_version >= 7 and kind == "edge":
                     existing_edge = conn.execute(
                         "SELECT * FROM knowledge_graph WHERE subject_canonical=? "
@@ -6599,16 +8489,24 @@ def import_jsonl(
                     raise ValueError(
                         "portable episode source manifest failed runtime validation"
                     )
-        if inserted.get("episode", 0) or inserted.get(
-            "episode_source_occurrence", 0
-        ):
-            # Aggregation summaries/embeddings are reproducible caches over the
-            # exact episode bytes and manifests. Never retain a tree built from
-            # the pre-import episode set, even inside a long-lived process.
-            conn.execute("DELETE FROM aggregation_nodes")
-            conn.execute("DELETE FROM aggregation_leaf_state")
+        aggregation_material_changed = bool(
+            inserted.get("episode", 0)
+            or inserted.get("episode_source_occurrence", 0)
+            or inserted.get("user_profile_fact", 0)
+        )
+        if meta_version < 15 and any(inserted.values()):
+            # Pre-v15 wires predate the local typed-aggregation publication
+            # boundary.  Even when their newly inserted rows are not presently
+            # selected as an episode/anchor, conservatively withdraw the local
+            # publication: an old donor cannot attest that its merge is
+            # irrelevant to every v55 material input policy.
+            aggregation_material_changed = True
         if meta_version >= 7:
             _import_v7_claim_state(conn, grouped, inserted)
+            if meta_version >= 14:
+                _import_v14_auxiliary_state(
+                    conn, grouped, inserted, config=config,
+                )
             from hymem.dreaming.inference import infer_transitive_edges
 
             policy_key = (
@@ -6626,6 +8524,9 @@ def import_jsonl(
                     "claim_observation", "edge_lifecycle",
                     "lifecycle_dependency", "_claim_extraction_outcome_changed",
                 )
+            )
+            aggregation_material_changed = bool(
+                aggregation_material_changed or direct_changed
             )
             if config is not None and (
                 direct_changed
@@ -6662,6 +8563,66 @@ def import_jsonl(
                 )
         elif meta_version == 6:
             _materialize_v6_graph_state(conn, grouped, inserted)
+            aggregation_material_changed = bool(
+                aggregation_material_changed or inserted.get("edge", 0)
+            )
+        aggregation_material_changed = bool(
+            aggregation_material_changed
+            or aggregation_authority_before
+            != _aggregation_material_authority_hash(conn)
+        )
+        if aggregation_material_changed:
+            # Nodes and their success acknowledgement are local reproducible
+            # cache state over episodes plus root anchor claims. Preserve the
+            # bounded historical failure counters, but force the destination
+            # to earn a fresh local clean build after material import changes.
+            from hymem.dreaming.aggregation_health import (
+                invalidate_aggregation_success,
+            )
+
+            # Physical nodes/leaf state are content-addressed fusion caches.
+            # v57 source invalidators have already withdrawn public authority;
+            # retaining proven historical rows lets a rebuild reuse unchanged
+            # typed prompts while re-attesting them to the new material epoch.
+            invalidate_aggregation_success(conn)
+        if meta_version < 11:
+            # Older wires had no way to distinguish an empty successful
+            # extraction from permanently missing claim input.  First retry
+            # the exact historical builder against any imported/local
+            # coverage, then durably terminalize only imported chunks that
+            # remain unmanifested.  This happens after v7 claim manifests are
+            # published and never invents membership from prose or ranges.
+            from hymem.dreaming.chunks import recover_legacy_chunk_source_manifests
+
+            imported_sessions = sorted({
+                str(record["session_id"])
+                for record in grouped.get("chunk", [])
+                if (
+                    record.get("chunk_kind") == "extraction"
+                    and record.get("salience_reason") != "short_session_fallback"
+                )
+            })
+            for imported_session_id in imported_sessions:
+                recover_legacy_chunk_source_manifests(conn, imported_session_id)
+            terminalized = 0
+            for record in grouped.get("chunk", []):
+                if (
+                    record.get("chunk_kind") != "extraction"
+                    or record.get("salience_reason") == "short_session_fallback"
+                ):
+                    continue
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO chunk_extraction_terminal_losses("
+                    "chunk_id,reason) SELECT id,'source_manifest_unrecoverable' "
+                    "FROM chunks WHERE id=? AND chunk_kind='extraction' "
+                    "AND source_manifest_version IS NULL "
+                    "AND source_manifest_count IS NULL",
+                    (record["id"],),
+                )
+                terminalized += max(0, int(cursor.rowcount or 0))
+            inserted["chunk_extraction_terminal_loss"] = (
+                inserted.get("chunk_extraction_terminal_loss", 0) + terminalized
+            )
         # Raw messages are intentionally not part of the portable-memory
         # format, but coverage artifacts retain their historical integer ids.
         # Reserve those ids so appending to an imported session cannot reuse an

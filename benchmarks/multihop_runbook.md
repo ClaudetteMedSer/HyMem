@@ -56,6 +56,97 @@ non-regression) and, on pass, flips it on.
 
 ---
 
+## Mandatory Phase-1 extraction canary
+
+LME, BEAM, LoCoMo, and MSC now run one deterministic extraction preflight per
+pending run configuration, before any scored conversation/question store is
+opened. The probe uses a dedicated `OpenAICompatibleClient` with the exact
+memory-pipeline endpoint, model, and thinking policy, then calls the production
+`extract_chunk()` path with valid `claim-source-v2` records. Canary policy v17
+(`hymem-phase1-extraction-canary-v17`) is pinned to extraction prompt v20 and
+binds the terminal clean-empty recovery policy as well as the block-aware,
+canonical-Markdown-table-safe source-split v9 policy. V9 keeps exact content
+and offsets while allowing a heading- or colon-introduced canonical table to
+split with separately labelled same-source prelude plus header context. It also
+gives a right-hand prose continuation an exact, bounded preceding same-source
+window so a claim crossing a sentence or paragraph cut remains visible. That
+window is context-only, applies to a bounded fragment prefix, adds no calls,
+and cannot independently own an extracted item. The policy, effective HyMem
+config, report, checkpoint, and registry all carry the same SHA-256 contract
+identity, mechanically derived from the actual prompt bytes and executable
+validation/recovery behavior; a hand-edited version label cannot bless drift.
+
+The deterministic fixture
+(`hymem-phase1-context-paths-four-leaf-v7`) has two source records over 5,000
+characters each, so production prepartition must create exactly four initial
+fragments. The
+first record is an ATX-heading-introduced canonical table. Its only supported
+row is in the later continuation, where authoritative content contains neither
+the heading nor header; the actual provider request must carry the exact,
+separately labelled prelude and canonical header context. The second record
+separates a preference subject/predicate clause from its PostgreSQL object
+clause at a proven paragraph boundary; only the later fragment's exact bounded
+`source_boundary_context` completes it. Request/response-path evidence records
+both non-self-contained continuations, their exact contexts, proves each exact
+claim was emitted on its context-bearing continuation and never another leaf,
+records both source IDs, and reconciles primary/empty/omission request counts
+with total completions.
+
+The prose record also contains clearly labelled non-factual list and fenced-code
+controls. Both blocks contain concrete schema-like decoy tokens, but split the
+relation labels so they neither state a relationship nor trigger cue recovery.
+A pass requires each complete block to reach the provider intact at least twice,
+zero request-fragment boundaries inside either span, and no decoy output. The
+policy-bound `hymem-phase1-markdown-atom-split-probe-v1` additionally invokes
+the real source splitter on each exact control without a provider; both must
+remain atomic. These checks exercise block protection without adding provider
+spend. The probe otherwise uses the same Phase-1 prompt, source-ID contract,
+JSON/item validators, non-empty omission verification, and retry behavior as
+dream indexing.
+
+The two expected claims are fixed and manifested: the table-continuation claim
+`(HyMem Canary Relay:service, deploys_to, Fly.io:platform, +1)` at source
+message ID `9271604311`, and the boundary-spanning prose claim
+`(Avery Boundary Canary:person, prefers, PostgreSQL:database, +1)` at source
+message ID `9271604312`. Empty service/platform cells and inert hashes supply
+density without creating additional relationships. The report carries the
+fixture hash, initial-leaf count, exact execution path, and two canonical
+matched-claim evidence records, not only a success label. A pass means exactly
+those two final triples, zero markers, and zero coalesced duplicates; any
+additional schema-valid output fails closed. The run aborts before ingest if
+either bounded pass fails, validation fails, or either exact supported
+claim/type is absent or misattributed after empty/omission verification. The
+canary never constructs a HyMem database and its client is closed after the
+probe, so it cannot contaminate a benchmark store.
+
+The normal four-leaf path costs eight logical completions: four primary calls,
+two empty verifications, and two omission verifications. Recovery is limited to
+24 logical calls and 72 provider attempts under the shipped three-attempt
+transport policy; the production per-chunk limit remains 96 logical calls.
+
+Canary attempts/tokens are recorded separately under `extraction_canary` with
+`usage_accounting=excluded_from_scored_usage_dedicated_memory_pipeline_client`;
+they are not added to reader, judge, or memory-pipeline scored usage. LME and
+BEAM persist this in their execution segment. MSC/LoCoMo include it in recall
+rows; MSC recurrence also writes `<out>.extraction-canary.json`. Offline
+`--sim` and the existing `--no-dream` development path print and record
+`skipped_non_comparable`; neither is evidence that extraction works. A terminal
+checkpoint/resume with no pending indexing work records the distinct comparable
+`not_run_no_pending` zero-call state and does not spend another canary. Shared
+validation rejects unknown/missing fields, non-finite or inconsistent usage,
+partial/duplicate claim evidence, and a canary model, endpoint, thinking mode,
+or effective request body that differs from the memory pipeline. BEAM and LME
+repeat this validation when strict artifacts enter their registries; MSC and
+LoCoMo validate before work and bind the report to emitted rows/provenance.
+
+Do not start an expensive run if this line is absent or not `PASS`:
+
+```text
+Extraction canary: PASS (N provider attempt(s); excluded from scored memory-pipeline usage)
+```
+
+---
+
 ## Phase A — Build the labeled probe set
 
 The probe measures **bridging-edge recall@8**: does the edge that 1-hop
@@ -108,8 +199,9 @@ measures recall with the feature blind to the label.)
   # if it's tiny, the dream LLM isn't extracting (check thinking-disable).
   python benchmarks/multihop_probe.py --probe SLICE.json --verbose   # NO --store
   ```
-  Cost: one dream per question (~40 dreams for a 40-question slice). Requires the
-  box's extraction LLM (deepseek-v4-flash, thinking disabled).
+  Cost: one independently converged store per question (at least ~40 dream
+  cycles for a 40-question slice; more when a bounded tier leaves durable work).
+  Requires the box's extraction LLM (deepseek-v4-flash, thinking disabled).
 - **`--store` (mine an existing dreamed store, LLM-free, seconds):** faster, but
   you must supply a store already dreamed to completion (step 1 below).
 
@@ -120,18 +212,46 @@ measures recall with the feature blind to the label.)
    dream it (reuse the adapter's ingest path), **or** point at a persistent
    Hermes store.
    > **CRITICAL — dream to completion.** `dream()` processes at most
-   > `cfg.dream_budget` (=50) chunks per call, then stops with
-   > `report.budget_exhausted = True`. A 100k-message combined store is thousands
+   > `cfg.dream_budget` (=50) Phase-1 chunks per call. Recursive extraction is
+   > additionally bounded by `cfg.dream_extraction_provider_attempt_budget`
+   > (=200 actual provider requests; 0 disables this ceiling). Reaching either
+   > bound with work pending reports `report.budget_exhausted = True`; the
+   > independently capped short-turn baseline does the same when its positive
+   > allowance is spent with actionable work left (0 intentionally disables
+   > that tier). The call
+   > bound is separately visible as
+   > `report.extraction_provider_attempt_budget_exhausted`. It never interrupts
+   > a chunk, so the shipped client's sole three-attempt layer (SDK retries
+   > disabled) can overshoot by at most one chunk's 288-HTTP-request hard
+   > envelope. Digest/profile/fact calls do not count
+   > against it and their later-session tails still advance. A 100k-message
+   > combined store is thousands
    > of chunks, so a single `dream()` call consolidates ~1% of it (~20 episodes,
    > ~37 edges) — which produces a **false 0% G-A1** (nothing to bridge). Loop
-   > until drained, or raise the budget:
+   > until the **durable** backlog is drained. A non-exhausted individual report
+   > is not proof of completion: a failed attempt can remain pending. Use the
+   > shared bounded convergence helper, which also rejects lock stalls,
+   > timeouts, quarantine, terminal source loss, and lossless coverage whose
+   > integrity could not be established. This state is non-pending and fails
+   > immediately: resolve a transient cause or repair/rebuild persistent
+   > artifact damage, then start a new bounded convergence call. One complete
+   > successful source walk clears its durable health row.
    > ```python
-   > while True:
-   >     report = dream_hy.dream()
-   >     if not report.budget_exhausted:
-   >         break
-   > # or one-shot: HyMemConfig(..., dream_budget=100000)
+   > from benchmarks.strictness import converge_indexing
+   >
+   > indexing = converge_indexing(
+   >     dream_hy.dream,
+   >     status=dream_hy.dream_status,
+   >     max_cycles=1000,
+   >     timeout_s=3600,
+   >     require_healthy=True,
+   > )
    > ```
+   > Current strict evidence requires the coherent
+   > `hymem-dream-status-v5` + `hymem-benchmark-indexing-status-v3`
+   > snapshot; LME serializes it through `hymem-lme-indexing-summary-v4`.
+   > Prefer repeated bounded cycles over a huge one-shot chunk budget, which no
+   > longer predicts provider cost by itself.
    > You only need ~60–100 probe items, so a **bounded ~30–40-question subset**
    > dreamed to completion is enough and far cheaper than all 248.
    Confirm the store is actually dreamed (hundreds+ of edges, many subjects — not
@@ -282,6 +402,7 @@ jq '.metadata' ~/.hermes/benchmarks/<canonical-baseline>.json   # read; mirror t
 COMMON="--sample 0 --seed 0 --workers 8 \
   --answer-model deepseek-v4-flash --answer-extra-body {\"thinking\":{\"type\":\"disabled\"}} \
   --judge-model  deepseek-v4-flash --judge-extra-body  {\"thinking\":{\"type\":\"disabled\"}} \
+  --hymem-model deepseek-v4-flash --hymem-thinking disabled \
   <every other flag copied verbatim from the baseline metadata: embeddings / \
    permissive-default / rerank / value-supersession / etc.>"
 

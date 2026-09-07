@@ -76,15 +76,9 @@ def _seed_edge(hy, subj, pred, obj, *, subj_type=None, obj_type=None):
         (subj, pred, obj),
     )
     if subj_type:
-        hy.conn.execute(
-            "INSERT OR IGNORE INTO entity_types(entity_canonical, type) VALUES (?, ?)",
-            (subj, subj_type),
-        )
+        hy.set_entity_type(subj, subj_type)
     if obj_type:
-        hy.conn.execute(
-            "INSERT OR IGNORE INTO entity_types(entity_canonical, type) VALUES (?, ?)",
-            (obj, obj_type),
-        )
+        hy.set_entity_type(obj, obj_type)
 
 
 def test_augment_mr_sets_exact_graph_count_anchored(hy):

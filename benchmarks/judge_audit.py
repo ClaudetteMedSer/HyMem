@@ -1297,6 +1297,18 @@ def main(argv=None, client=None) -> int:
               f"(threshold {C4_MATERIAL}pp)\n    {res['verdict']}\n")
         return 0
 
+    # All branches above are pure readers of historical artifacts.  Guard only
+    # the paid constructor path, but do so before loading the run being judged.
+    if args.spend and client is None:
+        from hymem.contrib.model_policy import (
+            DeprecatedModelAliasError,
+            require_active_model,
+        )
+        try:
+            require_active_model(args.judge_model, role="judge-audit judge")
+        except DeprecatedModelAliasError as exc:
+            ap.error(str(exc))
+
     if not args.run:
         ap.error("one of --run, --pair or --report is required")
 

@@ -28,6 +28,7 @@ from hymem.core import db as core_db
 from hymem.dreaming import aggregate as agg_mod
 from hymem.dreaming.aggregate import _leaf_fingerprint, build_aggregation_nodes
 from hymem.extraction.llm import StubLLMClient
+from tests.test_aggregate import _seed_episode as _seed_exact_episode
 
 _NODE_JSON = json.dumps({"title": "Postgres", "summary": "Postgres everywhere."})
 _ROLLUP_JSON = json.dumps({"title": "Mixed", "summary": "Several threads."})
@@ -51,12 +52,8 @@ def _digest_cfg(cfg):
 
 
 def _seed_episode(conn, eid, sid, entities):
-    conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES (?)", (sid,))
-    conn.execute(
-        """INSERT INTO episodes(id, session_id, title, summary, participants,
-                                start_message_id, end_message_id, outcome, key_entities)
-           VALUES (?, ?, ?, ?, '[]', 1, 2, NULL, ?)""",
-        (eid, sid, f"Topic {eid}", f"Notes about {eid}.", json.dumps(entities)),
+    _seed_exact_episode(
+        conn, eid, sid, f"Topic {eid}", f"Notes about {eid}.", entities,
     )
 
 

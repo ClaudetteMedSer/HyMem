@@ -1,5 +1,10 @@
 # Pre-registration: does the ALIAS judge churn? — B2 v0.2 — 2026-09-01
 
+> **Archived protocol.** This superseded draft intentionally studied the
+> now-retired mutable `deepseek-chat` alias. Its model flags and commands are
+> historical evidence, not current instructions. Live runs pin
+> `deepseek-v4-flash` with thinking disabled.
+
 Status: **DRAFT — awaiting Atta's approval for the spend.** Branch:
 Beam-optimisation. One run, ~160 judge calls, ~4 minutes.
 

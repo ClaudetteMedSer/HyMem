@@ -136,6 +136,11 @@ from longmemeval_adapter import (  # noqa: E402
 # point of the density number is that it holds under the tokenizer the fact tier
 # will actually use (diacritic folding + the ASCII-safe token whitelist).
 from hymem.query.augment import _FTS_SAFE, _fold_diacritics  # noqa: E402
+from hymem.contrib.model_policy import (  # noqa: E402
+    DeprecatedModelAliasError,
+    require_active_model,
+)
+from benchmarks.strictness import bounded_exception_type, content_hash  # noqa: E402
 
 # ── Draft extraction prompt ─────────────────────────────────────────────────
 # Deliberately lives HERE and not in `hymem/extraction/prompts/__init__.py`: a
@@ -650,7 +655,7 @@ def run_question(
             gold_turns, [r["text"] for r in retrieved]
         )
     except Exception as e:  # a probe row must never abort the run
-        out["error"] = str(e)
+        out["error"] = f"execution_failure:{bounded_exception_type(e)}"
     finally:
         conn.close()
     return out
@@ -1078,6 +1083,12 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true", help="per-question table")
     args = ap.parse_args()
 
+    if not args.sim and not args.cost and not args.rescore:
+        try:
+            require_active_model(args.model, role="fact-probe extractor")
+        except DeprecatedModelAliasError as exc:
+            ap.error(str(exc))
+
     run = json.loads(args.source.read_text())
     try:
         miss_ids, ctrl_ids, diag = select_probe_sets(
@@ -1162,9 +1173,15 @@ def main() -> None:
             sample = build_faithfulness_sample(
                 rescored, by_id, size=args.faithfulness_sample, seed=args.seed)
             args.out.write_text(json.dumps(
-                {**prior, "summary": s, "per_question": rescored,
-                 "faithfulness_sample": sample,
-                 "rescored_from": str(args.rescore)}, indent=2))
+                {
+                    **prior,
+                    "summary": s,
+                    "per_question": rescored,
+                    "faithfulness_sample": sample,
+                    "rescored_from": {
+                        "artifact_sha256": content_hash(prior),
+                    },
+                }, indent=2))
             _print_sample_note(args.out, sample)
         sys.exit(0 if passed else 1)
 

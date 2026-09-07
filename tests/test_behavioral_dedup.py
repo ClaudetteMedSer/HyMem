@@ -10,25 +10,33 @@ from __future__ import annotations
 
 import json
 
-from hymem import HyMem, HyMemConfig
+from hymem import HyMem, HyMemConfig, StubEmbeddingClient
+from hymem.core import db as core_db
+from hymem.dreaming.aggregation_material import embedding_storage_identity
+
+
+def _embedding_client():
+    return StubEmbeddingClient(model_name="behavioral-fixture-v1", dim_value=4)
 
 
 def _edge(conn, subj, pred, obj, vec, *, pos=1, neg=0):
+    model, dim = embedding_storage_identity(_embedding_client())
     cur = conn.execute(
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
         "pos_evidence, neg_evidence, status, derived) VALUES (?, ?, ?, ?, ?, 'active', 0)",
         (subj, pred, obj, pos, neg),
     )
-    conn.execute(
-        "INSERT INTO edge_embeddings(edge_text, vector_json, model, dim) "
-        "VALUES (?, ?, 'fake', 4)",
-        (f"{subj} {pred} {obj}", json.dumps(vec)),
-    )
+    with core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT INTO edge_embeddings(edge_text, vector_json, model, dim) "
+            "VALUES (?, ?, ?, ?)",
+            (f"{subj} {pred} {obj}", json.dumps(vec), model, dim),
+        )
     return cur.lastrowid
 
 
 def test_semantically_close_behavioral_objects_merge(tmp_path):
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5)
     _edge(conn, "atta", "prefers", "concise_responses", [0.99, 0.01, 0.0, 0.0], pos=2)
@@ -50,7 +58,7 @@ def test_lexical_gate_is_dropped(tmp_path):
     # `concise` and `brevity` share no token and aren't substrings — normal
     # dedup's lexical gate would block them — but they're semantically close, so
     # the behavioral report merges them. This is the whole point of the sweep.
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=3)
     _edge(conn, "atta", "prefers", "brevity", [0.98, 0.02, 0.0, 0.0], pos=1)
@@ -62,7 +70,7 @@ def test_lexical_gate_is_dropped(tmp_path):
 
 
 def test_semantically_distinct_objects_do_not_merge(tmp_path):
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0])
     _edge(conn, "atta", "prefers", "verbose", [0.0, 1.0, 0.0, 0.0])  # orthogonal
@@ -74,7 +82,7 @@ def test_semantically_distinct_objects_do_not_merge(tmp_path):
 
 
 def test_different_subjects_are_separate(tmp_path):
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0])
     _edge(conn, "sara", "prefers", "concise", [1.0, 0.0, 0.0, 0.0])
@@ -85,7 +93,7 @@ def test_different_subjects_are_separate(tmp_path):
 
 
 def test_non_behavioral_predicates_excluded(tmp_path):
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     # `uses` is not behavioral — even with near-identical vectors it's ignored.
     _edge(conn, "app", "uses", "redis", [1.0, 0.0, 0.0, 0.0])
@@ -97,7 +105,7 @@ def test_non_behavioral_predicates_excluded(tmp_path):
 
 
 def test_report_is_read_only(tmp_path):
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0])
     _edge(conn, "atta", "prefers", "concise_mode", [0.99, 0.01, 0.0, 0.0])
@@ -112,7 +120,7 @@ def test_report_is_read_only(tmp_path):
 
 
 def test_threshold_controls_aggressiveness(tmp_path):
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0])
     # cosine ≈ 0.928 to the survivor — merges at 0.9, not at 0.97.
@@ -134,16 +142,20 @@ def test_apply_merges_evidence_and_retracts_members(tmp_path):
         apply_behavioral_merges,
     )
 
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     s_id = _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5, neg=1)
     m_id = _edge(conn, "atta", "prefers", "concise_mode", [0.99, 0.01, 0.0, 0.0], pos=2, neg=0)
 
-    proposals = find_behavioral_duplicates(conn, cosine_threshold=0.9)
+    proposals = find_behavioral_duplicates(
+        conn, cosine_threshold=0.9, embedding_client=_embedding_client(),
+    )
     assert len(proposals) == 1
 
     with core_db.transaction(conn):
-        result = apply_behavioral_merges(conn, proposals)
+        result = apply_behavioral_merges(
+            conn, proposals, embedding_client=_embedding_client(),
+        )
 
     assert result["clusters_merged"] == 1
     assert result["edges_retracted"] == 1
@@ -179,19 +191,25 @@ def test_apply_is_idempotent(tmp_path):
         apply_behavioral_merges,
     )
 
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5)
     _edge(conn, "atta", "prefers", "concise_mode", [0.99, 0.01, 0.0, 0.0], pos=2)
 
-    proposals = find_behavioral_duplicates(conn, cosine_threshold=0.9)
+    proposals = find_behavioral_duplicates(
+        conn, cosine_threshold=0.9, embedding_client=_embedding_client(),
+    )
 
     with core_db.transaction(conn):
-        r1 = apply_behavioral_merges(conn, proposals)
+        r1 = apply_behavioral_merges(
+            conn, proposals, embedding_client=_embedding_client(),
+        )
     assert r1["edges_retracted"] == 1
 
     with core_db.transaction(conn):
-        r2 = apply_behavioral_merges(conn, proposals)
+        r2 = apply_behavioral_merges(
+            conn, proposals, embedding_client=_embedding_client(),
+        )
     assert r2["edges_retracted"] == 0  # already retracted
     assert r2["clusters_merged"] == 0
 
@@ -212,15 +230,19 @@ def test_apply_registers_object_alias(tmp_path):
         apply_behavioral_merges,
     )
 
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5)
     _edge(conn, "atta", "prefers", "concise_mode", [0.99, 0.01, 0.0, 0.0], pos=2)
 
-    proposals = find_behavioral_duplicates(conn, cosine_threshold=0.9)
+    proposals = find_behavioral_duplicates(
+        conn, cosine_threshold=0.9, embedding_client=_embedding_client(),
+    )
 
     with core_db.transaction(conn):
-        apply_behavioral_merges(conn, proposals)
+        apply_behavioral_merges(
+            conn, proposals, embedding_client=_embedding_client(),
+        )
 
     alias = conn.execute(
         "SELECT canonical FROM entity_aliases WHERE alias = 'concise_mode'"
@@ -239,7 +261,7 @@ def test_apply_reassigns_kg_evidence(tmp_path):
         apply_behavioral_merges,
     )
 
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('s1')")
     cid = conn.execute(
@@ -260,10 +282,14 @@ def test_apply_reassigns_kg_evidence(tmp_path):
         )
     s_id = _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5)
 
-    proposals = find_behavioral_duplicates(conn, cosine_threshold=0.9)
+    proposals = find_behavioral_duplicates(
+        conn, cosine_threshold=0.9, embedding_client=_embedding_client(),
+    )
 
     with core_db.transaction(conn):
-        apply_behavioral_merges(conn, proposals)
+        apply_behavioral_merges(
+            conn, proposals, embedding_client=_embedding_client(),
+        )
 
     # Evidence should now be on survivor.
     evidence = conn.execute(
@@ -278,16 +304,18 @@ def test_apply_with_no_proposals_returns_zeros(tmp_path):
     from hymem.core import db as core_db
     from hymem.dreaming.behavioral_dedup import apply_behavioral_merges
 
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     with core_db.transaction(hy.conn):
-        result = apply_behavioral_merges(hy.conn, [])
+        result = apply_behavioral_merges(
+            hy.conn, [], embedding_client=_embedding_client(),
+        )
     assert result == {"clusters_merged": 0, "edges_retracted": 0, "survivors_updated": 0}
     hy.close()
 
 
 def test_apply_via_hy_api(tmp_path):
     """End-to-end through HyMem.apply_behavioral_merges()."""
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     _edge(conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5)
     _edge(conn, "atta", "prefers", "concise_mode", [0.99, 0.01, 0.0, 0.0], pos=2)
@@ -318,7 +346,7 @@ def test_apply_records_extraction_feedback(tmp_path):
         apply_behavioral_merges,
     )
 
-    hy = HyMem(HyMemConfig(root=tmp_path))
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
     conn = hy.conn
     # Setup a real chunk so feedback FK is satisfied.
     conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('s1')")
@@ -341,14 +369,118 @@ def test_apply_records_extraction_feedback(tmp_path):
             (m_id,),
         )
 
-    proposals = find_behavioral_duplicates(conn, cosine_threshold=0.9)
+    proposals = find_behavioral_duplicates(
+        conn, cosine_threshold=0.9, embedding_client=_embedding_client(),
+    )
 
     with core_db.transaction(conn):
-        apply_behavioral_merges(conn, proposals)
+        apply_behavioral_merges(
+            conn, proposals, embedding_client=_embedding_client(),
+        )
 
     fb_count = conn.execute(
         "SELECT COUNT(*) AS c FROM extraction_feedback WHERE feedback_type = 'retracted'"
     ).fetchone()["c"]
     assert fb_count >= 1
+
+    hy.close()
+
+
+def test_apply_feedback_preserves_each_live_member_source_and_skips_stale(tmp_path):
+    """Audit rows retain member provenance from the report/apply snapshot."""
+    from hymem.core import db as core_db
+    from hymem.dreaming.behavioral_dedup import (
+        apply_behavioral_merges,
+        find_behavioral_duplicates,
+    )
+
+    hy = HyMem(HyMemConfig(root=tmp_path), embedding_client=_embedding_client())
+    conn = hy.conn
+    conn.execute("INSERT INTO sessions(id) VALUES ('s1')")
+
+    sources = {
+        "concise_mode": ("c-mode", "I prefer concise mode"),
+        "brief_answers": ("c-brief", "Please give me brief answers"),
+        "terse": ("c-stale", "Keep everything terse"),
+    }
+    member_ids = {}
+    survivor_id = _edge(
+        conn, "atta", "prefers", "concise", [1.0, 0.0, 0.0, 0.0], pos=5
+    )
+    survivor_message_id = conn.execute(
+        "INSERT INTO messages(session_id, role, content, created_at) "
+        "VALUES ('s1', 'user', 'I prefer concise answers', "
+        "'2026-08-31T12:00:00Z')"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES ('c-survivor', 's1', ?, ?, 'test', "
+        "'I prefer concise answers')",
+        (survivor_message_id, survivor_message_id),
+    )
+    with core_db.evidence_mutation(conn):
+        conn.execute(
+            "INSERT INTO kg_evidence(edge_id, chunk_id, polarity, "
+            "evidence_weight, extracted_at) "
+            "VALUES (?, 'c-survivor', 1, 5, '2026-08-31T12:00:00Z')",
+            (survivor_id,),
+        )
+    for index, (obj, (chunk_id, text)) in enumerate(sources.items(), start=1):
+        message_id = conn.execute(
+            "INSERT INTO messages(session_id, role, content, created_at) "
+            "VALUES ('s1', 'user', ?, ?)",
+            (text, f"2026-09-0{index}T12:00:00Z"),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+            "salience_reason, text) VALUES (?, 's1', ?, ?, 'test', ?)",
+            (chunk_id, message_id, message_id, text),
+        )
+        member_id = _edge(
+            conn,
+            "atta",
+            "prefers",
+            obj,
+            [0.99, 0.01 * index, 0.0, 0.0],
+            pos=1,
+        )
+        member_ids[obj] = member_id
+        with core_db.evidence_mutation(conn):
+            conn.execute(
+                "INSERT INTO kg_evidence(edge_id, chunk_id, polarity, extracted_at) "
+                "VALUES (?, ?, 1, ?)",
+                (member_id, chunk_id, f"2026-09-0{index}T12:00:00Z"),
+            )
+
+    proposals = find_behavioral_duplicates(
+        conn, cosine_threshold=0.9, embedding_client=_embedding_client(),
+    )
+    assert len(proposals) == 1
+    assert {member.object for member in proposals[0].members} == set(sources)
+
+    # Simulate one proposal member becoming stale after the read-only report.
+    conn.execute(
+        "UPDATE knowledge_graph SET status = 'retracted' WHERE id = ?",
+        (member_ids["terse"],),
+    )
+    with core_db.transaction(conn):
+        result = apply_behavioral_merges(
+            conn, proposals, embedding_client=_embedding_client(),
+        )
+
+    assert result["edges_retracted"] == 2
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT extracted_object, chunk_id, chunk_text_snippet "
+            "FROM extraction_feedback ORDER BY extracted_object"
+        )
+    ] == [
+        ("brief_answers", "c-brief", "Please give me brief answers"),
+        ("concise_mode", "c-mode", "I prefer concise mode"),
+    ]
+    assert conn.execute(
+        "SELECT 1 FROM entity_aliases WHERE alias = 'terse'"
+    ).fetchone() is None
 
     hy.close()

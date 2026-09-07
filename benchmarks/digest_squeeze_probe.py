@@ -33,13 +33,11 @@ WHY THE HEADLINE IS A DIFF AND NOT A COUNT
 top-`cap` list, so what the defect costs is bounded by the cap, not by the
 graph. The probe therefore renders the block TWICE on one snapshot:
 
-  CURRENT  production `_anchor_facts(conn, cap)` itself. Not a copy: the
-           probe imports the function under test, so it cannot drift from it.
-  FIXED    what the separate-budget fix would render -- `load_profile` capped
-           at `profile_cap`, then `select_anchor_edges` capped independently
-           at `edge_cap` (`hymem/query/state_anchor.py`, whose predicate is
-           already parity-controlled against `_anchor_facts` by
-           `tests/test_state_anchor.py:320`).
+  CURRENT  production's exact typed `load_root_anchor_inputs(conn, cap)`
+           projection -- the same underlying loader `_anchor_facts` delegates.
+  FIXED    what the separate-budget fix would render -- exact typed profile
+           proofs capped at `profile_cap`, then exact typed knowledge-graph
+           proofs capped independently at `edge_cap`.
 
     edges_restored = edge lines in FIXED that are absent from CURRENT
 
@@ -101,12 +99,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from hymem.dreaming.aggregate import _anchor_facts  # noqa: E402
-from hymem.dreaming.user_profile import (  # noqa: E402
-    load_profile,
-    render_profile_fact,
+from hymem.dreaming.aggregation_provenance import (  # noqa: E402
+    load_knowledge_graph_anchor_inputs,
+    load_profile_anchor_inputs,
+    load_root_anchor_inputs,
 )
-from hymem.query.state_anchor import select_anchor_edges  # noqa: E402
 
 # Reuse the sibling benchmark's read-only opener rather than a third copy of
 # the URI dance (the locomo_adapter/msc_adapter sibling-import idiom).
@@ -132,12 +129,6 @@ _JSON_KEYS = (
     "reason",
 )
 
-_N_ELIGIBLE_EDGES = """
-    SELECT COUNT(*) FROM knowledge_graph
-    WHERE status = 'active' AND derived = 0 AND invalid_at IS NULL
-      AND pos_evidence > neg_evidence
-"""
-
 _N_ACTIVE_EDGES = """
     SELECT COUNT(*) FROM knowledge_graph
     WHERE status = 'active' AND derived = 0
@@ -155,25 +146,18 @@ def _data_version(conn: sqlite3.Connection) -> int:
 
 
 def _edge_lines(conn: sqlite3.Connection, cap: int) -> list[str]:
-    """The anchor block's EDGE half, rendered exactly as `_anchor_facts` does.
+    """The exact typed/source-backed knowledge-graph proof projection."""
 
-    Selection is delegated to `state_anchor.select_anchor_edges`, which is the
-    verbatim `_anchor_facts` predicate and carries its own parity control
-    (`tests/test_state_anchor.py:320`) -- so the probe adds no third copy of
-    that SQL.
-    """
     return [
-        f"{r['subject_canonical']} {r['predicate']} {r['object_canonical']}"
-        for r in select_anchor_edges(conn, cap=cap)
+        proof.rendered_text
+        for proof in load_knowledge_graph_anchor_inputs(conn, cap)
     ]
 
 
 def _profile_lines(conn: sqlite3.Connection, cap: int) -> list[str]:
-    """The anchor block's PROFILE half, rendered exactly as `_anchor_facts`
-    does. `cap <= 0` -> [] (the `0 disables` convention, held per budget)."""
-    if cap <= 0:
-        return []
-    return [render_profile_fact(e) for e in load_profile(conn, cap=cap)]
+    """The exact typed/source-backed profile proof projection."""
+
+    return [proof.rendered_text for proof in load_profile_anchor_inputs(conn, cap)]
 
 
 def fixed_facts(
@@ -202,13 +186,15 @@ def measure_squeeze(
     edge_cap = cap if edge_cap is None else edge_cap
     profile_cap = cap if profile_cap is None else profile_cap
 
-    n_profile_active = len(load_profile(conn))
-    n_profile_rendered = len(load_profile(conn, cap=cap)) if cap > 0 else 0
-    n_edges_active = int(conn.execute(_N_ELIGIBLE_EDGES).fetchone()[0])
+    unlimited = 2_147_483_647
+    n_profile_active = len(load_profile_anchor_inputs(conn, unlimited))
+    n_profile_rendered = len(load_profile_anchor_inputs(conn, cap))
+    n_edges_active = len(load_knowledge_graph_anchor_inputs(conn, unlimited))
     n_edges_active_total = int(conn.execute(_N_ACTIVE_EDGES).fetchone()[0])
 
-    # The CURRENT arm is the production function itself -- no copy to drift.
-    current = _anchor_facts(conn, cap)
+    # Both arms render only exact typed proofs. Invalid rows are filtered before
+    # either cap, so unattributed authority cannot consume a slot or headline.
+    current = [proof.rendered_text for proof in load_root_anchor_inputs(conn, cap)]
     fixed = fixed_facts(conn, edge_cap=edge_cap, profile_cap=profile_cap)
 
     # Profile rows lead the block in both arms (pinned by
@@ -280,8 +266,9 @@ def _verdict(report: dict) -> tuple[str, str]:
                 "no shared budget and no squeeze to size on this store")
     if report["n_edges_active"] == 0:
         return ("VACUOUS",
-                "no anchor-eligible graph edge exists (active, non-derived, "
-                "invalid_at IS NULL, pos>neg), so restoration has nothing to "
+                "no exact source-proven anchor-eligible graph edge exists "
+                "(including active, non-derived, current positive authority), "
+                "so restoration has nothing to "
                 "restore -- this store cannot answer the question, and its 0 "
                 "is NOT evidence that the squeeze is harmless")
     if report["n_profile_active"] == 0:

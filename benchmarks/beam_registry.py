@@ -29,12 +29,28 @@ import sys
 import math
 import re
 import json
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from hymem.contrib.endpoint_policy import (  # noqa: E402
+    TRANSPORT_SECURITY_LOCAL,
+    TRANSPORT_SECURITY_NONE,
+    validate_recorded_embedding_endpoint,
+    validate_http_endpoint,
+)
+
 try:  # package import (tests): benchmarks.run_registry
     from . import run_registry as rr
+    from .extraction_canary import (
+        validate_extraction_canary_config_binding,
+        validate_extraction_canary_report,
+    )
     from .strictness import content_hash
     from .run_registry import (
         DEFAULT_REGISTRY_DIR,
@@ -46,6 +62,10 @@ try:  # package import (tests): benchmarks.run_registry
     )
 except (ImportError, ValueError):  # direct CLI: python benchmarks/beam_registry.py
     import run_registry as rr
+    from extraction_canary import (  # type: ignore
+        validate_extraction_canary_config_binding,
+        validate_extraction_canary_report,
+    )
     from strictness import content_hash
     from run_registry import (
         DEFAULT_REGISTRY_DIR,
@@ -350,26 +370,18 @@ def _legacy_fraction_summary(
 
 def _manifested_embedding_execution_identity(identity: dict) -> tuple:
     """Translate public backend configuration to its metered client identity."""
+    from hymem.dreaming.aggregation_material import (
+        validate_public_embedding_identity,
+    )
 
-    backend = identity.get("backend")
-    model = identity.get("model")
-    dimension = identity.get("dimension")
-    if backend == "none":
-        return "none", None, None
-    if backend == "local-hash":
-        return "local_feature_hash", model, dimension
-    if backend == "openai-compatible":
-        try:
-            from hymem.contrib.openai_embedding_client import (
-                openai_compatible_embedding_identity,
-            )
-            observed_model = openai_compatible_embedding_identity(
-                identity.get("base_url"), model
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError("strict BEAM embedding manifest identity is malformed") from exc
-        return "openai_compatible", observed_model, dimension
-    raise ValueError("strict BEAM embedding backend is malformed")
+    try:
+        validated = validate_public_embedding_identity(identity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("strict BEAM embedding manifest identity is malformed") from exc
+    return (
+        validated["backend"], validated["vector_space_key"],
+        validated["dimension"],
+    )
 
 
 def _official_judge_identity_matches(config: dict, models: dict) -> bool:
@@ -445,18 +457,12 @@ def _parse_beam_judge_json(raw: str) -> tuple[dict | None, str]:
 
 
 def _validate_safe_endpoint(value, *, label: str) -> None:
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
-        raise ValueError(f"strict BEAM {label} endpoint is malformed")
-    parsed = urlsplit(value)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError(f"strict BEAM {label} endpoint is unsafe or ambiguous")
+    try:
+        validate_http_endpoint(value, label=f"strict BEAM {label}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"strict BEAM {label} endpoint is unsafe or ambiguous"
+        ) from exc
 
 
 def _validate_model_identity(value, *, label: str) -> None:
@@ -516,58 +522,16 @@ def _validate_prereg(value, *, required: bool) -> None:
 
 
 def _validate_embedding_config(identity: dict) -> None:
-    expected_fields = {
-        "configured", "backend", "model", "base_url", "dimension", "quality",
-        "network_free", "fallback_policy", "fallback_reason",
-    }
-    if not isinstance(identity, dict) or set(identity) != expected_fields:
-        raise ValueError("strict BEAM embedding configuration is malformed")
-    configured = identity.get("configured")
-    network_free = identity.get("network_free")
-    if not isinstance(configured, bool) or not isinstance(network_free, bool):
-        raise ValueError("strict BEAM embedding booleans are malformed")
-    backend = identity.get("backend")
-    if backend == "none":
-        expected = {
-            "configured": False, "backend": "none", "model": None,
-            "base_url": None, "dimension": None, "quality": "none",
-            "network_free": True, "fallback_policy": "none",
-            "fallback_reason": None,
-        }
-        if identity != expected:
-            raise ValueError("strict BEAM disabled embedding identity is inconsistent")
-        return
-    dimension = identity.get("dimension")
-    if (
-        configured is not True
-        or isinstance(dimension, bool)
-        or not isinstance(dimension, int)
-        or dimension <= 0
-        or not isinstance(identity.get("model"), str)
-        or not identity["model"].strip()
-        or identity["model"] != identity["model"].strip()
-        or identity.get("fallback_reason") is not None
-    ):
-        raise ValueError("strict BEAM enabled embedding identity is malformed")
-    if backend == "local-hash":
-        if (
-            identity.get("base_url") != "local://feature-hash"
-            or identity.get("quality") != "lexical-feature-hash"
-            or network_free is not True
-            or identity.get("fallback_policy") != "none"
-        ):
-            raise ValueError("strict BEAM local embedding identity is inconsistent")
-        return
-    if backend == "openai-compatible":
-        if (
-            identity.get("quality") != "semantic"
-            or network_free is not False
-            or identity.get("fallback_policy") != "fail-closed"
-        ):
-            raise ValueError("strict BEAM remote embedding identity is inconsistent")
-        _validate_safe_endpoint(identity.get("base_url"), label="embedding")
-        return
-    raise ValueError("strict BEAM embedding backend is unsupported")
+    from hymem.dreaming.aggregation_material import (
+        validate_public_embedding_identity,
+    )
+
+    try:
+        validate_public_embedding_identity(identity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "strict BEAM embedding configuration is malformed or obsolete"
+        ) from exc
 
 
 def _validate_effective_hymem_config(config: dict) -> dict:
@@ -646,6 +610,49 @@ def _validate_memory_pipeline_identity(value) -> None:
         raise ValueError(
             "strict BEAM memory pipeline effective extra_body is inconsistent"
         )
+
+
+def _validate_segment_extraction_canary(
+    segment: dict, *, pipeline: dict, prompt_version: str,
+) -> None:
+    """Require a passed probe for work and exact zero-work crash evidence."""
+
+    attempted = segment.get("attempted_attempts")
+    indexing_runs = segment.get("indexing_runs")
+    has_work = (
+        type(attempted) is int and attempted > 0
+    ) or (isinstance(indexing_runs, list) and bool(indexing_runs))
+    report = segment.get("extraction_canary")
+    if has_work:
+        mode = "required"
+    elif segment.get("status") == "complete":
+        mode = "no_pending_work"
+    elif isinstance(report, Mapping):
+        report_status = report.get("status")
+        if report_status == "pending":
+            mode = "pending"
+        elif report_status == "failed":
+            mode = "failed"
+        elif report_status == "passed":
+            mode = "required"
+        else:
+            raise ValueError(
+                "strict BEAM zero-work extraction canary state is invalid"
+            )
+    else:
+        raise ValueError("strict BEAM extraction canary report is absent")
+    try:
+        validate_extraction_canary_report(
+            report,
+            expected_mode=mode,
+            expected_client=(
+                pipeline if mode in {"required", "failed"} else None
+            ),
+            require_client_closed=mode in {"required", "failed"},
+            expected_prompt_version=prompt_version,
+        )
+    except Exception as exc:
+        raise ValueError("strict BEAM extraction canary evidence is invalid") from exc
 
 
 def _nonnegative_number(value, *, integer: bool = False):
@@ -754,10 +761,10 @@ def _validate_embedding_usage(
     )
     expected_quality = {
         "none": "none",
-        "local-hash": "lexical",
-        "openai-compatible": "semantic",
+        "local_feature_hash": "lexical",
+        "openai_compatible": "semantic",
     }[identity["backend"]]
-    expected_network_free = identity["backend"] != "openai-compatible"
+    expected_network_free = identity["backend"] != "openai_compatible"
     unavailable_running = bool(
         not require_identity
         and identity["configured"]
@@ -774,6 +781,8 @@ def _validate_embedding_usage(
         or usage.get("network_free") is not expected_network_free
         or usage.get("model") != expected_model
         or usage.get("dimension") != expected_dimension
+        or usage.get("identity_exact") is not identity["identity_exact"]
+        or usage.get("reuse_scope") != identity["reuse_scope"]
         or isinstance(usage.get("dimension"), bool)
     ):
         raise ValueError("strict BEAM embedding execution identity drifted")
@@ -1175,8 +1184,16 @@ def _validate_strict_envelope(data: dict) -> tuple[list[dict], dict, dict]:
         raise ValueError("strict BEAM official judge disclosure is inconsistent")
     _validate_model_identity(models.get("reader"), label="reader")
     _validate_model_identity(judge_identity, label="judge")
-    _validate_memory_pipeline_identity(models.get("memory_pipeline"))
+    pipeline_identity = models.get("memory_pipeline")
+    _validate_memory_pipeline_identity(pipeline_identity)
     _validate_effective_hymem_config(config)
+    try:
+        validate_extraction_canary_config_binding(
+            config.get("extraction_canary"),
+            config.get("effective_hymem_config"),
+        )
+    except Exception as exc:
+        raise ValueError("strict BEAM extraction canary policy is invalid") from exc
 
     if config.get("indexing_require_healthy") is not True:
         raise ValueError("strict BEAM indexing_require_healthy must be true")
@@ -1330,6 +1347,10 @@ def _validate_strict_envelope(data: dict) -> tuple[list[dict], dict, dict]:
         ):
             raise ValueError("strict BEAM segment attempted_attempts is invalid")
         segment_attempts += attempted_attempts
+        _validate_segment_extraction_canary(
+            segment, pipeline=pipeline_identity,
+            prompt_version=config["effective_hymem_config"]["prompt_version"],
+        )
         for usage_key, label in (
             ("reader_usage", "reader"),
             ("judge_usage", "judge"),

@@ -1,12 +1,10 @@
 """Tests for short-session lossless coverage (never-dreamed bug fix).
 
-Both chunk tiers only mint chunks from USER turns that clear min_chars or a
-trigger regex, so a session whose user turns are all short (test/WebSocket/
-diagnostic sessions) used to produce zero chunks, skip the per-session tail,
-and leave ``sessions.digested_prompt_version`` NULL forever.  The v38 fix gives
-every message an exact coverage artifact, independent of either extraction
-tier; truly empty sessions still skip.  Legacy fallback-builder unit tests stay
-below to pin compatibility, but the runner no longer needs to mint one.
+The lossless stream keeps session-tail processing independent of selective
+chunking. Short non-blank user turns now also enter the bounded baseline
+extraction tier; whitespace-only or truly empty sessions still produce no
+extraction chunk. Legacy fallback-builder unit tests stay below to pin
+compatibility, but the runner no longer needs to mint one.
 """
 
 from __future__ import annotations
@@ -34,7 +32,7 @@ def _digest_llm(
     procedures: list[dict] | None = None,
 ) -> StubLLMClient:
     """Stub returning one combined digest object for the batched call, and an
-    empty array for triple/marker chunk calls. Keyed on the digest user-prompt
+    exact clean-empty contract for Phase-1 chunk calls. Keyed on the digest user-prompt
     closer ``Return the JSON object now`` (see tests/test_digest.py)."""
     payload = {
         "episodes": episodes or [],
@@ -43,13 +41,24 @@ def _digest_llm(
     }
     return StubLLMClient(
         fixtures={"Return the JSON object now": json.dumps(payload)},
-        default="[]",
+        default=json.dumps({
+            "triples": [],
+            "markers": [],
+            "complete": True,
+        }),
     )
 
 
 def _digest_calls(llm: StubLLMClient) -> list:
     """The subset of recorded calls that hit the batched digest prompt."""
     return [c for c in llm.calls if "Return the JSON object now" in c.user]
+
+
+def _phase1_calls(llm: StubLLMClient) -> list:
+    return [
+        call for call in llm.calls
+        if "EXPLICIT behavioral signals" in call.system
+    ]
 
 
 def _seed_session(hy: HyMem, sid: str, turns: list[tuple[str, str]]) -> None:
@@ -59,8 +68,9 @@ def _seed_session(hy: HyMem, sid: str, turns: list[tuple[str, str]]) -> None:
     hy.close_session(sid)
 
 
-# All user turns well under salience_min_chars (30) and free of trigger words:
-# both tiers mint zero chunks, so only the fallback can carry the session.
+# All user turns are below the high-salience threshold and free of triggers;
+# the baseline may offer them to Phase 1 while the lossless stream carries the
+# independent digest/profile/fact tails.
 _SHORT_TURNS = [
     ("user", "ping"),
     ("assistant", "pong"),
@@ -110,6 +120,9 @@ def test_short_session_gets_exact_coverage_and_digest_stamp(cfg):
 
         assert _digested_version(hy, sid) == hy.config.prompt_version
         assert len(_digest_calls(llm)) == 1
+        assert hy.conn.execute(
+            "SELECT COUNT(*) FROM chunk_extraction_attempts"
+        ).fetchone()[0] == 0
     finally:
         hy.close()
 
@@ -181,8 +194,7 @@ def test_empty_session_still_skipped(cfg):
 
 
 def test_redream_short_session_makes_no_further_digest_calls(cfg):
-    """The fallback chunk must not break the skip-guard: a second dream over
-    the unchanged short session costs zero digest LLM calls."""
+    """Completed baseline and digest work is not re-offered on a second dream."""
     llm = _digest_llm(summary="A short diagnostic ping-pong exchange.")
     hy = HyMem(cfg, llm=llm)
     try:
@@ -190,10 +202,14 @@ def test_redream_short_session_makes_no_further_digest_calls(cfg):
         _seed_session(hy, sid, _SHORT_TURNS)
         hy.dream()
         after_first = len(_digest_calls(llm))
+        phase1_calls_after_first = len(_phase1_calls(llm))
         assert after_first == 1
 
         hy.dream()  # nothing changed
         assert len(_digest_calls(llm)) == after_first, "re-dream must skip the digest"
+        assert len(_phase1_calls(llm)) == phase1_calls_after_first, (
+            "processed baseline chunks must not be offered again"
+        )
         assert len(_coverage_rows(hy, sid)) == len(_SHORT_TURNS)
         assert _fallback_rows(hy, sid) == []
     finally:
@@ -204,8 +220,7 @@ def test_redream_short_session_makes_no_further_digest_calls(cfg):
 
 
 def test_qualifying_session_gets_no_fallback_chunk(cfg):
-    """The fallback only fires when BOTH tiers are empty: a session with a
-    qualifying (long) user turn mints regular chunks and no fallback row."""
+    """A qualifying long user turn uses the high tier, never the legacy helper."""
     llm = _digest_llm(summary="A regular substantive session about deploys.")
     hy = HyMem(cfg, llm=llm)
     try:

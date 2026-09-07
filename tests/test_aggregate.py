@@ -11,6 +11,7 @@ surfaces nodes ADDITIVELY without displacing episodes.
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import replace
 
 import pytest
@@ -35,6 +36,15 @@ from hymem.dreaming.aggregate import (
     _stable_sample,
     select_clusters,
 )
+from hymem.dreaming.aggregation_provenance import (
+    load_current_aggregation_publication,
+    persist_episode_source_manifest,
+    resolve_cited_episode_sources,
+)
+from hymem.dreaming.lossless import coverage_chunk_id, materialize_message_coverage
+from hymem.dreaming.embeddings import embedding_text_hash
+from hymem.dreaming.aggregation_material import embedding_storage_identity
+from hymem.dreaming.aggregate import capture_aggregation_material
 from hymem.extraction.llm import StubLLMClient
 from hymem.query.augment import (
     augment,
@@ -96,13 +106,30 @@ def _ep(eid: str, sid: str, entities: list[str], vector=None) -> dict:
 
 
 def _seed_episode(conn, eid, sid, title, summary, entities, start=1, end=2):
-    conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES (?)", (sid,))
-    conn.execute(
-        """INSERT INTO episodes(id, session_id, title, summary, participants,
-                                start_message_id, end_message_id, outcome, key_entities)
-           VALUES (?, ?, ?, ?, '[]', ?, ?, NULL, ?)""",
-        (eid, sid, title, summary, start, end, json.dumps(entities)),
-    )
+    def write():
+        conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES (?)", (sid,))
+        message_id = int(conn.execute(
+            "INSERT INTO messages(session_id,role,content) VALUES (?,'user',?)",
+            (sid, f"authoritative source occurrence {eid}"),
+        ).lastrowid)
+        materialize_message_coverage(conn, sid)
+        conn.execute(
+            """INSERT INTO episodes(id, session_id, title, summary, participants,
+                                    start_message_id, end_message_id, outcome, key_entities)
+               VALUES (?, ?, ?, ?, '[]', ?, ?, NULL, ?)""",
+            (eid, sid, title, summary, start, end, json.dumps(entities)),
+        )
+        occurrences = resolve_cited_episode_sources(
+            conn, sid, [coverage_chunk_id(sid, message_id)]
+        )
+        assert occurrences
+        persist_episode_source_manifest(conn, eid, occurrences)
+
+    if conn.in_transaction:
+        write()
+    else:
+        with core_db.transaction(conn):
+            write()
 
 
 @pytest.fixture
@@ -184,9 +211,9 @@ def test_salts_pinned():
     # cached positional-window fusions survive the fix (the "Acme Corp"
     # lesson). Root deliberately NOT bumped: its member ids change anyway when
     # the levels below re-key.
-    assert _CLUSTER_SALT == "cluster.v4"
-    assert _ROLLUP_SALT == "rollup.v3"
-    assert _ROOT_SALT == "root.v4"
+    assert _CLUSTER_SALT == "cluster.v5"
+    assert _ROLLUP_SALT == "rollup.v4"
+    assert _ROOT_SALT == "root.v5"
 
 
 def _windows(capped: dict[str, int]) -> set[frozenset[str]]:
@@ -366,7 +393,7 @@ def _level0_members(conn) -> set[str]:
     return members
 
 
-def test_aggregation_ceiling_excludes_post_snapshot_episodes(conn, cfg):
+def test_aggregation_recaptures_ceiling_with_material_revision(conn, cfg):
     cfg = _enabled(cfg)
     llm = _agg_llm()
     for eid, sid in (("e1", "s1"), ("e2", "s2")):     # one cross-session cluster
@@ -379,20 +406,20 @@ def test_aggregation_ceiling_excludes_post_snapshot_episodes(conn, cfg):
     assert (first.nodes, first.reused) == (1, 0)      # fused fresh
     assert _level0_members(conn) == {"e1", "e2"}
 
-    # An async stray lands AFTER the snapshot, sharing the cluster's entities so
-    # that — uncapped — it WOULD join and change the member set.
+    # A row landing before v57's atomic material capture is already current
+    # material.  A stale runner ceiling must not hide it while also absorbing
+    # its clock bump into the newly captured revision.
     _seed_episode(conn, "e3", "s3", "e3", "e3", ["postgres", "billing"])
 
     second = build_aggregation_nodes(conn, cfg, llm, None,
                                      episode_ceiling_rowid=ceiling)
-    assert _level0_members(conn) == {"e1", "e2"}      # stray above the ceiling
-    assert (second.nodes, second.reused) == (1, 1)    # cached fusion reused
+    assert _level0_members(conn) == {"e1", "e2", "e3"}
+    assert (second.nodes, second.reused) == (1, 0)
 
-    # Control: lift the ceiling and the same stray DOES join → membership change
-    # → fresh fusion. Proves the ceiling, not luck, is what excluded it.
+    # The now-complete snapshot is stable and therefore reuses normally.
     third = build_aggregation_nodes(conn, cfg, llm, None)
     assert _level0_members(conn) == {"e1", "e2", "e3"}
-    assert third.reused == 0
+    assert third.reused == 1
 
 
 # ── Stage-3b candidate blocking: O(n²) all-pairs → entity index + vec KNN ────
@@ -409,11 +436,16 @@ def _seed_embedded_episode(conn, embed, eid, sid, summary, entities,
     path a real store takes."""
     _seed_episode(conn, eid, sid, eid, summary, entities, start, end)
     vec = embed.embed([summary])[0]
-    conn.execute(
-        "INSERT INTO episode_embeddings(episode_id, vector_json, model, dim, text_hash) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (eid, encode_vector(vec), embed.model, embed.dim, f"hash:{eid}"),
-    )
+    model, dim = embedding_storage_identity(embed)
+    with core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT INTO episode_embeddings(episode_id, vector_json, model, dim, text_hash,"
+            "embedding_producer_key) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                eid, encode_vector(vec), model, dim,
+                embedding_text_hash(f"{eid}\n{summary}"), model,
+            ),
+        )
 
 
 def test_candidate_pairs_none_default_is_exact_all_pairs():
@@ -445,11 +477,44 @@ def test_generate_candidate_pairs_entity_index_exact_plus_knn(conn, cfg):
         _seed_episode(conn, "e4", "s4", "t4", "stream2", ["kafka", "flink"])
         _seed_embedded_episode(conn, embed, "e5", "s5", "same words", ["solo5"])
         _seed_embedded_episode(conn, embed, "e6", "s6", "same words", ["solo6"])
-    core_db.ensure_vec_table(conn, embed.dim)
+    model, dim = embedding_storage_identity(embed)
+    core_db.ensure_vec_table(conn, dim, model=model)
 
-    eps = load_clusterable_episodes(conn)
+    eps = load_clusterable_episodes(
+        conn, embedding_model=model, embedding_dim=dim,
+    )
     pairs = generate_candidate_pairs(conn, eps, emb_top_k=24)
     assert pairs == {("e1", "e2"), ("e3", "e4"), ("e5", "e6")}
+
+
+def test_episode_vector_keys_survive_source_rowid_change_and_vacuum(conn, cfg):
+    embed = StubEmbeddingClient()
+    with core_db.transaction(conn):
+        _seed_embedded_episode(conn, embed, "e1", "s1", "same words", ["a"])
+        _seed_embedded_episode(conn, embed, "e2", "s2", "same words", ["b"])
+    model, dim = embedding_storage_identity(embed)
+    core_db.ensure_vec_table(conn, dim, model=model)
+    active_cfg = _enabled(cfg)
+    before = capture_aggregation_material(conn, active_cfg, embed)
+    before_pairs = generate_candidate_pairs(
+        conn, list(before.episodes), emb_top_k=24,
+    )
+
+    old_rowid = int(conn.execute(
+        "SELECT rowid FROM episodes WHERE id='e1'"
+    ).fetchone()[0])
+    conn.execute("UPDATE episodes SET rowid=rowid+1000 WHERE id='e1'")
+    assert int(conn.execute(
+        "SELECT rowid FROM episodes WHERE id='e1'"
+    ).fetchone()[0]) != old_rowid
+    conn.execute("VACUUM")
+
+    after = capture_aggregation_material(conn, active_cfg, embed)
+    after_pairs = generate_candidate_pairs(
+        conn, list(after.episodes), emb_top_k=24,
+    )
+    assert before_pairs == after_pairs == {("e1", "e2")}
+    assert before.binding["material_epoch_key"] == after.binding["material_epoch_key"]
 
 
 def test_blocking_exact_when_k_covers_store(conn, cfg):
@@ -467,25 +532,39 @@ def test_blocking_exact_when_k_covers_store(conn, cfg):
                                ["kafka", "stream"])               # entity link to e3
         _seed_embedded_episode(conn, embed, "e5", "s5", "weekend cycling",
                                ["cycling"])                       # singleton
-    core_db.ensure_vec_table(conn, embed.dim)
+    model, dim = embedding_storage_identity(embed)
+    core_db.ensure_vec_table(conn, dim, model=model)
 
-    eps = load_clusterable_episodes(conn)
+    eps = load_clusterable_episodes(
+        conn, embedding_model=model, embedding_dim=dim,
+    )
     exact = cluster_episodes(eps, 0.55, 0.50)
     pairs = generate_candidate_pairs(conn, eps, emb_top_k=24)
     assert pairs is not None
     assert cluster_episodes(eps, 0.55, 0.50, candidate_pairs=pairs) == exact
 
 
-def test_generate_candidate_pairs_none_without_vec_table(conn, cfg):
-    # (d) sqlite_vec is optional: no vec_episodes table → None → the caller
-    # falls back to exact all-pairs, embedded small stores unchanged.
+def test_generate_candidate_pairs_entity_only_without_vectors(conn, cfg):
+    # (d) With no valid vectors the entity relation is already the complete
+    # exact blocking relation; sqlite-vec availability is irrelevant.
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres"])
         _seed_episode(conn, "e2", "s2", "t2", "s", ["postgres"])
     conn.execute("DROP TABLE IF EXISTS vec_episodes")   # simulate vec-less store
     assert not core_db.has_vec_table(conn, table="vec_episodes")
     eps = load_clusterable_episodes(conn)
-    assert generate_candidate_pairs(conn, eps, emb_top_k=24) is None
+    pairs = generate_candidate_pairs(conn, eps, emb_top_k=24)
+    assert pairs == {("e1", "e2")}
+    assert cluster_episodes(eps, 0.55, 0.50, candidate_pairs=pairs) == (
+        cluster_episodes(eps, 0.55, 0.50, candidate_pairs=None)
+    )
+
+    # Disjoint vectorless episodes do not require any pair checks.
+    eps[1]["entities"] = {"unrelated"}
+    assert generate_candidate_pairs(conn, eps, emb_top_k=24) == set()
+    assert cluster_episodes(eps, 0.55, 0.50, candidate_pairs=set()) == (
+        cluster_episodes(eps, 0.55, 0.50, candidate_pairs=None)
+    )
 
 
 def test_generate_candidate_pairs_none_when_top_k_zero(conn, cfg):
@@ -495,9 +574,12 @@ def test_generate_candidate_pairs_none_when_top_k_zero(conn, cfg):
     with core_db.transaction(conn):
         _seed_embedded_episode(conn, embed, "e1", "s1", "postgres", ["postgres"])
         _seed_embedded_episode(conn, embed, "e2", "s2", "postgres", ["postgres"])
-    core_db.ensure_vec_table(conn, embed.dim)
+    model, dim = embedding_storage_identity(embed)
+    core_db.ensure_vec_table(conn, dim, model=model)
     assert core_db.has_vec_table(conn, table="vec_episodes")
-    eps = load_clusterable_episodes(conn)
+    eps = load_clusterable_episodes(
+        conn, embedding_model=model, embedding_dim=dim,
+    )
     assert generate_candidate_pairs(conn, eps, emb_top_k=0) is None
     assert generate_candidate_pairs(conn, eps, emb_top_k=24) is not None
 
@@ -516,9 +598,12 @@ def test_blocking_reduces_candidate_pair_count(conn, cfg):
                 f"thread {i % 6} progress notes", [f"t{i % 20}"],
                 start=i + 1, end=i + 2,
             )
-    core_db.ensure_vec_table(conn, embed.dim)
+    model, dim = embedding_storage_identity(embed)
+    core_db.ensure_vec_table(conn, dim, model=model)
 
-    eps = load_clusterable_episodes(conn)
+    eps = load_clusterable_episodes(
+        conn, embedding_model=model, embedding_dim=dim,
+    )
     pairs = generate_candidate_pairs(conn, eps, emb_top_k=5)
     assert pairs is not None
     assert len(pairs) < n * (n - 1) // 2
@@ -542,7 +627,8 @@ def test_build_same_nodes_with_blocking_on_and_off(conn, cfg):
                                ["postgres", "billing"])
         _seed_embedded_episode(conn, embed, "e3", "s3", "weekend cycling",
                                ["cycling"])
-    core_db.ensure_vec_table(conn, embed.dim)
+    model, dim = embedding_storage_identity(embed)
+    core_db.ensure_vec_table(conn, dim, model=model)
 
     def _nodes():
         return {
@@ -555,8 +641,17 @@ def test_build_same_nodes_with_blocking_on_and_off(conn, cfg):
     blocking_off = _replace(_enabled(cfg), aggregation_blocking_top_k=0)
     build_aggregation_nodes(conn, blocking_on, _agg_llm())
     nodes_on = _nodes()
-    build_aggregation_nodes(conn, blocking_off, _agg_llm())   # full rebuild
-    assert nodes_on == _nodes()
+    rebuilt = build_aggregation_nodes(
+        conn, blocking_off, _agg_llm()
+    )   # full rebuild
+    assert rebuilt.keying_residual == 0
+    nodes_off = _nodes()
+    assert {members for _, members in nodes_on} == {
+        members for _, members in nodes_off
+    }
+    assert {node_id for node_id, _ in nodes_on}.isdisjoint(
+        {node_id for node_id, _ in nodes_off}
+    )
     assert nodes_on, "the postgres cluster must produce a node either way"
 
 
@@ -591,6 +686,73 @@ def test_build_creates_node_for_cross_session_cluster(conn, cfg):
     assert emb["dim"] == 16
 
 
+def test_direct_vector_tamper_cannot_be_republished_as_cache_hit(conn, cfg):
+    embed = StubEmbeddingClient()
+    active_cfg = _enabled(cfg)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing", "Postgres billing", ["postgres"])
+        _seed_episode(conn, "e2", "s2", "Analytics", "Postgres analytics", ["postgres"])
+    first = build_aggregation_nodes(conn, active_cfg, _agg_llm(), embed)
+    assert first.nodes == 1
+    provider_calls = len(embed.calls)
+    vector_row = conn.execute(
+        "SELECT node_id,vector_json,model,text_hash FROM aggregation_node_embeddings"
+    ).fetchone()
+    publication_id = conn.execute(
+        "SELECT publication_id FROM aggregation_publication_state"
+    ).fetchone()["publication_id"]
+
+    forged = encode_vector([1.0] + [0.0] * 15)
+    with pytest.raises(sqlite3.IntegrityError, match="not authorized"):
+        conn.execute(
+            "UPDATE aggregation_node_embeddings SET vector_json=? WHERE node_id=?",
+            (forged, vector_row["node_id"]),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="not authorized"):
+        conn.execute(
+            "UPDATE embedding_cache SET vector_json=? WHERE text_hash=? AND model=?",
+            (forged, vector_row["text_hash"], vector_row["model"]),
+        )
+
+    assert conn.execute(
+        "SELECT vector_json FROM aggregation_node_embeddings WHERE node_id=?",
+        (vector_row["node_id"],),
+    ).fetchone()["vector_json"] == vector_row["vector_json"]
+    assert conn.execute(
+        "SELECT publication_id FROM aggregation_publication_state"
+    ).fetchone()["publication_id"] == publication_id
+    rebuilt = build_aggregation_nodes(conn, active_cfg, _agg_llm(), embed)
+    assert rebuilt.reused == 1
+    assert len(embed.calls) == provider_calls
+
+
+def test_pruning_exact_covered_raw_message_preserves_material_publication(conn, cfg):
+    active_cfg = _enabled(cfg)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing", "Postgres billing", ["postgres"])
+        _seed_episode(conn, "e2", "s2", "Analytics", "Postgres analytics", ["postgres"])
+    assert build_aggregation_nodes(conn, active_cfg, _agg_llm()).nodes == 1
+    revision = conn.execute(
+        "SELECT revision FROM aggregation_material_clock WHERE id=1"
+    ).fetchone()["revision"]
+    publication_id = conn.execute(
+        "SELECT publication_id FROM aggregation_publication_state"
+    ).fetchone()["publication_id"]
+
+    with core_db.transaction(conn):
+        conn.execute("DELETE FROM messages WHERE session_id='s1'")
+
+    assert conn.execute(
+        "SELECT revision FROM aggregation_material_clock WHERE id=1"
+    ).fetchone()["revision"] == revision
+    assert conn.execute(
+        "SELECT publication_id FROM aggregation_publication_state"
+    ).fetchone()["publication_id"] == publication_id
+    assert load_current_aggregation_publication(
+        conn, embedding_client=None,
+    ) is not None
+
+
 def test_build_is_noop_when_disabled(conn, cfg):
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres", "billing"])
@@ -618,7 +780,8 @@ def test_rebuild_replaces_stale_nodes(conn, cfg):
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres", "billing"])
         _seed_episode(conn, "e2", "s2", "t2", "s", ["postgres", "billing"])
-    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    llm = _agg_llm()
+    build_aggregation_nodes(conn, acfg, llm, None)
     first_id = conn.execute("SELECT id FROM aggregation_nodes").fetchone()["id"]
 
     # Add a third member to the cluster → different membership → different node id.
@@ -641,21 +804,18 @@ def test_rebuild_reuses_fusion_for_unchanged_cluster(conn, cfg):
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "t1", "s", ["postgres", "billing"])
         _seed_episode(conn, "e2", "s2", "t2", "s", ["postgres", "billing"])
-    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    llm = _agg_llm()
+    build_aggregation_nodes(conn, acfg, llm, None)
     first = conn.execute("SELECT id, title, summary FROM aggregation_nodes").fetchone()
-
-    poisoned = StubLLMClient(
-        fixtures={"fuse several related episodes": json.dumps(
-            {"title": "WRONG", "summary": "this fusion must never be used"})},
-        default="[]",
-    )
-    built = build_aggregation_nodes(conn, acfg, poisoned, None).nodes
+    llm.calls.clear()
+    built = build_aggregation_nodes(conn, acfg, llm, None).nodes
 
     row = conn.execute("SELECT id, title, summary FROM aggregation_nodes").fetchone()
     assert built == 1
     assert row["id"] == first["id"]
     assert row["title"] == first["title"] == "Postgres across projects"
     assert row["summary"] == first["summary"]
+    assert llm.calls == []
 
 
 # ── additive retrieval tier ──────────────────────────────────────────────────
@@ -780,6 +940,217 @@ def test_digest_absent_when_rollup_disabled(cfg, conn):
     ).fetchone()["c"] == 1
 
 
+def test_digest_disabled_publication_ignores_live_root_anchors(cfg, conn):
+    """Digest policy, not ``root_id is None``, controls anchor material.
+
+    A profile can be perfectly valid while the digest is disabled.  It must
+    not make the independently useful level-0 forest unreadable by being
+    compared against a deliberately empty captured anchor set.
+    """
+    from tests.test_digest_squeeze_probe import _seed_profile
+
+    acfg = _enabled(cfg, digest=False)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing on Postgres",
+                      "The billing service uses Postgres.", ["postgres"])
+        _seed_episode(conn, "e2", "s2", "Analytics on Postgres",
+                      "Analytics also uses Postgres.", ["postgres"])
+        _seed_profile(conn, "possession", "a verified bicycle")
+    result = build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    assert result.nodes == 1
+    publication = load_current_aggregation_publication(conn, embedding_client=None)
+    assert publication is not None
+    assert publication.root_node_id is None
+    assert publication.material_binding["root_anchor_policy"] == "disabled"
+    assert publication.material_binding["anchor_count"] == 0
+
+
+def test_digest_disabled_publication_survives_later_profile_anchor(cfg, conn):
+    from tests.test_digest_squeeze_probe import _seed_profile
+
+    acfg = _enabled(cfg, digest=False)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing", "Postgres billing", ["postgres"])
+        _seed_episode(conn, "e2", "s2", "Analytics", "Postgres analytics", ["postgres"])
+    assert build_aggregation_nodes(conn, acfg, _agg_llm(), None).nodes == 1
+    revision = conn.execute(
+        "SELECT revision FROM aggregation_material_clock WHERE id=1"
+    ).fetchone()["revision"]
+    publication_id = conn.execute(
+        "SELECT publication_id FROM aggregation_publication_state"
+    ).fetchone()["publication_id"]
+
+    with core_db.transaction(conn):
+        _seed_profile(conn, "possession", "a verified bicycle")
+
+    assert conn.execute(
+        "SELECT revision FROM aggregation_material_clock WHERE id=1"
+    ).fetchone()["revision"] == revision
+    assert conn.execute(
+        "SELECT publication_id FROM aggregation_publication_state"
+    ).fetchone()["publication_id"] == publication_id
+
+
+def test_embedding_disabled_publication_ignores_unconsumed_episode_vector(cfg, conn):
+    acfg = _enabled(cfg, digest=False)
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "Billing", "Postgres billing", ["postgres"])
+        _seed_episode(conn, "e2", "s2", "Analytics", "Postgres analytics", ["postgres"])
+    assert build_aggregation_nodes(conn, acfg, _agg_llm(), None).nodes == 1
+    revision = conn.execute(
+        "SELECT revision FROM aggregation_material_clock WHERE id=1"
+    ).fetchone()["revision"]
+    publication_id = conn.execute(
+        "SELECT publication_id FROM aggregation_publication_state"
+    ).fetchone()["publication_id"]
+    embed = StubEmbeddingClient()
+    model, dim = embedding_storage_identity(embed)
+    vector = embed.embed(["Billing\nPostgres billing"])[0]
+
+    with core_db.transaction(conn), core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT INTO episode_embeddings(episode_id,vector_json,model,dim,"
+            "text_hash,embedding_producer_key) VALUES (?,?,?,?,?,?)",
+            (
+                "e1", encode_vector(vector), model, dim,
+                embedding_text_hash("Billing\nPostgres billing"), model,
+            ),
+        )
+
+    assert conn.execute(
+        "SELECT revision FROM aggregation_material_clock WHERE id=1"
+    ).fetchone()["revision"] == revision
+    assert conn.execute(
+        "SELECT publication_id FROM aggregation_publication_state"
+    ).fetchone()["publication_id"] == publication_id
+
+
+def test_digest_enabled_empty_store_binds_inert_root_material(cfg, conn):
+    """A rootless empty publication must not bind unused root inputs."""
+    from tests.test_digest_squeeze_probe import _seed_profile
+
+    acfg = _enabled(cfg, digest=True)
+    with core_db.transaction(conn):
+        _seed_profile(conn, "possession", "a verified bicycle")
+    result = build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    assert result.nodes == 0
+    publication = load_current_aggregation_publication(conn, embedding_client=None)
+    assert publication is not None
+    assert publication.root_node_id is None
+    assert publication.material_binding["root_anchor_policy"] == "disabled"
+    assert publication.material_binding["anchor_count"] == 0
+
+    # The unconsumed profile is outside the material epoch: changing it keeps
+    # the empty publication available and leaves the episode/vector clock
+    # untouched.
+    revision = publication.material_revision
+    with core_db.transaction(conn):
+        conn.execute(
+            "UPDATE user_profile SET confidence=confidence-0.01 "
+            "WHERE slot='possession'"
+        )
+    current = load_current_aggregation_publication(conn, embedding_client=None)
+    assert current is not None
+    assert current.material_revision == revision
+
+
+def test_unselected_root_candidate_does_not_withdraw_publication(cfg, conn):
+    """Root data is exact-reselected, so rows below the cap are inert."""
+    from tests.test_digest_squeeze_probe import _seed_profile
+
+    acfg = replace(
+        _enabled(cfg, digest=True), aggregation_digest_anchor_facts=1,
+    )
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "A memory", "One exact memory.", ["one"])
+        _seed_profile(conn, "name", "Atta")
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    before = load_current_aggregation_publication(conn, embedding_client=None)
+    assert before is not None and before.root_node_id is not None
+
+    with core_db.transaction(conn):
+        _seed_profile(conn, "possession", "a bicycle")
+
+    after = load_current_aggregation_publication(conn, embedding_client=None)
+    assert after is not None
+    assert after.publication_id == before.publication_id
+    assert after.material_epoch_key == before.material_epoch_key
+    assert after.material_revision == before.material_revision
+
+
+def test_selected_root_change_is_rejected_without_clock_trigger(cfg, conn):
+    """Exact root proof validation, not a broad SQL clock, fences changes."""
+    from tests.test_digest_squeeze_probe import _seed_profile
+
+    acfg = replace(
+        _enabled(cfg, digest=True), aggregation_digest_anchor_facts=1,
+    )
+    with core_db.transaction(conn):
+        _seed_episode(conn, "e1", "s1", "A memory", "One exact memory.", ["one"])
+        _seed_profile(conn, "name", "Atta")
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    publication = load_current_aggregation_publication(conn, embedding_client=None)
+    assert publication is not None
+    revision = publication.material_revision
+
+    with core_db.transaction(conn):
+        conn.execute(
+            "UPDATE user_profile SET confidence=confidence-0.01 "
+            "WHERE slot='name'"
+        )
+
+    # The episode/vector clock is deliberately unchanged and the physical row
+    # remains auditable, but no public reader accepts its stale root proof.
+    assert conn.execute(
+        "SELECT revision FROM aggregation_material_clock WHERE id=1"
+    ).fetchone()["revision"] == revision
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM aggregation_publication_state"
+    ).fetchone()["count"] == 1
+    assert load_current_aggregation_publication(conn, embedding_client=None) is None
+
+
+def test_capture_and_publication_memoize_exact_source_proofs(cfg, conn):
+    """Each unique coverage coordinate is validated once per snapshot."""
+    acfg = _enabled(cfg)
+    with core_db.transaction(conn):
+        for index in range(6):
+            _seed_episode(
+                conn, f"e{index}", f"s{index}", f"Memory {index}",
+                f"Shared topic {index}.", ["shared"],
+            )
+
+    capture_sql: list[str] = []
+    conn.set_trace_callback(capture_sql.append)
+    capture_aggregation_material(conn, acfg, None)
+    conn.set_trace_callback(None)
+    assert sum(
+        "FROM message_retention_coverage mc" in sql for sql in capture_sql
+    ) == 6
+    assert not any(
+        "source_manifest_complete FROM episodes WHERE id=" in sql
+        for sql in capture_sql
+    )
+
+    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    read_sql: list[str] = []
+    conn.set_trace_callback(read_sql.append)
+    publication = load_current_aggregation_publication(conn, embedding_client=None)
+    conn.set_trace_callback(None)
+    assert publication is not None
+    assert sum(
+        "FROM message_retention_coverage mc" in sql for sql in read_sql
+    ) == 6
+    assert sum(
+        "FROM aggregation_generations WHERE generation_key=" in sql
+        for sql in read_sql
+    ) == 1
+    assert sum(
+        "FROM aggregation_material_epochs WHERE material_epoch_key=" in sql
+        for sql in read_sql
+    ) == 1
+
+
 def test_digest_root_excluded_from_retrieval_tier(cfg, conn):
     # The root says "cycles on weekends" — a query for exactly that must NOT
     # surface it in ctx.aggregation_nodes: levels >= 1 are standing context for
@@ -795,7 +1166,7 @@ def test_digest_root_excluded_from_retrieval_tier(cfg, conn):
         _seed_episode(conn, "e3", "s3", "Weekend cycling",
                       "Started cycling on weekends.", ["cycling"])
     build_aggregation_nodes(conn, acfg, _agg_llm(), embed)
-    assert load_digest(conn) is not None
+    assert load_digest(conn, embedding_client=embed) is not None
 
     ctx = augment(conn, acfg, "cycles on weekends digest", embedding_client=embed)
     root_id = conn.execute(
@@ -861,20 +1232,12 @@ def test_digest_rebuild_reuses_fusions(cfg, conn):
                       "Analytics also uses Postgres.", ["postgres", "billing"])
         _seed_episode(conn, "e3", "s3", "Weekend cycling",
                       "Started cycling on weekends.", ["cycling"])
-    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    llm = _agg_llm()
+    build_aggregation_nodes(conn, acfg, llm, None)
     before = load_digest(conn)
-
-    wrong = json.dumps({"title": "WRONG", "summary": "must not be used"})
-    poisoned = StubLLMClient(
-        fixtures={
-            "fuse several related episodes": wrong,
-            "combined summary that loses no thread": wrong,
-            "standing digest of everything known": wrong,
-        },
-        default="[]",
-    )
-    build_aggregation_nodes(conn, acfg, poisoned, None)
-    assert poisoned.calls == []                  # every fusion reused
+    llm.calls.clear()
+    build_aggregation_nodes(conn, acfg, llm, None)
+    assert llm.calls == []                       # every fusion reused
     after = load_digest(conn)
     assert after is not None and after.summary == before.summary
 
@@ -905,14 +1268,15 @@ def test_cluster_fusion_failure_is_contained(cfg, conn):
     )
     result = build_aggregation_nodes(conn, acfg, failing, None)
     assert result.fusion_failures == 1
-    # The failed cluster's episodes are NOT in the root's leaf members — they
-    # were contained, not leaked as pass-through leaves.
-    root = conn.execute(
-        "SELECT member_episode_ids FROM aggregation_nodes WHERE is_root = 1"
-    ).fetchone()
-    root_members = set(json.loads(root["member_episode_ids"]))
-    assert "e1" not in root_members and "e2" not in root_members
-    assert "e3" in root_members                    # genuine leftover still leafs
+    # A partial tree is never published or persisted as a candidate. There was
+    # no earlier publication in this fixture, so every public surface is empty.
+    assert load_digest(conn) is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM aggregation_publication_state"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM aggregation_nodes"
+    ).fetchone()[0] == 0
 
     # Heal: the retry (same node id) fuses fresh; the untouched remainder of
     # the tree reuses — the fail→heal transition stays local.
@@ -926,11 +1290,9 @@ def test_cluster_fusion_failure_is_contained(cfg, conn):
         == {frozenset({"e1", "e2"})}
 
 
-def test_root_fusion_failure_keeps_previous_root(cfg, conn):
-    # HyMem.digest() is host-facing standing context: when only the ROOT
-    # fusion fails, the previous root must survive the full-replace (one dream
-    # stale, footer already names generated_at) instead of the store going
-    # digest-less until the retry heals.
+def test_root_fusion_failure_withdraws_previous_root_but_keeps_physical_rows(cfg, conn):
+    # A failed replacement withdraws read authority before provider work. The
+    # previously complete tree remains physical cache/audit material only.
     acfg = _enabled(cfg, digest=True)
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "Billing on Postgres",
@@ -939,7 +1301,8 @@ def test_root_fusion_failure_keeps_previous_root(cfg, conn):
                       "Analytics also uses Postgres.", ["postgres"])
         _seed_episode(conn, "e3", "s3", "Weekend cycling",
                       "Started cycling on weekends.", ["cycling"])
-    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    llm = _agg_llm()
+    build_aggregation_nodes(conn, acfg, llm, None)
     before = load_digest(conn)
     assert before is not None
 
@@ -957,10 +1320,14 @@ def test_root_fusion_failure_keeps_previous_root(cfg, conn):
     )
     result = build_aggregation_nodes(conn, acfg, root_fails, None)
     assert result.fusion_failures == 1
-    kept = load_digest(conn)
-    assert kept is not None
-    assert kept.node_id == before.node_id          # the previous root survived
-    assert kept.summary == before.summary
+    assert load_digest(conn) is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM aggregation_publication_state"
+    ).fetchone()[0] == 0
+    kept = conn.execute(
+        "SELECT title,summary FROM aggregation_nodes WHERE id=?", (before.node_id,)
+    ).fetchone()
+    assert kept is not None and kept["summary"] == before.summary
 
     # Heal: the retry replaces the stale root with one covering the new leaf.
     build_aggregation_nodes(conn, acfg, _agg_llm(), None)
@@ -989,10 +1356,8 @@ def test_content_defined_groups_cap_coverage_and_locality():
     assert {g for g in before_sets if g <= prefix_ids} <= untouched
 
 
-def test_digest_root_fusion_is_grounded_in_graph_facts(cfg, conn):
-    # The root prompt must carry the VERIFIED FACTS block built from active
-    # non-derived graph edges — the store-grounded anchor that gives the model
-    # true identity signals instead of a vacuum to fill (the Acme incident).
+def test_digest_root_excludes_unattributed_graph_facts(cfg, conn):
+    # Raw graph rows without exact canonical evidence are not prompt inputs.
     from tests.conftest import seed_edge
     acfg = _enabled(cfg, digest=True)
     with core_db.transaction(conn):
@@ -1006,36 +1371,31 @@ def test_digest_root_fusion_is_grounded_in_graph_facts(cfg, conn):
     digest_calls = [c for c in llm.calls
                     if "standing digest of everything known" in c.system]
     assert len(digest_calls) == 1
-    assert "atta part_of medflow" in digest_calls[0].user
+    assert "atta part_of medflow" not in digest_calls[0].user
     assert "leftpad" not in digest_calls[0].user        # derived edges excluded
+    assert "(none)" in digest_calls[0].user
     assert load_digest(conn) is not None
 
 
-def test_digest_regenerates_when_graph_facts_change(cfg, conn):
-    # Same tree membership, changed graph → the anchor hash in the root's
-    # cache id must force a fresh fusion (a digest pinned to stale ground
-    # truth is the failure the anchor exists to prevent).
+def test_unattributed_graph_change_does_not_rekey_digest(cfg, conn):
+    # Adding another unproved graph row cannot become a prompt input or re-key
+    # an otherwise identical typed root.
     from tests.conftest import seed_edge
     acfg = _enabled(cfg, digest=True)
     with core_db.transaction(conn):
         _seed_episode(conn, "e1", "s1", "Weekend cycling",
                       "Started cycling on weekends.", ["cycling"])
         seed_edge(conn, "atta", "part_of", "medflow", pos=5)
-    build_aggregation_nodes(conn, acfg, _agg_llm(), None)
+    llm = _agg_llm()
+    build_aggregation_nodes(conn, acfg, llm, None)
 
     with core_db.transaction(conn):
         seed_edge(conn, "atta", "prefers", "duckdb", pos=4)
-    fresh = StubLLMClient(
-        fixtures={"standing digest of everything known": json.dumps(
-            {"title": "Fresh digest", "summary": "Re-grounded."})},
-        default="[]",
-    )
-    build_aggregation_nodes(conn, acfg, fresh, None)
+    llm.calls.clear()
+    build_aggregation_nodes(conn, acfg, llm, None)
     digest = load_digest(conn)
-    assert digest is not None and digest.title == "Fresh digest"
-    # And with the graph unchanged, a further rebuild reuses the new root.
-    build_aggregation_nodes(conn, acfg, StubLLMClient(default="[]"), None)
-    assert load_digest(conn).title == "Fresh digest"
+    assert digest is not None and digest.title == "User digest"
+    assert llm.calls == []
 
 
 def test_digest_anchor_disabled_with_zero_cap(cfg, conn):
@@ -1146,6 +1506,18 @@ def _build_digest_tree(cfg, conn):
 
 def test_expand_root_resolves_child_node_and_passthrough_episode(cfg, conn):
     _build_digest_tree(cfg, conn)
+    # Numeric episode ranges are compatibility metadata, not proof. A host
+    # must receive the exact source occurrence even if those fields drift.
+    conn.execute(
+        "UPDATE episodes SET start_message_id=500,end_message_id=900 "
+        "WHERE id='e3'"
+    )
+    exact_ids = tuple(
+        row[0] for row in conn.execute(
+            "SELECT source_message_id FROM episode_source_occurrences "
+            "WHERE episode_id='e3' ORDER BY ordinal"
+        )
+    )
     digest = load_digest(conn)
     assert digest is not None and digest.node_id  # the traversal entry point
 
@@ -1164,7 +1536,14 @@ def test_expand_root_resolves_child_node_and_passthrough_episode(cfg, conn):
     assert [e.id for e in exp.episodes] == ["e3"]
     leaf = exp.episodes[0]
     assert leaf.session_id == "s3"
-    assert (leaf.start_message_id, leaf.end_message_id) == (5, 9)
+    assert leaf.source_message_ids == exact_ids
+    assert (leaf.start_message_id, leaf.end_message_id) == (
+        exact_ids[0], exact_ids[-1],
+    )
+    assert tuple(
+        (source.session_id, source.message_id)
+        for source in leaf.source_occurrences
+    ) == tuple(("s3", message_id) for message_id in exact_ids)
 
 
 def test_expand_level0_node_returns_member_episodes_only(cfg, conn):
@@ -1184,17 +1563,14 @@ def test_expand_unknown_node_returns_none(cfg, conn):
     assert expand_node(conn, "no-such-node") is None
 
 
-def test_expand_reports_dangling_members(cfg, conn):
-    # Honest-read contract: a member id that resolves to neither table is
-    # reported, not silently dropped (only reachable via store surgery).
+def test_expand_fails_closed_on_dangling_members(cfg, conn):
+    # Missing authoritative input invalidates the whole publication.
     _build_digest_tree(cfg, conn)
     digest = load_digest(conn)
     with core_db.transaction(conn):
         conn.execute("DELETE FROM episodes WHERE id = 'e3'")
 
-    exp = expand_node(conn, digest.node_id)
-    assert exp.missing_member_ids == ["e3"]
-    assert len(exp.child_nodes) == 1 and exp.episodes == []
+    assert expand_node(conn, digest.node_id) is None
 
 
 @pytest.mark.parametrize("wrapper", [
@@ -1213,7 +1589,9 @@ def test_fusion_survives_a_fenced_or_chatty_reply(wrapper):
     # went missing from HEAD once already.
     llm = StubLLMClient(default=wrapper.format(body=_NODE_JSON))
     fused = _llm_fuse("prompt", llm, system="sys", kind="rollup")
-    assert fused == json.loads(_NODE_JSON)
+    assert fused is not None
+    assert {key: fused[key] for key in ("title", "summary")} == json.loads(_NODE_JSON)
+    assert fused["_aggregation_request_hash"].startswith("sha256:")
 
 
 def test_fusion_returns_none_on_an_unparseable_reply():

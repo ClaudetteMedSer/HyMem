@@ -13,10 +13,11 @@ import json
 
 import pytest
 
-from hymem import HyMem, HyMemConfig, redaction, portability
+from hymem import HyMem, HyMemConfig, StubEmbeddingClient, redaction, portability
 from hymem.core import db as core_db
 from hymem.core.message_records import message_content_hash
 from hymem.dreaming.canonicalize import normalize
+from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.dreaming import evidence as evidence_ledger
 from hymem.dreaming.bitemporal import record_lifecycle_event
 from hymem.dreaming.value_supersession import supersede_competing_values
@@ -25,14 +26,21 @@ from hymem.dreaming.message_coverage import (
     record_message_coverage,
 )
 from hymem.dreaming.lossless import (
+    COVERAGE_INTEGRITY_CONFIG_VERSION,
     LOSSLESS_COVERAGE_VERSION,
     coverage_chunk_id,
+    record_coverage_integrity_failure,
     validate_message_coverage_artifact,
 )
 from hymem.dreaming.lossless import materialize_message_coverage
-from hymem.dreaming.chunks import Chunk, persist_chunks
+from hymem.dreaming.chunks import (
+    Chunk,
+    persist_chunks,
+    record_unrecoverable_chunk_losses,
+)
 from hymem.dreaming import phase1
 from hymem.dreaming.phase1 import ChunkExtraction
+from hymem.extraction.contract import extraction_cache_key
 from hymem.extraction.triples import Triple
 from hymem.dreaming.user_profile import (
     PROFILE_PROMPT_VERSION,
@@ -51,6 +59,18 @@ _EXPECTED = {
     "procedure": 1, "edge": 1, "profile_entry": 1,
     "entity_alias": 0,
     "chunk_source_manifest": 0, "chunk_message_source": 0,
+    "phase1_generation": 0,
+    "entity_type": 0, "entity_property": 0,
+    "behavioral_marker": 0,
+    "entity_type_observation": 0,
+    "entity_property_observation": 0,
+    "entity_mention_observation": 0,
+    "phase1_auxiliary_outcome": 0,
+    "rule": 0,
+    "profile_entry_marker_evidence": 0,
+    "profile_marker_decision": 0,
+    "rule_marker_evidence": 0,
+    "rule_marker_decision": 0,
     "claim_extraction_outcome": 0,
     "edge_evidence": 0, "edge_evidence_signal": 1,
     "claim_observation": 0, "edge_lifecycle": 1,
@@ -60,6 +80,8 @@ _EXPECTED = {
     "fact_extraction_revision": 0,
     "narrative_fact": 0,
     "narrative_fact_lifecycle": 0,
+    "chunk_extraction_terminal_loss": 0,
+    "coverage_integrity_failure": 0,
 }
 
 
@@ -417,6 +439,59 @@ def test_export_writes_meta_header(tmp_path):
     hy.close()
 
 
+def test_v12_coverage_integrity_health_roundtrips_then_clears(tmp_path):
+    src = HyMem(HyMemConfig(root=tmp_path / "coverage-health-src"))
+    try:
+        src.open_session("needs-rebuild")
+        src.close_session("needs-rebuild")
+        with core_db.transaction(src.conn):
+            record_coverage_integrity_failure(
+                src.conn,
+                "needs-rebuild",
+                reason="source_stream_invalid",
+            )
+        out = tmp_path / "coverage-health.jsonl"
+        counts = src.export(out)
+        assert counts["coverage_integrity_failure"] == 1
+        objects = [json.loads(line) for line in out.read_text().splitlines()]
+        health = next(
+            item["record"]
+            for item in objects
+            if item["type"] == "coverage_integrity_failure"
+        )
+        assert health["session_id"] == "needs-rebuild"
+        assert health["config_version"] == COVERAGE_INTEGRITY_CONFIG_VERSION
+        assert health["failure_reason"] == "source_stream_invalid"
+        assert set(health) == {
+            "session_id", "config_version", "failure_reason", "occurrences",
+            "first_detected_at", "last_detected_at",
+        }
+    finally:
+        src.close()
+
+    dst = HyMem(
+        HyMemConfig(root=tmp_path / "coverage-health-dst"),
+        llm=StubLLMClient(default='{"triples":[],"markers":[],"complete":true}'),
+    )
+    try:
+        imported = dst.import_(out)
+        assert imported["coverage_integrity_failure"] == 1
+        assert dst.import_(out)["coverage_integrity_failure"] == 0
+        status = dst.dream_status()
+        assert status["coverage_integrity_failures"] == 1
+        assert status["coverage_integrity_failure_details"][0][
+            "session_id"
+        ] == "needs-rebuild"
+
+        # Import preserves the operator-visible health state. A later complete
+        # successful walk is the only normal clearing acknowledgement.
+        report = dst.dream()
+        assert report.coverage_integrity_failures == 0
+        assert dst.dream_status()["coverage_integrity_failures"] == 0
+    finally:
+        dst.close()
+
+
 def test_import_is_idempotent(tmp_path):
     src = HyMem(HyMemConfig(root=tmp_path / "src"))
     _seed(src)
@@ -711,12 +786,18 @@ def test_v7_successful_empty_outcome_supersedes_stale_claim_in_both_orders(
                 "FROM kg_claim_extraction_outcomes"
             ).fetchone()
             assert tuple(outcome) == (
-                "v14", 14, evidence_ledger.claim_result_hash([]),
+                extraction_cache_key("v14"),
+                14,
+                evidence_ledger.claim_result_hash([]),
             )
+            # Claim-only portability cannot prove that markers/entity hints
+            # were restored, so the imported chunk remains pending for a
+            # complete live Phase-1 replay.
             assert store.conn.execute(
                 "SELECT COUNT(*) FROM processed_chunks "
-                "WHERE chunk_id='shared-claim' AND prompt_version='v14'"
-            ).fetchone()[0] == 1
+                "WHERE chunk_id='shared-claim' AND prompt_version=?",
+                (extraction_cache_key("v14"),),
+            ).fetchone()[0] == 0
             assert sum(store.import_(empty_wire).values()) == 0
         assert _portable_claim_state(low_high) == _portable_claim_state(high_low)
     finally:
@@ -1021,12 +1102,17 @@ def test_v7_rejects_compounded_source_and_transaction_skew(tmp_path):
 
 def test_behavioral_merge_removes_member_and_roundtrips_portably(tmp_path):
     from hymem.dreaming.behavioral_dedup import (
-        DuplicateMember,
-        ProposedMerge,
         apply_behavioral_merges,
+        find_behavioral_duplicates,
     )
 
-    src = HyMem(HyMemConfig(root=tmp_path / "behavioral-portable-source"))
+    embedding = StubEmbeddingClient(
+        model_name="behavioral-portable-v1", dim_value=2,
+    )
+    src = HyMem(
+        HyMemConfig(root=tmp_path / "behavioral-portable-source"),
+        embedding_client=embedding,
+    )
     try:
         src.open_session("claim-session")
         messages = []
@@ -1055,15 +1141,30 @@ def test_behavioral_merge_removes_member_and_roundtrips_portably(tmp_path):
             edge_ids.append(int(src.conn.execute(
                 "SELECT id FROM knowledge_graph WHERE object_canonical=?", (obj,)
             ).fetchone()[0]))
+        model, dimension = embedding_storage_identity(embedding)
+        with core_db.embedding_mutation(src.conn):
+            src.conn.executemany(
+                "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
+                "VALUES (?,?,?,?)",
+                [
+                    (
+                        "user prefers concise", json.dumps([1.0, 0.0]),
+                        model, dimension,
+                    ),
+                    (
+                        "user prefers concise_mode", json.dumps([0.99, 0.01]),
+                        model, dimension,
+                    ),
+                ],
+            )
+        proposals = find_behavioral_duplicates(
+            src.conn, cosine_threshold=0.9, embedding_client=embedding,
+        )
+        assert len(proposals) == 1
         with core_db.transaction(src.conn):
-            apply_behavioral_merges(src.conn, [ProposedMerge(
-                subject="user", predicate="prefers",
-                survivor_id=edge_ids[0], survivor_object="concise",
-                survivor_pos=2, survivor_neg=0,
-                members=[DuplicateMember(
-                    edge_ids[1], "concise_mode", 2, 0, 0.99,
-                )],
-            )])
+            apply_behavioral_merges(
+                src.conn, proposals, embedding_client=embedding,
+            )
         assert src.conn.execute(
             "SELECT 1 FROM knowledge_graph WHERE id=?", (edge_ids[1],)
         ).fetchone() is None
@@ -1758,7 +1859,10 @@ def test_v7_same_semantic_revision_uses_commutative_authoritative_audit_metadata
 
         assert audit(old_new) == audit(new_old)
         assert audit(old_new)[0][0:4] == (
-            "metadata-new-chunk", "service", "65_percent", "v14",
+            "metadata-new-chunk",
+            "service",
+            "65_percent",
+            extraction_cache_key("v14"),
         )
         assert sum(old_new.import_(new_wire).values()) == 0
         assert sum(new_old.import_(old_wire).values()) == 0
@@ -2420,7 +2524,7 @@ def test_incomplete_profile_stage_is_not_exported_and_cursor_replays(tmp_path):
         fixtures={
             "typed user-profile facts": '{"items": []}',
             "Return the JSON object now": payload,
-            "single pass": '{"triples": [], "markers": []}',
+            "single pass": '{"triples": [], "markers": [], "complete": true}',
         },
         default="[]",
     )
@@ -2542,7 +2646,7 @@ def test_v3_import_normalizes_coverage_reserves_ids_and_continues(tmp_path):
         cfg,
         llm=StubLLMClient(
             fixtures={"Return the JSON object now": payload},
-            default='{"triples":[],"markers":[]}',
+            default='{"triples":[],"markers":[],"complete":true}',
         ),
     )
     try:
@@ -2715,6 +2819,8 @@ def test_redacted_import_scrubs_all_text_before_sql_and_keeps_coverage_valid(
             "INSERT INTO profile_entries(kind, text) VALUES ('preference', ?)",
             (f"contact {secret}",),
         )
+        with core_db.transaction(src.conn):
+            record_unrecoverable_chunk_losses(src.conn, "all-text")
         out = tmp_path / "all-text-unredacted.jsonl"
         src.export(out)
         assert secret in out.read_text(encoding="utf-8")
@@ -3078,6 +3184,8 @@ def test_generic_v37_exact_proof_roundtrips_without_becoming_ordered(tmp_path):
             chunk_id="generic-chunk",
             coverage_version="caller-proof-v1",
         )
+        with core_db.transaction(src.conn):
+            record_unrecoverable_chunk_losses(src.conn, "generic-proof")
         out = tmp_path / "generic-proof.jsonl"
         src.export(out)
     finally:
@@ -3503,6 +3611,8 @@ def test_redacted_generic_multirecord_pem_proof_remains_exact_and_idempotent(
                 src.conn, message_id=mid, chunk_id="pem-generic",
                 coverage_version="caller-pem-proof-v1",
             )
+        with core_db.transaction(src.conn):
+            record_unrecoverable_chunk_losses(src.conn, "pem")
         out = tmp_path / "pem.jsonl"
         src.export(out)
     finally:

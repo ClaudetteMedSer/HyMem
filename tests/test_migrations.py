@@ -6,13 +6,16 @@ idempotent against a fresh schema.sql database.
 
 from __future__ import annotations
 
+from importlib.resources import files
 from pathlib import Path
+import re
 import sqlite3
 
 import pytest
 
 from hymem import portability
 from hymem.core import db as core_db
+from hymem.extraction.contract import extraction_cache_key
 
 
 def _cols(conn, table) -> set[str]:
@@ -26,6 +29,66 @@ def _has_table(conn, name) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _drop_v57_material_triggers(conn: sqlite3.Connection) -> None:
+    """Remove current-tail invalidators while a test reconstructs old tables."""
+
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' "
+        "AND name LIKE 'aggregation_material_%'"
+    ).fetchall()
+    for row in rows:
+        conn.execute(f'DROP TRIGGER IF EXISTS "{row["name"]}"')
+
+
+def _downgrade_aggregation_material_to_authentic_v56(
+    conn: sqlite3.Connection,
+) -> None:
+    """Remove the entire v57 tail while retaining the exact v56 boundary."""
+
+    statements = core_db._split_sql_statements(
+        files("hymem.core.migrations").joinpath(
+            "057_aggregation_material_epoch.sql"
+        ).read_text(encoding="utf-8")
+    )
+    for statement in statements:
+        match = re.match(r"\s*CREATE\s+TRIGGER\s+(\w+)", statement, re.I)
+        if match:
+            conn.execute(f'DROP TRIGGER IF EXISTS "{match.group(1)}"')
+    for statement in statements:
+        match = re.match(
+            r"\s*CREATE\s+(?:UNIQUE\s+)?(INDEX|VIEW)\s+(\w+)",
+            statement, re.I,
+        )
+        if match:
+            conn.execute(
+                f'DROP {match.group(1).upper()} IF EXISTS "{match.group(2)}"'
+            )
+    conn.execute("DELETE FROM aggregation_publication_state")
+    for table, columns in (
+        ("episode_embeddings", ("embedding_producer_key",)),
+        ("aggregation_node_embeddings", ("embedding_producer_key",)),
+        ("aggregation_nodes", ("aggregation_material_epoch_key",)),
+        ("aggregation_publication_state", (
+            "aggregation_material_epoch_key", "material_revision",
+            "node_embedding_count", "node_embedding_set_hash",
+        )),
+        ("aggregation_build_health", (
+            "last_success_material_epoch_key", "pending_material_epoch_key",
+            "last_failure_material_epoch_key", "attempt_serial",
+            "pending_attempt_token",
+        )),
+        ("dream_runs", ("aggregation_material_epoch_key",)),
+    ):
+        for column in columns:
+            conn.execute(f'ALTER TABLE "{table}" DROP COLUMN "{column}"')
+    conn.execute("DROP TABLE aggregation_material_epochs")
+    conn.execute("DROP TABLE aggregation_material_clock")
+    conn.execute(
+        "DELETE FROM schema_meta WHERE key='aggregation_material_epoch_schema'"
+    )
+    conn.execute("UPDATE schema_meta SET value='56' WHERE key='schema_version'")
 
 
 def _downgrade_fact_domain_to_v45(conn: sqlite3.Connection) -> None:
@@ -193,6 +256,244 @@ def test_rerunning_migrations_is_a_noop(tmp_path: Path):
     conn.close()
 
 
+def test_v48_adds_safe_chunk_extraction_failure_diagnostics(tmp_path: Path):
+    conn = core_db.connect(tmp_path / "v48-diagnostics.sqlite")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key,value) VALUES ('schema_version','47');
+            CREATE TABLE chunk_extraction_attempts(
+                chunk_id TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_failure_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(chunk_id,prompt_version)
+            );
+            INSERT INTO chunk_extraction_attempts(
+                chunk_id,prompt_version,attempts
+            ) VALUES ('chunk','v13',2);
+            """
+        )
+        core_db._run_migrations(conn)
+        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+        assert {
+            "last_failure_reason", "last_failure_details",
+        }.issubset(_cols(conn, "chunk_extraction_attempts"))
+        row = conn.execute(
+            "SELECT attempts,last_failure_reason,last_failure_details "
+            "FROM chunk_extraction_attempts"
+        ).fetchone()
+        assert tuple(row) == (2, None, "[]")
+    finally:
+        conn.close()
+
+
+def test_v49_adds_dream_extraction_call_attribution(tmp_path: Path):
+    conn = core_db.connect(tmp_path / "v49-extraction-calls.sqlite")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key,value) VALUES ('schema_version','48');
+            CREATE TABLE dream_runs(
+                id INTEGER PRIMARY KEY,
+                started_at TIMESTAMP NOT NULL
+            );
+            INSERT INTO dream_runs(id,started_at) VALUES (1,CURRENT_TIMESTAMP);
+            """
+        )
+        core_db._run_migrations(conn)
+        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+        assert {
+            "chunk_extraction_completion_calls",
+            "chunk_extraction_provider_attempts",
+            "extraction_provider_attempt_budget_exhausted",
+        }.issubset(_cols(conn, "dream_runs"))
+        row = conn.execute(
+            "SELECT chunk_extraction_completion_calls,"
+            "chunk_extraction_provider_attempts,"
+            "extraction_provider_attempt_budget_exhausted FROM dream_runs"
+        ).fetchone()
+        assert tuple(row) == (0, 0, 0)
+    finally:
+        conn.close()
+
+
+def test_v50_adds_bounded_coverage_integrity_health_state(tmp_path: Path):
+    conn = core_db.connect(tmp_path / "v50-coverage-integrity.sqlite")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key,value) VALUES ('schema_version','49');
+            CREATE TABLE sessions(id TEXT PRIMARY KEY);
+            INSERT INTO sessions(id) VALUES ('affected-session');
+            CREATE TABLE dream_runs(
+                id INTEGER PRIMARY KEY,
+                started_at TIMESTAMP NOT NULL
+            );
+            INSERT INTO dream_runs(id,started_at) VALUES (1,CURRENT_TIMESTAMP);
+            """
+        )
+        core_db._run_migrations(conn)
+        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+        assert _cols(conn, "coverage_integrity_failures") == {
+            "session_id", "config_version", "failure_reason", "occurrences",
+            "first_detected_at", "last_detected_at",
+        }
+        assert "coverage_integrity_failures" in _cols(conn, "dream_runs")
+        assert conn.execute(
+            "SELECT coverage_integrity_failures FROM dream_runs WHERE id=1"
+        ).fetchone()[0] == 0
+        conn.execute(
+            "INSERT INTO coverage_integrity_failures("
+            "session_id,config_version,failure_reason) VALUES (?,?,?)",
+            (
+                "affected-session",
+                "lossless-coverage-integrity-v1|coverage="
+                "dream-lossless-message-v1|hash=sha256-role-content-v1|"
+                "record=hymem-message-jsonl-v1",
+                "source_stream_invalid",
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE coverage_integrity_failures "
+                "SET failure_reason='exception text: secret'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE coverage_integrity_failures "
+                "SET config_version='token=operator-secret'"
+            )
+    finally:
+        conn.close()
+
+
+def test_v51_adds_bounded_aggregation_build_health_state(tmp_path: Path):
+    conn = core_db.connect(tmp_path / "v51-aggregation-health.sqlite")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key,value) VALUES ('schema_version','50');
+            CREATE TABLE dream_runs(
+                id INTEGER PRIMARY KEY,
+                started_at TIMESTAMP NOT NULL
+            );
+            INSERT INTO dream_runs(id,started_at) VALUES (1,CURRENT_TIMESTAMP);
+            """
+        )
+        core_db._run_migrations(conn)
+        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+        assert {
+            "aggregation_build_exceptions", "aggregation_config_version",
+        }.issubset(_cols(conn, "dream_runs"))
+        assert _cols(conn, "aggregation_build_health") == {
+            "id", "last_success_config_version", "last_success_at",
+            "pending_config_version", "pending_attempts",
+            "pending_caught_exceptions", "pending_fusion_failures",
+            "first_pending_at", "last_attempt_at",
+            "total_caught_exceptions", "total_fusion_failures",
+            "superseded_pending_configs", "last_failure_config_version",
+            "last_failure_kind", "last_failure_at",
+        }
+        row = conn.execute(
+            "SELECT aggregation_build_exceptions,aggregation_config_version "
+            "FROM dream_runs WHERE id=1"
+        ).fetchone()
+        assert tuple(row) == (0, None)
+
+        version = "aggregation-build-config-v1:" + ("a" * 64)
+        conn.execute(
+            "INSERT INTO aggregation_build_health("
+            "id,pending_config_version,pending_attempts,first_pending_at,"
+            "last_attempt_at) VALUES (1,?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            (version,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE aggregation_build_health "
+                "SET pending_config_version='token=operator-secret' WHERE id=1"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE aggregation_build_health "
+                "SET pending_attempts=2147483648 WHERE id=1"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE aggregation_build_health "
+                "SET last_failure_kind='RuntimeError: secret' WHERE id=1"
+            )
+    finally:
+        conn.close()
+
+
+def test_v52_adds_source_materialization_acknowledgement(tmp_path: Path):
+    conn = core_db.connect(tmp_path / "v52-source-materialization.sqlite")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key,value) VALUES ('schema_version','51');
+            CREATE TABLE sessions(
+                id TEXT PRIMARY KEY,
+                coverage_message_id INTEGER
+            );
+            CREATE TABLE chunks(
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                chunk_kind TEXT NOT NULL
+            );
+            INSERT INTO sessions(id,coverage_message_id)
+            VALUES ('legacy-session',17);
+            """
+        )
+
+        core_db._run_migrations(conn)
+
+        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
+        assert {
+            "source_materialized_message_id",
+            "source_materialization_config_version",
+        }.issubset(_cols(conn, "sessions"))
+        row = conn.execute(
+            "SELECT source_materialized_message_id,"
+            "source_materialization_config_version FROM sessions"
+        ).fetchone()
+        assert tuple(row) == (None, None)
+
+        conn.execute(
+            "UPDATE sessions SET source_materialized_message_id=17,"
+            "source_materialization_config_version='producer' "
+            "WHERE id='legacy-session'"
+        )
+        conn.execute(
+            "INSERT INTO chunks(id,session_id,chunk_kind) "
+            "VALUES ('coverage','legacy-session','coverage')"
+        )
+        conn.execute("DELETE FROM chunks WHERE id='coverage'")
+        preserved = conn.execute(
+            "SELECT source_materialized_message_id FROM sessions"
+        ).fetchone()[0]
+        assert preserved == 17
+
+        conn.execute(
+            "INSERT INTO chunks(id,session_id,chunk_kind) "
+            "VALUES ('candidate','legacy-session','extraction')"
+        )
+        conn.execute("DELETE FROM chunks WHERE id='candidate'")
+        invalidated = conn.execute(
+            "SELECT source_materialized_message_id,"
+            "source_materialization_config_version FROM sessions"
+        ).fetchone()
+        assert tuple(invalidated) == (None, None)
+    finally:
+        conn.close()
+
+
 def test_fresh_schema_has_message_vector_freshness_and_composite_authority(
     tmp_path: Path,
 ):
@@ -247,11 +548,13 @@ def test_public_initialize_upgrades_populated_v43_embeddings_idempotently(
     coverage = conn.execute(
         "SELECT chunk_id FROM message_retention_coverage WHERE message_id=7"
     ).fetchone()
-    conn.execute(
-        "INSERT INTO chunk_embeddings(chunk_id,vector_json,model,dim,text_hash) "
-        "VALUES (?,?,?,?,?)",
-        (coverage["chunk_id"], "[1.0,0.0,0.0]", "legacy-space", 3, "old-hash"),
-    )
+    safe_space = "hymem-embedding-producer-v1:" + "0" * 64
+    with core_db.embedding_mutation(conn):
+        conn.execute(
+            "INSERT INTO chunk_embeddings(chunk_id,vector_json,model,dim,text_hash) "
+            "VALUES (?,?,?,?,?)",
+            (coverage["chunk_id"], "[1.0,0.0,0.0]", safe_space, 3, "old-hash"),
+        )
 
     # Recreate exactly the two pre-v44 embedding shapes while retaining the
     # rest of the fully migrated v43 domain and its populated coverage parent.
@@ -266,14 +569,14 @@ def test_public_initialize_upgrades_populated_v43_embeddings_idempotently(
     conn = core_db.connect(db_path)
     core_db.initialize(conn)
     try:
-        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
+        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
         assert "text_hash" in _cols(conn, "chunk_embeddings")
         row = conn.execute(
             "SELECT chunk_id,vector_json,model,dim,text_hash "
             "FROM chunk_embeddings"
         ).fetchone()
         assert tuple(row) == (
-            coverage["chunk_id"], "[1.0,0.0,0.0]", "legacy-space", 3, None,
+            coverage["chunk_id"], "[1.0,0.0,0.0]", safe_space, 3, None,
         )
         assert _has_table(conn, "message_embeddings")
         coverage_fk = [
@@ -296,7 +599,7 @@ def test_public_initialize_upgrades_populated_v43_embeddings_idempotently(
     conn = core_db.connect(db_path)
     core_db.initialize(conn)
     try:
-        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
+        assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
         assert conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0] == 1
         assert conn.execute(
             "SELECT text_hash FROM chunk_embeddings"
@@ -913,7 +1216,13 @@ def test_public_v39_singleton_upgrade_and_stale_stamp_replay_preserve_source(
         conn.execute("DROP TABLE IF EXISTS kg_edge_lifecycle")
         conn.execute("DROP TABLE IF EXISTS kg_claim_observations")
         conn.execute("DROP TABLE IF EXISTS chunk_message_sources")
+    _drop_v57_material_triggers(conn)
     conn.execute("PRAGMA foreign_keys=OFF")
+    # This current-schema fixture temporarily reconstructs the released v39
+    # table.  Remove the v57 view that depends on that table; the v57 stale-tail
+    # recognizer restores its exact owned definition once v40 has rebuilt the
+    # source domain during public startup.
+    conn.execute("DROP VIEW IF EXISTS aggregation_enabled_kg_sources")
     conn.executescript(
         """
         CREATE TABLE kg_evidence_v39(
@@ -1509,7 +1818,7 @@ def test_v38_uncovered_user_profile_survives_v39_export_import(tmp_path: Path):
             None,
             source_mid,
             "legacy-uncovered",
-            "2026-07-01T12:00:00Z",
+            "2026-07-01T12:00:00.000Z",
             "2026-07-01T12:00:00.000000+00:00",
         )
         assert tuple(dst.execute(
@@ -1801,6 +2110,114 @@ def _publish_migration_test_claim(conn) -> str:
     return chunk.id
 
 
+def test_populated_v52_phase1_rows_upgrade_as_explicitly_stale(
+    tmp_path: Path,
+):
+    """Released producer-unknown rows survive v53 but authorize no reuse."""
+
+    path = tmp_path / "populated-v52-phase1.sqlite"
+    conn = core_db.connect(path)
+    core_db.initialize(conn)
+    chunk_id = _publish_migration_test_claim(conn)
+    prompt_version = str(conn.execute(
+        "SELECT prompt_version FROM processed_chunks WHERE chunk_id=?",
+        (chunk_id,),
+    ).fetchone()[0])
+    conn.execute(
+        "INSERT INTO behavioral_markers(kind,statement,chunk_id) "
+        "VALUES ('style','legacy marker',?)",
+        (chunk_id,),
+    )
+    conn.execute(
+        "INSERT INTO chunk_extraction_attempts("
+        "chunk_id,prompt_version,attempts,last_failure_details) "
+        "VALUES (?,?,1,'[]')",
+        (chunk_id, prompt_version),
+    )
+
+    # Recreate the released v52 shape, including populated rows.  The normal
+    # bootstrap schema runs before forward migrations, so this also catches a
+    # premature v53 index that references an as-yet absent column.
+    core_db._drop_phase1_auxiliary_views(conn)
+    _drop_v57_material_triggers(conn)
+    for name in (
+        "phase1_generations_insert_guard",
+        "phase1_generations_update_guard",
+        "phase1_generations_delete_guard",
+        "kg_claim_observations_insert_guard",
+        "idx_processed_chunks_phase1_generation",
+        "idx_chunk_attempts_phase1_generation",
+        "idx_claim_outcomes_phase1_generation",
+        "idx_claim_observations_phase1_generation",
+        "idx_behavioral_markers_phase1_generation",
+        "idx_behavioral_marker_generation_identity",
+        "behavioral_marker_producer_insert_guard",
+        "behavioral_marker_semantic_update_guard",
+        "behavioral_marker_delete_guard",
+        "linked_profile_semantic_update_guard",
+        "linked_profile_delete_guard",
+        "linked_rule_semantic_update_guard",
+        "linked_rule_delete_guard",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
+    for table in (
+        "profile_marker_decisions", "profile_entry_marker_evidence",
+        "rule_marker_decisions", "rule_marker_evidence",
+        "entity_type_observations", "entity_property_observations",
+        "entity_mention_observations", "phase1_auxiliary_outcomes",
+    ):
+        conn.execute(f"DROP TABLE {table}")
+    for table in (
+        "processed_chunks", "chunk_extraction_attempts",
+        "kg_claim_extraction_outcomes", "kg_claim_observations",
+        "behavioral_markers",
+    ):
+        conn.execute(
+            f"ALTER TABLE {table} DROP COLUMN phase1_generation_key"
+        )
+    conn.execute("DROP TABLE phase1_generations")
+    conn.execute(
+        "UPDATE schema_meta SET value='52' WHERE key='schema_version'"
+    )
+    before_counts = {
+        table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in (
+            "processed_chunks", "chunk_extraction_attempts",
+            "kg_claim_extraction_outcomes", "kg_claim_observations",
+            "behavioral_markers",
+        )
+    }
+    conn.close()
+
+    upgraded = core_db.connect(path)
+    core_db.initialize(upgraded)
+    assert core_db.schema_version(upgraded) == core_db.EXPECTED_SCHEMA_VERSION
+    assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert upgraded.execute(
+        "SELECT COUNT(*) FROM phase1_generations"
+    ).fetchone()[0] == 0
+    for table, count in before_counts.items():
+        assert int(upgraded.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()[0]) == count
+        assert "phase1_generation_key" in _cols(upgraded, table)
+        assert upgraded.execute(
+            f"SELECT COUNT(*) FROM {table} "
+            "WHERE phase1_generation_key IS NOT NULL"
+        ).fetchone()[0] == 0
+    # A legacy prompt-only success is deliberately not a current generation.
+    assert upgraded.execute(
+        "SELECT 1 FROM processed_chunks pc "
+        "JOIN kg_claim_extraction_outcomes outcome "
+        "ON outcome.chunk_id=pc.chunk_id "
+        "WHERE pc.chunk_id=? AND pc.phase1_generation_key IS NOT NULL "
+        "AND outcome.phase1_generation_key=pc.phase1_generation_key",
+        (chunk_id,),
+    ).fetchone() is None
+    upgraded.close()
+
+
 def test_stamped_v40_upgrades_to_v41_and_backfills_only_proven_nonempty_outcome(
     tmp_path: Path,
 ):
@@ -1835,7 +2252,15 @@ def test_stamped_v40_upgrades_to_v41_and_backfills_only_proven_nonempty_outcome(
         for row in conn.execute(
             "PRAGMA foreign_key_list(kg_claim_extraction_outcomes)"
         )
-    } == {("chunk_id", "chunks", "id", "RESTRICT")}
+    } == {
+        ("chunk_id", "chunks", "id", "RESTRICT"),
+        (
+            "phase1_generation_key",
+            "phase1_generations",
+            "generation_key",
+            "RESTRICT",
+        ),
+    }
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     conn.close()
 
@@ -1905,8 +2330,14 @@ def test_stamped_v41_reopen_replaces_stale_outcome_and_manifest_guards(
     conn.close()
 
 
-def test_stamped_v41_reopen_rebuilds_early_cascade_outcome_fk(tmp_path: Path):
-    path = tmp_path / "stamped-v41-cascade-outcome.sqlite"
+@pytest.mark.parametrize("legacy_delete_action", ("CASCADE", "RESTRICT"))
+def test_stamped_v41_reopen_rebuilds_early_cascade_outcome_fk(
+    tmp_path: Path,
+    legacy_delete_action: str,
+):
+    path = tmp_path / (
+        f"stamped-v41-{legacy_delete_action.lower()}-outcome.sqlite"
+    )
     conn = core_db.connect(path)
     core_db.initialize(conn)
     chunk_id = _publish_migration_test_claim(conn)
@@ -1918,37 +2349,89 @@ def test_stamped_v41_reopen_rebuilds_early_cascade_outcome_fk(tmp_path: Path):
     ):
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
     conn.executescript(
-        """
+        f"""
         ALTER TABLE kg_claim_extraction_outcomes
             RENAME TO kg_claim_extraction_outcomes_v41_final;
         CREATE TABLE kg_claim_extraction_outcomes(
-            chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+            chunk_id TEXT PRIMARY KEY REFERENCES chunks(id)
+                ON DELETE {legacy_delete_action},
             prompt_version TEXT NOT NULL,
             prompt_generation INTEGER NOT NULL CHECK(prompt_generation >= 0),
             result_hash TEXT NOT NULL,
             succeeded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        INSERT INTO kg_claim_extraction_outcomes
-            SELECT * FROM kg_claim_extraction_outcomes_v41_final;
+        INSERT INTO kg_claim_extraction_outcomes(
+            chunk_id,
+            prompt_version,
+            prompt_generation,
+            result_hash,
+            succeeded_at
+        )
+            SELECT
+                chunk_id,
+                prompt_version,
+                prompt_generation,
+                result_hash,
+                succeeded_at
+            FROM kg_claim_extraction_outcomes_v41_final;
         DROP TABLE kg_claim_extraction_outcomes_v41_final;
         """
     )
     assert conn.execute(
         "PRAGMA foreign_key_list(kg_claim_extraction_outcomes)"
-    ).fetchone()["on_delete"] == "CASCADE"
+    ).fetchone()["on_delete"] == legacy_delete_action
     conn.close()
 
     conn = core_db.connect(path)
     core_db.initialize(conn)
+    assert {
+        (row["from"], row["table"], row["to"], row["on_delete"])
+        for row in conn.execute(
+            "PRAGMA foreign_key_list(kg_claim_extraction_outcomes)"
+        )
+    } == {
+        ("chunk_id", "chunks", "id", "RESTRICT"),
+        (
+            "phase1_generation_key",
+            "phase1_generations",
+            "generation_key",
+            "RESTRICT",
+        ),
+    }
+    assert "phase1_generation_key" in _cols(
+        conn, "kg_claim_extraction_outcomes"
+    )
     assert conn.execute(
-        "PRAGMA foreign_key_list(kg_claim_extraction_outcomes)"
-    ).fetchone()["on_delete"] == "RESTRICT"
-    assert conn.execute(
-        "SELECT prompt_version FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_claim_outcomes_phase1_generation' "
+        "AND tbl_name='kg_claim_extraction_outcomes'"
+    ).fetchone() is not None
+    assert tuple(conn.execute(
+        "SELECT prompt_version,phase1_generation_key "
+        "FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
         (chunk_id,),
-    ).fetchone()[0] == "v13"
+    ).fetchone()) == (extraction_cache_key("v13"), None)
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("DELETE FROM chunks WHERE id=?", (chunk_id,))
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    conn.close()
+
+    # Startup healing is idempotent and does not lose the restored v53 shape.
+    conn = core_db.connect(path)
+    core_db.initialize(conn)
+    assert "phase1_generation_key" in _cols(
+        conn, "kg_claim_extraction_outcomes"
+    )
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_claim_outcomes_phase1_generation' "
+        "AND tbl_name='kg_claim_extraction_outcomes'"
+    ).fetchone() is not None
+    assert conn.execute(
+        "SELECT phase1_generation_key FROM kg_claim_extraction_outcomes "
+        "WHERE chunk_id=?",
+        (chunk_id,),
+    ).fetchone()[0] is None
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     conn.close()
 
@@ -2201,7 +2684,7 @@ def test_v46_complete_domain_with_stale_v45_stamp_preserves_fact_history(
     # implicit COMMIT would escape the surrounding transaction.
     core_db._run_migrations(conn)
 
-    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='trigger' "
         "AND name='fact_revision_update_guard'"
@@ -2370,7 +2853,7 @@ def test_v46_mid_migration_failure_rolls_back_and_restart_succeeds(
 
     monkeypatch.setattr(core_db, "_apply_migration_sql", original_apply)
     core_db._run_migrations(conn)
-    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     assert "facts_cursor_message_id" in _cols(conn, "sessions")
     legacy = conn.execute(
         "SELECT id,text,source_outcome_key,lifecycle_status "
@@ -2381,10 +2864,10 @@ def test_v46_mid_migration_failure_rolls_back_and_restart_succeeds(
         "SELECT fact_id,vector_json,model,dim,text_hash,created_at "
         "FROM narrative_fact_embeddings"
     ).fetchone()
-    assert tuple(embedding) == (
-        7, "[1.0,0.0]", "legacy-vector", 2, "legacy-hash",
-        "2026-08-01T12:00:00.000Z",
-    )
+    # v46 preserves the row across its crash-atomic fact-table rebuild.  The
+    # later v57 identity migration deliberately purges every pre-v57 derived
+    # vector because its caller-chosen model label cannot prove a producer.
+    assert embedding is None
     assert conn.execute(
         "SELECT seq FROM sqlite_sequence WHERE name='narrative_facts'"
     ).fetchone()[0] == 100
@@ -2451,7 +2934,96 @@ def test_v46_sparse_v45_domain_skips_safely_and_stamps(tmp_path: Path):
 
     core_db._run_migrations(conn)
 
-    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION == 46
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     assert "facts_cursor_message_id" not in _cols(conn, "sessions")
     assert not _has_table(conn, "fact_extraction_outcomes")
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "table",
+    sorted(core_db._V57_SOURCE_LOGICAL_KEYS),
+)
+def test_v57_preflight_rejects_column_complete_source_without_logical_key(
+    tmp_path: Path, table: str,
+):
+    """A CTAS/lookalike cannot duplicate one v57 source coordinate."""
+
+    conn = core_db.connect(tmp_path / f"v57-keyless-{table}.sqlite")
+    core_db.initialize(conn)
+    assert core_db._v57_domain_present(conn) is True
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    conn.execute(f'CREATE TABLE "{table}_keyless" AS SELECT * FROM "{table}"')
+    conn.execute(f'ALTER TABLE "{table}" RENAME TO "{table}_original"')
+    conn.execute(f'ALTER TABLE "{table}_keyless" RENAME TO "{table}"')
+    conn.execute(f'DROP TABLE "{table}_original"')
+
+    assert core_db._v57_source_logical_keys_present(conn) is False
+    assert core_db._v57_domain_present(conn) is False
+    assert core_db._v57_material_bindings_present(conn) is False
+    conn.close()
+
+
+@pytest.mark.parametrize("table", ["sessions", "embedding_cache"])
+def test_v57_initialize_does_not_stamp_malformed_complete_v56_domain(
+    tmp_path: Path, table: str,
+):
+    """A real v56 boundary with a keyless prerequisite stops at v56."""
+
+    conn = core_db.connect(tmp_path / f"v56-malformed-{table}.sqlite")
+    core_db.initialize(conn)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    conn.execute(f'CREATE TABLE "{table}_keyless" AS SELECT * FROM "{table}"')
+    conn.execute(f'ALTER TABLE "{table}" RENAME TO "{table}_original"')
+    conn.execute(f'ALTER TABLE "{table}_keyless" RENAME TO "{table}"')
+    conn.execute(f'DROP TABLE "{table}_original"')
+    conn.execute(
+        "UPDATE schema_meta SET value='56' WHERE key='schema_version'"
+    )
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="v57 aggregation material preflight"):
+        core_db.initialize(conn)
+    assert core_db.schema_version(conn) == 56
+    conn.close()
+
+
+def test_v57_authentic_v56_missing_cache_key_fails_without_stamp(tmp_path: Path):
+    """Predecessor-specific preflight runs before any v57 DDL is published."""
+
+    conn = core_db.connect(tmp_path / "authentic-v56-keyless-cache.sqlite")
+    core_db.initialize(conn)
+    _downgrade_aggregation_material_to_authentic_v56(conn)
+    conn.commit()
+    assert core_db.schema_version(conn) == 56
+    assert core_db._v57_domain_footprint_present(conn) is False
+    assert core_db._v56_generation_bindings_present(
+        conn, allow_v57=False,
+    ) is True
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("ALTER TABLE embedding_cache RENAME TO old_embedding_cache")
+    conn.execute(
+        "CREATE TABLE embedding_cache("
+        "text_hash TEXT NOT NULL,model TEXT NOT NULL,"
+        "vector_json TEXT NOT NULL,dim INTEGER NOT NULL,"
+        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+    )
+    conn.execute("DROP TABLE old_embedding_cache")
+    conn.commit()
+    assert core_db._v57_domain_footprint_present(conn) is False
+    assert core_db._v56_generation_bindings_present(
+        conn, allow_v57=False,
+    ) is True
+
+    with pytest.raises(RuntimeError, match="v57 aggregation material preflight"):
+        core_db.initialize(conn)
+    assert core_db.schema_version(conn) == 56
+    assert conn.execute(
+        "SELECT value FROM schema_meta WHERE "
+        "key='aggregation_material_epoch_schema'"
+    ).fetchone() is None
+    assert not _has_table(conn, "aggregation_material_clock")
     conn.close()

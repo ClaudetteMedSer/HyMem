@@ -484,6 +484,45 @@ def test_prune_bookkeeping_keeps_newest(hy, cfg):
     )
 
 
+def test_feedback_audit_cap_zero_and_equal_timestamps_are_deterministic(hy, cfg):
+    conn = hy.conn
+    for value in ("oldest", "middle", "newest"):
+        conn.execute(
+            "INSERT INTO extraction_feedback("
+            "chunk_text_snippet,extracted_subject,extracted_predicate,"
+            "extracted_object,created_at) VALUES (?,?, 'uses','db',?)",
+            (value, value, "2026-09-06 12:00:00"),
+        )
+
+    assert prune_bookkeeping(
+        conn, dataclasses.replace(cfg, extraction_feedback_keep=2)
+    ) == 1
+    assert [
+        row[0] for row in conn.execute(
+            "SELECT extracted_subject FROM extraction_feedback ORDER BY id"
+        )
+    ] == ["middle", "newest"]
+
+    assert prune_bookkeeping(
+        conn, dataclasses.replace(cfg, extraction_feedback_keep=0)
+    ) == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM extraction_feedback"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("value", (-1, True, 1.5, "2", 2**63))
+def test_feedback_audit_cap_rejects_invalid_sqlite_integer(cfg, value):
+    with pytest.raises(ValueError, match="extraction_feedback_keep"):
+        dataclasses.replace(cfg, extraction_feedback_keep=value)
+
+
+def test_feedback_audit_cap_accepts_sqlite_max_integer(hy, cfg):
+    updated = dataclasses.replace(cfg, extraction_feedback_keep=2**63 - 1)
+    assert updated.extraction_feedback_keep == 2**63 - 1
+    assert prune_bookkeeping(hy.conn, updated) == 0
+
+
 # --- Item D: episode + stale-procedure aging ---
 
 

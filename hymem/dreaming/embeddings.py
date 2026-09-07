@@ -60,6 +60,7 @@ class PendingEpisodeEmbeddings:
     dim: int
     model: str
     cache_hits: int = 0
+    authority_hashes: list[str] | None = None
 
 
 @dataclass
@@ -127,11 +128,16 @@ class ChunkEmbedRequest:
 
 
 def fetch_chunk_embeddings(
-    conn: sqlite3.Connection, embedder: EmbeddingClient
+    conn: sqlite3.Connection,
+    embedder: EmbeddingClient,
+    *,
+    exclude_ids: set[str] | None = None,
 ) -> PendingChunkEmbeddings | None:
     """Read pending chunks and embed them, consulting embedding_cache first.
 
-    Returns None when there are no chunks to embed.
+    ``exclude_ids`` lets the dream runner keep newly materialized low-priority
+    baseline work out of this catch-all batch until that work is actually
+    scheduled. Returns None when there are no chunks to embed.
     """
     model, dim = _embedding_identity(embedder)
     all_rows = conn.execute(
@@ -145,8 +151,11 @@ def fetch_chunk_embeddings(
         ORDER BY c.id
         """
     ).fetchall()
+    excluded = exclude_ids or set()
     rows = []
     for row in all_rows:
+        if row["id"] in excluded:
+            continue
         current_hash = embedding_text_hash(row["text"])
         stored = None
         if (
@@ -276,18 +285,11 @@ def _finite_embedding_vector(
 
 
 def _embedding_identity(embedder: EmbeddingClient) -> tuple[str, int]:
-    """Read and validate the exact durable vector-space identity."""
-    try:
-        model = embedder.model
-        dim = embedder.dim
-    except Exception as exc:
-        raise RuntimeError("embedding client identity is unavailable") from exc
-    if (
-        not isinstance(model, str) or not model
-        or isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
-    ):
-        raise RuntimeError("embedding client has an invalid model/dimension")
-    return model, dim
+    """Read the exact secret-free, producer-bound durable vector space."""
+
+    from hymem.dreaming.aggregation_material import embedding_storage_identity
+
+    return embedding_storage_identity(embedder)
 
 
 def _post_embed_identity(
@@ -532,6 +534,7 @@ def fetch_message_embeddings(
     )
 
 
+@core_db.embedding_writer
 def persist_message_embeddings(
     conn: sqlite3.Connection, pending: PendingMessageEmbeddings
 ) -> int:
@@ -600,6 +603,7 @@ def persist_message_embeddings(
     return persisted
 
 
+@core_db.embedding_writer
 def persist_chunk_embeddings(
     conn: sqlite3.Connection, pending: PendingChunkEmbeddings
 ) -> int:
@@ -862,6 +866,7 @@ def fetch_edge_embeddings(
     )
 
 
+@core_db.embedding_writer
 def persist_edge_embeddings(
     conn: sqlite3.Connection, pending: PendingEdgeEmbeddings
 ) -> int:
@@ -956,10 +961,11 @@ def fetch_episode_embeddings(
     model, initial_dim = _embedding_identity(embedder)
     rows = conn.execute(
         """
-        SELECT e.id, e.rowid AS rowid, e.title, e.summary,
+        SELECT e.id, e.title, e.summary,
                ee.text_hash AS stored_hash,
                ee.vector_json AS stored_vector,
-               ee.model AS stored_model, ee.dim AS stored_dim
+               ee.model AS stored_model, ee.dim AS stored_dim,
+               ee.embedding_producer_key AS stored_producer_key
         FROM episodes e
         JOIN sessions s ON s.id = e.session_id
         LEFT JOIN episode_embeddings ee ON ee.episode_id = e.id
@@ -969,18 +975,34 @@ def fetch_episode_embeddings(
     ).fetchall()
     if not rows:
         return None
+    vector_rowids = core_db.episode_vector_rowids(
+        str(row["id"]) for row in rows
+    )
 
     pending_ids: list[str] = []
     pending_rowids: list[int] = []
     pending_hashes: list[str] = []
     pending_texts: list[str] = []
+    pending_authority_hashes: list[str] = []
+    from hymem.dreaming.aggregation_provenance import episode_input_proof
     for r in rows:
-        text = _episode_embed_text(r["title"], r["summary"])
+        # Eligibility alone is not source authority. Validate the complete
+        # lossless occurrence proof before its text can enter a provider batch.
+        proof = episode_input_proof(
+            conn, str(r["id"]), with_session_prefix=False,
+        )
+        if proof is None:
+            continue
+        # Clustering embeds the published episode title/summary.  The source
+        # proof is still mandatory before those derived bytes may reach the
+        # provider, but its rendered occurrence text is a different contract.
+        text = _episode_embed_text(str(r["title"]), str(r["summary"]))
         text_hash = embedding_text_hash(text)
         if (
             r["stored_hash"] == text_hash
             and r["stored_model"] == model
             and r["stored_dim"] == initial_dim
+            and r["stored_producer_key"] == model
         ):
             try:
                 stored = decode_vector(r["stored_vector"])
@@ -989,9 +1011,10 @@ def fetch_episode_embeddings(
             if _finite_embedding_vector(stored, expected_dim=initial_dim) is not None:
                 continue
         pending_ids.append(r["id"])
-        pending_rowids.append(int(r["rowid"]))
+        pending_rowids.append(vector_rowids[str(r["id"])])
         pending_hashes.append(text_hash)
         pending_texts.append(text)
+        pending_authority_hashes.append(proof.proof_hash)
 
     if not pending_ids:
         return None
@@ -1014,6 +1037,49 @@ def fetch_episode_embeddings(
             miss_texts.append(pending_texts[i])
 
     if miss_texts:
+        # Re-resolve every item immediately at the provider boundary. One
+        # invalid member is removed rather than leaking as part of a valid
+        # batch; row alignment is rebuilt before the hook is invoked.
+        valid_indices: list[int] = []
+        for index in range(len(pending_ids)):
+            proof = episode_input_proof(
+                conn, pending_ids[index], with_session_prefix=False,
+            )
+            current = conn.execute(
+                "SELECT e.title,e.summary FROM episodes e "
+                "JOIN sessions s ON s.id=e.session_id WHERE e.id=? AND "
+                "(e.digest_generation IS NULL OR "
+                "e.digest_generation=s.digest_published_generation)",
+                (pending_ids[index],),
+            ).fetchone()
+            if (
+                proof is not None
+                and current is not None
+                and core_db.episode_vector_rowid(pending_ids[index])
+                == pending_rowids[index]
+                and proof.proof_hash == pending_authority_hashes[index]
+                and embedding_text_hash(_episode_embed_text(
+                    str(current["title"]), str(current["summary"]),
+                ))
+                == pending_hashes[index]
+            ):
+                valid_indices.append(index)
+        if len(valid_indices) != len(pending_ids):
+            pending_ids = [pending_ids[i] for i in valid_indices]
+            pending_rowids = [pending_rowids[i] for i in valid_indices]
+            pending_hashes = [pending_hashes[i] for i in valid_indices]
+            pending_texts = [pending_texts[i] for i in valid_indices]
+            pending_authority_hashes = [
+                pending_authority_hashes[i] for i in valid_indices
+            ]
+            vectors_out = [vectors_out[i] for i in valid_indices]
+            from_cache = [from_cache[i] for i in valid_indices]
+            miss_indices = [
+                i for i, vector in enumerate(vectors_out) if vector is None
+            ]
+            miss_texts = [pending_texts[i] for i in miss_indices]
+        if not pending_ids:
+            return None
         embedded = embedder.embed(miss_texts)
         if len(embedded) != len(miss_texts):
             raise RuntimeError(
@@ -1042,6 +1108,7 @@ def fetch_episode_embeddings(
         dim=final_dim,
         model=model,
         cache_hits=sum(from_cache),
+        authority_hashes=pending_authority_hashes,
     )
 
 
@@ -1228,6 +1295,7 @@ def fetch_fact_embeddings(
     )
 
 
+@core_db.embedding_writer
 def persist_fact_embeddings(
     conn: sqlite3.Connection, pending: PendingFactEmbeddings
 ) -> int:
@@ -1287,43 +1355,83 @@ def persist_fact_embeddings(
     return persisted
 
 
+@core_db.embedding_writer
 def persist_episode_embeddings(
     conn: sqlite3.Connection, pending: PendingEpisodeEmbeddings
 ) -> int:
     """UPSERT episode vectors into episode_embeddings + vec_episodes. Cache
     misses also land in embedding_cache. Caller wraps in core_db.transaction()."""
+    from hymem.dreaming.aggregation_provenance import episode_input_proof
+
     core_db.ensure_vec_table(conn, pending.dim, model=pending.model)
     has_vec = core_db.has_vec_table(conn, table="vec_episodes")
+    vector_rowids = core_db.episode_vector_rowids(
+        str(row["id"])
+        for row in conn.execute("SELECT id FROM episodes").fetchall()
+    )
     persisted = 0
-    for ep_id, rowid, vec, text_hash, is_cached in zip(
+    authority_hashes = pending.authority_hashes or [None] * len(pending.ids)
+    for ep_id, rowid, vec, text_hash, is_cached, authority_hash in zip(
         pending.ids,
         pending.rowids,
         pending.vectors,
         pending.text_hashes,
         pending.from_cache,
+        authority_hashes,
     ):
         vec = _finite_embedding_vector(vec, expected_dim=pending.dim)
         if vec is None:
             continue
+        proof = episode_input_proof(
+            conn, ep_id, with_session_prefix=False,
+        )
+        current_row = conn.execute(
+            "SELECT e.title,e.summary FROM episodes e "
+            "JOIN sessions s ON s.id=e.session_id WHERE e.id=? AND "
+            "(e.digest_generation IS NULL OR "
+            "e.digest_generation=s.digest_published_generation)",
+            (ep_id,),
+        ).fetchone()
+        if (
+            proof is None
+            or current_row is None
+            or vector_rowids.get(ep_id) != rowid
+            or embedding_text_hash(_episode_embed_text(
+                str(current_row["title"]), str(current_row["summary"]),
+            )) != text_hash
+            or (
+                authority_hash is not None
+                and proof.proof_hash != authority_hash
+            )
+        ):
+            continue
         if not is_cached:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO embedding_cache(text_hash, model, vector_json, dim)
+                INSERT INTO embedding_cache(text_hash, model, vector_json, dim)
                 VALUES (?, ?, ?, ?)
+                ON CONFLICT(text_hash,model) DO UPDATE SET
+                    vector_json=excluded.vector_json,dim=excluded.dim
                 """,
                 (text_hash, pending.model, encode_vector(vec), len(vec)),
             )
         conn.execute(
             """
-            INSERT INTO episode_embeddings(episode_id, vector_json, model, dim, text_hash)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO episode_embeddings(
+                episode_id,vector_json,model,dim,text_hash,
+                embedding_producer_key
+            ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(episode_id) DO UPDATE SET
                 vector_json = excluded.vector_json,
                 model = excluded.model,
                 dim = excluded.dim,
-                text_hash = excluded.text_hash
+                text_hash = excluded.text_hash,
+                embedding_producer_key = excluded.embedding_producer_key
             """,
-            (ep_id, encode_vector(vec), pending.model, len(vec), text_hash),
+            (
+                ep_id, encode_vector(vec), pending.model, len(vec), text_hash,
+                pending.model,
+            ),
         )
         if has_vec:
             # vec0 doesn't support INSERT OR REPLACE on the rowid PK, so delete

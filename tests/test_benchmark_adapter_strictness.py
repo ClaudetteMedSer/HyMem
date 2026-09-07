@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,8 +18,12 @@ import longmemeval_adapter as lme  # noqa: E402
 import beam_adapter as beam  # noqa: E402
 from benchmarks.strictness import (  # noqa: E402
     AtomicCheckpoint,
+    BenchmarkCleanupError,
+    BenchmarkIntegrityError,
+    IndexingConvergenceError,
     build_manifest,
     content_hash,
+    durable_indexing_status,
     publish_checkpoint_artifact,
 )
 
@@ -144,6 +149,13 @@ def test_lme_no_longer_applies_the_legacy_8k_character_cap():
 def test_lme_retrieval_exception_is_failure_even_if_reader_would_answer_gold(
     monkeypatch,
 ):
+    secret = "LME_PRIVATE_SENTINEL_190"
+    detail = (
+        f"Bearer {secret} at /home/node/private/{secret}/state.sqlite via "
+        f"https://user:{secret}@provider.example/v1?token={secret} "
+        + "x" * 20_000
+    )
+
     class BrokenAdapter:
         def __init__(self, *_args, **_kwargs):
             pass
@@ -158,7 +170,7 @@ def test_lme_retrieval_exception_is_failure_even_if_reader_would_answer_gold(
             return {"sessions": len(sessions), "messages": 1, "chars": 4}
 
         def search(self, *_args, **_kwargs):
-            raise RuntimeError("augment exploded")
+            raise RuntimeError(detail)
 
     class WouldHallucinateGold:
         calls = 0
@@ -196,8 +208,31 @@ def test_lme_retrieval_exception_is_failure_even_if_reader_would_answer_gold(
     )
     assert row["correct"] is False
     assert "execution_failure" in row["benchmark_failure"]
-    assert "augment exploded" in row["benchmark_failure"]
+    assert row["benchmark_failure"] == "execution_failure:RuntimeError"
+    wire = json.dumps(row)
+    assert secret not in wire and "/home/node/private" not in wire
     assert reader.calls == judge.calls == 0
+
+
+@pytest.mark.parametrize("module", [lme, beam])
+def test_provider_error_sentinel_contains_only_exception_type(monkeypatch, module):
+    secret = "PROVIDER_PRIVATE_SENTINEL_884"
+    detail = (
+        f"Bearer {secret} at /home/node/private/{secret}/key.json via "
+        f"https://user:{secret}@provider.example/v1?token={secret}"
+    )
+    client = module.LLMClient("model", "key")
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(detail)
+
+    monkeypatch.setattr(client, "_call", fail)
+    monkeypatch.setattr(module.time, "sleep", lambda *_args: None)
+    result = client.chat([])
+    assert result == "[LLM_ERROR:RuntimeError]"
+    assert secret not in result
+    if hasattr(client, "last_error"):
+        assert client.last_error == "RuntimeError"
 
 
 def test_beam_two_conversation_store_cannot_retrieve_prior_sentinel(tmp_path: Path):
@@ -227,18 +262,21 @@ def test_beam_embedding_backends_are_explicit_and_manifest_bound():
     semantic = beam.resolve_embedding_config(
         "openai-compatible", model="embed-a",
         base_url="https://embeddings.example/v1", dimension=768,
+        deployment_revision="public-revision-v1",
+        deployment_tenant="public-tenant-v1",
     )
-    assert local == {
-        "configured": True,
-        "backend": "local-hash",
-        "model": "hymem-local-feature-hash-v1",
-        "base_url": "local://feature-hash",
-        "dimension": 384,
-        "quality": "lexical-feature-hash",
-        "network_free": True,
-        "fallback_policy": "none",
-        "fallback_reason": None,
-    }
+    assert local["configured"] is True
+    assert local["backend"] == "local_feature_hash"
+    assert local["dimension"] == 384
+    assert local["quality"] == "lexical"
+    assert local["network_free"] is True
+    assert local["identity_exact"] is True
+    assert local["reuse_scope"] == "durable"
+    assert local["transport_security"] == "local-no-network"
+    assert local["request_model"] == "hymem-local-feature-hash-v1"
+    assert local["vector_space_key"].startswith(
+        "hymem-embedding-producer-v1:"
+    )
     assert disabled["configured"] is False and disabled["quality"] == "none"
     assert semantic["quality"] == "semantic"
     assert semantic["network_free"] is False
@@ -309,9 +347,8 @@ def test_embedding_usage_records_identity_and_marks_cross_instance_drift():
 
     first = beam.embedding_usage_snapshot(Meter("space-a", 3), configured=True)
     second = beam.embedding_usage_snapshot(Meter("space-b", 4), configured=True)
-    assert (first["model"], first["dimension"], first["identity_available"]) == (
-        "space-a", 3, True,
-    )
+    assert first["model"].startswith("hymem-embedding-producer-v1:")
+    assert (first["dimension"], first["identity_available"]) == (3, True)
     combined = beam.aggregate_embedding_usage_snapshots([first, second])
     assert combined["identity_consistent"] is False
     assert combined["model"] is None and combined["dimension"] is None
@@ -336,7 +373,11 @@ def test_beam_embedding_backend_reaches_hymem_and_is_honestly_metered(
         assert usage["quality"] == "lexical"
         assert usage["network_free"] is True
         assert usage["calls"] == 1 and usage["input_count"] == 2
-        assert usage["model"] == local.embedding_client.model
+        from hymem.dreaming.aggregation_material import embedding_storage_identity
+
+        assert usage["model"] == embedding_storage_identity(
+            local.embedding_client
+        )[0]
         assert usage["dimension"] == 384
         assert usage["request_attempts"] == 0
         assert usage["provider_token_usage_available"] is False
@@ -383,10 +424,13 @@ def test_beam_embedding_backlog_covers_retained_messages_and_rejects_zero_vector
         assert beam.embedding_backlog_status(
             adapter.hy.read_conn, adapter.embedding_client
         )["pending_message_embeddings"] == 0
-        adapter.hy.conn.execute(
-            "UPDATE message_embeddings SET vector_json=? WHERE message_id=?",
-            (json.dumps([0.0] * adapter.embedding_client.dim), message_id),
-        )
+        from hymem.core import db as core_db
+
+        with core_db.embedding_mutation(adapter.hy.conn):
+            adapter.hy.conn.execute(
+                "UPDATE message_embeddings SET vector_json=? WHERE message_id=?",
+                (json.dumps([0.0] * adapter.embedding_client.dim), message_id),
+            )
         assert beam.embedding_backlog_status(
             adapter.hy.read_conn, adapter.embedding_client
         )["pending_message_embeddings"] == 1
@@ -409,8 +453,10 @@ def test_beam_embedding_backlog_uses_scalar_queries_not_fetchall():
         def execute(self, *_args, **_kwargs):
             return Cursor()
 
+    from hymem import StubEmbeddingClient
+
     status = beam.embedding_backlog_status(
-        Connection(), SimpleNamespace(model="m", dim=3)
+        Connection(), StubEmbeddingClient(model_name="m", dim_value=3)
     )
     assert status == {
         "pending_chunk_embeddings": 0,
@@ -419,6 +465,157 @@ def test_beam_embedding_backlog_uses_scalar_queries_not_fetchall():
         "pending_episode_embeddings": 0,
         "pending_fact_embeddings": 0,
     }
+
+    class DisabledConnection:
+        def __getattr__(self, _name):
+            raise AssertionError("disabled embeddings must not query the store")
+
+    assert all(
+        value == 0
+        for value in beam.embedding_backlog_status(
+            DisabledConnection(), None
+        ).values()
+    )
+    with pytest.raises(BenchmarkIntegrityError, match="identity is unavailable"):
+        beam.embedding_backlog_status(
+            Connection(), SimpleNamespace(model="", dim=3)
+        )
+
+
+def _empty_indexing_llm():
+    from hymem.extraction.llm import StubLLMClient
+
+    return StubLLMClient(
+        fixtures={
+            "Return the JSON object now": json.dumps({
+                "episodes": [], "summary": "", "procedures": [],
+            }),
+        },
+        default=json.dumps({
+            "triples": [], "markers": [], "complete": True,
+        }),
+    )
+
+
+def test_lme_durable_status_fails_on_only_current_fact_quarantine(tmp_path: Path):
+    from hymem import HyMem, HyMemConfig
+    from hymem.dreaming.facts import (
+        fact_cursor_retry_unit_key,
+        facts_retry_policy_version,
+    )
+
+    cfg = HyMemConfig(
+        root=tmp_path,
+        aggregation_nodes_enabled=False,
+        episode_granularity_enabled=False,
+        profile_extraction_enabled=False,
+        facts_extraction_enabled=True,
+        salience_min_chars=1,
+        dream_baseline_budget=0,
+    )
+    hy = HyMem(cfg, llm=_empty_indexing_llm())
+    try:
+        hy.log_message("fact-quarantine", "user", "A current fact retry unit.")
+        retry_unit = fact_cursor_retry_unit_key(
+            "fact-quarantine", None, None, 0
+        )
+        retry_identity = facts_retry_policy_version(
+            cfg, replay_slice_key=retry_unit
+        )
+        hy.conn.execute(
+            "UPDATE sessions SET facts_retry_count=?,"
+            "facts_retry_config_version=?,facts_quarantined=1 WHERE id=?",
+            (
+                cfg.facts_extraction_max_attempts,
+                retry_identity,
+                "fact-quarantine",
+            ),
+        )
+
+        adapter = object.__new__(lme.HyMemAdapter)
+        adapter.hy = hy
+        adapter.embedding_client = None
+        adapter.last_indexing_summary = None
+        with pytest.raises(IndexingConvergenceError) as failed:
+            adapter.dream_and_wait(timeout=10, max_cycles=1)
+        assert failed.value.summary["failure"]["code"] == "quarantined_extraction"
+        assert (
+            failed.value.summary["final_status"]["quarantined"]
+            ["quarantined_facts"]
+        ) == 1
+
+        # A recognized quarantine from an old prompt/config generation is not
+        # active under the runner's current policy and must not poison a rebuild.
+        stale_cfg = replace(
+            cfg, dream_digest_max_chars=cfg.dream_digest_max_chars + 1
+        )
+        stale_identity = facts_retry_policy_version(
+            stale_cfg, replay_slice_key=retry_unit
+        )
+        hy.conn.execute(
+            "UPDATE sessions SET facts_retry_config_version=? WHERE id=?",
+            (stale_identity, "fact-quarantine"),
+        )
+        status = durable_indexing_status(hy, None)
+        assert status["quarantined_facts"] == 0
+        assert status["quarantined_facts_malformed"] == 0
+    finally:
+        hy.close()
+
+
+def test_lme_durable_status_catches_poison_singleton_message_embedding(
+    tmp_path: Path,
+):
+    from hymem import HyMem, HyMemConfig
+
+    poison_text = "POISON_MESSAGE_EMBED_ONLY"
+
+    from hymem.extraction.embeddings import MappedStubEmbeddingClient
+
+    cfg = HyMemConfig(
+        root=tmp_path,
+        aggregation_nodes_enabled=False,
+        episode_granularity_enabled=False,
+        profile_extraction_enabled=False,
+        facts_extraction_enabled=False,
+        salience_min_chars=1,
+        dream_baseline_budget=0,
+    )
+    embedding = MappedStubEmbeddingClient(
+        dim=3,
+        model="poison-singleton-v1",
+        default=[1.0, 0.0, 0.0],
+        fail_on=poison_text,
+    )
+    hy = HyMem(
+        cfg, llm=_empty_indexing_llm(), embedding_client=embedding
+    )
+    try:
+        message_id = hy.log_message("poison", "user", poison_text)
+        assert hy.conn.execute(
+            "SELECT 1 FROM message_embeddings WHERE message_id=?",
+            (message_id,),
+        ).fetchone() is None
+
+        adapter = object.__new__(lme.HyMemAdapter)
+        adapter.hy = hy
+        adapter.embedding_client = embedding
+        adapter.last_indexing_summary = None
+        with pytest.raises(IndexingConvergenceError) as failed:
+            adapter.dream_and_wait(timeout=10, max_cycles=1)
+
+        summary = failed.value.summary
+        assert summary["failure"]["code"] == "cycle_exception"
+        # An exact content-specific producer failure is now surfaced by the
+        # cycle itself.  It must remain audible and cannot be treated as a
+        # healthy durable mirror merely because ingestion was best-effort.
+        assert summary["final_status"] is None
+        assert hy.conn.execute(
+            "SELECT 1 FROM message_embeddings WHERE message_id=?",
+            (message_id,),
+        ).fetchone() is None
+    finally:
+        hy.close()
 
 
 def test_beam_semantic_embedding_client_is_passed_through(
@@ -437,12 +634,14 @@ def test_beam_semantic_embedding_client_is_passed_through(
         embedding_backend="openai-compatible",
         embedding_model="embed-a", embedding_base_url="https://embed.example/v1",
         embedding_dim=768, embedding_api_key="do-not-publish",
+        embedding_deployment_revision="fixture-release-2026-09",
+        embedding_deployment_tenant="fixture-tenant",
     )
     adapter.open()
     try:
         assert adapter.hy._embed is sentinel
         assert seen["api_key"] == "do-not-publish"
-        assert seen["config"]["backend"] == "openai-compatible"
+        assert seen["config"]["backend"] == "openai_compatible"
         assert seen["config"]["dimension"] == 768
         assert "do-not-publish" not in json.dumps(
             beam.public_embedding_config(seen["config"])
@@ -489,10 +688,19 @@ def test_beam_search_passes_source_scope_and_fails_closed_on_leak():
 
 
 def test_beam_configured_embedding_cannot_silently_degrade_to_fts():
+    from hymem import StubEmbeddingClient
+
+    embedding_client = StubEmbeddingClient(
+        model_name="embed-v1", dim_value=8,
+    )
+    embedding_config = beam.resolve_embedding_config(
+        "local-hash", model="embed-v1", dimension=8,
+    )
     context = SimpleNamespace(
         semantic_status=SimpleNamespace(
             configured=True, attempted=True, available=False,
-            model="embed-v1", dim=8, reason="provider_error",
+            model=embedding_config["vector_space_key"], dim=8,
+            reason="provider_error",
         ),
         total_message_matches=0, message_hits=[], count_message_hits=[],
         recent_turns=[], fts_hits=[], facts=[], episodes=[],
@@ -500,8 +708,8 @@ def test_beam_configured_embedding_cannot_silently_degrade_to_fts():
         user_profile=[],
     )
     adapter = object.__new__(beam.HyMemAdapter)
-    adapter.embedding_config = {"configured": True, "dimension": 8}
-    adapter.embedding_client = SimpleNamespace(model="embed-v1", dim=8)
+    adapter.embedding_config = embedding_config
+    adapter.embedding_client = embedding_client
     adapter.hy = SimpleNamespace(augment=lambda *_args, **_kwargs: context)
     with pytest.raises(
         beam.BenchmarkIntegrityError, match="embedding retrieval was unavailable"
@@ -688,6 +896,13 @@ def test_beam_partial_official_judge_failure_invalidates_entire_row():
 
 
 def test_beam_retrieval_exception_cannot_be_scored_as_capability():
+    secret = "BEAM_PRIVATE_SENTINEL_491"
+    detail = (
+        f"Bearer {secret} at /home/node/private/{secret}/state.sqlite via "
+        f"https://user:{secret}@provider.example/v1?token={secret} "
+        + "x" * 20_000
+    )
+
     class BrokenAdapter:
         def ingest(self, *_args, **_kwargs):
             return {"total_msgs": 1, "total_chars": 4}
@@ -696,7 +911,7 @@ def test_beam_retrieval_exception_cannot_be_scored_as_capability():
             pass
 
         def search(self, *_args, **_kwargs):
-            raise RuntimeError("augment exploded")
+            raise RuntimeError(detail)
 
     class WouldHallucinateGold:
         calls = 0
@@ -723,8 +938,47 @@ def test_beam_retrieval_exception_cannot_be_scored_as_capability():
     row = output["questions"][0]
     assert row["score"] == 0.0
     assert row["result_valid"] is False
-    assert "augment exploded" in row["benchmark_failure"]
+    assert row["benchmark_failure"] == "execution_failure:RuntimeError"
+    wire = json.dumps(row)
+    assert secret not in wire and "/home/node/private" not in wire
     assert reader.calls == judge.calls == 0
+
+
+@pytest.mark.parametrize(
+    "error_type", [BenchmarkIntegrityError, BenchmarkCleanupError]
+)
+def test_beam_question_structural_failure_escapes_item_boundary(
+    monkeypatch, error_type,
+):
+    class Adapter:
+        last_indexing_summary = None
+
+        def ingest(self, *_args, **_kwargs):
+            return {"total_msgs": 1, "total_chars": 6}
+
+        def dream_and_wait(self, *_args, **_kwargs):
+            pass
+
+    primary = error_type("structural question failure")
+    monkeypatch.setattr(
+        beam, "_evaluate_beam_question",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(primary),
+    )
+    conv = {
+        "id": "c", "scale": "100K",
+        "messages": [{"role": "user", "content": "source"}],
+        "questions": [{
+            "question_id": "q1", "ability_short": "IE", "question": "q?",
+        }],
+    }
+
+    with pytest.raises(error_type) as caught:
+        beam.evaluate_conversation(
+            True, object(), object(), Adapter(), conv, 3,
+            oracle_ability=True,
+        )
+
+    assert caught.value is primary
 
 
 @pytest.mark.parametrize(
@@ -1021,7 +1275,8 @@ def test_beam_episode_probe_failure_preserves_valid_score(monkeypatch):
     )
     assert row["result_valid"] is True and row["score"] == 1.0
     assert row["probe"] is None
-    assert "diagnostic exploded" in row["probe_error"]
+    assert row["probe_error"] == "probe_failure:RuntimeError"
+    assert "diagnostic exploded" not in json.dumps(row)
 
 
 def test_beam_failing_canary_persists_usage_before_exit(tmp_path: Path):
@@ -1062,6 +1317,65 @@ def test_beam_failing_canary_persists_usage_before_exit(tmp_path: Path):
     assert usage["token_usage_available"] is False
 
 
+@pytest.mark.parametrize(
+    "primary_type", [RuntimeError, KeyboardInterrupt, SystemExit],
+    ids=["exception", "keyboard_interrupt", "system_exit"],
+)
+def test_beam_canary_segment_failure_preserves_exact_primary_and_safe_note(
+    capsys, primary_type,
+):
+    primary = primary_type("provider secret=primary-token")
+    secondary = RuntimeError("checkpoint secret=secondary-token")
+    primaries_seen = []
+
+    class FailingCanary:
+        def chat(self, *_args, **_kwargs):
+            raise primary
+
+    class FailingLedger:
+        def update_execution_segment(self, *_args, **_kwargs):
+            primaries_seen.append(sys.exc_info()[1])
+            raise secondary
+
+    with pytest.raises(BaseException) as caught:
+        beam._run_canary_with_checkpoint(
+            FailingLedger(), "process-test", lambda status: {"status": status},
+            "answer", FailingCanary(), [], 12,
+        )
+
+    assert caught.value is primary
+    assert primaries_seen == [primary]
+    notes = "\n".join(getattr(primary, "__notes__", ()))
+    assert '"stage":"execution_segment_snapshot"' in notes
+    assert '"exception_type":"RuntimeError"' in notes
+    assert "primary-token" not in notes
+    assert "secondary-token" not in notes
+    assert "secondary-token" not in capsys.readouterr().err
+
+
+def test_beam_canary_standalone_segment_failure_raises_unchanged():
+    secondary = RuntimeError("standalone segment persistence failure")
+    primaries_seen = []
+
+    class SuccessfulCanary:
+        def chat(self, *_args, **_kwargs):
+            return "ok"
+
+    class FailingLedger:
+        def update_execution_segment(self, *_args, **_kwargs):
+            primaries_seen.append(sys.exc_info()[1])
+            raise secondary
+
+    with pytest.raises(BaseException) as caught:
+        beam._run_canary_with_checkpoint(
+            FailingLedger(), "process-test", lambda status: {"status": status},
+            "answer", SuccessfulCanary(), [], 12,
+        )
+
+    assert caught.value is secondary
+    assert primaries_seen == [None]
+
+
 def test_beam_postprocessing_failure_still_publishes_durable_rows(
     tmp_path: Path, monkeypatch,
 ):
@@ -1092,12 +1406,82 @@ def test_beam_postprocessing_failure_still_publishes_durable_rows(
         ["100K"], label_free=True, judge_gold=True,
     )
     assert summary == {}
-    assert "summary exploded" in payload["diagnostic_errors"][0]
+    assert payload["diagnostic_errors"] == [{
+        "stage": "score_summary", "exception_type": "RuntimeError",
+    }]
+    assert "summary" not in payload
+    assert "summary_counts" not in payload
+    assert "summary exploded" not in json.dumps(payload)
     archive = tmp_path / "results_20260904T120000Z-strict-deadbeef.json"
     publish_checkpoint_artifact(ledger, archive, payload=payload)
     saved = json.loads(archive.read_text())
     assert saved["execution"]["counts"]["expected"] == 1
     assert saved["per_question"][0]["score"] == 1.0
+    assert "summary" not in saved
+    assert "summary_counts" not in saved
+    ledger.close()
+
+    malformed_ledger = AtomicCheckpoint(
+        tmp_path / "malformed-summary.checkpoint.json", manifest=manifest,
+        expected_ids=["q1"], verdict_key="result_valid",
+    )
+    malformed_ledger.record("q1", row={
+        "question_id": "q1", "ability": "IE", "score": 1.0,
+        "result_valid": True, "correct": True,
+    })
+    monkeypatch.setattr(beam, "compute_scores", lambda _rows: {"100K": {}})
+    malformed_payload, malformed_summary, _ = beam._strict_beam_payload(
+        malformed_ledger,
+        {"100K": [{
+            "id": "c", "questions": [
+                {"question_id": "q1", "ability_short": "IE"},
+            ],
+        }]},
+        ["100K"], label_free=True, judge_gold=True,
+    )
+    assert malformed_summary == {}
+    assert "summary" not in malformed_payload
+    assert "summary_counts" not in malformed_payload
+    assert malformed_payload["diagnostic_errors"] == [{
+        "stage": "score_summary",
+        "exception_type": "BenchmarkIntegrityError",
+    }]
+    malformed_ledger.close()
+
+    reconstruction_ledger = AtomicCheckpoint(
+        tmp_path / "reconstruction.checkpoint.json", manifest=manifest,
+        expected_ids=["q1"], verdict_key="result_valid",
+    )
+    reconstruction_ledger.record("q1", row={
+        "question_id": "q1", "ability": "IE", "score": 1.0,
+        "result_valid": True, "correct": True,
+    })
+    monkeypatch.setattr(
+        reconstruction_ledger, "reconcile",
+        lambda: (_ for _ in ()).throw(ValueError("private reconstruction detail")),
+    )
+    reconstruction_payload, reconstruction_summary, reconstructed = (
+        beam._strict_beam_payload(
+            reconstruction_ledger,
+            {"100K": [{
+                "id": "c", "questions": [
+                    {"question_id": "q1", "ability_short": "IE"},
+                ],
+            }]},
+            ["100K"], label_free=True, judge_gold=True,
+        )
+    )
+    assert reconstruction_summary == {}
+    assert reconstructed == []
+    assert "summary" not in reconstruction_payload
+    assert "summary_counts" not in reconstruction_payload
+    assert reconstruction_payload["diagnostic_errors"] == [{
+        "stage": "result_reconstruction", "exception_type": "ValueError",
+    }]
+    assert "private reconstruction detail" not in json.dumps(
+        reconstruction_payload
+    )
+    reconstruction_ledger.close()
 
 
 def test_beam_partial_callback_failure_materializes_only_still_pending_ids(
@@ -1177,10 +1561,10 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
     """Exercise the paid-run lifecycle with deterministic, network-free fakes.
 
     This covers the failure seams that unit helpers cannot: a callback crashes
-    after one durable row, adapter cleanup raises, presentation raises after
-    publication, independent conversations receive independent stores, and a
-    terminal resume republishes without constructing provider clients or
-    reopening memory stores.
+    after one durable row, adapter cleanup blocks publication, presentation
+    raises only after cleanup and publication, independent conversations receive
+    independent stores, and a terminal resume republishes without constructing
+    provider clients or reopening memory stores.
     """
 
     def question(item_id: str, ability: str = "IE") -> dict:
@@ -1258,6 +1642,7 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
 
     live_adapters = []
     open_paths = []
+    fail_adapter_close = {"enabled": True}
 
     class ZeroMeter:
         call_count = 0
@@ -1294,8 +1679,7 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
             open_paths.append(self.db_path)
 
         def close(self):
-            # Cleanup failures are diagnostics and cannot strand durable rows.
-            if self is live_adapters[0]:
+            if fail_adapter_close["enabled"]:
                 raise RuntimeError("synthetic close failure")
 
     monkeypatch.setattr(beam, "HyMemAdapter", FakeAdapter)
@@ -1324,6 +1708,96 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
 
     monkeypatch.setattr(beam, "evaluate_conversation", fake_evaluate)
     monkeypatch.setattr(beam, "print_episode_probe", lambda _rows: None)
+    extraction_canary_calls = []
+    fail_extraction_canary = {"enabled": False}
+
+    def fake_extraction_canary(**kwargs):
+        extraction_canary_calls.append(kwargs)
+        policy = beam.extraction_canary_policy()
+        client_identity = beam.extraction_canary_client_policy(
+            base_url=kwargs["base_url"], model=kwargs["model"],
+            thinking=kwargs["thinking"],
+        )
+        report = {
+            **policy,
+            "status": "passed",
+            "client": {
+                "client_class": "fixture.CanaryClient", **client_identity,
+            },
+            "client_closed": True,
+            "completion_calls": policy["normal_pass_completion_calls"],
+            "provider_attempts": policy["normal_pass_completion_calls"],
+            "initial_prepartition_leaves": policy["expected_prepartition_leaves"],
+            "duplicate_triples_collapsed": 0,
+            "usage": {
+                "calls": policy["normal_pass_completion_calls"],
+                "calls_available": True,
+                "request_attempts": policy["normal_pass_completion_calls"],
+                "request_attempts_available": True,
+                "successful_responses": policy["normal_pass_completion_calls"],
+                "successful_responses_available": True,
+                "prompt_tokens": 20, "completion_tokens": 10,
+                "total_tokens": 30, "latency_s": 0.1,
+                "cost_usd": None, "token_usage_available": True,
+                "latency_available": True, "cost_available": False,
+            },
+            "matched_supported_claims": 2,
+            "missing_expected_claim_indexes": [],
+            "valid_triples_returned": 2,
+            "valid_markers_returned": 0,
+            "execution_path": policy["normal_execution_path"],
+            "claim_evidence": [
+                {"expected_claim_index": index, **claim}
+                for index, claim in enumerate(policy["expected_claims"])
+            ],
+        }
+        if fail_extraction_canary["enabled"]:
+            report.update(
+                status="failed", failure_reason="clean_empty",
+                failure_details=[], matched_supported_claims=0,
+                missing_expected_claim_indexes=[0, 1],
+                valid_triples_returned=0, claim_evidence=[],
+            )
+            raise beam.ExtractionCanaryError(
+                "synthetic extraction canary failure", report
+            )
+        return report
+
+    monkeypatch.setattr(
+        beam, "run_configured_extraction_canary", fake_extraction_canary
+    )
+
+    # The new Phase-1 canary itself fails before reader/judge canaries and
+    # before any live memory adapter/store. Its sanitized report is durable in
+    # the checkpoint execution segment, and the lease is still recoverable.
+    extraction_results = tmp_path / "extraction-canary"
+    extraction_argv = [
+        "beam_adapter.py", "--scales", "100K", "--sample", "2",
+        "--no-prereg", "--api-key", "fake", "--embedding-backend", "none",
+        "--results-dir", str(extraction_results),
+    ]
+    fail_extraction_canary["enabled"] = True
+    monkeypatch.setattr(sys, "argv", extraction_argv)
+    with pytest.raises(
+        beam.ExtractionCanaryError, match="synthetic extraction canary failure"
+    ):
+        beam.main()
+    fail_extraction_canary["enabled"] = False
+    extraction_checkpoints = list(
+        (extraction_results / "checkpoints").glob("*.json")
+    )
+    assert len(extraction_checkpoints) == 1
+    extraction_checkpoint = json.loads(extraction_checkpoints[0].read_text())
+    extraction_segment = extraction_checkpoint["execution_segments"][0]
+    assert extraction_segment["extraction_canary"]["status"] == "failed"
+    assert extraction_segment["extraction_canary"]["failure_reason"] == "clean_empty"
+    extraction_reacquired = AtomicCheckpoint(
+        extraction_checkpoints[0], manifest=extraction_checkpoint["manifest"],
+        expected_ids=extraction_checkpoint["expected_ids"], resume=True,
+        verdict_key="result_valid",
+    )
+    extraction_reacquired.close()
+    assert open_paths == []
 
     # A canary exception occurs before any memory store opens. The public main
     # wrapper must still release the checkpoint lease even while pytest retains
@@ -1357,6 +1831,18 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
         "--results-dir", str(first_results),
     ]
     monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(BenchmarkIntegrityError, match="cleanup failed") as cleanup:
+        beam.main()
+    assert "synthetic close failure" not in str(cleanup.value)
+    assert not list(first_results.glob("results_*-strict-*.json"))
+    assert not (first_results / "results_latest.json").exists()
+
+    checkpoints = list((first_results / "checkpoints").glob("*.json"))
+    assert len(checkpoints) == 1
+    fail_adapter_close["enabled"] = False
+    monkeypatch.setattr(
+        sys, "argv", argv + ["--resume-from", str(checkpoints[0])],
+    )
     monkeypatch.setattr(
         beam, "print_report",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -1377,17 +1863,31 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
         "q1", "q2", "q3",
     ]
     assert saved["per_question"][1]["result_valid"] is False
-    assert any(
-        "synthetic close failure" in error
-        for error in saved["diagnostic_errors"]
+    assert saved["per_question"][1]["benchmark_failure"] == (
+        "conversation_failure:RuntimeError"
     )
+    assert "synthetic crash after durable callback" not in json.dumps(saved)
+    first_segment = saved["execution"]["segments"][0]
+    assert first_segment["extraction_canary"]["status"] == "passed"
+    assert first_segment["extraction_canary"]["usage_accounting"] == (
+        beam.extraction_canary_policy()["usage_accounting"]
+    )
+    assert first_segment["memory_pipeline_usage"]["calls"] == 0
+    # This lifecycle fixture intentionally abbreviates BEAM to IE/TR instead
+    # of constructing the benchmark's ten-ability denominator. The adapter
+    # must therefore preserve its rows while declining to publish a strict
+    # derived summary that the registry would reject.
+    assert saved["diagnostic_errors"] == [{
+        "stage": "score_summary",
+        "exception_type": "BenchmarkIntegrityError",
+    }]
+    assert "summary" not in saved
+    assert "summary_counts" not in saved
     assert len(open_paths) == 2 and len(set(open_paths)) == 2
     assert [adapter.private_state for adapter in live_adapters] == [
         {"conversation-a"}, {"conversation-b"},
     ]
 
-    checkpoints = list((first_results / "checkpoints").glob("*.json"))
-    assert len(checkpoints) == 1
     client_count = len(llm_constructions)
     provider_count = len(provider_resolutions)
     open_count = len(open_paths)
@@ -1406,6 +1906,9 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
     assert len(llm_constructions) == client_count
     assert len(provider_resolutions) == provider_count
     assert len(open_paths) == open_count
+    # Once for each pending run configuration above; never per conversation,
+    # terminal resume, or calibration-only invocation.
+    assert len(extraction_canary_calls) == 4
     republished = list(second_results.glob("results_*-strict-*.json"))
     assert len(republished) == 1
     assert json.loads(republished[0].read_text())["execution"]["counts"] == saved[
@@ -1429,3 +1932,248 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
     assert len(llm_constructions) == client_count
     assert len(provider_resolutions) == provider_count
     assert len(open_paths) == open_count
+
+
+@pytest.mark.parametrize(
+    "failure_site",
+    [
+        "checkpoint",
+        "evaluator",
+        "inner_question",
+        "checkpoint_and_segment",
+        "evaluator_and_segment",
+        "interrupt_and_segment",
+        "segment_only",
+    ],
+)
+def test_beam_structural_conversation_failure_aborts_before_publication(
+    monkeypatch, tmp_path, failure_site,
+):
+    """Conversation primaries survive a failing final segment snapshot."""
+
+    question = {
+        "question_id": "q1", "ability_short": "IE", "question": "q?",
+        "ideal_answer": "", "gold_text": "gold", "gold_kind": "response",
+        "gold_resolution": "exact", "rubric": ["criterion"],
+    }
+    conversations = {"100K": [{
+        "id": "conversation-a", "scale": "100K",
+        "messages": [{"role": "user", "content": "source"}],
+        "questions": [question],
+    }]}
+    monkeypatch.setattr(
+        beam, "resolve_dataset_revisions",
+        lambda _scales, _pin=None: {beam.BEAM_REPO: "a" * 40},
+    )
+    monkeypatch.setattr(
+        beam, "load_beam_conversations", lambda *_a, **_k: conversations,
+    )
+    monkeypatch.setattr(beam, "print_gold_audit", lambda _rows: None)
+    monkeypatch.setattr(beam, "print_report", lambda *_a, **_k: None)
+    monkeypatch.setattr(beam, "print_episode_probe", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        beam, "resolve_answer_provider",
+        lambda spec, _key, role="answer": (
+            beam.parse_provider_spec(spec)[1],
+            beam.parse_provider_spec(spec)[2],
+            "resolved-key",
+            beam.parse_provider_spec(spec)[0],
+        ),
+    )
+
+    class MeterOnlyClient:
+        call_count = 0
+        request_attempts = 0
+        successful_responses = 0
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        total_latency_s = 0.0
+        cost_usd = 0.0
+        token_usage_available = True
+        last_finish_reason = "stop"
+
+        def __init__(self, model, _key, **_kwargs):
+            self.model = model
+
+        def close(self):
+            pass
+
+    class FakeAdapter:
+        def __init__(self, db_path, **_kwargs):
+            self.db_path = Path(db_path)
+            self.pipeline_llm = None
+            self.embedding_client = None
+            self.last_indexing_summary = None
+
+        def build_config(self):
+            from hymem import HyMemConfig
+            return HyMemConfig(root=self.db_path.parent)
+
+        def open(self):
+            self.pipeline_llm = MeterOnlyClient("pipeline", "key")
+            self.last_indexing_summary = {
+                "cycles": 1, "converged": True, "pending_total": 0,
+            }
+
+        def ingest(self, *_args, **_kwargs):
+            return {"total_msgs": 1, "total_chars": 6}
+
+        def dream_and_wait(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(beam, "LLMClient", MeterOnlyClient)
+    monkeypatch.setattr(beam, "HyMemAdapter", FakeAdapter)
+    monkeypatch.setattr(
+        beam, "run_configured_extraction_canary", lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        beam, "validate_extraction_canary_report", lambda *_a, **_k: {},
+    )
+    monkeypatch.setattr(beam, "print_extraction_canary", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        beam, "_run_canary_with_checkpoint", lambda *_a, **_k: "ok",
+    )
+
+    original_record = beam.AtomicCheckpoint.record
+    original_update_segment = beam.AtomicCheckpoint.update_execution_segment
+    record_calls = 0
+    fail_segment_update = False
+    segment_primary_seen = []
+    checkpoint_primary = BenchmarkIntegrityError(
+        "original checkpoint failure with secret=primary-token"
+    )
+    evaluator_primary = BenchmarkIntegrityError(
+        "original evaluator failure with secret=evaluator-token"
+    )
+    interrupt_primary = KeyboardInterrupt(
+        "original interrupt with secret=interrupt-token"
+    )
+    segment_failure = RuntimeError(
+        "secondary segment failure with secret=secondary-token"
+    )
+
+    def maybe_fail_record(self, *args, **kwargs):
+        nonlocal fail_segment_update, record_calls
+        record_calls += 1
+        if failure_site in {"checkpoint", "checkpoint_and_segment"} \
+                and record_calls == 1:
+            if failure_site == "checkpoint_and_segment":
+                fail_segment_update = True
+            raise checkpoint_primary
+        return original_record(self, *args, **kwargs)
+
+    monkeypatch.setattr(beam.AtomicCheckpoint, "record", maybe_fail_record)
+
+    def maybe_fail_segment_update(self, *args, **kwargs):
+        if fail_segment_update:
+            segment_primary_seen.append(sys.exc_info()[1])
+            raise segment_failure
+        return original_update_segment(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        beam.AtomicCheckpoint,
+        "update_execution_segment",
+        maybe_fail_segment_update,
+    )
+
+    def evaluate(*_args, pending_ids, on_result, **_kwargs):
+        nonlocal fail_segment_update
+        if failure_site == "evaluator":
+            raise BenchmarkIntegrityError("synthetic evaluator integrity failure")
+        if failure_site == "evaluator_and_segment":
+            fail_segment_update = True
+            raise evaluator_primary
+        if failure_site == "interrupt_and_segment":
+            fail_segment_update = True
+            raise interrupt_primary
+        assert pending_ids == {"q1"}
+        on_result({
+            "question_id": "q1", "scale": "100K",
+            "conv_id": "conversation-a", "ability": "IE",
+            "question": "q?", "score": 1.0, "llm_judge_score": 1.0,
+            "scores": [1.0], "judge_protocol": "official",
+            "result_valid": True, "correct": True,
+        })
+        if failure_site == "segment_only":
+            fail_segment_update = True
+
+    if failure_site == "inner_question":
+        monkeypatch.setattr(
+            beam, "_evaluate_beam_question",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                BenchmarkIntegrityError("synthetic inner integrity failure")
+            ),
+        )
+    else:
+        monkeypatch.setattr(beam, "evaluate_conversation", evaluate)
+    results_dir = tmp_path / "results"
+    checkpoint = tmp_path / f"beam-{failure_site}.checkpoint.json"
+    monkeypatch.setattr(sys, "argv", [
+        "beam_adapter.py", "--scales", "100K", "--sample", "1",
+        "--no-prereg", "--api-key", "fake", "--embedding-backend", "none",
+        "--results-dir", str(results_dir), "--checkpoint", str(checkpoint),
+    ])
+
+    with pytest.raises(BaseException) as caught:
+        beam.main()
+
+    if failure_site == "checkpoint_and_segment":
+        assert segment_primary_seen == [caught.value]
+        assert type(caught.value).__name__ == "_CheckpointPersistenceAbort"
+        assert caught.value.__cause__ is checkpoint_primary
+        notes = "\n".join(getattr(caught.value, "__notes__", ()))
+        assert '"stage":"execution_segment_snapshot"' in notes
+        assert '"exception_type":"RuntimeError"' in notes
+        assert "secondary-token" not in notes
+    elif failure_site == "evaluator_and_segment":
+        assert segment_primary_seen == [caught.value]
+        assert type(caught.value).__name__ == "_CheckpointPersistenceAbort"
+        assert caught.value.__cause__ is evaluator_primary
+        notes = "\n".join(getattr(caught.value, "__notes__", ()))
+        assert '"stage":"execution_segment_snapshot"' in notes
+        assert '"exception_type":"RuntimeError"' in notes
+        assert "secondary-token" not in notes
+    elif failure_site == "interrupt_and_segment":
+        assert caught.value is interrupt_primary
+        assert segment_primary_seen == [interrupt_primary]
+        notes = "\n".join(getattr(caught.value, "__notes__", ()))
+        assert '"stage":"execution_segment_snapshot"' in notes
+        assert '"exception_type":"RuntimeError"' in notes
+        assert "secondary-token" not in notes
+    elif failure_site == "segment_only":
+        assert caught.value is segment_failure
+        assert segment_primary_seen == [None]
+    else:
+        assert type(caught.value).__name__ == "_CheckpointPersistenceAbort"
+        assert isinstance(caught.value.__cause__, BenchmarkIntegrityError)
+    assert record_calls == (
+        1 if failure_site in {
+            "checkpoint", "checkpoint_and_segment", "segment_only",
+        } else 0
+    )
+    state = json.loads(checkpoint.read_text())
+    assert state["status"] == "running"
+    if failure_site == "segment_only":
+        assert list(state["entries"]) == ["q1"]
+    else:
+        assert state["entries"] == {}
+    assert not list(results_dir.glob("results_*-strict-*.json"))
+    assert not (results_dir / "results_latest.json").exists()
+
+    resumed = beam.AtomicCheckpoint(
+        checkpoint,
+        manifest=state["manifest"],
+        expected_ids=state["expected_ids"],
+        resume=True,
+        verdict_key="result_valid",
+    )
+    try:
+        assert resumed.pending_ids == (
+            () if failure_site == "segment_only" else ("q1",)
+        )
+    finally:
+        resumed.close()

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from hymem.contrib.implementation_identity import import_time_source_sha256
+
+EXTRACTION_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
+
 import logging
 import math
 from dataclasses import dataclass
@@ -34,7 +38,6 @@ class Triple:
 def extract_triples(
     client: LLMClient,
     text: str,
-    negative_examples: str = "",
 ) -> tuple[list[Triple], dict[str, str], dict[str, dict[str, str]]]:
     """Run the locked-vocabulary triple prompt and validate the output.
 
@@ -44,7 +47,7 @@ def extract_triples(
     Anything malformed or off-vocabulary is silently dropped — the LLM is allowed
     to be wrong, but we never propagate garbage into the graph.
     """
-    system = build_triple_system(negative_examples)
+    system = build_triple_system()
     request = LLMRequest(
         system=system,
         user=TRIPLE_USER_TEMPLATE.format(text=text),
@@ -80,73 +83,180 @@ _COMBINED_OPTIONAL_KEYS = frozenset({
     "source_message_id",
 })
 
+_COMBINED_MAX_PROPERTIES = 4
 
-def combined_triple_item_is_valid(
+
+def normalize_combined_triple_item(
     item: object, *, require_source_message_id: bool = False
-) -> bool:
-    """Exact item contract for the cursor-authorizing combined extractor."""
+) -> tuple[dict | None, tuple[str, ...], tuple[str, ...]]:
+    """Validate one combined-extractor item and normalize harmless drift.
+
+    The return value is ``(item, errors, normalizations)``.  Core claim
+    semantics (subject/predicate/object/polarity) and the source citation are
+    fail-closed.  Optional enrichment is not allowed to destroy a valid claim:
+    malformed type/property/value hints are removed, and harmless surrounding
+    whitespace/case drift is normalized deterministically.  Error and
+    normalization codes contain field names only -- never model-supplied
+    values -- so callers may safely persist them as diagnostics.
+    """
     if not isinstance(item, dict):
-        return False
+        return None, ("item:not_object",), ()
+
+    errors: list[str] = []
+    normalizations: list[str] = []
+    normalized: dict = {}
     keys = set(item)
-    if not _COMBINED_REQUIRED_KEYS <= keys:
-        return False
+    for key in sorted(_COMBINED_REQUIRED_KEYS - keys):
+        errors.append(f"{key}:missing")
     if keys - _COMBINED_REQUIRED_KEYS - _COMBINED_OPTIONAL_KEYS:
-        return False
-    if not all(
-        isinstance(item[key], str) and bool(item[key].strip())
-        for key in ("subject", "predicate", "object")
+        errors.append("item:unexpected_keys")
+
+    for key in ("subject", "predicate", "object"):
+        value = item.get(key)
+        if not isinstance(value, str):
+            errors.append(f"{key}:not_string")
+            continue
+        stripped = value.strip()
+        if not stripped:
+            errors.append(f"{key}:empty")
+            continue
+        normalized[key] = stripped
+    predicate = normalized.get("predicate")
+    if predicate is not None:
+        canonical_predicate = predicate.casefold()
+        if canonical_predicate not in ALLOWED_PREDICATES:
+            errors.append("predicate:not_allowed")
+        else:
+            if canonical_predicate != predicate:
+                normalizations.append("predicate:normalized_case")
+            normalized["predicate"] = canonical_predicate
+
+    polarity = item.get("polarity")
+    if (
+        isinstance(polarity, bool)
+        or not isinstance(polarity, int)
+        or polarity not in (1, -1)
     ):
-        return False
-    if item["predicate"] not in ALLOWED_PREDICATES:
-        return False
-    polarity = item["polarity"]
-    if isinstance(polarity, bool) or not isinstance(polarity, int) or polarity not in (1, -1):
-        return False
+        errors.append("polarity:not_plus_or_minus_one")
+    else:
+        normalized["polarity"] = polarity
+
     source_message_id = item.get("source_message_id")
+    if isinstance(source_message_id, str):
+        # Some OpenAI-compatible providers serialize an integer schema field as
+        # a JSON string. Only the canonical positive-decimal spelling is
+        # losslessly equivalent: no sign, whitespace, leading zero, decimal,
+        # exponent, or Unicode digit normalization is accepted here.
+        if (
+            source_message_id
+            and len(source_message_id) <= 19
+            and source_message_id[0] in "123456789"
+            and all(character in "0123456789" for character in source_message_id)
+        ):
+            parsed_source_message_id = int(source_message_id)
+            if str(parsed_source_message_id) == source_message_id:
+                source_message_id = parsed_source_message_id
+                normalizations.append(
+                    "source_message_id:normalized_decimal_string"
+                )
     if require_source_message_id and "source_message_id" not in item:
-        return False
-    if source_message_id is not None and (
+        errors.append("source_message_id:missing")
+    elif source_message_id is not None and (
         isinstance(source_message_id, bool)
         or not isinstance(source_message_id, int)
         or source_message_id < 1
     ):
-        return False
+        errors.append("source_message_id:not_positive_integer")
+    elif "source_message_id" in item:
+        normalized["source_message_id"] = source_message_id
+
+    if errors:
+        return None, tuple(errors), ()
+
     for key in ("value_text", "value_unit", "temporal_scope"):
-        if key in item and not isinstance(item[key], str):
-            return False
+        if key not in item:
+            continue
+        value = item[key]
+        if not isinstance(value, str) or not value.strip():
+            normalizations.append(f"{key}:removed_invalid_optional")
+            continue
+        normalized[key] = value.strip()
+
     if "value_numeric" in item:
         number = item["value_numeric"]
-        if isinstance(number, bool) or not isinstance(number, (int, float)):
-            return False
-        try:
-            finite = math.isfinite(float(number))
-        except (OverflowError, ValueError):
-            return False
-        if not finite:
-            return False
+        finite = False
+        if not isinstance(number, bool) and isinstance(number, (int, float)):
+            try:
+                finite = math.isfinite(float(number))
+            except (OverflowError, ValueError):
+                finite = False
+        if finite:
+            normalized["value_numeric"] = number
+        else:
+            normalizations.append("value_numeric:removed_invalid_optional")
+
     for key in ("subject_type", "object_type"):
-        if key in item and (
-            not isinstance(item[key], str) or item[key] not in _VALID_TYPES
-        ):
-            return False
+        if key not in item:
+            continue
+        value = item[key]
+        candidate = value.strip().casefold() if isinstance(value, str) else ""
+        if candidate in _VALID_TYPES:
+            normalized[key] = candidate
+        else:
+            normalizations.append(f"{key}:removed_invalid_optional")
+
     for key in ("subject_properties", "object_properties"):
         if key not in item:
             continue
-        props = item[key]
-        if not isinstance(props, dict) or len(props) > 4:
-            return False
-        for prop_key, prop_value in props.items():
+        properties = item[key]
+        if not isinstance(properties, dict):
+            normalizations.append(f"{key}:removed_invalid_optional")
+            continue
+        candidates: dict[str, str] = {}
+        conflicts: set[str] = set()
+        removed = False
+        for prop_key, prop_value in properties.items():
+            if not isinstance(prop_key, str) or not isinstance(prop_value, str):
+                removed = True
+                continue
+            normalized_key = prop_key.strip().lower()
+            normalized_value = prop_value.strip()
             if (
-                not isinstance(prop_key, str)
-                or not isinstance(prop_value, str)
-                or not prop_key.strip()
-                or prop_key != prop_key.strip().lower()
-                or not prop_value.strip()
-                or len(prop_key) > _MAX_PROP_KEY_LEN
-                or len(prop_value) > _MAX_PROP_VALUE_LEN
+                not normalized_key
+                or not normalized_value
+                or len(normalized_key) > _MAX_PROP_KEY_LEN
+                or len(normalized_value) > _MAX_PROP_VALUE_LEN
             ):
-                return False
-    return True
+                removed = True
+                continue
+            prior = candidates.get(normalized_key)
+            if prior is not None and prior != normalized_value:
+                conflicts.add(normalized_key)
+                removed = True
+                continue
+            candidates[normalized_key] = normalized_value
+        for conflict in conflicts:
+            candidates.pop(conflict, None)
+        ordered = sorted(candidates.items())
+        if len(ordered) > _COMBINED_MAX_PROPERTIES:
+            ordered = ordered[:_COMBINED_MAX_PROPERTIES]
+            removed = True
+        if ordered:
+            normalized[key] = dict(ordered)
+        if removed or not ordered:
+            normalizations.append(f"{key}:normalized_optional")
+
+    return normalized, (), tuple(normalizations)
+
+
+def combined_triple_item_is_valid(
+    item: object, *, require_source_message_id: bool = False
+) -> bool:
+    """Whether the item has valid core semantics after safe hint cleanup."""
+    normalized, errors, _normalizations = normalize_combined_triple_item(
+        item, require_source_message_id=require_source_message_id
+    )
+    return normalized is not None and not errors
 
 
 # Caps on per-entity property metadata. The LLM is occasionally chatty;

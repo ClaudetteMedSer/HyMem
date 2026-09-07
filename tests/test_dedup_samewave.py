@@ -18,37 +18,26 @@ from hymem.core import db as core_db
 from hymem.dreaming import phase1
 from hymem.dreaming.chunks import Chunk
 from hymem.dreaming.phase1 import ChunkExtraction
+from hymem.extraction.embeddings import MappedStubEmbeddingClient
 from hymem.extraction.triples import Triple
 
 
-class FakeEmbedder:
+def FakeEmbedder(mapping: dict[str, list[float]]):
     """Maps exact triple-text strings to controlled vectors so cosine is
     deterministic. Unmapped texts raise (every embedded text must be mapped)."""
 
-    model = "fake"
-    dim = 4
-
-    def __init__(self, mapping: dict[str, list[float]]):
-        self.mapping = mapping
-        self.calls: list[list[str]] = []
-
-    def embed(self, texts):
-        self.calls.append(list(texts))
-        return [self.mapping[t] for t in texts]
+    return MappedStubEmbeddingClient(
+        mapping, model="samewave-fixture-v1", dim=4,
+    )
 
 
-class TxnWatchingEmbedder(FakeEmbedder):
+def TxnWatchingEmbedder(conn, mapping):
     """Records ``conn.in_transaction`` at every embed() call so a test can prove
     no embed ever ran under the write lock (mirrors test_dedup_delock.py)."""
 
-    def __init__(self, conn, mapping):
-        super().__init__(mapping)
-        self._conn = conn
-        self.in_txn_flags: list[bool] = []
-
-    def embed(self, texts):
-        self.in_txn_flags.append(self._conn.in_transaction)
-        return super().embed(texts)
+    return MappedStubEmbeddingClient(
+        mapping, model="samewave-fixture-v1", dim=4, conn=conn,
+    )
 
 
 def _seed_chunk(hy: HyMem, chunk_id: str) -> Chunk:
@@ -134,11 +123,18 @@ def test_samewave_cross_chunk_collapses(cfg):
         c2 = _seed_chunk(hy, "c_b")
         pool = phase1.new_in_cycle_pool()
 
-        e1 = FakeEmbedder({"app prefers concise": [1.0, 0.0, 0.0, 0.0]})
-        _persist(hy, c1, [Triple("app", "prefers", "concise", 1)], e1, pool)
-
-        e2 = FakeEmbedder({"app prefers concise_mode": [1.0, 0.0, 0.0, 0.0]})
-        _persist(hy, c2, [Triple("app", "prefers", "concise_mode", 1)], e2, pool)
+        embedder = FakeEmbedder({
+            "app prefers concise": [1.0, 0.0, 0.0, 0.0],
+            "app prefers concise_mode": [1.0, 0.0, 0.0, 0.0],
+        })
+        _persist(
+            hy, c1, [Triple("app", "prefers", "concise", 1)],
+            embedder, pool,
+        )
+        _persist(
+            hy, c2, [Triple("app", "prefers", "concise_mode", 1)],
+            embedder, pool,
+        )
 
         assert hy.conn.execute(
             "SELECT COUNT(*) AS c FROM knowledge_graph "
@@ -227,9 +223,9 @@ def test_samewave_embed_never_inside_write_lock(cfg):
             embedder, pool,
         )
 
-        assert embedder.in_txn_flags, "expected at least one embed() call"
-        assert all(flag is False for flag in embedder.in_txn_flags), (
-            f"embed ran inside a write transaction: {embedder.in_txn_flags}"
+        assert embedder.transaction_states, "expected at least one embed() call"
+        assert all(flag is False for flag in embedder.transaction_states), (
+            f"embed ran inside a write transaction: {embedder.transaction_states}"
         )
         # And the collapse still happened.
         assert hy.conn.execute(

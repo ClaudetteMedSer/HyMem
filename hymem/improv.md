@@ -19,21 +19,24 @@ of work.
   path, not the primary hot path).
 
 ### 1b. Expanded predicate vocabulary  ✅
-- All 18 predicates live in `ALLOWED_PREDICATES` in
+- All 22 predicates live in `ALLOWED_PREDICATES` in
   [hymem/extraction/prompts/__init__.py](extraction/prompts/__init__.py)
   and the matching CHECK constraint in
   [hymem/core/schema.sql](core/schema.sql).
-- The 8 added (`implements`, `contains`, `configured_with`,
+- The original expansion added 8 technical predicates (`implements`, `contains`, `configured_with`,
   `requires_version`, `runs_on`, `connects_to`, `generates`, `tested_by`)
-  are documented inline in the system prompt.
+  and the current vocabulary also includes 4 personal-memory predicates
+  (`owns`, `located_in`, `participates_in`, `has_attribute`); all are
+  documented inline in the system prompt.
 
 ### 1c. Numeric & temporal fact extraction  ✅
 - `kg_evidence` carries `value_text`, `value_numeric`, `value_unit`,
   `temporal_scope` columns.
 - [hymem/extraction/triples.py](extraction/triples.py) parses each field
   and persists into evidence; the system prompt instructs extraction.
-- `prompt_version` is now `"v7"` (covers 1b, 1c, 2b, 3a, and prompt
-  refinements made since).
+- This tier originally landed under prompt v7. The live extraction contract is
+  prompt v20; changing that version re-offers source-manifested chunks while
+  prompt-independent terminal source losses remain closed.
 
 ---
 
@@ -73,12 +76,15 @@ of work.
 
 ## Tier 3 — Advanced Capabilities  ✅ done
 
-### 3a. Feedback-driven extraction  ✅
-- `extraction_feedback` table in [hymem/core/schema.sql](core/schema.sql).
-- `retract_edge` in [hymem/api.py](api.py) records a feedback row.
-- [hymem/dreaming/runner.py](dreaming/runner.py) loads the 10 most-recent
-  feedback rows and injects them as a negative-examples block into the
-  triple prompt via `build_triple_system(negative_examples=...)`.
+### 3a. Source-linked retraction audit  ✅
+- `extraction_feedback` remains as the historical table name in
+  [hymem/core/schema.sql](core/schema.sql).
+- `retract_edge`, automatic retraction, and behavioral dedup retain bounded,
+  source-linked correction records for audit.
+- Dynamic feedback into extraction prompts is deliberately retired. Neither
+  the runner nor standalone/combined prompt builders accept audit values as
+  instructions, preventing injection, cross-session suppression, and valid
+  reassertion blocking.
 
 ### 3b. Multi-hop inference  ✅
 - `derived` column on `knowledge_graph`.

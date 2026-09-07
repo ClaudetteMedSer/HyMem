@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 );
 
 INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
+-- Durable discriminator for pre-bootstrap v55 loss detection. The additive
+-- loader could otherwise recreate a wholly dropped aggregation domain empty.
+INSERT OR IGNORE INTO schema_meta(key, value)
+VALUES ('aggregation_typed_provenance_schema', '55');
 
 -- Raw session log. Hermes pushes messages in; HyMem owns the table.
 CREATE TABLE IF NOT EXISTS sessions (
@@ -92,6 +96,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Highest source message durably materialized as a canonical JSONL
     -- coverage artifact.  Independent from the LLM digest cursor.
     coverage_message_id INTEGER,
+    -- Highest lossless frontier completely examined by both Phase-1 chunk
+    -- producers.  The config identity prevents a changed producer from
+    -- inheriting an older acknowledgement.  These are operational cursors:
+    -- portable imports may omit them and safely rebuild from exact coverage.
+    source_materialized_message_id INTEGER,
+    source_materialization_config_version TEXT,
     -- Resumable input position for the current digest build generation.  The
     -- value identifies both its prompt/config and one full replacement walk.
     -- The offset belongs to the first covered message above
@@ -211,6 +221,26 @@ CREATE INDEX IF NOT EXISTS idx_message_retention_coverage_stream
     ON message_retention_coverage(
         source_session_id, coverage_version, message_id
     );
+
+-- v50: durable fail-closed health signal when ordered coverage integrity could
+-- not be established. One row per session bounds storage across transient or
+-- persistent failures regardless of retry cadence.
+-- Values are deliberately structural only: no source bytes, exception text,
+-- endpoint data, or credentials are retained.
+CREATE TABLE IF NOT EXISTS coverage_integrity_failures (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    config_version TEXT NOT NULL CHECK (
+        config_version = 'lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1'
+    ),
+    failure_reason TEXT NOT NULL CHECK (
+        failure_reason IN ('materialization_failure', 'source_stream_invalid')
+    ),
+    occurrences INTEGER NOT NULL DEFAULT 1 CHECK (
+        occurrences BETWEEN 1 AND 2147483647
+    ),
+    first_detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Coverage becomes immutable once its raw source is gone. The hash UDF is
 -- registered by core/db.py on every HyMem connection. Together with the chunk
@@ -391,13 +421,72 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     PRIMARY KEY (text_hash, model)
 );
 
+-- Irrecoverable Phase-1 input loss.  Unlike provider/output quarantine this is
+-- a property of the durable source artifact, not of a prompt version: once an
+-- old extraction chunk has no exact claim-source manifest and its pre-upgrade
+-- source bytes are gone, no future prompt can safely recreate that input.
+-- Keeping this separate from processed_chunks makes the loss explicit without
+-- counterfeiting a successful (possibly empty) extraction.
+CREATE TABLE IF NOT EXISTS chunk_extraction_terminal_losses (
+    chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK (
+        reason IN ('source_manifest_unrecoverable')
+    ),
+    detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_extraction_terminal_losses_reason
+    ON chunk_extraction_terminal_losses(reason);
+
 -- Idempotency: each chunk processed at most once per prompt_version.
+-- v53 generation bindings are registered before a live marker/outcome is
+-- published. Legacy NULL bindings are retained only as untrusted history.
+CREATE TABLE IF NOT EXISTS phase1_generations (
+    generation_key TEXT PRIMARY KEY,
+    extraction_cache_key TEXT NOT NULL,
+    producer_identity_sha256 TEXT NOT NULL,
+    identity_exact BOOLEAN NOT NULL CHECK (identity_exact IN (0, 1)),
+    reuse_scope TEXT NOT NULL CHECK (
+        reuse_scope IN ('durable', 'process_instance')
+    ),
+    binding_json TEXT NOT NULL CHECK (json_valid(binding_json)),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS processed_chunks (
     chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
     prompt_version TEXT NOT NULL,
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    phase1_generation_key TEXT
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
     PRIMARY KEY (chunk_id, prompt_version)
 );
+CREATE TRIGGER IF NOT EXISTS processed_chunks_terminal_loss_insert_guard
+BEFORE INSERT ON processed_chunks
+WHEN EXISTS (
+    SELECT 1 FROM chunk_extraction_terminal_losses loss
+    WHERE loss.chunk_id = new.chunk_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'terminal extraction loss cannot be marked processed');
+END;
+CREATE TRIGGER IF NOT EXISTS processed_chunks_terminal_loss_update_guard
+BEFORE UPDATE OF chunk_id, prompt_version ON processed_chunks
+WHEN EXISTS (
+    SELECT 1 FROM chunk_extraction_terminal_losses loss
+    WHERE loss.chunk_id = new.chunk_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'terminal extraction loss cannot be marked processed');
+END;
+CREATE TRIGGER IF NOT EXISTS chunk_extraction_terminal_loss_clear_processed
+AFTER INSERT ON chunk_extraction_terminal_losses
+BEGIN
+    DELETE FROM processed_chunks WHERE chunk_id = new.chunk_id;
+END;
+CREATE TRIGGER IF NOT EXISTS chunk_extraction_terminal_loss_update_guard
+BEFORE UPDATE ON chunk_extraction_terminal_losses
+BEGIN
+    SELECT RAISE(ABORT, 'terminal extraction loss is immutable');
+END;
 
 -- Latest successful source-validated claim interpretation for a chunk.  The
 -- compact result hash makes an empty newer extraction portable authority: it
@@ -407,7 +496,9 @@ CREATE TABLE IF NOT EXISTS kg_claim_extraction_outcomes (
     prompt_version TEXT NOT NULL,
     prompt_generation INTEGER NOT NULL CHECK (prompt_generation >= 0),
     result_hash TEXT NOT NULL,
-    succeeded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    succeeded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    phase1_generation_key TEXT
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT
 );
 CREATE TRIGGER IF NOT EXISTS kg_claim_extraction_outcomes_insert_guard
 BEFORE INSERT ON kg_claim_extraction_outcomes
@@ -448,6 +539,10 @@ CREATE TABLE IF NOT EXISTS chunk_extraction_attempts (
     prompt_version TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_failure_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_failure_reason TEXT,
+    last_failure_details TEXT NOT NULL DEFAULT '[]',
+    phase1_generation_key TEXT
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
     PRIMARY KEY (chunk_id, prompt_version)
 );
 
@@ -464,6 +559,8 @@ CREATE TABLE IF NOT EXISTS entity_types (
     type TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
     source_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+    origin TEXT NOT NULL DEFAULT 'legacy_unattributed'
+        CHECK (origin IN ('user', 'legacy_unattributed')),
     PRIMARY KEY (entity_canonical, type)
 );
 CREATE INDEX IF NOT EXISTS idx_entity_types_type ON entity_types(type);
@@ -480,6 +577,8 @@ CREATE TABLE IF NOT EXISTS entity_properties (
     value TEXT NOT NULL,
     source_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    origin TEXT NOT NULL DEFAULT 'legacy_unattributed'
+        CHECK (origin IN ('user', 'legacy_unattributed')),
     PRIMARY KEY (entity_canonical, key)
 );
 CREATE INDEX IF NOT EXISTS idx_entity_properties_key ON entity_properties(key);
@@ -728,7 +827,9 @@ CREATE TABLE IF NOT EXISTS behavioral_markers (
     statement TEXT NOT NULL,
     chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    consolidated_at TIMESTAMP
+    consolidated_at TIMESTAMP,
+    phase1_generation_key TEXT
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_markers_consolidated ON behavioral_markers(consolidated_at);
 
@@ -740,7 +841,9 @@ CREATE TABLE IF NOT EXISTS profile_entries (
     pos_evidence INTEGER NOT NULL DEFAULT 1,
     neg_evidence INTEGER NOT NULL DEFAULT 0,
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    source TEXT NOT NULL DEFAULT 'legacy_unattributed'
+        CHECK (source IN ('user', 'agent_inferred', 'legacy_unattributed'))
 );
 
 -- Honcho peer registry: maps Honcho peer_id → HyMem role.
@@ -884,12 +987,42 @@ CREATE TABLE IF NOT EXISTS episode_embeddings (
 -- RAPTOR cross-session aggregation nodes (schema v16; hierarchy in v17). A
 -- level-0 node fuses a cluster of episodes (connected components over
 -- embedding-OR-entity overlap) that span multiple sessions, so a synthesis
+-- v56: exact secret-free identity of the LLM producer and executable
+-- aggregation request/parser contract. This registry is local rebuild state,
+-- not portable source material.
+CREATE TABLE IF NOT EXISTS aggregation_generations (
+    generation_key TEXT PRIMARY KEY CHECK (
+        length(generation_key) = 96
+        AND substr(generation_key,1,32) = 'hymem-aggregation-generation-v1:'
+        AND substr(generation_key,33) NOT GLOB '*[^0-9a-f]*'
+    ),
+    material_config_version TEXT NOT NULL CHECK (
+        length(material_config_version) = 92
+        AND substr(material_config_version,1,28) =
+            'aggregation-build-config-v1:'
+        AND substr(material_config_version,29) NOT GLOB '*[^0-9a-f]*'
+    ),
+    producer_identity_sha256 TEXT NOT NULL CHECK (
+        length(producer_identity_sha256) = 71
+        AND producer_identity_sha256 GLOB 'sha256:*'
+    ),
+    identity_exact BOOLEAN NOT NULL CHECK (identity_exact IN (0,1)),
+    reuse_scope TEXT NOT NULL CHECK (
+        reuse_scope IN ('durable','process_instance')
+        AND ((identity_exact=1 AND reuse_scope='durable')
+             OR (identity_exact=0 AND reuse_scope='process_instance'))
+    ),
+    binding_json TEXT NOT NULL CHECK (json_valid(binding_json)),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- question reads a handful of cluster summaries instead of dozens of raw turns.
 -- Levels >= 1 (v17) are RAPTOR rollups whose member_episode_ids hold CHILD ids
 -- (lower-level node ids and/or pass-through episode ids), recursing until one
 -- is_root digest node — the standing "what do you know about me" summary
 -- exposed via HyMem.digest(). Only level 0 enters query-time retrieval. The
--- whole layer is additive and off by default (cfg.aggregation_nodes_enabled).
+-- whole layer is additive and enabled by default; callers can opt out with
+-- cfg.aggregation_nodes_enabled = False.
 -- Rebuilt from scratch each dream — membership is a pure function of the
 -- current episodes — so there is no stable-id UPSERT churn; the id is a content
 -- hash of members, which also keys reuse of an unchanged node's LLM fusion.
@@ -905,8 +1038,8 @@ CREATE TABLE IF NOT EXISTS aggregation_nodes (
     level INTEGER NOT NULL DEFAULT 0,
     is_root INTEGER NOT NULL DEFAULT 0,
     -- Flattened exact source set behind the effective fusion input.  Existing
-    -- pre-v45 rows default to incomplete and stay available only to unscoped
-    -- compatibility reads until a rebuild publishes verified provenance.
+    -- pre-v45 rows default to incomplete and remain non-authoritative physical
+    -- history; no public/provider read serves them before an exact rebuild.
     source_manifest_version TEXT,
     source_manifest_count INTEGER NOT NULL DEFAULT 0
         CHECK (source_manifest_count >= 0),
@@ -916,6 +1049,32 @@ CREATE TABLE IF NOT EXISTS aggregation_nodes (
     -- Hash of ordered member ids + exact rendered title/summary + each member's
     -- source-manifest state (and root-only extra prompt inputs).
     input_fingerprint TEXT,
+    -- v55: typed effective-input proof.  ``member_episode_ids`` remains a
+    -- compatibility rendering only; this manifest says whether each member is
+    -- an episode, child node, or an explicitly typed authoritative anchor.
+    input_manifest_version TEXT,
+    input_manifest_count INTEGER NOT NULL DEFAULT 0
+        CHECK (input_manifest_count >= 0),
+    input_manifest_hash TEXT,
+    input_manifest_complete BOOLEAN NOT NULL DEFAULT 0
+        CHECK (input_manifest_complete IN (0, 1)),
+    node_kind TEXT CHECK (
+        node_kind IS NULL OR node_kind IN ('cluster','rollup','root')
+    ),
+    output_hash TEXT,
+    -- One clean structural publication owns every servable node.  Candidate
+    -- rows may exist while a build is pending, but readers accept only the
+    -- exact set named by aggregation_publication_state.
+    publication_id TEXT,
+    build_config_version TEXT,
+    aggregation_generation_key TEXT
+        REFERENCES aggregation_generations(generation_key) ON DELETE RESTRICT,
+    aggregation_request_hash TEXT CHECK (
+        aggregation_request_hash IS NULL OR (
+            length(aggregation_request_hash)=71
+            AND aggregation_request_hash GLOB 'sha256:*'
+        )
+    ),
     CHECK (
         (source_manifest_complete = 0
          AND source_manifest_count = 0
@@ -960,6 +1119,99 @@ CREATE TABLE IF NOT EXISTS aggregation_node_source_occurrences (
 CREATE INDEX IF NOT EXISTS idx_aggregation_source_occurrence
     ON aggregation_node_source_occurrences(source_session_id, source_message_id);
 
+-- v55: exact typed effective inputs and their per-input lossless proofs.
+-- These rows preserve type across the hierarchy, so a text id that happens to
+-- exist in both episodes and aggregation_nodes is never resolved by guesswork.
+CREATE TABLE IF NOT EXISTS aggregation_node_inputs (
+    node_id TEXT NOT NULL REFERENCES aggregation_nodes(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    input_kind TEXT NOT NULL CHECK (input_kind IN (
+        'episode','aggregation_node','user_profile',
+        'knowledge_graph','narrative_fact'
+    )),
+    source_key TEXT NOT NULL CHECK (length(source_key) > 0),
+    source_ref_json TEXT NOT NULL CHECK (json_valid(source_ref_json)),
+    payload_hash TEXT NOT NULL CHECK (
+        length(payload_hash) = 71 AND payload_hash GLOB 'sha256:*'
+    ),
+    authority_hash TEXT NOT NULL CHECK (
+        length(authority_hash) = 71 AND authority_hash GLOB 'sha256:*'
+    ),
+    source_manifest_count INTEGER NOT NULL CHECK (source_manifest_count > 0),
+    source_manifest_hash TEXT NOT NULL CHECK (
+        length(source_manifest_hash) = 71
+        AND source_manifest_hash GLOB 'sha256:*'
+    ),
+    PRIMARY KEY (node_id, ordinal),
+    UNIQUE (node_id, input_kind, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS aggregation_node_input_sources (
+    node_id TEXT NOT NULL,
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal >= 0),
+    source_ordinal INTEGER NOT NULL CHECK (source_ordinal >= 0),
+    source_message_id INTEGER NOT NULL,
+    source_session_id TEXT NOT NULL,
+    source_role TEXT NOT NULL
+        CHECK (source_role IN ('user','assistant','system','tool')),
+    source_peer_id TEXT,
+    source_workspace_id TEXT,
+    source_created_at TIMESTAMP,
+    source_coverage_chunk_id TEXT NOT NULL,
+    source_coverage_version TEXT NOT NULL,
+    source_content_hash TEXT NOT NULL,
+    PRIMARY KEY (node_id, input_ordinal, source_ordinal),
+    UNIQUE (
+        node_id, input_ordinal, source_session_id, source_message_id
+    ),
+    FOREIGN KEY (node_id, input_ordinal)
+        REFERENCES aggregation_node_inputs(node_id, ordinal) ON DELETE CASCADE,
+    FOREIGN KEY (
+        source_message_id, source_coverage_chunk_id, source_coverage_version
+    ) REFERENCES message_retention_coverage(
+        message_id, chunk_id, coverage_version
+    ) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_aggregation_input_source_occurrence
+    ON aggregation_node_input_sources(source_session_id, source_message_id);
+
+-- v55: the only authority for serving a root digest.  Build-attempt counters
+-- remain operational in aggregation_build_health; this small semantic
+-- projection is locally attested because changing it changes visibility.
+-- Aggregation material is a rebuildable local cache and is not portable.
+CREATE TABLE IF NOT EXISTS aggregation_publication_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    publication_id TEXT NOT NULL CHECK (
+        length(publication_id) = 71 AND publication_id GLOB 'sha256:*'
+    ),
+    config_version TEXT NOT NULL CHECK (
+        length(config_version) = 92
+        AND substr(config_version,1,28) = 'aggregation-build-config-v1:'
+    ),
+    cluster_min_members INTEGER NOT NULL CHECK (cluster_min_members >= 1),
+    cluster_min_sessions INTEGER NOT NULL CHECK (cluster_min_sessions >= 1),
+    anchor_fact_cap INTEGER NOT NULL CHECK (anchor_fact_cap >= 0),
+    root_node_id TEXT,
+    node_count INTEGER NOT NULL CHECK (node_count >= 0),
+    node_set_hash TEXT NOT NULL CHECK (
+        length(node_set_hash) = 71 AND node_set_hash GLOB 'sha256:*'
+    ),
+    published_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP CHECK (
+        typeof(published_at) = 'text'
+        AND length(published_at) = 19
+        AND strftime('%Y-%m-%d %H:%M:%S', published_at) IS NOT NULL
+        AND strftime('%Y-%m-%d %H:%M:%S', published_at) = published_at
+    ),
+    aggregation_generation_key TEXT
+        REFERENCES aggregation_generations(generation_key) ON DELETE RESTRICT,
+    request_contract_sha256 TEXT CHECK (
+        request_contract_sha256 IS NULL OR (
+            length(request_contract_sha256)=71
+            AND request_contract_sha256 GLOB 'sha256:*'
+        )
+    )
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS aggregation_nodes_fts USING fts5(
     title, summary,
     content='aggregation_nodes', content_rowid='rowid',
@@ -977,8 +1229,9 @@ CREATE TRIGGER IF NOT EXISTS aggregation_nodes_fts_update AFTER UPDATE ON aggreg
 END;
 
 -- Node-summary embeddings, keyed by node id. Retrieval does a Python-cosine
--- scan over these (no vec0 table) since the node count is small and the tier is
--- off by default — keeping the vec0 plumbing limited to chunks/edges/episodes.
+-- scan over these (no vec0 table) since the node count is small and query
+-- exposure is narrowly ability-gated, keeping vec0 plumbing limited to
+-- chunks/edges/episodes.
 CREATE TABLE IF NOT EXISTS aggregation_node_embeddings (
     node_id TEXT PRIMARY KEY REFERENCES aggregation_nodes(id) ON DELETE CASCADE,
     vector_json TEXT NOT NULL,
@@ -1110,8 +1363,8 @@ CREATE TRIGGER IF NOT EXISTS procedures_fts_update AFTER UPDATE ON procedures BE
     INSERT INTO procedures_fts(rowid, name, description, steps) VALUES (new.rowid, new.name, new.description, new.steps);
 END;
 
--- Extraction feedback: stores wrongly-extracted triples so future extractions
--- can learn from past mistakes.
+-- Retraction audit: records the source and triple associated with automatic,
+-- manual, or dedup corrections. These values are never prompt instructions.
 CREATE TABLE IF NOT EXISTS extraction_feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
@@ -1145,6 +1398,18 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     sessions_processed INTEGER NOT NULL DEFAULT 0,
     chunks_seen INTEGER NOT NULL DEFAULT 0,
     chunks_processed INTEGER NOT NULL DEFAULT 0,
+    -- v49: exact Phase-1 provider attempts (including raised calls), and
+    -- whether its soft cycle ceiling left an actionable chunk untouched.
+    chunk_extraction_completion_calls INTEGER NOT NULL DEFAULT 0
+        CHECK(chunk_extraction_completion_calls >= 0),
+    chunk_extraction_provider_attempts INTEGER NOT NULL DEFAULT 0
+        CHECK(chunk_extraction_provider_attempts >= 0),
+    extraction_provider_attempt_budget_exhausted INTEGER NOT NULL DEFAULT 0
+        CHECK(extraction_provider_attempt_budget_exhausted IN (0, 1)),
+    -- v50: sessions whose ordered lossless source failed local validation in
+    -- this cycle. The durable per-session ledger carries exact identities.
+    coverage_integrity_failures INTEGER NOT NULL DEFAULT 0
+        CHECK(coverage_integrity_failures >= 0),
     chunks_embedded INTEGER NOT NULL DEFAULT 0,
     edges_embedded INTEGER NOT NULL DEFAULT 0,
     triples_extracted INTEGER NOT NULL DEFAULT 0,
@@ -1152,6 +1417,18 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     aggregation_nodes_built INTEGER NOT NULL DEFAULT 0,
     aggregation_nodes_reused INTEGER NOT NULL DEFAULT 0,
     aggregation_fusion_failures INTEGER NOT NULL DEFAULT 0,
+    -- v51: a total aggregation-build exception is separately attributable
+    -- and is also reflected as a nonzero fusion-failure unit by the runner.
+    aggregation_build_exceptions INTEGER NOT NULL DEFAULT 0
+        CHECK(aggregation_build_exceptions >= 0),
+    aggregation_config_version TEXT CHECK (
+        aggregation_config_version IS NULL OR (
+            length(aggregation_config_version) = 92
+            AND substr(aggregation_config_version, 1, 28) =
+                'aggregation-build-config-v1:'
+            AND substr(aggregation_config_version, 29) NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
     aggregation_input_episodes INTEGER NOT NULL DEFAULT 0,
     aggregation_blocking TEXT NOT NULL DEFAULT '',
     -- v29 deficit attribution (renumbered from 027): NULL = unattributed, NOT
@@ -1200,9 +1477,109 @@ CREATE TABLE IF NOT EXISTS dream_runs (
     profile_items_extracted INTEGER NOT NULL DEFAULT 0,
     profile_failures INTEGER NOT NULL DEFAULT 0,
     skipped_locked INTEGER NOT NULL DEFAULT 0,
-    error TEXT
+    error TEXT,
+    aggregation_generation_key TEXT
+        REFERENCES aggregation_generations(generation_key) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_dream_runs_started ON dream_runs(started_at);
+
+-- v51: singleton, bounded aggregation attempt state. The active attempt is
+-- marked before the fallible build boundary and cleared only by an applicable
+-- zero-failure result. Prompt text, source text, model/key/endpoint data, and
+-- exception strings are forbidden by construction; only config hashes, enum
+-- diagnostics, counters, and timestamps survive a restart.
+CREATE TABLE IF NOT EXISTS aggregation_build_health (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    last_success_config_version TEXT CHECK (
+        last_success_config_version IS NULL OR (
+            length(last_success_config_version) = 92
+            AND substr(last_success_config_version, 1, 28) =
+                'aggregation-build-config-v1:'
+            AND substr(last_success_config_version, 29)
+                NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    last_success_at TIMESTAMP,
+    pending_config_version TEXT CHECK (
+        pending_config_version IS NULL OR (
+            length(pending_config_version) = 92
+            AND substr(pending_config_version, 1, 28) =
+                'aggregation-build-config-v1:'
+            AND substr(pending_config_version, 29)
+                NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    pending_attempts INTEGER NOT NULL DEFAULT 0
+        CHECK(pending_attempts BETWEEN 0 AND 2147483647),
+    pending_caught_exceptions INTEGER NOT NULL DEFAULT 0
+        CHECK(pending_caught_exceptions BETWEEN 0 AND 2147483647),
+    pending_fusion_failures INTEGER NOT NULL DEFAULT 0
+        CHECK(pending_fusion_failures BETWEEN 0 AND 2147483647),
+    first_pending_at TIMESTAMP,
+    last_attempt_at TIMESTAMP,
+    total_caught_exceptions INTEGER NOT NULL DEFAULT 0
+        CHECK(total_caught_exceptions BETWEEN 0 AND 2147483647),
+    total_fusion_failures INTEGER NOT NULL DEFAULT 0
+        CHECK(total_fusion_failures BETWEEN 0 AND 2147483647),
+    superseded_pending_configs INTEGER NOT NULL DEFAULT 0
+        CHECK(superseded_pending_configs BETWEEN 0 AND 2147483647),
+    last_failure_config_version TEXT CHECK (
+        last_failure_config_version IS NULL OR (
+            length(last_failure_config_version) = 92
+            AND substr(last_failure_config_version, 1, 28) =
+                'aggregation-build-config-v1:'
+            AND substr(last_failure_config_version, 29)
+                NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    last_failure_kind TEXT CHECK (
+        last_failure_kind IS NULL OR last_failure_kind IN (
+            'exception', 'fusion_failure', 'exception_and_fusion'
+        )
+    ),
+    last_failure_at TIMESTAMP,
+    last_success_generation_key TEXT
+        REFERENCES aggregation_generations(generation_key) ON DELETE RESTRICT,
+    pending_generation_key TEXT
+        REFERENCES aggregation_generations(generation_key) ON DELETE RESTRICT,
+    last_failure_generation_key TEXT
+        REFERENCES aggregation_generations(generation_key) ON DELETE RESTRICT,
+    CHECK (
+        (last_success_config_version IS NULL AND last_success_at IS NULL)
+        OR
+        (last_success_config_version IS NOT NULL AND last_success_at IS NOT NULL)
+    ),
+    CHECK (
+        (
+            pending_config_version IS NULL
+            AND pending_attempts = 0
+            AND pending_caught_exceptions = 0
+            AND pending_fusion_failures = 0
+            AND first_pending_at IS NULL
+            AND last_attempt_at IS NULL
+        )
+        OR
+        (
+            pending_config_version IS NOT NULL
+            AND pending_attempts >= 1
+            AND first_pending_at IS NOT NULL
+            AND last_attempt_at IS NOT NULL
+        )
+    ),
+    CHECK (
+        (
+            last_failure_config_version IS NULL
+            AND last_failure_kind IS NULL
+            AND last_failure_at IS NULL
+        )
+        OR
+        (
+            last_failure_config_version IS NOT NULL
+            AND last_failure_kind IS NOT NULL
+            AND last_failure_at IS NOT NULL
+        )
+    )
+);
 
 -- v23: `always_on` Rules as a first-class node type (Idea B). Standing
 -- behavioral imperatives ("always run the tests before pushing") injected into
@@ -1409,3 +1786,392 @@ CREATE TABLE IF NOT EXISTS rules (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_rules_active ON rules(scope, status, invalid_at);
+
+-- v54 producer-bound whole-response auxiliary publication.  Existing
+-- entity_types/entity_properties rows are compatibility history unless their
+-- explicit origin is user; model output lives in the observation ledgers.
+CREATE TABLE IF NOT EXISTS phase1_auxiliary_outcomes (
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    phase1_generation_key TEXT NOT NULL
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    extraction_cache_key TEXT NOT NULL,
+    auxiliary_contract_key TEXT NOT NULL,
+    result_hash TEXT NOT NULL CHECK (
+        substr(result_hash, 1, 7) = 'sha256:' AND length(result_hash) = 71
+        AND substr(result_hash, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    entity_type_count INTEGER NOT NULL CHECK (entity_type_count >= 0),
+    entity_property_count INTEGER NOT NULL CHECK (entity_property_count >= 0),
+    entity_mention_count INTEGER NOT NULL CHECK (entity_mention_count >= 0),
+    marker_count INTEGER NOT NULL CHECK (marker_count >= 0),
+    published_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chunk_id, phase1_generation_key)
+);
+CREATE INDEX IF NOT EXISTS idx_phase1_auxiliary_generation
+    ON phase1_auxiliary_outcomes(phase1_generation_key, chunk_id);
+CREATE TABLE IF NOT EXISTS entity_type_observations (
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    entity_canonical TEXT NOT NULL CHECK (
+        length(trim(entity_canonical)) > 0
+        AND hymem_entity_canonical_is_normalized(entity_canonical) = 1
+    ),
+    type TEXT NOT NULL CHECK (length(trim(type)) > 0),
+    confidence REAL NOT NULL DEFAULT 1.0 CHECK (
+        typeof(confidence) IN ('integer', 'real')
+        AND confidence >= 0.0 AND confidence <= 1.0
+    ),
+    phase1_generation_key TEXT NOT NULL
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chunk_id, entity_canonical, type, phase1_generation_key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_type_observations_lookup
+    ON entity_type_observations(type, entity_canonical, phase1_generation_key);
+CREATE INDEX IF NOT EXISTS idx_entity_type_observations_entity
+    ON entity_type_observations(entity_canonical, phase1_generation_key);
+CREATE TABLE IF NOT EXISTS entity_property_observations (
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    entity_canonical TEXT NOT NULL CHECK (
+        length(trim(entity_canonical)) > 0
+        AND hymem_entity_canonical_is_normalized(entity_canonical) = 1
+    ),
+    key TEXT NOT NULL CHECK (length(trim(key)) > 0),
+    value TEXT NOT NULL,
+    phase1_generation_key TEXT NOT NULL
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chunk_id, entity_canonical, key, phase1_generation_key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_property_observations_lookup
+    ON entity_property_observations(
+        key, value, entity_canonical, phase1_generation_key
+    );
+CREATE INDEX IF NOT EXISTS idx_entity_property_observations_entity
+    ON entity_property_observations(
+        entity_canonical, key, phase1_generation_key
+    );
+CREATE TABLE IF NOT EXISTS entity_mention_observations (
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    entity_canonical TEXT NOT NULL CHECK (
+        length(trim(entity_canonical)) > 0
+        AND hymem_entity_canonical_is_normalized(entity_canonical) = 1
+    ),
+    phase1_generation_key TEXT NOT NULL
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chunk_id,entity_canonical,phase1_generation_key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_mention_observations_entity
+    ON entity_mention_observations(entity_canonical,phase1_generation_key);
+CREATE TABLE IF NOT EXISTS profile_entry_marker_evidence (
+    profile_entry_id INTEGER NOT NULL
+        REFERENCES profile_entries(id) ON DELETE CASCADE,
+    marker_id INTEGER NOT NULL
+        REFERENCES behavioral_markers(id) ON DELETE CASCADE,
+    phase1_generation_key TEXT NOT NULL
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (profile_entry_id, marker_id)
+);
+CREATE INDEX IF NOT EXISTS idx_profile_marker_generation
+    ON profile_entry_marker_evidence(phase1_generation_key, marker_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_marker_one_decision
+    ON profile_entry_marker_evidence(marker_id);
+CREATE TABLE IF NOT EXISTS profile_marker_decisions (
+    marker_id INTEGER PRIMARY KEY
+        REFERENCES behavioral_markers(id) ON DELETE CASCADE,
+    phase1_generation_key TEXT NOT NULL
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    profile_policy_key TEXT NOT NULL CHECK (
+        length(trim(profile_policy_key)) > 0
+    ),
+    decision TEXT NOT NULL CHECK (
+        decision IN ('materialized','manual_authority','identity_conflict')
+    ),
+    profile_entry_id INTEGER NOT NULL
+        REFERENCES profile_entries(id) ON DELETE CASCADE,
+    decided_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_profile_marker_decision_generation
+    ON profile_marker_decisions(phase1_generation_key,marker_id);
+CREATE TABLE IF NOT EXISTS rule_marker_evidence (
+    rule_id INTEGER NOT NULL REFERENCES rules(id) ON DELETE CASCADE,
+    marker_id INTEGER NOT NULL
+        REFERENCES behavioral_markers(id) ON DELETE CASCADE,
+    phase1_generation_key TEXT NOT NULL
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (rule_id, marker_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_marker_generation
+    ON rule_marker_evidence(phase1_generation_key, marker_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rule_marker_one_decision
+    ON rule_marker_evidence(marker_id);
+CREATE TABLE IF NOT EXISTS rule_marker_decisions (
+    marker_id INTEGER PRIMARY KEY
+        REFERENCES behavioral_markers(id) ON DELETE CASCADE,
+    phase1_generation_key TEXT NOT NULL
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    routing_key TEXT NOT NULL CHECK (length(trim(routing_key)) > 0),
+    decision TEXT NOT NULL CHECK (decision IN ('routed', 'no_rule')),
+    rule_id INTEGER REFERENCES rules(id) ON DELETE SET NULL,
+    decided_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK ((decision='routed' AND rule_id IS NOT NULL)
+        OR (decision='no_rule' AND rule_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_rule_marker_decision_generation
+    ON rule_marker_decisions(phase1_generation_key,marker_id);
+
+/* The canonical v54 views/marker index/guards are installed by migration 054
+   and healed at startup.  They cannot execute in this bootstrap script because
+   initialize() runs schema.sql before upgrading an existing pre-v53 table that
+   does not yet have phase1_generation_key/origin/source columns.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_behavioral_marker_generation_identity
+    ON behavioral_markers(chunk_id, phase1_generation_key, kind, statement)
+    WHERE phase1_generation_key IS NOT NULL;
+
+DROP VIEW IF EXISTS current_entity_types;
+CREATE VIEW current_entity_types AS
+SELECT entity_canonical, type, confidence, source_chunk_id, origin
+FROM entity_types WHERE origin = 'user'
+UNION ALL
+SELECT observation.entity_canonical, observation.type,
+       observation.confidence, observation.chunk_id, 'agent_inferred'
+FROM entity_type_observations observation
+JOIN kg_claim_extraction_outcomes claim
+  ON claim.chunk_id=observation.chunk_id
+ AND claim.phase1_generation_key=observation.phase1_generation_key
+JOIN phase1_auxiliary_outcomes auxiliary
+  ON auxiliary.chunk_id=observation.chunk_id
+ AND auxiliary.phase1_generation_key=observation.phase1_generation_key
+ AND auxiliary.extraction_cache_key=claim.prompt_version
+JOIN processed_chunks processed
+  ON processed.chunk_id=claim.chunk_id
+ AND processed.prompt_version=claim.prompt_version
+ AND processed.phase1_generation_key=claim.phase1_generation_key
+JOIN phase1_generations generation
+  ON generation.generation_key=claim.phase1_generation_key
+ AND generation.extraction_cache_key=claim.prompt_version
+WHERE hymem_phase1_generation_is_current(
+          generation.generation_key,generation.identity_exact
+      )=1;
+
+DROP VIEW IF EXISTS current_entity_properties;
+CREATE VIEW current_entity_properties AS
+WITH authorized AS (
+ SELECT observation.entity_canonical,observation.key,observation.value,
+        observation.chunk_id,observation.phase1_generation_key,
+        chunk.end_message_id,chunk.created_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY observation.entity_canonical,observation.key
+          ORDER BY chunk.end_message_id DESC,
+                   hymem_normalize_iso_timestamp(chunk.created_at) DESC,
+                   observation.chunk_id DESC,
+                   observation.phase1_generation_key DESC,
+                   observation.value DESC
+        ) AS authority_rank
+ FROM entity_property_observations observation
+ JOIN chunks chunk ON chunk.id=observation.chunk_id
+ JOIN kg_claim_extraction_outcomes claim
+   ON claim.chunk_id=observation.chunk_id
+  AND claim.phase1_generation_key=observation.phase1_generation_key
+ JOIN phase1_auxiliary_outcomes auxiliary
+   ON auxiliary.chunk_id=observation.chunk_id
+  AND auxiliary.phase1_generation_key=observation.phase1_generation_key
+  AND auxiliary.extraction_cache_key=claim.prompt_version
+ JOIN processed_chunks processed
+   ON processed.chunk_id=claim.chunk_id
+  AND processed.prompt_version=claim.prompt_version
+  AND processed.phase1_generation_key=claim.phase1_generation_key
+ JOIN phase1_generations generation
+   ON generation.generation_key=claim.phase1_generation_key
+  AND generation.extraction_cache_key=claim.prompt_version
+ WHERE hymem_phase1_generation_is_current(
+           generation.generation_key,generation.identity_exact
+       )=1
+)
+SELECT entity_canonical,key,value,source_chunk_id,updated_at,origin
+FROM entity_properties WHERE origin='user'
+UNION ALL
+SELECT authorized.entity_canonical,authorized.key,authorized.value,
+       authorized.chunk_id,authorized.created_at,'agent_inferred'
+FROM authorized
+WHERE authorized.authority_rank=1
+  AND NOT EXISTS (
+    SELECT 1 FROM entity_properties manual
+    WHERE manual.entity_canonical=authorized.entity_canonical
+      AND manual.key=authorized.key AND manual.origin='user'
+  );
+
+DROP VIEW IF EXISTS current_profile_entries;
+CREATE VIEW current_profile_entries AS
+SELECT id,kind,text,pos_evidence,neg_evidence,first_seen,last_updated,source
+FROM profile_entries WHERE source='user'
+UNION ALL
+SELECT entry.id,entry.kind,entry.text,COUNT(DISTINCT link.marker_id),
+       entry.neg_evidence,entry.first_seen,entry.last_updated,entry.source
+FROM profile_entries entry
+JOIN profile_entry_marker_evidence link ON link.profile_entry_id=entry.id
+JOIN behavioral_markers marker
+  ON marker.id=link.marker_id
+ AND marker.phase1_generation_key=link.phase1_generation_key
+JOIN kg_claim_extraction_outcomes claim
+  ON claim.chunk_id=marker.chunk_id
+ AND claim.phase1_generation_key=marker.phase1_generation_key
+JOIN phase1_auxiliary_outcomes auxiliary
+  ON auxiliary.chunk_id=marker.chunk_id
+ AND auxiliary.phase1_generation_key=marker.phase1_generation_key
+ AND auxiliary.extraction_cache_key=claim.prompt_version
+JOIN processed_chunks processed
+  ON processed.chunk_id=claim.chunk_id
+ AND processed.prompt_version=claim.prompt_version
+ AND processed.phase1_generation_key=claim.phase1_generation_key
+JOIN phase1_generations generation
+  ON generation.generation_key=claim.phase1_generation_key
+ AND generation.extraction_cache_key=claim.prompt_version
+WHERE entry.source='agent_inferred'
+  AND hymem_phase1_generation_is_current(
+          generation.generation_key,generation.identity_exact
+      )=1
+GROUP BY entry.id;
+
+DROP VIEW IF EXISTS current_rules;
+CREATE VIEW current_rules AS
+SELECT id,text,scope,trigger_entities,source,pos_evidence,neg_evidence,
+       valid_at,invalid_at,status,created_at
+FROM rules
+WHERE source='user' AND status='active' AND invalid_at IS NULL
+UNION ALL
+SELECT rule.id,rule.text,rule.scope,rule.trigger_entities,rule.source,
+       COUNT(DISTINCT link.marker_id),rule.neg_evidence,rule.valid_at,
+       rule.invalid_at,rule.status,rule.created_at
+FROM rules rule
+JOIN rule_marker_evidence link ON link.rule_id=rule.id
+JOIN behavioral_markers marker
+  ON marker.id=link.marker_id
+ AND marker.phase1_generation_key=link.phase1_generation_key
+JOIN kg_claim_extraction_outcomes claim
+  ON claim.chunk_id=marker.chunk_id
+ AND claim.phase1_generation_key=marker.phase1_generation_key
+JOIN phase1_auxiliary_outcomes auxiliary
+  ON auxiliary.chunk_id=marker.chunk_id
+ AND auxiliary.phase1_generation_key=marker.phase1_generation_key
+ AND auxiliary.extraction_cache_key=claim.prompt_version
+JOIN processed_chunks processed
+  ON processed.chunk_id=claim.chunk_id
+ AND processed.prompt_version=claim.prompt_version
+ AND processed.phase1_generation_key=claim.phase1_generation_key
+JOIN phase1_generations generation
+  ON generation.generation_key=claim.phase1_generation_key
+ AND generation.extraction_cache_key=claim.prompt_version
+WHERE rule.source='agent_inferred'
+  AND rule.status='active' AND rule.invalid_at IS NULL
+  AND hymem_phase1_generation_is_current(
+          generation.generation_key,generation.identity_exact
+      )=1
+GROUP BY rule.id;
+
+CREATE TRIGGER IF NOT EXISTS profile_marker_evidence_lineage_guard
+BEFORE INSERT ON profile_entry_marker_evidence
+WHEN hymem_evidence_mutation_authorized() <> 1
+  OR NOT EXISTS (
+ SELECT 1 FROM behavioral_markers marker
+ JOIN profile_entries entry ON entry.id=new.profile_entry_id
+ WHERE marker.id=new.marker_id
+   AND marker.phase1_generation_key=new.phase1_generation_key
+   AND entry.source='agent_inferred'
+   AND entry.text=marker.statement
+   AND entry.kind=CASE marker.kind
+       WHEN 'preference' THEN 'preference'
+       WHEN 'rejection' THEN 'avoidance'
+       WHEN 'style' THEN 'style'
+       ELSE 'context'
+   END
+)
+BEGIN
+ SELECT RAISE(ABORT,'invalid profile marker lineage');
+END;
+CREATE TRIGGER IF NOT EXISTS rule_marker_evidence_lineage_guard
+BEFORE INSERT ON rule_marker_evidence
+WHEN hymem_evidence_mutation_authorized() <> 1
+  OR NOT EXISTS (
+ SELECT 1 FROM behavioral_markers marker
+ JOIN rules rule ON rule.id=new.rule_id
+ WHERE marker.id=new.marker_id
+   AND marker.phase1_generation_key=new.phase1_generation_key
+   AND rule.source='agent_inferred'
+)
+BEGIN
+ SELECT RAISE(ABORT,'invalid rule marker lineage');
+END;
+CREATE TRIGGER IF NOT EXISTS phase1_auxiliary_outcome_insert_guard
+BEFORE INSERT ON phase1_auxiliary_outcomes
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS phase1_auxiliary_outcome_update_guard
+BEFORE UPDATE ON phase1_auxiliary_outcomes
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS phase1_auxiliary_outcome_delete_guard
+BEFORE DELETE ON phase1_auxiliary_outcomes
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS entity_type_observation_insert_guard
+BEFORE INSERT ON entity_type_observations
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS entity_type_observation_update_guard
+BEFORE UPDATE ON entity_type_observations
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS entity_type_observation_delete_guard
+BEFORE DELETE ON entity_type_observations
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS entity_property_observation_insert_guard
+BEFORE INSERT ON entity_property_observations
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS entity_property_observation_update_guard
+BEFORE UPDATE ON entity_property_observations
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS entity_property_observation_delete_guard
+BEFORE DELETE ON entity_property_observations
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'Phase-1 auxiliaries are internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS profile_marker_evidence_update_guard
+BEFORE UPDATE ON profile_entry_marker_evidence
+BEGIN SELECT RAISE(ABORT,'profile marker evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS profile_marker_evidence_delete_guard
+BEFORE DELETE ON profile_entry_marker_evidence
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'profile marker evidence is internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS rule_marker_evidence_update_guard
+BEFORE UPDATE ON rule_marker_evidence
+BEGIN SELECT RAISE(ABORT,'rule marker evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS rule_marker_evidence_delete_guard
+BEFORE DELETE ON rule_marker_evidence
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'rule marker evidence is internally managed'); END;
+CREATE TRIGGER IF NOT EXISTS rule_marker_decision_insert_guard
+BEFORE INSERT ON rule_marker_decisions
+WHEN hymem_evidence_mutation_authorized() <> 1
+  OR NOT EXISTS (
+    SELECT 1 FROM behavioral_markers marker
+    WHERE marker.id=new.marker_id
+      AND marker.phase1_generation_key=new.phase1_generation_key
+  )
+  OR (new.decision='routed' AND NOT EXISTS (
+    SELECT 1 FROM rules rule
+    WHERE rule.id=new.rule_id AND rule.source='agent_inferred'
+  ))
+BEGIN SELECT RAISE(ABORT,'invalid rule marker decision'); END;
+CREATE TRIGGER IF NOT EXISTS rule_marker_decision_update_guard
+BEFORE UPDATE ON rule_marker_decisions
+BEGIN SELECT RAISE(ABORT,'rule marker decision is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS rule_marker_decision_delete_guard
+BEFORE DELETE ON rule_marker_decisions
+WHEN hymem_evidence_mutation_authorized() <> 1
+BEGIN SELECT RAISE(ABORT,'rule marker decision is internally managed'); END;
+*/

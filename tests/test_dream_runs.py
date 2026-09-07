@@ -6,6 +6,7 @@ import pytest
 
 from hymem import HyMem, HyMemConfig
 from hymem.dreaming.lossless import coverage_chunk_id
+from hymem.extraction.contract import extraction_cache_key
 from hymem.extraction.llm import LLMRequest, StubLLMClient
 from tests.conftest import make_routed_llm
 
@@ -44,6 +45,18 @@ def test_dream_persists_run_report(hy):
     assert row["sessions_processed"] == report.sessions_processed
     assert row["chunks_seen"] == report.chunks_seen
     assert row["chunks_processed"] == report.chunks_processed
+    assert row["chunk_extraction_completion_calls"] == (
+        report.chunk_extraction_completion_calls
+    )
+    assert row["chunk_extraction_provider_attempts"] == (
+        report.chunk_extraction_provider_attempts
+    )
+    assert row["extraction_provider_attempt_budget_exhausted"] == int(
+        report.extraction_provider_attempt_budget_exhausted
+    )
+    assert row["coverage_integrity_failures"] == (
+        report.coverage_integrity_failures
+    )
     assert row["triples_extracted"] == report.triples_extracted
     assert row["markers_extracted"] == report.markers_extracted
 
@@ -213,7 +226,10 @@ def test_refresh_lock_does_not_touch_other_holders_lock(hy):
         "SELECT acquired_at FROM run_lock WHERE name = 'dreaming'"
     ).fetchone()["acquired_at"]
 
-    _refresh_lock(hy.conn, "intruder_B")
+    from hymem.core import db as core_db
+
+    with pytest.raises(core_db.LeaseOwnershipLost):
+        _refresh_lock(hy.conn, "intruder_B")
 
     after = hy.conn.execute(
         "SELECT acquired_at, holder FROM run_lock WHERE name = 'dreaming'"
@@ -291,8 +307,14 @@ def test_recent_dream_runs_returns_dicts(hy):
     expected_keys = {
         "id", "started_at", "ended_at",
         "sessions_processed", "chunks_seen", "chunks_processed",
+        "chunk_extraction_completion_calls",
+        "chunk_extraction_provider_attempts",
+        "extraction_provider_attempt_budget_exhausted",
+        "coverage_integrity_failures",
         "chunks_embedded", "triples_extracted", "markers_extracted",
         "aggregation_nodes_built", "aggregation_nodes_reused",
+        "aggregation_fusion_failures", "aggregation_build_exceptions",
+        "aggregation_config_version",
         "skipped_locked", "error",
     }
     assert expected_keys.issubset(rows[0].keys())
@@ -302,8 +324,22 @@ def test_dream_status_before_any_dream(hy):
     # Fresh DB: no chunks yet, no dream has run, no lock held.
     status = hy.dream_status()
     assert status["pending_chunks"] == 0
+    assert status["coverage_integrity_failures"] == 0
+    assert status["coverage_integrity_failure_reasons"] == {}
+    assert status["coverage_integrity_failure_details"] == []
+    assert status["coverage_integrity_failure_details_truncated"] is False
+    assert status["pending_aggregation"] == int(
+        hy.config.aggregation_nodes_enabled
+    )
+    assert status["aggregation_active_caught_exceptions"] == 0
+    assert status["aggregation_active_fusion_failures"] == 0
+    assert status["aggregation_total_caught_exceptions"] == 0
+    assert status["aggregation_total_fusion_failures"] == 0
     assert status["total_chunks"] == 0
     assert status["prompt_version"] == hy.config.prompt_version
+    assert status["extraction_provider_attempt_budget"] == (
+        hy.config.dream_extraction_provider_attempt_budget
+    )
     assert status["in_progress"] is False
     assert status["last_run"] is None
 
@@ -328,15 +364,19 @@ def test_dream_status_counts_and_last_run(hy):
     assert after["last_run"]["ended_at"] is not None
     assert after["last_run"]["error"] is None
 
-    # Seed MORE chunks without dreaming → they have no processed_chunks row for
-    # the current prompt_version, so they count as pending.
+    # Remove one scheduling marker without changing its exact source manifest:
+    # the source-valid chunk is actionable again for this prompt version.
+    chunk_id = hy.conn.execute(
+        "SELECT id FROM chunks WHERE session_id='s1' "
+        "AND chunk_kind='extraction' LIMIT 1"
+    ).fetchone()[0]
     hy.conn.execute(
-        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
-        "salience_reason, text) VALUES ('extra-1', 's1', 1, 2, 'test', 'extra chunk')"
+        "DELETE FROM processed_chunks WHERE chunk_id=? AND prompt_version=?",
+        (chunk_id, extraction_cache_key(hy.config.prompt_version)),
     )
     hy.conn.commit()
     bumped = hy.dream_status()
-    assert bumped["total_chunks"] == after["total_chunks"] + 1
+    assert bumped["total_chunks"] == after["total_chunks"]
     assert bumped["pending_chunks"] == 1
 
 
@@ -415,8 +455,8 @@ def test_dream_records_error(hy, monkeypatch):
         "SELECT * FROM dream_runs ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert row is not None
-    assert row["error"] is not None
-    assert "boom_phase2_failure" in row["error"]
+    assert row["error"] == "execution_failure:RuntimeError"
+    assert "boom_phase2_failure" not in row["error"]
     assert row["ended_at"] is not None
 
 
@@ -434,7 +474,7 @@ def test_corrupt_quarantine_flags_cannot_starve_digest_or_profile(tmp_path):
                 '{"episodes":[],"summary":"","procedures":[]}'
             ),
         },
-        default='{"triples":[],"markers":[]}',
+        default='{"triples":[],"markers":[],"complete":true}',
     )
     hy = HyMem(cfg, llm=llm)
     try:

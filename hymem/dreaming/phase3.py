@@ -4,7 +4,6 @@ import logging
 import sqlite3
 
 from hymem.config import HyMemConfig
-from hymem.core.db import backfill_entity_mentions
 from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.dreaming import evidence
 
@@ -31,9 +30,6 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
     # a negative bump is stretched per-predicate, so sticky predicates decay
     # slower without becoming more sensitive to recent mentions.
     mention_cutoff = f"-{default_window} days"
-
-    # Catch chunks that exist but were never indexed (e.g. pre-upgrade DBs).
-    backfill_entity_mentions(conn)
 
     active_predicates = [
         r["predicate"]
@@ -69,7 +65,7 @@ def decay(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
             recent_mention = conn.execute(
                 """
-                SELECT em.chunk_id AS chunk_id FROM entity_mentions em
+                SELECT em.chunk_id AS chunk_id FROM current_entity_mentions em
                 JOIN chunks c ON c.id = em.chunk_id
                 WHERE em.entity_canonical IN (?, ?)
                   AND hymem_timestamp_at_or_before(
@@ -239,8 +235,8 @@ def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         comention = conn.execute(
             """
             SELECT em_s.chunk_id AS chunk_id
-            FROM entity_mentions em_s
-            JOIN entity_mentions em_o
+            FROM current_entity_mentions em_s
+            JOIN current_entity_mentions em_o
               ON em_s.chunk_id = em_o.chunk_id
             JOIN chunks c ON c.id = em_s.chunk_id
             WHERE em_s.entity_canonical = ?
@@ -297,11 +293,11 @@ def reinforce(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
 
 
 def _record_retraction_feedback(conn: sqlite3.Connection, edge: sqlite3.Row) -> None:
-    """Insert a row into extraction_feedback for an edge about to be
-    auto-retracted. Prefer the most recent positive-evidence chunk (the chunk
-    that produced the wrong extraction), but fall back to negative evidence —
-    zombie edges only have polarity=-1 rows, and skipping them was leaving
-    extraction_feedback permanently empty for the most useful negative cases.
+    """Audit an edge about to be auto-retracted in ``extraction_feedback``.
+
+    Prefer the most recent positive-evidence chunk, but fall back to negative
+    evidence so a negative-only zombie still has a source-linked audit record.
+    These values are retention-bounded evidence and never prompt instructions.
     """
     evidence = conn.execute(
         f"""

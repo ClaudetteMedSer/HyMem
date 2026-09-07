@@ -44,6 +44,10 @@ import tempfile
 from pathlib import Path
 
 from hymem import HyMem, HyMemConfig
+from hymem.contrib.model_policy import (
+    DeprecatedModelAliasError,
+    require_active_model,
+)
 from hymem.extraction.llm import LLMRequest
 
 
@@ -119,9 +123,7 @@ def _build_llm(model: str, base_url: str | None, api_key: str | None, *, stub_re
     if model == "stub":
         from hymem.extraction.llm import StubLLMClient
         return StubLLMClient(default=stub_reply)
-    if "chat" in (model or "") and "v4" not in (model or ""):
-        print(f"WARNING: model '{model}' looks like the deprecated deepseek-chat.",
-              file=sys.stderr)
+    require_active_model(model, role="rules-compliance LLM")
     from hymem.contrib.openai_client import OpenAICompatibleClient
     return OpenAICompatibleClient(api_key=api_key, base_url=base_url, model=model)
 
@@ -247,6 +249,16 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true", help="print answers + judge reasons")
     ap.add_argument("--json", action="store_true", help="emit one machine-readable JSON line")
     args = ap.parse_args()
+
+    try:
+        for role, model in (
+            ("rules-compliance answerer", args.answer_model),
+            ("rules-compliance judge", args.judge_model),
+        ):
+            if model != "stub":
+                require_active_model(model, role=role)
+    except DeprecatedModelAliasError as exc:
+        ap.error(str(exc))
 
     probes = PROBES
     if args.probes:

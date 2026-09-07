@@ -33,12 +33,18 @@ import json
 import logging
 import re
 import sqlite3
+import hashlib
 from dataclasses import dataclass, field
 
 from hymem import redaction
+from hymem.contrib.implementation_identity import (
+    compose_import_time_sha256,
+    import_time_source_sha256,
+)
 from hymem.dreaming.canonicalize import normalize
 
 log = logging.getLogger("hymem.rules")
+RULES_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
 
 RULE_SCOPES = frozenset({"always_on", "contextual"})
 RULE_SOURCES = frozenset({"user", "agent_inferred"})
@@ -49,6 +55,152 @@ RULE_SOURCES = frozenset({"user", "agent_inferred"})
 # imperative the agent must obey on every turn — it belongs in profile_entries,
 # not in a rule injected into every context.
 _RULE_KINDS = frozenset({"rejection", "style", "correction"})
+
+
+def rule_routing_key(cfg, phase1_generation_key: str | None) -> str | None:
+    """Canonical identity of the complete marker-to-rule producer.
+
+    The Phase-1 generation binds the exact LLM client/model/request used by
+    both extraction and the durability call in the live runner.  This envelope
+    additionally binds the Phase-2 prompt, parser/router implementation, and
+    policy knobs so changing any of them hides old inferred rules until the
+    marker is successfully rerouted.
+    """
+
+    if phase1_generation_key is None:
+        return None
+    from hymem import rules_extract
+
+    rules_guard = getattr(
+        rules_extract, "_RULE_EXTRACTION_INTEGRITY_FUNCTION", None,
+    )
+    if (
+        rules_extract.rule_extraction_support_integrity is not rules_guard
+        or not callable(rules_guard)
+        or not rules_guard()
+    ):
+        raise RuntimeError("marker-to-rule implementation integrity changed")
+    implementation = compose_import_time_sha256(
+        RULES_IMPLEMENTATION_SHA256,
+        rules_extract.RULES_EXTRACTION_IMPLEMENTATION_SHA256,
+    )
+    prompt_payload = json.dumps(
+        {
+            "system": rules_extract.DURABILITY_SYSTEM,
+            "user_template": rules_extract.DURABILITY_USER_TEMPLATE,
+            "version": rules_extract.DURABILITY_PROMPT_VERSION,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload = json.dumps(
+        {
+            "batch_size": int(
+                getattr(cfg, "rules_extraction_batch_size", 20)
+            ),
+            "confidence_min": float(
+                getattr(cfg, "rules_extraction_confidence_min", 0.75)
+            ),
+            "implementation_sha256": implementation,
+            "mode": str(getattr(cfg, "rules_extraction_mode", "lexical")),
+            "phase1_generation_key": phase1_generation_key,
+            "prompt_sha256": "sha256:" + hashlib.sha256(
+                prompt_payload.encode("utf-8")
+            ).hexdigest(),
+            "schema": "marker-rule-routing-v2",
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _persist_marker_rule_decision(
+    conn: sqlite3.Connection,
+    *,
+    marker_id: int,
+    generation_key: str,
+    routing_key: str,
+    decision,
+) -> bool:
+    """Atomically replace one marker's completed routing materialization."""
+
+    safe_text = ""
+    if decision.route:
+        safe_text = redaction.redact(decision.text.strip())
+        if not safe_text or decision.scope not in RULE_SCOPES:
+            raise ValueError("invalid completed marker routing output")
+
+    previous_rule_ids = [
+        int(row["rule_id"])
+        for row in conn.execute(
+            "SELECT rule_id FROM rule_marker_evidence WHERE marker_id=?",
+            (marker_id,),
+        ).fetchall()
+    ]
+    conn.execute("DELETE FROM rule_marker_evidence WHERE marker_id=?", (marker_id,))
+    conn.execute("DELETE FROM rule_marker_decisions WHERE marker_id=?", (marker_id,))
+
+    if not decision.route:
+        conn.execute(
+            "INSERT INTO rule_marker_decisions("
+            "marker_id,phase1_generation_key,routing_key,decision) "
+            "VALUES (?,?,?,'no_rule')",
+            (marker_id, generation_key, routing_key),
+        )
+        return False
+
+    existing = conn.execute(
+        "SELECT id,source,scope,status FROM rules WHERE text=?", (safe_text,)
+    ).fetchone()
+    if existing is not None and existing["source"] == "user":
+        # Inference never reinforces, revives, rescopes, or downgrades a user
+        # row. This is nevertheless a completed routing decision.
+        conn.execute(
+            "INSERT INTO rule_marker_decisions("
+            "marker_id,phase1_generation_key,routing_key,decision) "
+            "VALUES (?,?,?,'no_rule')",
+            (marker_id, generation_key, routing_key),
+        )
+        return False
+    if existing is None:
+        cursor = conn.execute(
+            "INSERT INTO rules(text,scope,trigger_entities,source,valid_at) "
+            "VALUES (?,?,'[]','agent_inferred',CURRENT_TIMESTAMP)",
+            (safe_text, decision.scope),
+        )
+        rule_id = int(cursor.lastrowid)
+    else:
+        rule_id = int(existing["id"])
+        if existing["status"] != "active":
+            conn.execute(
+                "INSERT INTO rule_marker_decisions("
+                "marker_id,phase1_generation_key,routing_key,decision) "
+                "VALUES (?,?,?,'no_rule')",
+                (marker_id, generation_key, routing_key),
+            )
+            return False
+    conn.execute(
+        "INSERT INTO rule_marker_evidence("
+        "rule_id,marker_id,phase1_generation_key) VALUES (?,?,?)",
+        (rule_id, marker_id, generation_key),
+    )
+    conn.execute(
+        "INSERT INTO rule_marker_decisions("
+        "marker_id,phase1_generation_key,routing_key,decision,rule_id) "
+        "VALUES (?,?,?,'routed',?)",
+        (marker_id, generation_key, routing_key, rule_id),
+    )
+    for affected_id in sorted(set(previous_rule_ids + [rule_id])):
+        conn.execute(
+            "UPDATE rules SET pos_evidence=(SELECT COUNT(*) FROM "
+            "rule_marker_evidence WHERE rule_id=?),scope=CASE WHEN id=? "
+            "THEN ? ELSE scope END WHERE id=? AND source='agent_inferred'",
+            (affected_id, rule_id, decision.scope, affected_id),
+        )
+    return True
 
 
 def is_rule_eligible_kind(kind: str) -> bool:
@@ -114,7 +266,14 @@ def rule_scope_for_marker(kind: str, statement: str) -> str | None:
     return "always_on" if _DIRECTIVE_RE.search(statement or "") else None
 
 
-def route_markers_to_rules(conn: sqlite3.Connection, cfg, llm=None) -> int:
+def route_markers_to_rules(
+    conn: sqlite3.Connection,
+    cfg,
+    llm=None,
+    *,
+    phase1_generation_key: str | None = None,
+    allow_legacy_unscoped: bool = False,
+) -> int:
     """Promote the durable sub-slice of UNCONSOLIDATED behavioral markers into
     `agent_inferred` rules. Returns the number of rules minted/reinforced.
 
@@ -124,13 +283,42 @@ def route_markers_to_rules(conn: sqlite3.Connection, cfg, llm=None) -> int:
     `llm`/`llm_fastpath` = one batched durability call via `rules_extract`). The
     LLM arms rewrite each kept marker to a CANONICAL imperative, so `add_rule`'s
     text-UPSERT collapses paraphrases and accumulates `pos_evidence` — the
-    recurrence signal repetition-gated promotion will read. Idempotent; degrades
+    recurrence signal repetition-gated promotion will read. Runner calls bind
+    the fresh input to the active Phase-1 generation. Already-materialized
+    agent-inferred rules are deliberately outside this Phase-1 reconciliation;
+    they need a separate source-linked Phase-2 replay design. Idempotent; degrades
     to 0 on a pre-v23 store; a bad/duplicate statement never blocks the rest."""
+    mode = getattr(cfg, "rules_extraction_mode", "lexical")
+    confidence_min = getattr(cfg, "rules_extraction_confidence_min", 0.75)
+    batch_size = getattr(cfg, "rules_extraction_batch_size", 20)
+    routing_key = rule_routing_key(cfg, phase1_generation_key)
     try:
-        rows = conn.execute(
-            "SELECT kind, statement FROM behavioral_markers "
-            "WHERE consolidated_at IS NULL ORDER BY id"
-        ).fetchall()
+        if phase1_generation_key is None and not allow_legacy_unscoped:
+            rows = []
+        elif phase1_generation_key is None:
+            rows = conn.execute(
+                "SELECT id,kind,statement,phase1_generation_key "
+                "FROM behavioral_markers "
+                "WHERE consolidated_at IS NULL "
+                "AND phase1_generation_key IS NULL ORDER BY id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT marker.id,marker.kind,marker.statement,"
+                "marker.phase1_generation_key "
+                "FROM behavioral_markers marker "
+                "JOIN current_phase1_publications publication "
+                "ON publication.chunk_id=marker.chunk_id "
+                "AND publication.phase1_generation_key="
+                "marker.phase1_generation_key "
+                "WHERE NOT EXISTS ("
+                "SELECT 1 FROM rule_marker_decisions decision "
+                "WHERE decision.marker_id=marker.id "
+                "AND decision.routing_key=?) "
+                "AND marker.phase1_generation_key=? "
+                "ORDER BY marker.id",
+                (routing_key, phase1_generation_key),
+            ).fetchall()
     except sqlite3.OperationalError:
         return 0
     if not rows:
@@ -141,23 +329,55 @@ def route_markers_to_rules(conn: sqlite3.Connection, cfg, llm=None) -> int:
     markers = [(r["kind"], r["statement"]) for r in rows]
     decisions = rules_extract.route_decisions(
         markers,
-        mode=getattr(cfg, "rules_extraction_mode", "lexical"),
+        mode=mode,
         llm=llm,
-        confidence_min=getattr(cfg, "rules_extraction_confidence_min", 0.75),
-        batch_size=getattr(cfg, "rules_extraction_batch_size", 20),
+        confidence_min=confidence_min,
+        batch_size=batch_size,
     )
     minted = 0
-    for d in decisions:
-        if not d.route:
-            continue
-        try:
-            add_rule(conn, d.text, scope=d.scope, source="agent_inferred")
-            minted += 1
-        except (ValueError, sqlite3.OperationalError):
-            continue  # a bad/duplicate statement never blocks the rest
+    from hymem.core.db import evidence_mutation
+
+    with evidence_mutation(conn):
+        for row, d in zip(rows, decisions):
+            generation_key = row["phase1_generation_key"]
+            if generation_key is None:
+                # Compatibility mode retains the old unscoped behavior, but
+                # cannot create producer-authoritative lineage.
+                if d.route:
+                    try:
+                        add_rule(
+                            conn, d.text, scope=d.scope,
+                            source="agent_inferred",
+                        )
+                        minted += 1
+                    except (ValueError, sqlite3.OperationalError):
+                        pass
+                continue
+            # Provider/parse absence is explicit; a legitimate completed
+            # negative may have confidence 0 and must remain idempotent.
+            if not d.complete:
+                continue
+            marker_id = int(row["id"])
+            if routing_key is None:
+                continue
+            conn.execute("SAVEPOINT hymem_marker_rule_decision")
+            try:
+                changed = _persist_marker_rule_decision(
+                    conn,
+                    marker_id=marker_id,
+                    generation_key=str(generation_key),
+                    routing_key=routing_key,
+                    decision=d,
+                )
+            except (ValueError, sqlite3.OperationalError, sqlite3.IntegrityError):
+                conn.execute("ROLLBACK TO hymem_marker_rule_decision")
+                conn.execute("RELEASE hymem_marker_rule_decision")
+                continue
+            conn.execute("RELEASE hymem_marker_rule_decision")
+            minted += int(changed)
     if minted:
         log.info("rules.extracted count=%d mode=%s (agent_inferred from markers)",
-                 minted, getattr(cfg, "rules_extraction_mode", "lexical"))
+                 minted, mode)
     return minted
 
 
@@ -195,6 +415,8 @@ def suggest_rules_from_markers(
     limit: int | None = None,
     mode: str = "llm",
     confidence_min: float | None = None,
+    phase1_generation_key: str | None = None,
+    allow_legacy_unscoped: bool = False,
 ) -> list["RuleCandidate"]:
     """Propose standing rules from UNCONSOLIDATED behavioral markers — the manual,
     NO-WRITE twin of `route_markers_to_rules`. Reads the same marker set (plus a
@@ -216,11 +438,32 @@ def suggest_rules_from_markers(
     if confidence_min is None:
         confidence_min = getattr(cfg, "rules_extraction_confidence_min", 0.75)
     try:
-        rows = conn.execute(
-            "SELECT bm.kind AS kind, bm.statement AS statement, c.session_id AS session_id "
-            "FROM behavioral_markers bm LEFT JOIN chunks c ON bm.chunk_id = c.id "
-            "WHERE bm.consolidated_at IS NULL ORDER BY bm.id"
-        ).fetchall()
+        if phase1_generation_key is None and not allow_legacy_unscoped:
+            rows = []
+        elif phase1_generation_key is None:
+            rows = conn.execute(
+                "SELECT bm.kind AS kind,bm.statement AS statement,"
+                "c.session_id AS session_id "
+                "FROM behavioral_markers bm "
+                "LEFT JOIN chunks c ON bm.chunk_id=c.id "
+                "WHERE bm.consolidated_at IS NULL "
+                "AND bm.phase1_generation_key IS NULL ORDER BY bm.id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT bm.kind AS kind,bm.statement AS statement,"
+                "c.session_id AS session_id "
+                "FROM behavioral_markers bm "
+                "LEFT JOIN chunks c ON bm.chunk_id=c.id "
+                "JOIN current_phase1_publications publication "
+                "ON publication.chunk_id=bm.chunk_id "
+                "AND publication.phase1_generation_key="
+                "bm.phase1_generation_key "
+                "WHERE bm.phase1_generation_key=? "
+                "AND bm.consolidated_at IS NULL "
+                "ORDER BY bm.id",
+                (phase1_generation_key,),
+            ).fetchall()
     except sqlite3.OperationalError:
         return []
     if not rows:
@@ -280,8 +523,7 @@ def list_rules(conn: sqlite3.Connection) -> list["Rule"]:
     active set. Read-only; `[]` on a pre-v23 store."""
     try:
         rows = conn.execute(
-            f"SELECT {_RULE_COLS} FROM rules "
-            "WHERE status = 'active' AND invalid_at IS NULL ORDER BY scope, id"
+            f"SELECT {_RULE_COLS} FROM current_rules ORDER BY scope, id"
         ).fetchall()
     except sqlite3.OperationalError:
         return []
@@ -344,8 +586,7 @@ def load_rules(
     ``matched_entities``. Read-only; returns ``[]`` on a pre-v23 store."""
     try:
         rows = conn.execute(
-            f"SELECT {_RULE_COLS} FROM rules "
-            "WHERE status = 'active' AND invalid_at IS NULL"
+            f"SELECT {_RULE_COLS} FROM current_rules"
         ).fetchall()
     except sqlite3.OperationalError:
         return []
@@ -391,12 +632,43 @@ def add_rule(
     if source not in RULE_SOURCES:
         raise ValueError(f"unknown rule source {source!r} (expected one of {sorted(RULE_SOURCES)})")
 
-    triggers = sorted({normalize(t) for t in (trigger_entities or []) if t and t.strip()})
+    raw_triggers = trigger_entities or []
+    if not isinstance(raw_triggers, list) or any(
+        not isinstance(item, str) or not item.strip()
+        for item in raw_triggers
+    ):
+        raise ValueError("rule trigger entities must be non-empty strings")
+    triggers = sorted({normalize(item) for item in raw_triggers})
+    if any(not trigger for trigger in triggers):
+        raise ValueError("rule trigger entities must normalize to non-empty identities")
+    if scope == "contextual" and not triggers:
+        raise ValueError("contextual rules require at least one trigger entity")
+    if scope == "always_on" and triggers:
+        raise ValueError("always-on rules cannot have trigger entities")
     triggers_json = json.dumps(triggers)
 
     if supersedes is not None:
         retract_rule(conn, supersedes)
 
+    existing = conn.execute(
+        "SELECT id,source FROM rules WHERE text=?", (text,)
+    ).fetchone()
+    if existing is not None and source == "agent_inferred":
+        # Only marker-linked internal routing may reinforce inferred rows, and
+        # inference can never mutate an identically worded user rule.
+        return int(existing["id"])
+    if existing is not None and source == "user" and existing["source"] == "agent_inferred":
+        from hymem.core.db import evidence_mutation
+
+        with evidence_mutation(conn):
+            conn.execute(
+                "DELETE FROM rule_marker_evidence WHERE rule_id=?",
+                (existing["id"],),
+            )
+            conn.execute(
+                "DELETE FROM rule_marker_decisions WHERE rule_id=?",
+                (existing["id"],),
+            )
     conn.execute(
         """
         INSERT INTO rules(text, scope, trigger_entities, source, valid_at)
@@ -418,12 +690,19 @@ def add_rule(
 def retract_rule(conn: sqlite3.Connection, rule_id: int) -> None:
     """Close an active rule's validity interval (``status='retracted'`` +
     ``invalid_at``). Idempotent: an already-retracted rule keeps its close date."""
-    conn.execute(
-        """
-        UPDATE rules
-        SET status = 'retracted',
-            invalid_at = COALESCE(invalid_at, CURRENT_TIMESTAMP)
-        WHERE id = ? AND status = 'active'
-        """,
-        (rule_id,),
-    )
+    from hymem.core.db import evidence_mutation
+
+    # A linked inferred row remains immutable evidence history, but an explicit
+    # user retraction may close its lifecycle. The private authority satisfies
+    # the semantic guard without deleting lineage or mutating user rules via an
+    # inference path; current_rules already hides the closed projection.
+    with evidence_mutation(conn):
+        conn.execute(
+            """
+            UPDATE rules
+            SET status = 'retracted',
+                invalid_at = COALESCE(invalid_at, CURRENT_TIMESTAMP)
+            WHERE id = ? AND status = 'active'
+            """,
+            (rule_id,),
+        )

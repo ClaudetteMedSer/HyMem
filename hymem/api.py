@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Callable, Iterable, Literal, Mapping
 from urllib.parse import urlsplit
 
 from hymem import portability
@@ -18,6 +18,7 @@ from hymem import redaction
 from hymem import rules as rules_mod
 from hymem import session as session_log
 from hymem.config import HyMemConfig
+from hymem.deadline import MonotonicDeadline
 from hymem.core import db as core_db
 from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.dreaming import canonicalize as canon
@@ -25,32 +26,39 @@ from hymem.dreaming import evidence as evidence_ledger
 from hymem.dreaming.aggregate import (
     Digest,
     NodeExpansion,
+    aggregation_config_version,
     expand_node as aggregate_expand_node,
     load_digest,
 )
-from hymem.dreaming.lossless import materialize_message_coverage
+from hymem.dreaming.aggregation_health import aggregation_health_status
+from hymem.dreaming.aggregation_material import embedding_execution_identity
+from hymem.dreaming.aggregation_generation import (
+    aggregation_generation_binding_for_contract,
+    aggregation_generation_contract,
+)
+from hymem.dreaming.lossless import (
+    COVERAGE_INTEGRITY_CONFIG_VERSION,
+    materialize_message_coverage,
+)
+from hymem.dreaming.phase1_auxiliary import (
+    add_manual_entity_property,
+    add_manual_entity_type,
+)
 from hymem.dreaming.embeddings import (
     fetch_message_embeddings,
     message_embedding_id_batches,
     persist_message_embeddings,
 )
-from hymem.dreaming.digest import (
-    active_episode_prompt_version,
-    digest_config_version,
-    digest_retry_policy_version,
-    digest_retry_state_is_valid,
-)
-from hymem.dreaming.runner import DreamReport, run_dreaming
+from hymem.dreaming.status import durable_dream_work_status
+from hymem.dreaming.runner import DreamLeaseLost, DreamReport, run_dreaming
 from hymem.dreaming.user_profile import (
     ProfileEntry,
     enforce_profile_redaction_policy,
     load_profile,
-    profile_config_version,
-    profile_retry_policy_version,
-    profile_retry_state_is_valid,
 )
 from hymem.extraction.embeddings import EmbeddingClient
 from hymem.extraction.llm import LLMClient
+from hymem.extraction.producer import phase1_generation_binding
 from hymem.query.ask import Answer, ask as query_ask
 from hymem.query.augment import AugmentedContext, augment, build_token_overlap_index
 from hymem.query.conflicts import Conflict, find_conflicts
@@ -99,10 +107,23 @@ def _ensure_embedding_server(timeout: float = 45.0) -> bool:
     base_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL")
     if not base_url:
         return True
+    from hymem.contrib.endpoint_policy import (
+        EMBEDDING_INTERNAL_HTTP_ENV,
+        validate_http_endpoint,
+    )
     from hymem.contrib.openai_embedding_client import safe_embedding_base_url
     display_url = safe_embedding_base_url(base_url)
+    try:
+        endpoint = validate_http_endpoint(
+            base_url,
+            label="embedding",
+            allow_insecure_internal_env=EMBEDDING_INTERNAL_HTTP_ENV,
+        )
+    except ValueError:
+        log.warning("embedding endpoint %s was rejected by transport policy", display_url)
+        return False
 
-    parts = urlsplit(base_url)
+    parts = urlsplit(endpoint.url)
     host = (parts.hostname or "").lower()
     if host not in _LOCAL_HOSTS:
         # Remote provider: not ours to manage. Skip rather than fail.
@@ -124,7 +145,9 @@ def _ensure_embedding_server(timeout: float = 45.0) -> bool:
         )
         return False
 
-    log.warning("embedding server at %s is down — restarting via %r", display_url, cmd)
+    # The operator command may contain credentials or an opaque tenant route.
+    # Never render it into process logs.
+    log.warning("embedding server at %s is down — restart requested", display_url)
     try:
         # Detach so the embedding server outlives this restart trigger; inherit
         # the environment so HYMEM_EMBEDDING_* stay consistent with the client.
@@ -135,7 +158,10 @@ def _ensure_embedding_server(timeout: float = 45.0) -> bool:
             start_new_session=True,
         )
     except (OSError, ValueError) as exc:
-        log.warning("failed to launch embedding server (%r): %s", cmd, exc)
+        log.warning(
+            "embedding server launch failed error_type=%s",
+            type(exc).__name__,
+        )
         return False
 
     deadline = time.monotonic() + timeout
@@ -180,6 +206,24 @@ class HyMem:
         embedding_client: EmbeddingClient | None = None,
     ) -> None:
         self.config = config
+        # Resolve before assignment so an unsafe explicit declaration (for
+        # example a credential-bearing endpoint) cannot leave the instance in
+        # a half-switched state. Unknown clients receive their conservative
+        # process-instance binding here and keep it for this object lifetime.
+        self._phase1_generation = (
+            phase1_generation_binding(config.prompt_version, llm)
+            if llm is not None else None
+        )
+        self._aggregation_contract = (
+            aggregation_generation_contract(config)
+            if config.aggregation_nodes_enabled else None
+        )
+        self._aggregation_generation = (
+            aggregation_generation_binding_for_contract(
+                self._aggregation_contract, llm,
+            )
+            if llm is not None and self._aggregation_contract is not None else None
+        )
         self._llm = llm
         self._embed = embedding_client
         self._conn: sqlite3.Connection | None = None
@@ -198,11 +242,11 @@ class HyMem:
             self._conn = core_db.connect(self.config.db_path)
         if not self._initialized:
             core_db.initialize(self._conn)
-            core_db.backfill_entity_mentions(self._conn)
             if self.config.redact_secrets:
                 with core_db.transaction(self._conn):
                     enforce_profile_redaction_policy(self._conn)
             self._initialized = True
+            self._scope_phase1_reads(self._conn)
         return self._conn
 
     @property
@@ -210,6 +254,7 @@ class HyMem:
         if self._read_conn is None:
             self.conn  # ensure the write connection is initialized first
             self._read_conn = core_db.connect(self.config.db_path)
+            self._scope_phase1_reads(self._read_conn)
             # Load optional vec0 acceleration shadows before query_only. Durable
             # identity/content-validated vectors remain retrieval authority.
             core_db._load_vec_extension(self._read_conn)
@@ -226,7 +271,46 @@ class HyMem:
             self._initialized = False
 
     def set_llm(self, llm: LLMClient) -> None:
+        generation = phase1_generation_binding(self.config.prompt_version, llm)
+        aggregation_generation = (
+            aggregation_generation_binding_for_contract(
+                self._aggregation_contract, llm,
+            )
+            if self._aggregation_contract is not None else None
+        )
+        self._phase1_generation = generation
+        self._aggregation_generation = aggregation_generation
         self._llm = llm
+        if self._conn is not None:
+            self._scope_phase1_reads(self._conn)
+        if self._read_conn is not None:
+            self._scope_phase1_reads(self._read_conn)
+
+    def _scope_phase1_reads(self, conn: sqlite3.Connection) -> None:
+        generation_key = (
+            str(self._phase1_generation["generation_key"])
+            if self._phase1_generation is not None else None
+        )
+        core_db.register_current_phase1_generation(conn, generation_key)
+        core_db.register_current_rule_routing(
+            conn, rules_mod.rule_routing_key(self.config, generation_key)
+        )
+
+    def _current_aggregation_generation_key(self) -> str | None:
+        """Resolve the live producer at each aggregation read boundary.
+
+        Maintained clients expose mutable Python attributes, so the binding
+        cached by ``__init__``/``set_llm`` is only lifecycle metadata. It must
+        never authorize reads after an in-place model, endpoint, request, or
+        retry-policy change.
+        """
+
+        if self._llm is None or self._aggregation_contract is None:
+            return None
+        current = aggregation_generation_binding_for_contract(
+            self._aggregation_contract, self._llm,
+        )
+        return str(current["generation_key"])
 
     def set_embedding_client(self, embedding_client: EmbeddingClient) -> None:
         self._embed = embedding_client
@@ -245,21 +329,23 @@ class HyMem:
                 "fallback_reason": None,
             }
         try:
-            model: object = self._embed.model
+            _binding, model, dim = embedding_execution_identity(self._embed)
         except Exception:
-            model = None
+            model, dim = None, None
         try:
-            dim: object = self._embed.dim
+            backend_value = str(getattr(self._embed, "backend", "configured"))
         except Exception:
-            dim = None
+            backend_value = "configured"
+        backend = (
+            backend_value if backend_value in {
+                "configured", "local_feature_hash", "openai_compatible",
+            } else "configured"
+        )
         try:
-            backend = str(getattr(self._embed, "backend", "configured"))
+            quality_value = str(getattr(self._embed, "quality", "semantic"))
         except Exception:
-            backend = "configured"
-        try:
-            quality = str(getattr(self._embed, "quality", "semantic"))
-        except Exception:
-            quality = "semantic"
+            quality_value = "semantic"
+        quality = quality_value if quality_value in {"lexical", "semantic"} else "semantic"
         try:
             network_free = bool(getattr(self._embed, "network_free", False))
         except Exception:
@@ -268,7 +354,11 @@ class HyMem:
             fallback_reason = getattr(self._embed, "fallback_reason", None)
         except Exception:
             fallback_reason = None
-        if not isinstance(fallback_reason, str) or not fallback_reason:
+        if fallback_reason not in {
+            "remote_embedding_credentials_missing",
+            "remote_embedding_endpoint_rejected",
+            "remote_embedding_client_unavailable",
+        }:
             fallback_reason = None
         return {
             "configured": True,
@@ -494,15 +584,55 @@ class HyMem:
         overwrites). Re-asserting identical text reinforces instead of
         duplicating. Text is redaction-scrubbed at persist time.
         """
+        if source != "user":
+            raise ValueError(
+                "HyMem.add_rule accepts user/told rules only; inferred rules "
+                "are created by the producer-scoped marker router"
+            )
         with core_db.transaction(self.conn):
             return rules_mod.add_rule(
                 self.conn,
                 text,
                 scope=scope,
                 trigger_entities=trigger_entities,
-                source=source,
+                source="user",
                 supersedes=supersedes,
             )
+
+    def set_entity_type(
+        self,
+        entity: str,
+        type_name: str,
+        *,
+        confidence: float = 1.0,
+    ) -> None:
+        """Assert a user-authored entity type with explicit durable authority.
+
+        This is the supported alternative to writing ``entity_types``
+        directly.  It cannot be hidden, reinforced, or overwritten by an LLM
+        extraction; a later explicit call may update its confidence.
+        """
+        with core_db.transaction(self.conn):
+            add_manual_entity_type(
+                self.conn, entity, type_name, confidence=confidence,
+            )
+        self._token_overlap_index = None
+
+    def set_entity_property(self, entity: str, key: str, value: str) -> None:
+        """Assert a user-authored property with explicit durable authority.
+
+        Identifiers must be non-empty.  An empty string remains a meaningful
+        explicit value; when secret redaction is enabled, the value is scrubbed
+        at this persistence boundary.
+        """
+        if not isinstance(value, str):
+            raise ValueError("entity property value must be a string")
+        prepared_value = (
+            redaction.redact(value) if self.config.redact_secrets else value
+        )
+        with core_db.transaction(self.conn):
+            add_manual_entity_property(self.conn, entity, key, prepared_value)
+        self._token_overlap_index = None
 
     def retract_rule(self, rule_id: int) -> None:
         """Retire a rule by closing its validity interval (`status='retracted'`
@@ -551,6 +681,9 @@ class HyMem:
         return rules_mod.suggest_rules_from_markers(
             self.read_conn, self.config, self._llm,
             limit=limit, mode=mode, confidence_min=confidence_min,
+            phase1_generation_key=phase1_generation_binding(
+                self.config.prompt_version, self._llm
+            )["generation_key"],
         )
 
     # ---- query-time --------------------------------------------------
@@ -595,6 +728,7 @@ class HyMem:
             source_peer_id=source_peer_id,
             source_workspace_id=source_workspace_id,
             ability=ability,
+            aggregation_generation_key=self._current_aggregation_generation_key(),
         )
 
     def ask(
@@ -638,7 +772,7 @@ class HyMem:
         # `ctx.digest` may already be populated when cfg.augment_include_digest
         # is on; only load it here when the caller asked and augment didn't.
         if include_digest and ctx.digest is None:
-            ctx.digest = load_digest(self.read_conn)
+            ctx.digest = self.digest()
         return query_ask(self.config, self._llm, question, ctx)
 
     def digest(self) -> Digest | None:
@@ -659,13 +793,27 @@ class HyMem:
         single call per turn can set `cfg.augment_include_digest` to receive
         the same object as `ctx.digest` from `augment()` instead.
         """
-        return load_digest(self.read_conn)
+        if (
+            not self.config.aggregation_nodes_enabled
+            or not self.config.aggregation_digest_enabled
+        ):
+            return None
+        return load_digest(
+            self.read_conn,
+            expected_config_version=aggregation_config_version(self.config),
+            expected_cluster_min_members=self.config.aggregation_min_members,
+            expected_cluster_min_sessions=self.config.aggregation_min_sessions,
+            expected_anchor_fact_cap=self.config.aggregation_digest_anchor_facts,
+            expected_generation_key=self._current_aggregation_generation_key(),
+            embedding_client=self._embed,
+        )
 
     def expand_node(self, node_id: str) -> NodeExpansion | None:
         """Drill one level down into the RAPTOR aggregation tree — the
         provenance read behind "why does my digest say X?". Resolves the
         node's persisted members into child nodes and member episodes (each
-        episode carrying its session id and raw-message span), so a host can
+        episode carrying its exact ordered source-message coordinates and
+        ownership scope), so a host can
         walk from the standing digest (`digest().node_id`) or a query-tier
         node (`AggregationNodeHit.node_id`) all the way down to the original
         turns. Returns None for an unknown id (e.g. a stale id from before
@@ -673,7 +821,17 @@ class HyMem:
         are only stable while the underlying episode membership is).
         Read-only; never an LLM call.
         """
-        return aggregate_expand_node(self.read_conn, node_id)
+        if not self.config.aggregation_nodes_enabled:
+            return None
+        return aggregate_expand_node(
+            self.read_conn, node_id,
+            expected_config_version=aggregation_config_version(self.config),
+            expected_cluster_min_members=self.config.aggregation_min_members,
+            expected_cluster_min_sessions=self.config.aggregation_min_sessions,
+            expected_anchor_fact_cap=self.config.aggregation_digest_anchor_facts,
+            expected_generation_key=self._current_aggregation_generation_key(),
+            embedding_client=self._embed,
+        )
 
     def profile(self) -> list[ProfileEntry]:
         """ACTIVE typed user-profile rows (schema v18) — the durable personal
@@ -783,20 +941,42 @@ class HyMem:
 
     # ---- dreaming ----------------------------------------------------
 
-    def dream(self, *, session_ids: Iterable[str] | None = None) -> DreamReport:
+    def dream(
+        self,
+        *,
+        session_ids: Iterable[str] | None = None,
+        deadline: MonotonicDeadline | None = None,
+    ) -> DreamReport:
         if self._llm is None:
             raise RuntimeError(
                 "HyMem.dream requires an LLMClient. Pass one to the constructor "
                 "or call set_llm() before dreaming."
             )
-        ids = list(session_ids) if session_ids is not None else None
-        report = run_dreaming(
-            self.conn,
-            self.config,
-            self._llm,
-            session_ids=ids,
-            embedding_client=self._embed,
+        # Permit intentional in-place configuration changes only by treating
+        # them as an explicit producer switch. The runner independently fences
+        # against further drift during a provider request.
+        self._phase1_generation = phase1_generation_binding(
+            self.config.prompt_version, self._llm
         )
+        if self._conn is not None:
+            self._scope_phase1_reads(self._conn)
+        if self._read_conn is not None:
+            self._scope_phase1_reads(self._read_conn)
+        ids = list(session_ids) if session_ids is not None else None
+        try:
+            report = run_dreaming(
+                self.conn,
+                self.config,
+                self._llm,
+                session_ids=ids,
+                embedding_client=self._embed,
+                deadline=deadline,
+            )
+        except DreamLeaseLost:
+            # Earlier fenced units from this cycle, or the successor process,
+            # may already have changed retrieval state before the handoff.
+            self.invalidate_query_caches()
+            raise
         # Dreaming may have added, retracted, or merged canonicals — invalidate
         # the token-overlap index so the next augment() rebuilds it.
         self._token_overlap_index = None
@@ -844,7 +1024,9 @@ class HyMem:
             else self.config.behavioral_dedup_cosine_threshold
         )
         proposals = behavioral_dedup.find_behavioral_duplicates(
-            self.read_conn, cosine_threshold=threshold
+            self.read_conn,
+            cosine_threshold=threshold,
+            embedding_client=self._embed,
         )
         return {
             "cosine_threshold": threshold,
@@ -898,7 +1080,9 @@ class HyMem:
             else self.config.behavioral_dedup_cosine_threshold
         )
         proposals = behavioral_dedup.find_behavioral_duplicates(
-            self.read_conn, cosine_threshold=threshold
+            self.read_conn,
+            cosine_threshold=threshold,
+            embedding_client=self._embed,
         )
         if not proposals:
             return {
@@ -911,7 +1095,9 @@ class HyMem:
         from hymem.core import db as core_db
 
         with core_db.transaction(self.conn):
-            result = behavioral_dedup.apply_behavioral_merges(self.conn, proposals)
+            result = behavioral_dedup.apply_behavioral_merges(
+                self.conn, proposals, embedding_client=self._embed,
+            )
 
         # Invalidate so next augment rebuilds entity lookups from the slimmed graph.
         self._token_overlap_index = None
@@ -921,10 +1107,42 @@ class HyMem:
         return result
 
     def dream_status(self) -> dict:
+        """Return one coherent, read-only durable indexing-health snapshot."""
+        return self.dream_status_with_snapshot(lambda _conn: {})
+
+    def dream_status_with_snapshot(
+        self,
+        extension: Callable[[sqlite3.Connection], Mapping[str, object]],
+    ) -> dict:
+        """Extend :meth:`dream_status` inside its exact SQLite snapshot.
+
+        Benchmark completion also audits embedding mirrors.  Letting that
+        audit run here prevents a writer from advancing source state between
+        two independently clean-looking status reads.  The callback is
+        read-only, executes on a dedicated query-only connection, and may not
+        shadow production dream-status fields.
+        """
+        if not callable(extension):
+            raise TypeError("dream status snapshot extension must be callable")
+        self.conn  # initialize/migrate the store before opening it read-only
+        with core_db.read_snapshot(self.config.db_path) as conn:
+            self._scope_phase1_reads(conn)
+            status = self._dream_status_snapshot(conn)
+            extra = extension(conn)
+            if not isinstance(extra, Mapping):
+                raise TypeError("dream status snapshot extension must return a mapping")
+            overlap = set(status).intersection(extra)
+            if overlap:
+                raise ValueError("dream status snapshot extension shadows status fields")
+            status.update(extra)
+            return status
+
+    def _dream_status_snapshot(self, conn: sqlite3.Connection) -> dict:
         """Operator-visibility snapshot of the dreaming/extraction backlog.
 
-        Pure SQL via `read_conn` — no LLM or embedding calls, no writes — so it
-        works even when no LLM/embedding client is configured. Useful to explain
+        Pure reads over a dedicated coherent SQLite snapshot — no LLM,
+        embedding calls, or writes — so it works even when no LLM/embedding
+        client is configured. Useful to explain
         the re-extraction surge that follows a `prompt_version` bump: when the
         version changes, every chunk is "pending" again and the next dream(s)
         reprocess the whole backlog, which can take minutes.
@@ -935,9 +1153,47 @@ class HyMem:
           - `quarantined_chunks`: unprocessed chunks whose consecutive failure
             count reached the current retry bound. These are not completed and
             reopen when the prompt or retry policy changes.
+          - `pending_source_materialization`: covered/raw session frontiers not
+            yet acknowledged by the current salience+baseline chunk producers.
+          - `pending_digests`, `pending_profiles`, and `pending_facts`: current
+            lossless consumer cursors, rebuilds/replays, or local publication
+            stamps still owed below their exact quarantine bounds.
+          - `malformed_*`: structurally invalid cursor/retry/authority state.
+            These counters are health blockers and never convert to success.
+          - `terminal_loss_chunks`: chunks whose exact source manifest is
+            irrecoverably absent. They are not successful and never reopen on
+            a prompt change; `terminal_loss_reasons` provides the breakdown.
+          - `coverage_integrity_failures`: sessions whose ordered lossless
+            source could not be established under the current structural
+            validator. This is non-pending unhealthy state, not work that a
+            convergence loop should blindly spin on. Resolve a transient
+            storage/validation failure or repair persistent artifact damage;
+            the next complete good walk clears it. Bounded structural details
+            name the affected session/config without source or exception text.
+          - `quarantined_facts`: fact extraction units held under the CURRENT
+            prompt/config/retry/cursor identity. Stale identities are reopened
+            work and do not count. `quarantined_facts_malformed` separately
+            counts flagged rows whose bounded retry, cursor, or fact authority
+            state is inconsistent.
+            Both are zero when fact extraction is disabled or its retry bound
+            is zero.
+          - `pending_aggregation`: 1 while the enabled material aggregation
+            config has no clean local build acknowledgement, including after a
+            partial fusion failure, total exception, crash, or portable source
+            import. Disabled aggregation never reports actionable pending work;
+            historical bounded counters remain visible for audit.
           - `total_chunks`: retrieval/extraction chunk count. Lossless coverage
             artifacts are durable source storage and do not enter this budget.
-          - `prompt_version`: the current `config.prompt_version`.
+          - `prompt_version`: the current human `config.prompt_version`.
+          - `extraction_contract`: its derived prompt/validator/recovery
+            binding; `extraction_cache_key` is the exact Phase-1 DB namespace.
+          - `phase1_generation`: the secret-free producer/effective-request
+            binding currently owed. A configured model switch therefore makes
+            old processed markers visibly pending instead of relabeling them.
+          - `extraction_provider_attempt_budget`: configured soft Phase-1
+            provider-request-attempt ceiling per cycle (0 means unlimited).
+            Measured usage and whether it blocked pending work are exposed on
+            `last_run`.
           - `in_progress`: True iff a `run_lock` row named 'dreaming' exists.
             This is intentionally coarse — a *stale* lock (e.g. from a crashed
             dream) reads as in_progress until it expires. Lock heartbeat/TTL is
@@ -945,103 +1201,101 @@ class HyMem:
           - `last_run`: the most recent `dream_runs` row as a dict, or None if
             no dream has ever run.
         """
-        conn = self.read_conn
-        pv = self.config.prompt_version
+        from hymem.extraction.contract import extraction_cache_key
+
+        pv = extraction_cache_key(self.config.prompt_version)
+        generation = (
+            phase1_generation_binding(self.config.prompt_version, self._llm)
+            if self._llm is not None else None
+        )
+        generation_key = (
+            str(generation["generation_key"]) if generation is not None else ""
+        )
 
         retry_bound = int(self.config.chunk_extraction_max_attempts)
         pending_chunks = conn.execute(
             "SELECT COUNT(*) FROM chunks c "
             "WHERE c.chunk_kind = 'extraction' "
             "AND COALESCE(c.salience_reason, '') <> 'short_session_fallback' "
+            "AND c.source_manifest_version='claim-source-manifest-v1' "
+            "AND c.source_manifest_count>0 "
             "AND NOT EXISTS ("
-            "    SELECT 1 FROM processed_chunks pc "
-            "    WHERE pc.chunk_id = c.id AND pc.prompt_version = ?"
+            "    SELECT 1 FROM chunk_extraction_terminal_losses loss "
+            "    WHERE loss.chunk_id=c.id"
+            ") "
+            "AND NOT EXISTS ("
+            "    SELECT 1 FROM current_phase1_publications publication "
+            "    WHERE publication.chunk_id=c.id "
+            "      AND publication.prompt_version=? "
+            "      AND publication.phase1_generation_key=?"
             ") "
             "AND (? <= 0 OR NOT EXISTS ("
             "    SELECT 1 FROM chunk_extraction_attempts a "
             "    WHERE a.chunk_id = c.id AND a.prompt_version = ? "
+            "      AND a.phase1_generation_key=? "
             "      AND a.attempts >= ?"
             "))",
-            (pv, retry_bound, pv, retry_bound),
+            (pv, generation_key, retry_bound, pv, generation_key, retry_bound),
         ).fetchone()[0]
         quarantined_chunks = (
             conn.execute(
                 "SELECT COUNT(*) FROM chunks c "
                 "WHERE c.chunk_kind = 'extraction' "
                 "AND COALESCE(c.salience_reason, '') <> 'short_session_fallback' "
+                "AND c.source_manifest_version='claim-source-manifest-v1' "
+                "AND c.source_manifest_count>0 "
                 "AND NOT EXISTS ("
-                "    SELECT 1 FROM processed_chunks pc "
-                "    WHERE pc.chunk_id = c.id AND pc.prompt_version = ?"
+                "    SELECT 1 FROM chunk_extraction_terminal_losses loss "
+                "    WHERE loss.chunk_id=c.id"
+                ") "
+                "AND NOT EXISTS ("
+                "    SELECT 1 FROM current_phase1_publications publication "
+                "    WHERE publication.chunk_id=c.id "
+                "      AND publication.prompt_version=? "
+                "      AND publication.phase1_generation_key=?"
                 ") "
                 "AND EXISTS ("
                 "    SELECT 1 FROM chunk_extraction_attempts a "
                 "    WHERE a.chunk_id = c.id AND a.prompt_version = ? "
+                "      AND a.phase1_generation_key=? "
                 "      AND a.attempts >= ?"
                 ")",
-                (pv, pv, retry_bound),
+                (pv, generation_key, pv, generation_key, retry_bound),
             ).fetchone()[0]
             if retry_bound > 0
             else 0
         )
-        digest_config = digest_config_version(
-            prompt_version=self.config.prompt_version,
-            episode_prompt_version=active_episode_prompt_version(
-                self.config.episode_granularity_enabled
-            ),
-            max_chars=self.config.dream_digest_max_chars,
-            max_tokens=self.config.dream_digest_max_tokens,
-            max_episodes=(
-                self.config.dream_max_episodes_per_session
-                if self.config.episode_granularity_enabled else None
-            ),
-        )
-        digest_retry_key = digest_retry_policy_version(
-            digest_config,
-            max_attempts=self.config.digest_extraction_max_attempts,
-        )
-        digest_retry_prefix = digest_retry_key.rsplit("|", 1)[0] + "|"
-        digest_retry_rows = conn.execute(
-            "SELECT digest_retry_count, digest_retry_config_version, "
-            "digest_quarantined FROM sessions"
+        terminal_loss_rows = conn.execute(
+            "SELECT reason,COUNT(*) AS n "
+            "FROM chunk_extraction_terminal_losses GROUP BY reason ORDER BY reason"
         ).fetchall()
-        quarantined_digests = sum(
-            1
-            for row in digest_retry_rows
-            if digest_retry_state_is_valid(
-                row["digest_retry_count"], row["digest_retry_config_version"],
-                row["digest_quarantined"],
-            )
-            and self.config.digest_extraction_max_attempts > 0
-            and row["digest_retry_count"]
-            >= self.config.digest_extraction_max_attempts
-            and row["digest_retry_config_version"].startswith(digest_retry_prefix)
-        )
-        profile_config = profile_config_version(
-            max_chars=self.config.dream_digest_max_chars,
-            max_items=self.config.profile_max_items_per_session,
-            redact_values=self.config.redact_secrets,
-        )
-        profile_retry_key = profile_retry_policy_version(
-            profile_config,
-            max_attempts=self.config.profile_extraction_max_attempts,
-        )
-        profile_retry_prefix = profile_retry_key.rsplit("|", 1)[0] + "|"
-        profile_retry_rows = conn.execute(
-            "SELECT profile_retry_count, profile_retry_config_version, "
-            "profile_quarantined FROM sessions"
+        terminal_loss_reasons = {
+            str(row["reason"]): int(row["n"]) for row in terminal_loss_rows
+        }
+        terminal_loss_chunks = sum(terminal_loss_reasons.values())
+        coverage_failure_rows = conn.execute(
+            "SELECT failure_reason,COUNT(*) AS n "
+            "FROM coverage_integrity_failures "
+            "GROUP BY failure_reason ORDER BY failure_reason"
         ).fetchall()
-        quarantined_profiles = sum(
-            1
-            for row in profile_retry_rows
-            if profile_retry_state_is_valid(
-                row["profile_retry_count"], row["profile_retry_config_version"],
-                row["profile_quarantined"],
-            )
-            and self.config.profile_extraction_max_attempts > 0
-            and row["profile_retry_count"]
-            >= self.config.profile_extraction_max_attempts
-            and row["profile_retry_config_version"].startswith(profile_retry_prefix)
+        coverage_integrity_failure_reasons = {
+            str(row["failure_reason"]): int(row["n"])
+            for row in coverage_failure_rows
+        }
+        coverage_integrity_failures = sum(
+            coverage_integrity_failure_reasons.values()
         )
+        coverage_detail_limit = 100
+        coverage_detail_rows = conn.execute(
+            "SELECT session_id,config_version,failure_reason,occurrences,"
+            "first_detected_at,last_detected_at "
+            "FROM coverage_integrity_failures "
+            "ORDER BY last_detected_at DESC,session_id LIMIT ?",
+            (coverage_detail_limit + 1,),
+        ).fetchall()
+        coverage_integrity_failure_details = [
+            dict(row) for row in coverage_detail_rows[:coverage_detail_limit]
+        ]
         total_chunks = conn.execute(
             "SELECT COUNT(*) FROM chunks WHERE chunk_kind = 'extraction'"
         ).fetchone()[0]
@@ -1055,15 +1309,59 @@ class HyMem:
             "SELECT * FROM dream_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
 
+        aggregation_status = aggregation_health_status(
+            conn,
+            enabled=self.config.aggregation_nodes_enabled,
+            config_version=(
+                aggregation_config_version(self.config)
+                if self.config.aggregation_nodes_enabled else None
+            ),
+            generation_key=(
+                self._current_aggregation_generation_key()
+                if self.config.aggregation_nodes_enabled else None
+            ),
+            embedding_client=self._embed,
+        )
+        work_status = durable_dream_work_status(conn, self.config)
+
         return {
+            **work_status,
             "pending_chunks": pending_chunks,
             "quarantined_chunks": quarantined_chunks,
-            "quarantined_digests": quarantined_digests,
-            "quarantined_profiles": quarantined_profiles,
+            "terminal_loss_chunks": terminal_loss_chunks,
+            "terminal_loss_reasons": terminal_loss_reasons,
+            "coverage_integrity_failures": coverage_integrity_failures,
+            "coverage_integrity_failure_reasons": (
+                coverage_integrity_failure_reasons
+            ),
+            "coverage_integrity_failure_details": (
+                coverage_integrity_failure_details
+            ),
+            "coverage_integrity_failure_details_truncated": (
+                len(coverage_detail_rows) > coverage_detail_limit
+            ),
+            "coverage_integrity_config_version": (
+                COVERAGE_INTEGRITY_CONFIG_VERSION
+            ),
             "total_chunks": total_chunks,
-            "prompt_version": pv,
+            "prompt_version": self.config.prompt_version,
+            "extraction_contract": dict(self.config.extraction_contract),
+            "extraction_cache_key": pv,
+            "phase1_generation": generation,
+            "phase1_generation_key": (
+                generation_key if generation is not None else None
+            ),
+            "phase1_backlog_status": (
+                "current_producer" if generation is not None
+                else "producer_unavailable"
+            ),
+            "pending_chunks_authoritative": generation is not None,
+            "extraction_provider_attempt_budget": (
+                self.config.dream_extraction_provider_attempt_budget
+            ),
             "in_progress": in_progress,
             "last_run": dict(last_row) if last_row is not None else None,
+            **aggregation_status,
         }
 
     # ---- portability -------------------------------------------------
@@ -1133,7 +1431,8 @@ class HyMem:
                 evidence_weight=1,
                 details=f"HyMem.retract_edge({subj}, {predicate}, {obj})",
             )
-            # Store feedback for future extraction improvement
+            # Retain source-linked correction evidence for bounded audit.
+            # Audit values never flow back into an extraction prompt.
             evidence_rows = self.conn.execute(
                 f"""SELECT chunk_id FROM kg_evidence
                    WHERE edge_id = ? AND polarity = 1 AND is_current = 1

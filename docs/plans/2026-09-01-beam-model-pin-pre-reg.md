@@ -1,5 +1,10 @@
 # Pre-registration: BEAM model pin (deepseek-chat → v4-flash) — 2026-09-01 (v0.1)
 
+> **Archived migration protocol.** The `deepseek-chat` statements below
+> describe the now-retired mutable alias at the time of this experiment; they
+> are historical evidence, not current instructions. Live runs pin
+> `deepseek-v4-flash` with thinking disabled.
+
 Status: **DRAFT — awaiting review, then Atta's approval for the spend.**
 Branch: Beam-optimisation. Phase 2 of the sequence banked in
 `2026-08-31-beam-gold-delta-rejudge-pre-reg.md` §8 ("Next per plan: §6 registry
@@ -16,8 +21,9 @@ The gold-delta phase (§8, 2026-08-31) returned **REBASE REQUIRED**: the June
 record's meaning changed, so a fresh gold-on canonical is needed. That
 canonical must be produced on some model. The choice is between:
 
-- **the alias** `deepseek-chat` — currently working, but the server maps it to
-  v4-flash non-thinking with no model-identity field in the response. Nothing
+- **the alias** `deepseek-chat` — it was working at experiment time, but the
+  server mapped it to v4-flash non-thinking with no model-identity field in
+  the response. Nothing
   in an artifact can witness which model actually graded it.
 - **the pin** `deepseek-v4-flash` + `thinking: {"type": "disabled"}` — which
   `references/deepseek-model-migration.md` asserts is the "byte-path-equivalent
@@ -120,10 +126,10 @@ as regression or improvement.
   Suite 1505 passed / 1 skipped (`/home/node/.venv`).
 - **`extra_body` defaults to empty.** An unflagged run sends the same four body
   keys it sent before the plumbing existed, so A and B remain comparators. This
-  is a deliberate divergence from `hymem/contrib/openai_client.py:81-86`'s
+  is a deliberate divergence from `hymem/contrib/openai_client.py`'s
   `auto` host-substring gate: a library may inject by default, a benchmark may
   not, because injection retires comparators without anyone deciding to.
-- **`longmemeval_adapter.py:384-392` raises only on `content is None`** — it
+- **The historical `longmemeval_adapter.py` client raised only on `content is None`** — it
   does NOT implement the three-way `content or reasoning or reasoning_content`
   fallback the migration doc's table claimed. The trap shape is `content == ""`
   with `finish_reason=length`, which a null-check passes through. The doc row

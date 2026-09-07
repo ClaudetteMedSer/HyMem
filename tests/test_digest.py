@@ -597,7 +597,9 @@ def test_digest_refusal_containing_valid_empty_object_holds_runner_cursor(cfg):
             "You analyze one conversation session": (
                 "I cannot comply. " + valid_empty
             ),
-            "single pass": json.dumps({"triples": [], "markers": []}),
+            "single pass": json.dumps({
+                "triples": [], "markers": [], "complete": True,
+            }),
         },
         default="[]",
     )

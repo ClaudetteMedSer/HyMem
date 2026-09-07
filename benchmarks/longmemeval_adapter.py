@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import gc
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -34,6 +36,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests as http
 
@@ -42,27 +45,54 @@ import requests as http
 _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root))
 
+from hymem.contrib.endpoint_policy import (  # noqa: E402
+    EMBEDDING_INTERNAL_HTTP_ENV,
+    TRANSPORT_SECURITY_NONE,
+    endpoint_transport_security,
+    resolve_embedding_api_key,
+    resolve_llm_api_key,
+    safe_endpoint_label,
+    secret_free_endpoint_identity,
+    validate_http_endpoint,
+)
+from hymem.contrib.model_policy import (  # noqa: E402
+    DeprecatedModelAliasError,
+    require_active_model,
+)
+
 from benchmarks.strictness import (
     AtomicCheckpoint,
+    BenchmarkCleanupError,
     BenchmarkIntegrityError,
+    IndexingConvergenceError,
+    OwnedResourceScope,
+    PythonSourceSlice,
     aggregate_embedding_usage_snapshots,
     aggregate_usage_snapshots,
     add_strict_run_arguments,
+    benchmark_hymem_source_paths,
     build_manifest,
     code_hash,
     content_hash,
+    converge_indexing,
+    durable_indexing_status,
     file_hash,
     freeze_calibration,
+    is_structural_benchmark_error,
     load_calibration,
-    publish_checkpoint_artifact,
+    prepare_checkpoint_artifact,
+    publish_prepared_artifact_after_cleanup,
+    python_file_imported_symbols,
+    python_slice_imported_symbols,
     resolve_checkpoint_path,
+    run_cleanup_actions,
     select_protocol_ids,
     sanitize_for_artifact,
     strict_accuracy,
     usage_snapshot,
     embedding_usage_snapshot,
+    effective_hymem_config_identity,
     validate_ids,
-    dataclass_identity,
     write_immutable_artifact,
     write_latest_pointer,
 )
@@ -73,6 +103,7 @@ from benchmarks.lme_protocol import (
     LME_EVALUATOR_SHA256,
     LME_EVALUATOR_URL,
     LME_HISTORICAL_LOCAL_JUDGE_PROMPTS_EXACT_OFFICIAL,
+    LME_INDEXING_SUMMARY_VERSION,
     LME_OFFICIAL_JUDGE_BASE_URL,
     LME_OFFICIAL_JUDGE_MAX_TOKENS,
     LME_OFFICIAL_JUDGE_MODEL,
@@ -87,6 +118,7 @@ from benchmarks.lme_protocol import (
     LME_S_QTYPE_COUNTS,
     LME_S_SOURCE_IDS_HASH,
     LME_SUPPORTED_SCALES,
+    canonicalize_lme_indexing_summary,
     export_official_predictions,
     is_official_abstention_id,
     normalize_extra_body,
@@ -96,6 +128,58 @@ from benchmarks.lme_protocol import (
     validate_lme_dataset,
     validate_safe_endpoint,
 )
+from benchmarks.extraction_canary import (
+    ExtractionCanaryError,
+    extraction_canary_client_policy,
+    secret_free_extraction_canary_report,
+    extraction_canary_policy,
+    print_extraction_canary,
+    run_configured_extraction_canary,
+    skipped_extraction_canary,
+    validate_extraction_canary_config_binding,
+    validate_extraction_canary_report,
+)
+
+
+def _pipeline_extraction_prompt_version(args: argparse.Namespace) -> str:
+    """Resolve the canary/cache prompt label from the effective adapter config."""
+
+    cfg = _adapter_for_args(
+        Path("/benchmark-identity/hymem.sqlite"), args, ""
+    ).build_config()
+    validate_extraction_canary_config_binding(
+        extraction_canary_policy(prompt_version=cfg.prompt_version), cfg
+    )
+    return cfg.prompt_version
+
+
+def _validate_pipeline_extraction_canary(
+    report: object, args: argparse.Namespace, *, mode: str,
+) -> dict[str, Any]:
+    """Bind a live preflight to the exact memory-pipeline request identity."""
+
+    prompt_version = _pipeline_extraction_prompt_version(args)
+    return validate_extraction_canary_report(
+        report,
+        expected_mode=mode,
+        expected_client=(
+            extraction_canary_client_policy(
+                base_url=args.hymem_base_url,
+                model=args.hymem_model,
+                thinking=args.hymem_thinking,
+            )
+            if mode == "required" else None
+        ),
+        require_client_closed=mode == "required",
+        expected_prompt_version=prompt_version,
+    )
+
+
+def _bounded_exception_type(exc: BaseException) -> str:
+    """Return only a bounded class identity for durable failure evidence."""
+
+    name = type(exc).__name__
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,127}", name) else "Exception"
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -282,8 +366,9 @@ DEFAULT_INDEXING_TIMEOUT_S = 3600.0
 # DeepSeek API
 DEEPSEEK_API_KEY = ""
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-ANSWER_MODEL = "deepseek-chat"
-JUDGE_MODEL = "deepseek-chat"
+PINNED_DEEPSEEK_MODEL = "deepseek-v4-flash"
+ANSWER_MODEL = PINNED_DEEPSEEK_MODEL
+JUDGE_MODEL = PINNED_DEEPSEEK_MODEL
 
 # Local embedding server (lever L1) — the FastEmbed ONNX server Hermes runs in
 # production. These are the OUT-OF-THE-BOX defaults for --embeddings so the flag
@@ -302,10 +387,11 @@ def longmemeval_code_hash(
     strictness_path: Path | None = None,
     protocol_path: Path | None = None,
     run_registry_path: Path | None = None,
+    extraction_canary_path: Path | None = None,
     hymem_path: Path | None = None,
     root: Path | None = None,
 ) -> str:
-    """Hash every local module that can change LME evidence or scoring.
+    """Hash exact executable dependencies that can change LME evidence.
 
     Arguments are injectable so the identity dependency can be regression
     tested against temporary files without editing the working tree.
@@ -313,14 +399,58 @@ def longmemeval_code_hash(
 
     root_path = Path(root or _repo_root).resolve()
     benchmark_dir = Path(__file__).resolve().parent
-    return code_hash(
-        [
-            Path(adapter_path or __file__),
-            Path(strictness_path or benchmark_dir / "strictness.py"),
-            Path(protocol_path or benchmark_dir / "lme_protocol.py"),
-            Path(run_registry_path or benchmark_dir / "run_registry.py"),
+    adapter = Path(adapter_path or __file__)
+    protocol = Path(protocol_path or benchmark_dir / "lme_protocol.py")
+    registry = Path(run_registry_path or benchmark_dir / "run_registry.py")
+    protocol_symbols = python_file_imported_symbols(
+        adapter,
+        module_names=("benchmarks.lme_protocol", "lme_protocol"),
+    )
+    registry_symbols = python_file_imported_symbols(
+        adapter,
+        module_names=("benchmarks.run_registry", "run_registry"),
+    )
+    canary = Path(extraction_canary_path or benchmark_dir / "extraction_canary.py")
+    canary_symbols = python_file_imported_symbols(
+        adapter,
+        module_names=("benchmarks.extraction_canary", "extraction_canary"),
+    )
+    dependency_slices: list[PythonSourceSlice] = []
+    if protocol_symbols:
+        dependency_slices.append(PythonSourceSlice(protocol, protocol_symbols))
+    if registry_symbols:
+        dependency_slices.append(PythonSourceSlice(registry, registry_symbols))
+    if canary_symbols:
+        dependency_slices.append(PythonSourceSlice(canary, canary_symbols))
+    strictness = Path(strictness_path or benchmark_dir / "strictness.py")
+    strictness_modules = ("benchmarks.strictness", "strictness")
+    strictness_symbols = set(python_file_imported_symbols(
+        adapter, module_names=strictness_modules
+    ))
+    for source_slice in dependency_slices:
+        strictness_symbols.update(python_slice_imported_symbols(
+            source_slice, module_names=strictness_modules
+        ))
+    if not strictness_symbols:
+        raise BenchmarkIntegrityError("LME code identity lacks strictness imports")
+    strictness_slice = PythonSourceSlice(
+        strictness, tuple(strictness_symbols)
+    )
+    dependency_slices.append(strictness_slice)
+    dependency_sources: list[Path | PythonSourceSlice] = [
+        adapter, *dependency_slices,
+    ]
+    inputs: list[Path | PythonSourceSlice] = [
+        adapter,
+        *dependency_slices,
+        *benchmark_hymem_source_paths(
             Path(hymem_path or root_path / "hymem"),
-        ],
+            root=root_path,
+            dependency_sources=dependency_sources,
+        ),
+    ]
+    return code_hash(
+        inputs,
         root=root_path,
     )
 
@@ -553,6 +683,7 @@ LLM_ERROR_PREFIX = "[LLM_ERROR"
 RESERVED_CHAT_BODY_KEYS = frozenset({
     "model", "messages", "temperature", "max_tokens", "n",
 })
+THINKING_DISABLED = {"thinking": {"type": "disabled"}}
 
 
 def is_llm_error(text: str | None) -> bool:
@@ -565,25 +696,81 @@ def validate_request_extra_body(value: dict | None) -> dict:
     return normalize_extra_body(value, label="request")
 
 
+def resolve_model_extra_body(
+    model: str,
+    base_url: str,
+    extra_body: dict | None,
+) -> tuple[dict, bool]:
+    """Return a safe, effective raw request body extension.
+
+    DeepSeek v4-flash writes its usable answer to the ordinary ``content``
+    field only when thinking is disabled.  An omitted body therefore gets the
+    required vendor extension automatically on the actual DeepSeek endpoint.
+    A caller-provided body remains authoritative, but a DeepSeek v4-flash body
+    that would leave thinking enabled is rejected instead of producing a
+    capability score from empty completions.
+
+    The endpoint check is deliberately exact-host.  A custom OpenAI-compatible
+    gateway never receives a DeepSeek-only key merely because its model name
+    resembles ours; operators of such gateways can pass an explicit body when
+    their provider supports it.
+    """
+
+    if not isinstance(model, str) or not model.strip() or model != model.strip():
+        raise BenchmarkIntegrityError("LLM model identity must be non-empty")
+    normalized_base = validate_safe_endpoint(base_url, label="LLM")
+    body = validate_request_extra_body(extra_body)
+    was_absent = extra_body is None
+    host = (urlsplit(normalized_base).hostname or "").casefold()
+    is_deepseek_endpoint = host == "api.deepseek.com"
+    is_v4_flash = "v4-flash" in model.casefold()
+
+    if was_absent and is_deepseek_endpoint and is_v4_flash:
+        return copy.deepcopy(THINKING_DISABLED), True
+    if is_deepseek_endpoint and is_v4_flash:
+        thinking = body.get("thinking")
+        if not isinstance(thinking, dict) or thinking.get("type") != "disabled":
+            raise BenchmarkIntegrityError(
+                "DeepSeek v4-flash requires thinking.type='disabled'; omit "
+                "the extra-body option to use the safe default"
+            )
+    return body, False
+
+
 # ── LLM Client ──────────────────────────────────────────────────────
 
 class LLMClient:
     def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
                  extra_body: dict | None = None, *, n: int | None = None):
+        # The benchmark's raw requests client does not pass through
+        # OpenAICompatibleClient.  Enforce the shared active-model policy
+        # before endpoint credential resolution or any network-capable state.
+        require_active_model(model, role="LongMemEval reader/judge")
         if not isinstance(model, str) or not model.strip() or model != model.strip():
             raise BenchmarkIntegrityError("LLM model identity must be non-empty")
         self.model = model
-        self.api_key = api_key
-        # Default keeps every existing caller byte-path-identical; only the ANSWER
-        # client is ever pointed elsewhere (via --answer-base-url), so the judge
-        # posture stays the frozen comparability contract with the canonical run.
-        self.base_url = validate_safe_endpoint(base_url, label="LLM")
+        # The answer and judge can be pointed at independent endpoints.  The
+        # endpoint and credential are jointly resolved before any call.  This
+        # keeps a process-wide provider key from becoming a bearer token for a
+        # custom host even when a caller bypasses the CLI resolver.
+        try:
+            endpoint, resolved_key = resolve_llm_api_key(
+                base_url, explicit_key=api_key or None
+            )
+        except (EnvironmentError, ValueError) as exc:
+            raise BenchmarkIntegrityError(str(exc)) from exc
+        self.api_key = resolved_key
+        self.base_url = endpoint.url
         # Extra top-level request-body fields merged into every call — the raw-HTTP
-        # equivalent of the OpenAI SDK's `extra_body`. Needed post-2026-07-24: the
-        # deepseek-chat deprecation moved reader/judge to deepseek-v4-flash, a
-        # REASONING model that prepends thinking tokens (corrupting the yes/no judge
-        # parse) unless sent {"thinking":{"type":"disabled"}}. Empty = unchanged.
-        self.extra_body = validate_request_extra_body(extra_body)
+        # equivalent of the OpenAI SDK's `extra_body`. Needed post-2026-07-24:
+        # the retired deepseek-chat alias had moved reader/judge to
+        # deepseek-v4-flash, whose thinking mode can consume the response budget
+        # (and corrupt the yes/no judge parse) unless thinking is disabled.
+        # ``None`` means no operator body was supplied and activates the safe
+        # DeepSeek-only default; an explicit object is validated as-is.
+        self.extra_body, self.extra_body_defaulted = resolve_model_extra_body(
+            model, self.base_url, extra_body
+        )
         if n is not None and (
             isinstance(n, bool) or not isinstance(n, int) or n <= 0
         ):
@@ -602,9 +789,11 @@ class LLMClient:
         # Guards the two counters so they aggregate correctly when many worker
         # threads share this client (--workers > 1).
         self._lock = threading.Lock()
+        self._closed = False
 
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
         last_error = None
+        last_exception_type = "Exception"
         for attempt in range(3):
             try:
                 content, usage = self._call(messages, temperature, max_tokens)
@@ -628,6 +817,7 @@ class LLMClient:
                 return content
             except Exception as e:
                 last_error = str(e)
+                last_exception_type = _bounded_exception_type(e)
                 # A failed request may have reached the provider but did not
                 # return an auditable usage block. Even a later successful
                 # retry cannot make the call-chain token total complete.
@@ -646,8 +836,8 @@ class LLMClient:
                     time.sleep(3)
                 else:
                     break
-        self.last_error = last_error
-        return f"[LLM_ERROR: {last_error[:100]}]"
+        self.last_error = last_exception_type
+        return f"[LLM_ERROR:{last_exception_type}]"
 
     def _call(self, messages: list, temperature: float, max_tokens: int) -> tuple[str, dict]:
         body = {
@@ -697,6 +887,19 @@ class LLMClient:
             content,
             data.get("usage", {}),
         )
+
+    def close(self) -> None:
+        """End this wrapper's lifecycle exactly once.
+
+        ``requests.post`` owns and closes its short-lived Session per request,
+        so there is no persistent transport here.  The explicit close hook
+        still gives benchmark ownership scopes one uniform, testable contract.
+        """
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
 
 
 # ── Dataset Loader (streaming) ──────────────────────────────────────
@@ -812,13 +1015,15 @@ class HyMemAdapter:
                  rules_extraction: bool | None = None,
                  facts_enabled: bool | None = None,
                  facts_extraction: bool | None = None,
-                 pipeline_model: str = "deepseek-chat",
+                 pipeline_model: str = PINNED_DEEPSEEK_MODEL,
                  pipeline_base_url: str = DEEPSEEK_BASE_URL,
                  pipeline_thinking: str = "auto",
                  embedding_base_url: str | None = None,
                  embedding_model: str | None = None,
                  embedding_dim: int | None = None,
-                 embedding_api_key: str | None = None):
+                 embedding_api_key: str | None = None,
+                 embedding_deployment_revision: str | None = None,
+                 embedding_deployment_tenant: str | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -848,10 +1053,15 @@ class HyMemAdapter:
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
         self.embedding_api_key = embedding_api_key
+        self.embedding_deployment_revision = embedding_deployment_revision
+        self.embedding_deployment_tenant = embedding_deployment_tenant
         self.hy = None
         self.pipeline_llm = None
         self.embedding_client = None
         self.last_indexing_summary = None
+        self._owned_resources = OwnedResourceScope(
+            "LongMemEval memory-adapter resources"
+        )
 
     def build_config(self):
         """Exact effective HyMem config, usable before provider construction."""
@@ -981,55 +1191,75 @@ class HyMemAdapter:
         if self.facts_extraction is not None:
             overrides["facts_extraction_enabled"] = self.facts_extraction
         cfg = self.build_config()
-        llm = OpenAICompatibleClient(
-            api_key=self.api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
-            base_url=self.pipeline_base_url,
-            model=self.pipeline_model,
-            thinking=self.pipeline_thinking,
-        )
-        self.pipeline_llm = llm
-        # Optional semantic-recall A/B (lever L1). Drives the SAME local FastEmbed
-        # server Hermes uses in production. Pass this benchmark's local FastEmbed
-        # defaults explicitly so --embeddings works with ZERO env setup. DeepSeek
-        # has no embeddings API; HYMEM_EMBEDDING_* can instead select a real
-        # embedding endpoint. Off by default: the headline baseline is lexical-only
-        # (a paired comparison).
-        embedding_client = None
-        if self.embeddings:
-            from hymem.contrib.openai_embedding_client import (
-                OpenAICompatibleEmbeddingClient,
-                is_loopback_embedding_url,
-                is_official_openai_embedding_url,
+        try:
+            llm = OpenAICompatibleClient(
+                api_key=self.api_key or os.environ.get("HYMEM_LLM_API_KEY", ""),
+                base_url=self.pipeline_base_url,
+                model=self.pipeline_model,
+                thinking=self.pipeline_thinking,
             )
+            self.pipeline_llm = self._owned_resources.own(
+                llm, label="memory pipeline client"
+            )
+            # Optional semantic-recall A/B (lever L1). Drives the SAME local FastEmbed
+            # server Hermes uses in production. Pass this benchmark's local FastEmbed
+            # defaults explicitly so --embeddings works with ZERO env setup. DeepSeek
+            # has no embeddings API; HYMEM_EMBEDDING_* can instead select a real
+            # embedding endpoint. Off by default: the headline baseline is lexical-only
+            # (a paired comparison).
+            embedding_client = None
+            if self.embeddings:
+                from hymem.contrib.openai_embedding_client import (
+                    OpenAICompatibleEmbeddingClient,
+                    is_loopback_embedding_url,
+                    is_official_openai_embedding_url,
+                )
 
-            env = os.environ.get
-            embedding_base_url = (
-                self.embedding_base_url
-                or env("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
-            )
-            embedding_api_key = self.embedding_api_key or env("HYMEM_EMBEDDING_API_KEY")
-            if not embedding_api_key and is_loopback_embedding_url(embedding_base_url):
-                embedding_api_key = LOCAL_EMBED_API_KEY
-            if (
-                not embedding_api_key
-                and is_official_openai_embedding_url(embedding_base_url)
-            ):
-                embedding_api_key = env("OPENAI_API_KEY")
-            embedding_client = OpenAICompatibleEmbeddingClient(
-                api_key=embedding_api_key,
-                base_url=embedding_base_url,
-                model=(self.embedding_model or env("HYMEM_EMBEDDING_MODEL")
-                       or LOCAL_EMBED_MODEL),
-                dim=(self.embedding_dim if self.embedding_dim is not None else
-                     int(env("HYMEM_EMBEDDING_DIM") or LOCAL_EMBED_DIM)),
-            )
-        self.embedding_client = embedding_client
-        self.hy = HyMem(cfg, llm=llm, embedding_client=embedding_client)
-        return self
+                env = os.environ.get
+                embedding_base_url = (
+                    self.embedding_base_url
+                    or env("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
+                )
+                embedding_api_key = self.embedding_api_key or env("HYMEM_EMBEDDING_API_KEY")
+                if not embedding_api_key and is_loopback_embedding_url(embedding_base_url):
+                    embedding_api_key = LOCAL_EMBED_API_KEY
+                if (
+                    not embedding_api_key
+                    and is_official_openai_embedding_url(embedding_base_url)
+                ):
+                    embedding_api_key = env("OPENAI_API_KEY")
+                embedding_client = OpenAICompatibleEmbeddingClient(
+                    api_key=embedding_api_key,
+                    base_url=embedding_base_url,
+                    model=(self.embedding_model or env("HYMEM_EMBEDDING_MODEL")
+                           or LOCAL_EMBED_MODEL),
+                    dim=(self.embedding_dim if self.embedding_dim is not None else
+                         int(env("HYMEM_EMBEDDING_DIM") or LOCAL_EMBED_DIM)),
+                    pin_dimension=True,
+                    deployment_revision=(
+                        self.embedding_deployment_revision
+                        or env("HYMEM_EMBEDDING_DEPLOYMENT_REVISION")
+                    ),
+                    deployment_tenant=(
+                        self.embedding_deployment_tenant
+                        or env("HYMEM_EMBEDDING_DEPLOYMENT_TENANT")
+                    ),
+                )
+                self._owned_resources.own(
+                    embedding_client, label="embedding client"
+                )
+            self.embedding_client = embedding_client
+            self.hy = HyMem(cfg, llm=llm, embedding_client=embedding_client)
+            self._owned_resources.own(self.hy, label="memory store")
+            return self
+        except BaseException as exc:
+            self._owned_resources.close(primary_exception=exc)
+            raise
 
     def close(self):
-        if self.hy:
-            self.hy.close()
+        try:
+            self._owned_resources.close()
+        finally:
             self.hy = None
 
     def ingest_sessions(self, sessions: list[list[dict]], session_ids: list[str],
@@ -1105,47 +1335,52 @@ class HyMemAdapter:
         require_healthy: bool = True,
     ):
         """Run bounded cycles until the durable extraction backlog is healthy."""
-        from benchmarks.strictness import converge_indexing
-
         start = time.time()
         dream_hy = self.hy.fork()
-        cleanup_errors: list[str] = []
         try:
             try:
-                self.last_indexing_summary = converge_indexing(
+                raw_summary = converge_indexing(
                     dream_hy.dream,
-                    status=dream_hy.dream_status,
+                    status=lambda: durable_indexing_status(
+                        dream_hy, getattr(self, "embedding_client", None),
+                    ),
                     max_cycles=max_cycles,
                     timeout_s=timeout,
                     require_healthy=require_healthy,
                 )
+                self.last_indexing_summary = canonicalize_lme_indexing_summary(
+                    raw_summary
+                )
+                if self.last_indexing_summary["outcome"] == "failure":
+                    raise IndexingConvergenceError(
+                        "memory indexing completed without usable health",
+                        self.last_indexing_summary,
+                    )
             except Exception as exc:
-                if hasattr(exc, "summary"):
-                    self.last_indexing_summary = dict(exc.summary)
+                if isinstance(exc, IndexingConvergenceError):
+                    if exc.summary.get("schema") == LME_INDEXING_SUMMARY_VERSION:
+                        self.last_indexing_summary = dict(exc.summary)
+                    else:
+                        self.last_indexing_summary = canonicalize_lme_indexing_summary(
+                            exc.summary
+                        )
+                    # Direct callers and tests inspect the raised summary too;
+                    # never leave the raw exception/source-bearing variant on
+                    # one surface while persisting the bounded one on another.
+                    exc.summary = self.last_indexing_summary
                 raise
         finally:
-            try:
-                dream_hy.close()
-            except BaseException as exc:
-                cleanup_errors.append(
-                    f"dream_fork_close: {type(exc).__name__}: {exc}"
-                )
-            try:
-                self.hy.invalidate_query_caches()
-            except BaseException as exc:
-                cleanup_errors.append(
-                    f"query_cache_invalidation: {type(exc).__name__}: {exc}"
-                )
-            if cleanup_errors:
-                if self.last_indexing_summary is None:
-                    self.last_indexing_summary = {
-                        "complete": False, "healthy": False,
-                        "cleanup_errors": cleanup_errors,
-                    }
-                else:
-                    self.last_indexing_summary.setdefault(
-                        "cleanup_errors", []
-                    ).extend(cleanup_errors)
+            cleanup_sink = None
+            if self.last_indexing_summary is not None:
+                cleanup_sink = self.last_indexing_summary["cleanup_errors"]
+            run_cleanup_actions(
+                [
+                    ("dream_fork_close", dream_hy.close),
+                    ("query_cache_invalidation", self.hy.invalidate_query_caches),
+                ],
+                primary_exception=sys.exc_info()[1],
+                evidence_sink=cleanup_sink,
+            )
         elapsed = time.time() - start
         print(
             f"      Dream converged in {elapsed:.0f}s across "
@@ -1169,6 +1404,28 @@ class HyMemAdapter:
         own bracketed context block instead.
         """
         result = self.hy.augment(query, ability=ability)
+        if self.embedding_client is not None:
+            from hymem.dreaming.aggregation_material import (
+                embedding_execution_identity,
+            )
+
+            _binding, producer_key, dimension = embedding_execution_identity(
+                self.embedding_client
+            )
+            semantic = getattr(result, "semantic_status", None)
+            if (
+                semantic is None
+                or getattr(semantic, "configured", None) is not True
+                or getattr(semantic, "attempted", None) is not True
+                or getattr(semantic, "available", None) is not True
+                or getattr(semantic, "model", None) != producer_key
+                or getattr(semantic, "dim", None) != dimension
+            ):
+                reason = getattr(semantic, "reason", "missing_status")
+                raise BenchmarkIntegrityError(
+                    "configured embedding retrieval was unavailable or changed "
+                    f"identity (reason={reason})"
+                )
 
         # Collect all sources
         graph_facts = []
@@ -2589,7 +2846,9 @@ def evaluate_question(
         gold_turns, gold_mode = [], "diagnostic-error"
         recall_ceiling, recall_tier = None, "unknown"
         gold_turn_tiers, gold_turns_in_pool = [], None
-        recall_diagnostic_error = f"{type(exc).__name__}: {exc}"
+        recall_diagnostic_error = (
+            f"recall_gold_turns:{_bounded_exception_type(exc)}"
+        )
     try:
         gold_in_episodes = (
             _answer_in_texts(answer, _ep_texts) if _ep_texts else False
@@ -2600,7 +2859,7 @@ def evaluate_question(
         )
     except Exception as exc:
         gold_in_episodes = gold_in_facts = None
-        detail = f"answer_containment: {type(exc).__name__}: {exc}"
+        detail = f"answer_containment:{_bounded_exception_type(exc)}"
         recall_diagnostic_error = (
             f"{recall_diagnostic_error}; {detail}"
             if recall_diagnostic_error else detail
@@ -3027,13 +3286,19 @@ def _adapter_for_args(db_path: Path, args, api_key: str) -> HyMemAdapter:
         graph_multihop_min_score=args.graph_multihop_min_score,
         rules_enabled=args.rules, rules_extraction=args.rules_extraction,
         facts_enabled=args.facts, facts_extraction=args.facts_extraction,
-        pipeline_model=getattr(args, "hymem_model", "deepseek-chat"),
+        pipeline_model=getattr(args, "hymem_model", PINNED_DEEPSEEK_MODEL),
         pipeline_base_url=getattr(args, "hymem_base_url", DEEPSEEK_BASE_URL),
         pipeline_thinking=getattr(args, "hymem_thinking", "auto"),
         embedding_base_url=getattr(args, "embedding_base_url", None),
         embedding_model=getattr(args, "embedding_model", None),
         embedding_dim=getattr(args, "embedding_dim", None),
         embedding_api_key=getattr(args, "embedding_api_key", None),
+        embedding_deployment_revision=getattr(
+            args, "embedding_deployment_revision", None,
+        ),
+        embedding_deployment_tenant=getattr(
+            args, "embedding_deployment_tenant", None,
+        ),
     )
 
 
@@ -3081,10 +3346,11 @@ def resolve_prereg(path: str | None) -> dict | None:
 
 def _provider_for_url(base_url: str) -> str:
     normalized = validate_safe_endpoint(base_url, label="provider")
-    if normalized == DEEPSEEK_BASE_URL:
-        return "deepseek"
-    if normalized == LME_OFFICIAL_JUDGE_BASE_URL:
-        return "openai"
+    official = validate_http_endpoint(
+        normalized, label="provider"
+    ).official_provider
+    if official is not None:
+        return official
     return "openai-compatible"
 
 
@@ -3101,36 +3367,44 @@ def resolve_endpoint_key(
     """
 
     normalized = validate_safe_endpoint(base_url, label=role)
-    if explicit_key:
-        return explicit_key
-    if normalized == DEEPSEEK_BASE_URL and deepseek_key:
-        return deepseek_key
-    if role == "judge" and normalized == LME_OFFICIAL_JUDGE_BASE_URL:
-        openai_key = os.environ.get("OPENAI_API_KEY", "")
-        if openai_key:
-            return openai_key
+    # ``deepseek_key`` may include the legacy CLI/config-file source, but it is
+    # promoted to explicit only after exact-origin validation.  The shared
+    # resolver independently permits HYMEM_LLM_API_KEY for custom endpoints and
+    # binds OPENAI_API_KEY/DEEPSEEK_API_KEY to their official origins.
+    authorized_explicit = explicit_key
+    endpoint = validate_http_endpoint(normalized, label=role)
+    if not authorized_explicit and endpoint.official_provider == "deepseek":
+        authorized_explicit = deepseek_key
+    try:
+        _endpoint, key = resolve_llm_api_key(
+            normalized, explicit_key=authorized_explicit
+        )
+        return key
+    except (EnvironmentError, ValueError):
+        pass
     option = {
         "reader": "--answer-api-key",
         "judge": "--judge-api-key",
         "memory pipeline": "--hymem-api-key",
     }.get(role, "an explicit role-specific API key")
     raise BenchmarkIntegrityError(
-        f"{role} endpoint {normalized!r} requires {option}"
+        f"{role} endpoint {safe_endpoint_label(normalized, label=role)!r} "
+        f"requires {option}"
     )
 
 
 def resolve_embedding_identity(args) -> dict[str, Any]:
-    if not args.embeddings:
-        return {
-            "configured": False, "backend": "none", "quality": "none",
-            "network_free": True, "model": None, "base_url": None,
-            "dimension": None, "fallback_policy": "none",
-        }
-    from hymem.contrib.openai_embedding_client import (
-        openai_compatible_embedding_identity,
-        safe_embedding_base_url,
-        validate_embedding_base_url,
+    from hymem.dreaming.aggregation_material import (
+        configured_openai_embedding_producer_binding,
+        embedding_producer_binding,
+        public_embedding_identity,
     )
+    if not args.embeddings:
+        return public_embedding_identity(
+            embedding_producer_binding(None), None,
+            fallback_policy="none", fallback_reason=None,
+            transport_security=TRANSPORT_SECURITY_NONE,
+        )
     base_url = (
         args.embedding_base_url
         or os.environ.get("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
@@ -3151,20 +3425,41 @@ def resolve_embedding_identity(args) -> dict[str, Any]:
         raise BenchmarkIntegrityError("embedding dimension must be a positive integer")
     if not isinstance(model, str) or not model.strip() or model != model.strip():
         raise BenchmarkIntegrityError("embedding model identity is malformed")
-    validate_embedding_base_url(base_url)
-    # Query parameters make two request routes share a misleading public label;
-    # strict benchmark identities refuse that ambiguity outright.
-    parsed = __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit(base_url)
-    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
-        raise BenchmarkIntegrityError("embedding endpoint is unsafe or ambiguous")
-    public_url = safe_embedding_base_url(base_url)
-    return {
-        "configured": True, "backend": "openai_compatible",
-        "quality": "semantic", "network_free": False,
-        "model": openai_compatible_embedding_identity(base_url, model),
-        "request_model": model, "base_url": public_url,
-        "dimension": dimension, "fallback_policy": "fail-closed",
-    }
+    try:
+        endpoint = validate_http_endpoint(
+            base_url,
+            label="embedding",
+            allow_insecure_internal_env=EMBEDDING_INTERNAL_HTTP_ENV,
+        )
+    except (TypeError, ValueError) as exc:
+        raise BenchmarkIntegrityError(
+            "embedding endpoint is unsafe or ambiguous"
+        ) from exc
+    revision = getattr(args, "embedding_deployment_revision", None) or os.environ.get(
+        "HYMEM_EMBEDDING_DEPLOYMENT_REVISION"
+    )
+    tenant = getattr(args, "embedding_deployment_tenant", None) or os.environ.get(
+        "HYMEM_EMBEDDING_DEPLOYMENT_TENANT"
+    )
+    try:
+        binding = configured_openai_embedding_producer_binding(
+            base_url=endpoint.url,
+            request_model=model,
+            dimension=dimension,
+            pin_dimension=True,
+            deployment_revision=revision,
+            deployment_tenant=tenant,
+        )
+        return public_embedding_identity(
+            binding, dimension,
+            fallback_policy="fail-closed", fallback_reason=None,
+            transport_security=endpoint_transport_security(endpoint),
+        )
+    except (TypeError, ValueError) as exc:
+        raise BenchmarkIntegrityError(
+            "strict embeddings require explicit deployment revision, tenant, "
+            "and a pinned dimension"
+        ) from exc
 
 
 def resolve_embedding_key(args) -> str | None:
@@ -3172,29 +3467,17 @@ def resolve_embedding_key(args) -> str | None:
 
     if not args.embeddings:
         return None
-    from hymem.contrib.openai_embedding_client import (
-        is_loopback_embedding_url,
-        is_official_openai_embedding_url,
-    )
     base_url = (
         args.embedding_base_url
         or os.environ.get("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
     )
-    if args.embedding_api_key:
-        return args.embedding_api_key
-    if is_loopback_embedding_url(base_url):
-        return LOCAL_EMBED_API_KEY
-    if is_official_openai_embedding_url(base_url):
-        key = os.environ.get("OPENAI_API_KEY")
-        if key:
-            return key
-    key = os.environ.get("HYMEM_EMBEDDING_API_KEY")
-    if key:
+    try:
+        _endpoint, key = resolve_embedding_api_key(
+            base_url, explicit_key=args.embedding_api_key or None
+        )
         return key
-    raise BenchmarkIntegrityError(
-        "non-loopback embedding endpoint requires --embedding-api-key or "
-        "HYMEM_EMBEDDING_API_KEY"
-    )
+    except (EnvironmentError, ValueError) as exc:
+        raise BenchmarkIntegrityError(str(exc)) from exc
 
 
 def validate_runtime_arguments(args, parser: argparse.ArgumentParser) -> None:
@@ -3252,6 +3535,32 @@ def validate_runtime_arguments(args, parser: argparse.ArgumentParser) -> None:
         value = getattr(args, field)
         if not isinstance(value, str) or not value.strip() or value != value.strip():
             parser.error(f"--{field.replace('_', '-')} must be a non-empty model id")
+    # Keep provider-free calibration/export and historical artifact transforms
+    # readable, while rejecting every role this invocation can actually call.
+    # This runs before credentials, dataset IO, checkpoints, or temp stores.
+    if args.rejudge:
+        active_models = (("LongMemEval judge", args.judge_model),)
+    elif args.freeze_calibration:
+        active_models = ()
+    elif args.inspect_floor:
+        active_models = (("LongMemEval memory pipeline", args.hymem_model),)
+    elif args.distill_dryrun:
+        active_models = (
+            ("LongMemEval reader", args.answer_model),
+            ("LongMemEval judge", args.judge_model),
+            ("LongMemEval memory pipeline", args.hymem_model),
+        )
+    else:
+        active_models = [("LongMemEval memory pipeline", args.hymem_model)]
+        if not args.retrieval_only or args.distill:
+            active_models.append(("LongMemEval reader", args.answer_model))
+        if not args.retrieval_only:
+            active_models.append(("LongMemEval judge", args.judge_model))
+    try:
+        for role, active_model in active_models:
+            require_active_model(active_model, role=role)
+    except DeprecatedModelAliasError as exc:
+        parser.error(str(exc))
     for label in ("answer_base_url", "judge_base_url", "hymem_base_url"):
         try:
             validate_safe_endpoint(getattr(args, label), label=label)
@@ -3259,8 +3568,14 @@ def validate_runtime_arguments(args, parser: argparse.ArgumentParser) -> None:
             parser.error(str(exc))
 
 
+class _ParallelQuestionStopped(BaseException):
+    """Internal cooperative cancellation; never materialize this as a row."""
+
+
 def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
-                           api_key, distill_llm=None):
+                           api_key, distill_llm=None, *,
+                           _parallel_stop: threading.Event | None = None,
+                           _on_fatal_abort=None, _on_runtime=None):
     """Full lifecycle for one question: fresh temp DB → open → evaluate → cleanup.
 
     Self-contained so it can run in a worker thread. Each question gets its own
@@ -3270,6 +3585,18 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
     incorrect results so one bad question cannot abort a parallel run. Process-
     control ``BaseException`` values still propagate after best-effort cleanup.
     """
+    def _raise_if_parallel_stopped() -> None:
+        if _parallel_stop is not None and _parallel_stop.is_set():
+            raise _ParallelQuestionStopped()
+
+    def _notify_fatal_abort(exc: BaseException) -> None:
+        if _on_fatal_abort is not None:
+            _on_fatal_abort(exc)
+
+    # A submitted task may have been dequeued just as another worker or the
+    # coordinator discovered a fatal persistence fault.  Do not construct a
+    # store (or reach a provider-capable path) after that signal.
+    _raise_if_parallel_stopped()
     print(f"[{qi+1}/{total}] Q: {q_data['question_id']} ({q_data['question_type']})", flush=True)
 
     # Fresh temp DB per question (sessions are question-specific)
@@ -3283,12 +3610,15 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
         "distill_fired": False,
         "distill_calls": 0,
     }
-    lifecycle_errors: list[str] = []
+    lifecycle_errors: list[dict[str, str]] = []
     try:
         tmp_dir = Path(tempfile.mkdtemp(prefix="hymem-lme-"))
         db_path = tmp_dir / "hymem.sqlite"
         hy = _adapter_for_args(db_path, args, api_key)
         hy.open()
+        # Opening is a safe lifecycle boundary.  A task already running while
+        # another task failed can still stop before indexing/reader/judge work.
+        _raise_if_parallel_stopped()
         result = evaluate_question(
             answer_llm, judge_llm, hy, q_data, args.top_k,
             auto_ability=args.auto_ability, no_dream=args.no_dream,
@@ -3312,16 +3642,22 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
                 args, "indexing_require_healthy", True
             ),
         )
-    except Exception as e:
-        print(f"    ERROR: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
+    except BenchmarkCleanupError as exc:
+        _notify_fatal_abort(exc)
+        raise
+    except IndexingConvergenceError as e:
+        summary = getattr(hy, "last_indexing_summary", None)
+        failure = summary.get("failure") if isinstance(summary, dict) else None
+        failure_code = failure.get("code") if isinstance(failure, dict) else None
+        if not isinstance(failure_code, str):
+            failure_code = "malformed_status_shape"
+        print(f"    INDEXING FAILED: {failure_code}", flush=True)
         result = {
             "question_id": q_data.get("question_id", "unknown"),
             "question_type": q_data.get("question_type", "unknown"),
             "correct": False,
-            "error": str(e),
-            "benchmark_failure": f"execution_failure: {type(e).__name__}: {e}",
+            "benchmark_failure": f"indexing_failure:{failure_code}",
+            "indexing": summary,
             "oracle_ability": QUESTION_TYPE_TO_ABILITY.get(
                 q_data.get("question_type")
             ),
@@ -3334,18 +3670,51 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
             "distill_fired": False,
             "distill_calls": 0,
         }
+    except Exception as e:
+        if is_structural_benchmark_error(e):
+            _notify_fatal_abort(e)
+            raise
+        print(f"    ERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        exception_type = _bounded_exception_type(e)
+        result = {
+            "question_id": q_data.get("question_id", "unknown"),
+            "question_type": q_data.get("question_type", "unknown"),
+            "correct": False,
+            # The traceback is operator-visible above. Durable benchmark
+            # evidence keeps only a bounded class identity, never arbitrary
+            # exception/source/provider text.
+            "benchmark_failure": f"execution_failure:{exception_type}",
+            "oracle_ability": QUESTION_TYPE_TO_ABILITY.get(
+                q_data.get("question_type")
+            ),
+            "detected_ability": None,
+            "ability_used": (
+                None if getattr(args, "auto_ability", True) else
+                QUESTION_TYPE_TO_ABILITY.get(q_data.get("question_type"))
+            ),
+            "retrieval_only": bool(getattr(args, "retrieval_only", False)),
+            "distill_fired": False,
+            "distill_calls": 0,
+        }
+    except _ParallelQuestionStopped:
+        raise
+    except BaseException as exc:
+        # Process-control failures must stop sibling tasks before this worker's
+        # cleanup finishes; the original object remains the primary exception.
+        _notify_fatal_abort(exc)
+        raise
     finally:
+        cleanup_actions = []
         if hy is not None:
-            try:
+            def snapshot_pipeline_usage():
                 result.setdefault(
                     "memory_pipeline_usage",
                     usage_snapshot(getattr(hy, "pipeline_llm", None)),
                 )
-            except BaseException as exc:
-                lifecycle_errors.append(
-                    f"pipeline_usage: {type(exc).__name__}: {exc}"
-                )
-            try:
+
+            def snapshot_embedding_usage():
                 result.setdefault(
                     "embedding_usage",
                     embedding_usage_snapshot(
@@ -3353,35 +3722,39 @@ def _evaluate_one_question(qi, total, q_data, args, answer_llm, judge_llm,
                         configured=bool(getattr(args, "embeddings", False)),
                     ),
                 )
-            except BaseException as exc:
-                lifecycle_errors.append(
-                    f"embedding_usage: {type(exc).__name__}: {exc}"
-                )
-            try:
+
+            def snapshot_indexing_summary():
                 if getattr(hy, "last_indexing_summary", None) is not None:
                     result.setdefault("indexing", hy.last_indexing_summary)
-            except BaseException as exc:
-                lifecycle_errors.append(
-                    f"indexing_usage: {type(exc).__name__}: {exc}"
-                )
-            try:
-                hy.close()
-            except BaseException as exc:
-                lifecycle_errors.append(
-                    f"adapter_close: {type(exc).__name__}: {exc}"
-                )
+
+            cleanup_actions.extend([
+                ("pipeline_usage_snapshot", snapshot_pipeline_usage),
+                ("embedding_usage_snapshot", snapshot_embedding_usage),
+                ("indexing_summary_snapshot", snapshot_indexing_summary),
+                ("adapter_close", hy.close),
+            ])
         if tmp_dir is not None and not args.keep_db:
-            try:
+            def remove_temporary_store():
                 import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=False)
-            except BaseException as exc:
-                lifecycle_errors.append(
-                    f"temporary_store_cleanup: {type(exc).__name__}: {exc}"
-                )
-        try:
-            gc.collect()
-        except BaseException as exc:
-            lifecycle_errors.append(f"gc: {type(exc).__name__}: {exc}")
+
+            cleanup_actions.append(
+                ("temporary_store_cleanup", remove_temporary_store)
+            )
+        cleanup_actions.append(("gc_collect", gc.collect))
+        if _on_runtime is not None:
+            # The coordinator cannot recover a local per-question pipeline or
+            # embedding meter from a Future that is discarded during a fatal
+            # checkpoint abort.  Hand the final snapshots off from the worker's
+            # cleanup path, including cooperative-stop and structural failures.
+            cleanup_actions.append(
+                ("runtime_usage_handoff", lambda: _on_runtime(result))
+            )
+        run_cleanup_actions(
+            cleanup_actions,
+            primary_exception=sys.exc_info()[1],
+            evidence_sink=lifecycle_errors,
+        )
         if lifecycle_errors:
             result.setdefault("lifecycle_errors", []).extend(lifecycle_errors)
     return result
@@ -3458,6 +3831,27 @@ def _inspect_floor_questions(questions: list[dict], args, api_key: str) -> None:
     print(f"  tiers exercised: {tier_mode}   "
           f"(run with --embeddings and full dream to reproduce the audited floor)\n{'='*72}")
 
+    if floor_ids:
+        extraction_prompt_version = _pipeline_extraction_prompt_version(args)
+        extraction_canary_report = (
+            skipped_extraction_canary(
+                "no_dream", prompt_version=extraction_prompt_version
+            )
+            if args.no_dream else
+            run_configured_extraction_canary(
+                api_key=api_key,
+                base_url=args.hymem_base_url,
+                model=args.hymem_model,
+                thinking=args.hymem_thinking,
+                prompt_version=extraction_prompt_version,
+            )
+        )
+        _validate_pipeline_extraction_canary(
+            extraction_canary_report, args,
+            mode="no_dream" if args.no_dream else "required",
+        )
+        print_extraction_canary(extraction_canary_report)
+
     mode_tally: Counter = Counter()
     for n, qid in enumerate(floor_ids, 1):
         q_data = by_id[qid]
@@ -3469,7 +3863,10 @@ def _inspect_floor_questions(questions: list[dict], args, api_key: str) -> None:
             hy = HyMemAdapter(tmp_dir / "hymem.sqlite", api_key=api_key,
                               embeddings=args.embeddings,
                               rerank_top_k=args.rerank_top_k, rerank_model=args.rerank_model,
-                              rerank_message_hits=args.rerank_message_hits)
+                              rerank_message_hits=args.rerank_message_hits,
+                              pipeline_model=args.hymem_model,
+                              pipeline_base_url=args.hymem_base_url,
+                              pipeline_thinking=args.hymem_thinking)
             hy.open()
             sessions = q_data.get("haystack_sessions", [])
             sids = q_data.get("haystack_session_ids",
@@ -3493,11 +3890,20 @@ def _inspect_floor_questions(questions: list[dict], args, api_key: str) -> None:
             print(f"\n[{n}] {qid} ERROR: {e}")
             continue
         finally:
+            cleanup_actions = []
             if hy:
-                hy.close()
+                cleanup_actions.append(("adapter_close", hy.close))
             import shutil
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            gc.collect()
+            cleanup_actions.extend([
+                (
+                    "temporary_store_cleanup",
+                    lambda: shutil.rmtree(tmp_dir, ignore_errors=False),
+                ),
+                ("gc_collect", gc.collect),
+            ])
+            run_cleanup_actions(
+                cleanup_actions, primary_exception=sys.exc_info()[1],
+            )
 
         print(f"\n[{n}/{len(floor_ids)}] {qid}  ({q_data.get('question_type')})")
         print(f"  Q: {question}")
@@ -3590,7 +3996,10 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                               args, "episode_granularity", False),
                           value_supersession=args.value_supersession,
                           facts_enabled=getattr(args, "facts", None),
-                          facts_extraction=getattr(args, "facts_extraction", None))
+                          facts_extraction=getattr(args, "facts_extraction", None),
+                          pipeline_model=args.hymem_model,
+                          pipeline_base_url=args.hymem_base_url,
+                          pipeline_thinking=args.hymem_thinking)
         hy.open()
         hy.ingest_sessions(sessions, sids, dates)
         if not args.no_dream:
@@ -3633,19 +4042,28 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
         out["judge_raw"] = _judge_raw
         out["judge_error"] = _correct is None
     except Exception as e:
-        out["error"] = str(e)
+        out["error"] = f"execution_failure:{_bounded_exception_type(e)}"
     finally:
+        cleanup_actions = []
         if hy:
-            hy.close()
+            cleanup_actions.append(("adapter_close", hy.close))
         import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        gc.collect()
+        cleanup_actions.extend([
+            (
+                "temporary_store_cleanup",
+                lambda: shutil.rmtree(tmp_dir, ignore_errors=False),
+            ),
+            ("gc_collect", gc.collect),
+        ])
+        run_cleanup_actions(
+            cleanup_actions, primary_exception=sys.exc_info()[1],
+        )
     return out
 
 
-def _distill_dryrun_questions(
+def _distill_dryrun_questions_impl(
     questions: list[dict], args, pipeline_key: str,
-    answer_key: str, judge_key: str,
+    answer_key: str, judge_key: str, owned_clients: OwnedResourceScope,
 ) -> None:
     """G-P1a front-run gate. Reads the instrumented source run, recovers the MS
     synthesis misses (with a live deep-lexical split), runs the distillation arm
@@ -3692,20 +4110,51 @@ def _distill_dryrun_questions(
         print(f"  ⚠ {len(missing)} candidate qid(s) not in the loaded sample — "
               f"re-run with --sample 0: {missing[:5]}")
     if args.answer_base_url != DEEPSEEK_BASE_URL:
-        print(f"  answer reader: {args.answer_model} @ {args.answer_base_url}  "
-              f"(judge frozen: {args.judge_model} @ {DEEPSEEK_BASE_URL})")
+        print(
+            f"  answer reader: {args.answer_model} @ "
+            f"{safe_endpoint_label(args.answer_base_url, label='reader')}  "
+            f"(judge frozen: {args.judge_model} @ "
+            f"{safe_endpoint_label(DEEPSEEK_BASE_URL, label='judge')})"
+        )
     print(f"  distill prompt: {args.distill_prompt_version.upper()}   "
           f"max calls/q: {DISTILL_MAX_CALLS}\n{'='*72}", flush=True)
 
-    answer_llm = LLMClient(args.answer_model, answer_key,
-                           base_url=args.answer_base_url,
-                           extra_body=getattr(args, "answer_extra_body_obj", None))
-    judge_llm = LLMClient(args.judge_model, judge_key,
-                          base_url=args.judge_base_url,
-                          extra_body=getattr(args, "judge_extra_body_obj", None),
-                          n=1 if args.judge_protocol == "official" else None)
+    answer_llm = owned_clients.own(
+        LLMClient(args.answer_model, answer_key,
+                  base_url=args.answer_base_url,
+                  extra_body=getattr(args, "answer_extra_body_obj", None)),
+        label="distillation reader client",
+    )
+    judge_llm = owned_clients.own(
+        LLMClient(args.judge_model, judge_key,
+                  base_url=args.judge_base_url,
+                  extra_body=getattr(args, "judge_extra_body_obj", None),
+                  n=1 if args.judge_protocol == "official" else None),
+        label="distillation judge client",
+    )
 
     tasks = [("cand", qid) for qid in candidates] + [("ctrl", qid) for qid in control]
+
+    if tasks:
+        extraction_prompt_version = _pipeline_extraction_prompt_version(args)
+        extraction_canary_report = (
+            skipped_extraction_canary(
+                "no_dream", prompt_version=extraction_prompt_version
+            )
+            if args.no_dream else
+            run_configured_extraction_canary(
+                api_key=pipeline_key,
+                base_url=args.hymem_base_url,
+                model=args.hymem_model,
+                thinking=args.hymem_thinking,
+                prompt_version=extraction_prompt_version,
+            )
+        )
+        _validate_pipeline_extraction_canary(
+            extraction_canary_report, args,
+            mode="no_dream" if args.no_dream else "required",
+        )
+        print_extraction_canary(extraction_canary_report)
 
     def _run(kind: str, qid: str) -> dict:
         res = _distill_run_one(by_id[qid], args, answer_llm, judge_llm,
@@ -3789,6 +4238,18 @@ def _distill_dryrun_questions(
     print(f"\n{'='*72}\nBank this block + the verdict in longmemeval_roadmap.md under P1.\n")
 
 
+def _distill_dryrun_questions(
+    questions: list[dict], args, pipeline_key: str,
+    answer_key: str, judge_key: str,
+) -> None:
+    """Run the dry-run while owning its shared clients through final output."""
+
+    with OwnedResourceScope("LongMemEval distillation clients") as owned_clients:
+        return _distill_dryrun_questions_impl(
+            questions, args, pipeline_key, answer_key, judge_key, owned_clients
+        )
+
+
 # ── Re-judge (re-pair a banked baseline under a new judge) ───────────
 # Built for the 2026-07-24 deepseek-chat hard-deprecation: the canonical 70.0
 # baseline was answered AND judged by deepseek-chat, so it can't be reproduced.
@@ -3797,7 +4258,9 @@ def _distill_dryrun_questions(
 # wasteful. This re-runs ONLY the judge over the stored hypotheses, no ingest /
 # no answer, and reports the per-category judge drift.
 
-def _rejudge_run(args, api_key: str) -> None:
+def _rejudge_run_impl(
+    args, api_key: str, owned_clients: OwnedResourceScope,
+) -> None:
     """Re-judge a stored results JSON under the current --judge-model
     (+ --judge-extra-body). Writes a re-judged copy and prints original-vs-new
     per-category drift. Rows with no hypothesis (or an [LLM_ERROR] answer) keep
@@ -3811,10 +4274,13 @@ def _rejudge_run(args, api_key: str) -> None:
         return
     orig_judge = (run.get("config", {}) or {}).get("judge_model", "unknown")
 
-    judge_llm = LLMClient(args.judge_model, api_key,
-                          base_url=args.judge_base_url,
-                          extra_body=getattr(args, "judge_extra_body_obj", None),
-                          n=1 if args.judge_protocol == "official" else None)
+    judge_llm = owned_clients.own(
+        LLMClient(args.judge_model, api_key,
+                  base_url=args.judge_base_url,
+                  extra_body=getattr(args, "judge_extra_body_obj", None),
+                  n=1 if args.judge_protocol == "official" else None),
+        label="rejudge client",
+    )
 
     # Flag the pre-untruncation artifact (q[:200]/a[:200]/hyp[:500]) so the
     # approximation caveat is raised only when it actually applies.
@@ -3826,9 +4292,6 @@ def _rejudge_run(args, api_key: str) -> None:
     print(f"\n{'='*72}\nRE-JUDGE — {src.name}")
     print(f"  rows: {len(pq)}   original judge: {orig_judge}   new judge: {args.judge_model}"
           + (f"  +extra_body={args.judge_extra_body_obj}" if args.judge_extra_body_obj else ""))
-    if not args.judge_extra_body_obj and "v4-flash" in args.judge_model:
-        print("  ⚠ v4-flash judge WITHOUT --judge-extra-body "
-              "'{\"thinking\":{\"type\":\"disabled\"}}' — reasoning tokens may corrupt the yes/no parse.")
     if clipped:
         print(f"  ⚠ ~{clipped} rows look field-clipped (pre-untruncation run) — "
               "re-judge is a close approximation for those, not byte-faithful.")
@@ -3880,6 +4343,7 @@ def _rejudge_run(args, api_key: str) -> None:
         [{**r, "correct": r.get("correct_original")} for r in new_rows])
     new_scores = compute_scores(new_rows)
     elapsed = time.time() - t0
+    owned_clients.close()
 
     print(f"\n{'─'*72}\nJUDGE DRIFT  ({orig_judge} → {args.judge_model})")
     print(f"  {'category':<26} {'orig':>7} {'rejudged':>9} {'Δpp':>7} {'n':>5}")
@@ -3907,7 +4371,13 @@ def _rejudge_run(args, api_key: str) -> None:
     cfg = dict(out.get("config", {}) or {})
     cfg.update({"rejudged_from": src.name, "rejudge_original_judge": orig_judge,
                 "judge_model": args.judge_model,
-                "judge_extra_body": getattr(args, "judge_extra_body_obj", None),
+                "judge_extra_body": copy.deepcopy(getattr(
+                    args, "judge_extra_body_obj", None
+                )),
+                "extra_body_defaulted": [
+                    role for role in getattr(args, "extra_body_defaulted", [])
+                    if role == "judge"
+                ],
                 "answer_calls": 0,
                 "judge_calls": judge_llm.call_count,
                 "total_tokens": judge_llm.total_tokens,
@@ -3926,9 +4396,19 @@ def _rejudge_run(args, api_key: str) -> None:
           f"judged by {args.judge_model}.\n")
 
 
+def _rejudge_run(args, api_key: str) -> None:
+    """Rejudge with deterministic teardown after usage is archived."""
+
+    with OwnedResourceScope("LongMemEval rejudge clients") as owned_clients:
+        return _rejudge_run_impl(args, api_key, owned_clients)
+
+
 # ── Main ────────────────────────────────────────────────────────────
 
-def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
+def _run_main(
+    _owned_ledgers: list[AtomicCheckpoint] | None,
+    owned_clients: OwnedResourceScope,
+):
     global DEEPSEEK_API_KEY
 
     parser = argparse.ArgumentParser(description="HyMem LongMemEval Benchmark")
@@ -3990,16 +4470,13 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     )
     parser.add_argument("--answer-extra-body", default=None, metavar="JSON",
                         help="JSON object merged into the ANSWER request body (raw-HTTP "
-                             "`extra_body`). Use for a reasoning reader that needs "
-                             "thinking off, e.g. deepseek-v4-flash: "
-                             "'{\"thinking\":{\"type\":\"disabled\"}}'. gpt-oss-120b "
-                             "does not need it.")
+                             "`extra_body`). When omitted, the pinned DeepSeek "
+                             "v4-flash default gets thinking disabled automatically; "
+                             "custom endpoints are never given a vendor body implicitly.")
     parser.add_argument("--judge-extra-body", default=None, metavar="JSON",
-                        help="JSON object merged into the JUDGE request body. REQUIRED "
-                             "when judging with deepseek-v4-flash (deepseek-chat was "
-                             "hard-deprecated 2026-07-24): "
-                             "'{\"thinking\":{\"type\":\"disabled\"}}' — else the "
-                             "reasoning preamble corrupts the yes/no parse.")
+                        help="JSON object merged into the JUDGE request body. When "
+                             "omitted, the pinned DeepSeek v4-flash default gets "
+                             "thinking disabled automatically.")
     parser.add_argument("--rejudge", default=None, metavar="RUN.json",
                         help="Re-judge a stored results JSON under the current "
                              "--judge-model (+ --judge-extra-body) — NO ingest, NO answer "
@@ -4012,7 +4489,7 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
                              "field-truncation was lifted carry clipped q/a/hypothesis — "
                              "the re-judge is then a close approximation, not byte-faithful.")
     parser.add_argument("--api-key", default="")
-    parser.add_argument("--hymem-model", default="deepseek-chat")
+    parser.add_argument("--hymem-model", default=PINNED_DEEPSEEK_MODEL)
     parser.add_argument("--hymem-base-url", default=DEEPSEEK_BASE_URL)
     parser.add_argument(
         "--hymem-thinking", choices=("auto", "disabled", "off", "enabled"),
@@ -4128,6 +4605,16 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-dim", type=int, default=None)
     parser.add_argument("--embedding-api-key", default=None)
+    parser.add_argument(
+        "--embedding-deployment-revision",
+        default=os.environ.get("HYMEM_EMBEDDING_DEPLOYMENT_REVISION"),
+        help="Non-secret immutable embedding deployment revision attestation.",
+    )
+    parser.add_argument(
+        "--embedding-deployment-tenant",
+        default=os.environ.get("HYMEM_EMBEDDING_DEPLOYMENT_TENANT"),
+        help="Non-secret semantic tenant/routing attestation.",
+    )
     parser.add_argument("--aggregation-nodes", action="store_true",
                         help="RAPTOR G4 lever: enable the Phase-2 cross-session aggregation "
                              "layer (dream builds cluster-summary nodes; the retrieval tier "
@@ -4288,7 +4775,11 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
             parser.error(str(exc))
 
     # Resolve API key
-    DEEPSEEK_API_KEY = args.api_key or os.environ.get("HYMEM_LLM_API_KEY", "")
+    DEEPSEEK_API_KEY = (
+        args.api_key
+        or os.environ.get("HYMEM_LLM_API_KEY", "")
+        or os.environ.get("DEEPSEEK_API_KEY", "")
+    )
     if not DEEPSEEK_API_KEY:
         config_path = Path("/home/node/.hermes/config.yaml")
         if config_path.exists():
@@ -4299,7 +4790,7 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
                     break
     # Parse the optional per-client extra_body JSON (fail fast on bad JSON).
     def _parse_extra_body(raw: str | None, which: str) -> dict | None:
-        if not raw:
+        if raw is None:
             return None
         try:
             val = json.loads(raw)
@@ -4313,8 +4804,23 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
             return validate_request_extra_body(val)
         except BenchmarkIntegrityError as exc:
             parser.error(f"--{which}-extra-body: {exc}")
-    args.answer_extra_body_obj = _parse_extra_body(args.answer_extra_body, "answer") or {}
-    args.judge_extra_body_obj = _parse_extra_body(args.judge_extra_body, "judge") or {}
+    parsed_answer_body = _parse_extra_body(args.answer_extra_body, "answer")
+    parsed_judge_body = _parse_extra_body(args.judge_extra_body, "judge")
+    try:
+        args.answer_extra_body_obj, answer_body_defaulted = resolve_model_extra_body(
+            args.answer_model, args.answer_base_url, parsed_answer_body
+        )
+        args.judge_extra_body_obj, judge_body_defaulted = resolve_model_extra_body(
+            args.judge_model, args.judge_base_url, parsed_judge_body
+        )
+    except BenchmarkIntegrityError as exc:
+        parser.error(str(exc))
+    args.extra_body_defaulted = [
+        role for role, defaulted in (
+            ("answer", answer_body_defaulted),
+            ("judge", judge_body_defaulted),
+        ) if defaulted and (not args.rejudge or role == "judge")
+    ]
 
     # Re-judge a stored results JSON under the current judge — no dataset needed,
     # so dispatch before the (large) dataset load. Built for the deepseek-chat
@@ -4366,15 +4872,23 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     print(f"  Top-K: {args.top_k}")
     print(f"  Answer model: {args.answer_model}")
     if args.answer_base_url != DEEPSEEK_BASE_URL:
-        print(f"  ⚠ Answer endpoint: {args.answer_base_url} (PARITY READER — "
-              f"judge remains independently configured at {args.judge_base_url})")
+        print(
+            "  ⚠ Answer endpoint: "
+            f"{safe_endpoint_label(args.answer_base_url, label='reader')} "
+            "(PARITY READER — judge remains independently configured at "
+            f"{safe_endpoint_label(args.judge_base_url, label='judge')})"
+        )
     print(f"  Judge model: {args.judge_model}")
     print(f"  Workers: {args.workers}")
+    embedding_identity = resolve_embedding_identity(args)
     if args.embeddings:
-        emb_url = os.environ.get("HYMEM_EMBEDDING_BASE_URL") or LOCAL_EMBED_BASE_URL
-        emb_model = os.environ.get("HYMEM_EMBEDDING_MODEL") or LOCAL_EMBED_MODEL
+        declaration = embedding_identity["producer_binding"]["declaration"]
+        origin = declaration.get("endpoint_origin", "local")
         src = "env" if os.environ.get("HYMEM_EMBEDDING_BASE_URL") else "local default"
-        print(f"  Embeddings: ON (semantic recall) — {emb_model} @ {emb_url} [{src}]")
+        print(
+            "  Embeddings: ON (semantic recall) — "
+            f"{embedding_identity['vector_space_key']} @ {origin} [{src}]"
+        )
     else:
         print(f"  Embeddings: OFF (lexical/FTS-only — baseline)")
     if (args.rerank_top_k is not None or args.rerank_model is not None
@@ -4430,7 +4944,6 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     # labels remain in rows for official judging/diagnostics, never selection or
     # default routing. Runtime totals and credentials are deliberately absent.
     dataset_sha = file_hash(data_file)
-    embedding_identity = resolve_embedding_identity(args)
     source_ids_hash = content_hash(list(source_ids))
     observed_qtype_counts = dict(Counter(
         q["question_type"] for q in source_questions
@@ -4458,6 +4971,9 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         # Raw JSON strings can hide credential-shaped nested keys from the
         # recursive sanitizer. Only the parsed objects below enter identity.
         "answer_extra_body", "judge_extra_body",
+        # The live memory-pipeline route may carry an opaque deployment or
+        # tenant identifier.  Persist only its origin and exact digest below.
+        "answer_base_url", "judge_base_url", "hymem_base_url",
     }
     strict_config = {
         key: value for key, value in vars(args).items()
@@ -4469,6 +4985,10 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         or not args.indexing_require_healthy or args.retrieval_only
         or args.no_dream or not pinned_s_source
     )
+    config_probe = _adapter_for_args(
+        Path("/benchmark-identity/hymem.sqlite"), args, ""
+    ).build_config()
+    effective_hymem_config = effective_hymem_config_identity(config_probe)
     strict_config.update({
         "label_free_answer_path": bool(args.auto_ability),
         "scored_run": not args.retrieval_only,
@@ -4494,7 +5014,12 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         "evaluator_sha256": LME_EVALUATOR_SHA256,
         "evaluator_url": LME_EVALUATOR_URL,
         "official_judge_model": LME_OFFICIAL_JUDGE_MODEL,
-        "official_judge_base_url": LME_OFFICIAL_JUDGE_BASE_URL,
+        **{
+            "official_judge_" + key: value
+            for key, value in secret_free_endpoint_identity(
+                LME_OFFICIAL_JUDGE_BASE_URL, label="official judge"
+            ).items()
+        },
         "official_judge_temperature": LME_OFFICIAL_JUDGE_TEMPERATURE,
         "official_judge_max_tokens": LME_OFFICIAL_JUDGE_MAX_TOKENS,
         "official_verdict_parser": LME_OFFICIAL_VERDICT_PARSER,
@@ -4512,32 +5037,88 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         "indexing_require_healthy": bool(args.indexing_require_healthy),
         "embedding_runtime": embedding_identity,
         "context_policy": args.context_policy_obj,
+        "extraction_canary": extraction_canary_policy(
+            prompt_version=config_probe.prompt_version
+        ),
+        "effective_hymem_config": effective_hymem_config,
     })
-    config_probe = _adapter_for_args(
-        Path("/benchmark-identity/hymem.sqlite"), args, ""
-    ).build_config()
-    strict_config["effective_hymem_config"] = dataclass_identity(
-        config_probe, exclude={"root"}
+    runtime_extraction_binding = validate_extraction_canary_config_binding(
+        strict_config["extraction_canary"], effective_hymem_config
+    )
+    reader_endpoint = secret_free_endpoint_identity(
+        args.answer_base_url, label="reader"
+    )
+    judge_endpoint = secret_free_endpoint_identity(
+        args.judge_base_url, label="judge"
     )
     pipeline_base = validate_safe_endpoint(args.hymem_base_url, label="memory pipeline")
+    pipeline_endpoint = secret_free_endpoint_identity(
+        pipeline_base, label="memory pipeline"
+    )
+    strict_config.update({
+        "answer_endpoint_origin": reader_endpoint["endpoint_origin"],
+        "answer_endpoint_sha256": reader_endpoint["endpoint_sha256"],
+        "judge_endpoint_origin": judge_endpoint["endpoint_origin"],
+        "judge_endpoint_sha256": judge_endpoint["endpoint_sha256"],
+        "hymem_endpoint_origin": pipeline_endpoint["endpoint_origin"],
+        "hymem_endpoint_sha256": pipeline_endpoint["endpoint_sha256"],
+    })
     pipeline_host = (__import__("urllib.parse", fromlist=["urlsplit"])
                      .urlsplit(pipeline_base).hostname or "").casefold()
     pipeline_sends_thinking = args.hymem_thinking == "disabled" or (
         args.hymem_thinking == "auto"
         and ("deepseek" in pipeline_host or "deepseek" in args.hymem_model.casefold())
     )
+    try:
+        pipeline_transport_version = importlib.metadata.version("openai")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise BenchmarkIntegrityError(
+            "memory pipeline transport version is unavailable"
+        ) from exc
+    from hymem.contrib.openai_client import (
+        DEFAULT_LLM_TIMEOUT_SECONDS,
+        llm_attestation_sha256,
+        openai_compatible_producer_declaration,
+    )
+    from hymem.extraction.producer import producer_binding_from_typed_declaration
+
+    pipeline_revision_sha256 = llm_attestation_sha256(
+        os.environ.get("HYMEM_LLM_DEPLOYMENT_REVISION"),
+        label="memory pipeline deployment revision",
+    )
+    pipeline_tenant_sha256 = llm_attestation_sha256(
+        os.environ.get("HYMEM_LLM_DEPLOYMENT_TENANT"),
+        label="memory pipeline deployment tenant",
+    )
+    pipeline_aggregation_producer = producer_binding_from_typed_declaration(
+        openai_compatible_producer_declaration(
+            model=args.hymem_model,
+            endpoint=pipeline_base,
+            thinking_mode=args.hymem_thinking,
+            effective_extra_body=(
+                {"thinking": {"type": "disabled"}}
+                if pipeline_sends_thinking else {}
+            ),
+            transport_package_version=pipeline_transport_version,
+            request_timeout_seconds=DEFAULT_LLM_TIMEOUT_SECONDS,
+            deployment_revision_sha256=pipeline_revision_sha256,
+            deployment_tenant_sha256=pipeline_tenant_sha256,
+            require_consistent_thinking=True,
+        ),
+        declaration_hook="aggregation_producer_declaration",
+    )
     strict_models = {
         "reader": {
             "provider": _provider_for_url(args.answer_base_url),
             "model": args.answer_model,
-            "base_url": validate_safe_endpoint(args.answer_base_url, label="reader"),
+            **reader_endpoint,
             "temperature": 0.0, "max_tokens": 1024,
             "extra_body": args.answer_extra_body_obj,
         },
         "judge": {
             "provider": _provider_for_url(args.judge_base_url),
             "model": args.judge_model,
-            "base_url": validate_safe_endpoint(args.judge_base_url, label="judge"),
+            **judge_endpoint,
             "temperature": 0.0, "max_tokens": 10,
             "n": 1 if args.judge_protocol == "official" else None,
             "extra_body": args.judge_extra_body_obj,
@@ -4554,11 +5135,17 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         "memory_pipeline": {
             "provider": _provider_for_url(args.hymem_base_url),
             "model": args.hymem_model,
-            "base_url": pipeline_base, "thinking_mode": args.hymem_thinking,
+            **pipeline_endpoint,
+            "thinking_mode": args.hymem_thinking,
             "effective_extra_body": (
                 {"thinking": {"type": "disabled"}}
                 if pipeline_sends_thinking else {}
             ),
+            "aggregation_producer": pipeline_aggregation_producer,
+            "deployment_revision_sha256": pipeline_revision_sha256,
+            "deployment_tenant_sha256": pipeline_tenant_sha256,
+            "transport_package_version": pipeline_transport_version,
+            "request_timeout_seconds": DEFAULT_LLM_TIMEOUT_SECONDS,
         },
         "embedding": embedding_identity,
     }
@@ -4659,6 +5246,19 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         protocol_split=args.protocol_split,
         calibration=calibration,
     )
+    # Re-validate the serialized manifest boundary itself.  This is after
+    # sanitization/hash construction and before any benchmark provider can be
+    # called, so neither a resume artifact nor config/report drift can rely on
+    # the independently held in-process prompt label.
+    manifest_extraction_binding = validate_extraction_canary_config_binding(
+        manifest["config"].get("extraction_canary"),
+        manifest["config"].get("effective_hymem_config"),
+    )
+    if manifest_extraction_binding != runtime_extraction_binding:
+        raise BenchmarkIntegrityError(
+            "LongMemEval manifest extraction contract differs from runtime config"
+        )
+    extraction_prompt_version = manifest_extraction_binding["prompt_version"]
     # HyMem's current architecture/prompt campaign was informed by the public S
     # set.  A frozen internal split remains useful for disciplined iteration,
     # but cannot retroactively create clean benchmark evidence.
@@ -4715,9 +5315,12 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         answer_api_key = _role_key(
             "reader", args.answer_base_url, args.answer_api_key
         )
-        answer_llm = LLMClient(
-            args.answer_model, answer_api_key, base_url=args.answer_base_url,
-            extra_body=args.answer_extra_body_obj,
+        answer_llm = owned_clients.own(
+            LLMClient(
+                args.answer_model, answer_api_key, base_url=args.answer_base_url,
+                extra_body=args.answer_extra_body_obj,
+            ),
+            label="reader client",
         )
     else:
         answer_llm = PoisonLLM("reader")
@@ -4725,10 +5328,13 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         judge_api_key = _role_key(
             "judge", args.judge_base_url, args.judge_api_key
         )
-        judge_llm = LLMClient(
-            args.judge_model, judge_api_key, base_url=args.judge_base_url,
-            extra_body=args.judge_extra_body_obj,
-            n=1 if args.judge_protocol == "official" else None,
+        judge_llm = owned_clients.own(
+            LLMClient(
+                args.judge_model, judge_api_key, base_url=args.judge_base_url,
+                extra_body=args.judge_extra_body_obj,
+                n=1 if args.judge_protocol == "official" else None,
+            ),
+            label="judge client",
         )
     else:
         judge_llm = PoisonLLM("judge")
@@ -4759,6 +5365,27 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     embedding_usage_instances: list[dict[str, Any]] = []
     indexing_runs: list[dict[str, Any]] = []
     runtime_instrumentation_errors: list[str] = []
+    extraction_canary_report: dict[str, Any] = (
+        skipped_extraction_canary(
+            "no_pending_work", prompt_version=extraction_prompt_version
+        )
+        if not work_total else
+        skipped_extraction_canary(
+            "no_dream", prompt_version=extraction_prompt_version
+        )
+        if args.no_dream else
+        {
+            **extraction_canary_policy(
+                prompt_version=extraction_prompt_version
+            ),
+            "status": "pending",
+        }
+    )
+    if work_total and not args.no_dream:
+        validate_extraction_canary_report(
+            extraction_canary_report, expected_mode="pending",
+            expected_prompt_version=extraction_prompt_version,
+        )
 
     def unavailable_llm_usage() -> dict[str, Any]:
         return {
@@ -4782,9 +5409,11 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
             "backend": identity["backend"],
             "quality": identity["quality"],
             "network_free": identity["network_free"],
-            "model": identity["model"],
+            "model": identity["vector_space_key"],
             "dimension": identity["dimension"],
             "identity_available": True,
+            "identity_exact": identity["identity_exact"],
+            "reuse_scope": identity["reuse_scope"],
             "calls": 0, "calls_available": True,
             "request_attempts": 0,
             "request_attempts_available": True,
@@ -4807,6 +5436,7 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
             "quality": "none", "network_free": None,
             "model": None, "dimension": None,
             "identity_available": False,
+            "identity_exact": None, "reuse_scope": None,
             "calls": None, "calls_available": False,
             "request_attempts": None,
             "request_attempts_available": False,
@@ -4821,39 +5451,68 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
             "cost_usd": None, "cost_available": False,
         }
 
+    runtime_capture_lock = threading.RLock()
+    captured_runtime_ids: set[str] = set()
+
     def _capture_runtime(row: dict[str, Any]) -> None:
-        pipeline = row.get("memory_pipeline_usage")
-        if not isinstance(pipeline, dict):
-            runtime_instrumentation_errors.append(
-                f"{row.get('question_id')}: memory pipeline usage unavailable"
+        # Worker-finally handoff and coordinator result collection intentionally
+        # overlap.  Keying by the protocol-unique id makes that overlap safe and
+        # prevents cumulative per-question meters from being counted twice.
+        runtime_id = str(row.get("question_id", "unknown"))
+        with runtime_capture_lock:
+            if runtime_id in captured_runtime_ids:
+                return
+            captured_runtime_ids.add(runtime_id)
+            pipeline = row.get("memory_pipeline_usage")
+            if not isinstance(pipeline, dict):
+                runtime_instrumentation_errors.append(
+                    "memory_pipeline_usage:Unavailable"
+                )
+            pipeline_usage_instances.append(
+                dict(pipeline) if isinstance(pipeline, dict) else unavailable_llm_usage()
             )
-        pipeline_usage_instances.append(
-            dict(pipeline) if isinstance(pipeline, dict) else unavailable_llm_usage()
-        )
-        embedding = row.get("embedding_usage")
-        if bool(args.embeddings) and not isinstance(embedding, dict):
-            runtime_instrumentation_errors.append(
-                f"{row.get('question_id')}: embedding usage/identity unavailable"
+            embedding = row.get("embedding_usage")
+            if bool(args.embeddings) and not isinstance(embedding, dict):
+                runtime_instrumentation_errors.append(
+                    "embedding_usage:Unavailable"
+                )
+            embedding_usage_instances.append(
+                dict(embedding) if isinstance(embedding, dict) else
+                unavailable_embedding_usage()
             )
-        embedding_usage_instances.append(
-            dict(embedding) if isinstance(embedding, dict) else
-            unavailable_embedding_usage()
-        )
-        indexing = row.get("indexing")
-        if isinstance(indexing, dict):
-            indexing_runs.append({
-                "question_id": row.get("question_id"), **dict(indexing),
-            })
+            indexing = row.get("indexing")
+            if isinstance(indexing, dict):
+                indexing_runs.append({
+                    "question_id": row.get("question_id"),
+                    "summary": dict(indexing),
+                })
+
+    def _observable_attempts() -> int:
+        with runtime_capture_lock:
+            return len(captured_runtime_ids)
 
     def _segment(status: str, attempted: int) -> dict:
-        instrumentation_errors: list[str] = list(runtime_instrumentation_errors)
+        # Worker-finally callbacks can update these collections while an
+        # ordinary result is being checkpointed.  Take one coherent image under
+        # their callback lock, then aggregate outside it.
+        with runtime_capture_lock:
+            instrumentation_errors: list[str] = list(
+                runtime_instrumentation_errors
+            )
+            pipeline_snapshots = [
+                dict(snapshot) for snapshot in pipeline_usage_instances
+            ]
+            embedding_snapshots = [
+                dict(snapshot) for snapshot in embedding_usage_instances
+            ]
+            indexing_snapshots = [dict(item) for item in indexing_runs]
 
         def captured(label: str, fn, fallback):
             try:
                 return fn()
-            except BaseException as exc:
+            except Exception as exc:
                 instrumentation_errors.append(
-                    f"{label}: {type(exc).__name__}: {exc}"
+                    f"{label}:{_bounded_exception_type(exc)}"
                 )
                 return fallback()
 
@@ -4876,8 +5535,8 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         pipeline_usage = captured(
             "memory_pipeline_usage",
             lambda: (
-                aggregate_usage_snapshots(pipeline_usage_instances)
-                if pipeline_usage_instances else usage_snapshot(
+                aggregate_usage_snapshots(pipeline_snapshots)
+                if pipeline_snapshots else usage_snapshot(
                     PoisonLLM("unused memory pipeline")
                 )
             ),
@@ -4888,8 +5547,8 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
             "embedding_usage",
             lambda: (
                 aggregate_embedding_usage_snapshots(
-                    embedding_usage_instances
-                ) if embedding_usage_instances else zero_embedding_usage()
+                    embedding_snapshots
+                ) if embedding_snapshots else zero_embedding_usage()
             ),
             unavailable_embedding_usage,
         )
@@ -4908,14 +5567,56 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
             "memory_pipeline_usage": pipeline_usage,
             "embedding_usage": embedding_usage,
             "latest_indexing": (
-                dict(indexing_runs[-1]) if indexing_runs else None
+                dict(indexing_snapshots[-1]) if indexing_snapshots else None
             ),
-            "indexing_runs": [dict(item) for item in indexing_runs],
+            "indexing_runs": indexing_snapshots,
+            # This dedicated-client spend is intentionally NOT part of
+            # memory_pipeline_usage. It is separately attributable and occurs
+            # once here, before any worker can create a benchmark store.
+            "extraction_canary": secret_free_extraction_canary_report(
+                extraction_canary_report
+            ),
             "instrumentation_errors": instrumentation_errors,
         }
 
     if work_total:
         ledger.update_execution_segment(segment_id, _segment("running", 0))
+        if not args.no_dream:
+            try:
+                extraction_canary_report = run_configured_extraction_canary(
+                    api_key=pipeline_key,
+                    base_url=args.hymem_base_url,
+                    model=args.hymem_model,
+                    thinking=args.hymem_thinking,
+                    prompt_version=extraction_prompt_version,
+                )
+                _validate_pipeline_extraction_canary(
+                    extraction_canary_report, args, mode="required",
+                )
+            except ExtractionCanaryError as exc:
+                extraction_canary_report = dict(exc.report)
+                validate_extraction_canary_report(
+                    extraction_canary_report,
+                    expected_mode="failed",
+                    expected_client=extraction_canary_client_policy(
+                        base_url=args.hymem_base_url,
+                        model=args.hymem_model,
+                        thinking=args.hymem_thinking,
+                    ),
+                    require_client_closed=True,
+                    expected_prompt_version=extraction_prompt_version,
+                )
+                ledger.update_execution_segment(
+                    segment_id, _segment("running", 0)
+                )
+                raise
+            ledger.update_execution_segment(segment_id, _segment("running", 0))
+            print_extraction_canary(extraction_canary_report)
+        else:
+            _validate_pipeline_extraction_canary(
+                extraction_canary_report, args, mode="no_dream",
+            )
+            print_extraction_canary(extraction_canary_report)
     elif is_resume:
         # A crash after its last durable row but before segment finalization is
         # recoverable without constructing a provider client. Close that history
@@ -4952,69 +5653,242 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
               f"Elapsed: {elapsed:.0f}s | Avg: {elapsed/max(1, done):.0f}s/q"
               f"{suffix}{err}", flush=True)
 
-    if args.workers > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    if args.workers > 1 and work_total:
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-        # Collect by original index so per_question stays input-ordered (stable
-        # / comparable across runs) even though completion order is arbitrary.
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {
-                pool.submit(_evaluate_one_question, qi, work_total, q_data, args,
-                            answer_llm, judge_llm, pipeline_key,
-                            distill_llm): q_data
-                for qi, q_data in enumerate(work_questions)
-            }
-            for done, fut in enumerate(as_completed(futures), 1):
-                q_data = futures[fut]
+        parallel_stop = threading.Event()
+        parallel_state_lock = threading.RLock()
+        parallel_primary: list[BaseException] = []
+
+        def _signal_parallel_abort(exc: BaseException) -> BaseException:
+            # This lock also orders fatal worker notification against the
+            # coordinator's final pre-record stop check.  Consequently no
+            # ledger.record call can begin after a structural worker failure.
+            with parallel_state_lock:
+                if not parallel_primary:
+                    parallel_primary.append(exc)
+                parallel_stop.set()
+                return parallel_primary[0]
+
+        def _raise_parallel_primary() -> None:
+            with parallel_state_lock:
+                if parallel_stop.is_set():
+                    if parallel_primary:
+                        raise parallel_primary[0]
+                    raise _ParallelQuestionStopped()
+
+        def _parallel_evaluate(qi: int, q_data: dict) -> dict:
+            if parallel_stop.is_set():
+                raise _ParallelQuestionStopped()
+            try:
+                return _evaluate_one_question(
+                    qi, work_total, q_data, args, answer_llm, judge_llm,
+                    pipeline_key, distill_llm,
+                    _parallel_stop=parallel_stop,
+                    _on_fatal_abort=_signal_parallel_abort,
+                    _on_runtime=_capture_runtime,
+                )
+            except _ParallelQuestionStopped:
+                raise
+            except BaseException as exc:
+                # Ordinary provider/question exceptions retain the historical
+                # failed-row behavior below.  Structural and process-control
+                # failures signal siblings before this future becomes ready.
+                if (
+                    not isinstance(exc, Exception)
+                    or is_structural_benchmark_error(exc)
+                ):
+                    primary = _signal_parallel_abort(exc)
+                    if primary is not exc:
+                        raise _ParallelQuestionStopped()
+                raise
+
+        worker_count = min(args.workers, work_total)
+        pool = ThreadPoolExecutor(max_workers=worker_count)
+        work_iter = iter(enumerate(work_questions))
+        futures: dict[Any, tuple[int, dict]] = {}
+        attempted_count = 0
+        checkpoint_abort: list[BaseException] = []
+
+        def _fill_parallel_window() -> None:
+            while len(futures) < worker_count and not parallel_stop.is_set():
                 try:
-                    result = fut.result()
-                    _capture_runtime(result)
+                    qi, q_data = next(work_iter)
+                except StopIteration:
+                    return
+                future = pool.submit(_parallel_evaluate, qi, q_data)
+                futures[future] = (qi, q_data)
+
+        try:
+            _fill_parallel_window()
+            while futures:
+                _raise_parallel_primary()
+                ready, _pending_futures = wait(
+                    tuple(futures), return_when=FIRST_COMPLETED,
+                )
+                # A worker signals before publishing a structural exception to
+                # its Future.  Check before accepting any simultaneously ready
+                # success, and process the ready batch in input order.
+                _raise_parallel_primary()
+                ordered_ready = sorted(ready, key=lambda fut: futures[fut][0])
+                for fut in ordered_ready:
+                    _qi, q_data = futures.pop(fut)
+                    _raise_parallel_primary()
+                    try:
+                        result = fut.result()
+                        _capture_runtime(result)
+                    except _ParallelQuestionStopped:
+                        _raise_parallel_primary()
+                        raise
+                    except BenchmarkCleanupError as exc:
+                        primary = _signal_parallel_abort(exc)
+                        if primary is exc:
+                            raise
+                        raise primary
+                    except Exception as exc:
+                        if is_structural_benchmark_error(exc):
+                            primary = _signal_parallel_abort(exc)
+                            if primary is exc:
+                                raise
+                            raise primary
+                        result = {
+                            "question_id": q_data["question_id"],
+                            "question_type": q_data.get("question_type", "unknown"),
+                            "correct": False,
+                            "benchmark_failure": (
+                                f"worker_failure:{_bounded_exception_type(exc)}"
+                            ),
+                            "oracle_ability": LME_ABILITY_BY_TYPE.get(
+                                q_data.get("question_type")
+                            ),
+                            "detected_ability": None,
+                            "ability_used": (
+                                None if args.auto_ability else
+                                LME_ABILITY_BY_TYPE.get(q_data.get("question_type"))
+                            ),
+                            "retrieval_only": bool(args.retrieval_only),
+                            "distill_fired": False,
+                            "distill_calls": 0,
+                        }
+                        _capture_runtime(result)
+
+                    next_attempted = attempted_count + 1
+                    # Persistence and fatal notification share one gate: once
+                    # any fatal fault wins it, no later record call can start.
+                    with parallel_state_lock:
+                        _raise_parallel_primary()
+                        try:
+                            ledger.record(
+                                q_data["question_id"], row=result,
+                                execution_segment=_segment(
+                                    "running", next_attempted
+                                ),
+                            )
+                        except BaseException as exc:
+                            checkpoint_abort.append(exc)
+                            primary = _signal_parallel_abort(exc)
+                            if primary is exc:
+                                raise
+                            raise primary
+                    attempted_count = next_attempted
+                    all_results = list(ledger.reconcile().rows)
+                    if (
+                        attempted_count % 10 == 0
+                        or attempted_count == work_total
+                    ):
+                        _progress(attempted_count)
+                # Refill only after every ready result has been reconciled.  At
+                # most worker_count evaluations therefore exist at any time.
+                _fill_parallel_window()
+        except BaseException as exc:
+            if isinstance(exc, _ParallelQuestionStopped):
+                with parallel_state_lock:
+                    primary = parallel_primary[0] if parallel_primary else exc
+                    parallel_stop.set()
+            else:
+                primary = _signal_parallel_abort(exc)
+            for future in futures:
+                future.cancel()
+            if primary is exc:
+                raise
+            raise primary
+        finally:
+            primary_exception = sys.exc_info()[1]
+            if primary_exception is not None:
+                parallel_stop.set()
+                for future in futures:
+                    future.cancel()
+            # Explicit shutdown is required here.  The executor context
+            # manager cannot request cancellation of queued futures and would
+            # wait while those tasks continued to spend.
+            shutdown_complete = [False]
+
+            def _shutdown_and_capture_runtime() -> None:
+                pool.shutdown(wait=True, cancel_futures=True)
+                # Futures may have finished after the coordinator's fatal record
+                # failure.  Inspect their values only for runtime evidence; they
+                # must never reach ledger.record on this abort path.
+                for future in tuple(futures):
+                    if future.cancelled():
+                        continue
+                    try:
+                        sibling_result = future.result()
+                    except BaseException:
+                        continue
+                    if isinstance(sibling_result, dict):
+                        _capture_runtime(sibling_result)
+                shutdown_complete[0] = True
+
+            cleanup_actions = [("resource_close", _shutdown_and_capture_runtime)]
+            if checkpoint_abort:
+                cleanup_actions.append((
+                    "execution_segment_snapshot",
+                    lambda: ledger.update_execution_segment(
+                        segment_id,
+                        _segment(
+                            "complete" if shutdown_complete[0] else "running",
+                            _observable_attempts(),
+                        ),
+                    ),
+                ))
+            run_cleanup_actions(
+                cleanup_actions,
+                primary_exception=primary_exception,
+            )
+    else:
+        checkpoint_abort: list[BaseException] = []
+        try:
+            for qi, q_data in enumerate(work_questions):
+                result = _evaluate_one_question(
+                    qi, work_total, q_data, args, answer_llm, judge_llm,
+                    pipeline_key, distill_llm,
+                    _on_runtime=_capture_runtime,
+                )
+                _capture_runtime(result)
+                try:
                     ledger.record(
                         q_data["question_id"], row=result,
-                        execution_segment=_segment("running", done),
+                        execution_segment=_segment(
+                            "running", _observable_attempts()
+                        ),
                     )
-                except Exception as exc:
-                    row = {
-                        "question_id": q_data["question_id"],
-                        "question_type": q_data.get("question_type", "unknown"),
-                        "correct": False,
-                        "benchmark_failure": (
-                            f"worker_failure: {type(exc).__name__}: {exc}"
-                        ),
-                        "oracle_ability": LME_ABILITY_BY_TYPE.get(
-                            q_data.get("question_type")
-                        ),
-                        "detected_ability": None,
-                        "ability_used": (
-                            None if args.auto_ability else
-                            LME_ABILITY_BY_TYPE.get(q_data.get("question_type"))
-                        ),
-                        "retrieval_only": bool(args.retrieval_only),
-                        "distill_fired": False,
-                        "distill_calls": 0,
-                    }
-                    _capture_runtime(row)
-                    ledger.record(
-                        q_data["question_id"], row=row,
-                        execution_segment=_segment("running", done),
-                    )
+                except BaseException as exc:
+                    checkpoint_abort.append(exc)
+                    raise
                 all_results = list(ledger.reconcile().rows)
-                if done % 10 == 0 or done == work_total:
-                    _progress(done)
-    else:
-        for qi, q_data in enumerate(work_questions):
-            result = _evaluate_one_question(
-                qi, work_total, q_data, args, answer_llm, judge_llm,
-                pipeline_key, distill_llm,
-            )
-            _capture_runtime(result)
-            ledger.record(
-                q_data["question_id"], row=result,
-                execution_segment=_segment("running", qi + 1),
-            )
-            all_results = list(ledger.reconcile().rows)
-            if (qi + 1) % 10 == 0:
-                _progress(qi + 1)
+                if (qi + 1) % 10 == 0:
+                    _progress(qi + 1)
+        finally:
+            primary_exception = sys.exc_info()[1]
+            if checkpoint_abort:
+                run_cleanup_actions(
+                    [("execution_segment_snapshot", lambda:
+                        ledger.update_execution_segment(
+                            segment_id,
+                            _segment("complete", _observable_attempts()),
+                        ))],
+                    primary_exception=primary_exception,
+                )
 
     elapsed = time.time() - start_time
     if work_total:
@@ -5033,7 +5907,7 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         try:
             return fn(all_results)
         except Exception as exc:
-            diagnostic_errors[name] = f"{type(exc).__name__}: {exc}"
+            diagnostic_errors[name] = _bounded_exception_type(exc)
             return default
 
     if args.retrieval_only:
@@ -5115,8 +5989,32 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
         f"longmemeval-v2-hymem-{stamp}-{publication_nonce}-seed{args.seed}-"
         f"strict-{manifest['run_id'].removeprefix('sha256:')[:12]}.json"
     )
-    output = publish_checkpoint_artifact(
-        ledger, archive_path, payload=payload
+    artifact = prepare_checkpoint_artifact(ledger, payload=payload)
+    complete_segments = [
+        segment for segment in checkpoint_snapshot.get("execution_segments", [])
+        if isinstance(segment, dict) and segment.get("status") == "complete"
+    ]
+    final_segment = complete_segments[-1] if complete_segments else {}
+    answer_usage = dict(
+        final_segment.get("reader_usage") or unavailable_llm_usage()
+    )
+    judge_usage = dict(
+        final_segment.get("judge_usage") or unavailable_llm_usage()
+    )
+    if _owned_ledgers is not None:
+        _owned_ledgers[:] = [
+            owned for owned in _owned_ledgers if owned is not ledger
+        ]
+    # Final usage is frozen in ``artifact`` before transports close.  Neither
+    # the immutable archive nor its latest pointer may exist unless provider
+    # teardown and checkpoint lease release both succeed.
+    output = publish_prepared_artifact_after_cleanup(
+        archive_path,
+        artifact,
+        cleanup_actions=[
+            ("resource_close", owned_clients.close),
+            ("checkpoint_close", ledger.close),
+        ],
     )
     artifact_digest = content_hash(output)
     write_latest_pointer(results_path, archive=archive_path,
@@ -5125,22 +6023,6 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     print(f"  Archived: {archive_path.name}", flush=True)
 
     print(f"\nEvaluation complete in {elapsed:.0f}s")
-    try:
-        answer_usage = usage_snapshot(answer_llm)
-    except BaseException as exc:
-        print(
-            f"WARNING: final reader usage unavailable: "
-            f"{type(exc).__name__}: {exc}", file=sys.stderr,
-        )
-        answer_usage = unavailable_llm_usage()
-    try:
-        judge_usage = usage_snapshot(judge_llm)
-    except BaseException as exc:
-        print(
-            f"WARNING: final judge usage unavailable: "
-            f"{type(exc).__name__}: {exc}", file=sys.stderr,
-        )
-        judge_usage = unavailable_llm_usage()
     print(f"  Answer calls: {answer_usage['calls']}, "
           f"Judge calls: {judge_usage['calls']}")
     totals = (answer_usage["total_tokens"], judge_usage["total_tokens"])
@@ -5181,6 +6063,25 @@ def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
     print(f"\nResults saved to {results_path}")
 
 
+def _main(_owned_ledgers: list[AtomicCheckpoint] | None = None):
+    """Run LongMemEval and close shared clients after their final snapshots."""
+
+    owns_ledgers = _owned_ledgers is None
+    ledgers = [] if _owned_ledgers is None else _owned_ledgers
+    try:
+        with OwnedResourceScope(
+            "LongMemEval shared provider clients"
+        ) as owned_clients:
+            return _run_main(ledgers, owned_clients)
+    finally:
+        if owns_ledgers:
+            run_cleanup_actions(
+                [("checkpoint_close", ledger.close)
+                 for ledger in reversed(ledgers)],
+                primary_exception=sys.exc_info()[1],
+            )
+
+
 def main():
     """CLI entry point; always release a checkpoint lease on BaseException."""
 
@@ -5188,17 +6089,11 @@ def main():
     try:
         return _main(owned_ledgers)
     finally:
-        for ledger in reversed(owned_ledgers):
-            try:
-                ledger.close()
-            except BaseException as exc:
-                # Lease release is cleanup. Never replace an expensive run's
-                # row/result (or the original interruption) with a close error.
-                print(
-                    f"WARNING: checkpoint cleanup failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                )
+        run_cleanup_actions(
+            [("checkpoint_close", ledger.close)
+             for ledger in reversed(owned_ledgers)],
+            primary_exception=sys.exc_info()[1],
+        )
 
 
 if __name__ == "__main__":
