@@ -75,9 +75,13 @@ from hymem.dreaming.digest import (
     digest_attempt_max_chars,
     digest_config_version,
     digest_generation_matches_config,
+    digest_staging_cursor_is_valid,
     digest_retry_policy_version,
     digest_retry_is_quarantined,
     extract_session_digest,
+    load_completed_digest_slices,
+    load_digest_staged_summary,
+    stage_digest_extraction,
     record_digest_failure,
 )
 from hymem.dreaming.lossless import (
@@ -103,7 +107,7 @@ from hymem.dreaming.facts import (
     record_fact_failure,
     record_fact_failure_if_pending,
 )
-from hymem.dreaming.procedures import persist_procedures
+from hymem.dreaming.procedures import persist_procedures, publish_digest_procedures
 from hymem.dreaming.mentions import index_chunk_mentions
 from hymem.dreaming.temporal import index_chunk_temporal_mentions
 from hymem.dreaming.retention import (
@@ -717,6 +721,45 @@ def _run_dreaming(
     def _check_deadline() -> None:
         if deadline is not None:
             deadline.check()
+
+    def _semantic_config(tier: str) -> str:
+        if tier == "digest":
+            return digest_config_version(
+                prompt_version=cfg.prompt_version,
+                episode_prompt_version=active_episode_prompt_version(
+                    cfg.episode_granularity_enabled,
+                ),
+                max_chars=cfg.dream_digest_max_chars,
+                max_tokens=cfg.dream_digest_max_tokens,
+                max_episodes=(cfg.dream_max_episodes_per_session
+                              if cfg.episode_granularity_enabled else None),
+                client=phase1_identity_client,
+            )
+        if tier == "profile":
+            return profile_config_version(
+                max_chars=cfg.dream_digest_max_chars,
+                max_items=cfg.profile_max_items_per_session,
+                redact_values=cfg.redact_secrets,
+                client=phase1_identity_client,
+            )
+        return facts_config_version(cfg, client=phase1_identity_client)
+
+    semantic_configs = {
+        tier: _semantic_config(tier) for tier in (
+            "digest",
+            *(("profile",) if cfg.profile_extraction_enabled else ()),
+            *(("facts",) if cfg.facts_extraction_enabled else ()),
+        )
+    }
+
+    @contextlib.contextmanager
+    def _semantic_boundary(tier: str):
+        """Fence calls and commits against model/config/loaded-code drift."""
+        if _semantic_config(tier) != semantic_configs[tier]:
+            raise RuntimeError(f"{tier} producer generation changed")
+        yield
+        if _semantic_config(tier) != semantic_configs[tier]:
+            raise RuntimeError(f"{tier} producer generation changed")
 
     def _aggregation_health_write(write):
         """Publish one aggregation-health transition at a fenced boundary.
@@ -1388,6 +1431,8 @@ def _run_dreaming(
             # artifacts are protected by the v37 ledger.
             digested = conn.execute(
                 "SELECT summary, summary_source, auto_summary, "
+                "auto_summary_message_id, auto_summary_partial_message_id, "
+                "auto_summary_message_offset, "
                 "digested_prompt_version, profile_prompt_version, "
                 "profile_cursor_message_id, "
                 "profile_cursor_partial_message_id, profile_cursor_offset, "
@@ -1422,16 +1467,7 @@ def _run_dreaming(
             # That token distinguishes two complete rebuilds under the SAME
             # configuration, so an authoritative shorter result can retire
             # stale rows only after its replacement walk reaches the tail.
-            digest_config = digest_config_version(
-                prompt_version=cfg.prompt_version,
-                episode_prompt_version=episode_prompt_version,
-                max_chars=cfg.dream_digest_max_chars,
-                max_tokens=cfg.dream_digest_max_tokens,
-                max_episodes=(
-                    cfg.dream_max_episodes_per_session
-                    if cfg.episode_granularity_enabled else None
-                ),
-            )
+            digest_config = semantic_configs["digest"]
             stored_digest_generation = (
                 digested["digest_cursor_prompt_version"] if digested else None
             )
@@ -1463,12 +1499,31 @@ def _run_dreaming(
             cursor_offset = int(digested["digest_cursor_offset"] or 0) if cursor_current else 0
             coverage_tail = digested["coverage_message_id"] if digested else None
             digest_cursor_invalid = False
+            staged_auto_summary = None
+            staging_valid = True
+            if cursor_current:
+                try:
+                    staged_auto_summary = load_digest_staged_summary(
+                        conn, session_id, stored_digest_generation,
+                        (cursor_message_id, partial_message_id, cursor_offset),
+                    )
+                    # Old/pre-v58 in-progress walks have no complete private
+                    # output chain. Replay them instead of publishing only the
+                    # remaining suffix. A completed forward base needs no stage.
+                    staging_valid = (
+                        (cursor_message_id, partial_message_id, cursor_offset)
+                        != (coverage_tail, None, 0)
+                        if staged_auto_summary is not None
+                        else digest_staging_cursor_is_valid(conn, session_id)
+                    )
+                except (RuntimeError, ValueError, TypeError):
+                    staging_valid = False
             if (
                 cursor_current
-                and not _lossless_cursor_is_valid(
+                and (not staging_valid or not _lossless_cursor_is_valid(
                     conn, session_id, cursor_message_id,
                     partial_message_id, cursor_offset,
-                )
+                ))
             ):
                 log.warning(
                     "digest.cursor_invalid session_id=%s cursor=%s tail=%s "
@@ -1480,6 +1535,7 @@ def _run_dreaming(
                 partial_message_id = None
                 cursor_offset = 0
                 digest_cursor_invalid = True
+                staged_auto_summary = None
             newest_message_id = conn.execute(
                 "SELECT MAX(id) AS m FROM messages WHERE session_id = ?",
                 (session_id,),
@@ -1512,6 +1568,7 @@ def _run_dreaming(
                 partial_message_id = None
                 cursor_offset = 0
                 caught_up = False
+                staged_auto_summary = None
             digest_retry_key = digest_retry_policy_version(
                 digest_config,
                 max_attempts=cfg.digest_extraction_max_attempts,
@@ -1557,7 +1614,9 @@ def _run_dreaming(
                 # first v38 walk with it.  Prompt-version rewinds also carry a
                 # prior automatic summary so a partial rebuild never hides the
                 # already-published history.
-                if digested["auto_summary"]:
+                if staged_auto_summary is not None:
+                    prior_auto_summary = staged_auto_summary
+                elif digested["auto_summary"]:
                     # A rewind re-reads the exact source stream, but it must
                     # never replace a complete published history with the
                     # first bounded slice of the rebuild.  Carrying the prior
@@ -1580,17 +1639,18 @@ def _run_dreaming(
                     cfg.dream_digest_max_chars, digest_retry_count
                 )
                 try:
-                    digest = extract_session_digest(
-                        conn, session_id, llm,
-                        max_tokens=cfg.dream_digest_max_tokens,
-                        max_chars=digest_attempt_chars,
-                        since_message_id=cursor_message_id,
-                        partial_message_id=partial_message_id,
-                        since_message_offset=cursor_offset,
-                        prior_summary=prior_auto_summary,
-                        granular=cfg.episode_granularity_enabled,
-                        max_episodes=cfg.dream_max_episodes_per_session,
-                    )
+                    with _semantic_boundary("digest"):
+                        digest = extract_session_digest(
+                            conn, session_id, llm,
+                            max_tokens=cfg.dream_digest_max_tokens,
+                            max_chars=digest_attempt_chars,
+                            since_message_id=cursor_message_id,
+                            partial_message_id=partial_message_id,
+                            since_message_offset=cursor_offset,
+                            prior_summary=prior_auto_summary,
+                            granular=cfg.episode_granularity_enabled,
+                            max_episodes=cfg.dream_max_episodes_per_session,
+                        )
                 except Exception:
                     report.digest_failures += 1
                     log.exception("digest.extraction_failure session_id=%s", session_id)
@@ -1620,7 +1680,19 @@ def _run_dreaming(
                         else:
                             report.budget_exhausted = True
                     if digest is not None and not digest.parse_failed:
-                        with core_db.transaction(conn):
+                        with core_db.transaction(conn), _semantic_boundary("digest"):
+                            summary_to_persist = digest.summary or prior_auto_summary[:500]
+                            stage_digest_extraction(
+                                conn, session_id, digest_build_generation,
+                                slice_key, digest, summary_to_persist,
+                                before=(cursor_message_id, partial_message_id, cursor_offset),
+                                expected_state=(
+                                    digested["digest_cursor_prompt_version"],
+                                    digested["digest_cursor_message_id"],
+                                    digested["digest_cursor_partial_message_id"],
+                                    int(digested["digest_cursor_offset"] or 0),
+                                ),
+                            )
                             # At most one unpublished replacement generation is
                             # retained. A successfully-started new build may
                             # discard abandoned staging, but never the marker's
@@ -1637,7 +1709,8 @@ def _run_dreaming(
                                     published_digest_generation,
                                 ),
                             )
-                            if digest.episodes.items:
+                            if (digest.episodes.items and
+                                    digest_build_generation != published_digest_generation):
                                 ep_count = persist_episodes(
                                     conn, session_id, digest.episodes,
                                     granular=cfg.episode_granularity_enabled,
@@ -1648,29 +1721,6 @@ def _run_dreaming(
                                 report.episodes_created += ep_count
                                 log.debug(
                                     "episodes session_id=%s count=%d", session_id, ep_count
-                                )
-                            summary_to_persist = digest.summary or prior_auto_summary
-                            # An explicitly empty summary is a successful
-                            # no-op, not a parse failure.  Persist its position
-                            # too (retaining any prior text), so the summary and
-                            # digest cursors cannot disagree about whether this
-                            # material was examined.
-                            persist_auto_session_summary(
-                                conn,
-                                session_id,
-                                summary_to_persist,
-                                covered_message_id=digest.covered_message_id,
-                                partial_message_id=digest.partial_message_id,
-                                covered_message_offset=digest.next_message_offset,
-                            )
-                            if summary_to_persist:
-                                log.debug("summary session_id=%s", session_id)
-                            if digest.procedures.items:
-                                pr_count = persist_procedures(
-                                    conn, session_id, digest.procedures
-                                )
-                                log.debug(
-                                    "procedures session_id=%s count=%d", session_id, pr_count
                                 )
                             conn.execute(
                                 """
@@ -1700,6 +1750,42 @@ def _run_dreaming(
                                     (digest.covered_message_id, session_id),
                                 )
                             if digest.caught_up:
+                                completed_slices = load_completed_digest_slices(
+                                    conn, session_id, digest_build_generation,
+                                )
+                                if digest_build_generation != published_digest_generation:
+                                    # Reconstruct replacement episodes from the
+                                    # validated private chain. Missing, altered,
+                                    # or injected physical staging rows must not
+                                    # decide the completed publication set.
+                                    conn.execute(
+                                        "DELETE FROM episodes WHERE session_id=? AND digest_generation=?",
+                                        (session_id, digest_build_generation),
+                                    )
+                                # Forward-tail episodes share the published
+                                # generation and therefore stay JSON-staged
+                                # until here. Replacement episodes already have
+                                # private generation-scoped rows.
+                                for completed_slice in completed_slices:
+                                    ep_count = persist_episodes(
+                                        conn, session_id, completed_slice["episodes"],
+                                        granular=cfg.episode_granularity_enabled,
+                                        digest_slice_key=completed_slice["slice_key"],
+                                        digest_generation=digest_build_generation,
+                                    )
+                                    if digest_build_generation == published_digest_generation:
+                                        report.episodes_created += ep_count
+                                publish_digest_procedures(
+                                    conn, session_id, digest_build_generation,
+                                    [part["procedures"] for part in completed_slices],
+                                    replacing=(digest_build_generation != published_digest_generation),
+                                )
+                                persist_auto_session_summary(
+                                    conn, session_id, completed_slices[-1]["summary"],
+                                    covered_message_id=digest.covered_message_id,
+                                    partial_message_id=digest.partial_message_id,
+                                    covered_message_offset=digest.next_message_offset,
+                                )
                                 # Publish prompt stamps and retire the previous
                                 # complete generation only after the replacement
                                 # walk is wholly durable.  A mid-walk failure
@@ -1740,6 +1826,10 @@ def _run_dreaming(
                                         "AND digest_generation = ?",
                                         (session_id, digest_build_generation),
                                     )
+                                conn.execute(
+                                    "DELETE FROM digest_staging WHERE session_id=?",
+                                    (session_id,),
+                                )
                             else:
                                 # Completion loops historically use this flag
                                 # to decide whether another dream pass is owed.
@@ -1761,11 +1851,7 @@ def _run_dreaming(
             # staged with the cursor; consumer-visible rows change only in the
             # transaction that reaches the complete USER tail.
             if cfg.profile_extraction_enabled:
-                profile_config = profile_config_version(
-                    max_chars=cfg.dream_digest_max_chars,
-                    max_items=cfg.profile_max_items_per_session,
-                    redact_values=cfg.redact_secrets,
-                )
+                profile_config = semantic_configs["profile"]
                 stored_profile_generation = (
                     digested["profile_cursor_prompt_version"] if digested else None
                 )
@@ -1889,7 +1975,7 @@ def _run_dreaming(
                             f"{profile_config}|walk={uuid.uuid4().hex}"
                         )
                         try:
-                            with core_db.transaction(conn):
+                            with core_db.transaction(conn), _semantic_boundary("profile"):
                                 conn.execute(
                                     "DELETE FROM profile_staging WHERE session_id = ?",
                                     (session_id,),
@@ -1934,16 +2020,17 @@ def _run_dreaming(
                         profile_retry_count,
                     )
                     try:
-                        profile = extract_user_profile(
-                            conn,
-                            session_id,
-                            llm,
-                            max_chars=attempt_max_chars,
-                            max_items=cfg.profile_max_items_per_session,
-                            since_message_id=profile_cursor_message_id,
-                            partial_message_id=profile_partial_message_id,
-                            since_message_offset=profile_cursor_offset,
-                        )
+                        with _semantic_boundary("profile"):
+                            profile = extract_user_profile(
+                                conn,
+                                session_id,
+                                llm,
+                                max_chars=attempt_max_chars,
+                                max_items=cfg.profile_max_items_per_session,
+                                since_message_id=profile_cursor_message_id,
+                                partial_message_id=profile_partial_message_id,
+                                since_message_offset=profile_cursor_offset,
+                            )
                     except Exception:
                         report.profile_failures += 1
                         log.exception(
@@ -1996,7 +2083,7 @@ def _run_dreaming(
                                 report.budget_exhausted = True
                         else:
                             try:
-                                with core_db.transaction(conn):
+                                with core_db.transaction(conn), _semantic_boundary("profile"):
                                     # A successfully-started replacement may
                                     # retire abandoned staging, never published
                                     # profile rows.
@@ -2103,7 +2190,7 @@ def _run_dreaming(
                     facts_cursor = facts_state["facts_cursor_message_id"]
                     facts_partial = facts_state["facts_cursor_partial_message_id"]
                     facts_offset = int(facts_state["facts_cursor_offset"] or 0)
-                    current_facts_config = facts_config_version(cfg)
+                    current_facts_config = semantic_configs["facts"]
                     retry_state_valid = facts_retry_state_is_valid(
                         facts_state["facts_retry_count"],
                         facts_state["facts_retry_config_version"],
@@ -2154,7 +2241,8 @@ def _run_dreaming(
                         session_id, facts_cursor, facts_partial, facts_offset
                     )
                     retry_key = facts_retry_policy_version(
-                        cfg, replay_slice_key=retry_unit_key
+                        cfg, replay_slice_key=retry_unit_key,
+                        publication_version=current_facts_config,
                     )
                     active_quarantine = bool(
                         retry_state_valid
@@ -2193,10 +2281,13 @@ def _run_dreaming(
                     if cursor_valid and stale_slice is not None and not active_quarantine:
                         _check_deadline()
                         try:
-                            facts = reextract_fact_outcome(
-                                conn, stale_slice, llm, cfg,
-                                _require_committed_chain=False,
-                            )
+                            with _semantic_boundary("facts"):
+                                facts = reextract_fact_outcome(
+                                    conn, stale_slice, llm, cfg,
+                                    _require_committed_chain=False,
+                                )
+                                if facts.publication_version != current_facts_config:
+                                    raise RuntimeError("fact replay producer generation changed")
                         except Exception:
                             report.fact_failures += 1
                             log.exception(
@@ -2211,7 +2302,7 @@ def _run_dreaming(
                             else:
                                 persisted = 0
                                 try:
-                                    with core_db.transaction(conn):
+                                    with core_db.transaction(conn), _semantic_boundary("facts"):
                                         persisted = persist_facts(
                                             conn, session_id, facts,
                                             max_items=cfg.dream_max_facts_per_session,
@@ -2283,13 +2374,17 @@ def _run_dreaming(
                             cfg.dream_digest_max_chars, prior_attempts
                         )
                         try:
-                            facts = extract_facts(
-                                conn, session_id, llm, cfg,
-                                since_message_id=facts_cursor,
-                                partial_message_id=facts_partial,
-                                start_offset=facts_offset,
-                                max_chars=attempt_chars,
-                            )
+                            with _semantic_boundary("facts"):
+                                facts = extract_facts(
+                                    conn, session_id, llm, cfg,
+                                    since_message_id=facts_cursor,
+                                    partial_message_id=facts_partial,
+                                    start_offset=facts_offset,
+                                    max_chars=attempt_chars,
+                                )
+                                if facts is not None:
+                                    if facts.publication_version != current_facts_config:
+                                        raise RuntimeError("fact extraction producer generation changed")
                         except Exception:
                             report.fact_failures += 1
                             log.exception(
@@ -2303,7 +2398,7 @@ def _run_dreaming(
                             else:
                                 persisted = 0
                                 try:
-                                    with core_db.transaction(conn):
+                                    with core_db.transaction(conn), _semantic_boundary("facts"):
                                         persisted = persist_facts(
                                             conn, session_id, facts,
                                             max_items=cfg.dream_max_facts_per_session,
@@ -2329,7 +2424,7 @@ def _run_dreaming(
                             facts_state["facts_cursor_prompt_version"]
                             != current_facts_config
                         ):
-                            with core_db.transaction(conn):
+                            with core_db.transaction(conn), _semantic_boundary("facts"):
                                 if not fact_session_authority_is_valid(
                                     conn, session_id
                                 ):
@@ -2551,7 +2646,13 @@ def _run_dreaming(
             phase2.consolidate_profile(
                 conn, cfg, phase1_generation_key=phase1_generation_key
             )
-            phase2.consolidate_insights(conn, cfg)
+        # Markdown files are repairable snapshots, not transactional database
+        # authority. Never publish content which a later SQL/file error could
+        # roll back. Every ordinary dream refreshes both, including a retry
+        # with no new source after a prior sidecar publication failure.
+        _check_deadline()
+        phase2.publish_profile(conn, cfg)
+        phase2.consolidate_insights(conn, cfg)
         profile_count = conn.execute(
             "SELECT COUNT(*) AS c FROM current_profile_entries"
         ).fetchone()["c"]
@@ -2591,7 +2692,6 @@ def _run_dreaming(
             pruned += prune_retracted_edges(conn, cfg)
             pruned += prune_episodes_and_procedures(conn, cfg)
             pruned += prune_bookkeeping(conn, cfg)
-            phase2.consolidate_insights(conn, cfg)  # refresh after decay
             conn.execute("DELETE FROM token_overlap_index")
             _current_edge = live_edge_predicate()
             _canon_rows = conn.execute(
@@ -2611,6 +2711,9 @@ def _run_dreaming(
                     "INSERT OR IGNORE INTO token_overlap_index(token, canonical) VALUES (?, ?)",
                     _index_data,
                 )
+
+        _check_deadline()
+        phase2.consolidate_insights(conn, cfg)  # committed post-decay snapshot
 
         # VACUUM cannot share the atomic BEGIN IMMEDIATE ownership proof used by
         # every semantic/retrieval-state publication. It can also renumber the

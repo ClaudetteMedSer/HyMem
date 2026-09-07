@@ -107,7 +107,7 @@ _MIN_FRAGMENT_CONTENT_CHARS = 96
 # repeated window is context only and never independently owns an item.
 # This identifier is part of the benchmark canary policy so a scored run cannot
 # silently reuse evidence produced under an older splitter.
-SOURCE_RECORD_SPLIT_POLICY_VERSION = "hymem-source-semantic-split-v9"
+SOURCE_RECORD_SPLIT_POLICY_VERSION = "hymem-source-semantic-split-v10"
 # Right-hand canonical-table fragments retain exact original ``content`` and
 # offsets. This separately labelled context carries the table's original
 # header+delimiter bytes and, for an introduced table, its exact heading/colon
@@ -123,6 +123,14 @@ SOURCE_BOUNDARY_CONTEXT_VERSION = (
     "hymem-adjacent-prose-boundary-context-v1"
 )
 _MAX_SOURCE_BOUNDARY_CONTEXT_CHARS = 320
+# Cross-record continuations need the preceding conversational turn, not just
+# same-message prose. Context records never join the owned citation set. Both
+# semantic bytes and encoded overhead are bounded and counted in leaf inputs.
+SOURCE_CONVERSATION_CONTEXT_VERSION = "hymem-claim-context-v1"
+_MAX_CONVERSATION_CONTEXT_RECORDS = 2
+_MAX_CONVERSATION_CONTEXT_CHARS = 640
+_MAX_CONVERSATION_CONTEXT_ENCODED_CHARS = 1400
+_MAX_CONVERSATION_CONTEXT_APPLICABILITY_CHARS = 320
 # A terminal primary-empty result is never authoritative until that exact
 # source unit has received one direct empty-verification call.  Keeping this
 # identity separate from prompt wording lets benchmark artifacts reject the
@@ -217,6 +225,9 @@ class _ExtractionUnit:
     # child so a recursively split continuation never needs to be reclassified
     # as a generic headerless grid.
     trusted_table_boundaries: tuple[int, ...] = ()
+    # Exact, separately labelled preceding source slices for interpretation;
+    # these are deliberately absent from source_records and allowed_ids.
+    context_records: tuple[tuple[int, str], ...] = ()
 
     @property
     def allowed_ids(self) -> frozenset[int] | None:
@@ -631,6 +642,11 @@ def _source_payload(record: tuple[int, str]) -> dict | None:
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
+        return None
+    if any(key in payload for key in (
+        "source_context_only", "context_for_source_message_id",
+        "applies_through_source_content_end",
+    )):
         return None
     payload_message_id = payload.get("source_message_id")
     if (
@@ -1969,9 +1985,190 @@ def _semantic_split_point(
     return min(ranked)[2] if ranked else None
 
 
+def _conversation_context_suffix(content: str, limit: int) -> str | None:
+    """Retain an exact suffix without cutting negation, lists or code blocks."""
+
+    if len(content) <= limit:
+        return content
+    blocks = _markdown_block_analysis(content)
+    candidates = {
+        *(match.end() for match in _PARAGRAPH_BOUNDARY_RE.finditer(content)),
+        *blocks.structural_boundaries,
+        *_sentence_boundary_points(content),
+    }
+    cuts = [
+        cut for cut in candidates
+        if len(content) - limit <= cut < len(content)
+        and not _cut_inside_spans(cut, blocks.protected_spans)
+    ]
+    return content[min(cuts):] if cuts else None
+
+
+def _conversation_context_slice(
+    payload: dict, limit: int,
+) -> tuple[str, dict | None] | None:
+    """Keep a prose suffix or a proven table tail with its exact semantics."""
+
+    content = payload["content"]
+    inherited = payload.get("source_fragment_context")
+    suffix = _conversation_context_suffix(content, limit)
+    if suffix is not None:
+        return suffix, inherited
+    base_start = (
+        0 if payload.get("source_record_version") == "hymem-claim-source-v2"
+        else payload["source_content_start"]
+    )
+    discovery_start = _inherited_table_context_local_end(
+        payload, base_start=base_start, content_length=len(content),
+    )
+    blocks = _markdown_block_analysis(content)
+    for cut in _trusted_table_boundary_points(
+        content, (), local_discovery_start=discovery_start,
+    ):
+        if not (
+            len(content) - limit <= cut < len(content)
+            and (
+                not _cut_inside_spans(cut, blocks.protected_spans)
+                or cut in blocks.contextual_table_boundaries
+            )
+        ):
+            continue
+        table_context = _canonical_table_context_for_cut(
+            content, cut=cut, base_start=base_start,
+            inherited_context=inherited, local_discovery_start=discovery_start,
+        )
+        if table_context is not None:
+            return content[cut:], table_context
+    return None
+
+
+def _preceding_conversation_context(
+    unit: _ExtractionUnit,
+    left_records: tuple[tuple[int, str], ...],
+    right_record: tuple[int, str],
+) -> tuple[tuple[int, str], ...] | None:
+    """Build a bounded adjacent window; None holds an unsafe truncation.
+
+    Stop at session/workspace/distinct-user boundaries. Never skip an unrepresentable nearest
+    record to attach more distant context, and never truncate inside a semantic
+    unit merely to fit it into the context allowance.
+    """
+
+    target = _source_payload(right_record)
+    if target is None:
+        return None
+    scope = (target.get("source_session_id"), target.get("source_workspace_id"))
+    candidates = unit.context_records + left_records
+    remaining = _MAX_CONVERSATION_CONTEXT_CHARS
+    encoded_remaining = _MAX_CONVERSATION_CONTEXT_ENCODED_CHARS
+    chosen: list[tuple[int, str]] = []
+    for message_id, encoded in reversed(candidates):
+        if len(chosen) >= _MAX_CONVERSATION_CONTEXT_RECORDS or remaining == 0:
+            break
+        payload = loads_strict_json(encoded)
+        if (payload.get("source_session_id"), payload.get("source_workspace_id")) != scope:
+            break
+        if (
+            payload.get("source_role") == target.get("source_role") == "user"
+            and payload.get("source_peer_id") is not None
+            and target.get("source_peer_id") is not None
+            and payload["source_peer_id"] != target["source_peer_id"]
+        ):
+            # User-local confirmation cannot adopt another user's statements.
+            # Assistant turns may have their own peer ID and remain eligible.
+            break
+        sliced = _conversation_context_slice(payload, remaining)
+        if sliced is None:
+            # The nearest record cannot be represented faithfully. A more
+            # distant optional record may be omitted once adjacency is kept.
+            if not chosen:
+                return None
+            break
+        content, table_context = sliced
+        end = (
+            len(payload["content"])
+            if payload.get("source_record_version") == "hymem-claim-source-v2"
+            else payload["source_content_end"]
+        )
+        context = {
+            key: payload.get(key) for key in (
+                "source_message_id", "source_role", "source_peer_id",
+                "source_session_id", "source_workspace_id", "source_created_at",
+            )
+        }
+        context.update({
+            "content": content,
+            "source_record_version": SOURCE_CONVERSATION_CONTEXT_VERSION,
+            "source_context_only": True,
+            "source_content_start": end - len(content),
+            "source_content_end": end,
+            "context_for_source_message_id": right_record[0],
+            "applies_through_source_content_end": min(
+                _MAX_CONVERSATION_CONTEXT_APPLICABILITY_CHARS,
+                len(target["content"])
+                if target.get("source_record_version") == "hymem-claim-source-v2"
+                else target["source_content_end"],
+            ),
+        })
+        while True:
+            if table_context is not None:
+                context["source_fragment_context"] = table_context
+            else:
+                context.pop("source_fragment_context", None)
+            encoded_context = json.dumps(context, sort_keys=True, separators=(",", ":"))
+            excess = len(encoded_context) + 1 - encoded_remaining
+            if excess <= 0:
+                break
+            # Header/prelude metadata also consumes the hard encoded allowance.
+            # Shorten only at another proven boundary, never an arbitrary byte.
+            sliced = _conversation_context_slice(payload, max(0, len(content) - excess))
+            if sliced is None or len(sliced[0]) >= len(content):
+                break
+            content, table_context = sliced
+            context["content"] = content
+            context["source_content_start"] = end - len(content)
+        if excess > 0:
+            if not chosen:
+                return None
+            break
+        chosen.append((message_id, encoded_context))
+        remaining -= len(content)
+        encoded_remaining -= len(encoded_context) + 1
+    return tuple(reversed(chosen))
+
+
+def _source_unit(
+    records: tuple[tuple[int, str], ...],
+    *,
+    context_records: tuple[tuple[int, str], ...] = (),
+    trusted_table_boundaries: tuple[int, ...] = (),
+) -> _ExtractionUnit:
+    """Render context and owned records, retaining one-sided applicability."""
+
+    first_payload = _source_payload(records[0])
+    assert first_payload is not None
+    first_start = (
+        0 if first_payload.get("source_record_version") == "hymem-claim-source-v2"
+        else first_payload["source_content_start"]
+    )
+    retained = tuple(
+        record for record in context_records
+        if (context := loads_strict_json(record[1]))["context_for_source_message_id"]
+        == records[0][0]
+        and first_start < context["applies_through_source_content_end"]
+    )
+    return _ExtractionUnit(
+        text="\n".join(encoded for _mid, encoded in retained + records),
+        source_records=records,
+        context_records=retained,
+        trusted_table_boundaries=trusted_table_boundaries,
+    )
+
+
 def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit] | None:
     records = unit.source_records
     table_boundaries: tuple[int, ...] = ()
+    right_context = unit.context_records
     if records is not None:
         if len(records) > 1:
             lengths = [len(encoded) + 1 for _mid, encoded in records]
@@ -1987,6 +2184,11 @@ def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit
                     cut = index
             left_records = records[:cut]
             right_records = records[cut:]
+            right_context = _preceding_conversation_context(
+                unit, left_records, right_records[0],
+            )
+            if right_context is None:
+                return None
         elif len(records) == 1:
             payload = _source_payload(records[0])
             if payload is None:
@@ -2051,17 +2253,17 @@ def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit
         else:
             return None
         return (
-            _ExtractionUnit(
-                text="\n".join(encoded for _mid, encoded in left_records),
-                source_records=left_records,
+            _source_unit(
+                left_records,
+                context_records=unit.context_records,
                 trusted_table_boundaries=(
                     tuple(point for point in table_boundaries if point < cut)
                     if len(records) == 1 else ()
                 ),
             ),
-            _ExtractionUnit(
-                text="\n".join(encoded for _mid, encoded in right_records),
-                source_records=right_records,
+            _source_unit(
+                right_records,
+                context_records=right_context,
                 trusted_table_boundaries=(
                     tuple(
                         point - cut
@@ -2611,6 +2813,16 @@ def extract_chunk(
         return merged, verifier_split_recoverable
 
     def recover(current: _ExtractionUnit, depth: int) -> ChunkResult:
+        # A recovery split can add context metadata to its children. Apply the
+        # same hard input ceiling as initial prepartitioning before any call.
+        if len(current.text) > _MAX_LEAF_INPUT_CHARS:
+            split = _split_unit(current) if depth < _MAX_SPLIT_DEPTH else None
+            if split is None:
+                return _failure("resource_limit", "input:context_leaf_limit_exceeded")
+            left = recover(split[0], depth + 1)
+            if left.failed:
+                return _failed_split_after_left(left)
+            return _merge_results(left, recover(split[1], depth + 1))
         verifier_failed = False
         verifier_split_recoverable = False
         result, _raw = attempt(current)

@@ -67,7 +67,7 @@ this probe exercises no HyMem tier — it extracts from the haystack sessions an
 indexes into its own FTS5 table, which is exactly what migration 026's
 `narrative_facts_fts` will be. Rebuilding + dreaming a store per question would
 cost hundreds of LLM calls and measure nothing extra, so the store is skipped and
-the FTS query path is imported from production (`_FTS_SAFE`, `_fold_diacritics`)
+the FTS query path is imported from production (`_fts_safe_text`, `_fold_diacritics`)
 so the tokenization under test is the real one.
 
 One consequence, stated plainly: the selection rule's last clause ("gold survived
@@ -134,8 +134,8 @@ from longmemeval_adapter import (  # noqa: E402
 
 # The production FTS query path, imported rather than reimplemented: the whole
 # point of the density number is that it holds under the tokenizer the fact tier
-# will actually use (diacritic folding + the ASCII-safe token whitelist).
-from hymem.query.augment import _FTS_SAFE, _fold_diacritics  # noqa: E402
+# will actually use (Latin accent folding + Unicode-safe literal query terms).
+from hymem.query.augment import _fts_safe_text, _fold_diacritics  # noqa: E402
 from hymem.contrib.model_policy import (  # noqa: E402
     DeprecatedModelAliasError,
     require_active_model,
@@ -522,7 +522,7 @@ def search_facts(
     conn: sqlite3.Connection, question: str, *, top_k: int = _FACT_TOP_K
 ) -> list[dict]:
     """BM25 over the fact index using the PRODUCTION query path."""
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(question)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(question)).strip()
     tokens = [t for t in cleaned.split() if len(t) >= 2]
     if not tokens:
         return []

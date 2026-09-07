@@ -356,6 +356,10 @@ class StubLLMClient:
 
         return self.phase1_producer_declaration()
 
+    def memory_producer_declaration(self):
+        """Digest, profile and facts use the same exact fixture router."""
+        return self.phase1_producer_declaration()
+
     def complete(self, request: LLMRequest) -> str:
         if type(self) is StubLLMClient and (
             maintained_stub_llm_integrity is not _STUB_LLM_INTEGRITY_FUNCTION
@@ -378,7 +382,7 @@ class StubLLMClient:
 
 _STUB_LLM_GUARD_NAMES = (
     "complete", "phase1_producer_declaration",
-    "aggregation_producer_declaration", "fixtures", "default",
+    "aggregation_producer_declaration", "memory_producer_declaration", "fixtures", "default",
     "__getattribute__", "__getattr__",
 )
 _STUB_LLM_ORIGINAL_GUARD = tuple(

@@ -335,9 +335,7 @@ def test_each_cap_is_respected_independently(conn):
 
 
 def test_the_predicate_matches_the_digest_anchor_row_for_row(conn, cfg):
-    """CONTROL on the copied predicate: the selector must agree with
-    `_anchor_facts`' EDGE leg exactly. If the digest's clause ever changes,
-    this fails and the copy is re-decided deliberately rather than drifting."""
+    """Exact-source rows share ordering without widening either live gate."""
     from hymem.dreaming.aggregate import _anchor_facts
     from hymem.dreaming.bitemporal import stamp_validity
     from hymem.query.state_anchor import select_anchor_edges
@@ -355,6 +353,9 @@ def test_the_predicate_matches_the_digest_anchor_row_for_row(conn, cfg):
             source_tag="state-anchor-parity",
         )
         stamp_validity(conn)
+        # Equal recency is intentional: fixture insertion must not make the
+        # expectation depend on crossing a wall-clock second.
+        conn.execute("UPDATE knowledge_graph SET last_seen='2024-01-01 00:00:00'")
         _seed_edge(conn, "b", "uses", "redis", pos=2, neg=4)          # margin <= 0
         _seed_edge(conn, "c", "uses", "kafka", pos=3, neg=0, derived=1)
         _seed_edge(conn, "d", "uses", "mysql", pos=3, neg=0,
@@ -365,7 +366,7 @@ def test_the_predicate_matches_the_digest_anchor_row_for_row(conn, cfg):
     # No profile rows seeded here, so the digest block IS the edge leg, in order.
     assert rendered == _anchor_facts(conn, 50)
     assert rendered == ["a uses postgres", "e uses sqlite"], (
-        "the copied predicate drifted: margin<=0 / derived / invalid_at rows leaked "
+        "the live predicate drifted: margin<=0 / derived / invalid_at rows leaked "
         "in, or the evidence-margin ordering changed"
     )
 

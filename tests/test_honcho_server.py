@@ -340,7 +340,7 @@ def test_dream_status_endpoint(client):
     }
     assert body["quarantined_facts"] == 0
     assert body["quarantined_facts_malformed"] == 0
-    assert body["dream_status_schema"] == "hymem-dream-status-v6"
+    assert body["dream_status_schema"] == "hymem-dream-status-v7"
     assert body["phase1_backlog_status"] == "current_producer"
     assert body["pending_chunks_authoritative"] is True
     assert isinstance(body["phase1_generation_key"], str)

@@ -38,6 +38,8 @@ from collections.abc import Mapping
 from pathlib import Path
 
 try:  # package import (tests): benchmarks.locomo_registry
+    from .archive_evidence import (validate_checkpoint_attestation, validate_scoped_indexing,
+                                   validate_scoped_row, validate_scoped_pipeline_usage)
     from . import run_registry as rr
     from .extraction_canary import (
         validate_extraction_canary_config_binding,
@@ -45,6 +47,8 @@ try:  # package import (tests): benchmarks.locomo_registry
     )
     from .strictness import CHECKPOINT_VERSION, STRICT_PROTOCOL_VERSION, content_hash
 except (ImportError, ValueError):  # direct CLI: python benchmarks/locomo_registry.py
+    from archive_evidence import (validate_checkpoint_attestation, validate_scoped_indexing,
+                                  validate_scoped_row, validate_scoped_pipeline_usage)
     import run_registry as rr
     from extraction_canary import (  # type: ignore
         validate_extraction_canary_config_binding,
@@ -368,6 +372,25 @@ def _validate_strict_locomo(data: dict) -> tuple[list[dict], dict, dict]:
     ):
         if config.get(field) is not manifest.get(field):
             raise ValueError(f"strict LoCoMo manifest/config {field} drifted")
+    for field in ("sim", "no_dream", "category_steering", "answerable_clause"):
+        if type(config.get(field)) is not bool:
+            raise ValueError("strict LoCoMo run mode is malformed")
+    if (config["scored_run"] is config["sim"]
+            or config["label_free_answer_path"] is config["category_steering"]
+            or config["exploratory_label_steering"] is not config["category_steering"]):
+        raise ValueError("strict LoCoMo scoring/routing contradicts execution mode")
+    if any(config.get(key) for key in ("sim", "no_dream", "category_steering", "answerable_clause", "sample", "categories", "conversations")) and not config["exploratory_non_comparable"]:
+        raise ValueError("strict LoCoMo exploratory mode is marked comparable")
+    try:
+        from .msc_registry import _validate_model_identity
+    except ImportError:
+        from msc_registry import _validate_model_identity
+    normalized_models = {key: dict(value) if isinstance(value, Mapping) else value for key, value in models.items()}
+    if not config["sim"]:
+        for role in ("reader", "judge", "memory_pipeline"):
+            if isinstance(normalized_models.get(role), dict):
+                normalized_models[role].setdefault("configured", True)
+    _validate_model_identity(normalized_models, scored=config["scored_run"], simulation=config["sim"])
     effective = config.get("effective_hymem_config")
     if not isinstance(effective, dict):
         raise ValueError("strict LoCoMo effective HyMem config is absent")
@@ -453,16 +476,6 @@ def _validate_strict_locomo(data: dict) -> tuple[list[dict], dict, dict]:
     segments = execution.get("segments")
     if not isinstance(counts, dict) or not isinstance(segments, list) or not segments:
         raise ValueError("strict LoCoMo execution evidence is incomplete")
-    checkpoint = execution.get("checkpoint")
-    if (
-        not isinstance(checkpoint, dict)
-        or set(checkpoint) != {"schema", "state_sha256"}
-        or checkpoint.get("schema") != CHECKPOINT_VERSION
-        or re.fullmatch(
-            r"sha256:[0-9a-f]{64}", str(checkpoint.get("state_sha256"))
-        ) is None
-    ):
-        raise ValueError("strict LoCoMo checkpoint digest evidence is malformed")
     expected_counts = {
         "expected": expected_count,
         "attempted": expected_count - missing_count,
@@ -494,6 +507,14 @@ def _validate_strict_locomo(data: dict) -> tuple[list[dict], dict, dict]:
     all_complete = True
     answer_calls = judge_calls = 0
     calls_exact = True
+    scopes = set()
+    successful_scopes = set()
+    receipts_by_scope = defaultdict(list)
+    expected_scopes = {"locomo:" + row["conv_id"] for row in rows if isinstance(row.get("conv_id"), str)}
+    if any(not isinstance(row.get("conv_id"), str) or not row["conv_id"] for row in rows):
+        raise ValueError("strict LoCoMo source conversation is absent")
+    attempted_scopes = {"locomo:" + row["conv_id"] for row in rows
+                        if row.get("benchmark_failure") != "missing_prediction"}
     for segment in segments:
         if not isinstance(segment, dict):
             raise ValueError("strict LoCoMo execution segment is malformed")
@@ -525,10 +546,17 @@ def _validate_strict_locomo(data: dict) -> tuple[list[dict], dict, dict]:
             mode = "pending"
         elif report.get("status") == "failed":
             mode = "failed"
+        elif report.get("status") == "not_run_no_pending":
+            mode = "no_pending_work"
         elif report.get("status") == "skipped_non_comparable":
             mode = report.get("skip_reason")
         else:
             raise ValueError("strict LoCoMo extraction canary is invalid")
+        required_mode = "simulation" if config["sim"] else "no_dream" if config["no_dream"] else "required"
+        if ((mode in {"required", "failed", "pending"} and required_mode != "required")
+                or mode not in {"required", "failed", "pending", "no_pending_work"} and mode != required_mode
+                or mode in {"failed", "pending", "no_pending_work"} and attempted != 0):
+            raise ValueError("strict LoCoMo canary contradicts run mode/work")
         try:
             validate_extraction_canary_report(
                 report, expected_mode=mode,
@@ -550,14 +578,43 @@ def _validate_strict_locomo(data: dict) -> tuple[list[dict], dict, dict]:
         )
         if reader_calls is None or segment_judge_calls is None or status != "complete":
             calls_exact = False
-        else:
+        if reader_calls is not None:
             answer_calls += reader_calls
+        if segment_judge_calls is not None:
             judge_calls += segment_judge_calls
         for key in ("indexing_runs", "indexing_failures"):
             if not isinstance(segment.get(key), list):
                 raise ValueError(f"strict LoCoMo {key} evidence is malformed")
+        local_scopes = set()
+        local_receipts = []
+        for key in ("indexing_runs", "indexing_failures"):
+            for item in segment[key]:
+                if not isinstance(item, dict) or set(item) != {"scope_id", "summary"}:
+                    raise ValueError("strict LoCoMo indexing evidence is malformed")
+                scope = item["scope_id"]
+                if not isinstance(scope, str) or scope not in expected_scopes or scope in local_scopes:
+                    raise ValueError("strict LoCoMo indexing scope is unknown/duplicate")
+                local_scopes.add(scope)
+                scopes.add(scope)
+                validate_scoped_indexing(item["summary"], scope_id=scope, config=config,
+                                        failed=key == "indexing_failures")
+                if key == "indexing_runs":
+                    successful_scopes.add(scope)
+                    receipts_by_scope[scope].append(item["summary"])
+                    local_receipts.append(item["summary"])
+        validate_scoped_pipeline_usage(local_receipts, segment["memory_pipeline_usage"])
+        if len(local_scopes) > attempted:
+            raise ValueError("strict LoCoMo indexing scopes exceed attempted work")
     if segment_attempts != total_attempts:
         raise ValueError("strict LoCoMo segment attempts do not reconcile")
+    if config["scored_run"] and (answer_calls < completed_count or judge_calls < completed_count):
+        raise ValueError("strict LoCoMo model calls are below completed row count")
+    if not attempted_scopes.issubset(scopes):
+        raise ValueError("strict LoCoMo indexing scopes do not cover result ledger")
+    for row in rows:
+        if not row.get("benchmark_failure") and "locomo:" + row["conv_id"] not in successful_scopes:
+            raise ValueError("strict LoCoMo completed row lacks successful indexing")
+        validate_scoped_row(row, scope_id="locomo:" + row["conv_id"], receipts=receipts_by_scope)
     if not all(any(report == candidate for candidate in all_segment_canaries)
                for report in canary_reports):
         raise ValueError("strict LoCoMo row canary is not owned by a segment")
@@ -574,6 +631,7 @@ def _validate_strict_locomo(data: dict) -> tuple[list[dict], dict, dict]:
         raise ValueError("strict LoCoMo strict accuracy does not reconcile")
     if data.get("result_digest") != content_hash(rows):
         raise ValueError("strict LoCoMo result digest is invalid")
+    validate_checkpoint_attestation(data)
     return rows, {
         "answer_calls": answer_calls if calls_exact and all_complete else None,
         "judge_calls": judge_calls if calls_exact and all_complete else None,

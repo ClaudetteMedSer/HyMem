@@ -195,3 +195,115 @@ def persist_procedures(
     if count:
         log.debug("procedures.persisted session_id=%s count=%d", session_id, count)
     return count
+
+
+def procedure_payload_sha256(record: object) -> str:
+    """Bind exact procedure content, independently of manual feedback/clocks."""
+    payload = {key: record[key] for key in ("name", "description")}  # type: ignore[index]
+    for key in ("steps", "triggers", "entities_involved"):
+        value = record[key]  # type: ignore[index]
+        payload[key] = json.loads(value) if isinstance(value, str) else value
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, ensure_ascii=True, allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def publish_digest_procedures(
+    conn: sqlite3.Connection,
+    session_id: str,
+    generation: str,
+    extractions: list[ProceduresExtraction],
+    *,
+    replacing: bool,
+) -> int:
+    """Reconcile the union of a proven complete digest walk atomically.
+
+    A forward tail is additive; a replacement retires omitted owned rows,
+    including an explicitly empty whole walk. Ownership is never inferred
+    from a name or id. Pre-v59, manual and legacy-imported rows are preserved,
+    and edits to owned content detach that row rather than being overwritten.
+    Duplicate names use the last occurrence in source/slice order, matching
+    the historical sequential-upsert policy without losing earlier slices.
+    """
+    from hymem.dreaming.digest import digest_generation_is_recognized
+
+    if not conn.in_transaction:
+        raise RuntimeError("procedure publication requires a transaction")
+    session = conn.execute(
+        "SELECT digest_published_generation FROM sessions WHERE id=?", (session_id,),
+    ).fetchone()
+    if session is None or not digest_generation_is_recognized(generation):
+        raise ValueError("procedure publication has invalid generation/session")
+    published = session["digest_published_generation"]
+    if replacing != (generation != published):
+        raise ValueError("procedure publication has inconsistent replacement mode")
+    selected: dict[str, dict] = {}
+    for extraction in extractions:
+        for item in extraction.items:
+            selected[item["name"].strip().casefold()] = item
+
+    owned: dict[str, list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        "SELECT p.*,o.generation,o.payload_sha256 FROM procedures p "
+        "JOIN procedure_digest_publications o ON o.procedure_id=p.id "
+        "WHERE p.session_id=? ORDER BY p.id", (session_id,),
+    ).fetchall():
+        try:
+            intact = (row["generation"] == published
+                      and row["payload_sha256"] == procedure_payload_sha256(row))
+        except (TypeError, ValueError, KeyError):
+            intact = False
+        if not intact:
+            # Explicit manual content changes are stronger than old inferred
+            # ownership; retaining the row must not allow a later replay to
+            # accidentally regain its retirement authority.
+            conn.execute("DELETE FROM procedure_digest_publications WHERE procedure_id=?",
+                         (row["id"],))
+            continue
+        owned.setdefault(row["name"].strip().casefold(), []).append(row)
+
+    keep: set[str] = set()
+    for name_key, item in selected.items():
+        candidates = owned.get(name_key, [])
+        existing = candidates[0] if candidates else None
+        if existing is not None:
+            procedure_id = existing["id"]
+        else:
+            identity = hashlib.sha256(f"{session_id}\0{name_key}".encode()).hexdigest()
+            base = f"{session_id}@digest_proc_{identity}"
+            procedure_id = base
+            suffix = 0
+            # An imported/manual row may deliberately use the generated id.
+            # A namespace spelling is never permission to overwrite it.
+            while conn.execute("SELECT 1 FROM procedures WHERE id=?", (procedure_id,)).fetchone():
+                suffix += 1
+                procedure_id = f"{base}:{suffix}"
+        payload_hash = procedure_payload_sha256(item)
+        conn.execute(
+            "INSERT INTO procedures(id,session_id,name,description,steps,triggers,entities_involved,status) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "name=excluded.name,description=excluded.description,steps=excluded.steps,"
+            "triggers=excluded.triggers,entities_involved=excluded.entities_involved,status=excluded.status",
+            (procedure_id, session_id, item["name"], item["description"],
+             json.dumps(item["steps"]), json.dumps(item["triggers"]),
+             json.dumps(item["entities_involved"]), "active"),
+        )
+        conn.execute(
+            "INSERT INTO procedure_digest_publications(procedure_id,generation,payload_sha256) "
+            "VALUES (?,?,?) ON CONFLICT(procedure_id) DO UPDATE SET "
+            "generation=excluded.generation,payload_sha256=excluded.payload_sha256,retired=0",
+            (procedure_id, generation, payload_hash),
+        )
+        keep.add(procedure_id)
+    for name_key, rows in owned.items():
+        for row in rows:
+            if row["id"] not in keep and (replacing or name_key in selected):
+                # Keep negative feedback for a later reappearance. Existing
+                # retention policy may eventually remove old stale rows.
+                conn.execute("UPDATE procedures SET status='stale' WHERE id=?", (row["id"],))
+                conn.execute(
+                    "UPDATE procedure_digest_publications SET generation=?,retired=1 WHERE procedure_id=?",
+                    (generation, row["id"]),
+                )
+    return len(selected)

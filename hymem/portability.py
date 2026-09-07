@@ -52,6 +52,7 @@ from hymem.dreaming.digest import (
     digest_retry_state_is_valid,
 )
 from hymem.dreaming import canonicalize
+from hymem.dreaming.procedures import procedure_payload_sha256
 from hymem.dreaming import evidence as evidence_ledger
 from hymem.dreaming.aggregation_provenance import (
     BoundSourceOccurrence,
@@ -149,7 +150,9 @@ log = logging.getLogger("hymem.portability")
 # kinds/columns.
 # v15 keeps aggregation material local/rebuildable, but import invalidation now
 # includes the v55 structural-publication singleton and typed proof cache.
-EXPORT_VERSION = 15
+# v16 carries explicit payload-bound digest procedure ownership. Older rows
+# without this declaration remain unknown-origin, never inferred from an id.
+EXPORT_VERSION = 16
 _MAX_SQLITE_ROWID = 2**63 - 1
 _ROWID_RESERVE_HEADROOM = 1_000_000
 
@@ -473,7 +476,11 @@ _V14_EXPORT_SPEC.extend([
 ])
 
 
-_EXPORT_SPEC = _V14_EXPORT_SPEC
+_V16_EXPORT_SPEC = [*_V14_EXPORT_SPEC, (
+    "procedure_digest_publication", "procedure_digest_publications",
+    ["procedure_id", "generation", "payload_sha256", "retired"],
+)]
+_EXPORT_SPEC = _V16_EXPORT_SPEC
 _V6_TABLE_BY_KIND = {kind: table for kind, table, _ in _V6_EXPORT_SPEC}
 _V6_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V6_EXPORT_SPEC}
 _V7_TABLE_BY_KIND = {kind: table for kind, table, _ in _V7_EXPORT_SPEC}
@@ -492,13 +499,16 @@ _V13_TABLE_BY_KIND = {kind: table for kind, table, _ in _V13_EXPORT_SPEC}
 _V13_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V13_EXPORT_SPEC}
 _V14_TABLE_BY_KIND = {kind: table for kind, table, _ in _V14_EXPORT_SPEC}
 _V14_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V14_EXPORT_SPEC}
-_TABLE_BY_KIND = _V14_TABLE_BY_KIND
-_COLS_BY_KIND = _V14_COLS_BY_KIND
+_V16_TABLE_BY_KIND = {kind: table for kind, table, _ in _V16_EXPORT_SPEC}
+_V16_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V16_EXPORT_SPEC}
+_TABLE_BY_KIND = _V16_TABLE_BY_KIND
+_COLS_BY_KIND = _V16_COLS_BY_KIND
 # Sessions must import before rows that FK-reference them.
 _IMPORT_ORDER = [
     "session", "peer", "session_peer", "chunk",
     "message_retention_coverage", "user_profile_fact",
     "episode", "episode_source_occurrence", "procedure", "edge", "profile_entry",
+    "procedure_digest_publication",
     "rule",
     "chunk_extraction_terminal_loss",
     "coverage_integrity_failure",
@@ -630,6 +640,19 @@ def _collect_current_records(conn) -> dict[str, list[dict]]:
     for kind, table, cols in _EXPORT_SPEC:
         if kind == "chunk_source_manifest":
             where = " WHERE source_manifest_version IS NOT NULL"
+        elif kind == "episode":
+            where = (
+                " WHERE digest_generation IS NULL OR digest_generation=("
+                "SELECT digest_published_generation FROM sessions "
+                "WHERE sessions.id=episodes.session_id)"
+            )
+        elif kind == "episode_source_occurrence":
+            where = (
+                " WHERE EXISTS (SELECT 1 FROM episodes e JOIN sessions s "
+                "ON s.id=e.session_id WHERE e.id=episode_source_occurrences.episode_id "
+                "AND (e.digest_generation IS NULL OR "
+                "e.digest_generation=s.digest_published_generation))"
+            )
         elif kind == "phase1_generation":
             # Process-instance nonces are useful only to make one live process
             # idempotent. Exporting them as reusable declarations would turn an
@@ -733,6 +756,33 @@ def _collect_current_records(conn) -> dict[str, list[dict]]:
                 f"SELECT {', '.join(cols)} FROM {table}{where} ORDER BY rowid"
             ).fetchall()
         grouped[kind] = [{column: row[column] for column in cols} for row in rows]
+
+    procedures_by_id = {row["id"]: row for row in grouped.get("procedure", [])}
+    # An exact-content manual edit ends digest ownership. Export the changed
+    # procedure as unknown-origin, just as the local publisher preserves it.
+    grouped["procedure_digest_publication"] = [
+        row for row in grouped.get("procedure_digest_publication", [])
+        if row["procedure_id"] in procedures_by_id
+        and row["payload_sha256"] == procedure_payload_sha256(procedures_by_id[row["procedure_id"]])
+    ]
+
+    # Private digest staging is intentionally not portable. Emit only the
+    # completed publication and rewind any unfinished input cursor so restore
+    # replays exact retained source instead of skipping unpublished slices.
+    for record in grouped.get("session", []):
+        staged = conn.execute(
+            "SELECT 1 FROM digest_staging WHERE session_id=? LIMIT 1",
+            (record["id"],),
+        ).fetchone()
+        if (staged or record.get("digest_cursor_partial_message_id") is not None
+                or int(record.get("digest_cursor_offset") or 0)
+                or record.get("digest_cursor_prompt_version") != record.get("digest_published_generation")):
+            record.update(
+                digest_cursor_message_id=None, digest_cursor_partial_message_id=None,
+                digest_cursor_offset=0, digest_cursor_prompt_version=None,
+                digest_retry_count=0, digest_retry_config_version=None,
+                digest_quarantined=0,
+            )
 
     portable_generation_keys = {
         str(record["generation_key"])
@@ -2190,6 +2240,29 @@ def _validate_v12_coverage_integrity_records(
         seen.add(str(session_id))
 
 
+def _validate_v16_procedure_ownership(grouped: dict[str, list[dict]]) -> None:
+    procedures = {row["id"]: row for row in grouped.get("procedure", [])}
+    sessions = {row["id"]: row for row in grouped.get("session", [])}
+    seen = set()
+    for record in grouped.get("procedure_digest_publication", []):
+        procedure_id = record["procedure_id"]
+        if not _wire_text(procedure_id, nonempty=True) or procedure_id in seen:
+            raise ValueError("portable procedure ownership has invalid/duplicate identity")
+        seen.add(procedure_id)
+        procedure = procedures.get(procedure_id)
+        session = sessions.get(procedure["session_id"]) if procedure else None
+        if (procedure is None or session is None
+                or not digest_generation_is_recognized(record["generation"])
+                or record["generation"] != session["digest_published_generation"]
+                or not isinstance(record["payload_sha256"], str)
+                or not _RAW_SHA256_RE.fullmatch(record["payload_sha256"])
+                or record["payload_sha256"] != procedure_payload_sha256(procedure)
+                or not _wire_int(record["retired"], minimum=0)
+                or record["retired"] not in (0, 1)
+                or (record["retired"] == 1 and procedure["status"] != "stale")):
+            raise ValueError("portable procedure ownership does not match published payload/session")
+
+
 def _validate_v6_record_scalars(grouped: dict[str, list[dict]]) -> None:
     """Validate v6 values before the first destination write.
 
@@ -3423,6 +3496,8 @@ def _v6_existing_row_is_identical(conn, kind: str, record: dict) -> bool:
         return True
     elif kind in {"chunk", "procedure"}:
         key_sql, key_params = "id = ?", (record["id"],)
+    elif kind == "procedure_digest_publication":
+        key_sql, key_params = "procedure_id = ?", (record["procedure_id"],)
     elif kind == "episode_source_occurrence":
         key_sql = "episode_id = ? AND ordinal = ?"
         key_params = (record["episode_id"], record["ordinal"])
@@ -3492,6 +3567,16 @@ def _preflight_v6_target_collisions(
     conn, grouped: dict[str, list[dict]], *, merge_v7_edges: bool = False,
     merge_v14_authority: bool = False,
 ) -> None:
+    for record in grouped.get("procedure_digest_publication", []):
+        existing = conn.execute("SELECT 1 FROM procedures WHERE id=?",
+                                (record["procedure_id"],)).fetchone()
+        ownership = conn.execute(
+            "SELECT * FROM procedure_digest_publications WHERE procedure_id=?",
+            (record["procedure_id"],),
+        ).fetchone()
+        if existing is not None and ownership is None:
+            raise ValueError("portable procedure ownership cannot rebind unknown/manual target")
+        _v6_existing_row_is_identical(conn, "procedure_digest_publication", record)
     for kind in (
         "session", "peer", "session_peer", "chunk",
         "message_retention_coverage", "episode",
@@ -5171,6 +5256,19 @@ def _redact_portable_records(
         if isinstance(record.get("details"), str):
             record["details"] = redact_maybe_json_text(record["details"])
     _rewrite_v7_lifecycle_keys(grouped, manual_signal_keys)
+    procedures_by_id = {row["id"]: row for row in grouped.get("procedure", [])}
+    sessions_by_id = {row["id"]: row for row in grouped.get("session", [])}
+    # If privacy normalization revoked a sensitive/unsafe control marker,
+    # retain its procedure as unknown-origin instead of exporting that marker
+    # through this secondary ownership surface.
+    grouped["procedure_digest_publication"] = [
+        row for row in grouped.get("procedure_digest_publication", [])
+        if row["generation"] == sessions_by_id[
+            procedures_by_id[row["procedure_id"]]["session_id"]
+        ]["digest_published_generation"]
+    ]
+    for record in grouped.get("procedure_digest_publication", []):
+        record["payload_sha256"] = procedure_payload_sha256(procedures_by_id[record["procedure_id"]])
 
 
 def _preflight_v6_export(conn) -> None:
@@ -5288,6 +5386,7 @@ def _preflight_v7_export(conn) -> dict[str, list[dict]]:
     # its evidence hashes, so reject it before emitting bytes.
     _preflight_v7_target_aliases(conn, grouped)
     _validate_v6_record_scalars(grouped)
+    _validate_v16_procedure_ownership(grouped)
     _validate_v13_phase1_records(grouped)
     from hymem.dreaming.phase1_auxiliary import (
         validate_phase1_auxiliary_registry,
@@ -7554,6 +7653,7 @@ def export_jsonl(conn, path: str | Path) -> dict[str, int]:
         # makes export -> import -> re-export byte stable while preserving the
         # exact typed evidence behind every portable manifest.
         _redact_portable_records(grouped, redact_values=False)
+        _validate_v16_procedure_ownership(grouped)
         _validate_v7_records(grouped)
         _validate_v13_phase1_records(grouped)
         _validate_v14_auxiliary_records(grouped)
@@ -7725,7 +7825,8 @@ def import_jsonl(
                     if not _wire_int(obj.get("schema_version"), minimum=1):
                         raise ValueError("portable header has invalid schema version")
             elif kind in (
-                _V14_TABLE_BY_KIND if (meta_version or 0) >= 14
+                _V16_TABLE_BY_KIND if (meta_version or 0) >= 16
+                else _V14_TABLE_BY_KIND if (meta_version or 0) >= 14
                 else _V13_TABLE_BY_KIND if (meta_version or 0) >= 13
                 else _V12_TABLE_BY_KIND if (meta_version or 0) >= 12
                 else _V11_TABLE_BY_KIND if (meta_version or 0) >= 11
@@ -7750,7 +7851,8 @@ def import_jsonl(
         raise ValueError("portable export is missing its header")
     if meta_version >= 6:
         version_tables = (
-            _V14_TABLE_BY_KIND if meta_version >= 14
+            _V16_TABLE_BY_KIND if meta_version >= 16
+            else _V14_TABLE_BY_KIND if meta_version >= 14
             else _V13_TABLE_BY_KIND if meta_version >= 13
             else _V12_TABLE_BY_KIND if meta_version >= 12
             else _V11_TABLE_BY_KIND if meta_version >= 11
@@ -7761,7 +7863,8 @@ def import_jsonl(
             else _V6_TABLE_BY_KIND
         )
         version_columns = (
-            _V14_COLS_BY_KIND if meta_version >= 14
+            _V16_COLS_BY_KIND if meta_version >= 16
+            else _V14_COLS_BY_KIND if meta_version >= 14
             else _V13_COLS_BY_KIND if meta_version >= 13
             else _V12_COLS_BY_KIND if meta_version >= 12
             else _V11_COLS_BY_KIND if meta_version >= 11
@@ -7818,6 +7921,7 @@ def import_jsonl(
             for record in grouped.get("edge_evidence_signal", []):
                 record["signal_key"] = _portable_signal_key(record)
         _validate_v6_record_scalars(grouped)
+        _validate_v16_procedure_ownership(grouped)
         # Reject poisoned source ids before validators traverse or index exact
         # coverage.  Besides preserving AUTOINCREMENT headroom, this makes the
         # cheap bounded scalar check precede any attacker-amplifiable work.
@@ -7868,6 +7972,7 @@ def import_jsonl(
         # observing raw portable secrets. Pure in-memory structural checks,
         # such as the rowid-domain validation above, are safe to run first.
         _redact_portable_records(grouped)
+        _validate_v16_procedure_ownership(grouped)
         if meta_version >= 7:
             _validate_v7_records(grouped)
         if meta_version >= 13:

@@ -70,6 +70,7 @@ _PROFILE_CONFIG_PATTERN = (
     rf"{re.escape(PROFILE_STREAM_VERSION)}\|"
     rf"prompt={re.escape(PROFILE_PROMPT_VERSION)}\|"
     r"chars=[1-9]\d*\|items=(?:0|[1-9]\d*)\|redact=[01]"
+    r"(?:\|semantic=sha256:[0-9a-f]{64})?"
 )
 _PROFILE_GENERATION_RE = re.compile(
     _PROFILE_CONFIG_PATTERN + r"\|walk=[0-9a-f]{32}"
@@ -218,14 +219,20 @@ _UNKNOWN_PROFILE_VALID_AT = "0001-01-01T00:00:00.000000+00:00"
 
 
 def profile_config_version(
-    *, max_chars: int, max_items: int, redact_values: bool = True
+    *, max_chars: int, max_items: int, redact_values: bool = True,
+    client: object | None = None,
 ) -> str:
-    """Stable configuration prefix for a resumable profile walk."""
+    """Stable configuration/producer prefix for a resumable profile walk.
+
+    ``client=None`` retains the historical configuration-only fixture/import
+    shape. It cannot match a current client-bound publication.
+    """
+    from hymem.dreaming.semantic_generation import semantic_generation_suffix
     return (
         f"{PROFILE_STREAM_VERSION}|prompt={PROFILE_PROMPT_VERSION}|"
         f"chars={int(max_chars)}|items={int(max_items)}|"
         f"redact={int(bool(redact_values))}"
-    )
+    ) + semantic_generation_suffix("profile", client)
 
 
 def profile_generation_matches_config(generation: object, config: str) -> bool:
@@ -1184,12 +1191,30 @@ def publish_profile_generation(
     )
     if previous_after != session_after:
         raise RuntimeError("profile staging tail does not match its cursor")
+    # Repeated evidence may occur in one response or in overlapping context
+    # across slices. Fold only this completed generation's equal assertions
+    # before replacing old confidence, so response/slice order cannot select
+    # a confidence and the old producer's confidence cannot leak into the fold.
+    source_items: dict[tuple[str, str, int, str], dict] = {}
+    for item in items:
+        source_key = (
+            item["slot"], item.get("slot_key") or "", item["source_message_id"],
+            " ".join(item["value"].casefold().split()),
+        )
+        prior_item = source_items.get(source_key)
+        if prior_item is None:
+            source_items[source_key] = dict(item)
+        else:
+            prior_item["confidence"] = max(prior_item["confidence"], item["confidence"])
+            prior_item["value"] = min(prior_item["value"], item["value"])
+    items = [source_items[key] for key in sorted(source_items)]
     # Staging was already redacted. Running the redactor again is unnecessary
     # and could make externally supplied redaction functions non-idempotent.
     inserted = persist_user_profile(
         conn,
         ProfileExtraction(items=items),
         redact_values=False,
+        _authoritative_source_replay=True,
     )
     conn.execute(
         "DELETE FROM profile_staging WHERE session_id = ? AND generation = ?",
@@ -1405,6 +1430,7 @@ def persist_user_profile(
     extraction: ProfileExtraction,
     *,
     redact_values: bool = True,
+    _authoritative_source_replay: bool = False,
 ) -> int:
     """Persist validated items with bi-temporal supersession. Caller wraps in
     core_db.transaction().
@@ -1484,8 +1510,9 @@ def persist_user_profile(
         ]
         if exact:
             conn.execute(
-                "UPDATE user_profile SET confidence = MAX(confidence, ?) WHERE id = ?",
-                (conf, exact[0]["id"]),
+                "UPDATE user_profile SET confidence = CASE WHEN ? THEN ? "
+                "ELSE MAX(confidence, ?) END WHERE id = ?",
+                (int(_authoritative_source_replay), conf, conf, exact[0]["id"]),
             )
             reconcile_profile_intervals(
                 conn, slot, key, fallback_now=fallback_now
@@ -1500,14 +1527,20 @@ def persist_user_profile(
             # stores merged in reverse order still converge.
             normalized_value = " ".join(value.casefold().split())
             prior_values = [" ".join(r["value"].casefold().split()) for r in prior_rows]
-            if normalized_value >= min(prior_values):
+            # A completed, validated local generation is a newer extraction
+            # of this exact source, not an unordered portable merge. Its
+            # interpretation must replace the old producer's assertion even
+            # when the new text happens to sort later alphabetically.
+            if not _authoritative_source_replay and normalized_value >= min(prior_values):
                 continue
             keeper = min(prior_rows, key=lambda row: row["id"])
             conn.execute(
                 "UPDATE user_profile SET value = ?, "
-                "confidence = MAX(confidence, ?), evidence_message_id = ? "
+                "confidence = CASE WHEN ? THEN ? ELSE MAX(confidence, ?) END, "
+                "evidence_message_id = ? "
                 "WHERE id = ?",
-                (value, conf, live_mid, keeper["id"]),
+                (value, int(_authoritative_source_replay), conf, conf,
+                 live_mid, keeper["id"]),
             )
             conn.execute(
                 "DELETE FROM user_profile WHERE slot = ? AND slot_key IS ? "

@@ -12,6 +12,7 @@ import pytest
 
 from benchmarks import locomo_adapter as locomo
 from benchmarks import locomo_registry
+from tests.archive_evidence_fixtures import skipped_indexing
 from benchmarks.strictness import (
     BenchmarkIntegrityError,
     content_hash,
@@ -73,11 +74,7 @@ def _runtime(conv: dict) -> dict:
     }
     return {
         "scope_id": f"locomo:{conv['id']}",
-        "indexing": {
-            "scope_id": f"locomo:{conv['id']}",
-            "complete": False, "healthy": False, "comparable": False,
-            "skip_reason": "simulation",
-        },
+        "indexing": skipped_indexing(f"locomo:{conv['id']}"),
         "memory_pipeline_usage": zero,
         "embedding_usage": embedding_usage_snapshot(None, configured=False),
     }
@@ -454,6 +451,43 @@ def test_exception_after_failed_callback_does_not_record_id_twice(
     state = json.loads(checkpoint.read_text())
     assert state["entries"]["q1"]["attempts"] == 2
     assert state["counts"]["total_attempts"] == 2
+    archives = sorted((tmp_path / "results").glob("locomo-*strict-*.json"))
+    assert len(archives) == 2
+    for archive in archives:
+        artifact = json.loads(archive.read_text())
+        locomo_registry._locomo_row(artifact, archive)
+        for segment in artifact["execution"]["segments"]:
+            assert segment["indexing_failures"] == []
+            assert [item["scope_id"] for item in segment["indexing_runs"]] == ["locomo:conv-one"]
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_partial_success_then_conversation_failure_preserves_source_indexing(
+    monkeypatch, tmp_path, workers,
+):
+    conv = _conversation("conv-one", "q1", "q2", "q3")
+    checkpoint = tmp_path / "partial-failure.checkpoint.json"
+    monkeypatch.setattr(locomo, "load_locomo_data", lambda *_a, **_k: [conv])
+
+    def partially_succeeds(conversation, _args, _answer, _judge, **kwargs):
+        kwargs["on_checkpoint"](_row(conversation, conversation["qa"][0]), _runtime(conversation))
+        raise RuntimeError("private provider diagnostic after indexing")
+
+    monkeypatch.setattr(locomo, "evaluate_conversation", partially_succeeds)
+    monkeypatch.setattr(sys, "argv", _argv(tmp_path, "--checkpoint", checkpoint, "--workers", str(workers)))
+    locomo.main()
+    archive = next((tmp_path / "results").glob("locomo-*strict-*.json"))
+    artifact = json.loads(archive.read_text())
+    locomo_registry._locomo_row(artifact, archive)
+    rows = artifact["per_question"]
+    assert rows[0]["correct"] is True
+    assert [row["benchmark_failure"] for row in rows[1:]] == ["conversation_failure:RuntimeError"] * 2
+    assert artifact["execution"]["counts"]["completed"] == 1
+    assert artifact["execution"]["counts"]["failed"] == 2
+    segment = artifact["execution"]["segments"][0]
+    assert segment["indexing_failures"] == []
+    assert [item["scope_id"] for item in segment["indexing_runs"]] == ["locomo:conv-one"]
+    assert "private provider diagnostic" not in json.dumps(artifact)
 
 
 def test_duplicate_callback_aborts_without_archive(monkeypatch, tmp_path):
@@ -686,7 +720,7 @@ def test_provider_capable_locomo_abort_resume_retains_reader_and_judge_spend(
         judge.spend()
         row = _row(conversation, question)
         runtime = _runtime(conversation)
-        runtime["indexing"] = None
+        runtime["indexing"] = skipped_indexing(f"locomo:{conversation['id']}", reason="no_dream")
         kwargs["on_checkpoint"](row, runtime)
         return [row]
 

@@ -854,6 +854,7 @@ def locomo_code_hash(
     *,
     adapter_path: Path | None = None,
     strictness_path: Path | None = None,
+    archive_evidence_path: Path | None = None,
     msc_adapter_path: Path | None = None,
     lme_adapter_path: Path | None = None,
     lme_protocol_path: Path | None = None,
@@ -937,6 +938,16 @@ def locomo_code_hash(
     dependency_slices.append(PythonSourceSlice(
         strictness, tuple(strictness_symbols)
     ))
+    archive_symbols: set[str] = set()
+    for source_slice in dependency_slices:
+        archive_symbols.update(python_slice_imported_symbols(
+            source_slice, module_names=("benchmarks.archive_evidence", "archive_evidence"),
+        ))
+    if archive_symbols:
+        dependency_slices.append(PythonSourceSlice(
+            Path(archive_evidence_path or benchmark_dir / "archive_evidence.py"),
+            tuple(archive_symbols),
+        ))
     dependency_sources: list[Path | PythonSourceSlice] = [
         adapter, *dependency_slices,
     ]
@@ -2370,9 +2381,14 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
                  "failure_reason": f"conversation_failure:{bounded_exception_type(exc)}"}
             )
             with runtime_lock:
-                indexing_failures[scope] = sanitize_for_artifact(
-                    summary, _preserve_evidence_text=False
-                )
+                # A callback may have already observed successful (or
+                # explicitly skipped) indexing before a reader/evaluator
+                # subsequently failed. Preserve that one source outcome;
+                # failures after indexing belong to the affected QA rows.
+                if scope not in indexing_by_scope:
+                    indexing_failures[scope] = sanitize_for_artifact(
+                        summary, _preserve_evidence_text=False
+                    )
             remaining = set(ledger.pending_ids)
             for question in conv["qa"]:
                 qid = question["question_id"]

@@ -9,7 +9,8 @@ from pathlib import Path
 
 from hymem.config import HyMemConfig
 from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
-from hymem.core import markdown_io
+from hymem.core import db as core_db, markdown_io
+from hymem.deadline import check_current_deadline
 
 log = logging.getLogger("hymem.dreaming.phase2")
 
@@ -32,12 +33,21 @@ def consolidate_profile(
     surfaced as a separate entry rather than silently overwriting.
 
     Runner calls are generation-filtered so a newly selected producer cannot
-    consume an older producer's fresh marker. Existing ``profile_entries`` are
-    intentionally not rewritten here: those denormalized Phase-2 projections
-    predate source linkage and require their own producer-aware provenance and
-    replay migration rather than an incomplete Phase-1 cleanup.
+    consume an older producer's fresh marker. In a caller-owned transaction
+    this only changes the database: call ``publish_profile`` after commit, or
+    let the next ordinary dream repair the sidecar. Standalone calls own and
+    commit their database transaction before publishing USER.md. A file error
+    therefore never rolls back already-published database authority.
     """
     validate_profile_materialization_policy()
+    if not conn.in_transaction:
+        with core_db.transaction(conn):
+            consolidate_profile(
+                conn, cfg, phase1_generation_key=phase1_generation_key,
+                allow_legacy_unscoped=allow_legacy_unscoped,
+            )
+        publish_profile(conn, cfg)
+        return
     if phase1_generation_key is None and not allow_legacy_unscoped:
         # A v53 neutral connection can authorize several exact historical
         # producers.  With no selected generation there is no safe way to pick
@@ -68,7 +78,6 @@ def consolidate_profile(
             (PROFILE_MATERIALIZATION_POLICY_KEY, phase1_generation_key),
         ).fetchall()
     if not rows:
-        _rewrite_profile_md(conn, cfg)
         return
 
     kind_to_profile = {
@@ -196,16 +205,14 @@ def consolidate_profile(
     # after stamping its marker consolidated made the signal impossible to
     # replay; retain the ledger and apply the cap in `_rewrite_profile_md`.
 
-    _rewrite_profile_md(conn, cfg)
-
-
 # Bind completed marker decisions to a pinned, runtime-independent executable
-# policy.  A deliberate semantic edit must mint a new key and retain older
-# decisions as history; an accidental edit fails closed instead of silently
-# treating old marker materializations as current.
-PROFILE_MATERIALIZATION_POLICY_KEY = "marker-profile-materialization-v4"
+# policy. A deliberate semantic edit must mint a new key. Existing decisions
+# remain until their exact retained markers are replayed, then the per-marker
+# decision row is replaced (this is not an append-only history). An accidental
+# edit fails closed instead of treating old materializations as current.
+PROFILE_MATERIALIZATION_POLICY_KEY = "marker-profile-materialization-v5"
 PROFILE_MATERIALIZATION_POLICY_SHA256 = (
-    "sha256:e9ced99351fb9a4aa08634d551712877769eebfec740ac302de40eb6134a36ac"
+    "sha256:c0a7a7ffe48bc95975857e1d27f5a477602bbc6695ecdbe56ca4d931069f3fb2"
 )
 
 
@@ -237,7 +244,8 @@ def validate_profile_materialization_policy() -> None:
 
 
 def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
-    """Refresh MEMORY.md's "Project Insights" section from the current graph."""
+    """Publish MEMORY.md insights from committed graph state, outside a TX."""
+    _assert_sidecar_publication_allowed(conn)
     insights: list[str] = []
 
     # Hubs: objects depended-on by 2+ subjects with non-trivial confidence.
@@ -309,17 +317,33 @@ def consolidate_insights(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
         "project_insights",
         body,
         header="## Project Insights (auto)",
+        before_replace=lambda: _assert_sidecar_publication_allowed(conn),
     )
 
 
 def _rewrite_profile_md(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
+    _assert_sidecar_publication_allowed(conn)
     body = current_profile_body(conn, cfg)
     markdown_io.write_section(
         cfg.user_md_path,
         "behavioral_profile",
         body,
         header="## Behavioral Profile (auto, do not edit manually)",
+        before_replace=lambda: _assert_sidecar_publication_allowed(conn),
     )
+
+
+def _assert_sidecar_publication_allowed(conn: sqlite3.Connection) -> None:
+    """Cooperative preflight, not an atomic SQLite/filesystem commit fence."""
+    if conn.in_transaction:
+        raise RuntimeError("sidecar publication requires committed state outside a transaction")
+    check_current_deadline()
+    core_db._assert_transaction_lease_owned(conn)
+
+
+def publish_profile(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
+    """Repair USER.md from committed authority, preserving manual sections."""
+    _rewrite_profile_md(conn, cfg)
 
 
 def current_profile_body(conn: sqlite3.Connection, cfg: HyMemConfig) -> str:

@@ -520,7 +520,7 @@ def test_lme_durable_status_fails_on_only_current_fact_quarantine(tmp_path: Path
             "fact-quarantine", None, None, 0
         )
         retry_identity = facts_retry_policy_version(
-            cfg, replay_slice_key=retry_unit
+            cfg, replay_slice_key=retry_unit, client=hy._llm
         )
         hy.conn.execute(
             "UPDATE sessions SET facts_retry_count=?,"
@@ -550,7 +550,7 @@ def test_lme_durable_status_fails_on_only_current_fact_quarantine(tmp_path: Path
             cfg, dream_digest_max_chars=cfg.dream_digest_max_chars + 1
         )
         stale_identity = facts_retry_policy_version(
-            stale_cfg, replay_slice_key=retry_unit
+            stale_cfg, replay_slice_key=retry_unit, client=hy._llm
         )
         hy.conn.execute(
             "UPDATE sessions SET facts_retry_config_version=? WHERE id=?",
@@ -1673,9 +1673,10 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
         def open(self):
             assert not self.private_state
             self.pipeline_llm = ZeroMeter()
-            self.last_indexing_summary = {
-                "cycles": 1, "converged": True, "pending_total": 0,
-            }
+            from tests.archive_evidence_fixtures import healthy_convergence
+            self.last_indexing_summary = healthy_convergence({
+                "indexing_max_cycles": 100, "indexing_timeout_s": 3600.0,
+            })
             open_paths.append(self.db_path)
 
         def close(self):
@@ -1868,6 +1869,16 @@ def test_beam_main_isolated_lifecycle_archive_and_terminal_resume_no_clients(
     )
     assert "synthetic crash after durable callback" not in json.dumps(saved)
     first_segment = saved["execution"]["segments"][0]
+    from benchmarks.archive_evidence import validate_convergence_summary
+    for segment in saved["execution"]["segments"]:
+        for receipt in segment["indexing_runs"]:
+            assert receipt["scale"] == "100K"
+            assert receipt["conversation_id"] in {"conversation-a", "conversation-b"}
+            assert validate_convergence_summary({key: value for key, value in receipt.items()
+                                                if key not in {"scale", "conversation_id"}}, config=saved["config"])
+        if segment.get("latest_indexing") is not None:
+            assert segment["latest_indexing"]["scale"] == "100K"
+            assert segment["latest_indexing"]["conversation_id"] in {"conversation-a", "conversation-b"}
     assert first_segment["extraction_canary"]["status"] == "passed"
     assert first_segment["extraction_canary"]["usage_accounting"] == (
         beam.extraction_canary_policy()["usage_accounting"]

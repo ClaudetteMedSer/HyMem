@@ -249,7 +249,7 @@ measures recall with the feature blind to the label.)
    > ```
    > Current strict evidence requires the coherent
    > `hymem-dream-status-v5` + `hymem-benchmark-indexing-status-v3`
-   > snapshot; LME serializes it through `hymem-lme-indexing-summary-v4`.
+   > snapshot; LME serializes it through `hymem-lme-indexing-summary-v5`.
    > Prefer repeated bounded cycles over a huge one-shot chunk budget, which no
    > longer predicts provider cost by itself.
    > You only need ~60–100 probe items, so a **bounded ~30–40-question subset**

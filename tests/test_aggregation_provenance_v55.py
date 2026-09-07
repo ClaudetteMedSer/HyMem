@@ -1215,7 +1215,7 @@ def test_duplicate_typed_input_and_source_are_rejected_by_storage(cfg):
         ).fetchone()
         with pytest.raises(sqlite3.IntegrityError):
             hy.conn.execute(
-                "INSERT INTO aggregation_node_input_sources(" 
+                "INSERT INTO aggregation_node_input_sources("
                 "node_id,input_ordinal,source_ordinal,source_message_id,"
                 "source_session_id,source_role,source_peer_id,source_workspace_id,"
                 "source_created_at,source_coverage_chunk_id,source_coverage_version,"
@@ -1779,6 +1779,9 @@ def test_forged_typed_wire_rolls_back_without_withdrawing_publication(cfg, tmp_p
 
 
 def test_v14_import_conservatively_invalidates_local_publication(cfg, tmp_path):
+    import hashlib
+    from hymem import portability
+
     source = HyMem(replace(cfg, root=tmp_path / "v14-source"))
     try:
         source.open_session("v14-new")
@@ -1787,9 +1790,28 @@ def test_v14_import_conservatively_invalidates_local_publication(cfg, tmp_path):
         source.export(wire)
     finally:
         source.close()
-    _rewrite_portable_wire(
-        wire,
-        lambda body: body[0].update({"version": 14, "schema_version": 54}),
+    # Build a genuine v14 fixture, not a relabelled current export: newer
+    # record kinds, columns and footer count keys were never part of v14.
+    objects = [json.loads(line) for line in wire.read_text(encoding="utf-8").splitlines()]
+    body = [{**objects[0], "version": 14, "schema_version": 54}]
+    for item in objects[1:-1]:
+        kind = item["type"]
+        if kind in portability._V14_COLS_BY_KIND:
+            body.append({"type": kind, "record": {
+                column: item["record"][column]
+                for column in portability._V14_COLS_BY_KIND[kind]
+            }})
+    encoded = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in body)
+    end = {
+        "type": "_end",
+        "counts": {
+            kind: sum(item["type"] == kind for item in body)
+            for kind in portability._V14_TABLE_BY_KIND
+        },
+        "sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    }
+    wire.write_text(
+        encoded + json.dumps(end, ensure_ascii=False) + "\n", encoding="utf-8",
     )
 
     target = HyMem(replace(cfg, root=tmp_path / "v14-target"))

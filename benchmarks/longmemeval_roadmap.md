@@ -32,7 +32,7 @@ lives on branch `Beam-optimisation`, uncommitted.
 defaults use exact `deepseek-v4-flash`; mutable `deepseek-chat` and
 `deepseek-reasoner` aliases are rejected. Strict indexing requires coherent
 `hymem-dream-status-v5` + `hymem-benchmark-indexing-status-v3` snapshots and
-persists `hymem-lme-indexing-summary-v4`. Any command below that is retained as
+persists `hymem-lme-indexing-summary-v5`. Any command below that is retained as
 historical evidence remains governed by the archival warning above; for a new
 run, pin every selected model identity explicitly.
 

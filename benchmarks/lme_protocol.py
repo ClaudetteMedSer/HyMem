@@ -113,7 +113,7 @@ LME_OFFICIAL_JUDGE_MAX_TOKENS = 10
 LME_OFFICIAL_VERDICT_PARSER = "substring-yes-in-lower-v1"
 LME_UPSTREAM_RETRY_POLICY = "unbounded-openai-backoff-v1"
 LME_LOCAL_RETRY_POLICY = "bounded-three-attempt-backoff-v1"
-LME_INDEXING_SUMMARY_VERSION = "hymem-lme-indexing-summary-v4"
+LME_INDEXING_SUMMARY_VERSION = "hymem-lme-indexing-summary-v5"
 LME_INDEXING_COVERAGE_DETAIL_LIMIT = 100
 LME_HISTORICAL_LOCAL_JUDGE_PROMPTS_EXACT_OFFICIAL = False
 # Compatibility alias for older imports.  Strict evidence uses the longer,
@@ -156,6 +156,7 @@ _NEGATED_YES = re.compile(
 )
 
 _INDEXING_FAILURE_CODES = frozenset({
+    "phase1_producer_unavailable",
     "timeout_before_cycle",
     "timeout_during_cycle",
     "cycle_exception",
@@ -1034,6 +1035,18 @@ def _canonical_coverage_evidence(final: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _require_current_phase1_authority(value: Mapping[str, Any]) -> None:
+    """Validate untrusted receipt fields before runtime authority helpers."""
+    generation = value.get("phase1_generation_key")
+    if (value.get("phase1_backlog_status") != "current_producer"
+            or value.get("pending_chunks_authoritative") is not True
+            or not isinstance(generation, str)
+            or re.fullmatch(r"hymem-phase1-generation-v1:[0-9a-f]{64}", generation) is None):
+        raise BenchmarkIntegrityError(
+            "LongMemEval indexing final status lacks exact Phase-1 producer authority"
+        )
+
+
 def _canonical_final_indexing_status(value: object) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise BenchmarkIntegrityError("LongMemEval indexing final status is absent")
@@ -1047,6 +1060,7 @@ def _canonical_final_indexing_status(value: object) -> dict[str, Any]:
         raise BenchmarkIntegrityError(
             "LongMemEval indexing final status has an unsupported benchmark schema"
         )
+    _require_current_phase1_authority(value)
 
     known_terminal = {"terminal_loss_chunks", "terminal_loss_reasons"}
     known_coverage = {
@@ -1230,6 +1244,7 @@ def _canonical_final_indexing_status(value: object) -> dict[str, Any]:
     return {
         "dream_status_schema": DREAM_STATUS_SCHEMA_VERSION,
         "benchmark_indexing_status_schema": BENCHMARK_INDEXING_STATUS_VERSION,
+        **{field: value[field] for field in DREAM_STATUS_PHASE1_AUTHORITY_FIELDS},
         "pending": pending,
         "malformed": malformed,
         "quarantined": quarantined,
@@ -1317,7 +1332,7 @@ def canonicalize_lme_indexing_summary(summary: object) -> dict[str, Any]:
         if failure is None or failure["code"] not in {
             "cycle_exception", "timeout_before_cycle", "timeout_during_cycle",
             "timeout_after_cycle",
-            "malformed_status_shape",
+            "malformed_status_shape", "phase1_producer_unavailable",
             "malformed_pending_backlog", "malformed_quarantine_state",
             "malformed_terminal_loss_state",
             "malformed_coverage_integrity_state",
@@ -1353,8 +1368,10 @@ def _validate_canonical_final_status(value: object) -> Mapping[str, Any]:
         "pending", "malformed", "quarantined", "terminal_loss",
         "coverage_integrity", "in_progress", "aggregation_generation",
         "aggregation_material",
+        *DREAM_STATUS_PHASE1_AUTHORITY_FIELDS,
     }:
         raise BenchmarkIntegrityError("LongMemEval indexing final status is malformed")
+    _require_current_phase1_authority(value)
     if (
         value.get("dream_status_schema") != DREAM_STATUS_SCHEMA_VERSION
         or value.get("benchmark_indexing_status_schema")
@@ -1762,7 +1779,7 @@ def _validate_versioned_indexing(
     if final is None and code not in {
         "cycle_exception", "timeout_before_cycle", "timeout_during_cycle",
         "timeout_after_cycle",
-        "malformed_status_shape",
+        "malformed_status_shape", "phase1_producer_unavailable",
         "malformed_pending_backlog",
         "malformed_quarantine_state", "malformed_terminal_loss_state",
         "malformed_coverage_integrity_state",
@@ -1774,6 +1791,10 @@ def _validate_versioned_indexing(
     ):
         raise BenchmarkIntegrityError(
             "LongMemEval coverage failure lacks durable coverage evidence"
+        )
+    if code == "phase1_producer_unavailable" and (final is not None or cycles == 0):
+        raise BenchmarkIntegrityError(
+            "LongMemEval unavailable producer contradicts its authority evidence"
         )
     if code == "quarantined_extraction" and (
         final is None or not any(final["quarantined"].values())
@@ -1875,7 +1896,7 @@ def _validate_legacy_indexing(
         if failure is None or failure["code"] not in {
             "cycle_exception", "timeout_before_cycle", "timeout_during_cycle",
             "timeout_after_cycle",
-            "malformed_status_shape",
+            "malformed_status_shape", "phase1_producer_unavailable",
             "malformed_pending_backlog", "malformed_quarantine_state",
             "malformed_terminal_loss_state", "malformed_coverage_integrity_state",
             "malformed_cycle_failure_report", "malformed_durable_state",
@@ -3123,6 +3144,7 @@ def validate_strict_artifact(
         if config.get("no_dream") is False:
             segment_indexing_outcomes: list[bool] = []
             segment_indexing_ids: set[str] = set()
+            minimum_pipeline_attempts = 0
             for recorded in indexing_runs:
                 if (
                     isinstance(recorded, Mapping)
@@ -3159,10 +3181,19 @@ def validate_strict_artifact(
                     summary_complete, normalized_summary,
                 ))
                 if summary_complete:
+                    minimum_pipeline_attempts += sum(
+                        report.get("chunk_extraction_provider_attempts", 0)
+                        for report in summary["reports"]
+                    )
                     indexed_ids.add(summary_qid)
                     indexed_summaries.setdefault(summary_qid, []).append(
                         normalized_summary
                     )
+            measured_attempts = measured_segment_usage["memory pipeline"]["attempts"]
+            if measured_attempts is not None and measured_attempts < minimum_pipeline_attempts:
+                raise BenchmarkIntegrityError(
+                    "LongMemEval extraction attempts exceed pipeline usage"
+                )
             if (
                 segment_indexing_outcomes
                 and not any(segment_indexing_outcomes)
@@ -3342,6 +3373,11 @@ def validate_strict_artifact(
         and not config["exploratory_label_steering"]
         and segments[-1].get("status") == "complete"
     )
+    try:
+        from .archive_evidence import validate_checkpoint_attestation
+    except ImportError:
+        from archive_evidence import validate_checkpoint_attestation
+    validate_checkpoint_attestation(data)
     return {
         "rows": rows,
         "scores": recomputed,

@@ -1275,7 +1275,7 @@ class MSCAdapter:
                  graph_multihop: bool = False, aperture: dict | None = None,
                  facts_enabled: bool | None = None,
                  facts_extraction: bool | None = None):
-        self.db_path = db_path
+        self.db_path = Path(db_path)
         self.api_key = api_key
         self.sim = sim
         self.hymem_model = hymem_model
@@ -1329,6 +1329,13 @@ class MSCAdapter:
         # dict must not be able to clobber it.
         overrides["aggregation_nodes_enabled"] = False
         cfg = HyMemConfig(root=self.db_path.parent, **overrides)
+        # HyMemConfig chooses one fixed filename under its store root. An
+        # arbitrary caller filename is not an alternate physical database:
+        # reject it before allocating clients or opening/mutating any store.
+        if self.db_path != cfg.db_path:
+            raise BenchmarkIntegrityError(
+                "MSC adapter database path must be its store root's hymem.sqlite"
+            )
         embedding_client = None
         try:
             if self.sim:
@@ -1626,6 +1633,10 @@ class MSCAdapter:
         if self.hy is None:
             raise BenchmarkIntegrityError(
                 "MSC adapter must be open before attesting material store state"
+            )
+        if self.db_path != self.hy.config.db_path:
+            raise BenchmarkIntegrityError(
+                "MSC adapter database path differs from its open memory store"
             )
         return compute_material_store_state(self.db_path)
 
@@ -2594,7 +2605,7 @@ def run_recall(
     scope_id = f"msc:{ex['id']}"
     indexing: dict | None = None
     callback_emitted = False
-    adapter = MSCAdapter(tmp / "m.sqlite", api_key=args.api_key, sim=args.sim,
+    adapter = MSCAdapter(tmp / "hymem.sqlite", api_key=args.api_key, sim=args.sim,
                          hymem_model=args.hymem_model, hymem_base_url=args.hymem_base_url,
                          hymem_thinking=args.hymem_thinking,
                          embeddings=args.embeddings, rules_extraction=args.rules_extraction,
@@ -2741,7 +2752,7 @@ def run_recall(
 
 def run_recurrence_dump(ex: dict, args) -> tuple[list[dict], dict]:
     tmp = Path(tempfile.mkdtemp(prefix="msc_"))
-    adapter = MSCAdapter(tmp / "m.sqlite", api_key=args.api_key, sim=args.sim,
+    adapter = MSCAdapter(tmp / "hymem.sqlite", api_key=args.api_key, sim=args.sim,
                          hymem_model=args.hymem_model, hymem_base_url=args.hymem_base_url,
                          hymem_thinking=args.hymem_thinking,
                          rules_extraction=args.rules_extraction)
@@ -3047,6 +3058,7 @@ def msc_code_hash(
     *,
     adapter_path: Path | None = None,
     strictness_path: Path | None = None,
+    archive_evidence_path: Path | None = None,
     lme_adapter_path: Path | None = None,
     lme_protocol_path: Path | None = None,
     extraction_canary_path: Path | None = None,
@@ -3111,6 +3123,16 @@ def msc_code_hash(
     dependency_slices.append(PythonSourceSlice(
         strictness, tuple(strictness_symbols)
     ))
+    archive_symbols: set[str] = set()
+    for source_slice in dependency_slices:
+        archive_symbols.update(python_slice_imported_symbols(
+            source_slice, module_names=("benchmarks.archive_evidence", "archive_evidence"),
+        ))
+    if archive_symbols:
+        dependency_slices.append(PythonSourceSlice(
+            Path(archive_evidence_path or benchmark_dir / "archive_evidence.py"),
+            tuple(archive_symbols),
+        ))
     dependency_sources: list[Path | PythonSourceSlice] = [
         adapter, *dependency_slices,
     ]

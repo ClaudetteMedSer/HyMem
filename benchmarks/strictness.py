@@ -198,6 +198,7 @@ _SAFE_FAILURE_CODES = frozenset({
     "output_limit_exceeded",
     "oversized_store_build_receipt",
     "parse_failure",
+    "phase1_producer_unavailable",
     "quarantined_extraction",
     "reader_transport_or_content_failure",
     "reader_transport_or_empty_response",
@@ -4175,6 +4176,10 @@ def prepare_checkpoint_artifact(
         )
     snapshot = ledger.finalize()
     reconciled = ledger.reconcile()
+    try:
+        from .archive_evidence import checkpoint_attestation
+    except ImportError:
+        from archive_evidence import checkpoint_attestation
     artifact: dict[str, Any] = {
         **extra,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -4186,11 +4191,9 @@ def prepare_checkpoint_artifact(
             "segments": snapshot["execution_segments"],
             # A host path is neither portable evidence nor needed for
             # recovery (the operator already supplied the checkpoint).  Bind
-            # the archive to the exact finalized state with an opaque digest.
-            "checkpoint": {
-                "schema": CHECKPOINT_VERSION,
-                "state_sha256": content_hash(snapshot),
-            },
+            # the archive to a minimal, independently reconcilable projection
+            # of the finalized ledger, not an unavailable file's opaque hash.
+            "checkpoint": checkpoint_attestation(snapshot, list(reconciled.rows)),
         },
         "per_question": list(reconciled.rows),
     }

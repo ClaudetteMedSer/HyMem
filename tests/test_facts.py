@@ -141,7 +141,7 @@ def test_extraction_persists_facts_with_canonical_entities_and_watermark(cfg):
         # as the verbatim surface forms the extractor emitted.
         assert json.loads(rows[0]["entities"]) == ["med_flow", "fly_io"]
         assert all(
-            r["prompt_version"] == facts_mod.facts_config_version(hy.config)
+            r["prompt_version"] == facts_mod.facts_config_version(hy.config, client=llm)
             for r in rows
         )
 
@@ -260,7 +260,7 @@ def test_prompt_version_bump_replays_then_extracts_new_tail(cfg, monkeypatch):
 
         assert after[: len(before)] == before
         assert [r["prompt_version"] for r in after[len(before):]] == [
-            facts_mod.facts_config_version(hy.config)
+            facts_mod.facts_config_version(hy.config, client=llm)
         ]
     finally:
         hy.close()

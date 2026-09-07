@@ -95,11 +95,13 @@ _MATERIAL_TABLES = frozenset({
     "phase1_generations",
     "phase1_auxiliary_outcomes",
     "procedures",
+    "procedure_digest_publications",
     "processed_chunks",
     "profile_entries",
     "profile_entry_marker_evidence",
     "profile_marker_decisions",
     "profile_staging",
+    "digest_staging",
     "rules",
     "rule_marker_decisions",
     "rule_marker_evidence",
@@ -645,7 +647,7 @@ def material_store_state(path: str | Path) -> dict:
 
         version = core_db.schema_version(conn)
         if (
-            version != 57
+            version != 59
             or not core_db._v57_domain_present(conn)
             or not core_db._v57_material_bindings_present(conn)
         ):

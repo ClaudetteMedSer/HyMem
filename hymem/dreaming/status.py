@@ -16,6 +16,7 @@ from hymem.dreaming.digest import (
     digest_config_version,
     digest_generation_is_recognized,
     digest_generation_matches_config,
+    digest_staging_cursor_is_valid,
     digest_retry_policy_version,
     digest_retry_is_quarantined,
     digest_retry_state_is_valid,
@@ -47,7 +48,7 @@ from hymem.dreaming.user_profile import (
 )
 
 
-DREAM_STATUS_SCHEMA_VERSION = "hymem-dream-status-v6"
+DREAM_STATUS_SCHEMA_VERSION = "hymem-dream-status-v7"
 DURABLE_PENDING_FIELDS = (
     "pending_source_materialization",
     "pending_chunks",
@@ -63,7 +64,9 @@ DURABLE_MALFORMED_FIELDS = (
     "malformed_facts",
 )
 
-# Exact v6 health projection used by completion-claim consumers. V3 made
+# Exact v7 health projection used by completion-claim consumers. V7 binds
+# digest/profile/facts completion to the effective memory producer and loaded
+# implementation; an old v6 zero is not proof of this stronger guarantee. V3 made
 # Phase-1 completion producer-generation-aware; a v2 prompt-only zero cannot
 # be relabelled as complete under another model. V5 applies the same boundary
 # to aggregation publications and exposes their validated stored binding. The status
@@ -329,6 +332,7 @@ def _digest_status(
     conn: sqlite3.Connection,
     cfg: HyMemConfig,
     rows: list[sqlite3.Row],
+    client: object | None = None,
 ) -> dict[str, int]:
     episode_prompt = active_episode_prompt_version(
         cfg.episode_granularity_enabled
@@ -342,6 +346,7 @@ def _digest_status(
             cfg.dream_max_episodes_per_session
             if cfg.episode_granularity_enabled else None
         ),
+        client=client,
     )
     pending = 0
     quarantined = 0
@@ -378,9 +383,10 @@ def _digest_status(
         )
         cursor_invalid = bool(
             cursor_current
-            and not lossless_cursor_is_valid(
+            and (not digest_staging_cursor_is_valid(conn, row["id"])
+                 or not lossless_cursor_is_valid(
                 conn, row["id"], cursor, partial, int(offset),
-            )
+            ))
         )
         state_malformed = state_malformed or cursor_invalid
         if cursor_invalid:
@@ -442,6 +448,7 @@ def _profile_status(
     conn: sqlite3.Connection,
     cfg: HyMemConfig,
     rows: list[sqlite3.Row],
+    client: object | None = None,
 ) -> dict[str, int]:
     if not cfg.profile_extraction_enabled:
         return {
@@ -453,6 +460,7 @@ def _profile_status(
         max_chars=cfg.dream_digest_max_chars,
         max_items=cfg.profile_max_items_per_session,
         redact_values=cfg.redact_secrets,
+        client=client,
     )
     pending = 0
     quarantined = 0
@@ -563,6 +571,7 @@ def _fact_status(
     conn: sqlite3.Connection,
     cfg: HyMemConfig,
     rows: list[sqlite3.Row],
+    client: object | None = None,
 ) -> dict[str, int]:
     if not cfg.facts_extraction_enabled:
         return {
@@ -571,7 +580,7 @@ def _fact_status(
             "quarantined_facts_malformed": 0,
             "malformed_facts": 0,
         }
-    current_config = facts_config_version(cfg)
+    current_config = facts_config_version(cfg, client=client)
     pending = 0
     quarantined = 0
     quarantined_malformed = 0
@@ -649,7 +658,7 @@ def _fact_status(
             partial if _int_or_none(partial) else None, safe_offset
         )
         retry_key = facts_retry_policy_version(
-            cfg, replay_slice_key=retry_unit
+            cfg, replay_slice_key=retry_unit, publication_version=current_config,
         )
         # A current-unit retry cannot legitimately remain after all provider
         # work and the publication marker are complete.  It is neither a
@@ -691,7 +700,7 @@ def _fact_status(
 
 
 def durable_fact_work_status(
-    conn: sqlite3.Connection, cfg: HyMemConfig
+    conn: sqlite3.Connection, cfg: HyMemConfig, *, client: object | None = None,
 ) -> dict[str, int]:
     """Return the one authoritative fact work/quarantine classification."""
 
@@ -702,11 +711,11 @@ def durable_fact_work_status(
         "facts_retry_config_version,facts_quarantined "
         "FROM sessions ORDER BY id"
     ).fetchall()
-    return _fact_status(conn, cfg, rows)
+    return _fact_status(conn, cfg, rows, client)
 
 
 def durable_dream_work_status(
-    conn: sqlite3.Connection, cfg: HyMemConfig
+    conn: sqlite3.Connection, cfg: HyMemConfig, *, client: object | None = None,
 ) -> dict[str, int | str]:
     """Return every durable non-embedding work class for one read snapshot.
 
@@ -737,7 +746,7 @@ def durable_dream_work_status(
     return {
         "dream_status_schema": DREAM_STATUS_SCHEMA_VERSION,
         **_source_materialization_status(conn, cfg, rows),
-        **_digest_status(conn, cfg, rows),
-        **_profile_status(conn, cfg, rows),
-        **_fact_status(conn, cfg, rows),
+        **_digest_status(conn, cfg, rows, client),
+        **_profile_status(conn, cfg, rows, client),
+        **_fact_status(conn, cfg, rows, client),
     }

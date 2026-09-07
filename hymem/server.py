@@ -666,27 +666,39 @@ def _format_dream_completion(hy, report, *, targeted: bool) -> str:
 # ── tool implementations (callable directly in tests) ────────────────────────
 
 def _do_capture(session_id: str, messages: str, dream: bool = True) -> str:
+    # Validate the complete envelope before lazy bootstrap can create a store,
+    # clients, or source rows. Errors contain field/index diagnostics only.
+    if not isinstance(session_id, str) or not session_id.strip():
+        return "error: session_id must be a non-empty string"
+    if not isinstance(dream, bool):
+        return "error: dream must be a boolean"
+    if not isinstance(messages, str):
+        return "error: messages must be a JSON array"
     try:
         turns = json.loads(messages)
-    except json.JSONDecodeError as e:
-        return f"error: messages must be a JSON array — {e}"
+    except (json.JSONDecodeError, RecursionError):
+        return "error: messages must be a valid JSON array"
 
     if not isinstance(turns, list):
         return "error: messages must be a JSON array"
 
-    hy = _get_hy()
-    hy.open_session(session_id)
-    logged = 0
-    for turn in turns:
+    accepted: list[tuple[str, str]] = []
+    for index, turn in enumerate(turns):
+        if not isinstance(turn, dict):
+            return f"error: messages[{index}] must be an object"
         role = turn.get("role", "")
         content = turn.get("content", "")
+        if not isinstance(role, str) or not isinstance(content, str):
+            return f"error: messages[{index}].role and content must be strings"
+        # Preserve the prior filtering policy for otherwise well-typed items.
         if role not in {"user", "assistant", "system", "tool"}:
             continue
         if not content:
             continue
-        hy.log_message(session_id, role, content)
-        logged += 1
-    hy.close_session(session_id)
+        accepted.append((role, content))
+
+    hy = _get_hy()
+    logged = len(hy.log_messages(session_id, accepted, close_session=True))
 
     if not dream:
         return f"logged {logged} turns for session {session_id!r}"

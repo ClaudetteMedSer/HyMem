@@ -13,6 +13,7 @@ from benchmarks import beam_registry, run_registry
 from benchmarks.extraction_canary import extraction_canary_policy
 from benchmarks.strictness import build_manifest, content_hash
 from hymem.extraction.contract import extraction_contract_binding
+from tests.archive_evidence_fixtures import bind_checkpoint, healthy_convergence
 
 
 def _usage(calls: int, prompt: int, completion: int, *, latency: float = 1.0):
@@ -332,7 +333,7 @@ def _strict_artifact() -> dict:
             scale_rows
         )
         counts[scale]["OVERALL"] = len(scale_rows)
-    return {
+    artifact = {
         "benchmark": "BEAM",
         "version": "strict-v1",
         "date": "2026-09-04T12:00:01+00:00",
@@ -366,6 +367,13 @@ def _strict_artifact() -> dict:
         },
         "per_question": rows,
     }
+    from tests.archive_evidence_fixtures import bind_checkpoint, healthy_convergence
+    artifact["execution"]["segments"][0]["indexing_runs"] = [{
+        "scale": scale, "conversation_id": f"conversation-{scale}",
+        **healthy_convergence(config),
+    } for scale in config["scales"]]
+    bind_checkpoint(artifact)
+    return artifact
 
 
 def _rehash_manifest(data: dict) -> None:
@@ -373,6 +381,8 @@ def _rehash_manifest(data: dict) -> None:
     manifest["run_id"] = content_hash({
         key: value for key, value in manifest.items() if key != "run_id"
     })
+    from tests.archive_evidence_fixtures import bind_checkpoint
+    bind_checkpoint(data)
 
 
 def _rebind_manifest(data: dict) -> None:
@@ -383,6 +393,27 @@ def _rebind_manifest(data: dict) -> None:
     data["manifest"]["config_hash"] = content_hash(data["config"])
     data["manifest"]["model_hash"] = content_hash(data["models"])
     _rehash_manifest(data)
+
+
+def _strict_artifact_with_remote_embedding() -> dict:
+    data = _strict_artifact()
+    remote = _remote_embedding_identity()
+    data["config"]["embedding"] = deepcopy(remote)
+    data["models"]["embedding"] = deepcopy(remote)
+    data["execution"]["segments"][0]["embedding_usage"].update({
+        "backend": "openai_compatible",
+        "quality": "semantic",
+        "network_free": False,
+        "model": beam_registry._manifested_embedding_execution_identity(remote)[1],
+        "dimension": 1536,
+        "request_attempts": 6,
+        "successful_responses": 6,
+        "prompt_tokens": 4,
+        "total_tokens": 4,
+        "provider_token_usage_available": True,
+    })
+    _rebind_manifest(data)
+    return data
 
 
 def _official_full_artifact() -> dict:
@@ -444,6 +475,11 @@ def _official_full_artifact() -> dict:
     )
     data.pop("summary", None)
     data.pop("summary_counts", None)
+    data["execution"]["segments"][0]["indexing_runs"] = [{
+        "scale": "100K", "conversation_id": f"official-conversation-{index:02d}",
+        **healthy_convergence(data["config"]),
+    } for index in range(20)]
+    bind_checkpoint(data)
     return data
 
 
@@ -1034,6 +1070,7 @@ def test_strict_registry_validates_segment_ids_states_attempts_and_running_ident
     data["execution"]["segments"][0]["status"] = "running"
     # A prior interrupted segment is legitimate; exact usage simply becomes
     # unavailable in the registry.
+    bind_checkpoint(data)
     row = beam_registry._beam_row(data, tmp_path / "results_strict.json")
     assert row["total_tokens"] is None
 
@@ -1137,53 +1174,84 @@ def test_strict_registry_requires_integral_reconciled_provider_tokens(
         beam_registry._beam_row(data, tmp_path / "results_strict.json")
 
 
+@pytest.mark.parametrize("tokens", [0, 4, None])
+def test_strict_registry_accepts_remote_embedding_usage(tmp_path, tokens):
+    data = _strict_artifact_with_remote_embedding()
+    usage = data["execution"]["segments"][0]["embedding_usage"]
+    usage.update({
+        "prompt_tokens": tokens,
+        "total_tokens": tokens,
+        "provider_token_usage_available": tokens is not None,
+    })
+    bind_checkpoint(data)
+    row = beam_registry._beam_row(data, tmp_path / "results_strict.json")
+    assert row["overall"] == pytest.approx(31.25)
+    assert row["count"] == 40
+    assert json.loads(row["extras"])["manifest"] == data["manifest"]
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("prompt_tokens", 4.5, "prompt_tokens"),
+        ("prompt_tokens", True, "prompt_tokens"),
+        ("prompt_tokens", -1, "prompt_tokens"),
+        ("prompt_tokens", None, "prompt_tokens"),
+        ("total_tokens", 4.5, "total_tokens"),
+        ("total_tokens", True, "total_tokens"),
+        ("total_tokens", -1, "total_tokens"),
+        ("total_tokens", None, "total_tokens"),
         ("total_tokens", 5, "token totals"),
+        ("provider_token_usage_available", "true", "token availability"),
+        ("provider_token_usage_available", None, "token availability"),
+        ("provider_token_usage_available", False, "unavailable token usage"),
     ],
 )
 def test_strict_registry_requires_integral_reconciled_remote_embedding_tokens(
     tmp_path, field, value, message,
 ):
-    data = _strict_artifact()
-    remote = _remote_embedding_identity()
-    data["config"]["embedding"] = deepcopy(remote)
-    data["models"]["embedding"] = deepcopy(remote)
+    data = _strict_artifact_with_remote_embedding()
     usage = data["execution"]["segments"][0]["embedding_usage"]
-    usage.update({
-        "configured": True,
-        "backend": "openai_compatible",
-        "quality": "semantic",
-        "network_free": False,
-        "model": beam_registry._manifested_embedding_execution_identity(remote)[1],
-        "dimension": 1536,
-        "identity_exact": True,
-        "reuse_scope": "durable",
-        "identity_consistent": True,
-        "instances": 2,
-        "calls": 6,
-        "calls_available": True,
-        "request_attempts": 6,
-        "request_attempts_available": True,
-        "successful_responses": 6,
-        "successful_responses_available": True,
-        "input_count": 30,
-        "input_count_available": True,
-        "input_characters": 600,
-        "input_characters_available": True,
-        "prompt_tokens": 4,
-        "total_tokens": 4,
-        "provider_token_usage_available": True,
-        "latency_s": 0.5,
-        "latency_available": True,
-        "cost_usd": None,
-        "cost_available": False,
-    })
     usage[field] = value
-    _rebind_manifest(data)
     with pytest.raises(ValueError, match=message):
+        beam_registry._beam_row(data, tmp_path / "results_strict.json")
+
+
+@pytest.mark.parametrize("tokens_available", [True, False])
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("calls", 5, "embedding calls differ from successes"),
+        ("request_attempts", 5, "embedding attempts are below successes"),
+    ],
+)
+def test_strict_registry_reconciles_remote_embedding_counters(
+    tmp_path, tokens_available, field, value, message,
+):
+    data = _strict_artifact_with_remote_embedding()
+    usage = data["execution"]["segments"][0]["embedding_usage"]
+    if not tokens_available:
+        usage.update({
+            "prompt_tokens": None,
+            "total_tokens": None,
+            "provider_token_usage_available": False,
+        })
+    usage[field] = value
+    with pytest.raises(ValueError, match=message):
+        beam_registry._beam_row(data, tmp_path / "results_strict.json")
+
+
+@pytest.mark.parametrize("tokens", [0, 4])
+def test_strict_registry_rejects_network_free_embedding_provider_tokens(
+    tmp_path, tokens,
+):
+    data = _strict_artifact()
+    data["execution"]["segments"][0]["embedding_usage"].update({
+        "prompt_tokens": tokens,
+        "total_tokens": tokens,
+        "provider_token_usage_available": True,
+    })
+    with pytest.raises(ValueError, match="network-free embedding claims provider tokens"):
         beam_registry._beam_row(data, tmp_path / "results_strict.json")
 
 
@@ -1224,6 +1292,7 @@ def test_strict_registry_allows_unavailable_zero_attempt_recovery_segment(tmp_pa
             **extraction_canary_policy(), "status": "pending",
         },
     })
+    bind_checkpoint(data)
     row = beam_registry._beam_row(data, tmp_path / "results_strict.json")
     assert row["answer_calls"] is None
     assert row["total_tokens"] is None

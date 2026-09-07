@@ -154,7 +154,7 @@ def test_source_split_policy_changes_derived_cache_key_without_prompt_bump(
 ):
     current = contract.extraction_cache_key("v20")
     assert chunk_module.SOURCE_RECORD_SPLIT_POLICY_VERSION == (
-        "hymem-source-semantic-split-v9"
+        "hymem-source-semantic-split-v10"
     )
     assert chunk_module.SOURCE_FRAGMENT_CONTEXT_VERSION == (
         "hymem-canonical-markdown-table-fragment-context-v2"

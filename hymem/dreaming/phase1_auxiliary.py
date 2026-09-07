@@ -24,16 +24,18 @@ from hymem.extraction.markers import Marker
 AUXILIARY_CONTRACT_V0 = "phase1-auxiliary-contract-v0"
 AUXILIARY_CONTRACT_V1 = "phase1-auxiliary-contract-v1"
 AUXILIARY_CONTRACT_V2 = "phase1-auxiliary-contract-v2"
-CURRENT_AUXILIARY_CONTRACT_KEY = AUXILIARY_CONTRACT_V2
+AUXILIARY_CONTRACT_V3 = "phase1-auxiliary-contract-v3"
+CURRENT_AUXILIARY_CONTRACT_KEY = AUXILIARY_CONTRACT_V3
 # Backward-compatible import name. Current-policy code below deliberately uses
 # the explicit alias so future policies retain V0/V1/V2's immutable dispatch.
 AUXILIARY_CONTRACT_KEY = CURRENT_AUXILIARY_CONTRACT_KEY
 # This is deliberately pinned rather than silently recomputed into the
 # contract key.  Any edit to the v2 canonical projection/framing/publication
 # must fail the sentinel and be released as a new contract key while retaining
-# the immutable v0/v1 validator for durable history.
+# the immutable historical validators. V3 uses idempotent script-preserving
+# canonicalization; V0/V1/V2 hashes continue to describe the stored old keys.
 AUXILIARY_POLICY_SHA256 = (
-    "sha256:874f92901cb335d36209ee5bb8b5b29f5c0c02cdf1d2bfca03ae436e6f01a8a2"
+    "sha256:d66ee342fbf9c37df274ce67e68f7a517cb2975343b11f9f0bedaae968b48123"
 )
 
 
@@ -170,7 +172,7 @@ def _canonical_auxiliary_result_v2(
     entity_mentions: Sequence[str],
     markers: Sequence[tuple[str, str]],
 ) -> dict[str, object]:
-    """Current auxiliary framing with Unicode-safe canonical identities."""
+    """Frozen auxiliary framing for historical contract v2."""
 
     normalized_types = sorted({
         (str(entity), str(type_name), float(confidence))
@@ -207,10 +209,22 @@ def _canonical_auxiliary_result_v2(
     }
 
 
+def _canonical_auxiliary_result_v3(**kwargs) -> dict[str, object]:
+    """Frame new Unicode-policy output without reinterpreting V2 history."""
+    result = _canonical_auxiliary_result_v2(**kwargs)
+    payload = {
+        **result["payload"],
+        "auxiliary_contract_key": AUXILIARY_CONTRACT_V3,
+        "version": "phase1-auxiliary-result-v3",
+    }
+    return {**result, "payload": payload, "result_hash": _hash_payload(payload)}
+
+
 _AUXILIARY_CANONICALIZERS = {
     AUXILIARY_CONTRACT_V0: _canonical_auxiliary_result_v0,
     AUXILIARY_CONTRACT_V1: _canonical_auxiliary_result_v1,
     AUXILIARY_CONTRACT_V2: _canonical_auxiliary_result_v2,
+    AUXILIARY_CONTRACT_V3: _canonical_auxiliary_result_v3,
 }
 SUPPORTED_AUXILIARY_CONTRACT_KEYS = frozenset(_AUXILIARY_CANONICALIZERS)
 
@@ -560,13 +574,16 @@ def _publish_phase1_auxiliaries(
 _AUXILIARY_POLICY_FUNCTIONS = (
     _hash_payload,
     _hash_payload_v0_v1,
+    canonicalize._fold_latin_accents,
     canonicalize.normalize,
     canonicalize.resolve,
     _canonical_projection,
     _canonical_auxiliary_result_v2,
+    _canonical_auxiliary_result_v3,
     _publish_phase1_auxiliaries,
 )
 _AUXILIARY_CANONICAL_FUNCTIONS = (
+    canonicalize._fold_latin_accents,
     canonicalize.normalize,
     canonicalize.resolve,
 )
@@ -575,12 +592,11 @@ _AUXILIARY_CANONICAL_REGEXES = tuple(
     for pattern in (
         canonicalize._LEADING_ARTICLES,
         canonicalize._TRAILING_PAREN,
-        canonicalize._NON_ALNUM,
-        canonicalize._NON_UNICODE_WORD,
     )
 )
 _AUXILIARY_CANONICAL_SETTINGS = (
     canonicalize._MAX_UNICODE_CANONICAL_CHARS,
+    canonicalize.CANONICALIZATION_POLICY_VERSION,
 )
 _AUXILIARY_POLICY_IMPORT_SHA256 = _hash_payload({
     "callables": [
@@ -592,9 +608,10 @@ _AUXILIARY_POLICY_IMPORT_SHA256 = _hash_payload({
     "canonical_settings": list(_AUXILIARY_CANONICAL_SETTINGS),
     "dependency_names": [
         "_hash_payload", "_hash_payload_v0_v1",
-        "canonicalize.normalize", "canonicalize.resolve",
+        "canonicalize._fold_latin_accents", "canonicalize.normalize", "canonicalize.resolve",
         "_canonical_projection",
-        "_canonical_auxiliary_result_v2", "_publish_phase1_auxiliaries",
+        "_canonical_auxiliary_result_v2", "_canonical_auxiliary_result_v3",
+        "_publish_phase1_auxiliaries",
     ],
 })
 
@@ -612,23 +629,28 @@ def auxiliary_policy_sha256() -> str:
     dependencies = (
         _hash_payload,
         _hash_payload_v0_v1,
+        canonicalize._fold_latin_accents,
         canonicalize.normalize,
         canonicalize.resolve,
         _canonical_projection,
         _canonical_auxiliary_result_v2,
+        _canonical_auxiliary_result_v3,
         _publish_phase1_auxiliaries,
     )
-    canonical_functions = (canonicalize.normalize, canonicalize.resolve)
+    canonical_functions = (
+        canonicalize._fold_latin_accents, canonicalize.normalize, canonicalize.resolve,
+    )
     canonical_regexes = tuple(
         (pattern.pattern, int(pattern.flags))
         for pattern in (
             canonicalize._LEADING_ARTICLES,
             canonicalize._TRAILING_PAREN,
-            canonicalize._NON_ALNUM,
-            canonicalize._NON_UNICODE_WORD,
         )
     )
-    canonical_settings = (canonicalize._MAX_UNICODE_CANONICAL_CHARS,)
+    canonical_settings = (
+        canonicalize._MAX_UNICODE_CANONICAL_CHARS,
+        canonicalize.CANONICALIZATION_POLICY_VERSION,
+    )
     if (
         dependencies != _AUXILIARY_POLICY_FUNCTIONS
         or canonical_functions != _AUXILIARY_CANONICAL_FUNCTIONS
@@ -640,12 +662,12 @@ def auxiliary_policy_sha256() -> str:
 
 
 def validate_auxiliary_contract_implementation() -> None:
-    """Fail closed if current v2 policy changed without contract evolution."""
+    """Fail closed if current v3 policy changed without contract evolution."""
 
     actual = auxiliary_policy_sha256()
     if actual != AUXILIARY_POLICY_SHA256:
         raise RuntimeError(
-            "Phase-1 auxiliary v2 implementation changed without a new "
+            "Phase-1 auxiliary v3 implementation changed without a new "
             f"contract key (expected {AUXILIARY_POLICY_SHA256}, got {actual})"
         )
 

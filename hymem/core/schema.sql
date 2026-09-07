@@ -1323,6 +1323,25 @@ CREATE TABLE IF NOT EXISTS profile_staging (
 CREATE INDEX IF NOT EXISTS idx_profile_staging_generation
     ON profile_staging(session_id, generation);
 
+-- Private digest output is retained for only the active bounded-slice walk.
+-- The completed publication and its ordinary consumer tables remain intact.
+CREATE TABLE IF NOT EXISTS digest_staging (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    generation TEXT NOT NULL,
+    slice_key TEXT NOT NULL,
+    summary TEXT NOT NULL CHECK (length(summary) <= 500),
+    procedures_json TEXT NOT NULL CHECK (json_valid(procedures_json)),
+    episodes_json TEXT NOT NULL CHECK (json_valid(episodes_json)),
+    source_sha256 TEXT NOT NULL CHECK (length(source_sha256) = 64),
+    cursor_before_message_id INTEGER,
+    cursor_before_partial_message_id INTEGER,
+    cursor_before_offset INTEGER NOT NULL CHECK (cursor_before_offset >= 0),
+    cursor_after_message_id INTEGER,
+    cursor_after_partial_message_id INTEGER,
+    cursor_after_offset INTEGER NOT NULL CHECK (cursor_after_offset >= 0),
+    PRIMARY KEY (session_id, generation, slice_key)
+);
+
 -- Procedural memory: step-by-step workflows extracted from conversations.
 CREATE TABLE IF NOT EXISTS procedures (
     id TEXT PRIMARY KEY,
@@ -1338,6 +1357,14 @@ CREATE TABLE IF NOT EXISTS procedures (
 );
 CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);
 CREATE INDEX IF NOT EXISTS idx_procedures_entities ON procedures(entities_involved);
+-- Explicit, exact-content ownership for complete local digest publications.
+-- Unknown legacy/manual rows remain outside this ledger.
+CREATE TABLE IF NOT EXISTS procedure_digest_publications (
+    procedure_id TEXT PRIMARY KEY REFERENCES procedures(id) ON DELETE CASCADE,
+    generation TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+    retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0,1))
+);
 -- NOTE: the index on procedures.status lives ONLY in migration
 -- 010_procedure_status.sql, never here. schema.sql runs via executescript()
 -- BEFORE migrations, so on an existing pre-v10 DB the `procedures` table is

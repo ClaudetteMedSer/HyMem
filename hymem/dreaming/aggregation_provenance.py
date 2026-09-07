@@ -1352,7 +1352,7 @@ def load_knowledge_graph_anchor_inputs(
 
     if cap <= 0:
         return []
-    from hymem.core.graph import graph_clock_order_sql
+    from hymem.core.graph import anchor_edge_order_sql
 
     try:
         cursor = conn.execute(
@@ -1362,9 +1362,7 @@ def load_knowledge_graph_anchor_inputs(
             "AND (kg.valid_at IS NULL OR hymem_timestamp_at_or_before("
             "kg.valid_at,strftime('%Y-%m-%dT%H:%M:%fZ','now',"
             f"'+{EVENT_CLOCK_SKEW_SECONDS} seconds'))=1) "
-            "ORDER BY kg.pos_evidence-kg.neg_evidence DESC,"
-            f"{graph_clock_order_sql('kg.last_seen')},"
-            "kg.subject_canonical,kg.predicate,kg.object_canonical"
+            f"ORDER BY {anchor_edge_order_sql('kg')}"
         )
     except sqlite3.OperationalError:
         return []

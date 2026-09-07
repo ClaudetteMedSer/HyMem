@@ -1063,7 +1063,8 @@ def test_direct_invalid_rule_trigger_is_rejected_on_reopen(cfg):
         HyMem(config).conn
 
 
-def test_old_profile_policy_is_hidden_then_replayed(cfg):
+@pytest.mark.parametrize("old_policy", ["marker-profile-materialization-v3", "marker-profile-materialization-v4"])
+def test_old_profile_policy_is_hidden_then_replayed(cfg, old_policy):
     config = replace(cfg, aggregation_nodes_enabled=False)
     client = _DeclaredLLM("profile-policy-replay", "unused")
     hy = HyMem(config, llm=client)
@@ -1089,11 +1090,11 @@ def test_old_profile_policy_is_hidden_then_replayed(cfg):
                 "INSERT INTO profile_marker_decisions("
                 "marker_id,phase1_generation_key,profile_policy_key,decision,"
                 "profile_entry_id) SELECT marker_id,phase1_generation_key,"
-                "'marker-profile-materialization-v3',decision,profile_entry_id "
+                "?,decision,profile_entry_id "
                 "FROM (SELECT ? AS marker_id,? AS phase1_generation_key,"
                 "'materialized' AS decision,profile_entry_id FROM "
                 "profile_entry_marker_evidence WHERE marker_id=?)",
-                (marker_id, key, marker_id),
+                (old_policy, marker_id, key, marker_id),
             )
         assert hy.conn.execute(
             "SELECT COUNT(*) FROM current_profile_entries"

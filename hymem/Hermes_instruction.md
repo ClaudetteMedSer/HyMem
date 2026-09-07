@@ -148,7 +148,7 @@ operational notes:
   window-alignment fix) rebuilds the aggregation tree — a one-time LLM cost.**
   Subsequent dreams on a quiescent store reuse cached fusions (keyed by
   member-set hash), so re-dreaming a stable store costs zero digest LLM calls.
-- `GET /dream-status` returns the current `hymem-dream-status-v3` contract from
+- `GET /dream-status` returns the current `hymem-dream-status-v7` contract from
   one coherent SQLite snapshot. Completion requires every source-materialization,
   extraction, digest, profile, fact, aggregation, quarantine, malformed-state,
   terminal-loss, and coverage-integrity gate to be healthy; `pending_chunks=0`

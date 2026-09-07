@@ -543,6 +543,11 @@ def _make_strict_beam(path: Path, *, segment_status="complete"):
         },
         "per_question": rows,
     }
+    from tests.archive_evidence_fixtures import bind_checkpoint, healthy_convergence
+    data["execution"]["segments"][0]["indexing_runs"] = [{
+        "scale": scale, "conversation_id": conv_id, **healthy_convergence(config),
+    } for scale, conv_id in sorted({(row["scale"], row["conv_id"]) for row in rows})]
+    bind_checkpoint(data)
     path.write_text(json.dumps(data))
     return path
 

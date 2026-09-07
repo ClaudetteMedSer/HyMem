@@ -189,7 +189,7 @@ def test_msc_cli_body_parser_preserves_absent_vs_explicit_empty():
 def test_msc_pipeline_default_overrides_ambient_thinking_off(monkeypatch, tmp_path):
     pytest.importorskip("openai")
     monkeypatch.setenv("HYMEM_LLM_THINKING", "off")
-    adapter = msc.MSCAdapter(tmp_path / "msc.sqlite", api_key="test-key").open()
+    adapter = msc.MSCAdapter(tmp_path / "hymem.sqlite", api_key="test-key").open()
     try:
         assert adapter.pipeline_llm.thinking_mode == "auto"
         assert adapter.pipeline_llm.effective_extra_body == DISABLED
@@ -200,7 +200,7 @@ def test_msc_pipeline_default_overrides_ambient_thinking_off(monkeypatch, tmp_pa
 def test_msc_pipeline_auto_omits_vendor_body_for_unrelated_provider(tmp_path):
     pytest.importorskip("openai")
     adapter = msc.MSCAdapter(
-        tmp_path / "msc.sqlite", api_key="test-key",
+        tmp_path / "hymem.sqlite", api_key="test-key",
         hymem_model="gpt-4o-mini",
         hymem_base_url="https://api.openai.com/v1",
     ).open()

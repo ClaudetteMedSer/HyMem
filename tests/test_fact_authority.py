@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import sys
 
 import pytest
 
@@ -68,6 +69,10 @@ def _extract(
         start_offset=offset, max_chars=max_chars,
     )
     assert result is not None
+    # These ledger/CAS fixtures intentionally construct historical config-only
+    # authority units. Each payload uses a new fixture producer; production
+    # cannot append those as one current semantic generation without replay.
+    result.publication_version = facts.facts_config_version(hy.config)
     return result
 
 
@@ -575,6 +580,8 @@ def test_concurrent_publish_and_replay_use_cursor_and_generation_cas(cfg):
             peer, winner.slice_key,
             StubLLMClient(default='[{"text":"Replay B."}]'), hy.config,
         )
+        replay_a.publication_version = facts.facts_config_version(hy.config)
+        replay_b.publication_version = facts.facts_config_version(hy.config)
         assert replay_a.expected_generation == replay_b.expected_generation == 1
         with core_db.transaction(hy.conn):
             facts.persist_facts(hy.conn, "fact-cas", replay_a)
@@ -716,21 +723,21 @@ def test_fact_chain_indexes_and_quiescent_replay_path_scale(cfg, monkeypatch):
         committed_scans = 0
         original_committed = facts._committed_fact_slice_keys
 
-        def counted_committed(*args, **kwargs):
+        def count_committed(frame, event, arg):
             nonlocal committed_scans
-            committed_scans += 1
-            return original_committed(*args, **kwargs)
-
-        monkeypatch.setattr(
-            facts, "_committed_fact_slice_keys", counted_committed
-        )
+            if event == "call" and frame.f_code is original_committed.__code__:
+                committed_scans += 1
         hy.config = dataclasses.replace(
             hy.config,
             dream_max_facts_per_session=hy.config.dream_max_facts_per_session + 1,
         )
-        target_version = facts.facts_config_version(hy.config)
+        target_version = facts.facts_config_version(hy.config, client=hy._llm)
         replay_sql: list[str] = []
         hy.conn.set_trace_callback(replay_sql.append)
+        previous_profile = sys.getprofile()
+        # Observe calls without replacing the implementation we now bind to
+        # each generation (a mutating counter closure is not stable code).
+        sys.setprofile(count_committed)
         try:
             reports = []
             for _ in range(slices + 1):
@@ -744,6 +751,7 @@ def test_fact_chain_indexes_and_quiescent_replay_path_scale(cfg, monkeypatch):
                     break
         finally:
             hy.conn.set_trace_callback(None)
+            sys.setprofile(previous_profile)
         assert marker == target_version
         assert len(reports) == slices
         assert all(report.budget_exhausted for report in reports[:-1])

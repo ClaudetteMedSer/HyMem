@@ -519,6 +519,7 @@ def test_malformed_digest_generation_cannot_claim_steady_state(
             max_chars=hy.config.dream_digest_max_chars,
             max_tokens=hy.config.dream_digest_max_tokens,
             max_episodes=None,
+            client=llm,
         )
         assert digest_generation_matches_config(
             repaired["digest_cursor_prompt_version"], config
@@ -1427,7 +1428,10 @@ def test_prompt_change_mid_message_rewinds_exactly_from_retained_artifact(cfg):
         ).fetchone()
         assert first_state["digest_cursor_partial_message_id"] == message_id
         assert first_state["digest_cursor_offset"] > 0
-        assert "alpha" in first_state["auto_summary"]
+        assert first_state["auto_summary"] is None
+        assert "alpha" in hy.conn.execute(
+            "SELECT summary FROM digest_staging WHERE session_id=?", (sid,),
+        ).fetchone()[0]
         assert hy.conn.execute(
             "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?", (sid,),
         ).fetchone()["c"] == 0
@@ -1443,7 +1447,9 @@ def test_prompt_change_mid_message_rewinds_exactly_from_retained_artifact(cfg):
         report = hy2.dream()
         first_new_call = _digest_calls(second_llm)[0].user
         assert re.search(rf"message {message_id} role=user chars=0:\d+/", first_new_call)
-        assert "Remembered alpha" in first_new_call
+        # The previous walk never published: its private summary belongs to
+        # the old prompt generation and cannot seed a replacement producer.
+        assert "Remembered alpha" not in first_new_call
         assert report.budget_exhausted is True
 
         for _ in range(30):

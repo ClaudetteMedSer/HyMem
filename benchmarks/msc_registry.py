@@ -27,6 +27,8 @@ from hymem.contrib.endpoint_policy import (
 from hymem.contrib.model_policy import require_active_model
 
 try:  # package imports in tests
+    from .archive_evidence import (validate_checkpoint_attestation, validate_scoped_indexing,
+                                   validate_scoped_row, validate_scoped_pipeline_usage)
     from .extraction_canary import (
         validate_extraction_canary_config_binding,
         validate_extraction_canary_report,
@@ -40,6 +42,8 @@ try:  # package imports in tests
         read_artifact_or_pointer,
     )
 except (ImportError, ValueError):  # direct CLI
+    from archive_evidence import (validate_checkpoint_attestation, validate_scoped_indexing,
+                                  validate_scoped_row, validate_scoped_pipeline_usage)
     from extraction_canary import (  # type: ignore
         validate_extraction_canary_config_binding,
         validate_extraction_canary_report,
@@ -711,17 +715,8 @@ def validate_msc_artifact(value: object) -> dict[str, Any]:
         raise _fail("execution envelope is malformed")
     counts = execution["counts"]
     segments = execution["segments"]
-    checkpoint = execution["checkpoint"]
     if not isinstance(counts, dict) or not isinstance(segments, list) or not segments:
         raise _fail("execution evidence is incomplete")
-    if (
-        not isinstance(checkpoint, dict)
-        or set(checkpoint) != {"schema", "state_sha256"}
-        or checkpoint.get("schema") != CHECKPOINT_VERSION
-        or not isinstance(checkpoint.get("state_sha256"), str)
-        or not _SHA256.fullmatch(checkpoint["state_sha256"])
-    ):
-        raise _fail("checkpoint digest evidence is malformed")
     expected_counts = {
         "expected": expected_count,
         "attempted": expected_count - missing,
@@ -744,6 +739,8 @@ def validate_msc_artifact(value: object) -> dict[str, Any]:
     reader_successes_available = True
     judge_successes_available = True
     all_indexing_scopes: set[str] = set()
+    successful_indexing_scopes: set[str] = set()
+    receipts_by_scope = {}
     segment_canaries: list[dict[str, Any]] = []
     saw_complete = False
     for segment in segments:
@@ -841,6 +838,7 @@ def validate_msc_artifact(value: object) -> dict[str, Any]:
             attempted=attempted,
         )
         indexing_scopes: set[str] = set()
+        local_receipts = []
         for field in ("indexing_runs", "indexing_failures"):
             evidence = segment.get(field)
             if not isinstance(evidence, list):
@@ -863,10 +861,17 @@ def validate_msc_artifact(value: object) -> dict[str, Any]:
                     raise _fail("segment indexing evidence is inconsistent")
                 indexing_scopes.add(scope_id)
                 all_indexing_scopes.add(scope_id)
-        if len(indexing_scopes) != attempted:
+                validate_scoped_indexing(item["summary"], scope_id=scope_id, config=config,
+                                        failed=field == "indexing_failures")
+                if field == "indexing_runs":
+                    successful_indexing_scopes.add(scope_id)
+                    receipts_by_scope.setdefault(scope_id, []).append(item["summary"])
+                    local_receipts.append(item["summary"])
+        validate_scoped_pipeline_usage(local_receipts, pipeline_usage)
+        if len(indexing_scopes) > attempted:
             raise _fail("segment indexing evidence does not cover its attempts")
         if historical_preflight:
-            if status != "running" or attempted != 0:
+            if attempted != 0:
                 raise _fail("historical preflight segment claims benchmark attempts")
             _require_zero_llm_work(reader_usage)
             _require_zero_llm_work(judge_usage)
@@ -883,18 +888,23 @@ def validate_msc_artifact(value: object) -> dict[str, Any]:
     if not saw_complete or segment_attempts != total_attempts:
         raise _fail("execution segments do not reconcile")
     if scored and (
-        not reader_successes_available
-        or not judge_successes_available
-        or reader_successes < completed
+        reader_successes < completed
         or judge_successes < completed
     ):
         raise _fail("live model calls are below completed row count")
-    if all_indexing_scopes != {f"msc:{item_id}" for item_id in ids}:
-        raise _fail("indexing scopes do not reconcile to the result ledger")
+    if not {f"msc:{row['question_id']}" for row in rows
+            if row.get("benchmark_failure") != "missing_prediction"}.issubset(all_indexing_scopes):
+        raise _fail("indexing evidence scopes do not reconcile to the result ledger")
+    for row in rows:
+        if not row.get("benchmark_failure") and row["indexing_scope_id"] not in successful_indexing_scopes:
+            raise _fail("completed row has only failed indexing evidence")
+        validate_scoped_row(row, scope_id=row["indexing_scope_id"], receipts=receipts_by_scope)
     if not all(any(report == candidate for candidate in segment_canaries)
                for report in row_canaries):
         raise _fail("row canary is not owned by an execution segment")
-    for report in row_canaries:
+    for row, report in zip(rows, row_canaries):
+        if row.get("benchmark_failure") == "missing_prediction":
+            continue
         if required_canary and report.get("status") == "passed":
             continue
         if (
@@ -924,6 +934,7 @@ def validate_msc_artifact(value: object) -> dict[str, Any]:
         raise _fail("result digest is invalid")
     if not isinstance(data.get("legacy_bare_out"), bool):
         raise _fail("legacy sidecar declaration is malformed")
+    validate_checkpoint_attestation(data)
     return data
 
 

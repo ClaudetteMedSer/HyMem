@@ -34,7 +34,7 @@ from hymem.core.vectors import decode_vector
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 57
+EXPECTED_SCHEMA_VERSION = 59
 _EVIDENCE_MUTATION_KEYS: contextvars.ContextVar[
     frozenset[tuple[int, int, int]]
 ] = contextvars.ContextVar("hymem_evidence_mutation_keys", default=frozenset())
@@ -4531,6 +4531,12 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
                 raise RuntimeError(
                     "schema v57 aggregation material preflight is malformed"
                 )
+        if version == 58:
+            apply_version = apply_version and {
+                "source_workspace_id", "digest_cursor_prompt_version"
+            }.issubset({row[1] for row in conn.execute("PRAGMA table_info(sessions)")})
+        if version == 59:
+            apply_version = apply_version and _table_exists(conn, "procedures")
         if version == 40 and apply_v40 and not _v40_sql_is_complete(conn):
             _prepare_v40_legacy_shape(conn)
         if version == 46 and apply_version and _v46_sql_is_complete(conn):

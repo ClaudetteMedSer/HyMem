@@ -2,19 +2,19 @@
 retrieval, adapted 2026-08-14, implemented 2026-08-25).
 
 A retrieval-time expansion tier: seed a secondary lexical/vector expansion from
-the CURRENTLY ACTIVE graph facts — the same selection the digest anchor uses
+the CURRENTLY ACTIVE graph facts — the same ranking the digest anchor uses
 (`dreaming/aggregate.py:_anchor_facts`) — so that supporting-evidence rows
 which share no lexical or vector overlap with the query, but overlap with the
 *current state*, become reachable.
 
 Three pieces, mirroring the plan's tasks:
 
-1. ``select_anchor_edges`` — the exact ``_anchor_facts`` predicate
-   (``status='active' AND derived=0 AND invalid_at IS NULL AND
-   pos_evidence > neg_evidence``), ordered by evidence margin, bounded by
-   ``cap``. Copied verbatim from ``aggregate.py``; the digest function is NOT
-   refactored here (YAGNI — cross-module churn is a separate change if the
-   probe justifies it).
+1. ``select_anchor_edges`` — live direct graph edges, ordered by the shared
+   ``core.graph.anchor_edge_order_sql`` ranking and bounded by ``cap``.
+   Evidence margin and normalized recency outrank canonical claim coordinates;
+   insertion order cannot decide a semantic tie. The digest additionally
+   requires exact source proofs before its cap; retrieval's live-edge
+   compatibility policy stays separate.
 2. ``seed_terms_from_edges`` — canonical subject + predicate + object, plus
    typed-value sub-terms mirroring ``value_supersession.py``'s v3 classes:
    a version's alpha prefix is the discriminative side (``python_3.12`` ->
@@ -53,29 +53,27 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
+from hymem.core.graph import live_edge_predicate
 from hymem.dreaming.value_supersession import _ISO_DATE, _classify_object
 
-# The exact anchor ordering/projection. The truth predicate itself comes from
-# core.graph so every public/live reader changes together.
+# The anchor projection and live predicate; ordering is filled from the shared
+# core.graph helper at execution, not frozen at module import.
 #
 # `id` is projected in ADDITION to the digest's three columns. The digest only
 # renders text; the probe must trace a seed edge back to the chunks it was
-# extracted from, to exclude provenance-circular "recoveries" (D4). The filter,
-# the ordering and the cap are untouched, which is what the parity control
-# pins.
+# extracted from, to exclude provenance-circular "recoveries" (D4). The digest
+# retains its additional exact-proof gate before spending its anchor budget.
 _ANCHOR_SQL = f"""
     SELECT id, subject_canonical, predicate, object_canonical
     FROM knowledge_graph
     WHERE {live_edge_predicate()}
-    ORDER BY pos_evidence - neg_evidence DESC,
-             {graph_clock_order_sql('last_seen')}, id
+    ORDER BY {{order_by}}
     LIMIT ?
 """
 
 
 def select_anchor_edges(conn: sqlite3.Connection, cap: int = 20) -> list[sqlite3.Row]:
-    """The bitemporal active edge set, exactly as ``_anchor_facts`` selects it.
+    """The bitemporal live edge set, with the digest's shared total ordering.
 
     ``cap`` bounds the list (house style like ``aggregation_digest_anchor_facts``,
     default 20); cap <= 0 returns [] (mirrors the digest's early return).
@@ -86,7 +84,11 @@ def select_anchor_edges(conn: sqlite3.Connection, cap: int = 20) -> list[sqlite3
     """
     if cap <= 0:
         return []
-    return conn.execute(_ANCHOR_SQL, (cap,)).fetchall()
+    from hymem.core.graph import anchor_edge_order_sql
+
+    return conn.execute(
+        _ANCHOR_SQL.format(order_by=anchor_edge_order_sql()), (cap,),
+    ).fetchall()
 
 
 def select_anchor_profile_rows(conn: sqlite3.Connection, cap: int = 20) -> list:
@@ -239,7 +241,7 @@ def state_anchor_expand(
         return []
 
     # One combined FTS OR-query keeps the call count small: a query over all
-    # seed terms at top_k. `_fts_search` fragments on _FTS_SAFE (dots split,
+    # seed terms at top_k. `_fts_search` uses `_fts_safe_text` (dots split,
     # quotes stripped), so separator-heavy canonical terms (cuda_12.1,
     # 65_percent) are matched through their v3-class sub-terms — the version
     # prefix / unit / year the seed generator emits — while plain canonical

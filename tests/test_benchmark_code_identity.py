@@ -266,6 +266,7 @@ def _write_source_tree(root: Path) -> dict[str, Path]:
 def _common_kwargs(paths: dict[str, Path]) -> dict[str, Path]:
     return {
         "strictness_path": paths["strictness"],
+        "archive_evidence_path": paths.get("archive_evidence"),
         "lme_adapter_path": paths["adapter"],
         "lme_protocol_path": paths["protocol"],
         "extraction_canary_path": paths["canary"],
@@ -278,6 +279,7 @@ def _lme_hash(paths: dict[str, Path]) -> str:
     return lme.longmemeval_code_hash(
         adapter_path=paths["adapter"],
         strictness_path=paths["strictness"],
+        archive_evidence_path=paths.get("archive_evidence"),
         protocol_path=paths["protocol"],
         run_registry_path=paths["run_registry"],
         extraction_canary_path=paths["canary"],
@@ -383,6 +385,25 @@ def test_identities_are_checkout_independent(tmp_path: Path):
     first = _write_source_tree(tmp_path / "checkout-a")
     second = _write_source_tree(tmp_path / "checkout-b")
     assert _hashes(first) == _hashes(second)
+
+
+def test_reachable_archive_evidence_changes_all_four_identities(tmp_path: Path):
+    paths = _write_source_tree(tmp_path / "archive-evidence")
+    archive = paths["strictness"].with_name("archive_evidence.py")
+    paths["archive_evidence"] = archive
+    archive.write_text(
+        "def checkpoint_attestation(value):\n    return value + 17\n"
+        "def unused_archive_helper(value):\n    return value + 999\n",
+        encoding="utf-8",
+    )
+    _replace(paths["strictness"], "def strict_guard(value):\n    return strict_helper(value)",
+             "def strict_guard(value):\n    from benchmarks.archive_evidence import checkpoint_attestation\n    return checkpoint_attestation(strict_helper(value))")
+    before = _hashes(paths)
+    _replace(archive, "value + 17", "value + 18")
+    after = _hashes(paths)
+    _assert_changed(before, after, set(_HASHERS))
+    _replace(archive, "value + 999", "value + 1000")
+    assert _hashes(paths) == after
 
 
 @pytest.mark.parametrize(

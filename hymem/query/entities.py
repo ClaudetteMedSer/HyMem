@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
@@ -14,11 +15,27 @@ from hymem.core.graph import live_edge_predicate
 # matching thousands of subjects doesn't return thousands of strings.
 _COUNT_EVIDENCE_CAP = 100
 
-# First char must be a Unicode letter (so accented Latin words like "préfère"
-# tokenize whole instead of being shredded at the accent); body allows letters,
-# digits, underscore, hyphen, dot. normalize() then folds it consistently with
-# how the entity was stored.
-_TOKEN = re.compile(r"[^\W\d_][\w\-.]{1,40}")
+def _entity_tokens(message: str) -> Iterable[str]:
+    """Keep complete Unicode words, including their dependent vowel marks.
+
+    Python's word regex excludes combining marks. It also used to match a
+    truncated prefix of a long name; normalize the whole token and let the
+    canonical length bound reject it instead. One-letter names are valid in
+    many scripts (including Й and single CJK characters).
+    """
+    token: list[str] = []
+    for character in message:
+        category = unicodedata.category(character)
+        if category.startswith("L") or (
+            token and (category[0] in {"M", "N"} or character in "_-.")
+        ):
+            token.append(character)
+        else:
+            if token:
+                yield "".join(token)
+                token = []
+    if token:
+        yield "".join(token)
 
 
 def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
@@ -28,8 +45,8 @@ def match_known_entities(conn: sqlite3.Connection, message: str) -> list[str]:
     the alias table and the graph's existing canonical names. Cheap, deterministic,
     and the graph is its own dictionary — no LLM call needed at query time.
     """
-    raw_tokens = {m.group(0) for m in _TOKEN.finditer(message)}
-    candidates = {normalize(t) for t in raw_tokens if len(t) >= 2}
+    raw_tokens = set(_entity_tokens(message))
+    candidates = {key for token in raw_tokens if (key := normalize(token))}
 
     # Also try multi-word phrases (up to 3-grams) to catch "local dev environment".
     words = [w for w in re.split(r"\s+", message.strip()) if w]

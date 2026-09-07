@@ -297,6 +297,7 @@ def test_malformed_profile_generation_cannot_claim_steady_state(
         config = profile_config_version(
             max_chars=hy.config.dream_digest_max_chars,
             max_items=hy.config.profile_max_items_per_session,
+            client=llm,
         )
         assert profile_generation_matches_config(
             repaired["profile_cursor_prompt_version"], config

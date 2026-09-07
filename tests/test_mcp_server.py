@@ -143,6 +143,8 @@ class _DreamToolDouble:
         self.status_calls = 0
         self.dream_calls: list[object] = []
         self.logged: list[tuple[str, str, str]] = []
+        self.batch_calls: list[tuple[str, list, bool]] = []
+        self.closed_sessions: list[str] = []
 
     def dream(self, *, session_ids=None):
         self.dream_calls.append(session_ids)
@@ -159,6 +161,16 @@ class _DreamToolDouble:
 
     def log_message(self, session_id, role, content):
         self.logged.append((session_id, role, content))
+
+    def log_messages(self, session_id, turns, *, close_session=False):
+        batch = list(turns)
+        prepared = [(session_id, role, content) for role, content in batch]
+        first_id = len(self.logged) + 1
+        self.batch_calls.append((session_id, batch, close_session))
+        self.logged.extend(prepared)
+        if close_session:
+            self.closed_sessions.append(session_id)
+        return list(range(first_id, first_id + len(prepared)))
 
     def close_session(self, _session_id):
         return None
@@ -689,11 +701,12 @@ def test_dream_tool_reports_run_budget_exhaustion_as_incomplete(
         None,
         {"pending_chunks": 0},
         _clean_dream_status(dream_status_schema="hymem-dream-status-v1"),
+        _clean_dream_status(dream_status_schema="hymem-dream-status-v6"),
         _clean_dream_status(pending_chunks=True),
         _clean_dream_status(in_progress=0),
     ),
     ids=(
-        "not-a-dict", "missing-fields", "wrong-schema", "bool-count",
+        "not-a-dict", "missing-fields", "wrong-schema", "pre-memory-producer-schema", "bool-count",
         "non-bool-lock",
     ),
 )
@@ -785,6 +798,8 @@ def test_capture_clean_target_never_claims_store_wide_completion(monkeypatch):
     assert "dreaming complete" not in result
     assert fake.dream_calls == [["target-session"]]
     assert fake.status_calls == 1
+    assert fake.batch_calls == [("target-session", [("user", "remember this")], True)]
+    assert fake.closed_sessions == ["target-session"]
 
 
 def test_dream_tool_clean_snapshot_describes_new_completions_without_ratio(

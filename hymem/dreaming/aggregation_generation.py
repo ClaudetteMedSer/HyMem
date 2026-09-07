@@ -56,6 +56,7 @@ def aggregation_generation_contract(cfg: HyMemConfig) -> dict[str, str]:
     # build boundary, after its definitions are complete.
     from hymem.dreaming import aggregate as implementation
     from hymem.dreaming import aggregation_provenance as provenance
+    from hymem.core import graph as graph_semantics
     from hymem.extraction import jsonio as json_parser
     from hymem.dreaming.aggregation_provenance import (
         AGGREGATION_MAX_SUMMARY_CHARS,
@@ -161,6 +162,11 @@ def aggregation_generation_contract(cfg: HyMemConfig) -> dict[str, str]:
         load_profile_anchor_inputs,
         load_knowledge_graph_anchor_inputs,
         load_root_anchor_inputs,
+        # Anchor selection imports these at execution. Bind their loaded
+        # implementations as well as the caller, including rebound helpers.
+        graph_semantics.anchor_edge_order_sql,
+        graph_semantics.graph_clock_order_sql,
+        graph_semantics.bounded_graph_clock_sql,
         persist_aggregation_source_manifest,
         aggregation_typed_input_fingerprint,
         aggregation_input_manifest_hash,
@@ -174,7 +180,7 @@ def aggregation_generation_contract(cfg: HyMemConfig) -> dict[str, str]:
     )
     executable = _digest({
         "module_source_sha256": _CANONICAL_MODULE_SHA256(
-            implementation, provenance, json_parser,
+            implementation, provenance, json_parser, graph_semantics,
         ),
         "runtime_callable_surface_sha256": callable_surface,
     })

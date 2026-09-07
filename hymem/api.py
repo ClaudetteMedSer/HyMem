@@ -504,6 +504,7 @@ class HyMem:
         *,
         source_peer_ids: Iterable[str | None] | None = None,
         source_workspace_id: str | None = None,
+        close_session: bool = False,
     ) -> list[int]:
         """Append a batch of turns in a single transaction.
 
@@ -513,7 +514,12 @@ class HyMem:
         observation clock by at most 300 seconds; omit it (or pass the 2-tuple)
         to use ingestion time. Any invalid turn rolls back the full batch and
         its coverage artifacts. One BEGIN IMMEDIATE covers the whole batch.
+        Set ``close_session=True`` to include session closure in that same
+        atomic commit. Default callers keep the existing open-session behavior.
+        Best-effort embedding runs only after the complete batch commits.
         """
+        if not isinstance(close_session, bool):
+            raise ValueError("close_session must be a boolean")
         prepared = [
             (
                 turn[0],
@@ -557,6 +563,8 @@ class HyMem:
                 for (role, content, created_at), peer_id in zip(prepared, peers)
             ]
             materialize_message_coverage(self.conn, session_id)
+            if close_session:
+                session_log.close_session(self.conn, session_id)
         self._embed_pending_messages_best_effort(message_ids)
         return message_ids
 
@@ -1322,7 +1330,7 @@ class HyMem:
             ),
             embedding_client=self._embed,
         )
-        work_status = durable_dream_work_status(conn, self.config)
+        work_status = durable_dream_work_status(conn, self.config, client=self._llm)
 
         return {
             **work_status,

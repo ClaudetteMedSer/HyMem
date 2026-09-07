@@ -7,13 +7,22 @@ database file without `database is locked` errors.
 """
 from __future__ import annotations
 
+import sqlite3
 import threading
-import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from hymem import HyMem, HyMemConfig, StubEmbeddingClient
-from hymem.extraction.llm import LLMClient, LLMRequest, StubLLMClient
+from hymem.extraction.llm import LLMRequest, StubLLMClient
+from hymem.extraction.prompts import (
+    SESSION_DIGEST_SYSTEM,
+    build_chunk_empty_verification_system,
+    build_chunk_extraction_system,
+    build_chunk_omission_verification_system,
+)
 
 _ITERATIONS = 25
 _EMPTY_EXTRACTION = '{"triples":[],"markers":[],"complete":true}'
@@ -94,33 +103,68 @@ def test_dreaming_ingestion_and_reads_coexist(tmp_path: Path) -> None:
     assert not errors, f"concurrent access raised: {errors!r}"
 
 
+_COORDINATION_TIMEOUT = 15.0  # Hang protection, not a latency/performance SLO.
+_LIVE_TURNS = [
+    ("user", "parkedbatchtoken first complete source message"),
+    ("assistant", "parkedbatchtoken second complete source message"),
+]
+
+
 @dataclass
-class _SlowLLM:
-    """LLM stub that sleeps on every call — mimics real provider latency."""
-    delay_seconds: float = 0.2
-    default: str = _EMPTY_EXTRACTION
-    call_count: int = 0
-    _lock: threading.Lock = field(default_factory=threading.Lock)
+class _ParkedLLM:
+    """Park one real provider invocation until the independent writer finishes."""
+
+    scope: str
+    hold_writer_lock: bool = False
+    conn: sqlite3.Connection | None = None
+    entered: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+    exited: threading.Event = field(default_factory=threading.Event)
+    entry_transactions: list[bool] = field(default_factory=list)
+    parked_request: LLMRequest | None = None
+    parked_in_transaction: bool | None = None
+    timed_out: bool = False
 
     def complete(self, request: LLMRequest) -> str:
-        with self._lock:
-            self.call_count += 1
-        time.sleep(self.delay_seconds)
-        return self.default
+        assert self.conn is not None
+        self.entry_transactions.append(self.conn.in_transaction)
+        if request.system == SESSION_DIGEST_SYSTEM:
+            scope = "digest"
+            result = (
+                '{"episodes":[],"summary":"Conversational turns were recorded.",'
+                '"procedures":[]}'
+            )
+        else:
+            assert request.system in {
+                build_chunk_extraction_system(),
+                build_chunk_empty_verification_system(),
+                build_chunk_omission_verification_system(),
+            }, "unexpected provider scope"
+            scope = "phase1"
+            result = _EMPTY_EXTRACTION
+        if scope != self.scope or self.entered.is_set():
+            return result
+
+        # The negative control deliberately recreates the original regression
+        # on the actual dream connection, without patching production fences.
+        if self.hold_writer_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.parked_request = request
+            self.parked_in_transaction = self.conn.in_transaction
+            self.entered.set()
+            if not self.release.wait(_COORDINATION_TIMEOUT):
+                self.timed_out = True
+                raise AssertionError("test did not release the parked provider")
+        finally:
+            if self.hold_writer_lock:
+                self.conn.rollback()
+            self.exited.set()
+        return result
 
 
-def test_ingestion_not_blocked_by_in_flight_dream(tmp_path: Path) -> None:
-    """Regression for the proc=0 stall.
-
-    With LLM calls inside BEGIN IMMEDIATE (pre-fix), an in-flight dream holds
-    the SQLite WAL writer lock for the duration of each LLM call (~200 ms in
-    this test, multi-seconds in prod). Concurrent log_messages writes block
-    on the file-level lock and pile up.
-
-    Post-fix, LLM calls run outside transactions, so the dream only holds the
-    writer lock for the brief persist step. Ingestion writes should complete
-    in milliseconds even while the dream is mid-cycle.
-    """
+@contextmanager
+def _in_flight_dream(tmp_path: Path, scope: str, *, hold_writer_lock=False):
     cfg = HyMemConfig(
         root=tmp_path,
         profile_extraction_enabled=False,
@@ -129,66 +173,152 @@ def test_ingestion_not_blocked_by_in_flight_dream(tmp_path: Path) -> None:
         episode_granularity_enabled=False,
         dream_extraction_provider_attempt_budget=4,
     )
-    slow = _SlowLLM(delay_seconds=0.2)
-
+    provider = _ParkedLLM(scope, hold_writer_lock=hold_writer_lock)
     ingest = HyMem(cfg, llm=StubLLMClient(default=_EMPTY_EXTRACTION),
                    embedding_client=StubEmbeddingClient())
-    dreamer: HyMem = HyMem(cfg, llm=slow, embedding_client=StubEmbeddingClient())
-
-    # Seed enough chunks so the dream actually has phase1 work to do.
-    _seed(ingest, "sess-seed", 4)
-    ingest.conn
-    dreamer.conn
-
-    dream_done = threading.Event()
-    ingest_latencies: list[float] = []
+    dreamer = HyMem(cfg, llm=provider, embedding_client=StubEmbeddingClient())
+    observer = None
+    worker = None
     errors: list[BaseException] = []
 
     def dream_runner() -> None:
         try:
-            dreamer.dream()
+            dreamer.dream(session_ids=["sess-seed"])
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
-        finally:
-            dream_done.set()
 
-    def ingest_runner() -> None:
-        # Give the dream a head start so it's mid-cycle when we write.
-        time.sleep(0.05)
-        for i in range(20):
-            if dream_done.is_set():
-                break
-            start = time.monotonic()
-            try:
-                ingest.log_messages(
-                    "sess-live",
-                    [("user", f"live message {i} long enough to be a chunk in the dream cycle")],
-                )
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
-                return
-            ingest_latencies.append(time.monotonic() - start)
-            time.sleep(0.02)
+    try:
+        # Complete schema/connection initialization before synchronization.
+        _seed(ingest, "sess-seed", 4)
+        provider.conn = dreamer.conn
+        assert ingest.conn is not dreamer.conn
+        ingest.conn.execute("PRAGMA busy_timeout=0")
+        assert ingest.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 0
+        observer = sqlite3.connect(cfg.db_path, isolation_level=None)
+        observer.row_factory = sqlite3.Row
+        worker = threading.Thread(target=dream_runner, daemon=True)
+        worker.start()
+        assert provider.entered.wait(_COORDINATION_TIMEOUT), (
+            f"dream never reached the real {scope} provider: {errors!r}"
+        )
+        assert provider.parked_request is not None
+        assert "conversational turn number" in provider.parked_request.user
+        if scope == "phase1":
+            assert '"source_message_id":' in provider.parked_request.user
+        else:
+            assert "[chunk msgcov_" in provider.parked_request.user
+        assert not any(provider.entry_transactions), (
+            "production entered a provider while holding a transaction"
+        )
+        assert provider.parked_in_transaction is hold_writer_lock
+        assert not provider.exited.is_set()
+        yield ingest, observer, provider, worker
+    finally:
+        # Also runs when any assertion or fail-fast writer raises. Never leave
+        # a parked provider behind or close its SQLite handle while it is used.
+        provider.release.set()
+        if worker is not None:
+            worker.join(_COORDINATION_TIMEOUT)
+        if observer is not None:
+            observer.close()
+        ingest.close()
+        if worker is None or not worker.is_alive():
+            dreamer.close()
+        assert worker is None or not worker.is_alive(), "dream worker did not stop"
+        assert not provider.timed_out, "provider safety deadline expired"
+        assert not errors, f"concurrent access raised: {errors!r}"
+        assert not any(provider.entry_transactions)
 
-    t_dream = threading.Thread(target=dream_runner)
-    t_ingest = threading.Thread(target=ingest_runner)
-    t_dream.start()
-    t_ingest.start()
-    t_dream.join(timeout=10)
-    t_ingest.join(timeout=10)
 
-    assert not t_dream.is_alive(), "dream worker did not stop"
-    assert not t_ingest.is_alive(), "ingest worker did not stop"
-
-    ingest.close()
-    dreamer.close()
-
-    assert not errors, f"concurrent access raised: {errors!r}"
-    assert slow.call_count > 0, "dream should have made LLM calls during the test"
-    assert ingest_latencies, "ingest writer should have run during the dream"
-    # Pre-fix: latencies would cluster at ~200 ms (full LLM-call hold time)
-    # or hit busy_timeout. Post-fix: tens of milliseconds at most.
-    p95 = sorted(ingest_latencies)[int(0.95 * (len(ingest_latencies) - 1))]
-    assert p95 < 0.1, (
-        f"ingestion p95 latency {p95*1000:.0f} ms — dream still blocks writers"
+def _assert_committed_batch(ingest, observer, message_ids):
+    """A third connection must see the entire batch, not uncommitted SQL."""
+    assert len(message_ids) == len(_LIVE_TURNS)
+    assert not ingest.conn.in_transaction
+    rows = observer.execute(
+        "SELECT id, role, content FROM messages WHERE session_id='sess-live' ORDER BY id"
+    ).fetchall()
+    assert [row["id"] for row in rows] == message_ids
+    assert [(row["role"], row["content"]) for row in rows] == _LIVE_TURNS
+    session = observer.execute(
+        "SELECT ended_at, coverage_message_id FROM sessions WHERE id='sess-live'"
+    ).fetchone()
+    assert session["ended_at"] is not None
+    assert session["coverage_message_id"] == message_ids[-1]
+    coverage = observer.execute(
+        "SELECT mc.message_id, json_extract(c.text, '$.content') AS content "
+        "FROM message_retention_coverage mc JOIN chunks c ON c.id=mc.chunk_id "
+        "WHERE c.session_id='sess-live' ORDER BY mc.message_id"
+    ).fetchall()
+    assert [(row["message_id"], row["content"]) for row in coverage] == list(
+        zip(message_ids, [content for _, content in _LIVE_TURNS])
     )
+    assert [row[0] for row in observer.execute(
+        "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'parkedbatchtoken' "
+        "ORDER BY rowid"
+    )] == message_ids
+    assert [row[0] for row in observer.execute(
+        "SELECT mc.message_id FROM message_coverage_fts f "
+        "JOIN chunks c ON c.rowid=f.rowid "
+        "JOIN message_retention_coverage mc ON mc.chunk_id=c.id "
+        "WHERE message_coverage_fts MATCH 'parkedbatchtoken' ORDER BY mc.message_id"
+    )] == message_ids
+    assert [row[0] for row in observer.execute(
+        "SELECT message_id FROM message_embeddings "
+        "WHERE message_id IN (SELECT id FROM messages WHERE session_id='sess-live') "
+        "ORDER BY message_id"
+    )] == message_ids
+
+
+@pytest.mark.parametrize("scope", ["phase1", "digest"])
+def test_ingestion_not_blocked_by_in_flight_dream(tmp_path: Path, scope: str) -> None:
+    """A provider must not retain the WAL writer lock for its whole latency.
+
+    An end-to-end log_messages p95 conflates ordinary transaction contention,
+    SQL/Python work, scheduling and post-commit embedding. It cannot establish
+    that a provider holds a transaction, nor is this test a throughput SLO.
+    Instead, hold the actual provider in flight and disable SQLite lock waits:
+    the complete batch and both FTS indexes must commit before its release.
+    """
+    with _in_flight_dream(tmp_path, scope) as (ingest, observer, provider, _):
+        ids = ingest.log_messages("sess-live", _LIVE_TURNS, close_session=True)
+        _assert_committed_batch(ingest, observer, ids)
+        assert not provider.release.is_set()
+        assert not provider.exited.is_set()
+        assert not provider.conn.in_transaction
+
+
+@pytest.mark.parametrize("scope", ["phase1", "digest"])
+def test_in_flight_lock_probe_detects_provider_held_write_transaction(
+    tmp_path: Path, scope: str,
+) -> None:
+    """Negative control: the same writer detects the original lock regression."""
+    with _in_flight_dream(tmp_path, scope, hold_writer_lock=True) as state:
+        ingest, observer, provider, worker = state
+        for _ in range(2):
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                ingest.log_messages("sess-live", _LIVE_TURNS, close_session=True)
+            assert not ingest.conn.in_transaction
+            assert observer.execute(
+                "SELECT count(*) FROM sessions WHERE id='sess-live'"
+            ).fetchone()[0] == 0
+            assert observer.execute(
+                "SELECT count(*) FROM messages WHERE session_id='sess-live'"
+            ).fetchone()[0] == 0
+            assert not provider.exited.is_set()
+
+        provider.release.set()
+        worker.join(_COORDINATION_TIMEOUT)
+        assert not worker.is_alive()
+        assert provider.exited.is_set()
+        assert not provider.conn.in_transaction
+        ids = ingest.log_messages("sess-live", _LIVE_TURNS, close_session=True)
+        _assert_committed_batch(ingest, observer, ids)
+
+
+def test_in_flight_probe_releases_provider_after_assertion_failure(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError, match="forced assertion failure"):
+        with _in_flight_dream(tmp_path, "phase1") as (_, _, provider, worker):
+            raise AssertionError("forced assertion failure")
+    assert provider.release.is_set()
+    assert provider.exited.is_set()
+    assert not worker.is_alive()

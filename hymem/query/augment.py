@@ -1139,27 +1139,39 @@ def should_rerank(
     return True
 
 
-_FTS_SAFE = re.compile(r"[^A-Za-z0-9_\- ]+")
+def _fts_safe_text(text: str) -> str:
+    """Keep Unicode text while excluding every FTS operator/quote character.
+
+    Callers still quote each term and bind the complete MATCH expression.
+    Marks remain attached in query text; SQLite's tokenizer is the authority
+    for indexed full-text tokens, which are candidates, not entity identities.
+    """
+    return "".join(
+        character if (
+            unicodedata.category(character)[0] in {"L", "M", "N"}
+            or character in "_- "
+        ) else " "
+        for character in text
+    )
 
 
 def _fold_diacritics(text: str) -> str:
-    """Strip combining diacritics so a query token matches the FTS index.
+    """Fold Latin accents without deleting other scripts' meaningful marks.
 
-    The FTS5 `unicode61` tokenizer folds diacritics when it builds the index
-    ("café" is stored as "cafe"), but `_FTS_SAFE` below is an ASCII-only
-    whitelist — so without this step it would SHRED an accented query token
-    before it ever reaches FTS ("café" → "caf", "coördinatie" → "co rdinatie"),
-    and the Dutch/loanword query would silently match nothing while the index
-    holds the folded form. NFKD splits each precomposed letter into base + mark;
-    dropping the combining marks (`unicodedata.combining`) yields the same ASCII
-    base the index stored, so query and index agree. This covers the full Dutch
-    diacritic set (ë ï ö é ü á è …); precomposed Latin letters with no canonical
-    decomposition (ø ß æ — not used in Dutch) are left for the ASCII strip and
-    are a known out-of-scope residual."""
+    Do not casefold here: unicode61 indexes Straße as straße, not strasse.
+    Literal entity checks perform their own casefold after this shared step.
+    """
+    from hymem.dreaming.canonicalize import _fold_latin_accents
+
+    return unicodedata.normalize("NFC", _fold_latin_accents(text))
+
+
+def _lexical_words(text: str) -> list[str]:
+    folded = _fold_diacritics(text).casefold()
     return "".join(
-        ch for ch in unicodedata.normalize("NFKD", text)
-        if not unicodedata.combining(ch)
-    )
+        character if unicodedata.category(character)[0] in {"L", "M", "N"}
+        else " " for character in folded
+    ).split()
 
 
 def _fts_search(
@@ -1171,7 +1183,7 @@ def _fts_search(
     source_peer_id: str | None = None,
     source_workspace_id: str | None = None,
 ) -> list[FtsHit]:
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     if not cleaned:
         return []
     # Build an OR query across tokens so partial matches still surface results.
@@ -1408,7 +1420,7 @@ def _message_fts_search(
     it reaches turns dreaming never chunked. Returns [] (not an error) if the
     table is absent — e.g. a DB migrated by older code — so retrieval degrades to
     chunk-FTS rather than failing."""
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     if not cleaned:
         return []
     tokens = [t for t in cleaned.split() if len(t) >= 2]
@@ -1471,7 +1483,7 @@ def _coverage_message_fts_search(
     the bounded candidate scan; every survivor is then independently validated
     before its decoded content can reach a caller.
     """
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     tokens = [token for token in cleaned.split() if len(token) >= 2]
     if not tokens or top_k <= 0:
         return []
@@ -1756,7 +1768,7 @@ def _aggregate_tokens(query: str) -> list[str]:
     tokens shorter than 3 chars. Falls back to the normal len>=2 tokenization if
     that empties the set (a question made entirely of stop/short words), so the
     query is never empty."""
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     if not cleaned:
         return []
     parts = cleaned.split()
@@ -2037,7 +2049,7 @@ def _temporal_message_events(
     (`temporal_mentions`), so the list is purely chronological evidence. Degrades
     to [] — never raises — when `temporal_mentions` or `messages_fts` is absent
     (pre-v14 DB), mirroring `_message_fts_search`'s OperationalError tolerance."""
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     tokens = [t for t in cleaned.split() if len(t) >= 2]
 
     # When the query carries content tokens, scope the timeline to messages that
@@ -3150,15 +3162,8 @@ def _graph_lookup(
 
 def _query_mentions_canonical(query: str, canonical: str) -> bool:
     """Conservative Unicode-aware literal mention without global alias state."""
-    # ``[^\W_]`` means any Unicode word character except underscore. It keeps
-    # Greek, CJK, Cyrillic, and other scripts intact while treating canonical
-    # separators (``_``, punctuation, whitespace) uniformly as boundaries.
-    def words(value: str) -> list[str]:
-        folded = _fold_diacritics(value).casefold()
-        return re.findall(r"[^\W_]+", folded, flags=re.UNICODE)
-
-    query_words = words(query)
-    entity_words = words(canonical)
+    query_words = _lexical_words(query)
+    entity_words = _lexical_words(canonical)
     if not query_words or not entity_words:
         return False
     width = len(entity_words)
@@ -4077,9 +4082,8 @@ def _quality_allows_candidate(
         return True
 
     def words(text: str) -> list[str]:
-        folded = _fold_diacritics(text).casefold()
         return [
-            token for token in re.findall(r"[^\W_]+", folded, flags=re.UNICODE)
+            token for token in _lexical_words(text)
             if len(token) >= 3 and token not in _LOCAL_LEXICAL_STOPWORDS
         ]
 
@@ -4187,7 +4191,7 @@ def _episode_search(
     """
     from hymem.core import db as core_db
 
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     scope_sql, scope_params = _derived_scope_sql(
         "e", "start_message_id", "end_message_id",
         source_session_id=source_session_id,
@@ -4348,7 +4352,7 @@ def _fact_search(
     ranking. Every survivor then crosses the full coverage/hash/lifecycle
     validator before any external quality hook can inspect its text.
     """
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     scope_clauses = [
         "f.source_outcome_key IS NOT NULL",
         "f.lifecycle_status='active'",
@@ -4777,7 +4781,7 @@ def _aggregation_search_v55(
         return _query_source_occurrences(occurrences)
 
     candidate_k = max(1, top_k * 2)
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     fts_hits: list[AggregationNodeHit] = []
     tokens = [token for token in cleaned.split() if len(token) >= 2]
     if tokens:
@@ -5002,7 +5006,7 @@ def _rrf_merge_aggregation(
 
 
 def _procedure_search(conn: sqlite3.Connection, query: str, top_k: int = 3) -> list[ProcedureHit]:
-    cleaned = _FTS_SAFE.sub(" ", _fold_diacritics(query)).strip()
+    cleaned = _fts_safe_text(_fold_diacritics(query)).strip()
     if not cleaned:
         return []
     tokens = [t for t in cleaned.split() if len(t) >= 2]

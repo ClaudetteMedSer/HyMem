@@ -53,6 +53,9 @@ def _publish(
         start_offset=int(cursor["facts_cursor_offset"] or 0),
     )
     assert extraction is not None
+    # Historical authority fixtures intentionally vary fixture output per
+    # unit; they test portable ledger integrity, not current producer reuse.
+    extraction.publication_version = facts.facts_config_version(hy.config)
     with core_db.transaction(hy.conn):
         facts.persist_facts(
             hy.conn, session_id, extraction,
@@ -67,6 +70,7 @@ def _replay(hy: HyMem, slice_key: str, items: list[dict]) -> None:
         hy.conn, slice_key,
         StubLLMClient(default=json.dumps(items)), hy.config,
     )
+    extraction.publication_version = facts.facts_config_version(hy.config)
     with core_db.transaction(hy.conn):
         facts.persist_facts(
             hy.conn, "portable-facts", extraction,

@@ -205,6 +205,70 @@ def test_search_ignores_untokenizable_queries() -> None:
     conn.close()
 
 
+@pytest.fixture
+def unicode_fact_index():
+    conn = open_fact_index()
+    texts = {
+        "han2": "猫2 owns a bicycle.",
+        "han3": "猫3 owns a telescope.",
+        "han23": "猫23 owns a camera.",
+        "tokyo": "東京2 has a station.",
+        "osaka": "大阪2 has a harbor.",
+        "cyrillic": "Мария prefers tea.",
+        "hindi": "की prefers mangoes.",
+        "german": "Straße has a bakery.",
+        "accented": "The café sells coffee.",
+        "unaccented": "Andre grows flowers.",
+    }
+    try:
+        for session_id, text in texts.items():
+            index_facts(conn, session_id, [{"text": text}])
+        yield conn
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(("question", "expected_session"), [
+    ("猫2", "han2"), ("猫3", "han3"), ("東京2", "tokyo"), ("大阪2", "osaka"),
+    ("Мария", "cyrillic"), ("мария", "cyrillic"), ("की", "hindi"),
+    ("Straße", "german"), ("straße", "german"),
+    ("cafe", "accented"), ("café", "accented"), ("cafe\u0301", "accented"),
+    ("André", "unaccented"),
+])
+def test_unicode_fact_search_matches_real_sqlite_tokens(
+    unicode_fact_index, question, expected_session,
+) -> None:
+    hits = search_facts(unicode_fact_index, question, top_k=10)
+    assert [hit["session_id"] for hit in hits] == [expected_session]
+
+
+def test_fact_probe_imports_the_maintained_fts_normalizers() -> None:
+    from hymem.query import augment
+
+    assert fact_probe_module._fts_safe_text is augment._fts_safe_text
+    assert fact_probe_module._fold_diacritics is augment._fold_diacritics
+    assert fact_probe_module._fts_safe_text(
+        fact_probe_module._fold_diacritics("की Straße cafe\u0301 東京2")
+    ) == "की Straße cafe 東京2"
+
+
+@pytest.mark.parametrize(("question", "expected_sessions"), [
+    ('"猫2" OR NEAR(*)', {"han2"}),
+    ("text:猫2", {"han2"}),
+    ("猫2*", {"han2"}),
+    ('"猫2" NOT "猫3"', {"han2", "han3"}),
+    ("NEAR(猫2, 猫3)", {"han2", "han3"}),
+    ('猫2" OR 1=1 --', {"han2"}),
+    ("'; DROP TABLE facts; --", set()),
+])
+def test_fts_operator_syntax_is_only_literal_query_text(
+    unicode_fact_index, question, expected_sessions,
+) -> None:
+    hits = search_facts(unicode_fact_index, question, top_k=20)
+    assert {hit["session_id"] for hit in hits} == expected_sessions
+    assert unicode_fact_index.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 10
+
+
 # ── End-to-end plumbing (the --sim arm) ─────────────────────────────────────
 
 GOLD_TURN = ("I finally raised the postgres connection pool to 40 after the "

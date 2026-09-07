@@ -40,6 +40,28 @@ def graph_clock_order_sql(column: str, *, descending: bool = True) -> str:
     return f"({bounded} IS NOT NULL) DESC, {bounded} {direction}"
 
 
+def anchor_edge_order_sql(alias: str | None = None) -> str:
+    """Total KG anchor order shared by retrieval and proof-bearing digests.
+
+    Semantic coordinates break margin/instant ties before the local row id, so
+    inserting the same claims in a different order cannot change a capped
+    anchor. The unique subject/predicate/object constraint makes the id only a
+    final defensive tie-break. This fragment deliberately adds no filtering
+    or LIMIT: each consumer retains its live/proof and budget policy.
+    """
+    if alias is not None and (
+        not isinstance(alias, str) or _SQL_ALIAS.fullmatch(alias) is None
+    ):
+        raise ValueError("knowledge-graph SQL alias must be an identifier")
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"{prefix}pos_evidence - {prefix}neg_evidence DESC, "
+        f"{graph_clock_order_sql(prefix + 'last_seen')}, "
+        f"{prefix}subject_canonical, {prefix}predicate, "
+        f"{prefix}object_canonical, {prefix}id"
+    )
+
+
 def live_edge_predicate(
     alias: str | None = None,
     *,

@@ -74,7 +74,7 @@ def _healthy_indexing() -> dict:
         },
         "phase1_backlog_status": "current_producer",
         "pending_chunks_authoritative": True,
-        "phase1_generation_key": "hymem-phase1-generation-v1:test",
+        "phase1_generation_key": "hymem-phase1-generation-v1:" + "a" * 64,
         "terminal_loss_reasons": {},
         "coverage_integrity_failure_reasons": {},
         "coverage_integrity_failure_details": [],

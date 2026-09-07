@@ -208,7 +208,15 @@ slice to `hymem_beam/data/`.
 
 `MSCAdapter(db_path, …)` mirrors `HyMemAdapter` — isolated temp DB per dialogue,
 same `open()` → `HyMemConfig(root=…, **overrides)` + `OpenAICompatibleClient`, same
-`--keep-db`, same `fork()`-based bounded convergence. Two MSC-specific rules:
+`--keep-db`, same `fork()`-based bounded convergence.
+
+The explicit `db_path` must be `store_root / "hymem.sqlite"`, matching
+`HyMemConfig(root=store_root).db_path`. Other filenames are rejected before
+client or store creation; they are never silently redirected to a neighboring
+database. Receipt attestation also checks that this path still matches the
+open store. MSC recall/recurrence and LoCoMo reuse all use this same contract.
+
+Two MSC-specific rules:
 
 - **One HyMem session per MSC session — never merge.** LME chunks at 50 msgs/session
   (`f"{sess_id}_{i//50}"`); MSC sessions are ~10–14 turns, so keep exactly one

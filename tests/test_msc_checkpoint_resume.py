@@ -12,6 +12,7 @@ import pytest
 
 from benchmarks import msc_adapter as msc
 from benchmarks import msc_registry
+from tests.archive_evidence_fixtures import skipped_indexing, scoped_indexing
 from benchmarks.extraction_canary import (
     ExtractionCanaryError,
 )
@@ -65,17 +66,11 @@ def _zero_embedding() -> dict:
     return embedding_usage_snapshot(None, configured=False)
 
 
-def _runtime(example: dict, *, pipeline_calls: int = 0) -> dict:
+def _runtime(example: dict, *, pipeline_calls: int = 0, args=None) -> dict:
     scope = f"msc:{example['id']}"
     return {
         "scope_id": scope,
-        "indexing": {
-            "scope_id": scope,
-            "complete": False,
-            "healthy": False,
-            "comparable": False,
-            "skip_reason": "simulation",
-        },
+        "indexing": skipped_indexing(scope) if args is None else scoped_indexing(scope, args),
         "memory_pipeline_usage": _zero_llm(pipeline_calls),
         "embedding_usage": _zero_embedding(),
     }
@@ -196,7 +191,7 @@ def _argv(
 
 def _success(example, _args, _answer, _judge, **kwargs):
     row = _row(example)
-    kwargs["on_checkpoint"](row, _runtime(example))
+    kwargs["on_checkpoint"](row, _runtime(example, args=_args))
     return row
 
 
@@ -893,7 +888,7 @@ def test_shared_client_usage_is_snapshotted_once_not_per_question(
             client.request_attempts += 1
             client.successful_responses += 1
         row = _row(example)
-        kwargs["on_checkpoint"](row, _runtime(example))
+        kwargs["on_checkpoint"](row, _runtime(example, args=_args))
         return row
 
     monkeypatch.setattr(msc, "_build_llm", build)

@@ -215,6 +215,12 @@ def _module_source_digest(module: ModuleType, *roots: str) -> str:
 
 
 def _contract_components(prompt_version: str) -> dict[str, Any]:
+    # Resolve through the real publication consumers: a rebound module alias
+    # must not be represented by a separate import of its original definition.
+    from hymem.dreaming import phase1, phase1_auxiliary
+
+    canonicalize_module = phase1.canonicalize
+    auxiliary_canonicalize_module = phase1_auxiliary.canonicalize
     if (
         not isinstance(prompt_version, str)
         or not prompt_version
@@ -249,6 +255,11 @@ def _contract_components(prompt_version: str) -> dict[str, Any]:
         "schema": EXTRACTION_CONTRACT_SCHEMA,
         "contract_implementation": EXTRACTION_CONTRACT_IMPLEMENTATION_SHA256,
         "prompt_version": prompt_version,
+        "canonicalization_policy": canonicalize_module.CANONICALIZATION_POLICY_VERSION,
+        "canonicalization_unicode_version": canonicalize_module.CANONICAL_UNICODE_VERSION,
+        "auxiliary_canonicalization_policy": (
+            auxiliary_canonicalize_module.CANONICALIZATION_POLICY_VERSION
+        ),
         "prompt_bytes": {
             "primary_system": _text_digest(primary),
             "empty_verification_system": _text_digest(empty_verification),
@@ -298,6 +309,11 @@ def _contract_components(prompt_version: str) -> dict[str, Any]:
             "max_prose_boundary_context_chars": (
                 chunk_module._MAX_SOURCE_BOUNDARY_CONTEXT_CHARS
             ),
+            "conversation_context": chunk_module.SOURCE_CONVERSATION_CONTEXT_VERSION,
+            "max_conversation_context_records": chunk_module._MAX_CONVERSATION_CONTEXT_RECORDS,
+            "max_conversation_context_chars": chunk_module._MAX_CONVERSATION_CONTEXT_CHARS,
+            "max_conversation_context_encoded_chars": chunk_module._MAX_CONVERSATION_CONTEXT_ENCODED_CHARS,
+            "max_conversation_context_applicability_chars": chunk_module._MAX_CONVERSATION_CONTEXT_APPLICABILITY_CHARS,
             "clean_empty": chunk_module.CLEAN_EMPTY_RECOVERY_POLICY_VERSION,
             "retry_attempts": retry_module.DEFAULT_RETRY_ATTEMPTS,
             "max_completion_calls": (
@@ -319,6 +335,12 @@ def _contract_components(prompt_version: str) -> dict[str, Any]:
         # invalidation to unrelated prompt families or test clients. Logical
         # roots, never filesystem paths or object reprs, enter the digest.
         "executable_source": {
+            "canonicalization": _module_source_digest(
+                canonicalize_module, "normalize", "resolve",
+            ),
+            "auxiliary_canonicalization": _module_source_digest(
+                auxiliary_canonicalize_module, "normalize", "resolve",
+            ),
             "chunk": _module_source_digest(
                 chunk_module, "extract_chunk", "safe_failure_diagnostics"
             ),

@@ -881,7 +881,7 @@ def test_memory_adapters_close_owned_store_embedding_and_pipeline_once(
         )
     else:
         adapter = msc.MSCAdapter(
-            tmp_path / "msc.sqlite", api_key="key", embeddings=True,
+            tmp_path / "hymem.sqlite", api_key="key", embeddings=True,
         )
 
     adapter.open()

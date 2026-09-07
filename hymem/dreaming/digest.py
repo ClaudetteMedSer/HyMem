@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 
 from hymem.dreaming.episodes import EpisodesExtraction, validate_episode_items
-from hymem.dreaming.lossless import CoveredMessage, covered_messages_after
+from hymem.dreaming.lossless import (
+    CoveredMessage, covered_messages_after, lossless_cursor_is_valid,
+)
 from hymem.dreaming.procedures import ProceduresExtraction, validate_procedure_items
 from hymem.dreaming.summary import clean_summary
 from hymem.extraction.jsonio import is_ceiling_cut, loads_exact_or_fenced
@@ -42,7 +45,7 @@ _DIGEST_CONFIG_PATTERN = (
     rf"{re.escape(DIGEST_STREAM_VERSION)}\|"
     r"prompt=[^|\r\n]+\|episodes=[^|\r\n]+\|"
     r"chars=[1-9]\d*\|tokens=[1-9]\d*\|"
-    r"episode-cap=(?:blob|0|[1-9]\d*)"
+    r"episode-cap=(?:blob|0|[1-9]\d*)(?:\|semantic=sha256:[0-9a-f]{64})?"
 )
 _DIGEST_GENERATION_RE = re.compile(
     _DIGEST_CONFIG_PATTERN + r"\|walk=[0-9a-f]{32}"
@@ -55,15 +58,20 @@ _DIGEST_RETRY_RE = re.compile(
 
 def digest_config_version(
     *, prompt_version: str, episode_prompt_version: str | None, max_chars: int,
-    max_tokens: int, max_episodes: int | None,
+    max_tokens: int, max_episodes: int | None, client: object | None = None,
 ) -> str:
-    """Stable configuration prefix for one resumable digest walk."""
+    """Stable configuration/producer prefix for one resumable digest walk.
+
+    Omitting ``client`` constructs the recognized historical config-only
+    shape; runner and current-policy health checks always supply their client.
+    """
+    from hymem.dreaming.semantic_generation import semantic_generation_suffix
     return (
         f"{DIGEST_STREAM_VERSION}|prompt={prompt_version}|"
         f"episodes={episode_prompt_version or 'blob'}|chars={int(max_chars)}|"
         f"tokens={int(max_tokens)}|episode-cap="
         f"{int(max_episodes) if max_episodes is not None else 'blob'}"
-    )
+    ) + semantic_generation_suffix("digest", client)
 
 
 def digest_generation_matches_config(generation: object, config: str) -> bool:
@@ -251,6 +259,9 @@ class SessionDigest:
     episode_rejected_items: int = 0
     procedure_input_items: int = 0
     procedure_rejected_items: int = 0
+    # Hash the exact validated source snapshot read before the LLM call. This
+    # is re-proved when staging and again before completed publication.
+    source_sha256: str | None = None
 
 
 _DIGEST_SEPARATOR = "\n\n---\n\n"
@@ -438,6 +449,7 @@ def extract_session_digest(
     whose tail is already fully digested). No write transaction held; persist
     via the per-kind persist_* helpers inside one.
     """
+    before_cursor = (since_message_id, partial_message_id, since_message_offset)
     coverage_tail = conn.execute(
         "SELECT coverage_message_id FROM sessions WHERE id = ?", (session_id,)
     ).fetchone()["coverage_message_id"]
@@ -628,7 +640,220 @@ def extract_session_digest(
         caught_up=caught_up,
         episode_input_items=len(raw_episodes),
         procedure_input_items=len(data["procedures"]),
+        source_sha256=digest_source_sha256(
+            [message for message in messages if message.chunk_id in valid_chunk_ids],
+            before_cursor, (covered, partial_message_id, next_offset),
+        ),
     )
+
+
+def digest_source_sha256(messages: list[CoveredMessage], before: tuple, after: tuple) -> str:
+    return hashlib.sha256(json.dumps(
+        {"source": [asdict(message) for message in messages], "before": before, "after": after},
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+_MAX_DIGEST_STAGE_JSON_BYTES = 1_048_576
+
+
+def _digest_staging_json(items: list[dict]) -> str:
+    value = json.dumps(items, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                       separators=(",", ":"))
+    if len(value) > _MAX_DIGEST_STAGE_JSON_BYTES:
+        raise RuntimeError("digest staging exceeds its bounded payload limit")
+    return value
+
+
+def _validate_digest_staged_items(episodes, procedures, chunk_ids):
+    if not isinstance(episodes, list) or not isinstance(procedures, list):
+        raise RuntimeError("digest staging payload is not an array")
+    clean_episodes, rejected_episodes = _validate_digest_episode_items(episodes, chunk_ids)
+    clean_procedures, rejected_procedures = _validate_digest_procedure_items([
+        {**item, "chunk_ids": chunk_ids} if isinstance(item, dict) else item
+        for item in procedures
+    ], chunk_ids)
+    if (rejected_episodes or rejected_procedures or clean_episodes != episodes
+            or clean_procedures != procedures):
+        raise RuntimeError("digest staging payload violates its extraction contract")
+    return clean_episodes, clean_procedures
+
+
+def _staged_digest_cursor(row: sqlite3.Row, prefix: str) -> tuple:
+    return (
+        row[f"{prefix}_message_id"], row[f"{prefix}_partial_message_id"],
+        int(row[f"{prefix}_offset"] or 0),
+    )
+
+
+def _digest_stage_sources(conn, session_id: str, before: tuple, after: tuple):
+    if before == after or not all(
+        lossless_cursor_is_valid(conn, session_id, *cursor)
+        for cursor in (before, after)
+    ):
+        raise RuntimeError("digest staging has an invalid source cursor")
+    end = after[1] if after[1] is not None else after[0]
+    messages = covered_messages_after(
+        conn, session_id, before[0], through_message_id=end,
+    )
+    if (
+        not messages or messages[-1].message_id != end
+        or (before[1] is not None and messages[0].message_id != before[1])
+        or (before[0] == after[0] and after[2] <= before[2])
+    ):
+        raise RuntimeError("digest staging source range is not contiguous")
+    return messages
+
+
+def load_digest_staged_summary(
+    conn: sqlite3.Connection, session_id: str, generation: str,
+    cursor: tuple,
+) -> str | None:
+    """Read private rolling context only when its durable cursor matches."""
+    row = conn.execute(
+        "SELECT * FROM digest_staging WHERE session_id=? AND generation=? "
+        "ORDER BY COALESCE(cursor_before_message_id,-1) DESC, "
+        "cursor_before_offset DESC LIMIT 1", (session_id, generation),
+    ).fetchone()
+    if row is None:
+        return None
+    if _staged_digest_cursor(row, "cursor_after") != cursor:
+        raise RuntimeError("digest staging does not match its active cursor")
+    slices = load_completed_digest_slices(
+        conn, session_id, generation, require_complete=False,
+    )
+    return slices[-1]["summary"]
+
+
+def stage_digest_extraction(
+    conn: sqlite3.Connection, session_id: str, generation: str,
+    slice_key: str, extraction: SessionDigest, summary: str,
+    *, before: tuple, expected_state: tuple,
+) -> None:
+    """Stage one output and source proof inside the matching cursor transaction.
+
+    Only the active session generation is retained, so abandoned retries do
+    not accumulate. Published tables are untouched (including forward tails).
+    """
+    if not conn.in_transaction or extraction.parse_failed or not digest_generation_is_recognized(generation):
+        raise RuntimeError("digest staging requires a successful fenced transaction")
+    state = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if state is None or (
+        state["digest_cursor_prompt_version"], *_staged_digest_cursor(state, "digest_cursor")
+    ) != expected_state:
+        raise RuntimeError("digest staging cursor ownership changed during extraction")
+    after = (extraction.covered_message_id, extraction.partial_message_id, extraction.next_message_offset)
+    sources = _digest_stage_sources(conn, session_id, before, after)
+    source_hash = digest_source_sha256(sources, before, after)
+    if source_hash != extraction.source_sha256:
+        raise RuntimeError("digest extraction source changed before staging")
+    if not isinstance(summary, str) or len(summary) > 500:
+        raise RuntimeError("digest staging summary is invalid")
+    episodes, procedures = _validate_digest_staged_items(
+        extraction.episodes.items, extraction.procedures.items,
+        [message.chunk_id for message in sources],
+    )
+    conn.execute("DELETE FROM digest_staging WHERE session_id=? AND generation<>?", (session_id, generation))
+    conn.execute(
+        "INSERT INTO digest_staging(session_id,generation,slice_key,summary,"
+        "procedures_json,episodes_json,source_sha256,"
+        "cursor_before_message_id,cursor_before_partial_message_id,cursor_before_offset,"
+        "cursor_after_message_id,cursor_after_partial_message_id,cursor_after_offset) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, generation, slice_key, summary,
+         _digest_staging_json(procedures), _digest_staging_json(episodes), source_hash,
+         *before, *after),
+    )
+
+
+def load_completed_digest_slices(
+    conn: sqlite3.Connection, session_id: str, generation: str,
+    *, require_complete: bool = True,
+) -> list[dict]:
+    """Prove the full staged chain before the caller atomically publishes it."""
+    if require_complete and not conn.in_transaction:
+        raise RuntimeError("digest publication requires a transaction")
+    state = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if (state is None or state["digest_cursor_prompt_version"] != generation
+            or not digest_generation_is_recognized(generation)):
+        raise RuntimeError("digest publication generation is not the active cursor")
+    target = _staged_digest_cursor(state, "digest_cursor")
+    if require_complete and (
+        target != (state["coverage_message_id"], None, 0) or target[0] is None
+    ):
+        raise RuntimeError("digest publication has not reached its source tail")
+    rows = conn.execute(
+        "SELECT * FROM digest_staging WHERE session_id=? AND generation=? "
+        "ORDER BY COALESCE(cursor_before_message_id,-1),cursor_before_offset",
+        (session_id, generation),
+    ).fetchall()
+    expected_before = (
+        (state["auto_summary_message_id"], state["auto_summary_partial_message_id"],
+         int(state["auto_summary_message_offset"] or 0))
+        if generation == state["digest_published_generation"] else (None, None, 0)
+    )
+    result = []
+    for row in rows:
+        before = _staged_digest_cursor(row, "cursor_before")
+        after = _staged_digest_cursor(row, "cursor_after")
+        if before != expected_before:
+            raise RuntimeError("digest staging slice chain is incomplete")
+        sources = _digest_stage_sources(conn, session_id, before, after)
+        if digest_source_sha256(sources, before, after) != row["source_sha256"]:
+            raise RuntimeError("digest staging source proof changed")
+        chunk_ids = [message.chunk_id for message in sources]
+        if any(len(row[key]) > _MAX_DIGEST_STAGE_JSON_BYTES for key in ("episodes_json", "procedures_json")):
+            raise RuntimeError("digest staging exceeds its bounded payload limit")
+        episodes = loads_exact_or_fenced(row["episodes_json"])
+        procedures = loads_exact_or_fenced(row["procedures_json"])
+        # Procedure source IDs were already validated by extraction; bind the
+        # canonical internal shape to this exact staged source slice again.
+        clean_episodes, clean_procedures = _validate_digest_staged_items(
+            episodes, procedures, chunk_ids,
+        )
+        if (_digest_staging_json(episodes) != row["episodes_json"]
+                or _digest_staging_json(procedures) != row["procedures_json"]
+                or not isinstance(row["summary"], str)
+                or len(row["summary"]) > 500):
+            raise RuntimeError("digest staging payload violates its extraction contract")
+        result.append({"slice_key": row["slice_key"], "summary": row["summary"],
+                       "episodes": EpisodesExtraction(items=clean_episodes),
+                       "procedures": ProceduresExtraction(items=clean_procedures)})
+        expected_before = after
+    if not rows or expected_before != target:
+        raise RuntimeError("digest staging tail does not match its cursor")
+    return result
+
+
+def digest_staging_cursor_is_valid(conn, session_id: str) -> bool:
+    """Shared scheduling/health gate for private cursor-output coherence."""
+    state = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if state is None:
+        return False
+    cursor = _staged_digest_cursor(state, "digest_cursor")
+    try:
+        staged = load_digest_staged_summary(
+            conn, session_id, state["digest_cursor_prompt_version"], cursor,
+        )
+        if staged is not None:
+            # A caught-up cursor may only exist after the same transaction
+            # published and cleared its private payload.
+            return cursor != (state["coverage_message_id"], None, 0)
+        if conn.execute(
+            "SELECT 1 FROM digest_staging WHERE session_id=? LIMIT 1", (session_id,),
+        ).fetchone() is not None:
+            # A restored/malformed completed cursor cannot silently orphan an
+            # unfinished different-generation walk and claim clean completion.
+            return False
+        return bool(
+            state["digest_cursor_prompt_version"] == state["digest_published_generation"]
+            and cursor == (state["auto_summary_message_id"],
+                           state["auto_summary_partial_message_id"],
+                           int(state["auto_summary_message_offset"] or 0))
+            and cursor[1] is None and cursor[2] == 0
+        )
+    except (RuntimeError, ValueError, TypeError):
+        return False
 
 
 def _validate_digest_episode_items(

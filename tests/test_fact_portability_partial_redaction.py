@@ -51,13 +51,19 @@ def test_partial_fact_source_redaction_preserves_offsets_and_benign_entities(
             "partial-redaction", "user", content,
             created_at="2025-01-02T03:04:05.000Z",
         )
+        # One stable producer routes the first slice by its unique prefix;
+        # swapping fixture models for the continuation would correctly require
+        # replaying the first unit before appending a new-generation tail.
+        llm = StubLLMClient(fixtures={
+            "BENIGN-PREFIX medflow; contact": json.dumps([{
+                "text": f"Medflow support is available at {email}.",
+                "entities": ["medflow", normalized_email],
+            }]),
+        }, default="[]")
         extraction = facts.extract_facts(
             src.conn,
             "partial-redaction",
-            StubLLMClient(default=json.dumps([{
-                "text": f"Medflow support is available at {email}.",
-                "entities": ["medflow", normalized_email],
-            }])),
+            llm,
             src.config,
         )
         assert extraction is not None
@@ -73,13 +79,16 @@ def test_partial_fact_source_redaction_preserves_offsets_and_benign_entities(
         continuation = facts.extract_facts(
             src.conn,
             "partial-redaction",
-            StubLLMClient(default="[]"),
+            llm,
             src.config,
             since_message_id=cursor["facts_cursor_message_id"],
             partial_message_id=cursor["facts_cursor_partial_message_id"],
             start_offset=cursor["facts_cursor_offset"],
         )
         assert continuation is not None
+        assert continuation.items == []
+        assert continuation.publication_version == extraction.publication_version
+        assert "|semantic=sha256:" in continuation.publication_version
         assert continuation.cursor_before_partial_message_id == message_id
         assert continuation.cursor_before_offset == first_offset
         assert continuation.partial_message_id == message_id

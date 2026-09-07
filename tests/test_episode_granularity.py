@@ -693,7 +693,7 @@ def _range(hy: HyMem, sid: str) -> str:
 
 
 def test_generation_cleanup_replaces_destructive_window_supersession(
-    cfg, granular_cfg, monkeypatch
+    cfg, granular_cfg
 ):
     """v38 never deletes old episodes before a replacement walk completes.
 
@@ -703,15 +703,26 @@ def test_generation_cleanup_replaces_destructive_window_supersession(
     in every state.
     """
     import hymem.dreaming.runner as runner
+    import sys
+    from contextlib import contextmanager
 
     seen: list = []
     real = runner.persist_episodes
 
-    def spy(*args, **kwargs):
-        seen.append(kwargs.get("supersede_window", "MISSING"))
-        return real(*args, **kwargs)
+    def trace_persist(frame, event, arg):
+        if event == "call" and frame.f_code is real.__code__:
+            seen.append(frame.f_locals["supersede_window"])
 
-    monkeypatch.setattr(runner, "persist_episodes", spy)
+    @contextmanager
+    def observe_persist():
+        # Observe the actual bound implementation without replacing it with
+        # a mutating closure (which must invalidate semantic-generation proof).
+        previous_profile = sys.getprofile()
+        sys.setprofile(trace_persist)
+        try:
+            yield
+        finally:
+            sys.setprofile(previous_profile)
 
     # (a) blob-only store, first dream: stamp NULL -> no window.
     llm0 = _digest_llm()
@@ -720,10 +731,13 @@ def test_generation_cleanup_replaces_destructive_window_supersession(
         _seed(hy0, "s_wire")
         eps = [_episode("Chose fly.io over render", [_chunk_ids(hy0, "s_wire")[0]])]
         hy0.set_llm(_digest_llm(episodes=eps, summary="Deploy notes for staging."))
-        hy0.dream()
+        with observe_persist():
+            hy0.dream()
     finally:
         hy0.close()
-    assert seen == [None], seen
+    # One private replacement write, then reconstruction from the validated
+    # complete stage. Neither call may perform destructive window cleanup.
+    assert seen == [None, None], seen
 
     # (b) blob-only store re-extracting under a bumped prompt version: still
     # NULL, still no window. The re-dream stays additive, as it always was.
@@ -731,26 +745,29 @@ def test_generation_cleanup_replaces_destructive_window_supersession(
     llm1 = _digest_llm(episodes=eps, summary="Deploy notes, take two.")
     hy1 = HyMem(dataclasses.replace(cfg, prompt_version="v9-bumped"), llm=llm1)
     try:
-        hy1.dream()
+        with observe_persist():
+            hy1.dream()
     finally:
         hy1.close()
-    assert seen == [None], seen
+    assert seen == [None, None], seen
 
     # (c) flip ON, then (d) flip OFF again: still no eager window deletion.
     seen.clear()
     llm2 = _digest_llm(episodes=eps, summary="Deploy notes for staging.")
     hy2 = HyMem(granular_cfg, llm=llm2)
     try:
-        hy2.dream()
+        with observe_persist():
+            hy2.dream()
     finally:
         hy2.close()
-    assert seen == [None], seen
+    assert seen == [None, None], seen
 
     seen.clear()
     llm3 = _digest_llm(episodes=eps, summary="Deploy notes for staging.")
     hy3 = HyMem(cfg, llm=llm3)
     try:
-        hy3.dream()
+        with observe_persist():
+            hy3.dream()
     finally:
         hy3.close()
-    assert seen == [None], seen
+    assert seen == [None, None], seen

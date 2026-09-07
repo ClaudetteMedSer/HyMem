@@ -507,18 +507,19 @@ def chunk_extraction_is_quarantined(
     version, raising the bound, or setting it to zero immediately makes the
     chunk eligible again without destructive bookkeeping.
     """
-    prompt_version = extraction_cache_key(prompt_version)
     if max_attempts <= 0:
         return False
     if phase1_generation_key is None:
         return False
-    else:
-        row = conn.execute(
-            "SELECT attempts FROM chunk_extraction_attempts "
-            "WHERE chunk_id=? AND prompt_version=? "
-            "AND phase1_generation_key=?",
-            (chunk_id, prompt_version, phase1_generation_key),
-        ).fetchone()
+    # No key participates in an authorization/query on the fast paths above.
+    # Keep full current-contract validation whenever durable state is read.
+    prompt_version = extraction_cache_key(prompt_version)
+    row = conn.execute(
+        "SELECT attempts FROM chunk_extraction_attempts "
+        "WHERE chunk_id=? AND prompt_version=? "
+        "AND phase1_generation_key=?",
+        (chunk_id, prompt_version, phase1_generation_key),
+    ).fetchone()
     return bool(row is not None and int(row["attempts"]) >= int(max_attempts))
 
 

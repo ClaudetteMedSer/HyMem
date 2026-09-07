@@ -353,6 +353,8 @@ def make_strict_run(path: Path, *, segment_status="complete"):
         ],
     }
     artifact["result_digest"] = content_hash(artifact["per_question"])
+    from tests.archive_evidence_fixtures import bind_checkpoint
+    bind_checkpoint(artifact)
     path.write_text(json.dumps(artifact))
     return path
 
@@ -532,6 +534,8 @@ def test_same_basename_rejects_a_second_independently_valid_strict_result(tmp_db
         "multi-session": {"accuracy": 0.0, "count": 2},
     }
     replacement["result_digest"] = content_hash(replacement["per_question"])
+    from tests.archive_evidence_fixtures import bind_checkpoint
+    bind_checkpoint(replacement)
     archive.write_text(json.dumps(replacement))
 
     assert mod.validate_strict_artifact(replacement)["scores"]["OVERALL"][
@@ -665,6 +669,8 @@ def test_strict_retrieval_diagnostic_registers_with_null_scores(tmp_db):
         seed=old["seed"], expected_ids=["q1", "q2"], protocol_split="full",
     )
     artifact["result_digest"] = content_hash(artifact["per_question"])
+    from tests.archive_evidence_fixtures import bind_checkpoint
+    bind_checkpoint(artifact)
     archive.write_text(json.dumps(artifact))
     con = mod.connect()
     assert mod.ingest_file(con, archive) == "inserted"
@@ -721,6 +727,8 @@ def test_registry_stores_retrieval_distillation_usage_additively(tmp_db):
         seed=old["seed"], expected_ids=["q1", "q2"], protocol_split="full",
     )
     segment["model_identities"] = artifact["models"]
+    from tests.archive_evidence_fixtures import bind_checkpoint
+    bind_checkpoint(artifact)
     archive.write_text(json.dumps(artifact))
     con = mod.connect()
     assert mod.ingest_file(con, archive) == "inserted"

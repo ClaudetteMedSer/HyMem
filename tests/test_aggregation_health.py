@@ -303,8 +303,12 @@ def test_mcp_report_never_labels_failed_aggregation_complete(
     try:
         server.set_hy(hy)
         result = server._do_dream()
-        assert result.startswith("dreaming incomplete/unverified —")
+        assert result.startswith("dreaming incomplete —")
+        assert "store-wide reported indexing health is incomplete" in result
+        assert "status.pending_aggregation=1" in result
+        assert "report.aggregation_fusion_failures=4" in result
         assert "finished cleanly" not in result
+        assert "dreaming complete" not in result
     finally:
         hy.close()
 

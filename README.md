@@ -382,7 +382,7 @@ does not masquerade as an extraction-cache event.
    reads those model/data-derived values into a system prompt: doing so would
    leak corrections across sessions, suppress a later valid reassertion, and
    make prompt/cache identity depend on mutable store state.
-5. **Entity canonicalization**: Surface forms (e.g., "Postgres", "PostgreSQL", "postgresql") are normalized via Unicode folding, CamelCase splitting, article/parenthetical stripping, and an alias table.
+5. **Entity canonicalization**: Surface forms (e.g., "Postgres", "PostgreSQL", "postgresql") are normalized via Unicode folding, CamelCase splitting, article/parenthetical stripping, and an alias table. The v2 Unicode policy uses one idempotent pipeline: it folds Latin accents but retains non-Latin letters and attached marks, so `東京2`/`大阪2` and `नील`/`नाल` remain distinct. Keys longer than 512 characters fail closed, never truncate. This policy and the loaded normalization implementation participate in Phase-1 and fact generations; auxiliary contract v3 preserves v0–v2 historical hash dispatch. Deployment therefore requires retained-source replay for affected generations. Existing aliases are not guessed, merged, or automatically rekeyed, and previously collapsed identities cannot be reconstructed without their original sources; review old aliases and oversized legacy names explicitly. Unicode full-text queries now reach SQLite intact, but its existing `unicode61` tokenizer can ignore Indic/Arabic marks: full-text results remain candidates, not proof of exact entity identity.
 6. **Knowledge graph upsert + dedup (lock-free embedding)**: New triples insert edges, repeated triples reinforce evidence counters, negations add negative evidence. Before each chunk's persist transaction opens, dedup candidate vectors are batch-embedded *outside* the write lock (`prepare_dedup_vectors`); the in-transaction path then does pure SQL + in-memory cosine only — no embedding-API call ever runs while the SQLite writer lock is held. A new triple that is a near-duplicate of an existing edge (same predicate, one shared endpoint, lexical-sibling varying endpoint, cosine ≥ threshold) attaches its evidence to that edge instead of minting a sibling. **Same-wave collapse**: because `edge_embeddings` only holds *prior-cycle* vectors, sibling variants minted within the *same* dream are also compared against an in-memory pool of edges created earlier in the cycle (same gates), so a `prompt_version` re-extraction wave can't fan a single preference out into many phrasal-variant edges.
 7. **Idempotency**: Each chunk is processed at most once per mechanically derived extraction-contract identity. The identity binds the rendered prompt bytes, strict JSON/item/source-ID acceptance, and bounded split/retry/recovery implementation to the human `prompt_version`. Changing any bound behavior makes legacy cache/attempt/outcome rows stale even if the label was accidentally left unchanged; deliberately bumping the label also forces bounded reprocessing. Prompt-independent terminal source losses cannot be reconstructed by a contract or version change (see §13 for the re-extraction-surge note).
 
@@ -404,11 +404,42 @@ partial rows remain durable for retry but are excluded from FTS, vectors, and
 RAPTOR until the complete walk atomically swaps the published marker, so a
 failed rebuild cannot mutate or hide the last complete episode set.
 
+Summary, episodes, and the union of procedures from every bounded slice now
+publish in the same completion transaction. A complete replacement (including
+an empty result) marks omitted digest-owned procedures stale; a forward tail is
+additive. Stale procedures are excluded from retrieval, while their confidence
+feedback remains available if later re-extracted, until normal stale-retention
+expiry. Schema v59 records exact-content digest ownership, and portable v16
+preserves it across export/import. Unknown pre-v59 procedures, legacy imports
+without that declaration, and manually edited content are not automatically
+retired or overwritten—even when a digest emits the same name. These ambiguous
+historical rows require explicit review; their origin cannot safely be inferred
+from a generated-looking id. The ownership hash binds the declared payload and
+published session generation; it is not a proof of LLM entailment or authenticity.
+
 ### Phase 2 — Consolidation (`dreaming/phase2.py`)
 
 **Deterministic, no LLM.** Two sub-steps:
 
 **Profile consolidation**: Producer-authorized behavioral markers are promoted into `profile_entries` with exact marker evidence. Repeats reinforce the authoritative projection, while contradictions remain separate instead of silently overwriting. `profile_max_entries` (default: 16) caps reads and `USER.md` rendering; supported ledger rows are retained so a producer replay cannot create an unrecoverable hole. The auto-section is rewritten via `markdown_io.write_section()`.
+
+`USER.md` and `MEMORY.md` are repairable snapshots of committed database state.
+Phase 2 commits its database changes before publishing either file, and Phase 3
+refreshes insights only after its own commit. A file error can leave one sidecar
+stale, but cannot expose a subsequently rolled-back consolidation. The next
+ordinary dream repairs both without new ingestion; native profile reads already
+render the database-authorized section in memory. Replacements are atomic per
+file, not across both files or SQLite. Deadline/lease checks run immediately
+before each replacement, but are cooperative checks rather than cross-resource
+atomic fencing. Crashes may leave an old sidecar or temporary file; managed
+sections are reconstructed on retry and manual sections are preserved.
+
+Direct `consolidate_profile` calls inside a caller-owned transaction only
+consolidate the database: call `publish_profile` after committing, or allow the
+next dream to repair the file. Standalone calls commit their own transaction
+before publishing. Profile materialization policy v5 causes retained v4 markers
+to replay; old per-marker decisions are replaced during replay, not kept in an
+append-only decision history.
 
 **Insight generation**: The knowledge graph is queried for:
 - **Dependency hubs** — objects depended on by 2+ subjects with confidence > 0.6 (e.g., "`uv` is a shared dependency of: local_dev, ci_pipeline"). Only non-derived (direct) edges are considered.
@@ -650,7 +681,7 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 | `POST .../peers/{pid}/chat` | Scoped dialectic Q&A | Bounded iterative reasoning, deterministic fallback, JSON or SDK-compatible SSE |
 | `GET /v3/workspaces/{wid}/conflicts` | Unsupported legacy guard | Returns 501; native graph conflicts are not workspace-partitioned |
 | `GET /health` | Health check | |
-| `GET /dream-status` | `hy.dream_status()` — indexing health/backlog | Current `hymem-dream-status-v5` snapshot: all durable pending/malformed/quarantine/loss classes, bounded coverage/aggregation health, prompt/config/producer identity, `in_progress`, last run |
+| `GET /dream-status` | `hy.dream_status()` — indexing health/backlog | Current `hymem-dream-status-v7` snapshot: all durable pending/malformed/quarantine/loss classes, bounded coverage/aggregation health, prompt/config/producer identity, `in_progress`, last run |
 
 `hymem-dream-status-v3` is a completion contract, not just a progress counter.
 The API composes its status from one coherent SQLite read snapshot. Consumers that
@@ -711,6 +742,18 @@ the derived extraction-contract identity.
 **Zero-config startup.** `bootstrap.build_from_env()` is the single source of truth for environment-variable resolution; both server entry points and `hymem-doctor` build on it. A missing extraction-LLM key fails fast at startup with an actionable message instead of surfacing deep inside the first request. `hymem-doctor` runs the full preflight (keys, endpoint reachability, sqlite-vec, schema migration, embedding-dimension drift, canonical-form drift in `entity_aliases` / `knowledge_graph`) and prints the resolved provider/model/URLs.
 
 **No external dependencies at core.** The `hymem` package itself has zero dependencies beyond Python stdlib + SQLite. LLM clients, FastAPI, and sqlite-vec are optional extras (`hymem[server]`); the pinned `honcho-ai` SDK used by the contract tests is the `hymem[honcho]` extra. The `contrib/` layer provides OpenAI-compatible clients but can be swapped via the `LLMClient` and `EmbeddingClient` Protocols.
+
+Digest, typed-profile, and narrative-fact generations bind their configuration,
+loaded implementation, and effective memory producer. Changing these schedules
+a lossless-source replay, including after raw messages have been pruned; a first
+upgrade from configuration-only stamps also replays once. A stable producer
+then returns to zero-call reuse. Maintained clients expose
+`memory_producer_declaration()` automatically. Custom routers can implement
+that hook returning `Phase1ProducerDeclaration` for their actual memory route;
+the Phase-1 declaration is not assumed to identify the same model. Without a
+memory declaration, reuse is limited to the exact live client instance and a
+restart conservatively replays. Status v7 is required for this stronger
+completion guarantee; older clean status receipts are not current evidence.
 
 **Exact-producer LRU-cached embeddings.** Cold queries are dominated by the first `embed([query])` API call. `CachedEmbeddingClient` keys its LRU (default 128 entries) by the validated producer-space key, dimension, and exact input text, so Source 2 KNN and chunk search can safely share one query vector. A display model label alone is never cache authority. Maintained local embeddings carry a deterministic declaration; remote durable use additionally requires a pinned dimension plus operator-declared **public** deployment-revision and tenant labels. Undeclared or adaptive clients bypass the cache on every direct call and cannot select or populate durable mirrors, while high-level HyMem semantic ingestion/query rejects them before provider work. The public attestation labels must not contain credentials: their hashes are commitments, not secrecy, and low-entropy secrets remain guessable.
 
@@ -866,8 +909,10 @@ HyMem's harness targets **LongMemEval-S**: 500 questions across six base questio
 
 **Current indexing evidence contracts.** Strict convergence adds
 `hymem-benchmark-indexing-status-v3` to the coherent
-`hymem-dream-status-v5` snapshot. LME persists and validates
-`hymem-lme-indexing-summary-v4`. MSC and LoCoMo persist
+`hymem-dream-status-v7` snapshot. LME persists and validates
+`hymem-lme-indexing-summary-v5`, retaining exact Phase-1 authority. All four
+strict registries require the portable finalized-checkpoint projection described
+in [archive admission](benchmarks/archive_evidence.md). MSC and LoCoMo persist
 `hymem-benchmark-indexing-v4`, whose per-run report counts, fixed
 `DreamReport` totals/flags, terminal cycle, final status, and provider usage must
 reconcile. Their reusable-store envelope is

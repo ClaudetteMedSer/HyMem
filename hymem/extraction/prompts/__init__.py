@@ -323,6 +323,21 @@ source_message_id (integer).
   such an item from the preceding fragment. Do not join it to later fragment
   text beyond the applicability end. A boundary-spanning triple still cites
   the unchanged source_message_id of this same source message.
+- A preceding conversational turn may appear as a separate JSON record with
+  `source_record_version: hymem-claim-context-v1` and `source_context_only: true`.
+  It is interpretation context, NEVER an owned source or an independent item.
+  Use its exact content, role, and peer only to interpret a confirmation,
+  correction, or reference in the owned `context_for_source_message_id` before
+  `applies_through_source_content_end`. That owned record must contribute
+  indispensable support. Never return a triple or marker stated wholly in a
+  context-only record, even relabelled with an owned ID. Never cite a context
+  record's source_message_id. A question, suggestion, or assistant assertion
+  alone is not a user fact. Cite the owned confirming/correcting record, and
+  check completeness only for owned records. These rules apply equally to
+  primary, empty-verification, and omission-verification passes.
+  A context-only table tail may retain `source_fragment_context`: use its
+  exact header and prelude only to interpret that table tail, still never as
+  independently owned evidence.
 
 Always return all three keys. Empty arrays are valid when the checked excerpt
 contains no supported item. Example shape:

@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 # Sections are delimited by HTML comments so they survive surrounding edits and
 # parse unambiguously. Format:
@@ -32,11 +33,16 @@ def read_section(path: Path, section: str) -> str | None:
     return match.group(1) if match else None
 
 
-def write_section(path: Path, section: str, content: str, *, header: str | None = None) -> None:
+def write_section(
+    path: Path, section: str, content: str, *, header: str | None = None,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
     """Atomically replace (or insert) a managed section with `content`.
 
     `header` (e.g. '## Behavioral Profile') is written immediately above a freshly
     inserted section. Existing files keep whatever heading the user already has.
+    `before_replace` is a cooperative deadline/ownership guard run after the
+    temporary file is complete, immediately before its per-file replacement.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -56,7 +62,7 @@ def write_section(path: Path, section: str, content: str, *, header: str | None 
             prefix += "\n"
         new_text = prefix + block + "\n"
 
-    _atomic_write(path, new_text)
+    _atomic_write(path, new_text, before_replace=before_replace)
 
 
 def render_section(
@@ -93,14 +99,18 @@ def render_section(
     return prefix + block + "\n"
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _atomic_write(
+    path: Path, text: str, *, before_replace: Callable[[], None] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+        if before_replace is not None:
+            before_replace()
         os.replace(tmp, path)
-    except Exception:
+    except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
         raise

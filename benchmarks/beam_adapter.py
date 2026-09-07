@@ -366,6 +366,7 @@ def beam_code_hash(
     *,
     adapter_path: Path | None = None,
     strictness_path: Path | None = None,
+    archive_evidence_path: Path | None = None,
     lme_adapter_path: Path | None = None,
     lme_protocol_path: Path | None = None,
     extraction_canary_path: Path | None = None,
@@ -423,6 +424,16 @@ def beam_code_hash(
     dependency_slices.append(PythonSourceSlice(
         strictness, tuple(strictness_symbols)
     ))
+    archive_symbols: set[str] = set()
+    for source_slice in dependency_slices:
+        archive_symbols.update(python_slice_imported_symbols(
+            source_slice, module_names=("benchmarks.archive_evidence", "archive_evidence"),
+        ))
+    if archive_symbols:
+        dependency_slices.append(PythonSourceSlice(
+            Path(archive_evidence_path or benchmark_dir / "archive_evidence.py"),
+            tuple(archive_symbols),
+        ))
     dependency_sources: list[Path | PythonSourceSlice] = [
         adapter, *dependency_slices,
     ]
@@ -4206,7 +4217,8 @@ def _run_main(
                 )
             ),
             "latest_indexing": (
-                hy.last_indexing_summary if hy is not None
+                ({"scale": scale, "conversation_id": conv["id"], **dict(hy.last_indexing_summary)}
+                 if hy.last_indexing_summary is not None else None) if hy is not None
                 else (indexing_runs[-1] if indexing_runs else None)
             ),
             "indexing_runs": [dict(item) for item in indexing_runs],

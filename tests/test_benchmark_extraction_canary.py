@@ -1642,12 +1642,10 @@ def test_msc_invokes_canary_once_before_any_example_work(
             "question_type": "recall", "correct": True,
         }
         scope = f"msc:{example['id']}"
+        from tests.archive_evidence_fixtures import scoped_indexing
         kwargs["on_checkpoint"](row, {
             "scope_id": scope,
-            "indexing": {
-                "scope_id": scope, "complete": True, "healthy": True,
-                "comparable": True,
-            },
+            "indexing": scoped_indexing(scope, _args),
             "memory_pipeline_usage": msc._known_zero_pipeline_usage(),
             "embedding_usage": msc.embedding_usage_snapshot(
                 None, configured=False,

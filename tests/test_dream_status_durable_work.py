@@ -339,7 +339,7 @@ def test_fact_marker_only_work_ignores_quarantine_and_heals_without_llm(
         hy.open_session(session_id)
         unit = fact_cursor_retry_unit_key(session_id, None, None, 0)
         retry_key = facts_retry_policy_version(
-            hy.config, replay_slice_key=unit
+            hy.config, replay_slice_key=unit, client=llm,
         )
         hy.conn.execute(
             "UPDATE sessions SET facts_retry_count=?,"
@@ -350,7 +350,7 @@ def test_fact_marker_only_work_ignores_quarantine_and_heals_without_llm(
         held = hy.dream_status()
         assert held["pending_facts"] == 1
         assert held["quarantined_facts"] == 0
-        assert facts.fact_quarantine_status(hy.conn, hy.config)[
+        assert facts.fact_quarantine_status(hy.conn, hy.config, client=llm)[
             "quarantined_facts"
         ] == 0
 

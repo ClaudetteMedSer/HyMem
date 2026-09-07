@@ -20,6 +20,7 @@ import hashlib
 import importlib.util
 import inspect
 import dis
+import functools
 import json
 import re
 import secrets
@@ -115,6 +116,9 @@ class _ProducerDeclarationCarrier:
         return self.declaration
 
     def aggregation_producer_declaration(self) -> Phase1ProducerDeclaration:
+        return self.declaration
+
+    def memory_producer_declaration(self) -> Phase1ProducerDeclaration:
         return self.declaration
 
 
@@ -235,13 +239,66 @@ def _reject_credential_shaped_endpoint_path(endpoint: str) -> None:
             )
 
 
-def _loaded_code_record(code: types.CodeType) -> dict[str, object]:
+@dataclass(frozen=True, slots=True, eq=False)
+class _CodeIdentity:
+    """Identity key that never hashes/compares caller-supplied constants.
+
+    Python code equality may consult objects inside synthetic ``co_consts``.
+    Using the code object's identity avoids executing their hash/equality
+    hooks before the cache's immutability check. The strong reference also
+    prevents object-id recycling while this bounded cache entry exists.
+    """
+
+    code: types.CodeType
+
+    def __hash__(self) -> int:
+        return id(self.code)
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _CodeIdentity and self.code is other.code
+
+
+def _immutable_code_constant(
+    value: object, *, depth: int = 0, verified: set[int] | None = None,
+) -> bool:
+    """Only genuine immutable built-ins may enter the code-piece cache.
+
+    ``CodeType.replace`` accepts arbitrary objects in ``co_consts``. A code
+    object is therefore not sufficient proof that its entire constant graph
+    is immutable, even when that code object happens to be hashable.
+    """
+
+    # Cache eligibility must not exceed the serializer's existing traversal
+    # bound or expand shared constant DAGs exponentially. Refuse caching on
+    # unusually deep input; the ordinary depth-limited serializer still runs.
+    if depth > 12:
+        return False
+    if value is None or type(value) in (bool, int, str, float, bytes):
+        return True
+    if type(value) not in (tuple, frozenset, types.CodeType):
+        return False
+    if verified is None:
+        verified = set()
+    identity = id(value)
+    if identity in verified:
+        return True
+    items = value.co_consts if isinstance(value, types.CodeType) else value
+    if not all(
+        _immutable_code_constant(item, depth=depth + 1, verified=verified)
+        for item in items
+    ):
+        return False
+    verified.add(identity)
+    return True
+
+
+def _uncached_loaded_code_sha256(code: types.CodeType) -> str:
     constants = list(code.co_consts)
     # A docstring has no execution effect and historically did not move the
     # commitment.  Loaded bytecode, names, defaults, and nested code do.
     if constants and isinstance(constants[0], str):
         constants[0] = ("docstring-omitted",)
-    return {
+    record = {
         "argcount": code.co_argcount,
         "posonlyargcount": code.co_posonlyargcount,
         "kwonlyargcount": code.co_kwonlyargcount,
@@ -256,6 +313,62 @@ def _loaded_code_record(code: types.CodeType) -> dict[str, object]:
         "cellvars": list(code.co_cellvars),
         "exceptiontable": getattr(code, "co_exceptiontable", b"").hex(),
     }
+    encoded = json.dumps(
+        record, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return "loaded-code-sha256-v1:" + hashlib.sha256(encoded).hexdigest()
+
+
+@functools.lru_cache(maxsize=1024)
+def _immutable_loaded_code_sha256(identity: _CodeIdentity) -> str:
+    code = identity.code
+    if not _immutable_code_constant(code):
+        raise TypeError("code constants contain mutable or opaque state")
+    return _uncached_loaded_code_sha256(code)
+
+
+def _loaded_code_record(code: types.CodeType) -> str:
+    """Commit code pieces once, while inspecting function state every time.
+
+    Cached values are immutable digests, not caller-mutable record trees.
+    Defaults, closures, classes, global containers, and module bindings are
+    deliberately outside this cache. Replacing ``function.__code__`` selects
+    a new immutable key; unusual mutable code constants bypass it entirely.
+    """
+
+    try:
+        return _immutable_loaded_code_sha256(_CodeIdentity(code))
+    except TypeError:
+        return _uncached_loaded_code_sha256(code)
+
+
+@functools.lru_cache(maxsize=1024)
+def _immutable_code_global_names(identity: _CodeIdentity) -> tuple[str, ...]:
+    code = identity.code
+    # The same immutability check also excludes hashable mutable constants.
+    if not _immutable_code_constant(code):
+        raise TypeError("code constants contain mutable or opaque state")
+    return _uncached_code_global_names(code)
+
+
+def _uncached_code_global_names(code: types.CodeType) -> tuple[str, ...]:
+    names = {
+        instruction.argval
+        for instruction in dis.get_instructions(code)
+        if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}
+        and isinstance(instruction.argval, str)
+    }
+    for constant in code.co_consts:
+        if isinstance(constant, types.CodeType):
+            names.update(_code_global_names(constant))
+    return tuple(sorted(names))
+
+
+def _code_global_names(code: types.CodeType) -> tuple[str, ...]:
+    try:
+        return _immutable_code_global_names(_CodeIdentity(code))
+    except TypeError:
+        return _uncached_code_global_names(code)
 
 
 def _loaded_identity_value(value: object, *, depth: int = 0) -> object:
@@ -451,23 +564,7 @@ def exact_callable_sha256(*callables: object) -> str:
                     closure.append(value_record(cell_value, depth=depth + 1))
             referenced_globals = []
             namespace = function.__globals__
-            global_names: set[str] = set()
-            pending_codes = [function.__code__]
-            seen_codes: set[int] = set()
-            while pending_codes:
-                code = pending_codes.pop()
-                if id(code) in seen_codes:
-                    continue
-                seen_codes.add(id(code))
-                for instruction in dis.get_instructions(code):
-                    if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
-                        if isinstance(instruction.argval, str):
-                            global_names.add(instruction.argval)
-                pending_codes.extend(
-                    constant for constant in code.co_consts
-                    if isinstance(constant, types.CodeType)
-                )
-            for name in sorted(global_names):
+            for name in _code_global_names(function.__code__):
                 if name not in namespace or name == "__builtins__":
                     continue
                 global_value = namespace[name]
@@ -569,27 +666,17 @@ def canonical_module_slice_sha256(module: object, *roots: str) -> str:
         value = namespace[name]
         selected[name] = _loaded_identity_value(value)
         for code in code_objects(value):
-            nested = [code]
-            while nested:
-                current = nested.pop()
-                for instruction in dis.get_instructions(current):
-                    if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"}:
-                        continue
-                    dependency = instruction.argval
-                    if not isinstance(dependency, str) or dependency not in namespace:
-                        continue
-                    dependency_value = namespace[dependency]
-                    if (
-                        getattr(dependency_value, "__module__", module_name)
-                        == module_name
-                        or dependency.isupper()
-                        or dependency.startswith("_")
-                    ):
-                        pending.append(dependency)
-                nested.extend(
-                    item for item in current.co_consts
-                    if isinstance(item, types.CodeType)
-                )
+            for dependency in _code_global_names(code):
+                if dependency not in namespace:
+                    continue
+                dependency_value = namespace[dependency]
+                if (
+                    getattr(dependency_value, "__module__", module_name)
+                    == module_name
+                    or dependency.isupper()
+                    or dependency.startswith("_")
+                ):
+                    pending.append(dependency)
     payload = json.dumps(
         {
             "runtime": _LOADED_CODE_RUNTIME_DOMAIN,
@@ -1164,6 +1251,7 @@ def producer_binding_for_declaration(
 
     if declaration_hook not in {
         "phase1_producer_declaration", "aggregation_producer_declaration",
+        "memory_producer_declaration",
     }:
         raise ValueError("unsupported producer declaration hook")
 

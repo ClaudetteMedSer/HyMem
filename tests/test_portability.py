@@ -57,6 +57,7 @@ _EXPECTED = {
     "episode_source_occurrence": 0,
     "user_profile_fact": 1,
     "procedure": 1, "edge": 1, "profile_entry": 1,
+    "procedure_digest_publication": 0,
     "entity_alias": 0,
     "chunk_source_manifest": 0, "chunk_message_source": 0,
     "phase1_generation": 0,

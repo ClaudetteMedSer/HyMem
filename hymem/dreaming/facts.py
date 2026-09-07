@@ -67,11 +67,12 @@ _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _FACT_RETRY_RE = re.compile(
     r"^facts-lossless-v1\|prompt=facts\.v\d{1,6}\|chars=\d{1,9}\|"
     r"tokens=\d{1,9}\|items=\d{1,9}"
+    r"(?:\|semantic=sha256:[0-9a-f]{64})?"
     r"(?:\|slice=sha256:[0-9a-f]{64})?\|retry-max=\d{1,9}$"
 )
 _FACT_CONFIG_RE = re.compile(
     r"^facts-lossless-v1\|prompt=facts\.v\d{1,6}\|chars=\d{1,9}\|"
-    r"tokens=\d{1,9}\|items=\d{1,9}$"
+    r"tokens=\d{1,9}\|items=\d{1,9}(?:\|semantic=sha256:[0-9a-f]{64})?$"
 )
 _FACT_PROMPT_RE = re.compile(r"^facts\.v\d{1,6}$")
 
@@ -175,21 +176,44 @@ def fact_input_hash(rendered: str) -> str:
     return _sha256_json({"version": FACT_SLICE_VERSION, "rendered": rendered})
 
 
-def facts_config_version(cfg: HyMemConfig) -> str:
+def facts_config_version(cfg: HyMemConfig, *, client: object | None = None) -> str:
+    """Current producer version, or a historical config-only shape without a client."""
+    from hymem.dreaming.semantic_generation import semantic_generation_suffix
     return (
         f"facts-lossless-v1|prompt={FACTS_PROMPT_VERSION}|"
         f"chars={int(cfg.dream_digest_max_chars)}|"
         f"tokens={int(cfg.dream_digest_max_tokens)}|"
         f"items={int(cfg.dream_max_facts_per_session)}"
-    )
+    ) + semantic_generation_suffix("facts", client)
 
 
 def facts_retry_policy_version(
-    cfg: HyMemConfig, *, replay_slice_key: str | None = None
+    cfg: HyMemConfig, *, replay_slice_key: str | None = None,
+    client: object | None = None,
+    publication_version: str | None = None,
 ) -> str:
+    """Retry key for either a live producer or an already captured generation.
+
+    The runner supplies its captured publication version: a producer change
+    in an earlier tier must not quarantine the replacement producer for an
+    old-generation fact call that the publication fence refused to make.
+    """
+    if publication_version is None:
+        publication_version = facts_config_version(cfg, client=client)
+    elif client is not None:
+        raise ValueError("fact retry identity cannot use both captured and live producer")
+    else:
+        historical = facts_config_version(cfg)
+        if (
+            not isinstance(publication_version, str)
+            or _FACT_CONFIG_RE.fullmatch(publication_version) is None
+            or not (publication_version == historical
+                    or publication_version.startswith(historical + "|semantic=sha256:"))
+        ):
+            raise ValueError("fact retry publication version does not match configuration")
     replay = f"|slice={replay_slice_key}" if replay_slice_key is not None else ""
     return (
-        f"{facts_config_version(cfg)}{replay}|"
+        f"{publication_version}{replay}|"
         f"retry-max={int(cfg.facts_extraction_max_attempts)}"
     )
 
@@ -296,11 +320,13 @@ def _fact_replay_order_sql(alias: str = "") -> str:
 
 
 def fact_quarantine_status(
-    conn: sqlite3.Connection, cfg: HyMemConfig
+    conn: sqlite3.Connection, cfg: HyMemConfig, *, client: object | None = None,
 ) -> dict[str, int]:
     """Report quarantines that block the current fact write policy.
 
     A persisted quarantine belongs to one exact retry unit and policy identity.
+    Pass the configured memory client to classify current producer-bound work;
+    omitting it inspects the historical configuration-only namespace.
     Old prompt/config generations, old retry bounds, and already-advanced
     cursors therefore do not count as active.  Invalid flagged retry, cursor,
     or publication state is surfaced separately without exposing session or
@@ -340,7 +366,7 @@ def fact_quarantine_status(
     # Import lazily to avoid a module cycle during status initialization.
     from hymem.dreaming.status import durable_fact_work_status
 
-    status = durable_fact_work_status(conn, cfg)
+    status = durable_fact_work_status(conn, cfg, client=client)
     return {
         "quarantined_facts": status["quarantined_facts"],
         "quarantined_facts_malformed": status[
@@ -729,7 +755,7 @@ def extract_facts(
             slice_key=slice_key, input_hash=fact_input_hash(rendered),
             source_occurrences=occurrences,
             caught_up=message.message_id == facts_tail_message_id(conn, session_id),
-            publication_version=facts_config_version(cfg),
+            publication_version=facts_config_version(cfg, client=llm),
         )
 
     max_chars = max(
@@ -801,7 +827,7 @@ def extract_facts(
         slice_key=slice_key,
         input_hash=fact_input_hash(combined),
         source_occurrences=occurrences,
-        publication_version=facts_config_version(cfg),
+        publication_version=facts_config_version(cfg, client=llm),
     )
     request = LLMRequest(
         system=FACTS_SYSTEM,
@@ -943,7 +969,7 @@ def reextract_fact_outcome(
         slice_key=slice_key,
         input_hash=outcome["input_hash"],
         source_occurrences=occurrences,
-        publication_version=facts_config_version(cfg),
+        publication_version=facts_config_version(cfg, client=llm),
         expected_generation=int(outcome["generation"]),
     )
     if all(not fragment.strip() for fragment in source_fragments):

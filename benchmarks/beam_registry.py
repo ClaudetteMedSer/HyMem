@@ -46,6 +46,7 @@ from hymem.contrib.endpoint_policy import (  # noqa: E402
 )
 
 try:  # package import (tests): benchmarks.run_registry
+    from .archive_evidence import validate_checkpoint_attestation, validate_convergence_summary
     from . import run_registry as rr
     from .extraction_canary import (
         validate_extraction_canary_config_binding,
@@ -61,6 +62,7 @@ try:  # package import (tests): benchmarks.run_registry
         connect,
     )
 except (ImportError, ValueError):  # direct CLI: python benchmarks/beam_registry.py
+    from archive_evidence import validate_checkpoint_attestation, validate_convergence_summary
     import run_registry as rr
     from extraction_canary import (  # type: ignore
         validate_extraction_canary_config_binding,
@@ -841,7 +843,7 @@ def _validate_embedding_usage(
     )
     if complete and any(value is None for value in (calls, attempts, successes, latency)):
         raise ValueError("strict BEAM complete embedding usage lacks measured counters")
-    if identity["backend"] == "openai-compatible":
+    if identity["backend"] == "openai_compatible":
         if calls is not None and successes is not None and calls != successes:
             raise ValueError("strict BEAM embedding calls differ from successes")
         if attempts is not None and successes is not None and attempts < successes:
@@ -1656,6 +1658,43 @@ def _validate_strict_envelope(data: dict) -> tuple[list[dict], dict, dict]:
                         f"strict BEAM stored summary differs for {scale}/{metric}"
                     )
         summary_disclosure["stored_summary_validated"] = True
+    known_scopes = {(row.get("scale"), row.get("conv_id")) for row in rows}
+    indexed_scopes = set()
+    for segment in segments:
+        receipts = segment.get("indexing_runs")
+        if not isinstance(receipts, list):
+            raise ValueError("strict BEAM indexing receipt list is malformed")
+        receipts = list(receipts)
+        latest = segment.get("latest_indexing")
+        if latest is not None and latest not in receipts:
+            if segment.get("status") == "complete":
+                raise ValueError("strict BEAM latest indexing differs from completed history")
+            receipts.append(latest)
+        seen_scopes = set()
+        minimum_pipeline_attempts = 0
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                raise ValueError("strict BEAM indexing receipt is malformed")
+            scale, conversation = receipt.get("scale"), receipt.get("conversation_id")
+            if not isinstance(scale, str) or not isinstance(conversation, str):
+                raise ValueError("strict BEAM indexing scope is absent")
+            scope = (scale, conversation)
+            if scope not in known_scopes or scope in seen_scopes:
+                raise ValueError("strict BEAM indexing scope is unknown or duplicate")
+            seen_scopes.add(scope)
+            summary = {key: value for key, value in receipt.items() if key not in {"scale", "conversation_id"}}
+            healthy = validate_convergence_summary(summary, config=config, allow_failure=True)
+            if healthy:
+                indexed_scopes.add(scope)
+                minimum_pipeline_attempts += sum(report.get("chunk_extraction_provider_attempts", 0)
+                                                 for report in summary["reports"])
+        usage = segment.get("memory_pipeline_usage", {})
+        if usage.get("request_attempts_available") is True and usage["request_attempts"] < minimum_pipeline_attempts:
+            raise ValueError("strict BEAM extraction attempts exceed pipeline usage")
+    for row in rows:
+        if not row.get("benchmark_failure") and (row["scale"], row["conv_id"]) not in indexed_scopes:
+            raise ValueError("strict BEAM completed row lacks healthy indexing evidence")
+    validate_checkpoint_attestation(data)
     return rows, {
         "summary": recomputed_summary,
         "summary_counts": recomputed_counts,

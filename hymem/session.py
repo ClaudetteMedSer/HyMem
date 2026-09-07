@@ -41,6 +41,7 @@ def _session_is_pristine(conn: sqlite3.Connection, session_id: str) -> bool:
         ("episodes", "session_id"),
         ("procedures", "session_id"),
         ("profile_staging", "session_id"),
+        ("digest_staging", "session_id"),
         ("temporal_mentions", "session_id"),
         ("narrative_facts", "session_id"),
         ("fact_extraction_outcomes", "session_id"),

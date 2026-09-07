@@ -50,7 +50,7 @@ DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
 _OPENAI_LLM_EXECUTION_ATTRIBUTES = (
     "complete", "_complete_with_execution_lease",
     "phase1_producer_declaration",
-    "aggregation_producer_declaration", "track_provider_attempts",
+    "aggregation_producer_declaration", "memory_producer_declaration", "track_provider_attempts",
     "effective_extra_body", "close", "transport_integrity_ok",
     "model", "base_url", "thinking_mode", "transport_package_version",
     "count_tokens",
@@ -594,6 +594,10 @@ class OpenAICompatibleClient:
     def aggregation_producer_declaration(self):
         """Aggregation uses this client's same declared chat-completion wire."""
 
+        return self.phase1_producer_declaration()
+
+    def memory_producer_declaration(self):
+        """All memory tiers use this client's exact single-model request."""
         return self.phase1_producer_declaration()
 
     @contextmanager

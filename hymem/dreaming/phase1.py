@@ -327,12 +327,20 @@ def _persist_replay_auxiliary(
         entity_mentions=sorted(mentioned),
         markers=extraction.markers,
     )
+    # An exact claim replay may restore a missing acknowledgement after
+    # import, or repair a stale producer binding. An already-matching gate is
+    # not a new completion: touching its clock would make no-op replays churn
+    # the database each wall-clock second. Auxiliary changes/repairs above
+    # keep their own publication clock; ordinary claim reconciliation below
+    # still refreshes processed_at when real publication work is performed.
     conn.execute(
         "INSERT INTO processed_chunks("
         "chunk_id,prompt_version,phase1_generation_key) VALUES (?,?,?) "
         "ON CONFLICT(chunk_id,prompt_version) DO UPDATE SET "
         "phase1_generation_key=excluded.phase1_generation_key,"
-        "processed_at=CURRENT_TIMESTAMP",
+        "processed_at=CURRENT_TIMESTAMP "
+        "WHERE processed_chunks.phase1_generation_key IS NOT excluded.phase1_generation_key "
+        "OR processed_chunks.processed_at IS NULL",
         (chunk.id, conn.execute(
             "SELECT prompt_version FROM kg_claim_extraction_outcomes "
             "WHERE chunk_id=?", (chunk.id,),

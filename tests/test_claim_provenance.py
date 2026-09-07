@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timedelta
 
 import pytest
 import sqlite3
@@ -363,6 +364,8 @@ def test_highest_prompt_generation_wins_independent_of_processing_order(tmp_path
 def test_lower_generation_exact_replay_does_not_churn_restored_revision(tmp_path):
     conn = _open(tmp_path)
     try:
+        clock = [conn.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0]]
+        conn.create_function("current_timestamp", 0, lambda: clock[0])
         [message_id] = _messages(
             conn, [("user", "The app relation is disputed", "2024-01-01")]
         )
@@ -389,6 +392,11 @@ def test_lower_generation_exact_replay_does_not_churn_restored_revision(tmp_path
         before_wire = tmp_path / "stable-before.jsonl"
         after_wire = tmp_path / "stable-after.jsonl"
         portability.export_jsonl(conn, before_wire)
+
+        # Cross a SQL publication-clock day deterministically. Previously
+        # the unconditional processed_at UPDATE only escaped the whole-dump
+        # assertion when both publications happened in the same real second.
+        clock[0] = (datetime.fromisoformat(clock[0]) + timedelta(days=1)).isoformat(" ")
 
         _persist(
             conn, chunks["loser"], [negative], prompt_version="v14", cfg=cfg
@@ -464,6 +472,8 @@ def test_exact_claim_replay_persists_new_auxiliary_projections_without_churn(
 def test_exact_replay_repairs_staged_publication_and_missing_assertion(tmp_path):
     conn = _open(tmp_path)
     try:
+        clock = [conn.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0]]
+        conn.create_function("current_timestamp", 0, lambda: clock[0])
         [message_id] = _messages(
             conn, [("user", "The app uses Redis", "2024-01-01")]
         )
@@ -508,8 +518,15 @@ def test_exact_replay_repairs_staged_publication_and_missing_assertion(tmp_path)
             )
         core_db._ensure_post_migration_runtime_guards(conn)
 
+        before_processed_at = conn.execute(
+            "SELECT processed_at FROM processed_chunks WHERE chunk_id=?", (chunk.id,),
+        ).fetchone()[0]
+        clock[0] = (datetime.fromisoformat(clock[0]) + timedelta(seconds=1)).isoformat(" ")
         _persist(conn, chunk, [claim], prompt_version="v13", cfg=cfg)
 
+        assert conn.execute(
+            "SELECT processed_at FROM processed_chunks WHERE chunk_id=?", (chunk.id,),
+        ).fetchone()[0] == clock[0] != before_processed_at
         assert conn.execute("SELECT COUNT(*) FROM kg_evidence").fetchone()[0] == 1
         assert conn.execute(
             "SELECT published_at FROM kg_evidence WHERE id=?", (evidence_id,)

@@ -58,6 +58,7 @@ def test_dream_status_reports_active_current_fact_quarantine(hy: HyMem):
     identity = facts_retry_policy_version(
         hy.config,
         replay_slice_key=_cursor_retry_unit(hy, session_id),
+        client=hy._llm,
     )
     _set_quarantine(hy, session_id, identity)
 

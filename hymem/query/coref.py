@@ -288,7 +288,7 @@ def _salient_referents(window: list[Message]) -> list[str]:
 def _append_clause(query: str, referents: list[str]) -> str:
     """The one rewrite form: append, never replace (see module docstring).
 
-    The parenthesised clause is stripped to bare tokens by `_FTS_SAFE` on every
+    The parenthesised clause is stripped to bare tokens by `_fts_safe_text` on every
     FTS path, so the referents enter the BM25 OR-query as ordinary terms while
     remaining readable to an LLM reranker and to a human reading a log line."""
     return f"{query} (context: {', '.join(referents)})"

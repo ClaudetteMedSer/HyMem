@@ -58,7 +58,7 @@ def _current_indexing_status(**overrides):
         "coverage_integrity_failures": 0,
         "phase1_backlog_status": "current_producer",
         "pending_chunks_authoritative": True,
-        "phase1_generation_key": "hymem-phase1-generation-v1:test",
+        "phase1_generation_key": "hymem-phase1-generation-v1:" + "1" * 64,
         "in_progress": False,
     }
     value.update(overrides)
@@ -1620,7 +1620,7 @@ def test_checkpoint_and_artifact_bound_all_operational_diagnostics(
         "verbatim benchmark evidence remains exact"
     )
     checkpoint_identity = artifact["execution"]["checkpoint"]
-    assert set(checkpoint_identity) == {"schema", "state_sha256"}
+    assert set(checkpoint_identity) == {"schema", "state", "state_sha256"}
     assert checkpoint_identity["state_sha256"].startswith("sha256:")
     assert checkpoint.name not in archive_wire
     ledger.close()

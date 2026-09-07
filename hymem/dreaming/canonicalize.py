@@ -13,10 +13,9 @@ from hymem.core.time import (
 )
 
 # Strip leading articles, trailing parentheticals like "(container)", and
-# punctuation. Lowercase. ASCII-fold Latin surfaces and collapse whitespace
-# and underscores.  If that projection has no token at all, retain a bounded
-# NFKC/casefolded Unicode token instead of collapsing every non-Latin surface
-# onto the empty alias key.
+# punctuation. Casefold and accent-fold Latin bases, but retain non-Latin
+# letters and their meaningful combining marks in the SAME pipeline. A mixed
+# name must never lose its Unicode identity merely because it has ASCII too.
 # Articles cover common Latin-script European languages; this runs after the
 # string is already lowercased and accent-folded.
 _LEADING_ARTICLES = re.compile(
@@ -31,35 +30,67 @@ _LEADING_ARTICLES = re.compile(
     re.IGNORECASE,
 )
 _TRAILING_PAREN = re.compile(r"\s*\([^)]*\)\s*$")
-_NON_ALNUM = re.compile(r"[^a-z0-9]+")
-_NON_UNICODE_WORD = re.compile(r"[\W_]+", re.UNICODE)
 _MAX_UNICODE_CANONICAL_CHARS = 512
+CANONICALIZATION_POLICY_VERSION = "hymem-unicode-canonicalization-v2"
+CANONICAL_UNICODE_VERSION = unicodedata.unidata_version
+
+
+def _fold_latin_accents(surface: str) -> str:
+    """Compatibility-decompose, dropping marks only after a Latin base.
+
+    Unicode word regexes omit marks such as Devanagari vowels; dropping all marks
+    would likewise conflate Cyrillic Й/И, Greek accents, and vocalized Arabic.
+    Keep them through NFC composition and the later token filter instead.
+    """
+    out: list[str] = []
+    latin_base = False
+    for character in unicodedata.normalize("NFKD", surface):
+        category = unicodedata.category(character)
+        if category.startswith("M"):
+            if not latin_base:
+                out.append(character)
+        else:
+            latin_base = category.startswith("L") and (
+                "LATIN" in unicodedata.name(character, "")
+            )
+            out.append(character)
+    return "".join(out)
 
 
 def normalize(surface: str) -> str:
-    """Deterministic surface -> canonical key. Pure function, no DB needed."""
-    s = unicodedata.normalize("NFKD", surface).encode("ascii", "ignore").decode("ascii")
+    """Return a bounded, idempotent Unicode key, or empty for invalid names.
+
+    Compatibility spellings and case fold together; Latin accents, leading
+    articles and trailing parentheticals retain the historical policy. Other
+    letters/numbers and attached marks remain meaningful. Punctuation,
+    symbols, controls, and unattached marks separate tokens. No truncation is
+    allowed, including for ASCII names: oversized keys fail closed.
+    """
+    s = _fold_latin_accents(surface)
     s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
     s = re.sub(r'([a-z])([A-Z])', r'\1_\2', s)
-    s = s.strip().lower()
+    # Casefold can expand characters (ß -> ss, for example). Decompose again
+    # before classifying marks so the result remains a normalization fixed point.
+    s = _fold_latin_accents(s.casefold()).strip()
     s = _TRAILING_PAREN.sub("", s)
     s = _LEADING_ARTICLES.sub("", s)
-    s = _NON_ALNUM.sub("_", s).strip("_")
-    if s:
-        return s
-
-    # ASCII-only behavior above stays byte-for-byte stable.  This fallback is
-    # solely for surfaces that previously collapsed to ``""`` (CJK, Cyrillic,
-    # Arabic, and similar scripts). NFKC removes compatibility spellings,
-    # casefold makes casing deterministic, and every punctuation/control run
-    # is a separator. Oversized values fail closed rather than truncating two
-    # distinct identities onto the same key.
-    unicode_key = _NON_UNICODE_WORD.sub(
-        "_", unicodedata.normalize("NFKC", surface).casefold()
-    ).strip("_")
-    if len(unicode_key) > _MAX_UNICODE_CANONICAL_CHARS:
+    out: list[str] = []
+    attached = False
+    for character in s:
+        category = unicodedata.category(character)
+        if category[0] in {"L", "N"}:
+            out.append(character)
+            attached = True
+        elif category.startswith("M") and attached:
+            out.append(character)
+        else:
+            if out and out[-1] != "_":
+                out.append("_")
+            attached = False
+    key = unicodedata.normalize("NFC", "".join(out).strip("_"))
+    if len(key) > _MAX_UNICODE_CANONICAL_CHARS:
         return ""
-    return unicode_key
+    return key
 
 
 def resolve(conn: sqlite3.Connection, surface: str) -> str:

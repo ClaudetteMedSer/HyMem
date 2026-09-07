@@ -28,6 +28,7 @@ from benchmarks.strictness import (
     usage_snapshot,
 )
 from hymem.extraction.contract import extraction_contract_binding
+from tests.archive_evidence_fixtures import bind_checkpoint
 from hymem.contrib.endpoint_policy import secret_free_endpoint_identity
 from hymem.dreaming.aggregation_material import (
     aggregation_material_binding,
@@ -426,11 +427,15 @@ def make_artifact(*, retrieval_only: bool = False):
         "accuracy": None if retrieval_only else 1.0,
         "count": 0 if retrieval_only else 1,
     }
+    from tests.archive_evidence_fixtures import bind_checkpoint
+    bind_checkpoint(artifact)
     return artifact
 
 
 def _refresh_result_digest(artifact):
     artifact["result_digest"] = content_hash(artifact["per_question"])
+    from tests.archive_evidence_fixtures import bind_checkpoint
+    bind_checkpoint(artifact)
 
 
 def _refresh_manifest(artifact):
@@ -444,6 +449,8 @@ def _refresh_manifest(artifact):
     )
     for segment in artifact["execution"]["segments"]:
         segment["model_identities"] = artifact["models"]
+    from tests.archive_evidence_fixtures import bind_checkpoint
+    bind_checkpoint(artifact)
 
 
 def _retarget_pipeline_endpoint(artifact, endpoint: str) -> None:
@@ -750,7 +757,7 @@ def test_successful_indexing_summary_rejects_cleanup_failure_forgery():
 def test_lme_v3_preserves_all_durable_health_and_schema_identity():
     summary = _canonical_indexing_summary(failed=False)
     final = summary["final_status"]
-    assert summary["schema"] == "hymem-lme-indexing-summary-v4"
+    assert summary["schema"] == "hymem-lme-indexing-summary-v5"
     assert final["dream_status_schema"] == protocol.DREAM_STATUS_SCHEMA_VERSION
     assert final["benchmark_indexing_status_schema"] == (
         protocol.BENCHMARK_INDEXING_STATUS_VERSION
@@ -2032,6 +2039,7 @@ def test_strict_validator_recomputes_optional_router_and_recall_summaries():
 def test_running_recovery_segment_is_valid_but_exact_usage_is_null():
     artifact = make_artifact()
     artifact["execution"]["segments"][0]["status"] = "running"
+    bind_checkpoint(artifact)
     validated = protocol.validate_strict_artifact(artifact)
     assert validated["answer_calls"] is None
     assert validated["judge_calls"] is None
@@ -2060,6 +2068,7 @@ def test_failed_indexing_attempt_can_be_followed_by_healthy_resume():
         models=artifact["models"], seed=original["seed"],
         expected_ids=["qid"], protocol_split="full",
     )
+    bind_checkpoint(artifact)
     assert protocol.validate_strict_artifact(artifact)["counts"]["completed"] == 1
 
 
@@ -2571,6 +2580,7 @@ def test_configured_embedding_identity_and_provider_usage_are_reconciled():
         models=artifact["models"], seed=old["seed"],
         expected_ids=["qid"], protocol_split="full",
     )
+    bind_checkpoint(artifact)
     validated = protocol.validate_strict_artifact(artifact)
     assert validated["total_tokens"] == 12
 
@@ -2604,6 +2614,7 @@ def test_configured_embedding_identity_and_provider_usage_are_reconciled():
     unavailable["execution"]["segments"][0]["instrumentation_errors"] = [
         "qid: embedding usage/identity unavailable"
     ]
+    bind_checkpoint(unavailable)
     assert protocol.validate_strict_artifact(unavailable)["total_tokens"] is None
     unavailable["execution"]["segments"][0]["instrumentation_errors"] = []
     with pytest.raises(BenchmarkIntegrityError, match="embedding execution identity"):
@@ -2698,6 +2709,7 @@ def _full_failure_artifact(monkeypatch):
         "per_question": rows,
     }
     artifact["result_digest"] = content_hash(rows)
+    bind_checkpoint(artifact)
     return artifact, ids
 
 
@@ -2746,6 +2758,7 @@ def test_official_alignment_is_distinct_from_development_comparability(
         models=artifact["models"], seed=old["seed"],
         expected_ids=ids, protocol_split="full",
     )
+    bind_checkpoint(artifact)
     validated = protocol.validate_strict_artifact(artifact)
     assert validated["official_scoring_semantics_aligned"] is True
     assert validated["official_protocol_aligned"] is False
@@ -2794,6 +2807,7 @@ def test_official_export_is_exact_ordered_exclusive_and_failure_complete(
 def test_official_export_rejects_an_unfinalized_execution(tmp_path, monkeypatch):
     artifact, _ids = _full_failure_artifact(monkeypatch)
     artifact["execution"]["segments"][0]["status"] = "running"
+    bind_checkpoint(artifact)
     with pytest.raises(BenchmarkIntegrityError, match="completed strict"):
         protocol.export_official_predictions(artifact, tmp_path / "official.jsonl")
 
