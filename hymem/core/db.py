@@ -4985,7 +4985,9 @@ def _backfill_v40_chunk_manifests(conn: sqlite3.Connection) -> None:
         # Promote old claim rows only when the manifested chunk has exactly one
         # source AND that prospective source identity occurs exactly once. Do
         # this in a second pass so two ambiguous chunks cannot make the first
-        # arrival authoritative.
+        # arrival authoritative. Recovering coverage later (notably in v47)
+        # does not make retired evidence current again: leave that history
+        # untouched instead of minting a new observation/assertion for it.
         candidates = conn.execute(
             """
             SELECT ev.id, ev.edge_id, ev.chunk_id, ev.evidence_kind,
@@ -5003,6 +5005,7 @@ def _backfill_v40_chunk_manifests(conn: sqlite3.Connection) -> None:
              AND mc.chunk_id = cms.source_coverage_chunk_id
              AND mc.coverage_version = cms.source_coverage_version
             WHERE ev.provenance_status = 'legacy_unattributed'
+              AND ev.is_current = 1
               AND c.source_manifest_version = 'claim-source-manifest-v1'
               AND c.source_manifest_count = 1
             ORDER BY ev.id
