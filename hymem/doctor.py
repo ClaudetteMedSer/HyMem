@@ -161,6 +161,8 @@ def _check_embedding(
             f", fallback_reason={cfg.embedding_fallback_reason}"
             if cfg.embedding_fallback_reason else ""
         )
+        if cfg.embedding_fallback_detail:
+            fallback_detail += f", policy_detail={cfg.embedding_fallback_detail}"
         return (
             _Result(
                 status, "embeddings",

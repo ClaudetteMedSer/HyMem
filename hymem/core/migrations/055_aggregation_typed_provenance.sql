@@ -116,7 +116,7 @@ DROP TRIGGER IF EXISTS aggregation_publication_update_guard;
 
 CREATE TRIGGER aggregation_source_header_insert_guard
 BEFORE INSERT ON aggregation_nodes
-WHEN NOT (
+WHEN (
     new.source_manifest_complete = 0
     AND new.source_manifest_count = 0
     AND new.source_manifest_hash IS NULL
@@ -141,7 +141,7 @@ WHEN NOT (
          length(new.build_config_version) = 92
          AND substr(new.build_config_version,1,28) =
              'aggregation-build-config-v1:'))
-) BEGIN
+) IS NOT 1 BEGIN
     SELECT RAISE(ABORT, 'aggregation proof must publish after its children');
 END;
 
@@ -149,9 +149,9 @@ CREATE TRIGGER aggregation_source_header_update_guard
 BEFORE UPDATE OF source_manifest_version, source_manifest_count,
                  source_manifest_hash, source_manifest_complete,
                  input_manifest_version, input_manifest_count,
-                 input_manifest_hash, input_manifest_complete
+                 input_manifest_hash, input_manifest_complete, input_fingerprint
 ON aggregation_nodes
-WHEN NOT (
+WHEN (
     (new.source_manifest_complete = 0
      AND new.source_manifest_count = 0
      AND new.source_manifest_hash IS NULL
@@ -160,7 +160,10 @@ WHEN NOT (
      AND new.input_manifest_complete = 0
      AND new.input_manifest_count = 0
      AND new.input_manifest_hash IS NULL
-     AND new.input_manifest_version IS NULL)
+     AND new.input_manifest_version IS NULL
+     AND (new.input_fingerprint IS NULL OR (
+          length(new.input_fingerprint) = 71
+          AND new.input_fingerprint GLOB 'sha256:*')))
     OR
     (new.source_manifest_complete = 1
      AND new.source_manifest_version = 'aggregation-source-manifest-v1'
@@ -202,7 +205,7 @@ WHEN NOT (
                    AND source.input_ordinal=input.ordinal)
                 <> input.source_manifest_count
      ))
-) BEGIN
+) IS NOT 1 BEGIN
     SELECT RAISE(ABORT, 'invalid aggregation proof publication');
 END;
 

@@ -473,8 +473,19 @@ def _v55_aggregation_bindings_present(
 
 def _v55_aggregation_storage_present(
     conn: sqlite3.Connection, *, allow_v56: bool = False,
-    allow_v57: bool = False,
+    allow_v57: bool = False, allow_v56_bootstrap: bool = False,
 ) -> bool:
+    # schema.sql can create the v56 registry/publication tables before 056
+    # adds node columns. A failed 056 transaction leaves this exact, empty
+    # bootstrap tail at stamp 55. It is repairable storage, never a binding.
+    if allow_v56_bootstrap and (
+        allow_v56 or allow_v57 or schema_version(conn) != 55
+        or conn.execute(
+            "SELECT 1 FROM schema_meta WHERE key='aggregation_generation_schema'"
+        ).fetchone() is not None
+    ):
+        return False
+    extended_publication = allow_v56 or allow_v56_bootstrap
     if not _v55_domain_present(conn):
         return False
     marker = conn.execute(
@@ -545,11 +556,16 @@ def _v55_aggregation_storage_present(
         "aggregation_node_inputs", "aggregation_node_input_sources",
         "aggregation_node_source_occurrences", "aggregation_publication_state",
     }
-    if allow_v56:
+    if extended_publication:
         required_tables.add("aggregation_generations")
     if allow_v57:
         required_tables.add("aggregation_material_epochs")
     if not all(_table_exists(conn, table) for table in required_tables):
+        return False
+    if allow_v56_bootstrap and any(
+        conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+        for table in ("aggregation_generations", "aggregation_publication_state")
+    ):
         return False
     expected_shapes = {
         "aggregation_node_inputs": (
@@ -604,14 +620,14 @@ def _v55_aggregation_storage_present(
         ) + ((
             ("aggregation_generation_key", "TEXT", 0, None, 0),
             ("request_contract_sha256", "TEXT", 0, None, 0),
-        ) if allow_v56 else ()) + ((
+        ) if extended_publication else ()) + ((
             ("aggregation_material_epoch_key", "TEXT", 0, None, 0),
             ("material_revision", "INTEGER", 0, None, 0),
             ("node_embedding_count", "INTEGER", 0, None, 0),
             ("node_embedding_set_hash", "TEXT", 0, None, 0),
         ) if allow_v57 else ()),
     }
-    if allow_v56:
+    if extended_publication:
         expected_shapes["aggregation_generations"] = (
             ("generation_key", "TEXT", 0, None, 1),
             ("material_config_version", "TEXT", 1, None, 0),
@@ -663,7 +679,7 @@ def _v55_aggregation_storage_present(
         (1, 0, "aggregation_nodes", "node_id", "id", "NO ACTION", "CASCADE", "NONE"),
     ):
         return False
-    if allow_v56:
+    if extended_publication:
         node_generation_fks = tuple(
             tuple(row) for row in conn.execute(
                 "PRAGMA foreign_key_list(aggregation_nodes)"
@@ -678,7 +694,7 @@ def _v55_aggregation_storage_present(
             0, 0, "aggregation_generations", "aggregation_generation_key",
             "generation_key", "NO ACTION", "RESTRICT", "NONE",
         )
-        expected_node_fks = (expected_generation_fk,)
+        expected_node_fks = (expected_generation_fk,) if allow_v56 else ()
         expected_publication_fks = (expected_generation_fk,)
         if allow_v57:
             expected_material_fk = (
@@ -777,7 +793,7 @@ def _v55_aggregation_storage_present(
         },
         "aggregation_publication_state": {},
     }
-    if allow_v56:
+    if extended_publication:
         expected_indexes["aggregation_generations"] = {
             "sqlite_autoindex_aggregation_generations_1": (
                 1, "pk", 0,
@@ -816,7 +832,7 @@ def _v55_aggregation_storage_present(
     exact_v55_tables = [
         "aggregation_node_inputs", "aggregation_node_input_sources",
     ]
-    if not allow_v56:
+    if not extended_publication:
         exact_v55_tables.append("aggregation_publication_state")
     for table in exact_v55_tables:
         expected = next(
@@ -832,7 +848,7 @@ def _v55_aggregation_storage_present(
         ).fetchone()
         if actual_row is None or normalized(actual_row["sql"]) != normalized(expected):
             return False
-    if allow_v56:
+    if extended_publication:
         expected_registry = next(
             statement for statement in _split_sql_statements(
                 files("hymem.core.migrations").joinpath(
@@ -861,6 +877,22 @@ def _v55_aggregation_storage_present(
     if index_row is None or normalized(index_row["sql"]) != normalized(expected_index):
         return False
     schema_statements = _split_sql_statements(_load_schema())
+    if allow_v56_bootstrap:
+        # Unlike the completed v56 variant, this can only come from the exact
+        # bootstrap CREATE (not an ALTER of an already-published v55 table).
+        expected_publication = next(
+            statement for statement in schema_statements
+            if re.match(
+                r"\s*CREATE\s+TABLE.*aggregation_publication_state\b",
+                statement, re.I,
+            )
+        )
+        actual_publication = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='aggregation_publication_state'"
+        ).fetchone()
+        if normalized(actual_publication["sql"]) != normalized(expected_publication):
+            return False
     flat_expected = next(
         statement for statement in schema_statements
         if re.match(
@@ -878,9 +910,12 @@ def _v55_aggregation_storage_present(
         statement for statement in schema_statements
         if re.match(r"\s*CREATE\s+TABLE.*aggregation_nodes\b", statement, re.I)
     )
-    # A real v54->v55 upgrade has the same exact columns/constraints but
-    # SQLite serializes ALTER-added columns after the original table CHECK.
-    # Construct that one canonical alternate spelling from the owned sources.
+    # A schema.sql-origin v54->v55 upgrade retains its table-level CHECK;
+    # SQLite serializes ALTER-added columns differently. Migration 016
+    # predates the CHECK, however, and 017/045 only added columns. Recognize
+    # both exact owned lineages, not arbitrary tables with CHECKs removed.
+    # The bindings validator additionally requires the canonical v55 header
+    # guards, including NULL-safe fingerprint validation on unpublished rows.
     marker = fresh_node_expected.index("    input_manifest_version TEXT,")
     legacy_check = fresh_node_expected.index(
         "    CHECK (\n        (source_manifest_complete", marker
@@ -925,12 +960,49 @@ def _v55_aggregation_storage_present(
         ).fetchone()[0]
     finally:
         reference.close()
+    original_node_sql = next(
+        statement for statement in _split_sql_statements(
+            files("hymem.core.migrations").joinpath(
+                "016_aggregation_nodes.sql"
+            ).read_text(encoding="utf-8")
+        )
+        if re.match(r"\s*CREATE\s+TABLE.*aggregation_nodes\b", statement, re.I)
+    )
+    historical_migrations = [
+        "017_aggregation_hierarchy.sql", "045_aggregation_source_provenance.sql",
+        "055_aggregation_typed_provenance.sql",
+    ]
+    if allow_v56:
+        historical_migrations.append("056_aggregation_generation_identity.sql")
+    if allow_v57:
+        historical_migrations.append("057_aggregation_material_epoch.sql")
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.execute(original_node_sql)
+        for migration in historical_migrations:
+            for statement in _split_sql_statements(
+                files("hymem.core.migrations").joinpath(migration).read_text(
+                    encoding="utf-8"
+                )
+            ):
+                if re.match(
+                    r"\s*ALTER\s+TABLE\s+aggregation_nodes\s+ADD\s+COLUMN\b",
+                    statement, re.I,
+                ):
+                    reference.execute(statement)
+        historical_node_expected = reference.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='aggregation_nodes'"
+        ).fetchone()[0]
+    finally:
+        reference.close()
     node_actual = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND "
         "name='aggregation_nodes'"
     ).fetchone()
     if node_actual is None or normalized(node_actual["sql"]) not in {
         normalized(fresh_node_expected), normalized(migrated_node_expected),
+        normalized(historical_node_expected),
     }:
         return False
     return True
@@ -2807,6 +2879,7 @@ def initialize(conn: sqlite3.Connection) -> None:
         and schema_version(conn) == 55
         and _v55_domain_footprint_present(conn)
         and not _v55_aggregation_storage_present(conn)
+        and not _v55_aggregation_storage_present(conn, allow_v56_bootstrap=True)
     ):
         raise RuntimeError("schema v55 aggregation provenance domain is incomplete")
     if (
@@ -2880,7 +2953,7 @@ def _install_evidence_publication_guards(conn: sqlite3.Connection) -> None:
 
 
 def _install_aggregation_source_guards(conn: sqlite3.Connection) -> None:
-    """Install/heal the schema-appropriate aggregation proof boundary."""
+    """Install/heal the proof boundary without committing a caller's transaction."""
 
     legacy_script = files("hymem.core.migrations").joinpath(
         "045_aggregation_source_provenance.sql"
@@ -2906,14 +2979,14 @@ def _install_aggregation_source_guards(conn: sqlite3.Connection) -> None:
         start = legacy_script.index(marker)
         end = legacy_script.index("\nEND;", start) + len("\nEND;")
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        conn.executescript(legacy_script[start:end])
+        conn.execute(legacy_script[start:end])
     if schema_version(conn) < 55:
         for name in legacy_aggregation_names:
             marker = f"CREATE TRIGGER IF NOT EXISTS {name}"
             start = legacy_script.index(marker)
             end = legacy_script.index("\nEND;", start) + len("\nEND;")
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-            conn.executescript(legacy_script[start:end])
+            conn.execute(legacy_script[start:end])
         return
     typed_script = files("hymem.core.migrations").joinpath(
         "055_aggregation_typed_provenance.sql"
@@ -2931,7 +3004,7 @@ def _install_aggregation_source_guards(conn: sqlite3.Connection) -> None:
         start = typed_script.index(marker)
         end = typed_script.index("\nEND;", start) + len("\nEND;")
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        conn.executescript(typed_script[start:end])
+        conn.execute(typed_script[start:end])
 
 
 def _install_aggregation_generation_guards(conn: sqlite3.Connection) -> None:
@@ -4479,6 +4552,23 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     resumes cleanly. Migrations are idempotent, so a fresh schema.sql database
     (which starts at version 1) runs them all as no-ops up to the latest."""
     cur = schema_version(conn)
+    if cur >= 55 and (
+        _v55_aggregation_storage_present(
+            conn,
+            allow_v56=_v56_domain_footprint_present(conn),
+            allow_v57=_v57_domain_footprint_present(conn),
+        )
+        or (cur == 55 and _v55_aggregation_storage_present(conn))
+        or (cur == 55 and _v55_aggregation_storage_present(
+            conn, allow_v56_bootstrap=True,
+        ))
+    ):
+        # An interrupted v55/v56 upgrade (or a current store) can retain the
+        # original v55 header guards. Refresh them before the next migration's
+        # exact binding checks, after validating the complete storage prefix.
+        # execute(), not executescript(), keeps this healing crash-atomic.
+        with transaction(conn):
+            _install_aggregation_source_guards(conn)
     for version, entry in _discover_migrations():
         if version <= cur:
             continue

@@ -16,9 +16,13 @@ from pathlib import Path
 from hymem.api import HyMem
 from hymem.config import HyMemConfig
 from hymem.contrib.endpoint_policy import (
+    EMBEDDING_INTERNAL_HTTP_ENV,
     EndpointPolicyError,
+    _reject_credential_shaped_endpoint_host,
+    _reject_credential_shaped_endpoint_path,
     resolve_embedding_api_key,
     resolve_llm_api_key,
+    validate_http_endpoint,
 )
 
 log = logging.getLogger("hymem.bootstrap")
@@ -58,6 +62,9 @@ class EnvConfig:
     embedding_pin_dimension: bool = False
     embedding_deployment_revision: str | None = None
     embedding_deployment_tenant: str | None = None
+    # Snapshot of the rejected endpoint's safe policy explanation. Do not
+    # reconstruct it from later ambient environment or retain the rejected URL.
+    embedding_fallback_detail: str | None = None
 
     @property
     def has_llm_key(self) -> bool:
@@ -208,6 +215,35 @@ def _env_positive_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _embedding_endpoint_rejection_detail(
+    base_url: str, error: EndpointPolicyError,
+) -> str:
+    """Retain bounded policy text, never endpoint/key/flag values.
+
+    EndpointPolicyError messages from these maintained policy functions use
+    constant labels and never interpolate rejected input. Qualify the internal
+    HTTP hint against the complete route: transport rejection happens before
+    credential-shaped host/path validation, and enabling HTTP must not be
+    recommended as a remedy for such a route.
+    """
+    detail = str(error)
+    if f"; set {EMBEDDING_INTERNAL_HTTP_ENV}=1" in detail:
+        try:
+            # Inert diagnostic validation only. This explicit mapping neither
+            # changes process environment nor authorizes a key, client or call.
+            endpoint = validate_http_endpoint(
+                base_url,
+                label="embedding",
+                allow_insecure_internal_env=EMBEDDING_INTERNAL_HTTP_ENV,
+                environ={EMBEDDING_INTERNAL_HTTP_ENV: "1"},
+            )
+            _reject_credential_shaped_endpoint_host(endpoint)
+            _reject_credential_shaped_endpoint_path(endpoint)
+        except EndpointPolicyError as unsafe_route:
+            detail = str(unsafe_route)
+    return detail[:512]
+
+
 def resolve_env() -> EnvConfig:
     """Resolve all HyMem configuration from the environment.
 
@@ -235,6 +271,7 @@ def resolve_env() -> EnvConfig:
     )
     embedding_key: str | None = None
     embedding_fallback_reason: str | None = None
+    embedding_fallback_detail: str | None = None
     if explicit_embedding:
         requested_base = env(
             "HYMEM_EMBEDDING_BASE_URL", DEFAULT_REMOTE_EMBEDDING_BASE_URL
@@ -249,8 +286,11 @@ def resolve_env() -> EnvConfig:
             _embedding_endpoint, embedding_key = resolve_embedding_api_key(
                 requested_base
             )
-        except EndpointPolicyError:
+        except EndpointPolicyError as exc:
             embedding_fallback_reason = "remote_embedding_endpoint_rejected"
+            embedding_fallback_detail = _embedding_endpoint_rejection_detail(
+                requested_base, exc,
+            )
         except EnvironmentError:
             embedding_fallback_reason = "remote_embedding_credentials_missing"
         if embedding_key:
@@ -296,6 +336,7 @@ def resolve_env() -> EnvConfig:
         ),
         embedding_backend=embedding_backend,
         embedding_fallback_reason=embedding_fallback_reason,
+        embedding_fallback_detail=embedding_fallback_detail,
         aggregation_nodes_enabled=_env_flag("HYMEM_AGGREGATION_NODES_ENABLED"),
         aggregation_digest_enabled=_env_flag("HYMEM_AGGREGATION_DIGEST_ENABLED"),
     )
@@ -386,6 +427,12 @@ def build_from_env() -> HyMem:
                 model_name=cfg.embedding_model,
                 fallback_reason=cfg.embedding_fallback_reason,
             )
+            if cfg.embedding_fallback_reason == "remote_embedding_endpoint_rejected":
+                log.warning(
+                    "configured embedding endpoint rejected: %s; using "
+                    "deterministic local lexical fallback; run hymem-doctor",
+                    cfg.embedding_fallback_detail or cfg.embedding_fallback_reason,
+                )
             log.info(
                 "embeddings backend=%s model=%s dim=%d quality=lexical network=none%s",
                 cfg.embedding_backend, cfg.embedding_model, cfg.embedding_dim,

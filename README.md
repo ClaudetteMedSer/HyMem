@@ -54,8 +54,10 @@ backend; an explicit remote endpoint should use HTTPS and
 the official `api.openai.com` HTTPS origin). Full inventory in
 [§9 Configuration](#9-configuration).
 
-For the existing container-network embedding service, keep the exception
-explicit (HTTPS is preferred whenever the service can terminate TLS):
+An embedding service outside the Hermes container can still be local to its
+isolated container network. A service name such as `embedding-server` is not
+loopback inside Hermes, so keep the HTTP exception explicit (HTTPS is preferred
+whenever the service can terminate TLS):
 
 ```bash
 export HYMEM_EMBEDDING_BASE_URL=http://embedding-server:8766
@@ -63,6 +65,28 @@ export HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP=1
 # Set HYMEM_EMBEDDING_API_KEY only if that internal service authenticates.
 # HyMem otherwise sends a non-secret local dummy; cloud/LLM keys are never reused.
 ```
+
+Keep the service's actual `HYMEM_EMBEDDING_MODEL` and `HYMEM_EMBEDDING_DIM`.
+Network-backed durable vectors also require `HYMEM_EMBEDDING_PIN_DIMENSION=1`
+and the existing, operator-verified **public**
+`HYMEM_EMBEDDING_DEPLOYMENT_REVISION` and `HYMEM_EMBEDDING_DEPLOYMENT_TENANT`.
+These bind the exact vector producer, not credentials; obtain missing values
+from the service operator instead of guessing them or changing the model/dimension
+to make a check pass. The HTTP exception does not waive these requirements.
+
+Persist these settings in the environment supplied by the actual launcher to
+**both** the Honcho service and MCP process. An export in an interactive shell,
+or an edited `.env` file that the launcher never loads, does not update an
+already-running process. Restart processes when their launcher reloads the
+updated environment; if environment values are part of the container's creation
+configuration, recreate/redeploy that container with the updated configuration
+instead of merely restarting it. Preserve its existing storage mounts and other
+settings. Verify the process-visible non-secret settings and run `hymem-doctor`
+under the same environment—not just in a different login shell. Doctor's remote
+checks issue real provider requests. A rejected endpoint remains `[FAIL]` even
+though the server can use the lower-quality lexical fallback; the diagnostic
+states the opt-in only for a valid internal HTTP endpoint. Public HTTP is never
+enabled by this flag.
 
 ---
 
@@ -794,6 +818,9 @@ dimension).
 | `HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP` | unset (`false`) | Narrow emergency opt-in for cleartext embedding endpoints on a private/link-local IP or internal service DNS name (for example `http://embedding-server:8766`); public HTTP remains forbidden and HTTPS is preferred |
 | `HYMEM_EMBEDDING_MODEL` | `hymem-local-feature-hash-v1` | Exact embedding-space model id |
 | `HYMEM_EMBEDDING_DIM` | `384` | Exact embedding dimension |
+| `HYMEM_EMBEDDING_PIN_DIMENSION` | unset (`false`) | Required for network-backed durable vectors: assert the configured dimension with `1`; does not override the service's returned dimension |
+| `HYMEM_EMBEDDING_DEPLOYMENT_REVISION` | unset | Required public operator-verified model/deployment revision for network-backed durable vector identity; never a credential |
+| `HYMEM_EMBEDDING_DEPLOYMENT_TENANT` | unset | Required public operator-verified tenant/deployment scope for network-backed durable vector identity; never a credential |
 | `HYMEM_EMBEDDING_TIMEOUT_SECONDS` | `10` | Per-request timeout for an explicitly configured remote embedder; SDK retries are disabled |
 | `HYMEM_HONCHO_HOST` | `127.0.0.1` | Honcho server bind address |
 | `HYMEM_HONCHO_PORT` | `8765` | Honcho server port |
