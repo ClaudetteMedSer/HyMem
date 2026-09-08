@@ -19,15 +19,15 @@
 ## Quickstart
 
 `pip install` HyMem, point it at your model provider with environment
-variables, and run a server — no config files.
+variables, and run a server — no config files. With no embedding settings,
+this quickstart uses the deterministic no-network lexical feature-hash backend.
+For network-backed semantic embeddings, apply one complete environment block
+below **before** running the doctor or launching either server.
 
 ```bash
 pip install 'hymem[server]'
 
 export HYMEM_LLM_API_KEY=sk-...        # extraction LLM (DeepSeek/OpenAI/...)
-# Optional: configure an OpenAI-compatible semantic embedder. If omitted,
-# HyMem uses its deterministic no-network lexical feature-hash backend.
-export HYMEM_EMBEDDING_API_KEY=sk-...
 export HYMEM_ROOT=~/.hermes            # optional — SQLite + Markdown live here
 # RAPTOR aggregation + its standing digest are enabled by default.
 # Optional opt-out: export HYMEM_AGGREGATION_NODES_ENABLED=false
@@ -38,9 +38,14 @@ hymem-honcho      # Honcho-compatible HTTP subset on :8765
 hymem-server      # MCP tools server
 ```
 
-`hymem-doctor` prints the resolved provider/model/URLs and checks that the
-keys work, configured remote endpoints are reachable, `sqlite-vec` loads, the schema
-migrates, and the embedding model and dimension match existing vector shadows. If the
+`hymem-doctor` reports the resolved provider/model and safe endpoint identity,
+probes configured providers, checks that `sqlite-vec` loads and the schema migrates,
+and reports embedding model/dimension mismatches in vector shadows. It also
+counts producer-incompatible or malformed rows across all six durable embedding
+mirrors and reports foreign-key violations, without repairing or deleting them.
+This stored-row compatibility check is not a per-row vector recovery audit:
+it excludes the historical general embedding cache and does not establish that
+all existing source rows have current vectors or valid source proofs. If the
 LLM key is missing the servers refuse to start with a clear message rather than
 failing deep inside the first request.
 
@@ -54,17 +59,51 @@ backend; an explicit remote endpoint should use HTTPS and
 the official `api.openai.com` HTTPS origin). Full inventory in
 [§9 Configuration](#9-configuration).
 
+For an authenticated HTTPS embedding service, first obtain its actual API base,
+model ID, output dimension, and public deployment revision/tenant from the
+operator. This block refuses missing or empty values instead of choosing a model
+or dimension for your deployment:
+
+```bash
+: "${HYMEM_EMBEDDING_BASE_URL:?Set the actual HTTPS API base, including its route prefix}"
+: "${HYMEM_EMBEDDING_API_KEY:?Set the purpose-bound embedding API key}"
+: "${HYMEM_EMBEDDING_MODEL:?Set the operator-verified embedding model ID}"
+: "${HYMEM_EMBEDDING_DIM:?Set the operator-verified output dimension as a positive integer}"
+: "${HYMEM_EMBEDDING_DEPLOYMENT_REVISION:?Set the operator-verified public deployment revision}"
+: "${HYMEM_EMBEDDING_DEPLOYMENT_TENANT:?Set the operator-verified public deployment tenant}"
+export HYMEM_EMBEDDING_BASE_URL HYMEM_EMBEDDING_API_KEY
+export HYMEM_EMBEDDING_MODEL HYMEM_EMBEDDING_DIM
+export HYMEM_EMBEDDING_DEPLOYMENT_REVISION HYMEM_EMBEDDING_DEPLOYMENT_TENANT
+export HYMEM_EMBEDDING_PIN_DIMENSION=1
+```
+
 An embedding service outside the Hermes container can still be local to its
 isolated container network. A service name such as `embedding-server` is not
 loopback inside Hermes, so keep the HTTP exception explicit (HTTPS is preferred
-whenever the service can terminate TLS):
+whenever the service can terminate TLS). For that service **when its API is
+served under `/v1`**, use this complete alternative:
 
 ```bash
-export HYMEM_EMBEDDING_BASE_URL=http://embedding-server:8766
+: "${HYMEM_EMBEDDING_MODEL:?Set the operator-verified embedding model ID}"
+: "${HYMEM_EMBEDDING_DIM:?Set the operator-verified output dimension as a positive integer}"
+: "${HYMEM_EMBEDDING_DEPLOYMENT_REVISION:?Set the operator-verified public deployment revision}"
+: "${HYMEM_EMBEDDING_DEPLOYMENT_TENANT:?Set the operator-verified public deployment tenant}"
+export HYMEM_EMBEDDING_BASE_URL=http://embedding-server:8766/v1
 export HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP=1
+export HYMEM_EMBEDDING_MODEL HYMEM_EMBEDDING_DIM
+export HYMEM_EMBEDDING_DEPLOYMENT_REVISION HYMEM_EMBEDDING_DEPLOYMENT_TENANT
+export HYMEM_EMBEDDING_PIN_DIMENSION=1
 # Set HYMEM_EMBEDDING_API_KEY only if that internal service authenticates.
 # HyMem otherwise sends a non-secret local dummy; cloud/LLM keys are never reused.
 ```
+
+Preserve the service's **actual URL route**: the SDK appends `embeddings` to the
+configured API base; HyMem does not automatically append `/v1`. For example,
+`http://embedding-server:8766/v1` targets `/v1/embeddings`, while the bare origin
+targets `/embeddings`. A service mounted at `/proxy/openai` needs that prefix,
+not a universal `/v1` suffix. Do not include the final `/embeddings` operation
+in the base URL. Clear any stale embedding-specific API key when switching to
+an unauthenticated internal service; do not copy a cloud or LLM key into it.
 
 Keep the service's actual `HYMEM_EMBEDDING_MODEL` and `HYMEM_EMBEDDING_DIM`.
 Network-backed durable vectors also require `HYMEM_EMBEDDING_PIN_DIMENSION=1`
@@ -75,7 +114,10 @@ from the service operator instead of guessing them or changing the model/dimensi
 to make a check pass. The HTTP exception does not waive these requirements.
 
 Persist these settings in the environment supplied by the actual launcher to
-**both** the Honcho service and MCP process. An export in an interactive shell,
+**both** the Honcho service and MCP process, wherever both are deployed. They
+must use the same base route, model, dimension, pin, revision and tenant for the
+same vector producer; include the HTTP opt-in and purpose-bound credentials
+where applicable. An export in an interactive shell,
 or an edited `.env` file that the launcher never loads, does not update an
 already-running process. Restart processes when their launcher reloads the
 updated environment; if environment values are part of the container's creation
@@ -87,6 +129,64 @@ checks issue real provider requests. A rejected endpoint remains `[FAIL]` even
 though the server can use the lower-quality lexical fallback; the diagnostic
 states the opt-in only for a valid internal HTTP endpoint. Public HTTP is never
 enabled by this flag.
+
+The Honcho dream scheduler is **event-driven, not periodic**: ingestion kicks
+one bounded cycle, subject to cooldown. A restart, elapsed cooldown, restored
+embedding service, or remaining backlog does not itself schedule more cycles.
+A single dream does not guarantee that all vectors are regenerated: tiers
+have their own eligibility and bounds. Further work needs another qualifying
+event or an explicit `hymem_dream`/`HyMem.dream()` call. Check the resulting
+status and relevant vector rows; do not infer complete vector recovery from
+one successful dream, zero extraction backlog, or doctor preflight alone.
+
+### Embedding-only repair of existing vectors
+
+Use the same verified embedding environment as the service. This command does
+not construct an LLM client or require an LLM key. Dry-run is the default: it
+opens an **existing, current-schema** database read-only, makes no provider
+requests, and never creates, migrates, or reconstructs source data.
+
+```bash
+python -m hymem.reembed --json
+python -m hymem.reembed --apply --batch-size 16 --max-items 256 --timeout-seconds 60 --json
+```
+
+The equivalent `hymem-reembed` console command is available after reinstalling
+the updated package; `python -m hymem.reembed` also works directly after a pull.
+Use `--db /absolute/path/hymem.sqlite` to select another existing store.
+An incomplete remote configuration is refused, never converted to a local
+fallback. Intentional local-only apply additionally requires `--allow-local`.
+Malformed explicit dimensions and unpinned remote producer declarations fail
+closed before repair.
+
+Apply acquires the same renewable lease as dreaming. It repairs only existing
+chunk, message, live-edge, proof-valid episode, and current-fact vector mirrors;
+it does **not** create missing mirrors or include the historical general
+`embedding_cache`. Provider calls are embedding calls and can incur embedding
+costs, but no extraction/digest LLM calls occur. Each invocation processes at
+most `--max-items` rows through its repair cursor, including healthy and blocked
+ones, and embeds at most `--batch-size` items per request. This limit excludes
+read-only compatibility audits (which stream the full stored mirrors) and source
+proof/collision checks; those remain subject to the cooperative time budget.
+Repeat the same bounded command to
+resume its producer-specific durable cursor; it resets only at the end of a
+sweep. Dry-run always starts at the beginning without moving that cursor.
+
+Exit status is nonzero for incomplete, blocked, or failed work. JSON reports
+`health_before`, end-of-sweep `health_after`, per-invocation counters,
+`sweep_complete`, and accumulated
+`sweep_blocked`; zero means a completed clean/repaired **stored-vector scope**,
+not complete memory regeneration. Foreign-key corruption blocks all writes.
+Unproven historical rows (including extraction chunks without exact claim-source
+manifests, or whose stored render disagrees with those sources) are preserved
+and reported blocked. `pending` counts unrepaired candidates observed in this
+invocation; `repaired` counts its committed updates. Aggregation vectors
+are bound to published material: incompatible, corrupt, or unpublished rows are
+reported `rebuild_required`, never relabeled or independently re-embedded.
+Those require a normal aggregation/dream rebuild after repairing its inputs.
+The time limit is cooperative: shipped transports cap requests to the remaining
+budget, and late results are not committed. A failed provider batch retains its
+cursor for retry. There is no automatic scheduler or background retry.
 
 ---
 
@@ -717,8 +817,8 @@ aggregation, quarantine, malformed-state, and coverage obligations are healthy.
 Strict benchmark status extends this same snapshot with embedding-mirror backlog.
 
 **Key design choices in the Honcho server:**
-- **Dream cooldown**: Background dreaming kicks at most once per configurable cooldown (env: `HYMEM_DREAM_COOLDOWN_SECONDS`, default 60s). Uses FastAPI `BackgroundTasks` so the HTTP response isn't blocked.
-- **Background dreaming on a forked connection**: `_background_dream` runs on `HyMem.fork()` — a fresh SQLite connection that reuses the live instance's LLM/embedding clients — so a dream cycle never collides with concurrent `add_messages` writes.
+- **Event-driven dream cooldown**: Ingestion calls `DreamScheduler.kick()`; a long-lived daemon waits for kicks and spaces cycle starts by `HYMEM_DREAM_COOLDOWN_SECONDS` (default 60s). The cooldown is not a periodic timer, and a completed cycle does not automatically drain remaining work.
+- **Background dreaming on a forked connection**: The scheduler owns one `HyMem.fork()` for its lifetime, with a separate SQLite connection and shared live LLM/embedding clients. It invalidates the foreground query caches after a cycle; SQLite still serializes writers.
 - **Batched ingestion**: `add_messages` logs a whole batch under one transaction via `HyMem.log_messages()` rather than one `BEGIN IMMEDIATE` per turn.
 - **Role inference**: Peer IDs matching `user[-_]|human|client|telegram|discord|slack` → user role, `agent|hermes|assistant|ai[-_]|bot|llm` → assistant role.
 - **Bounded query and reasoning paths**: Search/context retrieval remains deterministic unless an optional reranker fires. Chat may additionally call the configured LLM through a bounded evidence-expansion loop; provider failure or unusable output falls back to deterministic, provenance-grounded text.
@@ -814,8 +914,8 @@ dimension).
 | `HYMEM_LLM_MODEL` | `deepseek-v4-flash` | Extraction model; retired mutable aliases `deepseek-chat` and `deepseek-reasoner` are rejected before client construction |
 | `HYMEM_LLM_THINKING` | `auto` | DeepSeek thinking-body policy; `auto` safely disables thinking on identified DeepSeek endpoints/models, while unrelated providers receive no vendor-specific body |
 | `HYMEM_EMBEDDING_API_KEY` | none | Purpose-bound key for an explicit embedding endpoint; `OPENAI_API_KEY` is inherited only for the exact official HTTPS `api.openai.com` origin, while loopback uses `local` |
-| `HYMEM_EMBEDDING_BASE_URL` | `local://feature-hash` | OpenAI-compatible endpoint; remote URLs require HTTPS by default; omission selects the deterministic no-network fallback |
-| `HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP` | unset (`false`) | Narrow emergency opt-in for cleartext embedding endpoints on a private/link-local IP or internal service DNS name (for example `http://embedding-server:8766`); public HTTP remains forbidden and HTTPS is preferred |
+| `HYMEM_EMBEDDING_BASE_URL` | `local://feature-hash` | Actual OpenAI-compatible API base, including its route prefix (for example `/v1` when served there); no automatic `/v1` suffix. Remote URLs require HTTPS by default; omission selects the deterministic no-network fallback |
+| `HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP` | unset (`false`) | Narrow emergency opt-in for cleartext embedding endpoints on a private/link-local IP or internal service DNS name (for example `http://embedding-server:8766/v1`); public HTTP remains forbidden and HTTPS is preferred. Still requires the complete pinned producer configuration above |
 | `HYMEM_EMBEDDING_MODEL` | `hymem-local-feature-hash-v1` | Exact embedding-space model id |
 | `HYMEM_EMBEDDING_DIM` | `384` | Exact embedding dimension |
 | `HYMEM_EMBEDDING_PIN_DIMENSION` | unset (`false`) | Required for network-backed durable vectors: assert the configured dimension with `1`; does not override the service's returned dimension |
@@ -824,7 +924,7 @@ dimension).
 | `HYMEM_EMBEDDING_TIMEOUT_SECONDS` | `10` | Per-request timeout for an explicitly configured remote embedder; SDK retries are disabled |
 | `HYMEM_HONCHO_HOST` | `127.0.0.1` | Honcho server bind address |
 | `HYMEM_HONCHO_PORT` | `8765` | Honcho server port |
-| `HYMEM_DREAM_COOLDOWN_SECONDS` | `60` | Min seconds between bg dream kicks |
+| `HYMEM_DREAM_COOLDOWN_SECONDS` | `60` | Min seconds between event-triggered background cycle starts; not a periodic schedule |
 | `HYMEM_AGGREGATION_NODES_ENABLED` | unset (config default: on) | Master switch: RAPTOR aggregation + standing digest built at dream time; set `false` to opt out |
 | `HYMEM_AGGREGATION_DIGEST_ENABLED` | unset (config default: on) | Sub-switch: roll cluster nodes up into the root digest (active only with the master switch on) |
 

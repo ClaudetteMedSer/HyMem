@@ -23,6 +23,7 @@ rerank = ["sentence-transformers>=2.2"]
 hymem-server = "hymem.server:main"
 hymem-honcho = "hymem.honcho.app:main"
 hymem-doctor = "hymem.doctor:main"
+hymem-reembed = "hymem.reembed:main"
 
 [tool.setuptools.packages.find]
 include = ["hymem*"]

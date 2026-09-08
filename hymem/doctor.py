@@ -259,15 +259,27 @@ def _check_schema_and_dim(
 ) -> list[_Result]:
     results: list[_Result] = []
     hy_cfg = HyMemConfig(root=cfg.root)
+    conn = None
+    initialized = False
+    initialization_failure = None
     try:
         conn = core_db.connect(hy_cfg.db_path)
         core_db.initialize(conn)
         version = core_db.schema_version(conn)
+        initialized = True
         results.append(_Result(OK, "schema",
                                f"initialized/migrated cleanly (version {version})"))
     except Exception as exc:  # noqa: BLE001
-        results.append(_Result(FAIL, "schema", f"initialize/migrate failed: {exc}"))
+        initialization_failure = exc
+        results.append(_Result(FAIL, "schema", f"initialize/migrate failed ({type(exc).__name__})"))
         return results
+    finally:
+        if not initialized:
+            _close_probe(
+                conn,
+                primary_exception=(sys.exc_info()[1] if initialization_failure is None else None),
+                reported_failure=initialization_failure,
+            )
 
     metadata_error: str | None = None
     try:
@@ -288,10 +300,10 @@ def _check_schema_and_dim(
             try:
                 stored_dim = int(dim_row["value"])
             except (TypeError, ValueError, OverflowError):
-                metadata_error = f"malformed vec_dim={dim_row['value']!r}"
+                metadata_error = "malformed vec_dim"
             else:
                 if stored_dim <= 0:
-                    metadata_error = f"invalid vec_dim={stored_dim!r}"
+                    metadata_error = "invalid vec_dim"
         stored_model = model_row["value"] if model_row else None
         if model_row is not None and (
             not isinstance(stored_model, str) or not stored_model
@@ -303,9 +315,12 @@ def _check_schema_and_dim(
         stored_dim = None
         stored_model = None
         vec_tables = []
-        metadata_error = f"could not read vector metadata: {exc}"
+        metadata_error = f"could not read vector metadata ({type(exc).__name__})"
     finally:
-        conn.close()
+        try:
+            results.extend(_check_stored_embedding_health(conn, live_dim, live_model))
+        finally:
+            conn.close()
 
     if metadata_error is not None:
         results.append(_Result(
@@ -317,7 +332,7 @@ def _check_schema_and_dim(
         results.append(_Result(
             WARN, "embedding identity",
             "vector shadow metadata is incomplete "
-            f"(vec_model={stored_model!r}, tables={vec_tables}); the next "
+            f"(shadow_tables={len(vec_tables)}); the next "
             "embedding persist will rebuild it",
         ))
     elif stored_dim is None:
@@ -331,22 +346,59 @@ def _check_schema_and_dim(
         ))
     elif live_dim is None:
         results.append(_Result(WARN, "embedding identity",
-                               f"stored model={stored_model} dim={stored_dim}; "
-                               "embedding client not verified"))
+                               "stored vector metadata exists; embedding client not verified"))
     elif live_dim != stored_dim or live_model != stored_model:
         results.append(_Result(
             FAIL, "embedding identity",
-            f"MISMATCH: configured identity={live_model} dim={live_dim}; "
-            f"stored vec model={stored_model} dim={stored_dim}. Retrieval skips "
-            "incompatible durable rows; run a dream to re-embed/rebuild shadows "
-            "or restore the prior model.",
+            "MISMATCH: configured producer/dimension differs from stored shadow metadata. "
+            "Retrieval skips incompatible durable rows; inspect stored compatibility "
+            "before source-authorized recovery or restoring the prior producer.",
         ))
     else:
         results.append(_Result(
             OK, "embedding identity",
-            f"configured identity={live_model} dim={live_dim} matches stored shadows",
+            "configured producer/dimension matches stored shadows; "
+            "stored rows are audited separately",
         ))
     return results
+
+
+def _check_stored_embedding_health(conn, live_dim, live_model) -> list[_Result]:
+    """Report aggregate compatibility/FK counts without row or producer values."""
+    from hymem.embedding_health import scan_embedding_health
+
+    health = scan_embedding_health(conn, live_model=live_model, live_dim=live_dim)
+    status = (
+        FAIL if health.status in {"incompatible", "unavailable"}
+        else WARN if health.status == "unverified" else OK
+    )
+    details = []
+    for table in health.tables:
+        if table.status == "unavailable":
+            details.append(f"{table.table}(unavailable={table.error_code}, counts=unknown)")
+        else:
+            details.append(
+                f"{table.table}(total={table.total}, current-compatible={table.current_compatible}, "
+                f"incompatible={table.incompatible}, malformed={table.malformed}, "
+                f"unverified={table.unverified})"
+            )
+    scope = "stored rows only; not missing-row/source-proof coverage"
+    if not health.live_identity_verified:
+        scope += "; live producer unverified"
+    result = _Result(status, "stored embedding compatibility", scope + "; " + "; ".join(details))
+    foreign_keys = health.foreign_keys
+    if foreign_keys.status == "unavailable":
+        fk_detail = f"unavailable={foreign_keys.error_code}; violation count unknown"
+    else:
+        fk_detail = f"violations={foreign_keys.total}"
+        if foreign_keys.by_table:
+            fk_detail += "; " + ", ".join(
+                f"{table}={count}" for table, count in foreign_keys.by_table
+            )
+    return [result, _Result(
+        OK if foreign_keys.status == "valid" else FAIL,
+        "foreign-key integrity", fk_detail,
+    )]
 
 
 def _check_canonical_drift(cfg: EnvConfig) -> _Result:
