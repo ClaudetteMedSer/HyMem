@@ -326,6 +326,16 @@ def merge(
     if keep == drop:
         return
 
+    # Resolving a kept name through an unrelated alias after moving state to
+    # that name would strand the state behind a one-hop redirect. A self-map,
+    # or a redirect to the exact identity being consumed, is safe: the latter
+    # becomes a self-map when references to drop are rewritten below.
+    target_alias = conn.execute(
+        "SELECT canonical FROM entity_aliases WHERE alias=?", (keep,),
+    ).fetchone()
+    if target_alias is not None and target_alias["canonical"] not in (keep, drop):
+        raise ValueError("merge target must not alias an unrelated canonical identity")
+
     # Two explicit user assertions are equal authority.  A differing value is
     # therefore a real semantic conflict, not something the arbitrary
     # keep/drop direction may resolve.  Detect it before touching aliases,
