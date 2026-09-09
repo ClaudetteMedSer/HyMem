@@ -34,7 +34,7 @@ from hymem.core.vectors import decode_vector
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 59
+EXPECTED_SCHEMA_VERSION = 61
 _EVIDENCE_MUTATION_KEYS: contextvars.ContextVar[
     frozenset[tuple[int, int, int]]
 ] = contextvars.ContextVar("hymem_evidence_mutation_keys", default=frozenset())
@@ -2413,6 +2413,12 @@ def register_read_authority_functions(conn: sqlite3.Connection) -> None:
         producer_generation_runtime_authorized,
     )
     from hymem.dreaming.canonicalize import normalize as normalize_entity
+    from hymem.core.extraction_audit import sql_valid as extraction_audit_valid
+
+    conn.create_function(
+        "hymem_extraction_audit_valid", 8, extraction_audit_valid,
+        deterministic=True,
+    )
 
     conn.create_function(
         "hymem_phase1_generation_is_authorized",
@@ -2855,6 +2861,10 @@ def _load_vec_extension(conn: sqlite3.Connection) -> bool:
 
 
 def initialize(conn: sqlite3.Connection) -> None:
+    if _table_exists(conn, "schema_meta") and schema_version(conn) >= 61:
+        with transaction(conn):
+            _validate_extraction_audit_storage(conn)
+            _install_extraction_audit_guards(conn)
     # schema.sql is an additive bootstrap and would otherwise recreate a
     # deleted v54 authority table before integrity validation, concealing
     # material data loss. Sparse historical fixtures have no v54 footprint and
@@ -2907,6 +2917,17 @@ def initialize(conn: sqlite3.Connection) -> None:
             f"Database schema version {cur} is newer than code expects ({EXPECTED_SCHEMA_VERSION}). "
             f"Downgrading is not supported. Use a newer version of HyMem."
         )
+    # Unlike the deliberately sparse _run_migrations() fixtures, a normal
+    # initialized store must contain every scalar owner. Do not silently skip
+    # admission guards if an existing table has lost/renamed a canonical key.
+    for table, required in (
+        ("entity_aliases", {"alias", "canonical"}),
+        ("knowledge_graph", {"subject_canonical", "object_canonical"}),
+        ("entity_mentions", {"entity_canonical"}),
+    ):
+        columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not required.issubset(columns):
+            raise RuntimeError("canonical write admission owner domain is incomplete")
     _run_migrations(conn)
 
 
@@ -3380,8 +3401,91 @@ def _ensure_narrative_facts_fts(conn: sqlite3.Connection) -> None:
             conn.execute("COMMIT")
 
 
+def _install_canonical_write_guards(conn: sqlite3.Connection) -> None:
+    """Restore only owned v60 admission guards, without rewriting history.
+
+    Sparse historical migration fixtures may lack individual domains. Install
+    guards for every complete scalar owner that exists; a later initialize()
+    supplies the remaining bootstrap tables. Reuse the migration definitions
+    so fresh creation, upgrade, and reopen cannot drift apart.
+    """
+    script = files("hymem.core.migrations").joinpath(
+        "060_canonical_write_admission.sql"
+    ).read_text(encoding="utf-8")
+    for statement in _split_sql_statements(script):
+        match = re.match(
+            r"CREATE TRIGGER IF NOT EXISTS (\w+)\s+BEFORE .*? ON (\w+)\b",
+            statement, flags=re.DOTALL,
+        )
+        if match is None:
+            raise RuntimeError("unexpected canonical admission migration statement")
+        name, table = match.groups()
+        columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        required = set(re.findall(r"new\.(\w+)", statement))
+        if not required.issubset(columns):
+            continue
+        current = conn.execute(
+            "SELECT tbl_name,sql FROM sqlite_master WHERE type='trigger' AND name=?",
+            (name,),
+        ).fetchone()
+        # SQLite removes IF NOT EXISTS from stored CREATE TRIGGER text.
+        expected = statement.replace(" IF NOT EXISTS", "").rstrip(";")
+        if current is not None and current[0] == table and current[1] == expected:
+            continue
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute(statement)
+
+
+def _extraction_audit_statements() -> list[str]:
+    return list(_split_sql_statements(files("hymem.core.migrations").joinpath(
+        "061_extraction_occurrence_audit.sql"
+    ).read_text(encoding="utf-8")))
+
+
+def _audit_ddl(sql: str) -> str:
+    return " ".join(sql.replace(" IF NOT EXISTS", "").rstrip(";").split())
+
+
+def _validate_extraction_audit_storage(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='kg_evidence_extraction_audit'"
+    ).fetchone()
+    if row is None or _audit_ddl(row[0]) != _audit_ddl(_extraction_audit_statements()[0]):
+        raise RuntimeError("schema v61 extraction audit storage is missing or malformed")
+    for index in conn.execute("PRAGMA index_list(kg_evidence_extraction_audit)"):
+        if index[2] and index[3] != "pk" and index[1] not in {
+            "idx_extraction_audit_chunk", "idx_extraction_audit_coverage"
+        }:
+            raise RuntimeError("schema v61 extraction audit has unexpected uniqueness")
+    from hymem.core.extraction_audit import validate_record
+    for row in conn.execute("SELECT * FROM kg_evidence_extraction_audit"):
+        validate_record(dict(row))
+
+
+def _install_extraction_audit_guards(conn: sqlite3.Connection) -> None:
+    # Only owned support objects may be healed, after exact storage validation.
+    for statement in _extraction_audit_statements()[1:]:
+        match = re.match(r"CREATE (INDEX|TRIGGER) IF NOT EXISTS (\w+)", statement)
+        if match is None:
+            raise RuntimeError("unexpected extraction audit migration statement")
+        kind, name = match.groups()
+        current = conn.execute("SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+                               (kind.lower(), name)).fetchone()
+        if current is not None and _audit_ddl(current[0]) == _audit_ddl(statement):
+            continue
+        conn.execute(f"DROP {kind} IF EXISTS {name}")
+        conn.execute(statement)
+
+
 def _ensure_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
     """Heal latest triggers only after their owning columns/tables exist."""
+    if schema_version(conn) >= 61:
+        with transaction(conn):
+            _validate_extraction_audit_storage(conn)
+            _install_extraction_audit_guards(conn)
+    if schema_version(conn) >= 60:
+        with transaction(conn):
+            _install_canonical_write_guards(conn)
     tables = {
         str(row["name"])
         for row in conn.execute(
@@ -4552,6 +4656,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     resumes cleanly. Migrations are idempotent, so a fresh schema.sql database
     (which starts at version 1) runs them all as no-ops up to the latest."""
     cur = schema_version(conn)
+    if cur >= 61:
+        _validate_extraction_audit_storage(conn)
     if cur >= 55 and (
         _v55_aggregation_storage_present(
             conn,
@@ -4627,6 +4733,31 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             }.issubset({row[1] for row in conn.execute("PRAGMA table_info(sessions)")})
         if version == 59:
             apply_version = apply_version and _table_exists(conn, "procedures")
+        if version == 60:
+            # Guards and version publication are one crash-atomic upgrade.
+            # Old rows are never normalized or given new provenance here.
+            with transaction(conn):
+                _install_canonical_write_guards(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_meta(key,value) VALUES "
+                    "('schema_version',?)", (str(version),),
+                )
+            log.info("migrated schema to v%d (%s)", version, entry.name)
+            continue
+        if version == 61:
+            with transaction(conn):
+                if _table_exists(conn, "kg_evidence_extraction_audit"):
+                    _validate_extraction_audit_storage(conn)
+                else:
+                    conn.execute(_extraction_audit_statements()[0])
+                _validate_extraction_audit_storage(conn)
+                _install_extraction_audit_guards(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_meta(key,value) VALUES "
+                    "('schema_version',?)", (str(version),),
+                )
+            log.info("migrated schema to v%d (%s)", version, entry.name)
+            continue
         if version == 40 and apply_v40 and not _v40_sql_is_complete(conn):
             _prepare_v40_legacy_shape(conn)
         if version == 46 and apply_version and _v46_sql_is_complete(conn):

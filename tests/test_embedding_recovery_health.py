@@ -31,12 +31,19 @@ def partial_switch(tmp_path):
     old = LocalHashEmbeddingClient(dim_value=3, model_name="old-producer")
     new = LocalHashEmbeddingClient(dim_value=3, model_name=cfg.embedding_model)
     conn.execute("INSERT INTO sessions(id) VALUES ('session')")
+    from hymem.dreaming.chunks import Chunk, persist_chunks
+    from hymem.dreaming.lossless import materialize_message_coverage
     for index in (1, 2):
-        conn.execute(
-            "INSERT INTO chunks(id,session_id,start_message_id,end_message_id,"
-            "salience_reason,text) VALUES (?,'session',?,?,'test',?)",
-            (f"chunk-{index}", index, index, f"Source text number {index}"),
-        )
+        text = f"Source text number {index}"
+        message_id = conn.execute(
+            "INSERT INTO messages(session_id,role,content) VALUES ('session','user',?)", (text,),
+        ).lastrowid
+        with core_db.transaction(conn):
+            materialize_message_coverage(conn, "session")
+            persist_chunks(conn, [Chunk(
+                f"chunk-{index}", "session", message_id, message_id,
+                "test", f"user: {text}", (message_id,),
+            )])
     with core_db.transaction(conn):
         assert persist_chunk_embeddings(conn, fetch_chunk_embeddings(conn, old)) == 2
     with core_db.transaction(conn):
@@ -45,7 +52,7 @@ def partial_switch(tmp_path):
         ) == 1
     model, dim = embedding_storage_identity(new)
     assert conn.execute("SELECT value FROM schema_meta WHERE key='vec_model'").fetchone()[0] == model
-    assert core_db.schema_version(conn) == 59
+    assert core_db.schema_version(conn) == core_db.EXPECTED_SCHEMA_VERSION
     try:
         yield conn, cfg, new, model, dim
     finally:

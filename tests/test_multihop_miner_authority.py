@@ -72,7 +72,7 @@ def test_raw_store_mode_and_graph_selectors_use_live_phase1_authority(cfg):
                 "INSERT INTO knowledge_graph("
                 "subject_canonical,predicate,object_canonical,pos_evidence,"
                 "neg_evidence,last_seen,last_reinforced,status,derived) "
-                "VALUES ('app','uses','derived-shadow',1,0,"
+                "VALUES ('app','uses','derived_shadow',1,0,"
                 "datetime('now'),datetime('now'),'active',1)"
             )
 

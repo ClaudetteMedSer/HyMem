@@ -616,6 +616,11 @@ CREATE INDEX IF NOT EXISTS idx_kg_object ON knowledge_graph(object_canonical);
 CREATE INDEX IF NOT EXISTS idx_kg_predicate ON knowledge_graph(predicate);
 CREATE INDEX IF NOT EXISTS idx_kg_status ON knowledge_graph(status);
 
+-- v60 canonical identity admission guards live in migration 060 and are
+-- restored on reopen. They reject new/changed malformed scalar identities,
+-- while allowing unrelated updates to retained legacy rows. Do not add a
+-- table CHECK here: it would block gradual repair of historical endpoints.
+
 -- Per-source evidence so we keep many session refs per edge plus surface forms.
 CREATE TABLE IF NOT EXISTS kg_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2202,3 +2207,5 @@ BEFORE DELETE ON rule_marker_decisions
 WHEN hymem_evidence_mutation_authorized() <> 1
 BEGIN SELECT RAISE(ABORT,'rule marker decision is internally managed'); END;
 */
+-- Migration 061 exclusively owns kg_evidence_extraction_audit; no bootstrap
+-- CREATE here: a missing current audit ledger must fail before additive healing.

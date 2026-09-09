@@ -1165,6 +1165,11 @@ def add_manual_entity_type(
     ):
         raise ValueError("entity type confidence must be finite and in [0, 1]")
     canonical = canonicalize.resolve(conn, entity.strip())
+    if (
+        not isinstance(canonical, str) or not canonical
+        or canonicalize.normalize(canonical) != canonical
+    ):
+        raise ValueError("entity resolves to a legacy identity requiring canonical repair")
     conn.execute(
         "INSERT INTO entity_types("
         "entity_canonical,type,confidence,source_chunk_id,origin) "
@@ -1195,6 +1200,11 @@ def add_manual_entity_property(
     if not isinstance(value, str):
         raise ValueError("entity property value must be a string")
     canonical = canonicalize.resolve(conn, entity.strip())
+    if (
+        not isinstance(canonical, str) or not canonical
+        or canonicalize.normalize(canonical) != canonical
+    ):
+        raise ValueError("entity resolves to a legacy identity requiring canonical repair")
     conn.execute(
         "INSERT INTO entity_properties("
         "entity_canonical,key,value,source_chunk_id,origin,updated_at) "

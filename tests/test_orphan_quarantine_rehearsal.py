@@ -21,6 +21,22 @@ from hymem.extraction.embeddings import MappedStubEmbeddingClient, embedding_tex
 _SCRIPT = Path(__file__).resolve().parents[1] / "tools/deployment/rehearse_orphan_quarantine.py"
 
 
+def historical_cli_command(script):
+    """Simulate the reviewed v59 runtime contract in a test subprocess.
+
+    This is NOT a frozen historical executable. Production helper pins remain
+    unchanged; separate unmodified-runtime tests prove they refuse newer code.
+    """
+    bootstrap = (
+        "import runpy,sys; from hymem.core import db; "
+        "db.EXPECTED_SCHEMA_VERSION=59; "
+        "migrations=db._discover_migrations(); "
+        "db._discover_migrations=lambda: [(v,p) for v,p in migrations if v<=59]; "
+        "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')"
+    )
+    return [sys.executable, "-c", bootstrap, str(script)]
+
+
 @pytest.fixture
 def helper():
     spec = importlib.util.spec_from_file_location("quarantine_rehearsal", _SCRIPT)
@@ -30,10 +46,22 @@ def helper():
 
 
 @pytest.fixture
-def source(tmp_path):
+def source(tmp_path, monkeypatch):
+    # A historical-contract simulation, not a current store relabelled v59.
+    # Actually omit forward migrations and retain the reviewed helper's v59
+    # runtime pin only within this synthetic fixture. Never loosen its guard.
+    migrations = db._discover_migrations()
+    monkeypatch.setattr(db, "EXPECTED_SCHEMA_VERSION", 59)
+    monkeypatch.setattr(
+        db, "_discover_migrations", lambda: [(v, p) for v, p in migrations if v <= 59]
+    )
     path = tmp_path / "source.sqlite"
     conn = db.connect(path)
     db.initialize(conn)
+    assert db.schema_version(conn) == 59
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='entity_mentions_canonical_insert_guard'"
+    ).fetchone() is None
     client = MappedStubEmbeddingClient({
         "zebraproof": [1.0, 0, 0],
         "zebraproof healthy control": [0.5, 0.5, 0],
@@ -245,7 +273,7 @@ def test_absent_fts_delete_trigger_cannot_leave_hidden_postings(helper, source, 
 
 def test_cli_output_never_contains_paths_identifiers_or_source_text(helper, source, tmp_path):
     path, _ = source
-    args = [sys.executable, str(_SCRIPT), "--source", str(path), "--rehearsal-dir", str(tmp_path / "cli"),
+    args = [*historical_cli_command(_SCRIPT), "--source", str(path), "--rehearsal-dir", str(tmp_path / "cli"),
             "--reference-sha256", _reference(helper, path)]
     result = subprocess.run(args, capture_output=True, text=True, timeout=40)
     assert result.returncode == 0, result.stdout
@@ -256,6 +284,22 @@ def test_cli_output_never_contains_paths_identifiers_or_source_text(helper, sour
     bad = subprocess.run(args + ["--private-unknown-option", "credential-value"], capture_output=True, text=True, timeout=10)
     assert bad.returncode == 1 and bad.stderr == "" and "credential-value" not in bad.stdout
     assert json.loads(bad.stdout)["reason"] == "invalid_arguments"
+
+
+def test_unmodified_current_runtime_refuses_historical_quarantine_cli(helper, source, tmp_path):
+    path, _ = source
+    before = _logical(helper, path)
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--source", str(path),
+         "--rehearsal-dir", str(tmp_path / "current-cli"),
+         "--reference-sha256", _reference(helper, path)],
+        capture_output=True, text=True, timeout=40,
+    )
+    assert result.returncode == 1 and result.stderr == ""
+    assert json.loads(result.stdout) == {
+        "status": "refused", "reason": "reviewed_schema_required", "source_writes": 0,
+    }
+    assert _logical(helper, path) == before
 
 
 def test_existing_vector_shadows_require_extension(helper, source, tmp_path, monkeypatch):

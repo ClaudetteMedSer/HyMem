@@ -34,7 +34,12 @@ def _resolve_canonicals(conn: sqlite3.Connection, candidates: list[str]) -> set[
         """,
         candidates + candidates + candidates,
     ).fetchall()
-    return {r[0] for r in rows}
+    # Legacy aliases remain readable, but must not manufacture new malformed
+    # owners while awaiting the explicit, provenance-preserving repair.
+    return {
+        r[0] for r in rows
+        if isinstance(r[0], str) and r[0] and normalize(r[0]) == r[0]
+    }
 
 
 def index_chunk_mentions(

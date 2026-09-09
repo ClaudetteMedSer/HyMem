@@ -16,6 +16,7 @@ from hymem.dreaming.chunks import Chunk, persist_chunks
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.extraction.triples import Triple
 from hymem.extraction.embeddings import LocalHashEmbeddingClient
+from tests.legacy_canonical import legacy_canonical_rows
 from tests.test_reembed import ExactEmbedder, observe_provider_calls
 
 
@@ -77,10 +78,13 @@ def _same_text(conn, count, *, dead=0):
     words = [f"part_{index}" for index in range(count + 1)]
     text = " uses ".join(words)
     ids = []
-    for index in range(1, len(words)):
-        changes = ({"status": "retracted"} if index <= dead and index % 2
-                   else {"valid_at": "not-a-clock"} if index <= dead else {})
-        ids.append(_edge(conn, " uses ".join(words[:index]), " uses ".join(words[index:]), **changes))
+    # These spaced/oversized identities are retained historical rows, not
+    # admissible new writes. Restore v60 guards before testing candidate reads.
+    with legacy_canonical_rows(conn):
+        for index in range(1, len(words)):
+            changes = ({"status": "retracted"} if index <= dead and index % 2
+                       else {"valid_at": "not-a-clock"} if index <= dead else {})
+            ids.append(_edge(conn, " uses ".join(words[:index]), " uses ".join(words[index:]), **changes))
     return text, ids
 
 

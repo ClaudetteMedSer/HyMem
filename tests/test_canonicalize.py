@@ -3,6 +3,7 @@ from __future__ import annotations
 import unicodedata
 
 import pytest
+from tests.legacy_canonical import legacy_canonical_rows
 
 from hymem.dreaming.canonicalize import (
     find_canonical_drift,
@@ -188,25 +189,17 @@ def test_merge_folds_edges_into_kept_canonical(hy):
 
 def test_find_canonical_drift_reports_all_four_columns(hy):
     conn = hy.conn
-    # Drift in entity_aliases.canonical (the YantrikDB-style symptom).
-    conn.execute(
-        "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
-        ("atta", "Atta_van_Westreenen"),
-    )
-    # Drift in entity_aliases.alias (uppercase alias key).
-    conn.execute(
-        "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
-        ("Mixed_Case_Key", "clean_value"),
-    )
-    # Drift in knowledge_graph subject and object columns.
-    conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
-        "VALUES ('Bad_Subject', 'uses', 'clean_obj')"
-    )
-    conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical) "
-        "VALUES ('clean_subj', 'uses', 'Bad_Object')"
-    )
+    with legacy_canonical_rows(conn):
+        # Historical drift in both alias and both KG endpoint columns.
+        conn.executemany(
+            "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
+            [("atta", "Atta_van_Westreenen"), ("Mixed_Case_Key", "clean_value")],
+        )
+        conn.executemany(
+            "INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical) "
+            "VALUES (?, 'uses', ?)",
+            [("Bad_Subject", "clean_obj"), ("clean_subj", "Bad_Object")],
+        )
 
     findings = find_canonical_drift(conn)
     locations = {loc for loc, _ in findings}
@@ -228,14 +221,15 @@ def test_find_canonical_drift_returns_empty_when_clean(hy):
 
 def test_repair_canonical_drift_normalizes_canonicals(hy):
     conn = hy.conn
-    conn.execute(
-        "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
-        ("atta", "Atta_van_Westreenen"),
-    )
-    conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, pos_evidence) "
-        "VALUES ('Atta_van_Westreenen', 'part_of', 'medflow', 5)"
-    )
+    with legacy_canonical_rows(conn):
+        conn.execute(
+            "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
+            ("atta", "Atta_van_Westreenen"),
+        )
+        conn.execute(
+            "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, pos_evidence) "
+            "VALUES ('Atta_van_Westreenen', 'part_of', 'medflow', 5)"
+        )
 
     fixes = repair_canonical_drift(conn)
 
@@ -266,10 +260,11 @@ def test_repair_canonical_drift_merges_collisions(hy):
         "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, pos_evidence) "
         "VALUES ('docker', 'uses', 'postgres', 3)"
     )
-    conn.execute(
-        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, pos_evidence) "
-        "VALUES ('Docker', 'uses', 'postgres', 2)"
-    )
+    with legacy_canonical_rows(conn):
+        conn.execute(
+            "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, pos_evidence) "
+            "VALUES ('Docker', 'uses', 'postgres', 2)"
+        )
 
     repair_canonical_drift(conn)
 
@@ -284,10 +279,11 @@ def test_repair_canonical_drift_merges_collisions(hy):
 
 def test_repair_canonical_drift_handles_alias_key_drift(hy):
     conn = hy.conn
-    conn.execute(
-        "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
-        ("Mixed_Key", "clean_canonical"),
-    )
+    with legacy_canonical_rows(conn):
+        conn.execute(
+            "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
+            ("Mixed_Key", "clean_canonical"),
+        )
 
     fixes = repair_canonical_drift(conn)
 
@@ -309,10 +305,11 @@ def test_repair_canonical_drift_drops_drifted_alias_on_collision(hy):
         "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
         ("docker", "docker"),
     )
-    conn.execute(
-        "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
-        ("Docker", "other_canonical"),
-    )
+    with legacy_canonical_rows(conn):
+        conn.execute(
+            "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
+            ("Docker", "other_canonical"),
+        )
 
     fixes = repair_canonical_drift(conn)
 

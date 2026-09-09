@@ -276,8 +276,8 @@ def repair_canonical_drift(conn: sqlite3.Connection) -> list[dict]:
     for drift in sorted(drifted_canonicals):
         target = normalize(drift)
         merge(conn, keep=target, drop=drift, _allow_legacy_drop=True)
-        # merge() preserves the drifted surface form as an alias key. We don't
-        # want un-normalized alias keys in the table — drop that artifact.
+        # Remove a pre-existing malformed alias key. The merge does not create
+        # that transient invalid key: new canonical write guards forbid it.
         conn.execute("DELETE FROM entity_aliases WHERE alias = ?", (drift,))
         fixes.append({"column": "canonical", "from": drift, "to": target})
 
@@ -366,10 +366,11 @@ def merge(
         "UPDATE OR IGNORE entity_aliases SET canonical = ? WHERE canonical = ?",
         (keep, drop),
     )
-    conn.execute(
-        "INSERT OR REPLACE INTO entity_aliases(alias, canonical) VALUES (?, ?)",
-        (drop, keep),
-    )
+    if normalize(drop) == drop and drop:
+        conn.execute(
+            "INSERT OR REPLACE INTO entity_aliases(alias, canonical) VALUES (?, ?)",
+            (drop, keep),
+        )
 
     # Entity hints are source-owned publications too.  Move their observation
     # identities under the same explicit canonical merge and rehash every
@@ -662,6 +663,8 @@ def merge(
                         (edge_id,),
                     ).fetchall()
                 ]
+                from hymem.core import extraction_audit
+                extraction_audit.capture_edge(conn, edge_id)
                 conn.execute(
                     "UPDATE knowledge_graph SET subject_canonical = ?, object_canonical = ? WHERE id = ?",
                     (new_subject, new_object, edge_id),

@@ -370,9 +370,9 @@ def test_readonly_opener_supports_strict_temporal_graph_reads(cfg):
         with core_db.transaction(hy.conn):
             edge_id = _seed_edge(
                 hy.conn,
-                "strict timestamp",
+                "strict_timestamp",
                 "uses",
-                "read-only udf",
+                "read_only_udf",
                 valid_at="2024-01-01T00:00:00.000Z",
             )
     finally:

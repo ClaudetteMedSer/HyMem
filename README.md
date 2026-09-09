@@ -125,10 +125,12 @@ configuration, recreate/redeploy that container with the updated configuration
 instead of merely restarting it. Preserve its existing storage mounts and other
 settings. Verify the process-visible non-secret settings and run `hymem-doctor`
 under the same environment—not just in a different login shell. Doctor's remote
-checks issue real provider requests. A rejected endpoint remains `[FAIL]` even
-though the server can use the lower-quality lexical fallback; the diagnostic
-states the opt-in only for a valid internal HTTP endpoint. Public HTTP is never
-enabled by this flag.
+checks issue real provider requests. A rejected endpoint, missing remote
+credentials, or remote client initialization failure stops server startup
+before the store is opened; it never activates a different local vector
+producer. The no-network lexical default applies only when no remote embedding
+configuration is supplied. The diagnostic states the opt-in only for a valid
+internal HTTP endpoint. Public HTTP is never enabled by this flag.
 
 The Honcho dream scheduler is **event-driven, not periodic**: ingestion kicks
 one bounded cycle, subject to cooldown. A restart, elapsed cooldown, restored
@@ -140,6 +142,38 @@ status and relevant vector rows; do not infer complete vector recovery from
 one successful dream, zero extraction backlog, or doctor preflight alone.
 
 ### Embedding-only repair of existing vectors
+
+Doctor keeps the full stored-vector compatibility inventory, but explains
+well-formed incompatible rows separately. Source-eligible current mismatches,
+malformed vectors, broken current proofs and unavailable/budget-exhausted
+classification remain `[FAIL]`. Explicit unmanifested or unproven records are
+`[WARN]` as **retained-unverified**, with terminal source loss shown as a subset.
+This label does not establish their age or legitimate past authority. Restore
+them only from trusted occurrence-specific provenance; never guess missing
+identity metadata or reactivate retired facts to clear a warning. Retired rows
+are nonoperational only when persisted lifecycle evidence proves retirement;
+missing proof alone is not retirement. Aggregation publication mismatches need
+a rebuild, not an embedding-only rewrite.
+
+Graph mirrors can also be **source-withdrawn**: all their owners are proven
+closed and at least one lost extraction authority through a source-complete,
+authorized successful-empty publication. This is not a negative fact about the
+world. Doctor validates the retained source revisions, winning empty receipts,
+producer registry, lifecycle assertions and terminal cache; missing, overwritten
+or invalid receipts remain unknown/failing. Preserve this audit history unchanged.
+A later overlapping empty publication at the same exact producer binding is
+accepted only while a complete original retirement receipt remains available;
+matching prompt text alone cannot prove unchanged producer authority.
+
+This source-aware diagnostic opens its own read-only snapshot and makes no
+provider requests (other doctor endpoint checks still do). It inspects source
+proofs only for incompatible rows, by default at most 4,096 candidates, with a
+60-second cooperative deadline and 100-million SQLite-step ceiling. The Python
+`scan_embedding_recovery_health()` API accepts bounded overrides for larger
+offline audits. **Current-compatible** still means producer metadata and vector
+numerics only: it does not prove current content, source authority, complete
+retrieval coverage, or that missing vectors have been created. The raw inventory
+and `hymem-reembed` repair/blocked semantics remain unchanged.
 
 Use the same verified embedding environment as the service. This command does
 not construct an LLM client or require an LLM key. Dry-run is the default: it
@@ -158,6 +192,23 @@ An incomplete remote configuration is refused, never converted to a local
 fallback. Intentional local-only apply additionally requires `--allow-local`.
 Malformed explicit dimensions and unpinned remote producer declarations fail
 closed before repair.
+
+Environment-based service startup also refuses default local embeddings when
+remote settings disappear but the existing store records another or unknown
+vector producer. Doctor reports the same refusal instead of declaring local
+embeddings healthy. This bounded read-only admission check honors committed
+WAL state and never initializes, migrates, or changes stored rows; SQLite may
+create its ordinary WAL coordination sidecars. The scan has a two-second
+cooperative deadline and a two-million SQLite-step ceiling; an incomplete
+check refuses startup. Restore the service's complete
+embedding environment, or use the intentional re-embed workflow above. Exact
+local shadow metadata permits historical incompatible mirrors after an explicit
+local repair. Without shadow metadata, populated mirrors/cache must agree with
+the default local producer, and unexplained vector shadows fail closed. A fresh
+or empty pre-vector store still gets the default local backend. This guard is
+not a global multi-writer lock: direct API client injection and intentional
+explicit remote producer changes remain available, and all service writers
+must use the same verified environment.
 
 Apply acquires the same renewable lease as dreaming. It repairs only existing
 chunk, message, live-edge, proof-valid episode, and current-fact vector mirrors;
@@ -859,7 +910,21 @@ the derived extraction-contract identity.
 
 **Schema version guard.** The database schema version is checked against an expected constant. If a newer-schema DB is opened with older code, initialization raises a clear error rather than silently corrupting data.
 
-**Canonical normalization at write, drift check at read.** Every entity name flowing into `entity_aliases` and `knowledge_graph` goes through `canonicalize.normalize()`. If a third-party tool or older code path ever writes around it, `find_canonical_drift()` surfaces the rows where `normalize(v) != v` and `hymem-doctor` flags them. `repair_canonical_drift()` rewrites drifted canonicals with `merge()` semantics — evidence sums on collision so two drifted forms of the same entity collapse cleanly. Auto-repair is opt-in; the doctor only reports, because rewriting a canonical can collide with an existing row and merge decisions belong to the operator.
+**Canonical normalization at write, drift check at read.** Every entity name flowing into `entity_aliases` and `knowledge_graph` goes through `canonicalize.normalize()`. If a third-party tool or older code path ever writes around it, `find_canonical_drift()` surfaces the rows where `normalize(v) != v` and `hymem-doctor` flags them. `repair_canonical_drift()` rewrites drifted canonicals with `merge()` semantics: source-equivalent evidence coalesces, and the existing authority reducer rebuilds confidence without double-counting sources. Auto-repair is opt-in; the doctor only reports, because rewriting a canonical can collide with an existing row and merge decisions belong to the operator.
+
+Schema 61 preserves the complete original extraction set before a canonical
+rename or evidence collision. `kg_evidence_extraction_audit` retains original
+edge spelling and extraction/source fields, including unnormalized historical
+timestamp text; these rows never supply confidence or publication authority.
+The migration creates empty storage and does not invent lost history. Source
+chunks and coverage remain pinned until their evidence owner is explicitly
+deleted by opt-in tombstone retention. Portable format 17 carries original
+sets, including read-only virtual originals for carriers not yet merged.
+Redacted imports scrub nested original text and remap coverage versions before
+any destination write. Recognized secrets in source handles (chunk, session,
+peer or workspace identifiers) cause a pre-write rejection, because rewriting
+only an audit reference would sever its source identity. Hashes verify payload
+integrity, not authenticity; formats through 16 keep their original schemas.
 
 **WAL by default.** Every connection is opened in WAL mode with `synchronous=NORMAL` and a 10s busy timeout, set in `connect()` so it applies before any migration runs. Background dreaming and live message ingestion run on separate connections without blocking each other or query-time reads — exercised directly by `test_concurrency.py`.
 

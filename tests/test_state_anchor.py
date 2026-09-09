@@ -113,7 +113,7 @@ def conn(cfg):
 def anchor_fixture(conn):
     """One evidence chunk reachable ONLY from the state anchor.
 
-    - Edge: dev_box installed cuda_12.1 (active, margin-positive).
+    - Edge: dev_box installed cuda_12_1 (active, margin-positive).
     - Evidence chunk for that edge: "We installed CUDA 12.1 and PyTorch 2.2
       on the dev box in January."
     - Query: "Which GPU system produces model training output?" — shares no
@@ -139,7 +139,7 @@ def anchor_fixture(conn):
         # NOT the seed edge's provenance, so reaching it is not tautological.
         _seed_chunk(conn, "c-gold", 3,
                     "The cuda toolkit on dev_box was upgraded again in March.")
-        _seed_edge(conn, "dev_box", "configured_with", "cuda_12.1", pos=3, neg=0)
+        _seed_edge(conn, "dev_box", "configured_with", "cuda_12_1", pos=3, neg=0)
         edge_id = conn.execute(
             "SELECT id FROM knowledge_graph WHERE subject_canonical='dev_box'"
         ).fetchone()[0]

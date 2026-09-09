@@ -157,18 +157,18 @@ def test_no_referent_leaves_query_untouched(cfg: HyMemConfig) -> None:
 def test_known_entity_from_graph_is_preferred(hy) -> None:
     """With a store, referents are CANONICAL graph names — the token the graph
     and entity tiers actually index on."""
-    seed_edge(hy.conn, "medflow", "deploys_to", "fly.io")
+    seed_edge(hy.conn, "medflow", "deploys_to", "fly_io")
     hy.conn.commit()
     turns = _turns(("user", "the medflow rollout slipped to friday"))
     out = rewrite_query("what about that?", turns, cfg=hy.config, conn=hy.conn)
     assert out.changed
-    assert "medflow" in out.rewritten
+    assert out.rewritten == "what about that? (context: medflow)"
 
 
 def test_query_naming_a_known_entity_does_not_fire(hy) -> None:
     # postgres in SUBJECT position: `match_known_entities` only trusts an
     # object-position canonical when it also looks entity-shaped elsewhere.
-    seed_edge(hy.conn, "postgres", "runs_on", "fly.io")
+    seed_edge(hy.conn, "postgres", "runs_on", "fly_io")
     hy.conn.commit()
     turns = _turns(("user", "we also run redis for the cache"))
     original = "is it faster than postgres?"

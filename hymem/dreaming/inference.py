@@ -6,8 +6,18 @@ import sqlite3
 
 from hymem.config import HyMemConfig
 from hymem.core.graph import live_edge_predicate
+from hymem.dreaming.canonicalize import normalize
 
 log = logging.getLogger("hymem.dreaming.inference")
+
+
+def _canonical_endpoints(row: sqlite3.Row) -> bool:
+    """Do not propagate legacy drift through either inference rule."""
+    return all(
+        isinstance(row[key], str) and bool(row[key])
+        and normalize(row[key]) == row[key]
+        for key in ("s", "o")
+    )
 
 
 def _record_policy(conn: sqlite3.Connection, cfg: HyMemConfig) -> None:
@@ -89,6 +99,8 @@ def infer_transitive_edges(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
            WHERE predicate = 'uses' AND {live_edge_predicate()}"""
     ).fetchall()
 
+    depends_rows = [row for row in depends_rows if _canonical_endpoints(row)]
+    uses_rows = [row for row in uses_rows if _canonical_endpoints(row)]
     if not depends_rows and not uses_rows:
         _record_policy(conn, cfg)
         return 0
@@ -150,6 +162,8 @@ def infer_transitive_edges(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
            WHERE predicate = 'depends_on'
              AND {live_edge_predicate(include_derived=True)}"""
     ).fetchall():
+        if not _canonical_endpoints(r):
+            continue
         refreshed_depends.setdefault(r["s"], []).append((r["o"], float(r["conf"])))
 
     for r in uses_rows:

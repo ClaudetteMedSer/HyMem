@@ -33,6 +33,7 @@ from pathlib import Path
 
 from hymem import redaction
 from hymem.core import db as core_db
+from hymem.core import extraction_audit
 from hymem.core.message_records import (
     MESSAGE_PROVENANCE_RECORD_VERSION,
     MESSAGE_RECORD_VERSION,
@@ -152,7 +153,8 @@ log = logging.getLogger("hymem.portability")
 # includes the v55 structural-publication singleton and typed proof cache.
 # v16 carries explicit payload-bound digest procedure ownership. Older rows
 # without this declaration remain unknown-origin, never inferred from an id.
-EXPORT_VERSION = 16
+# v17 preserves complete original extraction sets independently of authority.
+EXPORT_VERSION = 17
 _MAX_SQLITE_ROWID = 2**63 - 1
 _ROWID_RESERVE_HEADROOM = 1_000_000
 
@@ -480,7 +482,11 @@ _V16_EXPORT_SPEC = [*_V14_EXPORT_SPEC, (
     "procedure_digest_publication", "procedure_digest_publications",
     ["procedure_id", "generation", "payload_sha256", "retired"],
 )]
-_EXPORT_SPEC = _V16_EXPORT_SPEC
+_V17_EXPORT_SPEC = [*_V16_EXPORT_SPEC, (
+    "edge_evidence_extraction_audit", "kg_evidence_extraction_audit",
+    list(extraction_audit.COLUMNS),
+)]
+_EXPORT_SPEC = _V17_EXPORT_SPEC
 _V6_TABLE_BY_KIND = {kind: table for kind, table, _ in _V6_EXPORT_SPEC}
 _V6_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V6_EXPORT_SPEC}
 _V7_TABLE_BY_KIND = {kind: table for kind, table, _ in _V7_EXPORT_SPEC}
@@ -501,8 +507,10 @@ _V14_TABLE_BY_KIND = {kind: table for kind, table, _ in _V14_EXPORT_SPEC}
 _V14_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V14_EXPORT_SPEC}
 _V16_TABLE_BY_KIND = {kind: table for kind, table, _ in _V16_EXPORT_SPEC}
 _V16_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V16_EXPORT_SPEC}
-_TABLE_BY_KIND = _V16_TABLE_BY_KIND
-_COLS_BY_KIND = _V16_COLS_BY_KIND
+_V17_TABLE_BY_KIND = {kind: table for kind, table, _ in _V17_EXPORT_SPEC}
+_V17_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V17_EXPORT_SPEC}
+_TABLE_BY_KIND = _V17_TABLE_BY_KIND
+_COLS_BY_KIND = _V17_COLS_BY_KIND
 # Sessions must import before rows that FK-reference them.
 _IMPORT_ORDER = [
     "session", "peer", "session_peer", "chunk",
@@ -4343,7 +4351,11 @@ def _redact_portable_records(
     # surfaces before scrubbing them, then apply it to graph and alias natural
     # keys as one referentially consistent transform.
     normalized_sensitive_identities: dict[str, str] = {}
-    for evidence in grouped.get("edge_evidence", []):
+    original_extractions = [
+        extraction_audit.decode(row["payload_json"])["extraction"]
+        for row in grouped.get("edge_evidence_extraction_audit", [])
+    ]
+    for evidence in [*grouped.get("edge_evidence", []), *original_extractions]:
         for field in ("surface_subject", "surface_object"):
             surface = evidence.get(field)
             if not isinstance(surface, str):
@@ -5077,6 +5089,50 @@ def _redact_portable_records(
             safe = f"{canonicalize.normalize(safe)}_{fingerprint}"
         return safe
 
+    # Original audit strings are opaque history: recursively scrub JSON text,
+    # but never normalize its clocks, semantic keys or original edge spelling.
+    # Coverage versions are source references and follow the proof's map.
+    safe_audits = {}
+    for row in grouped.get("edge_evidence_extraction_audit", []):
+        payload = extraction_audit.decode(row["payload_json"])
+        if redact_values:
+            payload["original_edge"] = [
+                redact_canonical_identity(value) if index != 1 else scrubber.redact(value)
+                for index, value in enumerate(payload["original_edge"])
+            ]
+            extraction = payload["extraction"]
+            old_coverage = tuple(extraction[k] for k in (
+                "source_message_id", "source_coverage_chunk_id", "source_coverage_version"
+            ))
+            for field, value in extraction.items():
+                if isinstance(value, str):
+                    # Keep a referenced source handle exact. Secret-bearing
+                    # handles require a source-wide remapping, not invention
+                    # of an unrelated audit source.
+                    if field in {"chunk_id", "source_session_id", "source_peer_id",
+                                 "source_workspace_id", "source_coverage_chunk_id"}:
+                        if scrubber.redact(value) != value:
+                            raise ValueError("portable extraction audit source identity requires remapping")
+                    else:
+                        try:
+                            decoded = loads_strict_json(value)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            extraction[field] = scrubber.redact(value)
+                        else:
+                            safe_value = redact_json_node(decoded)
+                            if safe_value != decoded:
+                                extraction[field] = json.dumps(
+                                    safe_value, ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False,
+                                )
+            if old_coverage[1] is not None:
+                extraction["source_coverage_version"] = coverage_version_map[old_coverage]
+        safe = extraction_audit.record(row["evidence_id"], payload)
+        safe_audits[(safe["evidence_id"], safe["occurrence_hash"])] = safe
+    if "edge_evidence_extraction_audit" in grouped:
+        grouped["edge_evidence_extraction_audit"] = list(safe_audits.values())
+        _validate_extraction_audits(grouped)
+
     # These fields participate in natural keys. Stable source-derived suffixes
     # prevent two distinct identities from collapsing to one generic marker
     # during a privacy-preserving import.
@@ -5374,6 +5430,31 @@ def _preflight_v6_export(conn) -> None:
             raise ValueError("cannot export an invalid typed profile fact")
 
 
+def _validate_extraction_audits(grouped) -> dict[int, list[dict]]:
+    owners = {row["id"] for row in grouped.get("edge_evidence", [])}
+    chunks = {row["id"] for row in grouped.get("chunk", [])}
+    coverage = {(row["message_id"], row["chunk_id"], row["coverage_version"])
+                for row in grouped.get("message_retention_coverage", [])}
+    result: dict[int, list[dict]] = defaultdict(list)
+    seen = set()
+    for row in grouped.get("edge_evidence_extraction_audit", []):
+        extraction_audit.validate_record(row)
+        key = (row["evidence_id"], row["occurrence_hash"])
+        if key in seen:
+            raise ValueError("duplicate portable extraction audit")
+        seen.add(key)
+        if row["evidence_id"] not in owners or row["chunk_id"] not in chunks:
+            raise ValueError("portable extraction audit has missing owner/source")
+        if row["source_coverage_chunk_id"] is not None and (
+            row["source_message_id"], row["source_coverage_chunk_id"], row["source_coverage_version"]
+        ) not in coverage:
+            raise ValueError("portable extraction audit has missing coverage")
+        result[row["evidence_id"]].append(row)
+    if set(result) != owners:
+        raise ValueError("portable extraction audit has incomplete original sets")
+    return result
+
+
 def _preflight_v7_export(conn) -> dict[str, list[dict]]:
     """Return a self-validated current snapshot or fail before publishing."""
     _preflight_v6_export(conn)
@@ -5381,6 +5462,14 @@ def _preflight_v7_export(conn) -> dict[str, list[dict]]:
     if mismatches:
         raise ValueError("cannot export knowledge graph with stale evidence counters")
     grouped = _collect_current_records(conn)
+    # Virtual originals are read-only and precede the existing wire clock/key
+    # normalization. An audited representative contributes no new occurrence.
+    audit_rows = grouped["edge_evidence_extraction_audit"]
+    audited = {row["evidence_id"] for row in audit_rows}
+    for row in conn.execute("SELECT id FROM kg_evidence ORDER BY id"):
+        if row["id"] not in audited:
+            audit_rows.append(extraction_audit.carrier_record(conn, row["id"]))
+    _validate_extraction_audits(grouped)
     # The exported canonical identities must not resolve through this store's
     # own alias map. Such a split snapshot cannot be restored without re-keying
     # its evidence hashes, so reject it before emitting bytes.
@@ -5716,6 +5805,9 @@ def _import_v7_claim_state(
 ) -> None:
     """Restore v7 graph history through natural-key ID maps."""
     from hymem.core.time import validate_event_clock
+
+    incoming_audits = _validate_extraction_audits(grouped)
+    audit_inserted = 0
 
     generation_inserted = 0
     for record in sorted(
@@ -6188,8 +6280,9 @@ def _import_v7_claim_state(
             )
         mapped["_publication_at"] = wire_outcomes[outcome_key]
         wire_observations.append(mapped)
-    supported_wire_evidence_ids = {
+    producer_supported_wire_evidence_ids = {
         int(record["_wire_evidence_id"]) for record in wire_observations
+        if int(record["_producer_authority"]) > 0
     }
 
     def observation_authority_rank(record) -> tuple[object, ...]:
@@ -6308,6 +6401,7 @@ def _import_v7_claim_state(
                     )
 
     evidence_id_map: dict[int, int] = {}
+    mapped_target_evidence_ids: set[int] = set()
     evidence_inserted = 0
     evidence_columns = [
         column for column in _COLS_BY_KIND["edge_evidence"]
@@ -6435,14 +6529,20 @@ def _import_v7_claim_state(
                 )
                 if state_diverges and occurrence_is_winner and (
                     int(existing["is_current"]) == 1
-                    or int(record["id"]) in supported_wire_evidence_ids
+                    or int(record["id"]) in producer_supported_wire_evidence_ids
+                    or int(existing["id"]) in mapped_target_evidence_ids
                 ):
                     # Retirement is append-only. A current branch copy and a
                     # retired branch copy therefore represent two distinct
                     # transaction intervals even when their wire-local
                     # revision/interpretation are identical. Preserve both;
                     # deterministic renumbering below will assign the retired
-                    # interval first in either import order.
+                    # interval first in either import order. Prompt-only old
+                    # wire observations cannot support a new open interval:
+                    # the reducer retires their carrier for missing producer
+                    # authority, and replay must reuse that same occurrence.
+                    # Still preserve a distinct interval declared by another
+                    # wire row, even when both occurred in one millisecond.
                     revision_collision = existing
                     existing = None
                     preserve_distinct_interval = True
@@ -6468,6 +6568,9 @@ def _import_v7_claim_state(
                         raise ValueError(
                             "portable evidence revision collides with target"
                         )
+                    audit_inserted += extraction_audit.merge_incoming(
+                        conn, int(existing["id"]), incoming_audits[int(record["id"])],
+                    )
                     incoming_rank = first_occurrence_audit_rank(record)
                     existing_rank = first_occurrence_audit_rank(existing)
                     earliest_published_at = earliest_timestamp_spelling(
@@ -6621,7 +6724,12 @@ def _import_v7_claim_state(
                     )
                     target_evidence_id = int(cur.lastrowid)
                     evidence_inserted += 1
+                    audit_inserted += extraction_audit.merge_incoming(
+                        conn, target_evidence_id, incoming_audits[int(record["id"])],
+                        preserve_local=False,
+                    )
                 evidence_id_map[int(record["id"])] = target_evidence_id
+                mapped_target_evidence_ids.add(target_evidence_id)
                 continue
             else:
                 where = (
@@ -6651,6 +6759,12 @@ def _import_v7_claim_state(
                 target_evidence_id = int(cur.lastrowid)
                 evidence_inserted += 1
             evidence_id_map[int(record["id"])] = target_evidence_id
+            mapped_target_evidence_ids.add(target_evidence_id)
+
+            audit_inserted += extraction_audit.merge_incoming(
+                conn, target_evidence_id, incoming_audits[int(record["id"])],
+                preserve_local=existing is not None,
+            )
 
         # Canonicalize lower-authority retirement metadata after the union so
         # importing branch A then B and B then A converges byte-for-byte on the
@@ -6688,6 +6802,7 @@ def _import_v7_claim_state(
                         (retirement_at, row["id"]),
                     )
     inserted["edge_evidence"] = evidence_inserted
+    inserted["edge_evidence_extraction_audit"] = audit_inserted
 
     signal_inserted = 0
     signal_columns = [
@@ -7825,7 +7940,8 @@ def import_jsonl(
                     if not _wire_int(obj.get("schema_version"), minimum=1):
                         raise ValueError("portable header has invalid schema version")
             elif kind in (
-                _V16_TABLE_BY_KIND if (meta_version or 0) >= 16
+                _V17_TABLE_BY_KIND if (meta_version or 0) >= 17
+                else _V16_TABLE_BY_KIND if (meta_version or 0) >= 16
                 else _V14_TABLE_BY_KIND if (meta_version or 0) >= 14
                 else _V13_TABLE_BY_KIND if (meta_version or 0) >= 13
                 else _V12_TABLE_BY_KIND if (meta_version or 0) >= 12
@@ -7851,7 +7967,8 @@ def import_jsonl(
         raise ValueError("portable export is missing its header")
     if meta_version >= 6:
         version_tables = (
-            _V16_TABLE_BY_KIND if meta_version >= 16
+            _V17_TABLE_BY_KIND if meta_version >= 17
+            else _V16_TABLE_BY_KIND if meta_version >= 16
             else _V14_TABLE_BY_KIND if meta_version >= 14
             else _V13_TABLE_BY_KIND if meta_version >= 13
             else _V12_TABLE_BY_KIND if meta_version >= 12
@@ -7863,7 +7980,8 @@ def import_jsonl(
             else _V6_TABLE_BY_KIND
         )
         version_columns = (
-            _V16_COLS_BY_KIND if meta_version >= 16
+            _V17_COLS_BY_KIND if meta_version >= 17
+            else _V16_COLS_BY_KIND if meta_version >= 16
             else _V14_COLS_BY_KIND if meta_version >= 14
             else _V13_COLS_BY_KIND if meta_version >= 13
             else _V12_COLS_BY_KIND if meta_version >= 12
@@ -7907,6 +8025,17 @@ def import_jsonl(
             _upgrade_pre_v13_phase1_fields(grouped)
         if meta_version < 14:
             _upgrade_pre_v14_auxiliary_fields(grouped)
+        if meta_version >= 17:
+            _validate_extraction_audits(grouped)
+        elif meta_version >= 7:
+            # Older formats have only their wire carrier as original. Capture
+            # it before interpretation-key/redaction or merge normalization.
+            edges = {row["id"]: row for row in grouped.get("edge", [])}
+            grouped["edge_evidence_extraction_audit"] = [
+                extraction_audit.record(row["id"], extraction_audit.original(
+                    _edge_natural(edges[row["edge_id"]]), row,
+                )) for row in grouped.get("edge_evidence", [])
+            ]
         if meta_version >= 7:
             interpretation_by_wire_id: dict[int, str] = {}
             for record in grouped.get("edge_evidence", []):

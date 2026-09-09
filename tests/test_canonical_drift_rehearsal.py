@@ -5,6 +5,7 @@ import pytest
 
 from hymem.core import db
 from hymem.dreaming import canonicalize
+from tests.legacy_canonical import legacy_canonical_rows
 
 
 @pytest.fixture
@@ -19,7 +20,8 @@ def conn(tmp_path):
 
 def test_repair_refuses_normalized_target_that_is_already_another_identity_alias(conn):
     conn.execute("INSERT INTO entity_aliases(alias,canonical) VALUES ('project_name','established_project')")
-    conn.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES ('Project_Name','uses','tool',2)")
+    with legacy_canonical_rows(conn):
+        conn.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES ('Project_Name','uses','tool',2)")
     before = tuple(conn.iterdump())
     with pytest.raises(ValueError, match="alias"):
         with db.transaction(conn):
@@ -30,8 +32,9 @@ def test_repair_refuses_normalized_target_that_is_already_another_identity_alias
 @pytest.mark.parametrize("drop,legacy", [("project_alias", False), ("Project_Name", True)])
 def test_direct_merge_target_alias_conflict_is_detected_before_any_mutation(conn, drop, legacy):
     conn.execute("INSERT INTO entity_aliases(alias,canonical) VALUES ('project_name','established_project')")
-    conn.execute("INSERT INTO entity_aliases(alias,canonical) VALUES ('alternate',?)", (drop,))
-    conn.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES (?,'uses','tool',2)", (drop,))
+    with legacy_canonical_rows(conn):
+        conn.execute("INSERT INTO entity_aliases(alias,canonical) VALUES ('alternate',?)", (drop,))
+        conn.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES (?,'uses','tool',2)", (drop,))
     before = tuple(conn.iterdump())
     with pytest.raises(ValueError, match="alias"):
         canonicalize.merge(conn, keep="project_name", drop=drop, _allow_legacy_drop=legacy)
@@ -42,8 +45,9 @@ def test_direct_merge_target_alias_conflict_is_detected_before_any_mutation(conn
 
 @pytest.mark.parametrize("alias_target", ["project_name", "Project_Name"])
 def test_repair_accepts_self_alias_or_alias_to_exact_consumed_identity(conn, alias_target):
-    conn.execute("INSERT INTO entity_aliases(alias,canonical) VALUES ('project_name',?)", (alias_target,))
-    conn.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES ('Project_Name','uses','tool',2)")
+    with legacy_canonical_rows(conn):
+        conn.execute("INSERT INTO entity_aliases(alias,canonical) VALUES ('project_name',?)", (alias_target,))
+        conn.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES ('Project_Name','uses','tool',2)")
     with db.transaction(conn):
         fixes = canonicalize.repair_canonical_drift(conn)
     assert fixes and canonicalize.find_canonical_drift(conn) == []
@@ -59,8 +63,9 @@ def test_repair_accepts_self_alias_or_alias_to_exact_consumed_identity(conn, ali
 
 def test_repair_outer_transaction_rolls_back_earlier_success_when_later_identity_conflicts(conn):
     conn.execute("INSERT INTO entity_aliases(alias,canonical) VALUES ('zeta_project','established_project')")
-    for name in ("Alpha_Project", "Zeta_Project"):
-        conn.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES (?,'uses','tool',2)", (name,))
+    with legacy_canonical_rows(conn):
+        for name in ("Alpha_Project", "Zeta_Project"):
+            conn.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES (?,'uses','tool',2)", (name,))
     before = tuple(conn.iterdump())
     seen = []
     conn.set_trace_callback(seen.append)

@@ -410,7 +410,7 @@ def test_material_state_detects_derived_embedding_and_logical_fts_mutation(tmp_p
 
         hy.conn.execute(
             "INSERT INTO entity_aliases(alias,canonical) VALUES (?,?)",
-            ("Quokka", "quokka"),
+            ("quokka", "quokka"),
         )
         derived = material_store_state(hy.config.db_path)
         assert _changed_tables(baseline, derived) == {"entity_aliases"}
@@ -516,7 +516,7 @@ def test_semantic_digest_ignores_insertion_page_order_and_vacuum(tmp_path):
     left = _hy(tmp_path / "left")
     right = _hy(tmp_path / "right")
     try:
-        pairs = (("A", "a"), ("B", "b"), ("C", "c"))
+        pairs = (("alpha", "a"), ("beta", "b"), ("gamma", "c"))
         left.conn.executemany(
             "INSERT INTO entity_aliases(alias,canonical) VALUES (?,?)", pairs
         )

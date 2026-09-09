@@ -32,7 +32,8 @@ Key variables:
     HYMEM_LLM_THINKING       Thinking-body policy (default: auto)
     HYMEM_EMBEDDING_API_KEY  API key for an explicitly configured remote embedder
                              (OPENAI_API_KEY is used only for api.openai.com)
-    HYMEM_EMBEDDING_BASE_URL HTTPS OpenAI-compatible endpoint (HTTP only loopback)
+    HYMEM_EMBEDDING_BASE_URL HTTPS OpenAI-compatible endpoint (HTTP on loopback
+                             or with explicit isolated-internal-network opt-in)
     HYMEM_EMBEDDING_MODEL    Embedding model (with matching HYMEM_EMBEDDING_DIM)
     HYMEM_EMBEDDING_DIM      Declared vector dimension
     HYMEM_EMBEDDING_TIMEOUT_SECONDS
@@ -50,8 +51,8 @@ Key variables:
 With no embedding configuration, the server uses a deterministic, dependency-
 free local feature-hash backend (model identity and lexical quality are exposed
 in query status). An explicit localhost endpoint needs no real API key. An
-incomplete/unavailable remote configuration falls back without launching a
-service at import or construction time.
+incomplete, rejected, or unavailable explicit remote configuration refuses
+startup before opening the store; it never activates a local fallback producer.
 """
 from __future__ import annotations
 

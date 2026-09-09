@@ -157,7 +157,7 @@ def test_v58_upgrade_does_not_infer_legacy_ownership(cfg):
         config = hy.config
         hy.close()
         hy = HyMem(config, llm=llm)
-        assert db.schema_version(hy.conn) == 59
+        assert db.schema_version(hy.conn) == db.EXPECTED_SCHEMA_VERSION
         assert hy.conn.execute("SELECT COUNT(*) FROM procedure_digest_publications").fetchone()[0] == 0
         llm.emit_slice_artifacts = False
         hy.conn.execute("UPDATE sessions SET digested_prompt_version=NULL WHERE id='x'")
@@ -188,8 +188,10 @@ def test_portable_roundtrip_retains_explicit_but_not_inferred_ownership(cfg, tmp
         if legacy:
             def downgrade(records):
                 records[0]["version"] = 15
-                records[:] = [row for row in records if row["type"] != "procedure_digest_publication"]
-                del records[-1]["counts"]["procedure_digest_publication"]
+                newer_kinds = {"procedure_digest_publication", "edge_evidence_extraction_audit"}
+                records[:] = [row for row in records if row["type"] not in newer_kinds]
+                for kind in newer_kinds:
+                    del records[-1]["counts"][kind]
             _rewrite_export(path, downgrade)
         restored = HyMem(replace(hy.config, root=tmp_path / "restored"), llm=llm)
         try:

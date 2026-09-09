@@ -209,18 +209,18 @@ def test_limited_edge_updates_preserve_unrelated_shadows(store):
     client = ExactEmbedder()
     model, dim = embedding_storage_identity(client)
     for index in range(3):
-        store.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES (?,'uses','redis',1)", (f"user-{index}",))
+        store.execute("INSERT INTO knowledge_graph(subject_canonical,predicate,object_canonical,pos_evidence) VALUES (?,'uses','redis',1)", (f"user_{index}",))
     with db.transaction(store), db.embedding_mutation(store):
         db.ensure_vec_table(store, dim, model=model)
         for index in range(3):
-            store.execute("INSERT INTO edge_embeddings(edge_text,model,dim,vector_json) VALUES (?,?,3,?)", (f"user-{index} uses redis", model, "bad" if index == 0 else "[1,0,0]"))
+            store.execute("INSERT INTO edge_embeddings(edge_text,model,dim,vector_json) VALUES (?,?,3,?)", (f"user_{index} uses redis", model, "bad" if index == 0 else "[1,0,0]"))
             if db.has_vec_table(store, table="vec_edges"):
                 store.execute("INSERT INTO vec_edges(rowid,embedding) VALUES (?,?)", (index + 1, db._pack_vector([1, 0, 0])))
     report = reembed.repair(store, client, apply=True, max_items=1)
     assert report.repaired == 1 and not report.sweep_complete
     if db.has_vec_table(store, table="vec_edges"):
         assert {row[0] for row in store.execute("SELECT rowid FROM vec_edges")} == {1, 2, 3}
-    assert client.calls == [["user-0 uses redis"]]
+    assert client.calls == [["user_0 uses redis"]]
 
 
 def test_cli_readonly_no_create_no_llm_and_explicit_configuration(store, tmp_path, monkeypatch, capsys):

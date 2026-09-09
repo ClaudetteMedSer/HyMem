@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-MATERIAL_STORE_ATTESTATION_VERSION = "hymem-material-store-attestation-v7"
+MATERIAL_STORE_ATTESTATION_VERSION = "hymem-material-store-attestation-v8"
 
 
 class MaterialStoreAttestationError(RuntimeError):
@@ -82,6 +82,7 @@ _MATERIAL_TABLES = frozenset({
     "kg_claim_observations",
     "kg_edge_lifecycle",
     "kg_evidence",
+    "kg_evidence_extraction_audit",
     "kg_evidence_signals",
     "kg_lifecycle_dependencies",
     "knowledge_graph",
@@ -647,7 +648,7 @@ def material_store_state(path: str | Path) -> dict:
 
         version = core_db.schema_version(conn)
         if (
-            version != 59
+            version != core_db.EXPECTED_SCHEMA_VERSION
             or not core_db._v57_domain_present(conn)
             or not core_db._v57_material_bindings_present(conn)
         ):

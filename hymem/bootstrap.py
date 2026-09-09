@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
+import stat
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,7 +79,9 @@ class EnvConfig:
 
     @property
     def has_embedding_client(self) -> bool:
-        return self.embedding_backend == "local_feature_hash" or self.has_embedding_key
+        return self.embedding_fallback_reason is None and (
+            self.embedding_backend == "local_feature_hash" or self.has_embedding_key
+        )
 
     @property
     def embedding_identity(self) -> str:
@@ -248,7 +253,7 @@ def resolve_env() -> EnvConfig:
     """Resolve all HyMem configuration from the environment.
 
     Never raises and never constructs network clients — safe for the doctor
-    to call to report what *would* be used.
+    to report the candidate configuration and why startup would be refused.
     """
     env = os.environ.get
     llm_base_url = env("HYMEM_LLM_BASE_URL", DEFAULT_BASE_URL)
@@ -299,9 +304,10 @@ def resolve_env() -> EnvConfig:
             embedding_dim = requested_dim
             embedding_backend = "openai_compatible"
         else:
-            # An incomplete remote configuration must not instantiate a client
-            # that is guaranteed to fail. Keep vector tiers alive in a separate,
-            # explicitly lower-quality local vector space.
+            # Retain the legacy inert diagnostic fields, not the rejected URL
+            # or credentials. A fallback_reason makes this configuration
+            # unavailable: build_from_env must refuse it, never activate these
+            # local defaults against a store configured for a remote producer.
             embedding_base_url = DEFAULT_EMBEDDING_BASE_URL
             embedding_model = DEFAULT_EMBEDDING_MODEL
             embedding_dim = DEFAULT_EMBEDDING_DIM
@@ -342,13 +348,170 @@ def resolve_env() -> EnvConfig:
     )
 
 
+def _default_local_store_error(cfg: EnvConfig) -> str | None:
+    """Refuse implicit local startup over another or unknown durable space.
+
+    This is a bounded, read-only *admission* check, not a migration, vector
+    integrity audit or global writer lock. A committed exact local shadow
+    identity also permits historical incompatible mirrors/cache entries: an
+    intentional ``hymem-reembed --allow-local`` repair need not destroy them.
+    Without shadow identity, populated mirrors/cache are the only surviving
+    producer evidence and must all agree with the candidate local space.
+
+    Direct ``HyMem(..., embedding_client=...)`` construction and the explicit
+    re-embed workflow do not use this environment-bootstrap guard.
+    """
+    if cfg.embedding_backend != "local_feature_hash":
+        return None
+    conn: sqlite3.Connection | None = None
+    conflict = False
+    unavailable = False
+    try:
+        path = HyMemConfig(root=cfg.root).db_path.absolute()
+        try:
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(mode):
+            raise ValueError("existing store is not a regular file")
+
+        from hymem.dreaming.aggregation_material import embedding_storage_identity
+        from hymem.extraction.embeddings import LocalHashEmbeddingClient
+
+        local_model, local_dim = embedding_storage_identity(LocalHashEmbeddingClient(
+            dim_value=cfg.embedding_dim, model_name=cfg.embedding_model,
+        ))
+        # Never use core_db.connect/initialize here: even an unsuccessful
+        # diagnostic must not initialize, migrate or heal an existing store.
+        # mode=ro (not immutable) observes committed WAL state. SQLite owns any
+        # required read locks/sidecars; read-only opening can create coordination
+        # sidecars but does not mutate source rows or initialize/migrate the DB.
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA trusted_schema=OFF")
+        deadline = time.monotonic() + 2.0
+        remaining_steps = 2_000_000
+
+        def bounded_read() -> int:
+            nonlocal remaining_steps
+            remaining_steps -= 1_000
+            return int(remaining_steps < 0 or time.monotonic() >= deadline)
+
+        conn.set_progress_handler(bounded_read, 1_000)
+        conn.execute("BEGIN")
+        mirror_tables = (
+            "chunk_embeddings", "message_embeddings", "edge_embeddings",
+            "episode_embeddings", "narrative_fact_embeddings",
+            "aggregation_node_embeddings", "embedding_cache",
+        )
+        names = ("schema_meta", *mirror_tables)
+        objects = conn.execute(
+            "SELECT name, type FROM sqlite_master WHERE name IN ("
+            + ",".join("?" for _ in names)
+            + ") OR name GLOB 'vec_*' LIMIT 65", names,
+        ).fetchall()
+        if len(objects) > 64 or any(kind != "table" for _, kind in objects):
+            raise ValueError("unrecognized vector storage layout")
+        tables = {name for name, _ in objects}
+        metadata = []
+        if "schema_meta" in tables:
+            metadata = conn.execute(
+                "SELECT key, value FROM schema_meta "
+                "WHERE key IN ('vec_model', 'vec_dim') LIMIT 3"
+            ).fetchall()
+        if metadata:
+            values = dict(metadata)
+            # Partial, duplicate, malformed and unknown identities cannot
+            # authorize a default producer switch, even on empty shadows.
+            conflict = not (
+                len(metadata) == len(values) == 2
+                and values.get("vec_model") == local_model
+                and type(values.get("vec_dim")) in (str, int)
+                and values.get("vec_dim") in (str(local_dim), local_dim)
+            )
+        elif any(name.startswith("vec_") for name in tables):
+            conflict = True
+        else:
+            for table in mirror_tables:
+                if table not in tables:
+                    continue
+                # Empty pre-vector legacy tables need not possess today's
+                # columns. A populated uninspectable table fails closed.
+                if conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None:
+                    continue
+                typed_conflict = ""
+                if table in ("episode_embeddings", "aggregation_node_embeddings"):
+                    columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+                    if "embedding_producer_key" in columns:
+                        typed_conflict = " OR embedding_producer_key COLLATE BINARY IS NOT model"
+                if conn.execute(
+                    f'SELECT 1 FROM "{table}" WHERE '
+                    "typeof(model) IS NOT 'text' OR model COLLATE BINARY IS NOT ? "
+                    "OR typeof(dim) IS NOT 'integer' OR dim IS NOT ?"
+                    + typed_conflict + " LIMIT 1",
+                    (local_model, local_dim),
+                ).fetchone() is not None:
+                    conflict = True
+                    break
+        if time.monotonic() >= deadline:
+            raise TimeoutError("local embedding admission deadline")
+    except Exception:  # noqa: BLE001 - do not expose stored values/paths/errors
+        unavailable = True
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - a failed close cannot admit startup
+                unavailable = True
+    if unavailable or conflict:
+        reason = (
+            "existing vector producer state could not be safely verified"
+            if unavailable else
+            "existing vector producer state does not match default local embeddings"
+        )
+        return (
+            f"HyMem cannot start: {reason}. Restore the service's embedding "
+            "configuration before starting it. An intentional producer change "
+            "requires the maintained `hymem-reembed` workflow "
+            "(`--allow-local` for local apply); no vectors were changed by "
+            "this check. Run `hymem-doctor` to diagnose your configuration."
+        )
+    return None
+
+
+def _embedding_configuration_error(cfg: EnvConfig) -> str | None:
+    """Safe resolution/admission failure shared by startup and the doctor."""
+    if cfg.embedding_fallback_reason is None:
+        return _default_local_store_error(cfg)
+    if cfg.embedding_fallback_reason == "remote_embedding_endpoint_rejected":
+        reason = "remote_embedding_endpoint_rejected: configured remote embedding endpoint rejected"
+        if cfg.embedding_fallback_detail:
+            reason += f": {cfg.embedding_fallback_detail}"
+    elif cfg.embedding_fallback_reason == "remote_embedding_credentials_missing":
+        reason = (
+            "remote_embedding_credentials_missing: set HYMEM_EMBEDDING_API_KEY "
+            "for the configured endpoint, or use a provider key only with its "
+            "exact official HTTPS endpoint"
+        )
+    else:
+        # Do not echo arbitrary caller-supplied reason strings.
+        reason = "configured remote embeddings are unavailable"
+    return (
+        f"HyMem cannot start: {reason}. "
+        "No local embedding fallback will be installed. "
+        "Run `hymem-doctor` to diagnose your configuration."
+    )
+
+
 def build_from_env() -> HyMem:
     """Construct a HyMem instance from environment variables.
 
     Fails fast with a clear, actionable error if the extraction LLM key is
-    missing — instead of raising deep inside the first dream cycle. The
-    Embeddings default to a deterministic dependency-free local feature hash.
-    An OpenAI-compatible endpoint is used only when explicitly configured.
+    missing — instead of raising deep inside the first dream cycle. Embeddings
+    default to a deterministic dependency-free local feature hash only without
+    explicit remote configuration and without an incompatible existing store.
+    A rejected or unavailable configured remote client fails before opening
+    the store; it never switches the vector space.
     """
     from hymem.contrib.openai_client import OpenAICompatibleClient
     from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
@@ -369,6 +532,10 @@ def build_from_env() -> HyMem:
             "before launching the server.\n"
             "Run `hymem-doctor` to diagnose your configuration."
         )
+
+    embedding_configuration_error = _embedding_configuration_error(cfg)
+    if embedding_configuration_error is not None:
+        raise RuntimeError(embedding_configuration_error)
 
     from hymem.extraction.embeddings import (
         CachedEmbeddingClient,
@@ -398,6 +565,7 @@ def build_from_env() -> HyMem:
         )
 
         if cfg.embedding_backend == "openai_compatible":
+            embedding_construction_failed = False
             try:
                 embedding_transport = OpenAICompatibleEmbeddingClient(
                     api_key=cfg.embedding_api_key,
@@ -408,18 +576,17 @@ def build_from_env() -> HyMem:
                     deployment_revision=cfg.embedding_deployment_revision,
                     deployment_tenant=cfg.embedding_deployment_tenant,
                 )
-            except Exception as exc:  # noqa: BLE001 - degrade gracefully
-                from hymem.contrib.openai_embedding_client import (
-                    safe_embedding_base_url,
-                )
-                log.warning(
-                    "configured embedding client unavailable at %s (%s); using "
-                    "deterministic local lexical fallback",
-                    safe_embedding_base_url(cfg.embedding_base_url),
-                    type(exc).__name__,
-                )
-                embedding_transport = LocalHashEmbeddingClient(
-                    fallback_reason="remote_embedding_client_unavailable",
+            except Exception:  # noqa: BLE001 - redact provider-controlled faults
+                embedding_construction_failed = True
+            if embedding_construction_failed:
+                # Raise outside the handler so even the implicit exception
+                # context cannot retain provider-controlled credentials/URLs.
+                # The outer rollback still closes the already-created LLM.
+                raise RuntimeError(
+                    "HyMem cannot start: configured remote embedding client "
+                    "could not be initialized. Check the embedding configuration "
+                    "and installed client dependencies; run `hymem-doctor`. "
+                    "No local embedding fallback will be installed."
                 )
         else:
             embedding_transport = LocalHashEmbeddingClient(
@@ -427,12 +594,6 @@ def build_from_env() -> HyMem:
                 model_name=cfg.embedding_model,
                 fallback_reason=cfg.embedding_fallback_reason,
             )
-            if cfg.embedding_fallback_reason == "remote_embedding_endpoint_rejected":
-                log.warning(
-                    "configured embedding endpoint rejected: %s; using "
-                    "deterministic local lexical fallback; run hymem-doctor",
-                    cfg.embedding_fallback_detail or cfg.embedding_fallback_reason,
-                )
             log.info(
                 "embeddings backend=%s model=%s dim=%d quality=lexical network=none%s",
                 cfg.embedding_backend, cfg.embedding_model, cfg.embedding_dim,

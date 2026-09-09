@@ -29,16 +29,16 @@ from tests.conftest import seed_edge
 # Laplace-smoothed confidence of a fresh edge (pos=1, neg=0): (1+1)/(1+0+2).
 FRESH_CONF = 2.0 / 3.0
 DECAY = 0.5
-BRIDGE = ("medflow", "deploys_to", "fly.io")   # hop-2, the edge Source 1 misses
-DEEP = ("fly.io", "located_in", "aws")         # hop-3
+BRIDGE = ("medflow", "deploys_to", "fly_io")   # hop-2, the edge Source 1 misses
+DEEP = ("fly_io", "located_in", "aws")         # hop-3
 CONTROL = ("atta", "owns", "laptop")           # 1-hop direct hit (control set)
 ANCHOR = ("atta", "part_of", "medflow")        # 1-hop direct hit (Source 1)
 
 
 def _seed_chain(conn) -> None:
     seed_edge(conn, "atta", "part_of", "medflow")
-    seed_edge(conn, "medflow", "deploys_to", "fly.io")
-    seed_edge(conn, "fly.io", "located_in", "aws")
+    seed_edge(conn, "medflow", "deploys_to", "fly_io")
+    seed_edge(conn, "fly_io", "located_in", "aws")
     seed_edge(conn, "atta", "owns", "laptop")        # direct 1-hop control
     seed_edge(conn, "unrelated", "runs_on", "k8s")   # unrelated island
 

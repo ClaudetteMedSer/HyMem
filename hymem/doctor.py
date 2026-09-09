@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 
-from hymem.bootstrap import EnvConfig, resolve_env
+from hymem.bootstrap import EnvConfig, _embedding_configuration_error, resolve_env
 from hymem.config import HyMemConfig
 from hymem.contrib.endpoint_policy import safe_endpoint_label
 from hymem.core import db as core_db
@@ -145,6 +145,12 @@ def _check_embedding(
     """Return result plus the exact live storage-space identity."""
     from hymem.dreaming.aggregation_material import embedding_execution_identity
 
+    configuration_error = _embedding_configuration_error(cfg)
+    if configuration_error is not None:
+        # These legacy resolver fields are an inert diagnostic snapshot, not
+        # an active fallback producer. Do not manufacture a local identity and
+        # compare it to the operator's existing remote vectors.
+        return _Result(FAIL, "embeddings", configuration_error), None, None
     if cfg.embedding_backend == "local_feature_hash":
         from hymem.extraction.embeddings import LocalHashEmbeddingClient
         embedder = LocalHashEmbeddingClient(
@@ -152,22 +158,11 @@ def _check_embedding(
         )
         embedder.embed(["preflight probe"])
         _binding, model_key, live_dim = embedding_execution_identity(embedder)
-        status = OK
-        if cfg.embedding_fallback_reason == "remote_embedding_credentials_missing":
-            status = WARN
-        elif cfg.embedding_fallback_reason == "remote_embedding_endpoint_rejected":
-            status = FAIL
-        fallback_detail = (
-            f", fallback_reason={cfg.embedding_fallback_reason}"
-            if cfg.embedding_fallback_reason else ""
-        )
-        if cfg.embedding_fallback_detail:
-            fallback_detail += f", policy_detail={cfg.embedding_fallback_detail}"
         return (
             _Result(
-                status, "embeddings",
+                OK, "embeddings",
                 f"{model_key} (local deterministic lexical fallback, "
-                f"no network, dim={embedder.dim}{fallback_detail})",
+                f"no network, dim={embedder.dim})",
             ),
             live_dim,
             model_key,
@@ -193,7 +188,7 @@ def _check_embedding(
             safe_embedding_base_url,
         )
     except ImportError:
-        return _Result(WARN, "embeddings", "key present; openai package not installed"), None, None
+        return _Result(FAIL, "embeddings", "remote client unavailable; openai package not installed"), None, None
     display_url = safe_embedding_base_url(cfg.embedding_base_url)
     embedder = None
     failure: Exception | None = None
@@ -364,14 +359,33 @@ def _check_schema_and_dim(
 
 
 def _check_stored_embedding_health(conn, live_dim, live_model) -> list[_Result]:
-    """Report aggregate compatibility/FK counts without row or producer values."""
-    from hymem.embedding_health import scan_embedding_health
+    """Explain stored mismatches without hiding raw inventory or source faults.
 
-    health = scan_embedding_health(conn, live_model=live_model, live_dim=live_dim)
-    status = (
-        FAIL if health.status in {"incompatible", "unavailable"}
-        else WARN if health.status == "unverified" else OK
-    )
+    File-backed stores use a scanner-owned, bounded read-only snapshot. A
+    caller-owned transaction or in-memory diagnostic fixture retains the old
+    raw fail-closed audit; its uncommitted state cannot be reopened honestly.
+    """
+    from hymem.embedding_health import scan_embedding_health
+    from hymem.embedding_source_health import scan_embedding_recovery_health
+
+    recovery = None
+    try:
+        paths = conn.execute("PRAGMA database_list")
+        path = next((row[2] for row in paths if row[1] == "main"), None)
+        if path and not conn.in_transaction:
+            recovery = scan_embedding_recovery_health(path, live_model=live_model, live_dim=live_dim)
+    except sqlite3.Error:
+        pass  # The raw audit still fails closed on a damaged/closed handle.
+    if recovery is None:
+        health = scan_embedding_health(conn, live_model=live_model, live_dim=live_dim)
+        status = (
+            FAIL if health.status in {"incompatible", "unavailable"}
+            else WARN if health.status == "unverified" else OK
+        )
+    else:
+        health = recovery.inventory
+        status = (FAIL if recovery.status in {"unavailable", "action_required"}
+                  else WARN if recovery.status in {"historical", "unverified"} else OK)
     details = []
     for table in health.tables:
         if table.status == "unavailable":
@@ -383,8 +397,28 @@ def _check_stored_embedding_health(conn, live_dim, live_model) -> list[_Result]:
                 f"unverified={table.unverified})"
             )
     scope = "stored rows only; not missing-row/source-proof coverage"
+    scope += "; current-compatible is metadata/numerics only"
     if not health.live_identity_verified:
         scope += "; live producer unverified"
+    if recovery is not None:
+        scope += "; incompatible-row source classification (neutral durable producer scope)"
+        for table in recovery.tables:
+            if table.error_code:
+                details.append(f"{table.table}(source-classification={table.error_code}, source-counts=unknown)")
+            elif table.total:
+                details.append(
+                    f"{table.table}(source-eligible-incompatible={table.source_eligible}, "
+                    f"retained-unverified={table.retained_unverified}, "
+                    f"terminal-source-loss={table.terminal_source_loss} (subset of retained-unverified), "
+                    f"explicitly-retired={table.retired}, rebuild-required={table.rebuild_required}, "
+                    f"source-withdrawn={table.source_withdrawn} (successful-empty authority; not a negative fact), "
+                    f"unsafe-unknown={table.unsafe_unknown})"
+                )
+        if recovery.status == "historical":
+            scope += "; preserve unverified history; restore only with trusted source provenance"
+            scope += "; retained-unverified does not establish age or legitimate past authority"
+    elif health.status == "incompatible":
+        scope += "; source classification unavailable on caller snapshot; no historical downgrade"
     result = _Result(status, "stored embedding compatibility", scope + "; " + "; ".join(details))
     foreign_keys = health.foreign_keys
     if foreign_keys.status == "unavailable":
@@ -488,10 +522,14 @@ def run_doctor() -> int:
         cfg.embedding_model.encode("utf-8")
     ).hexdigest()
     print(f"  embedding model   : {embedding_model_digest}")
-    print(f"  embedding backend : {cfg.embedding_backend}")
+    embedding_backend = (
+        "unavailable (startup refused)"
+        if cfg.embedding_fallback_reason else cfg.embedding_backend
+    )
+    print(f"  embedding backend : {embedding_backend}")
     print(f"  embedding base URL: {safe_embedding_base_url(cfg.embedding_base_url)}")
     print(f"  embedding API key : {'set' if cfg.has_embedding_key else 'not needed'}")
-    print(f"  embedding fallback: {cfg.embedding_fallback_reason or 'none'}")
+    print(f"  embedding rejection: {cfg.embedding_fallback_reason or 'none'}")
     print("─" * 60)
 
     results: list[_Result] = [_check_root(cfg), _check_llm(cfg), _check_sqlite_vec()]

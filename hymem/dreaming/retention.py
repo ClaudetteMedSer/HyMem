@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import sqlite3
+from typing import Iterator
 
 from hymem.config import HyMemConfig
 from hymem.core import db as core_db
@@ -10,11 +11,19 @@ from hymem.core.message_records import (
     canonical_message_record,
     chunk_contains_message_record,
 )
+from hymem.deadline import check_current_deadline
 
 log = logging.getLogger("hymem.dreaming.retention")
 
 
 def prune_chunks(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
+    # Pin admission, vector/manifest removal and deletion share a writer lock.
+    # A restrictive audit FK must never fail after partial autocommit pruning.
+    with _message_retention_transaction(conn):
+        return _prune_chunks(conn, cfg)
+
+
+def _prune_chunks(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
     # Durable coverage artifacts have their own lifecycle and never compete
     # with selective retrieval/extraction chunks for this soft cap.
     total = conn.execute(
@@ -26,6 +35,12 @@ def prune_chunks(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
     keep_ids: set[str] = set()
 
     rows = conn.execute("SELECT DISTINCT chunk_id FROM kg_evidence").fetchall()
+    keep_ids.update(r["chunk_id"] for r in rows)
+    rows = conn.execute(
+        "SELECT chunk_id FROM kg_evidence_extraction_audit "
+        "UNION SELECT source_coverage_chunk_id AS chunk_id "
+        "FROM kg_evidence_extraction_audit WHERE source_coverage_chunk_id IS NOT NULL"
+    ).fetchall()
     keep_ids.update(r["chunk_id"] for r in rows)
     rows = conn.execute(
         "SELECT DISTINCT chunk_id FROM kg_claim_observations"
@@ -108,6 +123,43 @@ def prune_chunks(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
     return pruned
 
 
+@contextlib.contextmanager
+def _message_retention_transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    """Fence proof validation and deletion without owning a caller's commit."""
+    if not conn.in_transaction:
+        with core_db.transaction(conn):
+            yield
+        return
+
+    check_current_deadline()
+    conn.execute("SAVEPOINT hymem_prune_messages")
+    try:
+        # An existing BEGIN may still be deferred. Acquire the writer lock
+        # before reading any proofs; this touches no rows and fires no row
+        # triggers. An obsolete WAL snapshot fails here, before pruning.
+        conn.execute("UPDATE messages SET id = id WHERE 0")
+        core_db._assert_transaction_lease_owned(conn)
+        check_current_deadline()
+        yield
+        check_current_deadline()
+        core_db._assert_transaction_lease_owned(conn)
+        conn.execute("RELEASE hymem_prune_messages")
+    except BaseException as primary:
+        try:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK TO hymem_prune_messages")
+                conn.execute("RELEASE hymem_prune_messages")
+        except BaseException as rollback_error:
+            # Preserve cancellation/deadline/lease failures and never roll
+            # back unrelated caller work as a substitute for this savepoint.
+            with contextlib.suppress(AttributeError, TypeError):
+                primary.add_note(
+                    "message retention rollback failed: "
+                    f"{type(rollback_error).__name__}"
+                )
+        raise
+
+
 def prune_messages(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
     """Prune individually old, losslessly covered messages from ended sessions.
 
@@ -117,12 +169,24 @@ def prune_messages(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
     JSONL source record. Deleting ``messages`` fires the external-content FTS
     delete trigger and cascades temporal mentions. The durable coverage ledger,
     chunk, KG evidence, and evidence counters deliberately survive.
+
+    Proof validation and deletion share one writer transaction. Standalone
+    calls commit atomically; an existing caller transaction keeps ownership,
+    with only this function's work rolled back if pruning fails.
     """
     days = int(cfg.message_retention_days)
     if days <= 0:
         return 0
 
-    cutoff = f"-{days} days"
+    with _message_retention_transaction(conn):
+        pruned = _prune_covered_messages(conn, cutoff=f"-{days} days")
+    if pruned:
+        log.info("retention.messages pruned=%d", pruned)
+    return pruned
+
+
+def _prune_covered_messages(conn: sqlite3.Connection, *, cutoff: str) -> int:
+    check_current_deadline()
     candidates = conn.execute(
         """
         SELECT m.id, m.session_id, m.role, m.source_peer_id,
@@ -138,6 +202,7 @@ def prune_messages(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
 
     pruned = 0
     for message in candidates:
+        check_current_deadline()
         (
             expected_record,
             expected_hash,
@@ -200,6 +265,7 @@ def prune_messages(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
             DELETE FROM messages
             WHERE id = ? AND session_id = ? AND role = ? AND content = ?
               AND source_peer_id IS ? AND source_workspace_id IS ?
+              AND created_at IS ?
               AND created_at < datetime('now', ?)
               AND EXISTS (
                   SELECT 1 FROM sessions s
@@ -213,13 +279,12 @@ def prune_messages(conn: sqlite3.Connection, cfg: HyMemConfig) -> int:
                 message["content"],
                 message["source_peer_id"],
                 message["source_workspace_id"],
+                message["created_at"],
                 cutoff,
             ),
         )
         pruned += cur.rowcount or 0
 
-    if pruned:
-        log.info("retention.messages pruned=%d", pruned)
     return pruned
 
 

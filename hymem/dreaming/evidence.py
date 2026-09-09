@@ -1997,6 +1997,9 @@ def move_edge_provenance(
         # shared one canonical edge.  In particular, the successful outcome
         # (not its slightly earlier observation) is the transaction boundary
         # at which a losing interpretation may close.
+        from hymem.core import extraction_audit
+        for audit_edge_id in all_ids:
+            extraction_audit.capture_edge(conn, audit_edge_id)
         for (
             source_session_id, source_message_id, evidence_kind
         ), (desired, _winner_ids, authority_at) in prompt_authority.items():
@@ -2163,6 +2166,7 @@ def move_edge_provenance(
                         else:
                             superseded_at = exact["superseded_at"]
                             superseded_reason = exact["superseded_reason"]
+                extraction_audit.union(conn, int(exact["id"]), int(row["id"]))
                 conn.execute(
                     "UPDATE kg_evidence SET chunk_id=?,surface_subject=?,"
                     "surface_object=?,extraction_prompt_version=?,"
@@ -2414,9 +2418,10 @@ def move_edge_provenance(
                     )
 
         lifecycle_rows = conn.execute(
-            f"SELECT * FROM kg_edge_lifecycle WHERE edge_id IN ({placeholders}) "
+            "SELECT * FROM kg_edge_lifecycle WHERE edge_id IN ("
+            + ",".join("?" for _ in all_ids) + ") "
             "ORDER BY event_at, event_key, id",
-            members,
+            all_ids,
         ).fetchall()
         manual_event_origins = {
             (
@@ -2439,9 +2444,45 @@ def move_edge_provenance(
             if lifecycle["event_kind"] == "manual_retraction"
             and str(lifecycle["event_key"]).startswith("manual-retraction:")
         }
+        signal_rows = conn.execute(
+            "SELECT * FROM kg_evidence_signals WHERE edge_id IN ("
+            + ",".join("?" for _ in all_ids) + ") "
+            "ORDER BY signal_kind, signal_key, id",
+            all_ids,
+        ).fetchall()
+        # Compare original identities before either half of a manual pair can
+        # move or coalesce. Raw transaction-clock spellings are part of that
+        # identity, including the ordinary CURRENT_TIMESTAMP column default.
+        signal_identities = {
+            int(signal["id"]): (
+                signal["signal_kind"], signal["signal_key"],
+                int(signal["polarity"]), int(signal["evidence_weight"]),
+                int(signal["counts_toward_confidence"]), signal["details"],
+                signal["created_at"],
+                manual_event_snapshots.get(
+                    (int(signal["edge_id"]), str(signal["signal_key"]))
+                ) if signal["signal_kind"] == "manual_retraction" else None,
+            )
+            for signal in signal_rows
+        }
+        paired_lifecycle_ids = {
+            manual_event_origins.get(
+                (int(signal["edge_id"]), str(signal["signal_key"]))
+            )
+            for signal in signal_rows
+            if signal["signal_kind"] == "manual_retraction"
+        }
 
         for lifecycle in lifecycle_rows:
             lifecycle_id = int(lifecycle["id"])
+            if (
+                int(lifecycle["edge_id"]) == survivor_id
+                or lifecycle_id in paired_lifecycle_ids
+            ):
+                # Bound manual events move with their signal below. Generic
+                # lifecycle equality omits signal state and raw created_at,
+                # so it cannot decide whether a complete pair is a duplicate.
+                continue
             mapped_source = (
                 id_map.get(int(lifecycle["source_evidence_id"]))
                 if lifecycle["source_evidence_id"] is not None
@@ -2597,80 +2638,52 @@ def move_edge_provenance(
                 )
             conn.execute("DELETE FROM kg_evidence WHERE id = ?", (evidence_id,))
 
-        signal_rows = conn.execute(
-            f"SELECT * FROM kg_evidence_signals "
-            f"WHERE edge_id IN ({placeholders}) ORDER BY signal_kind, signal_key, id",
-            members,
-        ).fetchall()
         for signal in signal_rows:
+            if int(signal["edge_id"]) == survivor_id:
+                continue
             lifecycle_id = (
                 manual_event_origins.get(
                     (int(signal["edge_id"]), str(signal["signal_key"]))
                 )
                 if signal["signal_kind"] == "manual_retraction" else None
             )
-            incoming_pair = manual_event_snapshots.get(
-                (int(signal["edge_id"]), str(signal["signal_key"]))
-            )
+            identity = signal_identities[int(signal["id"])]
+            signal_key = signal["signal_key"]
             collision = conn.execute(
                 "SELECT * FROM kg_evidence_signals WHERE edge_id = ? "
                 "AND signal_kind = ? AND signal_key = ?",
                 (survivor_id, signal["signal_kind"], signal["signal_key"]),
             ).fetchone()
             if collision is not None:
-                semantic = (
-                    int(signal["polarity"]), int(signal["evidence_weight"]),
-                    int(signal["counts_toward_confidence"]), signal["details"],
-                    signal["created_at"],
-                )
-                existing_semantic = (
-                    int(collision["polarity"]),
-                    int(collision["evidence_weight"]),
-                    int(collision["counts_toward_confidence"]),
-                    collision["details"], collision["created_at"],
-                )
-                collision_lifecycle = (
-                    conn.execute(
-                        "SELECT event_at,details,direction,created_at "
-                        "FROM kg_edge_lifecycle WHERE edge_id=? AND event_key=?",
-                        (
-                            survivor_id,
-                            manual_retraction_event_key(signal["signal_key"]),
-                        ),
+                if identity != signal_identities[int(collision["id"])]:
+                    suffix = hashlib.sha256(json.dumps(
+                        identity, ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest()
+                    signal_key = f"{signal['signal_key']}:merge:{suffix}"
+                    collision = conn.execute(
+                        "SELECT * FROM kg_evidence_signals WHERE edge_id=? "
+                        "AND signal_kind=? AND signal_key=?",
+                        (survivor_id, signal["signal_kind"], signal_key),
                     ).fetchone()
-                    if signal["signal_kind"] == "manual_retraction" else None
-                )
-                existing_pair = (
-                    tuple(collision_lifecycle)
-                    if collision_lifecycle is not None else None
-                )
-                if semantic == existing_semantic and incoming_pair == existing_pair:
+                    if (
+                        collision is not None
+                        and identity != signal_identities[int(collision["id"])]
+                    ):
+                        # A suffix is also a legal caller key. Only original
+                        # snapshots from this merge can prove coalescence;
+                        # never infer original identity by parsing that key.
+                        raise ValueError("merged evidence signal key collides with different identity")
+                if collision is not None:
                     conn.execute(
                         "DELETE FROM kg_evidence_signals WHERE id = ?",
                         (signal["id"],),
                     )
-                    # Exact signal/event pairs collapse as a unit. The earlier
-                    # lifecycle pass normally removed the duplicate already;
-                    # this covers a legacy pair whose old key was noncanonical.
-                    if lifecycle_id is not None and conn.execute(
-                        "SELECT 1 FROM kg_edge_lifecycle WHERE id=?",
-                        (lifecycle_id,),
-                    ).fetchone() is not None:
+                    if lifecycle_id is not None:
                         conn.execute(
                             "DELETE FROM kg_edge_lifecycle WHERE id=?",
                             (lifecycle_id,),
                         )
                     continue
-                suffix = hashlib.sha256(json.dumps(
-                    [
-                        signal["signal_kind"], signal["signal_key"], *semantic,
-                        incoming_pair,
-                    ],
-                    ensure_ascii=False, separators=(",", ":"),
-                ).encode("utf-8")).hexdigest()
-                signal_key = f"{signal['signal_key']}:merge:{suffix}"
-            else:
-                signal_key = signal["signal_key"]
             conn.execute(
                 "UPDATE kg_evidence_signals SET edge_id = ?, signal_key = ? "
                 "WHERE id = ?",
@@ -2679,8 +2692,8 @@ def move_edge_provenance(
             if signal["signal_kind"] == "manual_retraction":
                 if lifecycle_id is not None:
                     conn.execute(
-                        "UPDATE kg_edge_lifecycle SET event_key=? WHERE id=?",
-                        (manual_retraction_event_key(signal_key), lifecycle_id),
+                        "UPDATE kg_edge_lifecycle SET edge_id=?, event_key=? WHERE id=?",
+                        (survivor_id, manual_retraction_event_key(signal_key), lifecycle_id),
                     )
 
         recanonicalize_lifecycle_keys(conn)

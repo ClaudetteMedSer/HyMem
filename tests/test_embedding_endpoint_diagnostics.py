@@ -10,8 +10,7 @@ import pytest
 from hymem import bootstrap, doctor
 from hymem.bootstrap import EnvConfig, resolve_env
 from hymem.contrib.endpoint_policy import EMBEDDING_INTERNAL_HTTP_ENV
-from hymem.doctor import FAIL, OK, WARN, _check_embedding
-from hymem.extraction.llm import StubLLMClient
+from hymem.doctor import FAIL, OK, _check_embedding
 
 
 @pytest.fixture(autouse=True)
@@ -223,12 +222,14 @@ def test_intentionally_local_backend_remains_ok_and_envconfig_field_is_optional(
     assert EnvConfig(**legacy_fields).embedding_fallback_detail is None
 
 
-def test_custom_https_missing_credentials_keeps_existing_warning(monkeypatch):
+def test_custom_https_missing_credentials_refuses_startup_without_a_local_identity(monkeypatch):
     monkeypatch.setenv("HYMEM_EMBEDDING_BASE_URL", "https://embeddings.example/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "cloud-private-sentinel")
     cfg = resolve_env()
-    result, _, _ = _check_embedding(cfg)
-    assert result.status == WARN
+    result, live_dim, live_model = _check_embedding(cfg)
+    assert result.status == FAIL
+    assert live_dim is live_model is None
+    assert cfg.has_embedding_client is False
     assert cfg.embedding_fallback_reason == "remote_embedding_credentials_missing"
     assert cfg.embedding_fallback_detail is None
     assert "private-sentinel" not in result.detail
@@ -241,7 +242,7 @@ def test_custom_https_missing_credentials_keeps_existing_warning(monkeypatch):
     ("http://embedding-server:8766/token/private-sentinel", None, False),
     ("http://embedding-server:8766", "private-sentinel", False),
 ])
-def test_startup_logs_safe_rejection_without_constructing_remote_embedder(
+def test_startup_raises_safe_rejection_without_constructing_any_transport(
     monkeypatch, caplog, url, flag, expect_hint,
 ):
     import hymem.contrib.openai_client as llm_module
@@ -250,22 +251,19 @@ def test_startup_logs_safe_rejection_without_constructing_remote_embedder(
     _configured_remote(monkeypatch, url)
     if flag is not None:
         monkeypatch.setenv(EMBEDDING_INTERNAL_HTTP_ENV, flag)
-    monkeypatch.setattr(llm_module, "OpenAICompatibleClient", lambda **_: StubLLMClient())
-
     def forbidden_remote(**_):
-        raise AssertionError("rejected endpoint constructed a remote client")
+        raise AssertionError("rejected endpoint constructed a transport")
 
+    monkeypatch.setattr(llm_module, "OpenAICompatibleClient", forbidden_remote)
     monkeypatch.setattr(embedding_module, "OpenAICompatibleEmbeddingClient", forbidden_remote)
     with caplog.at_level("WARNING", logger="hymem.bootstrap"):
-        memory = bootstrap.build_from_env()
-    try:
-        assert memory.embedding_status["backend"] == "local_feature_hash"
-        assert memory.embedding_status["fallback_reason"] == "remote_embedding_endpoint_rejected"
-        assert (f"set {EMBEDDING_INTERNAL_HTTP_ENV}=1" in caplog.text) is expect_hint
-        assert "run hymem-doctor" in caplog.text
-        assert "private-sentinel" not in caplog.text
-    finally:
-        bootstrap.shutdown_instance(memory)
+        with pytest.raises(RuntimeError) as caught:
+            bootstrap.build_from_env()
+    error = str(caught.value)
+    assert (f"set {EMBEDDING_INTERNAL_HTTP_ENV}=1" in error) is expect_hint
+    assert "hymem-doctor" in error
+    assert "No local embedding fallback" in error
+    assert "private-sentinel" not in error + caplog.text
 
 
 def test_doctor_cli_remains_failed_and_renders_actionable_policy(monkeypatch, capsys):

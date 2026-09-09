@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,7 @@ from coref_eval import (  # noqa: E402
     _MIN_RESOLUTION,
     _resolved,
     _run,
+    _seeded_conn,
     _summary,
 )
 
@@ -100,3 +103,114 @@ def test_resolved_requires_both_a_rewrite_and_a_referent() -> None:
     # Referent present but no rewrite fired — the referent was in the query all
     # along, which is exactly the case that must NOT be scored as a success.
     assert not _resolved(QueryRewrite("q about medflow", False, "self_contained"), expect)
+
+
+@pytest.fixture
+def seed_connections(monkeypatch):
+    from hymem.core import db
+
+    connections = []
+    original_connect = db.connect
+
+    def connect(path):
+        conn = original_connect(path)
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(db, "connect", connect)
+    yield connections
+    for conn in connections:
+        conn.close()
+
+
+def test_seeded_conn_normalizes_surface_endpoints_without_dropping_edges(tmp_path: Path) -> None:
+    edges = [
+        ["The Billing Service", "depends_on", "fly.io"],
+        ["MedFlow", "deploys_to", "ＦＬＹ．ＩＯ"],
+        ["Café", "uses", "東京"],
+    ]
+    original = json.loads(json.dumps(edges))
+    conn, close = _seeded_conn(tmp_path, edges)
+    try:
+        rows = conn.execute(
+            "SELECT subject_canonical, predicate, object_canonical "
+            "FROM knowledge_graph ORDER BY id"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("billing_service", "depends_on", "fly_io"),
+            ("med_flow", "deploys_to", "fly_io"),
+            ("cafe", "uses", "東京"),
+        ]
+        assert not conn.in_transaction
+        assert edges == original
+    finally:
+        close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        conn.execute("SELECT 1")
+
+
+@pytest.mark.parametrize(("bad_edge", "error", "message"), [
+    (["MEDFLOW", "deploys_to", "ＦＬＹ．ＩＯ"], sqlite3.IntegrityError, "UNIQUE"),
+    (["!!!", "uses", "redis"], ValueError, "empty canonical endpoint"),
+    (["medflow", "uses", "!!!"], ValueError, "empty canonical endpoint"),
+    (["medflow", "uses", "x" * 513], ValueError, "empty canonical endpoint"),
+    (["medflow", "USES", "redis"], sqlite3.IntegrityError, "CHECK"),
+])
+def test_seeded_conn_failure_rolls_back_and_closes(
+    tmp_path: Path, seed_connections, bad_edge, error, message,
+) -> None:
+    with pytest.raises(error, match=message):
+        _seeded_conn(tmp_path, [["medflow", "deploys_to", "fly.io"], bad_edge])
+    assert len(seed_connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        seed_connections[0].execute("SELECT 1")
+    with closing(sqlite3.connect(HyMemConfig(root=tmp_path).db_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM knowledge_graph").fetchone()[0] == 0
+
+
+def test_seeded_conn_closes_when_initialization_fails(
+    tmp_path: Path, seed_connections, monkeypatch,
+) -> None:
+    from hymem.core import db
+
+    def fail_initialization(conn):
+        raise RuntimeError("injected initialization failure")
+
+    monkeypatch.setattr(db, "initialize", fail_initialization)
+    with pytest.raises(RuntimeError, match="injected initialization failure"):
+        _seeded_conn(tmp_path, [["medflow", "deploys_to", "fly.io"]])
+    assert len(seed_connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        seed_connections[0].execute("SELECT 1")
+
+
+@pytest.mark.parametrize(("expect", "resolves"), [("fly_io", True), ("fly.io", False)])
+def test_surface_seed_uses_graph_without_rewriting_expected_answers(
+    tmp_path: Path, cfg: HyMemConfig, expect: str, resolves: bool,
+) -> None:
+    spec = {
+        "items": [{
+            "id": "surface-followup", "kind": "pronoun",
+            "query": "what about that?",
+            "turns": [["user", "the orchestration infrastructure runs on fly.io"]],
+            "edges": [["Fly.IO", "runs_on", "Linux"]],
+            "expect": [expect],
+        }],
+        "controls": [{
+            "id": "surface-control", "query": "is it faster than fly.io?",
+            "turns": [["user", "we also run redis for the cache"]],
+            "edges": [["Fly.IO", "runs_on", "Linux"]],
+        }],
+    }
+    original = json.loads(json.dumps(spec))
+    result = _run(spec, dataclasses.replace(cfg, coref_enabled=True), tmp_path)
+    item, control = result["items"][0], result["controls"][0]
+    assert item["path"] == "graph"
+    assert item["rewritten"] == "what about that? (context: fly_io)"
+    assert item["resolved"] is resolves
+    assert control["path"] == "graph"
+    assert control["rule"] == "self_contained"
+    assert not control["changed"]
+    assert control["rewritten"] == spec["controls"][0]["query"]
+    assert _summary(result)["pass"] is resolves
+    assert spec == original

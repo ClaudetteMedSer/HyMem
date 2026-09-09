@@ -644,9 +644,10 @@ def test_custom_embedding_endpoint_never_inherits_openai_key(monkeypatch, cfg):
     assert resolved.embedding_backend == "local_feature_hash"
     assert resolved.embedding_fallback_reason == "remote_embedding_credentials_missing"
     doctor_result, live_dim, _model_key = _check_embedding(resolved)
-    assert doctor_result.status == WARN
+    assert doctor_result.status == FAIL
     assert "remote_embedding_credentials_missing" in doctor_result.detail
-    assert live_dim == resolved.embedding_dim
+    assert live_dim is None
+    assert _model_key is None
     with pytest.raises(EnvironmentError, match="HYMEM_EMBEDDING_API_KEY"):
         OpenAICompatibleEmbeddingClient()
     assert constructed == []
@@ -686,7 +687,7 @@ def test_embedding_transport_requires_https_except_loopback(monkeypatch):
     doctor_result, live_dim, _model_key = _check_embedding(rejected)
     assert doctor_result.status == FAIL
     assert "remote_embedding_endpoint_rejected" in doctor_result.detail
-    assert live_dim == rejected.embedding_dim
+    assert live_dim is _model_key is None
     with pytest.raises(ValueError, match="only on loopback"):
         OpenAICompatibleEmbeddingClient()
     assert constructed == []
@@ -760,7 +761,8 @@ def test_embedding_diagnostics_redact_url_credentials_and_provider_errors(
 
     cfg = resolve_env()
     result, live_dim, _model_key = _check_embedding(cfg)
-    assert live_dim == cfg.embedding_dim and result.status == FAIL
+    assert live_dim is _model_key is None
+    assert result.status == FAIL
     assert cfg.embedding_fallback_reason == "remote_embedding_endpoint_rejected"
     assert secret not in result.detail and "password" not in result.detail
 

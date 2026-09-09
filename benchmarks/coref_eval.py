@@ -66,15 +66,29 @@ def _turns(pairs: list[list[str]]) -> list[Message]:
 
 
 def _seeded_conn(root: Path, edges: list[list[str]]):
-    """A throwaway HyMem store with `edges` seeded — returns (conn, closer)."""
+    """Seed surface-form edges into canonical columns; return (conn, closer).
+
+    Invalid endpoints and duplicate canonical triples fail the eval instead of
+    silently dropping fixtures. A failed batch leaves no partial graph behind.
+    """
     from hymem import HyMem, HyMemConfig
+    from hymem.core.db import transaction
+    from hymem.dreaming.canonicalize import normalize
     from hymem.extraction.llm import StubLLMClient
 
     hy = HyMem(HyMemConfig(root=root), llm=StubLLMClient(default="[]"))
-    for subj, pred, obj in edges:
-        hy.conn.execute(_INSERT_EDGE, (subj, pred, obj))
-    hy.conn.commit()
-    return hy.conn, hy.close
+    try:
+        conn = hy.conn
+        with transaction(conn):
+            for index, (subj, pred, obj) in enumerate(edges, 1):
+                subj, obj = normalize(subj), normalize(obj)
+                if not subj or not obj:
+                    raise ValueError(f"eval edge {index} has an empty canonical endpoint")
+                conn.execute(_INSERT_EDGE, (subj, pred, obj))
+    except BaseException:
+        hy.close()
+        raise
+    return conn, hy.close
 
 
 def _run_item(item: dict, cfg, tmp: Path, llm=None) -> tuple[QueryRewrite, str]:

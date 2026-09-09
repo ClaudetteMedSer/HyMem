@@ -74,6 +74,7 @@ _EXPECTED = {
     "rule_marker_decision": 0,
     "claim_extraction_outcome": 0,
     "edge_evidence": 0, "edge_evidence_signal": 1,
+    "edge_evidence_extraction_audit": 0,
     "claim_observation": 0, "edge_lifecycle": 1,
     "lifecycle_dependency": 0,
     "fact_extraction_outcome": 0,
