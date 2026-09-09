@@ -261,3 +261,26 @@ The private audit snapshot is retained for follow-up, not a deployed migration.
   verified existing producer settings, and run bounded embedding recovery.
   No production re-embedding/provider requests were performed here. Aggregation
   publication rebuilds and unproven legacy rows retain the documented limits.
+
+Follow-up: the requested backup search is complete. No authoritative parent or
+source was found in the located HyMem and original Hermes backups. See
+[the backup-selection audit](2026-09-08-orphan-backup-audit.md) for comparisons,
+scope, preserved originals and the remaining data-disposition decision. No
+production restoration or quarantine was performed.
+
+The user's subsequent approval covered a **clone-only quarantine rehearsal**,
+which is now independently verified. The expanded dependency audit found four
+entity links in addition to the orphan/vector; these were archived too. The
+repaired clone has zero FK faults, exact expected logical/index changes and a
+verified full-baseline recovery copy. Root's vector-enabled local gate passed
+99 tests. See [the rehearsal report](2026-09-08-orphan-quarantine-rehearsal.md)
+for evidence, limitations and retained private artifacts. Production application
+still requires a separate decision and was not performed.
+
+Subsequent explicit approval covered production application and sequential
+updates. Those are now performed: the exact orphan was recoverably quarantined,
+all three instances updated, and eligible vectors re-embedded under their actual
+service runtime. See [the production rollout report](2026-09-08-production-repair-rollout.md)
+for the final checks, two additional accepted performance fixes and remaining
+historical-data limitations. Earlier no-production statements above describe
+their earlier phases, not the current deployment state.

@@ -5057,26 +5057,31 @@ def build_token_overlap_index(
     it. Caller-cacheable; rebuild after a dream cycle that may have added,
     retracted, or merged edges.
 
-    On a warm database the persistent ``token_overlap_index`` table is read
-    directly (O(index rows) instead of O(active edges)). When the table is
-    empty — cold start, post-migration, or after runner invalidated it —
-    the function falls back to the full canonical scan and, if *write_conn* is
-    provided, persists the result so the next cold start is fast.
+    On a warm database the persistent ``token_overlap_index`` table supplies
+    token pairs, but its canonicals still require live graph authority. Build
+    that authority set once per statement, not once per cached token. When no
+    cached pair remains live — cold start, post-migration, or invalidation —
+    fall back to the full canonical scan and optionally persist the result.
 
     Public (no leading underscore) so callers — HyMem instances, background
     workers — can build, stash, and pass it back through `augment()` to avoid
-    re-scanning the canonical set on every query. At a few hundred canonicals
-    the scan is sub-millisecond; at tens of thousands it begins to matter.
+    re-scanning the canonical set on every query.
     """
     persisted = conn.execute(
         f"""
+        WITH live_edges AS MATERIALIZED (
+            SELECT subject_canonical, object_canonical
+            FROM knowledge_graph
+            WHERE {live_edge_predicate()}
+        ), live_canonicals AS (
+            SELECT subject_canonical AS canonical FROM live_edges
+            UNION
+            SELECT object_canonical FROM live_edges
+        )
         SELECT token_index.token, token_index.canonical
         FROM token_overlap_index token_index
-        WHERE EXISTS (
-            SELECT 1 FROM knowledge_graph kg
-            WHERE {live_edge_predicate('kg')}
-              AND (kg.subject_canonical = token_index.canonical
-                   OR kg.object_canonical = token_index.canonical)
+        WHERE token_index.canonical IN (
+            SELECT canonical FROM live_canonicals
         )
         """
     ).fetchall()

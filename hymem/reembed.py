@@ -107,9 +107,14 @@ def _source(conn, index, row):
             return None
         return proof.content, proof, (key,)
     if index == 2:
+        # Fence cheap exact-text selection before the correlated live proof.
+        # Do not cap candidates here: earlier same-text historical owners must
+        # not crowd out a later live owner or hide the >64-live-owner guard.
         sources = conn.execute(
-            f"SELECT * FROM knowledge_graph WHERE {live_edge_predicate()} "
-            "AND subject_canonical || ' ' || predicate || ' ' || object_canonical = ? ORDER BY id LIMIT 65", (key,),
+            "WITH candidates AS MATERIALIZED (SELECT * FROM knowledge_graph "
+            "WHERE subject_canonical || ' ' || predicate || ' ' || object_canonical = ?) "
+            f"SELECT * FROM candidates WHERE {live_edge_predicate('candidates')} "
+            "ORDER BY id LIMIT 65", (key,),
         ).fetchall()
         if not sources or len(sources) > 64:
             return None
