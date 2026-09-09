@@ -56,10 +56,15 @@ startup before opening the store; it never activates a local fallback producer.
 """
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import copy_context
+from functools import wraps
 import json
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass
 
 # Startup, env-var resolution, and the shared singleton live in hymem.bootstrap.
@@ -104,6 +109,72 @@ def _get_mcp():
 
 
 mcp = None
+
+
+class _MCPToolWorker:
+    """One store-owning thread, leaving MCP's protocol loop free for pings.
+
+    FastMCP executes synchronous tool functions directly on its event loop.
+    Offloading each call to a general thread pool would fix liveness but allow
+    concurrent transactions on the shared SQLite connection. This dedicated
+    worker instead serializes bootstrap, every tool, and final teardown.
+
+    Cancellation may discard a queued call; it cannot interrupt synchronous
+    work already running. Such work retains sole ownership until it returns.
+    Shutdown cancels queued calls and joins running work before closing either
+    the store or its provider clients. External process termination remains
+    subject to the dream runner's existing lease/crash-recovery protocol.
+    """
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hymem-mcp"
+        )
+        self._lock = threading.RLock()
+        self._pending: set[Future] = set()
+        self._closing = False
+        self._cleanup: Future | None = None
+
+    def _forget(self, future: Future) -> None:
+        with self._lock:
+            self._pending.discard(future)
+
+    def submit(self, function, /, *args, **kwargs) -> Future:
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("HyMem MCP worker is shutting down")
+            # Preserve per-request context without retaining it between calls.
+            future = self._executor.submit(
+                copy_context().run, function, *args, **kwargs
+            )
+            self._pending.add(future)
+            future.add_done_callback(self._forget)
+            return future
+
+    def tool(self, function):
+        @wraps(function)
+        async def invoke(*args, **kwargs):
+            # wrap_future propagates cancellation to work not yet started.
+            # Running calls remain in the single-owner queue through teardown.
+            return await asyncio.wrap_future(self.submit(function, *args, **kwargs))
+
+        return invoke
+
+    def close(self) -> None:
+        with self._lock:
+            if self._cleanup is None:
+                self._closing = True
+                for future in tuple(self._pending):
+                    future.cancel()
+                self._cleanup = self._executor.submit(_shutdown_hy)
+            cleanup = self._cleanup
+        try:
+            cleanup.result()
+        finally:
+            # Cleanup itself may still be queued if the waiting main thread
+            # receives KeyboardInterrupt. Never cancel that final owner task.
+            self._executor.shutdown(wait=True)
+
 
 _MAX_REPORTED_COUNT = (1 << 63) - 1
 _AGGREGATION_CONFIG_VERSION_PREFIX = "aggregation-build-config-v1:"
@@ -1003,30 +1074,34 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     primary: BaseException | None = None
+    worker = _MCPToolWorker()
     try:
         mcp_instance = _get_mcp()
         # Fail during process startup (with bootstrap rollback) instead of on
         # the first tool call after the MCP transport has advertised itself.
-        _get_hy()
-        mcp_instance.tool()(hymem_capture)
-        mcp_instance.tool()(hymem_log)
-        mcp_instance.tool()(hymem_dream)
-        mcp_instance.tool()(hymem_augment)
-        mcp_instance.tool()(hymem_ask)
-        mcp_instance.tool()(hymem_profile)
-        mcp_instance.tool()(hymem_digest)
-        mcp_instance.tool()(hymem_alias)
-        mcp_instance.tool()(hymem_retract)
-        mcp_instance.tool()(hymem_add_rule)
-        mcp_instance.tool()(hymem_list_rules)
-        mcp_instance.tool()(hymem_suggest_rules)
+        worker.submit(_get_hy).result()
+        for function in (
+            hymem_capture,
+            hymem_log,
+            hymem_dream,
+            hymem_augment,
+            hymem_ask,
+            hymem_profile,
+            hymem_digest,
+            hymem_alias,
+            hymem_retract,
+            hymem_add_rule,
+            hymem_list_rules,
+            hymem_suggest_rules,
+        ):
+            mcp_instance.tool()(worker.tool(function))
         mcp_instance.run()
     except BaseException as exc:
         primary = exc
         raise
     finally:
         try:
-            _shutdown_hy()
+            worker.close()
         except BaseException as cleanup:
             if primary is None:
                 raise

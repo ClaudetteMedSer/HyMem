@@ -2861,6 +2861,10 @@ def _load_vec_extension(conn: sqlite3.Connection) -> bool:
 
 
 def initialize(conn: sqlite3.Connection) -> None:
+    # Bootstrap uses executescript() and migrations own their transactions.
+    # Reject an incompatible caller transaction before either can commit it.
+    if conn.in_transaction:
+        raise RuntimeError("database initialization requires no active transaction")
     if _table_exists(conn, "schema_meta") and schema_version(conn) >= 61:
         with transaction(conn):
             _validate_extraction_audit_storage(conn)
@@ -2949,7 +2953,7 @@ def _install_evidence_revision_guards(conn: sqlite3.Connection) -> None:
         start = script.index(marker)
         end = script.index("\nEND;", start) + len("\nEND;")
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        conn.executescript(script[start:end])
+        conn.execute(script[start:end])
 
 
 def _install_evidence_publication_guards(conn: sqlite3.Connection) -> None:
@@ -2970,7 +2974,7 @@ def _install_evidence_publication_guards(conn: sqlite3.Connection) -> None:
         start = script.index(marker)
         end = script.index("\nEND;", start) + len("\nEND;")
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        conn.executescript(script[start:end])
+        conn.execute(script[start:end])
 
 
 def _install_aggregation_source_guards(conn: sqlite3.Connection) -> None:
@@ -3045,7 +3049,7 @@ def _install_aggregation_generation_guards(conn: sqlite3.Connection) -> None:
         start = script.index(marker)
         end = script.index("\nEND;", start) + len("\nEND;")
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        conn.executescript(script[start:end])
+        conn.execute(script[start:end])
 
 
 def _install_aggregation_material_support_objects(
@@ -3203,7 +3207,7 @@ def _install_external_peer_guards(conn: sqlite3.Connection) -> None:
         start = script.index(marker)
         end = script.index("\nEND;", start) + len("\nEND;")
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        conn.executescript(script[start:end])
+        conn.execute(script[start:end])
 
 
 def _ensure_message_coverage_fts(conn: sqlite3.Connection) -> None:
@@ -3235,7 +3239,8 @@ def _ensure_message_coverage_fts(conn: sqlite3.Connection) -> None:
         ):
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
         conn.execute("DROP TABLE message_coverage_fts")
-    conn.executescript(
+    _execute_startup_sql(
+        conn,
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS message_coverage_fts USING fts5(
             content,
@@ -3479,13 +3484,17 @@ def _install_extraction_audit_guards(conn: sqlite3.Connection) -> None:
 
 def _ensure_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
     """Heal latest triggers only after their owning columns/tables exist."""
+    with _startup_schema_repair(conn):
+        _install_post_migration_runtime_guards(conn)
+
+
+def _install_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
+    """Install the complete guard boundary inside the caller's repair unit."""
     if schema_version(conn) >= 61:
-        with transaction(conn):
-            _validate_extraction_audit_storage(conn)
-            _install_extraction_audit_guards(conn)
+        _validate_extraction_audit_storage(conn)
+        _install_extraction_audit_guards(conn)
     if schema_version(conn) >= 60:
-        with transaction(conn):
-            _install_canonical_write_guards(conn)
+        _install_canonical_write_guards(conn)
     tables = {
         str(row["name"])
         for row in conn.execute(
@@ -3501,7 +3510,8 @@ def _ensure_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
         and {"chunks", "chunks_fts"}.issubset(tables)
         and {"chunk_kind", "text"}.issubset(chunk_columns)
     ):
-        conn.executescript(
+        _execute_startup_sql(
+            conn,
             """
             CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunks
             WHEN new.chunk_kind = 'extraction' BEGIN
@@ -3546,7 +3556,8 @@ def _ensure_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
             if "phase1_generation_key" in observation_columns
             else ""
         )
-        conn.executescript(
+        _execute_startup_sql(
+            conn,
             f"""
             DROP TRIGGER IF EXISTS kg_evidence_signals_v40_insert_guard;
             DROP TRIGGER IF EXISTS kg_evidence_signals_v40_update_guard;
@@ -3712,7 +3723,8 @@ def _ensure_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
         # replace the durable publication guards unconditionally: this heals a
         # process that created an earlier same-named trigger definition before
         # the final migration contract was installed.
-        conn.executescript(
+        _execute_startup_sql(
+            conn,
             """
             DROP TRIGGER IF EXISTS kg_claim_extraction_outcomes_insert_guard;
             DROP TRIGGER IF EXISTS kg_claim_extraction_outcomes_update_guard;
@@ -3879,7 +3891,8 @@ def _ensure_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
 def _install_phase1_generation_guards(conn: sqlite3.Connection) -> None:
     """Heal canonical/immutable producer registry guards on every startup."""
 
-    conn.executescript(
+    _execute_startup_sql(
+        conn,
         """
         DROP TRIGGER IF EXISTS phase1_generations_insert_guard;
         DROP TRIGGER IF EXISTS phase1_generations_update_guard;
@@ -3912,6 +3925,12 @@ def _install_phase1_generation_guards(conn: sqlite3.Connection) -> None:
 
 def _install_phase1_auxiliary_guards(conn: sqlite3.Connection) -> None:
     """Heal v54's authority views, indexes, and mutation guards."""
+    with _startup_schema_repair(conn):
+        _replace_phase1_auxiliary_guards(conn)
+
+
+def _replace_phase1_auxiliary_guards(conn: sqlite3.Connection) -> None:
+    """Replace the interdependent objects without publishing an empty gap."""
 
     script = files("hymem.core.migrations").joinpath(
         "054_phase1_auxiliary_provenance.sql"
@@ -3925,7 +3944,7 @@ def _install_phase1_auxiliary_guards(conn: sqlite3.Connection) -> None:
     trigger_start = script.index(
         "CREATE TRIGGER IF NOT EXISTS profile_marker_evidence_lineage_guard"
     )
-    conn.executescript(script[view_start:trigger_start])
+    _execute_startup_sql(conn, script[view_start:trigger_start])
     trigger_names = (
         "profile_marker_evidence_lineage_guard",
         "profile_marker_decision_insert_guard",
@@ -3972,7 +3991,7 @@ def _install_phase1_auxiliary_guards(conn: sqlite3.Connection) -> None:
         start = script.index(marker)
         end = script.index("END;", start) + len("END;")
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        conn.executescript(script[start:end])
+        conn.execute(script[start:end])
 
 
 def _validate_phase1_generation_registry(conn: sqlite3.Connection) -> None:
@@ -4000,7 +4019,8 @@ def _install_source_materialization_guards(conn: sqlite3.Connection) -> None:
         "source_materialization_config_version",
     }.issubset(session_columns):
         return
-    conn.executescript(
+    _execute_startup_sql(
+        conn,
         """
         DROP TRIGGER IF EXISTS extraction_chunk_delete_invalidates_source_materialization;
         CREATE TRIGGER extraction_chunk_delete_invalidates_source_materialization
@@ -4018,7 +4038,8 @@ def _install_source_materialization_guards(conn: sqlite3.Connection) -> None:
 
 def _install_terminal_chunk_loss_guards(conn: sqlite3.Connection) -> None:
     """Heal v47's fail-closed scheduling guards on every startup."""
-    conn.executescript(
+    _execute_startup_sql(
+        conn,
         """
         DROP TRIGGER IF EXISTS processed_chunks_terminal_loss_insert_guard;
         CREATE TRIGGER processed_chunks_terminal_loss_insert_guard
@@ -4138,6 +4159,56 @@ def _split_sql_statements(script: str) -> list[str]:
     if tail:
         statements.append(tail)
     return statements
+
+
+def _execute_startup_sql(conn: sqlite3.Connection, script: str) -> None:
+    """Execute owned startup SQL strictly, without executescript's COMMIT.
+
+    Let SQLite recognize statement boundaries, including trigger bodies,
+    CASE expressions, quoted semicolons, and comments. Unlike migration
+    replay, support-object repair must not suppress SQL errors.
+    """
+    start = 0
+    for separator in re.finditer(";", script):
+        statement = script[start:separator.end()]
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            start = separator.end()
+    tail = script[start:]
+    if tail.strip():
+        conn.execute(tail)
+
+
+@contextlib.contextmanager
+def _startup_schema_repair(conn: sqlite3.Connection) -> Iterator[None]:
+    """Publish a complete repaired boundary, or roll back only our work.
+
+    Normal startup owns a writer transaction so concurrent connections see
+    the previous complete schema until COMMIT. Direct helper callers may own
+    a transaction already; a savepoint preserves their work and ownership.
+    """
+    if not conn.in_transaction:
+        with transaction(conn):
+            yield
+        return
+    name = "hymem_startup_schema_repair"
+    conn.execute(f"SAVEPOINT {name}")
+    try:
+        check_current_deadline()
+        yield
+        check_current_deadline()
+        conn.execute(f"RELEASE {name}")
+    except BaseException as primary:
+        for statement in (f"ROLLBACK TO {name}", f"RELEASE {name}"):
+            try:
+                conn.execute(statement)
+            except BaseException as cleanup_error:
+                with contextlib.suppress(AttributeError, TypeError):
+                    primary.add_note(
+                        "startup schema repair cleanup failed: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+        raise
 
 
 def _apply_migration_sql(conn: sqlite3.Connection, script: str) -> None:
@@ -4967,6 +5038,16 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             (str(version),),
         )
         log.info("migrated schema to v%d (%s)", version, entry.name)
+    # Views must be absent while an old dependent table is rebuilt, but that
+    # absence must never escape onto another live connection. Include all
+    # normalization and guard replacement in the same atomic repair unit.
+    with _startup_schema_repair(conn):
+        _repair_post_migration_schema(conn)
+    _complete_v57_embedding_route_scrub(conn)
+
+
+def _repair_post_migration_schema(conn: sqlite3.Connection) -> None:
+    """Repair support objects and legacy shapes in a caller-owned unit."""
     if schema_version(conn) >= 40 and _v40_domain_present(conn):
         _normalize_v40_portable_keys(conn)
     if schema_version(conn) >= 54:
@@ -4994,7 +5075,6 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     if schema_version(conn) >= 39 and _table_exists(conn, "user_profile"):
         _ensure_profile_active_invariants(conn)
     _ensure_post_migration_runtime_guards(conn)
-    _complete_v57_embedding_route_scrub(conn)
 
 
 def _drop_phase1_auxiliary_views(conn: sqlite3.Connection) -> None:
