@@ -122,7 +122,13 @@ class _ProducerDeclarationCarrier:
         return self.declaration
 
 
-_unknown_lock = threading.Lock()
+# Guard inspection/registry allocation can synchronously collect a different
+# client or proxy. Its weakref cleanup re-enters this same registry lock on the
+# collecting thread; a plain Lock would deadlock real provider dispatch. Keep
+# cross-thread exclusion, but permit that same-thread cleanup. Registry reads
+# retain their entry locally and cleanup checks the exact weakref before
+# deletion; no operation iterates a live registry while callbacks can mutate it.
+_unknown_lock = threading.RLock()
 # Weak-referenceable clients do not stay alive merely because identity was
 # requested.  A bounded strong fallback is unavoidable for classes that opt
 # out of weak references; eviction only makes their old cache fail closed.

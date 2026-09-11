@@ -5,6 +5,7 @@ import os
 import shlex
 import subprocess
 import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -187,6 +188,21 @@ def _embedding_health_ok(health_url: str, timeout: float = 2.0) -> bool:
         return False
 
 
+def _close_failed_connection(
+    conn: sqlite3.Connection, primary: BaseException,
+) -> None:
+    """Keep a setup fault authoritative even if best-effort cleanup fails."""
+    try:
+        conn.close()
+    except BaseException as cleanup:
+        try:
+            primary.add_note(
+                f"SQLite connection cleanup failed: {type(cleanup).__name__}"
+            )
+        except (AttributeError, TypeError):  # pragma: no cover - custom exception
+            pass
+
+
 class HyMem:
     """Public API for the Hermes host.
 
@@ -229,6 +245,11 @@ class HyMem:
         self._conn: sqlite3.Connection | None = None
         self._read_conn: sqlite3.Connection | None = None
         self._initialized = False
+        # Honcho's sync endpoints share this instance across worker threads.
+        # Keep connection construction, publication, and lifecycle changes
+        # atomic. This is not a lock around callers' SQL transactions: workers
+        # doing independent writes (for example dreaming) must still fork().
+        self._connection_lock = threading.RLock()
         # Token-overlap index for entity expansion in augment(). Built lazily
         # on first augment, invalidated after dreaming since dreaming is the
         # only thing that mutates the canonical set.
@@ -238,39 +259,61 @@ class HyMem:
 
     @property
     def conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = core_db.connect(self.config.db_path)
-        if not self._initialized:
-            core_db.initialize(self._conn)
-            if self.config.redact_secrets:
-                with core_db.transaction(self._conn):
-                    enforce_profile_redaction_policy(self._conn)
+        with self._connection_lock:
+            if self._conn is not None:
+                return self._conn
+            conn = core_db.connect(self.config.db_path)
+            try:
+                core_db.initialize(conn)
+                if self.config.redact_secrets:
+                    with core_db.transaction(conn):
+                        enforce_profile_redaction_policy(conn)
+                self._scope_phase1_reads(conn)
+            except BaseException as exc:
+                _close_failed_connection(conn, exc)
+                raise
+            # Never expose an uninitialized or unscoped connection, even when
+            # initialization fails and a later caller retries.
+            self._conn = conn
             self._initialized = True
-            self._scope_phase1_reads(self._conn)
-        return self._conn
+            return conn
 
     @property
     def read_conn(self) -> sqlite3.Connection:
-        if self._read_conn is None:
+        with self._connection_lock:
+            if self._read_conn is not None:
+                return self._read_conn
             self.conn  # ensure the write connection is initialized first
-            self._read_conn = core_db.connect(self.config.db_path)
-            self._scope_phase1_reads(self._read_conn)
-            # Load optional vec0 acceleration shadows before query_only. Durable
-            # identity/content-validated vectors remain retrieval authority.
-            core_db._load_vec_extension(self._read_conn)
-            self._read_conn.execute("PRAGMA query_only = ON")
-        return self._read_conn
+            conn = core_db.connect(self.config.db_path)
+            try:
+                self._scope_phase1_reads(conn)
+                # Load optional vec0 acceleration shadows before query_only.
+                # Durable identity/content-validated vectors remain authority.
+                core_db._load_vec_extension(conn)
+                conn.execute("PRAGMA query_only = ON")
+            except BaseException as exc:
+                _close_failed_connection(conn, exc)
+                raise
+            self._read_conn = conn
+            return conn
 
     def close(self) -> None:
-        if self._read_conn is not None:
-            self._read_conn.close()
-            self._read_conn = None
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        # Hosts must quiesce active operations before close(): the lifecycle
+        # lock protects initialization, not SQL using an already-returned handle.
+        with self._connection_lock:
+            if self._read_conn is not None:
+                self._read_conn.close()
+                self._read_conn = None
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
             self._initialized = False
+            self._token_overlap_index = None
 
     def set_llm(self, llm: LLMClient) -> None:
+        # Like close(), changing an existing connection's SQLite functions
+        # requires the host to quiesce SQL using already-returned handles. The
+        # lifecycle lock only prevents a switch halfway through connection setup.
         generation = phase1_generation_binding(self.config.prompt_version, llm)
         aggregation_generation = (
             aggregation_generation_binding_for_contract(
@@ -278,13 +321,14 @@ class HyMem:
             )
             if self._aggregation_contract is not None else None
         )
-        self._phase1_generation = generation
-        self._aggregation_generation = aggregation_generation
-        self._llm = llm
-        if self._conn is not None:
-            self._scope_phase1_reads(self._conn)
-        if self._read_conn is not None:
-            self._scope_phase1_reads(self._read_conn)
+        with self._connection_lock:
+            self._phase1_generation = generation
+            self._aggregation_generation = aggregation_generation
+            self._llm = llm
+            if self._conn is not None:
+                self._scope_phase1_reads(self._conn)
+            if self._read_conn is not None:
+                self._scope_phase1_reads(self._read_conn)
 
     def _scope_phase1_reads(self, conn: sqlite3.Connection) -> None:
         generation_key = (
@@ -313,7 +357,8 @@ class HyMem:
         return str(current["generation_key"])
 
     def set_embedding_client(self, embedding_client: EmbeddingClient) -> None:
-        self._embed = embedding_client
+        with self._connection_lock:
+            self._embed = embedding_client
 
     @property
     def embedding_status(self) -> dict[str, object]:
@@ -416,7 +461,8 @@ class HyMem:
         Used to run background dreaming on a separate connection so it does
         not collide with live ingestion on the primary connection.
         """
-        return HyMem(self.config, llm=self._llm, embedding_client=self._embed)
+        with self._connection_lock:
+            return HyMem(self.config, llm=self._llm, embedding_client=self._embed)
 
     # ---- session log -------------------------------------------------
 

@@ -105,7 +105,7 @@ from msc_adapter import (
     MSCAdapter,
     _indexing_limits,
     _lex_match,
-    model_identity_fields,
+    model_identity_fields as _msc_model_identity_fields,
     parse_extra_body_arg,
     prepare_indexing,
     run_or_record_indexing_failure,
@@ -687,6 +687,39 @@ def _effective_pipeline_body(args) -> dict[str, Any]:
     return {"thinking": {"type": "disabled"}} if send else {}
 
 
+def _judge_base_url(args, judge_llm=None) -> str:
+    """Resolve legacy callers and actual clients to one validated endpoint.
+
+    Older direct callers do not have the optional CLI field. A real supplied
+    client's endpoint takes precedence over that historical default, but must
+    agree with an explicitly configured endpoint so receipts cannot name a
+    different provider. Rejudging validates this before making any calls.
+    """
+    configured = getattr(args, "judge_base_url", None)
+    actual = getattr(judge_llm, "base_url", None)
+    configured_url = (
+        validate_http_endpoint(configured, label="judge").url
+        if configured is not None else None
+    )
+    actual_url = (
+        validate_http_endpoint(actual, label="judge").url
+        if actual is not None else None
+    )
+    if configured_url and actual_url and configured_url != actual_url:
+        raise BenchmarkIntegrityError("configured judge endpoint differs from client")
+    return actual_url or configured_url or _DEEPSEEK_BASE_URL
+
+
+def model_identity_fields(args, answer_llm, judge_llm, pipeline_llm) -> dict:
+    """Preserve MSC's shared fields while binding LoCoMo's optional judge URL."""
+    identity = _msc_model_identity_fields(
+        args, answer_llm, judge_llm, pipeline_llm
+    )
+    if not getattr(args, "sim", False):
+        identity["judge_base_url"] = _judge_base_url(args, judge_llm)
+    return identity
+
+
 def _effective_hymem_config(args):
     """Return the adapter's exact config object and public serialized identity."""
     from hymem import HyMemConfig
@@ -762,6 +795,7 @@ def _strict_identity(args) -> tuple[dict[str, Any], dict[str, Any]]:
             "embedding": embedding,
         }
     else:
+        judge_base_url = _judge_base_url(args)
         models = {
             "reader": {
                 "client_class": "longmemeval_adapter.LLMClient",
@@ -774,9 +808,9 @@ def _strict_identity(args) -> tuple[dict[str, Any], dict[str, Any]]:
             },
             "judge": {
                 "client_class": "longmemeval_adapter.LLMClient",
-                "provider": _provider_for_url(_DEEPSEEK_BASE_URL),
+                "provider": _provider_for_url(judge_base_url),
                 "model": args.judge_model,
-                "base_url": _DEEPSEEK_BASE_URL,
+                "base_url": judge_base_url,
                 "temperature": 0.0,
                 "max_tokens": 10,
                 "extra_body": copy.deepcopy(args.judge_extra_body_obj),
@@ -1561,6 +1595,7 @@ def _rejudge_file(
     """Re-judge a stored `--out` file, writing a flip-compatible copy."""
     from longmemeval_adapter import is_llm_error, judge_scored
 
+    effective_judge_url = _judge_base_url(args, judge_llm)
     rows = json.loads(Path(args.rejudge).read_text(encoding="utf-8"))
     if not isinstance(rows, list) or not rows:
         sys.exit(f"{args.rejudge}: expected a non-empty list of per-question results")
@@ -1595,7 +1630,7 @@ def _rejudge_file(
                 "judge_raw": judge_raw,
                 "judge_error": bool(judge_raw) and is_llm_error(judge_raw),
                 "judge_model": args.judge_model,
-                "judge_base_url": _DEEPSEEK_BASE_URL,
+                "judge_base_url": effective_judge_url,
                 "judge_extra_body": copy.deepcopy(effective_judge_body),
                 "_rejudged": judged}
 
@@ -1703,6 +1738,10 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
                          "requests disable thinking automatically")
     ap.add_argument("--judge-model", default=_JUDGE_MODEL)
     ap.add_argument(
+        "--judge-base-url", default=_DEEPSEEK_BASE_URL,
+        help="judge endpoint (also used by --rejudge; default: DeepSeek)",
+    )
+    ap.add_argument(
         "--judge-api-key", default=None,
         help="judge-specific API key (never inherited from --answer-api-key)",
     )
@@ -1800,6 +1839,9 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
         args.answer_base_url = validate_http_endpoint(
             args.answer_base_url, label="reader"
         ).url
+        args.judge_base_url = validate_http_endpoint(
+            args.judge_base_url, label="judge"
+        ).url
         args.hymem_base_url = validate_http_endpoint(
             args.hymem_base_url, label="memory pipeline"
         ).url
@@ -1850,7 +1892,7 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
             args.answer_model, args.answer_base_url, parsed_answer_body
         )
         args.judge_extra_body_obj, _ = resolve_model_extra_body(
-            args.judge_model, _DEEPSEEK_BASE_URL, parsed_judge_body
+            args.judge_model, args.judge_base_url, parsed_judge_body
         )
     except (BenchmarkIntegrityError, ValueError) as exc:
         ap.error(str(exc))
@@ -1884,7 +1926,7 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
             sys.exit("--rejudge needs a real judge; drop --sim.")
         judge_llm = owned_clients.own(
             _build_llm(
-                args.judge_model, _DEEPSEEK_BASE_URL,
+                args.judge_model, args.judge_base_url,
                 args.judge_api_key, args.judge_extra_body_obj,
             ),
             label="rejudge client",
@@ -2462,7 +2504,7 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
                 )
                 judge_llm = owned_clients.own(
                     _build_llm(
-                        args.judge_model, _DEEPSEEK_BASE_URL,
+                        args.judge_model, args.judge_base_url,
                         args.judge_api_key, args.judge_extra_body_obj,
                     ),
                     label="judge client",

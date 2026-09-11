@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -57,6 +58,71 @@ def provenance_client(hy):
     hsrv.set_scheduler(_NoopScheduler())
     with TestClient(hsrv.app) as client:
         yield client
+
+
+class _GraphReadClock:
+    """Control only SQLite's read-side 'now'; retain its real date parser."""
+
+    def __init__(self, builtin: sqlite3.Connection):
+        self.builtin = builtin
+        self.julian_day = float(builtin.execute(
+            "SELECT julianday('2025-02-01T00:00:00Z')"
+        ).fetchone()[0])
+        self.now_reads = 0
+
+    def julianday(self, *arguments):
+        if not arguments or arguments[0] == "now":
+            self.now_reads += 1
+            arguments = (self.julian_day, *arguments[1:])
+        placeholders = ",".join("?" for _ in arguments)
+        return self.builtin.execute(
+            f"SELECT julianday({placeholders})", arguments
+        ).fetchone()[0]
+
+
+@pytest.fixture
+def graph_read_clock(hy):
+    # The writer, publication clocks, and evidence validators stay real. Only
+    # the query connection's notion of 'now' is controlled: a slow host must
+    # not turn legitimate recency decay into apparent foreign-peer leakage.
+    builtin = sqlite3.connect(":memory:")
+    clock = _GraphReadClock(builtin)
+    hy.read_conn.create_function("julianday", -1, clock.julianday)
+    try:
+        yield clock
+    finally:
+        # Closing the reader discards its overridden function; do not leave a
+        # callback pointing at a closed delegate, or mask SQLite's builtin
+        # with create_function(..., None). HyMem.close() is idempotent.
+        hy.close()
+        builtin.close()
+
+
+def test_graph_read_clock_preserves_real_sqlite_date_parsing(hy, graph_read_clock):
+    for arguments in (
+        ("2025-01-01T00:00:00Z",),
+        ("2025-01-03T02:00:00+02:00",),
+        ("2025-01-01", "+1 day"),
+        (2460676.5,),
+        ("not-a-time",),
+        (None,),
+    ):
+        placeholders = ",".join("?" for _ in arguments)
+        query = f"SELECT julianday({placeholders})"
+        assert hy.read_conn.execute(query, arguments).fetchone()[0] == (
+            hy.conn.execute(query, arguments).fetchone()[0]
+        )
+    assert hy.read_conn.execute(
+        "SELECT julianday('now', '+1 day')"
+    ).fetchone()[0] == graph_read_clock.julian_day + 1
+    graph_read_clock.julian_day += 30
+    assert hy.read_conn.execute("SELECT julianday('now')").fetchone()[0] == (
+        graph_read_clock.julian_day
+    )
+    assert hy.conn.execute(
+        "SELECT count(*) FROM pragma_function_list "
+        "WHERE name='julianday' AND builtin=0"
+    ).fetchone()[0] == 0
 
 
 def _publish_claim(
@@ -1211,28 +1277,46 @@ def test_coverage_fts_shape_triggers_reopen_and_vacuum_are_healed(tmp_path):
         reopened.close()
 
 
-def test_scoped_graph_uses_only_local_authoritative_evidence(hy):
+@pytest.mark.parametrize("elapsed_days", [0, 30])
+def test_scoped_graph_uses_only_local_authoritative_evidence(
+    hy, graph_read_clock, elapsed_days
+):
     _publish_claim(
         hy, session_id="alice-positive", peer_id="alice",
         content="shared service uses redis", chunk_id="alice-positive",
+        created_at="2025-01-01T00:00:00Z",
     )
     baseline = hy.augment(
         "shared service redis", source_peer_id="alice", source_workspace_id="w"
     ).graph_facts
     assert len(baseline) == 1
+    assert baseline[0].score > 0
+    graph_read_clock.julian_day += elapsed_days
+    aged_baseline = hy.augment(
+        "shared service redis", source_peer_id="alice", source_workspace_id="w"
+    ).graph_facts
+    assert len(aged_baseline) == 1
+    # Keep the real scorer active and exercise a substantial elapsed interval
+    # without sleeping. Compare isolation at this same later scoring instant.
+    assert aged_baseline[0].score == pytest.approx(
+        baseline[0].score
+        * math.exp(-elapsed_days / hy.config.graph_recency_half_life_days),
+        rel=1e-12,
+    )
     baseline_metrics = (
-        baseline[0].pos_evidence, baseline[0].neg_evidence,
-        baseline[0].confidence,
+        aged_baseline[0].pos_evidence, aged_baseline[0].neg_evidence,
+        aged_baseline[0].confidence,
     )
     _publish_claim(
         hy, session_id="bob-negative", peer_id="bob",
         content="shared service does not use redis", chunk_id="bob-negative",
-        polarity=-1,
+        polarity=-1, created_at="2025-01-02T00:00:00Z",
     )
     for index in range(4):
         _publish_claim(
             hy, session_id=f"bob-positive-{index}", peer_id="bob",
             content="shared service uses redis", chunk_id=f"bob-positive-{index}",
+            created_at=f"2025-01-0{index + 3}T00:00:00Z",
         )
     isolated = hy.augment(
         "shared service redis", source_peer_id="alice", source_workspace_id="w"
@@ -1242,7 +1326,21 @@ def test_scoped_graph_uses_only_local_authoritative_evidence(hy):
         isolated[0].pos_evidence, isolated[0].neg_evidence,
         isolated[0].confidence,
     ) == baseline_metrics
-    assert isolated[0].score == pytest.approx(baseline[0].score, rel=1e-6)
+    assert isolated[0] == aged_baseline[0]
+    assert {citation.source_peer_id for citation in isolated[0].citations} == {"alice"}
+
+    # A real broader-scope query is the negative control: the foreign rows
+    # really are authoritative and would change this oracle if they leaked.
+    broader = hy.augment(
+        "shared service redis", source_workspace_id="w"
+    ).graph_facts
+    assert len(broader) == 1
+    assert broader[0].pos_evidence > isolated[0].pos_evidence
+    assert broader[0].neg_evidence > isolated[0].neg_evidence
+    assert broader[0].confidence != isolated[0].confidence
+    assert broader[0].score != isolated[0].score
+    assert "bob" in {citation.source_peer_id for citation in broader[0].citations}
+    assert graph_read_clock.now_reads >= 4
 
 
 def test_global_manual_retraction_closes_scoped_graph_view(hy):
@@ -1624,11 +1722,12 @@ def test_scoped_graph_top_k_tie_break_is_independent_of_edge_ids(tmp_path):
     assert winners == ["alpha_service", "alpha_service"]
 
 
-def test_foreign_entity_anchor_cannot_change_scoped_fallback(hy):
+def test_foreign_entity_anchor_cannot_change_scoped_fallback(hy, graph_read_clock):
     _publish_claim(
         hy, session_id="local-fallback", peer_id="alice", workspace_id="a",
         content="local service uses redis", chunk_id="local-fallback",
         subject="local_service",
+        created_at="2025-01-01T00:00:00Z",
     )
     before_ctx = hy.augment(
         "zephyr", source_peer_id="alice", source_workspace_id="a"
@@ -1638,11 +1737,13 @@ def test_foreign_entity_anchor_cannot_change_scoped_fallback(hy):
         for fact in before_ctx.graph_facts
     ]
     assert before and before_ctx.matched_entities == []
+    assert all(item[3] > 0 for item in before)
 
     _publish_claim(
         hy, session_id="foreign-anchor", peer_id="bob", workspace_id="b",
         content="zephyr uses postgres", chunk_id="foreign-anchor",
         subject="zephyr", object_="postgres",
+        created_at="2025-01-02T00:00:00Z",
     )
     after_ctx = hy.augment(
         "zephyr", source_peer_id="alice", source_workspace_id="a"
@@ -1651,11 +1752,9 @@ def test_foreign_entity_anchor_cannot_change_scoped_fallback(hy):
         (fact.subject, fact.predicate, fact.object, fact.score)
         for fact in after_ctx.graph_facts
     ]
-    assert [item[:3] for item in after] == [item[:3] for item in before]
-    assert [item[3] for item in after] == pytest.approx(
-        [item[3] for item in before], rel=1e-6
-    )
+    assert after == before
     assert after_ctx.matched_entities == []
+    assert graph_read_clock.now_reads >= 2
 
 
 def test_scoped_entity_match_uses_in_scope_source_surface_form(hy):
@@ -1750,16 +1849,18 @@ def test_scoped_semantic_recall_beats_more_than_top_k_recency_distractors(hy):
     assert "fallback:semantic" in ctx.graph_facts[0].why_retrieved
 
 
-def test_scoped_multihop_ignores_foreign_topology(hy):
+def test_scoped_multihop_ignores_foreign_topology(hy, graph_read_clock):
     _publish_claim(
         hy, session_id="chain-one", peer_id="alice", workspace_id="a",
         content="anchor is part of middle", chunk_id="chain-one",
         subject="anchor", predicate="part_of", object_="middle",
+        created_at="2025-01-01T00:00:00Z",
     )
     _publish_claim(
         hy, session_id="chain-two", peer_id="alice", workspace_id="a",
         content="middle deploys to target", chunk_id="chain-two",
         subject="middle", predicate="deploys_to", object_="target",
+        created_at="2025-01-01T00:00:00Z",
     )
     graph_cfg = replace(
         hy.config,
@@ -1769,7 +1870,7 @@ def test_scoped_multihop_ignores_foreign_topology(hy):
 
     def scoped():
         return _graph_lookup(
-            hy.conn, graph_cfg, "tell me about anchor", ["anchor"], {},
+            hy.read_conn, graph_cfg, "tell me about anchor", ["anchor"], {},
             frozenset(), overlap_info={}, source_peer_id="alice",
             source_workspace_id="a",
         )
@@ -1779,18 +1880,19 @@ def test_scoped_multihop_ignores_foreign_topology(hy):
         for fact in scoped()
     }
     assert ("middle", "deploys_to", "target") in before
+    assert all(score > 0 for score in before.values())
     _publish_claim(
         hy, session_id="foreign-chain", peer_id="bob", workspace_id="b",
         content="middle deploys to foreign noise", chunk_id="foreign-chain",
         subject="middle", predicate="deploys_to", object_="foreign_noise",
+        created_at="2025-01-02T00:00:00Z",
     )
     after = {
         (fact.subject, fact.predicate, fact.object): fact.score
         for fact in scoped()
     }
-    assert set(after) == set(before)
-    for triple in before:
-        assert after[triple] == pytest.approx(before[triple], rel=1e-6)
+    assert after == before
+    assert graph_read_clock.now_reads >= 2
 
 
 @pytest.mark.parametrize("mismatch", ["content", "created_at"])

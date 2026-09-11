@@ -188,6 +188,22 @@ def conn(cfg):
     hy.close()
 
 
+@pytest.fixture
+def anchor_fixture_clock(conn):
+    """Pin this fixture connection's SQL write clock, not production ranking.
+
+    Phase 1 writes each edge's last_seen with a separate CURRENT_TIMESTAMP.
+    Equal-margin edges therefore need an explicit equal-clock fixture before
+    their semantic tie-break order can be asserted. The real coverage,
+    evidence, lifecycle and publication writers still run. The conn fixture
+    owns and closes this private connection, discarding the SQL override;
+    SQLite's read-side date parser and every other connection stay untouched.
+    """
+    clock = ["2025-01-01 00:00:00"]
+    conn.create_function("current_timestamp", 0, lambda: clock[0])
+    return clock
+
+
 # ── the counterfactual diff ──────────────────────────────────────────────────
 
 def test_a_squeezed_store_restores_every_active_edge(conn):
@@ -210,20 +226,33 @@ def test_a_squeezed_store_restores_every_active_edge(conn):
     assert all(line.startswith("user ") for line in _anchor_facts(conn, 20))
 
 
-def test_the_fixed_arm_renders_the_same_lines_when_the_cap_binds_nothing(conn):
+@pytest.mark.parametrize("reverse_insertion", [False, True])
+def test_the_fixed_arm_renders_the_same_lines_when_the_cap_binds_nothing(
+    conn, anchor_fixture_clock, reverse_insertion,
+):
     """PARITY CONTROL. CURRENT uses the same exact typed projection underlying
     production `_anchor_facts`; FIXED applies independent caps to those loaders.
     On a store where the shared cap binds nothing, both must agree line for line."""
     with core_db.transaction(conn):
         _seed_profile(conn, "name", "Atta")
         _seed_profile(conn, "role", "bedrijfsarts")
+        claims = [("atta", "part_of", "medflow"),
+                  ("medflow", "uses", "postgres")]
         _seed_exact_kg_claims(
             conn, HyMemConfig(root=Path(".")),
-            [("atta", "part_of", "medflow"),
-             ("medflow", "uses", "postgres")],
+            list(reversed(claims)) if reverse_insertion else claims,
             source_tag="parity",
         )
 
+    edges = conn.execute(
+        "SELECT subject_canonical, last_seen, pos_evidence - neg_evidence "
+        "AS margin FROM knowledge_graph ORDER BY id"
+    ).fetchall()
+    assert [row["subject_canonical"] for row in edges] == (
+        ["medflow", "atta"] if reverse_insertion else ["atta", "medflow"]
+    )
+    assert [row["last_seen"] for row in edges] == anchor_fixture_clock * 2
+    assert edges[0]["margin"] == edges[1]["margin"] > 0
     current = _anchor_facts(conn, 20)
     assert current == [
         "user name Atta", "user role bedrijfsarts",
@@ -231,6 +260,93 @@ def test_the_fixed_arm_renders_the_same_lines_when_the_cap_binds_nothing(conn):
     ]
     assert fixed_facts(conn, edge_cap=20, profile_cap=20) == current
     assert measure_squeeze(conn, cap=20)["edges_restored"] == 0
+    # The parity control remains order- and cap-sensitive; equal sets alone
+    # would miss both regressions. Exercise the real independent-cap loaders.
+    assert _anchor_facts(conn, 3) == current[:3]
+    assert fixed_facts(conn, edge_cap=1, profile_cap=20) == current[:3]
+    assert fixed_facts(conn, edge_cap=20, profile_cap=1) == [
+        current[0], *current[2:],
+    ]
+
+
+def test_a_second_boundary_changes_graph_order_without_breaking_arm_parity(
+    conn, anchor_fixture_clock, monkeypatch,
+):
+    """Deterministic reproduction of the original fixture's wall-clock race.
+
+    Advance the SQL clock between real per-triple writes, exactly as a slow
+    host crossing a second boundary would. The newer claim must rank first;
+    neither the production order nor the probe may be sorted into parity.
+    """
+    real_upsert = phase1._upsert_triple
+    written = []
+
+    def upsert_across_second_boundary(*args, **kwargs):
+        result = real_upsert(*args, **kwargs)
+        written.append(result[0])
+        anchor_fixture_clock[0] = "2025-01-01 00:00:01"
+        return result
+
+    monkeypatch.setattr(phase1, "_upsert_triple", upsert_across_second_boundary)
+    with core_db.transaction(conn):
+        _seed_profile(conn, "name", "Atta")
+        _seed_profile(conn, "role", "bedrijfsarts")
+        _seed_exact_kg_claims(
+            conn, HyMemConfig(root=Path(".")),
+            [("atta", "part_of", "medflow"),
+             ("medflow", "uses", "postgres")],
+            source_tag="parity-second-boundary",
+        )
+
+    assert written == ["atta", "medflow"]
+    assert [tuple(row) for row in conn.execute(
+        "SELECT subject_canonical,last_seen FROM knowledge_graph ORDER BY id"
+    )] == [
+        ("atta", "2025-01-01 00:00:00"),
+        ("medflow", "2025-01-01 00:00:01"),
+    ]
+    current = _anchor_facts(conn, 20)
+    assert current == [
+        "user name Atta", "user role bedrijfsarts",
+        "medflow uses postgres", "atta part_of medflow",
+    ]
+    assert fixed_facts(conn, edge_cap=20, profile_cap=20) == current
+    assert measure_squeeze(conn, cap=20)["edges_restored"] == 0
+    assert _anchor_facts(conn, 3) == current[:3]
+    assert fixed_facts(conn, edge_cap=1, profile_cap=20) == current[:3]
+
+
+def test_order_parity_control_rejects_a_reversed_fixed_arm(
+    conn, anchor_fixture_clock, monkeypatch,
+):
+    import digest_squeeze_probe as probe
+
+    with core_db.transaction(conn):
+        _seed_profile(conn, "name", "Atta")
+        _seed_exact_kg_claims(
+            conn, HyMemConfig(root=Path(".")),
+            [("atta", "part_of", "medflow"),
+             ("medflow", "uses", "postgres")],
+            source_tag="parity-broken-order",
+        )
+
+    current = _anchor_facts(conn, 20)
+    assert current == [
+        "user name Atta", "atta part_of medflow", "medflow uses postgres",
+    ]
+    real_edge_lines = probe._edge_lines
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            probe, "_edge_lines",
+            lambda connection, cap: list(reversed(real_edge_lines(connection, cap))),
+        )
+        broken = fixed_facts(conn, edge_cap=20, profile_cap=20)
+        assert broken == [current[0], current[2], current[1]]
+        assert set(broken) == set(current)
+        with pytest.raises(AssertionError):
+            assert fixed_facts(conn, edge_cap=20, profile_cap=20) == current
+        assert _anchor_facts(conn, 20) == current
+    assert fixed_facts(conn, edge_cap=20, profile_cap=20) == current
 
 
 def test_ineligible_edges_are_never_restored(conn):

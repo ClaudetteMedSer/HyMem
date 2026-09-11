@@ -11,6 +11,7 @@ import math
 import re
 import sqlite3
 import struct
+import sys
 import threading
 from importlib.resources import files
 from pathlib import Path
@@ -2538,6 +2539,7 @@ def register_current_auxiliary_contract(conn: sqlite3.Connection) -> None:
 
 
 def connect(path: Path) -> sqlite3.Connection:
+    """Open a configured connection that may be used across request threads."""
     from hymem.dreaming.lossless import coverage_chunk_id
     from hymem.extraction.producer import (
         phase1_generation_registry_row_is_valid,
@@ -2550,7 +2552,18 @@ def connect(path: Path) -> sqlite3.Connection:
     )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
+    # CPython 3.12+ can reuse an in-flight cached statement across threads,
+    # corrupting even read-only results (python/cpython#118172). SQLite's own
+    # serialized mode does not protect this Python-side cache. All connections
+    # returned here may be shared; keep caching only on the unaffected 3.11
+    # runtime until an upstream fix gives us a verified safe newer boundary.
+    # Private snapshots and schema-reference connections retain their cache.
+    conn = sqlite3.connect(
+        str(path),
+        isolation_level=None,
+        check_same_thread=False,
+        cached_statements=0 if sys.version_info >= (3, 12) else 128,
+    )
     conn.row_factory = sqlite3.Row
     register_read_authority_functions(conn)
     conn.create_function(
@@ -2676,7 +2689,9 @@ def read_snapshot(path: Path) -> Iterator[sqlite3.Connection]:
     another thread may own its transaction. A dedicated read-only connection
     gives every multi-query health report one coherent WAL snapshot without
     acquiring a writer lock. Read-side predicates still receive their pure
-    timestamp and Phase-1 generation-authorization functions.
+    timestamp and Phase-1 generation-authorization functions. The caller owns
+    this private connection for the context's duration; do not share it across
+    concurrently executing threads.
     """
     uri = Path(path).resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(

@@ -497,7 +497,55 @@ def _empty_indexing_llm():
     )
 
 
-def test_lme_durable_status_fails_on_only_current_fact_quarantine(tmp_path: Path):
+def _control_lme_indexing_budget(monkeypatch, *, status_elapsed: float = 0.0):
+    """Control only the caller-owned indexing budget, not the dream's work.
+
+    These are durable-failure classification tests, not ten-second performance
+    gates. The real dream still receives the real convergence deadline object
+    and follows its deadline-aware path; only that object's existing clock seam
+    is controlled. In particular, do not patch the shared time module (which
+    would also alter scoring, SQLite timing, and dream lease clocks), or remove
+    the deadline (which would enable the best-effort embedding worker).
+    """
+    state = SimpleNamespace(now=0.0, dream_calls=0, statuses=[])
+    real_converge = lme.converge_indexing
+
+    def clock():
+        return state.now
+
+    def converge(dream, *, status, **kwargs):
+        def run_real_dream(*, deadline):
+            state.dream_calls += 1
+            assert deadline.clock is clock
+            return dream(deadline=deadline)
+
+        def read_real_status():
+            value = status()
+            state.statuses.append(value)
+            # Advance at an explicit semantic boundary, independent of how
+            # much wall time the real dream and durable SQLite scan consumed.
+            state.now = status_elapsed
+            return value
+
+        return real_converge(
+            run_real_dream, status=read_real_status, _clock=clock, **kwargs,
+        )
+
+    monkeypatch.setattr(lme, "converge_indexing", converge)
+    return state
+
+
+@pytest.mark.parametrize(
+    ("status_elapsed", "expected_failure"),
+    [
+        pytest.param(9.999, "quarantined_extraction", id="before-deadline"),
+        pytest.param(10.0, "timeout_after_cycle", id="at-deadline"),
+        pytest.param(10.001, "timeout_after_cycle", id="after-deadline"),
+    ],
+)
+def test_lme_durable_status_fails_on_only_current_fact_quarantine(
+    tmp_path: Path, monkeypatch, status_elapsed, expected_failure,
+):
     from hymem import HyMem, HyMemConfig
     from hymem.dreaming.facts import (
         fact_cursor_retry_unit_key,
@@ -512,6 +560,9 @@ def test_lme_durable_status_fails_on_only_current_fact_quarantine(tmp_path: Path
         facts_extraction_enabled=True,
         salience_min_chars=1,
         dream_baseline_budget=0,
+    )
+    budget = _control_lme_indexing_budget(
+        monkeypatch, status_elapsed=status_elapsed,
     )
     hy = HyMem(cfg, llm=_empty_indexing_llm())
     try:
@@ -538,11 +589,26 @@ def test_lme_durable_status_fails_on_only_current_fact_quarantine(tmp_path: Path
         adapter.last_indexing_summary = None
         with pytest.raises(IndexingConvergenceError) as failed:
             adapter.dream_and_wait(timeout=10, max_cycles=1)
-        assert failed.value.summary["failure"]["code"] == "quarantined_extraction"
-        assert (
-            failed.value.summary["final_status"]["quarantined"]
-            ["quarantined_facts"]
-        ) == 1
+        summary = failed.value.summary
+        assert summary["failure"]["code"] == expected_failure
+        assert summary["elapsed_s"] == status_elapsed
+        assert summary["cycles"] == len(summary["reports"]) == 1
+        assert budget.dream_calls == len(budget.statuses) == 1
+        assert budget.statuses[0]["quarantined_facts"] == 1
+        assert summary["healthy"] is False
+        assert summary["cleanup_errors"] == []
+        if expected_failure == "quarantined_extraction":
+            assert summary["final_status"]["quarantined"]["quarantined_facts"] == 1
+        else:
+            # Negative controls: even a genuine quarantine cannot supersede
+            # the absolute deadline. A late status is not published as valid.
+            assert summary["final_status"] is None
+            assert summary["complete"] is False
+        run = hy.conn.execute(
+            "SELECT ended_at, error FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert run is not None and run["ended_at"] is not None
+        assert run["error"] is None
 
         # A recognized quarantine from an old prompt/config generation is not
         # active under the runner's current policy and must not poison a rebuild.
@@ -564,7 +630,7 @@ def test_lme_durable_status_fails_on_only_current_fact_quarantine(tmp_path: Path
 
 
 def test_lme_durable_status_catches_poison_singleton_message_embedding(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ):
     from hymem import HyMem, HyMemConfig
 
@@ -581,6 +647,7 @@ def test_lme_durable_status_catches_poison_singleton_message_embedding(
         salience_min_chars=1,
         dream_baseline_budget=0,
     )
+    budget = _control_lme_indexing_budget(monkeypatch)
     embedding = MappedStubEmbeddingClient(
         dim=3,
         model="poison-singleton-v1",
@@ -606,6 +673,9 @@ def test_lme_durable_status_catches_poison_singleton_message_embedding(
 
         summary = failed.value.summary
         assert summary["failure"]["code"] == "cycle_exception"
+        assert summary["elapsed_s"] == 0.0
+        assert budget.dream_calls == 1
+        assert budget.statuses == []
         # An exact content-specific producer failure is now surfaced by the
         # cycle itself.  It must remain audible and cannot be treated as a
         # healthy durable mirror merely because ingestion was best-effort.

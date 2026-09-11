@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from dataclasses import replace
+from queue import Empty, Queue
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -770,59 +773,256 @@ def test_role_inference_from_peer_id():
     assert infer_role("ai-bot") == "assistant"
 
 
-def _install_scheduler(hy, cooldown: float):
-    from hymem.dreaming.scheduler import DreamScheduler
+_SCHEDULER_COORDINATION_TIMEOUT = 30.0  # Deadlock guard, not a dream latency SLO.
+
+
+class _ControlledScheduler:
+    """Observe the real worker, with only its clock and wait release controlled.
+
+    Parking each dream before delegation makes an in-flight HTTP kick explicit;
+    two uncoordinated posts can otherwise legally coalesce before the first run.
+    Normal tests still execute the complete HyMem pipeline on the real fork.
+    Policy-only/negative controls omit that work, using the same worker hooks.
+    """
+
+    def __init__(self, hy, monkeypatch, *, real_dream=True):
+        import hymem.dreaming.scheduler as scheduler_module
+
+        self.hy = hy
+        self.now = 1000.0
+        self.events = Queue()
+        self.run_release = threading.Event()
+        self.cooldown_release = threading.Event()
+        self.reports = []
+        self.errors = []
+        self.started = 0
+        self.scheduler = scheduler_module.DreamScheduler(hy, cooldown=60.0)
+        # Replacing the module reference, not time.monotonic itself, leaves all
+        # real pipeline/SQLite/lease deadlines on the real clock.
+        monkeypatch.setattr(
+            scheduler_module, "time",
+            SimpleNamespace(monotonic=lambda: self.now,
+                            sleep=scheduler_module.time.sleep),
+        )
+        original_fork = hy.fork
+
+        def fork():
+            child = original_fork()
+            original_dream = child.dream
+
+            def dream():
+                self.started += 1
+                self.events.put(("dream_started", self.started))
+                try:
+                    assert self.run_release.wait(_SCHEDULER_COORDINATION_TIMEOUT)
+                    self.run_release.clear()
+                    if real_dream:
+                        self.reports.append(original_dream())
+                    self.events.put(("dream_returned", self.started))
+                except BaseException as exc:
+                    self.errors.append(exc)
+                    raise
+
+            monkeypatch.setattr(child, "dream", dream)
+            return child
+
+        monkeypatch.setattr(hy, "fork", fork)
+        original_kick_wait = self.scheduler._kick.wait
+
+        def kick_wait():
+            self.events.put(("waiting_for_kick", (
+                self.scheduler.cycles_completed, self.scheduler._kick.is_set(),
+            )))
+            return original_kick_wait()
+
+        def cooldown_wait(timeout):
+            self.events.put(("cooldown", timeout))
+            try:
+                assert self.cooldown_release.wait(_SCHEDULER_COORDINATION_TIMEOUT)
+                self.cooldown_release.clear()
+                return self.scheduler._stop.is_set()
+            except BaseException as exc:
+                self.errors.append(exc)
+                raise
+
+        monkeypatch.setattr(self.scheduler._kick, "wait", kick_wait)
+        monkeypatch.setattr(self.scheduler._stop, "wait", cooldown_wait)
+
+    def expect(self, kind, value):
+        try:
+            observed = self.events.get(timeout=_SCHEDULER_COORDINATION_TIMEOUT)
+        except Empty:
+            pytest.fail(f"scheduler did not reach {kind}: {self.errors!r}")
+        assert observed == (kind, value), f"expected {kind}: got {observed!r}"
+
+    def advance_cooldown(self):
+        self.now += 60.0
+        self.cooldown_release.set()
+
+
+@contextmanager
+def _controlled_scheduler(hy, monkeypatch, *, real_dream=True):
+    from hymem.extraction.prompts import SESSION_DIGEST_SYSTEM, USER_PROFILE_SYSTEM
+
+    # Unlike the general fixture's standalone [], these are valid responses to
+    # the combined extraction, digest and profile contracts. No provider calls.
+    llm = make_routed_llm([], [])
+    extraction_fixtures = dict(llm.fixtures)
+    # Exact routes must precede broad extraction needles such as "single pass",
+    # which also occurs in the digest prompt.
+    llm.fixtures.clear()
+    llm.fixtures.update({
+        SESSION_DIGEST_SYSTEM: (
+            '{"episodes":[],"summary":"Local development was discussed.","procedures":[]}'
+        ),
+        USER_PROFILE_SYSTEM: '{"items":[]}',
+        **extraction_fixtures,
+    })
+    hy.set_llm(llm)
     if hsrv._scheduler is not None:
         hsrv._scheduler.stop()
-    sched = DreamScheduler(hy, cooldown=cooldown)
-    sched.start()
-    hsrv.set_scheduler(sched)
-    return sched
+    control = _ControlledScheduler(hy, monkeypatch, real_dream=real_dream)
+    try:
+        control.scheduler.start()
+        hsrv.set_scheduler(control.scheduler)
+        control.expect("waiting_for_kick", (0, False))
+        yield control
+    finally:
+        # Release parked waits on assertion failures too; join the real worker
+        # before the TestClient lifespan or HyMem fixture can close its store.
+        control.scheduler._stop.set()
+        control.run_release.set()
+        control.cooldown_release.set()
+        control.scheduler.stop(timeout=_SCHEDULER_COORDINATION_TIMEOUT)
+        assert not control.scheduler.is_running
+        hsrv.set_scheduler(_NoopScheduler())
+        assert not control.errors
 
 
-def test_dream_cooldown_throttles_back_to_back_calls(client, hy_with_embed):
-    sched = _install_scheduler(hy_with_embed, cooldown=60.0)
-
-    payload = {
-        "messages": [
-            {"content": "we use uv and system python for local dev", "peer_id": "user-1"},
-            {"content": "noted, no docker for the dev environment", "peer_id": "agent-main"},
-        ]
-    }
-    r1 = client.post("/v3/workspaces/hermes/sessions/cool-1/messages", json=payload)
-    r2 = client.post("/v3/workspaces/hermes/sessions/cool-1/messages", json=payload)
-    assert r1.status_code == 201
-    assert r2.status_code == 201
-
-    # First kick runs immediately; second is gated by cooldown.
-    assert sched.wait_for_cycle(1, timeout=5.0)
-
-    count = hy_with_embed.conn.execute(
-        "SELECT COUNT(*) FROM dream_runs"
-    ).fetchone()[0]
-    assert count == 1
+def _post_cooldown_message(client, ordinal):
+    response = client.post(
+        "/v3/workspaces/hermes/sessions/cooldown/messages",
+        json={"messages": [{"content": f"Local development note {ordinal}.",
+                            "peer_id": "user-1"}]},
+    )
+    assert response.status_code == 201
 
 
-def test_dream_cooldown_allows_after_window(client, hy_with_embed):
-    sched = _install_scheduler(hy_with_embed, cooldown=0.0)
+def _assert_in_flight_kick_is_cooled(client, control, *, drop_kick=False):
+    _post_cooldown_message(client, 1)
+    control.expect("dream_started", 1)
+    # The first kick has definitely been consumed. The second must survive the
+    # running cycle, not be mistaken for a second guaranteed cycle per POST.
+    _post_cooldown_message(client, 2)
+    control.captured_sources = _snapshot_cooldown_sources(control.hy)
+    if drop_kick:
+        control.scheduler._kick.clear()  # Negative control: lose pending work.
+    control.run_release.set()
+    control.expect("dream_returned", 1)
+    control.expect("waiting_for_kick", (1, True))
+    control.expect("cooldown", 60.0)
+    assert control.scheduler.cycles_completed == 1
+    assert control.started == 1
 
-    payload = {
-        "messages": [
-            {"content": "we use uv and system python for local dev", "peer_id": "user-1"},
-            {"content": "noted, no docker for the dev environment", "peer_id": "agent-main"},
-        ]
-    }
-    r1 = client.post("/v3/workspaces/hermes/sessions/cool-2/messages", json=payload)
-    r2 = client.post("/v3/workspaces/hermes/sessions/cool-2/messages", json=payload)
-    assert r1.status_code == 201
-    assert r2.status_code == 201
 
-    assert sched.wait_for_cycle(2, timeout=5.0)
+def _snapshot_cooldown_sources(hy):
+    return (
+        [tuple(row) for row in hy.conn.execute(
+            "SELECT * FROM messages WHERE session_id='cooldown' ORDER BY id"
+        )],
+        [tuple(row) for row in hy.conn.execute(
+            "SELECT * FROM message_retention_coverage "
+            "WHERE source_session_id='cooldown' ORDER BY message_id, chunk_id"
+        )],
+    )
 
-    count = hy_with_embed.conn.execute(
-        "SELECT COUNT(*) FROM dream_runs"
-    ).fetchone()[0]
-    assert count == 2
+
+def _assert_completed_http_dreams(hy, count, captured_sources):
+    runs = hy.conn.execute(
+        "SELECT ended_at, chunks_processed, digest_failures, profile_failures, "
+        "fact_failures, coverage_integrity_failures FROM dream_runs ORDER BY id"
+    ).fetchall()
+    assert len(runs) == count
+    assert all(row["ended_at"] is not None for row in runs)
+    assert sum(row["chunks_processed"] for row in runs) > 0
+    for row in runs:
+        assert tuple(row)[2:] == (0, 0, 0, 0)
+    # Both accepted HTTP messages have immutable lossless source proofs, even
+    # if the first run consumed both and the second had no new extraction work.
+    proofs = hy.conn.execute(
+        "SELECT source_peer_id, source_workspace_id FROM message_retention_coverage "
+        "WHERE source_session_id='cooldown' ORDER BY message_id"
+    ).fetchall()
+    assert [tuple(row) for row in proofs] == [("user-1", "hermes")] * 2
+    assert _snapshot_cooldown_sources(hy) == captured_sources
+
+
+def test_dream_cooldown_throttles_back_to_back_calls(client, hy_with_embed, monkeypatch):
+    with _controlled_scheduler(hy_with_embed, monkeypatch) as control:
+        _assert_in_flight_kick_is_cooled(client, control)
+    _assert_completed_http_dreams(hy_with_embed, 1, control.captured_sources)
+
+
+@pytest.mark.parametrize("kick_timing", ["during_cycle", "after_window"])
+def test_dream_cooldown_allows_after_window(
+    client, hy_with_embed, monkeypatch, kick_timing,
+):
+    with _controlled_scheduler(hy_with_embed, monkeypatch) as control:
+        if kick_timing == "during_cycle":
+            _assert_in_flight_kick_is_cooled(client, control)
+            control.advance_cooldown()
+        else:
+            _post_cooldown_message(client, 1)
+            control.expect("dream_started", 1)
+            control.run_release.set()
+            control.expect("dream_returned", 1)
+            control.expect("waiting_for_kick", (1, False))
+            control.now += 60.0
+            _post_cooldown_message(client, 2)
+            control.captured_sources = _snapshot_cooldown_sources(hy_with_embed)
+            # An already-expired cooldown must not enter another timed wait.
+        control.expect("dream_started", 2)
+        control.run_release.set()
+        control.expect("dream_returned", 2)
+        control.expect("waiting_for_kick", (2, False))
+        assert control.scheduler.cycles_completed == 2
+    _assert_completed_http_dreams(hy_with_embed, 2, control.captured_sources)
+
+
+@pytest.mark.parametrize("defect", ["bypassed_cooldown", "lost_pending_kick"])
+def test_http_cooldown_oracle_rejects_scheduler_defects(
+    client, hy_with_embed, monkeypatch, defect,
+):
+    with _controlled_scheduler(hy_with_embed, monkeypatch, real_dream=False) as control:
+        if defect == "bypassed_cooldown":
+            control.scheduler._cooldown = 0.0
+        expected = "cooldown" if defect == "bypassed_cooldown" else "waiting_for_kick"
+        with pytest.raises(AssertionError, match=f"expected {expected}"):
+            _assert_in_flight_kick_is_cooled(
+                client, control, drop_kick=defect == "lost_pending_kick",
+            )
+
+
+def test_http_scheduler_coalesces_multiple_in_flight_kicks(
+    client, hy_with_embed, monkeypatch,
+):
+    # Event semantics deliberately preserve pending work, not a count of HTTP
+    # requests. Real pipeline integration is covered by the two tests above.
+    with _controlled_scheduler(hy_with_embed, monkeypatch, real_dream=False) as control:
+        _post_cooldown_message(client, 1)
+        control.expect("dream_started", 1)
+        _post_cooldown_message(client, 2)
+        _post_cooldown_message(client, 3)
+        control.run_release.set()
+        control.expect("dream_returned", 1)
+        control.expect("waiting_for_kick", (1, True))
+        control.expect("cooldown", 60.0)
+        control.advance_cooldown()
+        control.expect("dream_started", 2)
+        control.run_release.set()
+        control.expect("dream_returned", 2)
+        control.expect("waiting_for_kick", (2, False))
+        assert control.started == control.scheduler.cycles_completed == 2
 
 
 def test_resolve_role_uses_peers_table_when_present(client, hy_with_embed):
