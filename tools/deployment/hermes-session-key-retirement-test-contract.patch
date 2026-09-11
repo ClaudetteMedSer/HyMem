@@ -1,0 +1,26 @@
+--- a/tests/honcho_plugin/test_client.py
++++ b/tests/honcho_plugin/test_client.py
+@@ -117,13 +117,14 @@
+         assert config.recall_mode == "context"
+ 
+ 
+-    def test_corrupt_config_falls_back_to_env(self, tmp_path):
++    def test_corrupt_config_fails_closed(self, tmp_path):
+         config_file = tmp_path / "config.json"
+         config_file.write_text("not valid json{{{")
+ 
+-        config = HonchoClientConfig.from_global_config(config_path=config_file)
+-        # Should fall back to from_env without crashing
+-        assert isinstance(config, HonchoClientConfig)
++        # An environment fallback could discard a persistent session retirement
++        # and resume capture into the incompatible source session.
++        with pytest.raises(ValueError, match="refusing environment fallback"):
++            HonchoClientConfig.from_global_config(config_path=config_file)
+ 
+ 
+ class TestResolveSessionName:
+@@ -584,4 +585,3 @@
+         assert passed_base_url == expected, (
+             f"Expected {expected!r}, got {passed_base_url!r}"
+         )
+-

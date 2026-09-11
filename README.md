@@ -908,6 +908,13 @@ the derived extraction-contract identity.
 
 **Contract-versioned idempotency.** Phase-1 cache, retry, observation, and outcome rows use a derived contract namespace covering the actual prompt bytes and executable acceptance/recovery path. Changing `prompt_version` still deliberately forces reprocessing, while prompt/validator/recovery drift also invalidates old rows without relying on a manual bump. Raw legacy `vNN` rows remain auditable but never satisfy the active cache key. Prompt-independent terminal source losses remain explicit rather than being retried or marked successful; see §13 for the operational limits.
 
+**Context-first fragment presentation.** Context-bearing fragments present their
+exact preceding interpretation context before authoritative `content`, rather
+than showing a continuation before its antecedent. Source bytes, offsets,
+citation rules, prompt wording and the canonical canary remain unchanged; the
+derived extraction-contract identity changes. See
+[verification and rollout implications](docs/context-first-fragment-extraction.md).
+
 **Schema version guard.** The database schema version is checked against an expected constant. If a newer-schema DB is opened with older code, initialization raises a clear error rather than silently corrupting data.
 
 **Canonical normalization at write, drift check at read.** Every entity name flowing into `entity_aliases` and `knowledge_graph` goes through `canonicalize.normalize()`. If a third-party tool or older code path ever writes around it, `find_canonical_drift()` surfaces the rows where `normalize(v) != v` and `hymem-doctor` flags them. `repair_canonical_drift()` rewrites drifted canonicals with `merge()` semantics: source-equivalent evidence coalesces, and the existing authority reducer rebuilds confidence without double-counting sources. Auto-repair is opt-in; the doctor only reports, because rewriting a canonical can collide with an existing row and merge decisions belong to the operator.

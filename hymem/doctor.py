@@ -468,6 +468,27 @@ def _check_canonical_drift(cfg: EnvConfig) -> _Result:
     )
 
 
+def _check_lossless_coverage(cfg: EnvConfig) -> _Result:
+    """Audit uncited source proofs too, independently of schema initialization."""
+    from hymem.coverage_health import scan_coverage_health
+
+    health = scan_coverage_health(HyMemConfig(root=cfg.root).db_path)
+    detail = (
+        f"complete={int(health.complete)}; retained={health.total}; checked={health.checked}; "
+        f"valid-raw-present={health.valid_raw_present}; valid-raw-pruned={health.valid_raw_pruned}; "
+        f"invalid={health.invalid}; independent-nonordered-proofs={health.independent_proofs}; "
+        f"missing-covered-raw-proofs={health.missing_proofs}; "
+        f"invalid-frontiers={health.invalid_frontiers}; "
+        f"recorded-failure-sessions={health.recorded_failure_sessions}"
+    )
+    if health.error_code:
+        detail += f"; unavailable={health.error_code}; partial counts do not establish health"
+    if health.recorded_failure_sessions:
+        detail += "; recorded failures require a successful maintained stream walk; audit does not clear them"
+    detail += "; retained proof audit, not proof of already-destroyed source/proof pairs"
+    return _Result(OK if health.status == "valid" else FAIL, "lossless coverage integrity", detail)
+
+
 def repack_embeddings(conn: sqlite3.Connection) -> int:
     """Re-encode legacy JSON-text vectors to the compact packed form across all
     embedding tables. Optional, idempotent operator maintenance — new writes are
@@ -536,6 +557,7 @@ def run_doctor() -> int:
     embedding_result, live_dim, live_model = _check_embedding(cfg)
     results.append(embedding_result)
     results.extend(_check_schema_and_dim(cfg, live_dim, live_model))
+    results.append(_check_lossless_coverage(cfg))
     results.append(_check_canonical_drift(cfg))
 
     for r in results:

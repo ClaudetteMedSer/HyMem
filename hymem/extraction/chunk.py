@@ -758,6 +758,22 @@ def _fragment_record(
         fragment["source_boundary_context"] = boundary_context
     else:
         fragment.pop("source_boundary_context", None)
+    if "source_fragment_context" in fragment or "source_boundary_context" in fragment:
+        # Present the validated preceding context before its continuation.
+        # Only top-level owned content moves: every nested context/metadata
+        # value retains its canonical encoding, and context-free fragments
+        # retain their original byte representation below.
+        keys = sorted(key for key in fragment if key != "content") + ["content"]
+        fields = [
+            json.dumps(key, ensure_ascii=False) + ":" + json.dumps(
+                fragment[key],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for key in keys
+        ]
+        return record[0], "{" + ",".join(fields) + "}"
     return record[0], json.dumps(
         fragment,
         ensure_ascii=False,
