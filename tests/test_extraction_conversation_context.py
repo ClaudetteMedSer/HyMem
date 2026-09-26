@@ -216,7 +216,7 @@ def test_same_peer_dense_table_and_independent_prose_remain_extractable():
 def test_unrepresentable_empty_context_metadata_terminates_without_calls():
     record = _record(1, "assistant", "")
     payload = json.loads(record[1])
-    payload["source_peer_id"] = "x" * 5000
+    payload["source_peer_id"] = "x" * 9000
     oracle = _ConversationOracle()
     result = chunk.extract_chunk(oracle, "ignored", source_records=((1, json.dumps(payload)), _record(2, "user", "Yes.")))
     assert result.failed
@@ -248,7 +248,7 @@ def test_recursive_multirecord_split_preserves_bounded_adjacent_turns():
 
 
 def test_unsafe_context_truncation_holds_instead_of_dropping_negation():
-    first = "Do you NOT " + "very " * 800 + "often use PostgreSQL?"
+    first = "Do you NOT " + "very " * 1700 + "often use PostgreSQL?"
     oracle = _ConversationOracle()
     result = chunk.extract_chunk(oracle, "ignored", source_records=(_record(1, "assistant", first), _record(2, "user", "Yes.")))
     assert result.failed and result.failure_reason == "resource_limit"

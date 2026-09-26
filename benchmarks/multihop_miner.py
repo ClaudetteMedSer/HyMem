@@ -82,6 +82,7 @@ from hymem.core.graph import live_edge_predicate  # noqa: E402
 from hymem.query.augment import _multihop_edges  # noqa: E402
 from hymem.query.entities import match_known_entities  # noqa: E402
 from hymem.contrib.model_policy import (  # noqa: E402
+    RECOMMENDED_DEEPSEEK_MODEL,
     DeprecatedModelAliasError,
     require_active_model,
 )
@@ -401,7 +402,7 @@ def main() -> None:
     ap.add_argument("--types", default=",".join(sorted(_MINE_TYPES)),
                     help="comma-separated question_types to mine (default MR+TR)")
     # per-question dreaming
-    ap.add_argument("--dream-model", default="deepseek-v4-flash",
+    ap.add_argument("--dream-model", default=RECOMMENDED_DEEPSEEK_MODEL,
                     help="per-question mode: extraction LLM. Thinking MUST be disabled for "
                          "v4-flash (the box's patched openai_client). 'stub' = no-op plumbing test.")
     ap.add_argument("--dream-base-url", default=None,

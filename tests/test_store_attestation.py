@@ -94,14 +94,18 @@ def _healthy_indexing() -> dict:
         },
         "aggregation_enabled": False,
         "in_progress": False,
+        "summary_healthy": True,
     }
     return {
         "protocol": msc.INDEXING_PROVENANCE_VERSION,
+        "indexing_completion_policy": msc.INDEXING_COMPLETION_POLICY,
         "scope_id": "locomo:conv",
         "mode": "converged",
         "comparable": True,
         "complete": True,
         "healthy": True,
+        "summary_healthy": True,
+        "outcome": "success",
         "convergence_count": 1,
         "cycles": 1,
         "settings": {
@@ -115,6 +119,8 @@ def _healthy_indexing() -> dict:
             "report_count": 1,
             "complete": True,
             "healthy": True,
+            "summary_healthy": True,
+            "outcome": "success",
             "failure_reason": None,
             "elapsed_s": 0.1,
             "dream_report_totals": dict(totals),
@@ -944,6 +950,13 @@ def test_query_dimension_mismatch_cannot_degrade_to_scored_lexical_retrieval(
         adapter.close()
 
 
+# This correctness fixture performs real SQLite dreaming, canonical status walks,
+# and receipt attestation. On the shared two-CPU test host those operations can
+# exceed ten seconds without an indexing failure. Keep a finite integration
+# budget for both waves, not a performance assertion or a production override.
+_EMBEDDING_RECEIPT_FIXTURE_TIMEOUT_S = 120.0
+
+
 def test_embedding_receipt_attests_vectors_and_reuses_without_provider_probe(
     tmp_path, monkeypatch,
 ):
@@ -955,7 +968,9 @@ def test_embedding_receipt_attests_vectors_and_reuses_without_provider_probe(
     first.hy.set_embedding_client(first_client)
     try:
         first.ingest(item)
-        first.dream(max_cycles=10, timeout_s=10)
+        first.dream(
+            max_cycles=10, timeout_s=_EMBEDDING_RECEIPT_FIXTURE_TIMEOUT_S
+        )
         receipt = first.publish_store_build_receipt(
             item, first.indexing_provenance(scope_id="locomo:conv")
         )
@@ -966,6 +981,9 @@ def test_embedding_receipt_attests_vectors_and_reuses_without_provider_probe(
             "sha256:"
         )
         assert "secret-never-persist" not in json.dumps(receipt)
+        assert receipt["indexing"]["settings"]["timeout_s_per_convergence"] == (
+            _EMBEDDING_RECEIPT_FIXTURE_TIMEOUT_S
+        )
     finally:
         first_client.close()
         first.close()
@@ -980,18 +998,97 @@ def test_embedding_receipt_attests_vectors_and_reuses_without_provider_probe(
         no_dream=False,
         dream_per_session=False,
         indexing_max_cycles=10,
-        indexing_timeout_s=10,
+        indexing_timeout_s=_EMBEDDING_RECEIPT_FIXTURE_TIMEOUT_S,
     )
     try:
         indexing = prepare_indexing(
             reopened, item, args, scope_id="locomo:conv", reuse=True
         )
         assert indexing["store_build_receipt"]["status"] == "validated"
+        assert indexing["settings"] == receipt["indexing"]["settings"]
         assert reopened_client.request_attempts == 0
         assert reopened.validate_store_build_receipt(item) == receipt
     finally:
         reopened_client.close()
         reopened.close()
+
+
+def _advance_embedding_fixture_status_clock(monkeypatch, elapsed_s, *, wave=None):
+    """Inject elapsed time, never substitute the real dream/status/attestation."""
+    real_converge = msc.converge_indexing
+    records = []
+
+    def converge(dream, *, status, **kwargs):
+        now = [100.0]
+        record = {"statuses": [], "summary": None}
+        records.append(record)
+        advance_this_wave = wave is None or wave == len(records)
+
+        def elapsed_status():
+            result = status()
+            record["statuses"].append(result)
+            if advance_this_wave:
+                now[0] += elapsed_s
+            return result
+
+        try:
+            record["summary"] = real_converge(
+                dream, status=elapsed_status, _clock=lambda: now[0], **kwargs
+            )
+            return record["summary"]
+        except strictness.IndexingConvergenceError as exc:
+            record["summary"] = exc.summary
+            raise
+
+    monkeypatch.setattr(msc, "converge_indexing", converge)
+    return records
+
+
+@pytest.mark.parametrize("elapsed_s", (11.0, 119.0))
+def test_embedding_receipt_fixture_accepts_bounded_status_delay(
+    tmp_path, monkeypatch, elapsed_s,
+):
+    records = _advance_embedding_fixture_status_clock(monkeypatch, elapsed_s)
+    test_embedding_receipt_attests_vectors_and_reuses_without_provider_probe(
+        tmp_path, monkeypatch
+    )
+    assert len(records) == 2
+    for record in records:
+        assert len(record["statuses"]) == 1
+        assert record["summary"]["complete"] is True
+        assert record["summary"]["healthy"] is True
+        assert record["summary"]["elapsed_s"] == elapsed_s
+
+
+@pytest.mark.parametrize("timeout_s,elapsed_s,wave", (
+    (10.0, 11.0, 1),
+    (120.0, 121.0, 1),
+    (120.0, 120.0, 2),
+))
+def test_embedding_receipt_fixture_still_rejects_status_deadline_expiry(
+    tmp_path, monkeypatch, timeout_s, elapsed_s, wave,
+):
+    monkeypatch.setattr(
+        sys.modules[__name__], "_EMBEDDING_RECEIPT_FIXTURE_TIMEOUT_S", timeout_s
+    )
+    records = _advance_embedding_fixture_status_clock(
+        monkeypatch, elapsed_s, wave=wave
+    )
+    with pytest.raises(strictness.IndexingConvergenceError) as failed:
+        test_embedding_receipt_attests_vectors_and_reuses_without_provider_probe(
+            tmp_path, monkeypatch
+        )
+    assert failed.value.summary["failure_reason"] == "timeout_after_cycle"
+    assert failed.value.summary["elapsed_s"] == elapsed_s
+    assert failed.value.summary["timeout_s"] == timeout_s
+    assert failed.value.summary["complete"] is False
+    assert failed.value.summary["healthy"] is False
+    assert len(records) == wave
+    assert len(records[-1]["statuses"]) == 1
+    assert len(failed.value.summary["reports"]) == 1
+    # First-wave expiry cannot publish; reuse-wave expiry preserves the earlier
+    # receipt but still raises before returning a scoreable indexing result.
+    assert (tmp_path / ".hymem-benchmark-store-build.json").exists() == (wave == 2)
 
 
 def test_embedding_receipt_refuses_wrong_dimension_in_durable_mirror(

@@ -154,7 +154,7 @@ def test_source_split_policy_changes_derived_cache_key_without_prompt_bump(
 ):
     current = contract.extraction_cache_key("v20")
     assert chunk_module.SOURCE_RECORD_SPLIT_POLICY_VERSION == (
-        "hymem-source-semantic-split-v10"
+        "hymem-source-semantic-split-v11"
     )
     assert chunk_module.SOURCE_FRAGMENT_CONTEXT_VERSION == (
         "hymem-canonical-markdown-table-fragment-context-v2"
@@ -179,6 +179,39 @@ def test_source_split_policy_changes_derived_cache_key_without_prompt_bump(
         "SOURCE_BOUNDARY_CONTEXT_VERSION",
         "hymem-adjacent-prose-boundary-context-v0",
     )
+    assert contract.extraction_cache_key("v20") != current
+
+
+def test_bounded_terminal_empty_policy_versions_cache_and_canary_identity(monkeypatch):
+    current = contract.extraction_cache_key("v20")
+    policy = extraction_canary_policy(prompt_version="v20")
+    version = "hymem-terminal-clean-empty-verification-v3"
+    assert chunk_module.CLEAN_EMPTY_RECOVERY_POLICY_VERSION == version
+    assert contract._contract_components("v20")["recovery_policy"]["clean_empty"] == version
+    assert policy["clean_empty_recovery_policy_version"] == version
+
+    monkeypatch.setattr(
+        chunk_module,
+        "CLEAN_EMPTY_RECOVERY_POLICY_VERSION",
+        "hymem-terminal-clean-empty-verification-v2",
+    )
+    assert contract.extraction_cache_key("v20") != current
+    assert extraction_canary_policy(prompt_version="v20") != policy
+    assert contract.ACTIVE_EXTRACTION_PROMPT_VERSION == "v20"
+
+
+def test_contract_repair_versions_cache_and_canary_identity(monkeypatch):
+    current = contract.extraction_cache_key("v20")
+    policy = extraction_canary_policy(prompt_version="v20")
+    version = "hymem-source-only-contract-repair-v1"
+    assert chunk_module.CONTRACT_REPAIR_POLICY_VERSION == version
+    assert contract._contract_components("v20")["recovery_policy"]["contract_repair"] == version
+    assert policy["contract_repair_policy_version"] == version
+    monkeypatch.setattr(chunk_module, "CONTRACT_REPAIR_POLICY_VERSION", "different")
+    assert contract.extraction_cache_key("v20") != current
+    assert extraction_canary_policy(prompt_version="v20") != policy
+    monkeypatch.undo()
+    monkeypatch.setattr(chunk_module, "CHUNK_CONTRACT_REPAIR_USER_SUFFIX", "changed")
     assert contract.extraction_cache_key("v20") != current
 
 

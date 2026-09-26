@@ -170,6 +170,22 @@ def test_vec_episodes_misalignment_is_detected_and_healed(cfg):
         with core_db.transaction(conn):
             conn.execute("DELETE FROM episodes WHERE id='e0'")
         assert core_db.vec_episodes_aligned(conn) is False
+        assert core_db.prune_extra_episode_vectors(conn) is True
+        assert core_db.vec_episodes_aligned(conn) is True
+        # A wrong overlapping vector is not surplus-only drift.
+        key = conn.execute("SELECT rowid FROM vec_episodes LIMIT 1").fetchone()[0]
+        with core_db.transaction(conn):
+            conn.execute("DELETE FROM vec_episodes WHERE rowid=?", (key,))
+            conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
+                         (key, core_db._pack_vector([0.0] * dim)))
+            conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
+                         (42, core_db._pack_vector([0.0] * dim)))
+        assert core_db.prune_extra_episode_vectors(conn) is False
+        assert conn.execute("SELECT 1 FROM vec_episodes WHERE rowid=42").fetchone()
+        with core_db.transaction(conn):
+            conn.execute("DELETE FROM vec_episodes WHERE rowid=?", (key,))
+        assert core_db.prune_extra_episode_vectors(conn) is False
+        assert conn.execute("SELECT 1 FROM vec_episodes WHERE rowid=42").fetchone()
         assert core_db.heal_rowid_shadows(conn) is True
         assert core_db.vec_episodes_aligned(conn) is True
     finally:

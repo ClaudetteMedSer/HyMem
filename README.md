@@ -312,6 +312,8 @@ hymem/
 ├── bootstrap.py        Env-var resolution + build_from_env() + shared singleton
 ├── doctor.py           hymem-doctor — preflight diagnostics (keys, endpoints,
 │                         sqlite-vec, schema, embedding-dim drift, canonical drift)
+├── recover_summaries.py hymem-recover-summaries — inspect or explicitly repair
+│                         degraded rolling summaries without item reindexing
 ├── server.py           MCP server — 12 tools (capture, log, dream, augment,
 │                         ask, profile, digest, alias, retract, add/list/suggest rules)
 ├── honcho_server.py    Back-compat shim → hymem.honcho
@@ -338,7 +340,9 @@ hymem/
 │   ├── dates.py        Stdlib-only date extraction primitives for the TR path
 │   ├── embeddings.py   Batch embedding of chunks + knowledge-graph edges (JSON + sqlite-vec)
 │   ├── phase1.py       Extraction persist + dedup (lock-free embed, same-wave collapse)
-│   ├── digest.py       Batched per-session episodes+summary+procedures (one LLM call)
+│   ├── digest.py       Batched episodes+summary+procedures, strict item/summary parsing
+│   ├── summary_state.py Independent summary frontier and health classification
+│   ├── summary_recovery.py Bounded, private summary-only source replay
 │   ├── phase2.py       Consolidation: markers→profile, graph→MEMORY.md
 │   ├── phase3.py       Co-occurrence-aware decay + retraction
 │   ├── inference.py    Transitive closure over depends_on edges
@@ -350,7 +354,7 @@ hymem/
 │   │                   the tech-domain graph vocabulary never captures
 │   ├── episodes.py     LLM-powered episodic memory extraction
 │   ├── procedures.py   LLM-powered procedural memory extraction
-│   ├── summary.py      LLM-powered session summarization
+│   ├── summary.py      Automatic and operator summary publication
 │   ├── aggregate.py    RAPTOR cross-session aggregation: cluster episodes →
 │   │                   fuse → hierarchy levels up to the root standing digest
 │   ├── behavioral_dedup.py  Dry-run report of pre-collapse behavioral duplicates
@@ -360,7 +364,7 @@ hymem/
 │   ├── llm.py          LLMClient Protocol + StubLLMClient (for tests)
 │   ├── embeddings.py   EmbeddingClient Protocol + StubEmbeddingClient +
 │   │                   exact-producer/dimension/text LRU cache
-│   ├── chunk.py        Merged single-call chunk extraction (triples + markers)
+│   ├── chunk.py        Merged triples+markers extraction with bounded verification
 │   ├── triples.py      Triple parsing/validation (subject, predicate, object, polarity)
 │   ├── markers.py      Behavioral-marker parsing/validation
 │   ├── retry.py        Bounded exponential backoff for external API calls
@@ -396,16 +400,17 @@ hymem/
 
 **Conversation storage:**
 - `sessions` — session ID + start/end timestamps, independent lossless-coverage
-  and resumable digest cursors, an automatic rolling summary, and provenance
-  for the compatibility/operator summary; a published-generation marker keeps
-  partial episode rebuilds out of retrieval and aggregation
+  and resumable digest cursors, an automatic rolling summary with its own
+  source-backed frontier/failure state, and provenance for the compatibility/
+  operator summary; a published-generation marker keeps partial episode
+  rebuilds out of retrieval and aggregation
 - `messages` — raw turns (user, assistant, system, tool)
 - `messages_fts` — FTS5 over raw turns, indexed live at ingest; powers the `message_hits` tier so a turn is recallable before any dream chunks it
 - `message_retention_coverage` — immutable, content-hashed proof that each
   source message has an exact canonical JSONL backing artifact; this is the
   only proof that can authorize raw-message pruning
 
-Portable v12 exports are coherent, manifest-backed snapshots. Imports merge
+Portable exports (current format v18) are coherent, manifest-backed snapshots. Imports merge
 disjoint identities and exact reimports are idempotent; if an existing
 session, chunk, or durable proof has the same identity but different canonical
 state, the entire import fails closed instead of silently rebinding evidence.
@@ -514,6 +519,8 @@ canonical origin plus SHA-256 digest, never raw path text.
 
 **Operational:**
 - `schema_meta` — schema version guard (see §8)
+- `summary_recovery` — schema v63 local-only private drafts and exact source
+  commitments for bounded replay; never a published summary or portable authority
 - `peers` — Honcho peer registry (peer_id → role mapping)
 - `run_lock` — advisory mutex for dreaming concurrency
 - `dream_runs` — per-cycle audit log
@@ -548,7 +555,7 @@ does not masquerade as an extraction-cache event.
 
 1. **Chunking**: Regex matches and user turns of at least 30 characters enter the high-priority tier. A separately capped baseline tier covers the remaining non-blank user turns, including short facts and contextual confirmations. Both builders read the validated lossless message stream. Each candidate and its exact source manifest are persisted before that candidate can be scheduled, and retention runs only after the complete session walk, so extraction budgets or raw-message pruning cannot strand undiscovered work. Chunks are persisted with a `salience_reason` field.
 2. **Entity mention indexing**: Each chunk's text is scanned for known entity surface forms, populating the `entity_mentions` inverted index.
-3. **LLM extraction (one merged contract per chunk)**: Each unprocessed chunk is sent to the LLM with a locked-vocabulary prompt that returns one JSON object with both `triples` and `markers`. Every otherwise-successful non-empty terminal unit receives exactly one omission-focused verification over the same source records; the verifier sees a compact list of accepted claim identities and must return only missed supported items. Exact repeats are deterministically deduplicated, while verifier failure, incompleteness, bad citation, or conflict fails the unit atomically. Every terminal primary-empty unit receives exactly one bounded empty-verification pass because an English cue regex cannot certify multilingual recall. A cue-bearing unit that can be split is source-safely recovered through fresh child primary calls, and every terminal child retains that same one-pass empty-check obligation. An unsplittable suspicious unit gets its second look but remains held if that verifier is also empty. A non-empty EMPTY output may trigger only the standard one-shot OMISSION pass; EMPTY-of-EMPTY and OMISSION-of-OMISSION never occur. An ordinary sparse non-empty unit or non-cue empty therefore costs two logical completion calls (normally two provider requests, at most six with the shipped retry policy), up from one before completeness checking. Predictable large inputs are pre-partitioned, while incomplete, truncated, saturated, or suspicious-empty replies get bounded source-safe subdivision/verification calls. A source-backed right-hand prose fragment receives an exact, separately labelled preceding window of at most 320 characters when a sentence or paragraph cut is chosen, so a claim spanning the boundary remains visible. The window applies only to the first 320 characters on the right, adds no calls, and is interpretation context rather than independent evidence; recursive splits reconstruct it from contiguous inherited bytes, while exact duplicate claims coalesce and polarity conflicts fail atomically. No branch is published unless every branch completes. The default 100,000-character accepted message pre-partitions into at most 32 initial leaves, which cost 64 calls when no further recovery is needed. A single binary recovery tree with 32 terminal leaves costs 95 calls (31 internal attempts plus 32 primary/verification pairs); arbitrary combinations of prepartitioning and later recovery are governed by the authoritative global 96-call counter and fail atomically if they need more. The shipped client has one explicit three-attempt retry layer and disables SDK retries, so the per-chunk hard ceiling remains 288 actual HTTP requests. Input beyond the fixed envelope fails atomically with a durable `resource_limit` diagnostic instead of being truncated or partially published. The combined prompt carries the full triple ruleset and the marker ruleset:
+3. **LLM extraction (merged triples and markers)**: Each chunk's primary call returns one JSON object with both item types. Every successful non-empty terminal result receives one omission-focused verification over the same exact source unit; every terminal primary-empty result receives one direct empty verification. A cue-bearing unit may first split at safe source boundaries, and each terminal child keeps the same check. If no safe split is available, two complete empty replies may finish an exact bounded unit; a cue alone does not turn them into a resource failure. A non-empty empty-verification reply receives the ordinary one-shot omission check. There is no verifier-of-verifier loop. Predictable large inputs are pre-partitioned, while truncation, saturation, incomplete replies and verifier conflicts use bounded source-safe recovery. Split policy `hymem-source-semantic-split-v11` admits conservative prose boundaries and proven body-row edges in canonical Markdown tables or explicit unit-labelled numeric tables. A right-hand continuation may carry exact, labelled same-source context for a prose seam or table header/prelude; context does not own evidence, and child source spans stay contiguous. Fenced code, whole list items and introduced blocks remain atomic unless a proven structural boundary applies. Unsplit oversized or otherwise unrepairable input holds with a durable reason; no partial branch publishes. The per-chunk ceiling is 96 logical completions and, with the shipped three-attempt client, 288 HTTP attempts. The combined prompt carries the full triple ruleset and marker ruleset:
    - **Triples**: `{subject, predicate, object, polarity}` where predicate must be one of 22: the 18 technical predicates `uses`, `depends_on`, `prefers`, `rejects`, `avoids`, `replaces`, `conflicts_with`, `deploys_to`, `part_of`, `equivalent_to`, `implements`, `contains`, `configured_with`, `requires_version`, `runs_on`, `connects_to`, `generates`, and `tested_by`, plus the four personal-memory predicates `owns`, `located_in`, `participates_in`, and `has_attribute`. Polarity is +1 (assertion) or -1 (negation/retraction). Optional fields: `value_text`, `value_numeric`, `value_unit`, `temporal_scope`. The prompt explicitly authorises people, teams, projects, and codebases as subjects/objects, with a worked linking example — `"Atta is working on MedFlow"` → `(atta, part_of, medflow)` — so identity↔artifact relationships land as 1-hop graph edges instead of sibling canonicals that only a fuzzy text match could connect.
    - **Markers**: `{kind, statement}` where kind is one of: `correction`, `preference`, `rejection`, `style`. Only explicit behavioral signals — no mood/emotion inference.
    - **Entity types**: LLM also infers entity type labels (language, framework, database, service, tool, etc.) for query expansion.
@@ -561,11 +568,40 @@ does not masquerade as an extraction-cache event.
 6. **Knowledge graph upsert + dedup (lock-free embedding)**: New triples insert edges, repeated triples reinforce evidence counters, negations add negative evidence. Before each chunk's persist transaction opens, dedup candidate vectors are batch-embedded *outside* the write lock (`prepare_dedup_vectors`); the in-transaction path then does pure SQL + in-memory cosine only — no embedding-API call ever runs while the SQLite writer lock is held. A new triple that is a near-duplicate of an existing edge (same predicate, one shared endpoint, lexical-sibling varying endpoint, cosine ≥ threshold) attaches its evidence to that edge instead of minting a sibling. **Same-wave collapse**: because `edge_embeddings` only holds *prior-cycle* vectors, sibling variants minted within the *same* dream are also compared against an in-memory pool of edges created earlier in the cycle (same gates), so a `prompt_version` re-extraction wave can't fan a single preference out into many phrasal-variant edges.
 7. **Idempotency**: Each chunk is processed at most once per mechanically derived extraction-contract identity. The identity binds the rendered prompt bytes, strict JSON/item/source-ID acceptance, and bounded split/retry/recovery implementation to the human `prompt_version`. Changing any bound behavior makes legacy cache/attempt/outcome rows stale even if the label was accidentally left unchanged; deliberately bumping the label also forces bounded reprocessing. Prompt-independent terminal source losses cannot be reconstructed by a contract or version change (see §13 for the re-extraction-surge note).
 
+The scored-benchmark Phase-1 canary is `hymem-phase1-extraction-canary-v19`.
+It calls this same extraction path on exact table/prose and atomic-block
+fixtures with a dedicated client, normally eight logical completions within
+a 24-call / 72-HTTP-attempt ceiling. Its receipt tests those paths and source
+handling; it does not prove universal claim recall.
+
 ### Inter-Phase Steps (`dreaming/runner.py`)
 
-After chunk extraction per session, one batched digest call produces episodes,
-an automatic summary, and procedures from the independent coverage stream. A
-persistent message/character cursor makes each bounded window retryable and
+After chunk extraction per session, one batched digest generation call produces
+episodes, an automatic summary, and procedures from the independent coverage stream.
+The response has a strict envelope and validates each episode and procedure
+against its own cited new source spans; boundary context and the prior summary
+cannot independently authorize new items. The automatic summary has a separate
+500-Unicode-character contract. A summary that exceeds the cap can receive one
+source-only compaction call using the unchanged original input. There is no
+separate LLM semantic/format verdict or diagnosis stage. Generated claims remain
+model-dependent; structural and citation checks are not proof of entailment.
+
+Schema v62 tracks the automatic summary's published generation and source
+frontier independently from the item frontier. Valid episodes and procedures
+can advance when only the summary fails; the failure is recorded and summary
+coverage does not advance. A stale prior summary is disclosed as incomplete and
+cannot authorize a suffix-only fresh summary. A separate schema-v63 recovery
+job can privately replay exact retained source, without deleting or changing
+published items, and atomically publish a bounded factual overview only after
+the full source walk succeeds. `hymem-recover-summaries` defaults to read-only
+inspection; `--apply` explicitly permits bounded provider work (by default one
+logical call per invocation, at most three rejected replies per exact recovery
+slice across invocations, 8,000 input characters, 3,072
+output tokens and a 120-second deadline). It requires an existing current-schema
+store and does not run the full dream loop. Recovery is selective, not a claim
+to preserve every historical detail, and its output remains non-authoritative.
+
+A persistent message/character cursor makes each bounded window retryable and
 idempotent: an oversized message resumes at the exact next character, and the
 message-level watermark advances only after its final slice commits. Short and
 assistant-only tails therefore reopen the digest even when they create no
@@ -579,10 +615,13 @@ partial rows remain durable for retry but are excluded from FTS, vectors, and
 RAPTOR until the complete walk atomically swaps the published marker, so a
 failed rebuild cannot mutate or hide the last complete episode set.
 
-Summary, episodes, and the union of procedures from every bounded slice now
-publish in the same completion transaction. A complete replacement (including
-an empty result) marks omitted digest-owned procedures stale; a forward tail is
-additive. Stale procedures are excluded from retrieval, while their confidence
+Each completed slice transaction records validated items with the summary
+decision: either accepted text at its own frontier or durable degradation
+metadata while prior automatic and operator text remain untouched. A rebuilt
+episode generation becomes public only when its complete walk atomically
+publishes the marker. A complete item replacement (including an empty result)
+marks omitted digest-owned procedures stale; a forward tail is additive. Stale
+procedures are excluded from retrieval, while their confidence
 feedback remains available if later re-extracted, until normal stale-retention
 expiry. Schema v59 records exact-content digest ownership, and portable v16
 preserves it across export/import. Unknown pre-v59 procedures, legacy imports
@@ -856,9 +895,9 @@ The server is a small package, not a monolith: `models.py` holds the typed Pydan
 | `POST .../peers/{pid}/chat` | Scoped dialectic Q&A | Bounded iterative reasoning, deterministic fallback, JSON or SDK-compatible SSE |
 | `GET /v3/workspaces/{wid}/conflicts` | Unsupported legacy guard | Returns 501; native graph conflicts are not workspace-partitioned |
 | `GET /health` | Health check | |
-| `GET /dream-status` | `hy.dream_status()` — indexing health/backlog | Current `hymem-dream-status-v7` snapshot: all durable pending/malformed/quarantine/loss classes, bounded coverage/aggregation health, prompt/config/producer identity, `in_progress`, last run |
+| `GET /dream-status` | `hy.dream_status()` — indexing health/backlog | Current `hymem-dream-status-v8` snapshot: all durable pending/malformed/quarantine/loss classes, independent summary health, bounded coverage/aggregation health, prompt/config/producer identity, `in_progress`, last run |
 
-`hymem-dream-status-v3` is a completion contract, not just a progress counter.
+The current `hymem-dream-status-v8` is a completion contract, not just a progress counter.
 The API composes its status from one coherent SQLite read snapshot. Consumers that
 claim completion require every defined blocking count and boolean gate, reconcile
 the bounded terminal-loss and coverage details, and fail closed on a missing schema
@@ -948,7 +987,7 @@ then returns to zero-call reuse. Maintained clients expose
 that hook returning `Phase1ProducerDeclaration` for their actual memory route;
 the Phase-1 declaration is not assumed to identify the same model. Without a
 memory declaration, reuse is limited to the exact live client instance and a
-restart conservatively replays. Status v7 is required for this stronger
+restart conservatively replays. Status v8 is required for this stronger
 completion guarantee; older clean status receipts are not current evidence.
 
 **Exact-producer LRU-cached embeddings.** Cold queries are dominated by the first `embed([query])` API call. `CachedEmbeddingClient` keys its LRU (default 128 entries) by the validated producer-space key, dimension, and exact input text, so Source 2 KNN and chunk search can safely share one query vector. A display model label alone is never cache authority. Maintained local embeddings carry a deterministic declaration; remote durable use additionally requires a pinned dimension plus operator-declared **public** deployment-revision and tenant labels. Undeclared or adaptive clients bypass the cache on every direct call and cannot select or populate durable mirrors, while high-level HyMem semantic ingestion/query rejects them before provider work. The public attestation labels must not contain credentials: their hashes are commitments, not secrecy, and low-entropy secrets remain guessable.
@@ -963,7 +1002,7 @@ completion guarantee; older clean status receipts are not current evidence.
 
 **Working memory before dreaming.** `augment(session_id=...)` returns the last N raw turns of the active session (`recent_turns`, `working_memory_turns` default 10) so within-session facts are recallable immediately, without waiting for a dream to consolidate them — see §6.
 
-**One merged extraction contract plus a bounded completeness check.** Phase-1 returns triples and markers from one primary response. Every successful non-empty terminal unit receives exactly one omission-focused pass. Every terminal primary-empty unit receives one direct empty-result check. Cue-bearing inputs may first subdivide through fresh child primary calls, but their terminal children retain the check; an unsplittable suspicious unit remains held when its verifier is also empty. A non-empty EMPTY output may trigger only the standard one-shot OMISSION pass; EMPTY-of-EMPTY and OMISSION-of-OMISSION never occur. Thus an ordinary sparse non-empty chunk or non-cue empty costs two logical completions (normally two provider requests and at most six with all shipped retries); cue-bearing recovery can cost more within the global envelope. Dense or malformed primary responses use the same hard-bounded recursive recovery path; a saturated array, incomplete branch, failed verifier, or exhausted resource envelope fails the whole chunk rather than publishing a plausible-looking subset.
+**One merged extraction contract plus a bounded completeness check.** Phase-1 returns triples and markers from one primary response. Every successful non-empty terminal unit receives exactly one omission-focused pass. Every terminal primary-empty unit receives one direct empty-result check. Cue-bearing inputs may first subdivide through fresh child primary calls, but their terminal children retain the check. If no safe split exists, two complete empty replies can finish the exact bounded unit; a cue alone is not a resource failure. This is a bounded process check, not proof that the model found every claim; canary and benchmark evaluation must still measure semantic misses. A non-empty EMPTY output may trigger only the standard one-shot OMISSION pass; EMPTY-of-EMPTY and OMISSION-of-OMISSION never occur. Thus an ordinary sparse non-empty or clean-empty terminal unit costs two logical completions (normally two provider requests and at most six with all shipped retries); cue-bearing recovery can cost more within the global envelope. Dense or malformed primary responses use the same hard-bounded recursive recovery path; a saturated array, incomplete branch, failed verifier, or exhausted resource envelope fails the whole chunk rather than publishing a plausible-looking subset.
 
 **Lock-free dedup embedding + same-wave collapse.** Triple-dedup similarity vectors are embedded *before* the per-chunk write transaction opens, so no embedding-API round-trip is ever held inside the SQLite writer lock; the in-lock path is pure SQL + in-memory cosine. The same in-memory vectors let sibling variants minted within one dream collapse against each other (not just against prior-cycle edges), which curbs the phrasal-variant edge proliferation a `prompt_version` bump used to cause — see §5.
 
@@ -983,7 +1022,7 @@ dimension).
 | `HYMEM_ROOT` | `~/.hermes` | Directory for sqlite + markdown files |
 | `HYMEM_LLM_API_KEY` | provider key for an exact official origin | Purpose-bound LLM key for the configured endpoint; `DEEPSEEK_API_KEY`/`OPENAI_API_KEY` never cross to a custom host |
 | `HYMEM_LLM_BASE_URL` | `https://api.deepseek.com` | LLM endpoint |
-| `HYMEM_LLM_MODEL` | `deepseek-v4-flash` | Extraction model; retired mutable aliases `deepseek-chat` and `deepseek-reasoner` are rejected before client construction |
+| `HYMEM_LLM_MODEL` | `deepseek-flash` | Requested-service extraction default; retired `deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` are rejected before client construction. Service identity does not attest immutable weights |
 | `HYMEM_LLM_THINKING` | `auto` | DeepSeek thinking-body policy; `auto` safely disables thinking on identified DeepSeek endpoints/models, while unrelated providers receive no vendor-specific body |
 | `HYMEM_EMBEDDING_API_KEY` | none | Purpose-bound key for an explicit embedding endpoint; `OPENAI_API_KEY` is inherited only for the exact official HTTPS `api.openai.com` origin, while loopback uses `local` |
 | `HYMEM_EMBEDDING_BASE_URL` | `local://feature-hash` | Actual OpenAI-compatible API base, including its route prefix (for example `/v1` when served there); no automatic `/v1` suffix. Remote URLs require HTTPS by default; omission selects the deterministic no-network fallback |
@@ -1107,9 +1146,12 @@ HyMem's harness targets **LongMemEval-S**: 500 questions across six base questio
 **Current evidence policy.** The default answer path is label-free: source `question_type`, `_abs`, answers, and answer-session marks cannot steer sampling, retrieval, or the reader. Oracle routing is an explicitly exploratory diagnostic. Full-set runs remain development evidence because LongMemEval has no official held-out split; the manifest separately records denominator validity, exact evaluator identity, pre-registration, and whether a run is scored or retrieval-only. A required row digest binds the ordered results, while the latest pointer and registry bind the immutable full-artifact digest; copied evidence is deduplicated and a reused basename with different bytes is rejected.
 
 **Current indexing evidence contracts.** Strict convergence adds
-`hymem-benchmark-indexing-status-v3` to the coherent
-`hymem-dream-status-v7` snapshot. LME persists and validates
-`hymem-lme-indexing-summary-v5`, retaining exact Phase-1 authority. All four
+`hymem-benchmark-indexing-status-v4` to the coherent
+`hymem-dream-status-v8` snapshot. LME persists and validates
+`hymem-lme-indexing-summary-v6`, retaining exact Phase-1 authority. Valid but
+missing or stale automatic summaries are reported as separate degradation,
+not an automatic item-indexing failure; malformed summary metadata remains an
+integrity failure. All four
 strict registries require the portable finalized-checkpoint projection described
 in [archive admission](benchmarks/archive_evidence.md). MSC and LoCoMo persist
 `hymem-benchmark-indexing-v4`, whose per-run report counts, fixed
@@ -1126,13 +1168,24 @@ cannot leak through the registry, status, portable export, or store receipt.
 Older or relabelled nested evidence fails closed rather than becoming a scored
 cache hit.
 
+Pending work may coexist with a quarantine, terminal source loss or malformed
+durable record. Such indexing failures retain their canonical failure evidence
+and truthful incomplete state; they do not become successes or lose their
+diagnosis merely because the store has not drained. The development episode
+probe directly compares digest arms; it is not a current strict-indexing or
+full-set readiness receipt. Its parse-failure rate divides failed session rows
+by recorded logical completion calls, so added calls can change that metric.
+`--sim`, `--cost`, and `--rescore` make no provider calls; simulation verdicts
+are synthetic plumbing checks, not evidence of factual fidelity.
+
 **Cost-aware screening is exploratory.** A lower-tier model may screen a fixed,
 stratified subset only when baseline and candidate use the same exact pinned
 model ID, seed/config, and fixed judge. Write-side/extraction changes additionally
 need an early screened-model × target-model interaction check because model
 quality changes the stored substrate. Promote on paired uncertainty and health,
 retrieval, and answer metrics—not a single score—then rerun the full definitive
-protocol under exact `deepseek-v4-flash`. See
+protocol under the explicitly recorded `deepseek-flash` service and request. This
+freezes requested identity, not provider weights. See
 [the model-migration note](references/deepseek-model-migration.md#cost-aware-lower-tier-screening).
 
 Reader packing has two explicitly different capacity policies. A locally supplied `tokenizer.json` is hashed, bound to the answer model, and fails closed if counting fails. Without one, the default is a 60,000-byte UTF-8 budget—not a token claim—checked together with 1,024 output tokens and a 256-token chat-framing reserve against the declared provider context ceiling. Raw retrieval receives a 60% selection reserve before summaries or distilled aids, although those aids still lead the rendered prompt. Official judge prompts/model/parser can match upstream scoring semantics, but the local safety-bounded three-attempt transport differs from upstream's unbounded retry policy; artifacts therefore record scoring-semantics alignment separately and do not claim full protocol/transport equivalence.
@@ -1188,18 +1241,18 @@ The biggest lifts land where cross-session consolidation matters most: **MS +9pp
 # exploratory full-set development run; produces no official-comparable claim
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
     --workers 4 --permissive-default --no-prereg \
-    --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash \
-    --hymem-model deepseek-v4-flash --hymem-thinking disabled
+    --answer-model deepseek-flash --judge-model deepseek-flash \
+    --hymem-model deepseek-flash --hymem-thinking disabled
 # fast exploratory no-dream A/B
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
     --workers 4 --no-dream --permissive-default --no-prereg \
-    --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash \
-    --hymem-model deepseek-v4-flash --hymem-thinking disabled
+    --answer-model deepseek-flash --judge-model deepseek-flash \
+    --hymem-model deepseek-flash --hymem-thinking disabled
 # oracle-label diagnostic (explicitly exploratory)
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 \
     --no-auto-ability --workers 8 --no-prereg \
-    --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash \
-    --hymem-model deepseek-v4-flash --hymem-thinking disabled
+    --answer-model deepseek-flash --judge-model deepseek-flash \
+    --hymem-model deepseek-flash --hymem-thinking disabled
 ```
 
 **Methodology.** Every diagnostic behind these numbers is run against a control
@@ -1244,8 +1297,8 @@ this project one retracted ceiling and three reversed lever orderings.
 - **Representation is a safe directional proxy, not Honcho's durable conclusion model**: `(observer → target)` reads currently render proof-valid target-authored occurrences from authorized shared sessions. They do not persist observer/observed conclusions, and therefore cannot yet represent something the observer learned about the target solely from observer-authored or third-party text.
 - **Single-writer database**: WAL mode lets reads run concurrently with the writer, and dreaming/ingestion run on separate connections, but SQLite still serializes the two writers. Fine for a single-agent setup, not for multi-tenant.
 - **No authentication**: Both MCP and Honcho servers are unauthenticated — they assume localhost-only access.
-- **Latin-script only**: Canonicalization, query-time entity matching, and the LLM prompts handle Latin-script languages (English, Dutch, French, German, Spanish, etc.) — accents are folded into canonical keys. Chunking salience triggers are tuned for English and Dutch; other languages fall back to length-based salience (the LLM is still the real filter). Non-Latin scripts (CJK, Cyrillic, Arabic) are not supported.
+- **Uneven multilingual recall**: Canonicalization preserves non-Latin letters and attached marks, and full-text queries reach SQLite intact, but the current `unicode61` tokenizer can ignore some Indic/Arabic marks. Chunking salience triggers are tuned for English and Dutch; other languages lean more on length and LLM extraction. Do not treat full-text candidate hits as proof of exact entity identity.
 - **LLM-dependent extraction quality**: Extraction quality ultimately depends on the LLM's capabilities. Retraction records are audit evidence, not a hidden training channel; a weak LLM can still produce sparse, noisy, or malformed outputs that the strict contract must hold or reject.
-- **Re-extraction surge after an extraction-contract change**: a prompt-version bump or any change to bound prompt/validator/recovery behavior makes every successfully processed, source-manifested extraction chunk eligible for the new contract, so a large store can require many dream cycles. That work is amortized: each cycle obeys `dream_budget`, the independent short-turn baseline budget, and the soft provider-attempt budget, while each chunk has a hard 96-logical-call / 288-HTTP-attempt envelope and publishes atomically. Under v20 every successful non-empty terminal result receives exactly one omission-verification pass (including results recovered by empty verification or terminal retry), while every terminal primary-empty unit receives exactly one direct empty-verification pass. Cue-driven child recovery preserves that obligation on each terminal child, and an unsplittable suspicious unit is held if its second look is still empty. A non-empty EMPTY output may trigger only the standard one-shot OMISSION pass; EMPTY-of-EMPTY and OMISSION-of-OMISSION never occur. Oversized records use block-aware source-split contract `hymem-source-semantic-split-v9`: prose may split at paragraph or conservatively classified sentence-terminal boundaries. A source-backed right continuation receives an exact, context-only preceding window of at most 320 characters from the same message, applicable only to its first 320 authoritative characters; recursive prose cuts stitch that window from contiguous inherited bytes without adding provider calls. Fenced code (including an unmatched fence through EOF), each top-level list item with its nested/blank/lazy continuations, a heading with its first body block, and a defensible colon-led introduction with its immediate list/code block remain atomic. Exact block edges can separate complete later sections or sibling items of a standalone list. A source-backed canonical table with a non-empty header plus matching delimiter may additionally split only after a validated body row, with that trust carried into recursive continuations. When a heading or defensible colon-led paragraph introduces that table, a continuation receives both the exact prelude and canonical header as separately labelled, same-source interpretation context; neither repeated slice becomes authoritative fragment `content`. An inherited context is immutable through its exact applicability range, so header-shaped body rows cannot replace it; local table discovery resumes after that range for genuinely later tables. Source-less tables are held because they cannot carry context safely. Table-looking text in code and apparent headerless pipe grids provide no boundary authority. Ambiguous abbreviation, initial, decimal, version-like punctuation, and generic soft newlines are not boundaries. If any other atomic block is itself oversized, or no admissible boundary fits the resource envelope, the unit deliberately remains held rather than sending incomplete evidence to the provider. Provider/output failures remain pending until the contract-scoped retry bound quarantines them; they are never marked successful. A legacy chunk whose exact source manifest is provably unrecoverable instead enters prompt-independent terminal source-loss state: changing the prompt cannot reconstruct its evidence or retry it, and strict indexing health continues to report the loss. `GET /dream-status` (or `HyMem.dream_status()`) exposes the public prompt label, active contract/cache identity, pending, quarantine, terminal-loss, and budget state so a long re-extraction wave is observable rather than mistaken for a hang.
+- **Re-extraction surge after an extraction-contract change**: a prompt-version bump or any change to bound prompt/validator/recovery behavior makes every successfully processed, source-manifested extraction chunk eligible for the new contract, so a large store can require many dream cycles. That work is amortized: each cycle obeys `dream_budget`, the independent short-turn baseline budget, and the soft provider-attempt budget, while each chunk has a hard 96-logical-call / 288-HTTP-attempt envelope and publishes atomically. Under v20 every successful non-empty terminal result receives exactly one omission-verification pass (including results recovered by empty verification or terminal retry), while every terminal primary-empty unit receives exactly one direct empty-verification pass. Cue-driven child recovery preserves that obligation on each terminal child, and when no safe split exists, two complete empty replies can finish the exact bounded unit; a cue alone cannot force a hold. This procedural check cannot prove semantic completeness. A non-empty EMPTY output may trigger only the standard one-shot OMISSION pass; EMPTY-of-EMPTY and OMISSION-of-OMISSION never occur. Oversized records use block-aware source-split contract `hymem-source-semantic-split-v11`: prose may split at paragraph or conservatively classified sentence-terminal boundaries. A source-backed right continuation receives an exact, context-only preceding window of at most 320 characters from the same message, applicable only to its first 320 authoritative characters; recursive prose cuts stitch that window from contiguous inherited bytes without adding provider calls. Fenced code (including an unmatched fence through EOF), each top-level list item with its nested/blank/lazy continuations, a heading with its first body block, and a defensible colon-led introduction with its immediate list/code block remain atomic. Exact block edges can separate complete later sections or sibling items of a standalone list. A source-backed canonical Markdown table with a non-empty header plus matching delimiter may additionally split only after a validated body row, with that trust carried into recursive continuations. Explicit unit-labelled whitespace numeric tables also admit proven body-row boundaries. When a heading or defensible colon-led paragraph introduces that table, a continuation receives both the exact prelude and canonical header as separately labelled, same-source interpretation context; neither repeated slice becomes authoritative fragment `content`. An inherited context is immutable through its exact applicability range, so header-shaped body rows cannot replace it; local table discovery resumes after that range for genuinely later tables. Source-less tables are held because they cannot carry context safely. Table-looking text in code and apparent headerless pipe grids provide no boundary authority. Ambiguous abbreviation, initial, decimal, version-like punctuation, and generic soft newlines are not boundaries. If any other atomic block is itself oversized, or no admissible boundary fits the resource envelope, the unit deliberately remains held rather than sending incomplete evidence to the provider. Provider/output failures remain pending until the contract-scoped retry bound quarantines them; they are never marked successful. A legacy chunk whose exact source manifest is provably unrecoverable instead enters prompt-independent terminal source-loss state: changing the prompt cannot reconstruct its evidence or retry it, and strict indexing health continues to report the loss. `GET /dream-status` (or `HyMem.dream_status()`) exposes the public prompt label, active contract/cache identity, pending, quarantine, terminal-loss, and budget state so a long re-extraction wave is observable rather than mistaken for a hang.
 - **Aggregation builds fail closed**: when aggregation is enabled, the runner persists a config-bound pending marker before entering the build. A partial fusion failure, total exception, or process death remains pending across restarts and strict benchmark convergence retries it; only a zero-failure build for the active material config clears the marker. Disabling the layer or switching configs does not let an unrelated old failure poison the active policy, and bounded lifetime counters retain the audit evidence without storing prompt/source/exception text.
 - **Best-effort redaction, not a guarantee**: secret/PII scrubbing targets high-confidence patterns (provider key prefixes, JWTs, PEM blocks, bearer/credential strings, emails). It deliberately avoids generic high-entropy heuristics that would shred ordinary prose, so a novel or unstructured secret format can slip through. Treat it as defense-in-depth, not a substitute for not pasting secrets.

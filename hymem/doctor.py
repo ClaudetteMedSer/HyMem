@@ -489,6 +489,38 @@ def _check_lossless_coverage(cfg: EnvConfig) -> _Result:
     return _Result(OK if health.status == "valid" else FAIL, "lossless coverage integrity", detail)
 
 
+def _check_summary_health(cfg: EnvConfig) -> _Result:
+    """Report stale context without confusing it with source-index corruption."""
+    from hymem.dreaming.status import durable_summary_status
+
+    path = HyMemConfig(root=cfg.root).db_path.resolve()
+    conn = None
+    try:
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5,
+                               isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("BEGIN")
+        state = durable_summary_status(conn)
+    except Exception as exc:
+        return _Result(FAIL, "summary context health",
+                       f"unverified ({type(exc).__name__}); no readiness claim")
+    finally:
+        if conn is not None:
+            conn.close()
+    detail = (
+        f"degraded={state['summary_degraded_sessions']}; "
+        f"missing={state['summary_missing_sessions']}; "
+        f"malformed={state['malformed_summaries']}"
+    )
+    if state["malformed_summaries"]:
+        return _Result(FAIL, "summary context health", detail + "; invalid summary state")
+    if not state["summary_healthy"]:
+        return _Result(WARN, "summary context health", detail +
+                       "; last accepted context preserved; summary recovery remains owed")
+    return _Result(OK, "summary context health", detail)
+
+
 def repack_embeddings(conn: sqlite3.Connection) -> int:
     """Re-encode legacy JSON-text vectors to the compact packed form across all
     embedding tables. Optional, idempotent operator maintenance — new writes are
@@ -559,6 +591,7 @@ def run_doctor() -> int:
     results.extend(_check_schema_and_dim(cfg, live_dim, live_model))
     results.append(_check_lossless_coverage(cfg))
     results.append(_check_canonical_drift(cfg))
+    results.append(_check_summary_health(cfg))
 
     for r in results:
         print(r.render())

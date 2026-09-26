@@ -106,6 +106,7 @@ def make_strict_run(path: Path, *, segment_status="complete"):
         "official_denominator_validated": False,
         "source_order_validated": False,
         "indexing_require_healthy": True,
+        "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1",
         "historical_local_judge_prompts_exact_official": False,
         "official_judge_match": False,
         "source_ids_hash": content_hash(["q1", "q2"]),

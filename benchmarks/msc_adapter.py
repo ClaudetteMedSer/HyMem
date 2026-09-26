@@ -89,6 +89,9 @@ from benchmarks.extraction_canary import (
 from benchmarks.strictness import (
     AtomicCheckpoint,
     BENCHMARK_INDEXING_STATUS_VERSION,
+    INDEXING_COMPLETION_POLICY,
+    SUMMARY_STATUS_FIELDS,
+    validated_summary_health,
     BenchmarkCleanupError,
     BenchmarkIntegrityError,
     IndexingConvergenceError,
@@ -133,6 +136,7 @@ from benchmarks.store_attestation import (
 from hymem.contrib.endpoint_policy import validate_http_endpoint
 from hymem.contrib.model_policy import (
     DeprecatedModelAliasError,
+    RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
 )
 from hymem.core.vectors import decode_vector
@@ -150,9 +154,9 @@ from hymem.extraction.producer import phase1_generation_binding
 # Reuse the LME machinery unchanged — same answer/judge clients and scoring keep
 # MSC and LME numbers in ONE comparability frame (frozen posture). Imported
 # lazily inside functions to keep --sim import-light and API-free.
-_ANSWER_MODEL = "deepseek-v4-flash"
-_JUDGE_MODEL = "deepseek-v4-flash"
-_HYMEM_MODEL = "deepseek-v4-flash"   # NOT the deprecated deepseek-chat (2026-07-24)
+_ANSWER_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+_JUDGE_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+_HYMEM_MODEL = RECOMMENDED_DEEPSEEK_MODEL
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 _MSC_APERTURE = {
     "message_fts_top_k": 15,
@@ -161,17 +165,18 @@ _MSC_APERTURE = {
 }
 DEFAULT_INDEXING_MAX_CYCLES = 100
 DEFAULT_INDEXING_TIMEOUT_S = 3600.0
-# v4 additionally binds the exact producer-authority status used to interpret
+# v5 additionally records summary health and the explicit source-index policy.
+# v4 binds the exact producer-authority status used to interpret
 # the Phase-1 pending count. A producer-unavailable zero can never certify a
 # completed store. Its fixed report totals, terminal cycle gates, and flag
 # counts continue to reconcile to the root totals.
-INDEXING_PROVENANCE_VERSION = "hymem-benchmark-indexing-v4"
-# v7 carries v4 convergence evidence in addition to the exact Phase-1
+INDEXING_PROVENANCE_VERSION = "hymem-benchmark-indexing-v5"
+# v8 carries v5 convergence evidence in addition to the exact Phase-1
 # producer/effective request.  A
 # screening-model receipt therefore cannot certify a target-model store.
-STORE_BUILD_RECEIPT_VERSION = "hymem-benchmark-store-build-v7"
+STORE_BUILD_RECEIPT_VERSION = "hymem-benchmark-store-build-v8"
 STORE_INDEXING_ATTESTATION_VERSION = (
-    "hymem-benchmark-store-indexing-attestation-v2"
+    "hymem-benchmark-store-indexing-attestation-v3"
 )
 STORE_BUILD_RECEIPT_NAME = ".hymem-benchmark-store-build.json"
 EMBEDDING_STORE_ATTESTATION_VERSION = (
@@ -360,6 +365,8 @@ _INDEXING_RUN_FIELDS = (
     "report_count",
     "complete",
     "healthy",
+    "summary_healthy",
+    "outcome",
     "failure_reason",
     "elapsed_s",
     "dream_report_totals",
@@ -371,11 +378,14 @@ _INDEXING_RUN_FIELDS = (
 )
 _INDEXING_PROVENANCE_FIELDS = (
     "protocol",
+    "indexing_completion_policy",
     "scope_id",
     "mode",
     "comparable",
     "complete",
     "healthy",
+    "summary_healthy",
+    "outcome",
     "convergence_count",
     "cycles",
     "settings",
@@ -394,6 +404,7 @@ _INDEXING_ATTESTATION_FIELDS = (
 _FINAL_STATUS_HEALTH_FIELDS = (
     "dream_status_schema",
     "benchmark_indexing_status_schema",
+    *SUMMARY_STATUS_FIELDS,
     *DURABLE_PENDING_FIELDS,
     *DREAM_STATUS_PHASE1_AUTHORITY_FIELDS,
     *DREAM_STATUS_AGGREGATION_AUTHORITY_FIELDS,
@@ -636,6 +647,7 @@ def _scope_matches_item(scope_id: object, item: dict | None) -> bool:
 def _final_health_projection(value: object, *, exact: bool) -> dict:
     if not isinstance(value, dict):
         raise BenchmarkIntegrityError("indexing final status is malformed")
+    validated_summary_health(value)
     required = set(_FINAL_STATUS_HEALTH_FIELDS)
     if exact and set(value) != required:
         raise BenchmarkIntegrityError(
@@ -730,6 +742,8 @@ def _validate_indexing_provenance(
         raise BenchmarkIntegrityError("indexing attestation schema is incompatible")
     if indexing["protocol"] != INDEXING_PROVENANCE_VERSION:
         raise BenchmarkIntegrityError("indexing provenance protocol is incompatible")
+    if indexing["indexing_completion_policy"] != INDEXING_COMPLETION_POLICY:
+        raise BenchmarkIntegrityError("indexing completion policy is incompatible")
     if not _scope_matches_item(indexing["scope_id"], item):
         raise BenchmarkIntegrityError("indexing scope does not match its source item")
     if (
@@ -849,6 +863,7 @@ def _validate_indexing_provenance(
         latest_run_health = _final_health_projection(
             run["final_status"], exact=True
         )
+        _validate_summary_outcome(run, latest_run_health)
 
     if summed_cycles != cycles:
         raise BenchmarkIntegrityError("indexing cycle arithmetic drifted")
@@ -871,12 +886,20 @@ def _validate_indexing_provenance(
     )
     if latest_run_health != health:
         raise BenchmarkIntegrityError("indexing final status disagrees with its run")
+    _validate_summary_outcome(indexing, health)
     _validate_indexing_usage(indexing["pipeline_usage"])
     return health
 
 
+def _validate_summary_outcome(value: dict, health: dict) -> None:
+    summary_healthy = health["summary_healthy"]
+    expected = "success" if summary_healthy else "success_with_summary_degradation"
+    if value.get("summary_healthy") is not summary_healthy or value.get("outcome") != expected:
+        raise BenchmarkIntegrityError("indexing outcome hides or invents summary degradation")
+
+
 def _canonical_indexing_attestation(indexing: object, *, item: dict) -> dict:
-    """Return the exact secret-safe indexing proof stored in receipt v5."""
+    """Return the exact secret-safe indexing proof stored in receipt v8."""
 
     health = _validate_indexing_provenance(indexing, item=item)
     assert isinstance(indexing, dict)
@@ -1580,6 +1603,8 @@ class MSCAdapter:
                 "report_count": len(run_reports),
                 "complete": run.get("complete"),
                 "healthy": run.get("healthy"),
+                "summary_healthy": run.get("summary_healthy"),
+                "outcome": run.get("outcome"),
                 "failure_reason": run.get("failure_reason"),
                 "elapsed_s": run.get("elapsed_s"),
                 "dream_report_totals": run_totals,
@@ -1596,11 +1621,14 @@ class MSCAdapter:
         latest = self.indexing_runs[-1]
         result = {
             "protocol": INDEXING_PROVENANCE_VERSION,
+            "indexing_completion_policy": INDEXING_COMPLETION_POLICY,
             "scope_id": scope_id,
             "mode": "converged",
             "comparable": True,
             "complete": all(run.get("complete") is True for run in self.indexing_runs),
             "healthy": all(run.get("healthy") is True for run in self.indexing_runs),
+            "summary_healthy": latest.get("summary_healthy"),
+            "outcome": latest.get("outcome"),
             "convergence_count": len(self.indexing_runs),
             "cycles": sum(int(run.get("cycles", 0)) for run in self.indexing_runs),
             "settings": {
@@ -3034,6 +3062,7 @@ def _strict_identity(args) -> tuple[dict[str, Any], dict[str, Any]]:
         "no_dream": bool(args.no_dream),
         "dream_per_session": bool(args.dream_per_session),
         "indexing_max_cycles": args.indexing_max_cycles,
+        "indexing_completion_policy": INDEXING_COMPLETION_POLICY,
         "indexing_timeout_s": float(args.indexing_timeout_s),
         "dump_context": bool(args.dump_context),
         "sim": bool(args.sim),

@@ -27,7 +27,7 @@ import longmemeval_adapter as lme  # noqa: E402
 import msc_adapter as msc  # noqa: E402
 
 
-PIN = "deepseek-v4-flash"
+PIN = "deepseek-flash"
 DISABLED = {"thinking": {"type": "disabled"}}
 
 

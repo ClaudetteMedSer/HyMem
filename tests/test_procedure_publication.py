@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import pytest
 
-from hymem import HyMem
+from hymem import HyMem, portability
 from hymem.core import db
 from hymem.dreaming.procedures import ProceduresExtraction, publish_digest_procedures
 from tests.test_digest_publication import _finish, _initial
@@ -192,6 +192,12 @@ def test_portable_roundtrip_retains_explicit_but_not_inferred_ownership(cfg, tmp
                 records[:] = [row for row in records if row["type"] not in newer_kinds]
                 for kind in newer_kinds:
                     del records[-1]["counts"][kind]
+                # A v15 archive cannot carry the independent-summary fields
+                # introduced by v18. Keep this a genuine old wire schema.
+                for row in records:
+                    if row["type"] == "session":
+                        for field in portability._V18_SUMMARY_FIELDS:
+                            del row["record"][field]
             _rewrite_export(path, downgrade)
         restored = HyMem(replace(hy.config, root=tmp_path / "restored"), llm=llm)
         try:

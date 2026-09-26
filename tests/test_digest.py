@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pytest
 
@@ -582,7 +583,8 @@ def test_digest_refusal_sets_parse_failed_and_logs(cfg, caplog):
         assert digest.episodes.items == [] and digest.procedures.items == []
         assert digest.summary is None
         assert any(
-            "digest.parse_failure" in r.message and sid in r.getMessage()
+            "digest.parse_failure" in r.message
+            and hashlib.sha256(sid.encode()).hexdigest() in r.getMessage()
             for r in caplog.records
         )
     finally:
@@ -645,20 +647,16 @@ def test_digest_wrong_shape_holds_the_watermark_and_is_audible(cfg, caplog):
         assert digest.parse_failed is True
         assert digest.covered_message_id is None
         assert any(
-            "digest.shape_failure" in r.message and sid in r.getMessage()
+            "digest.shape_failure" in r.message
+            and hashlib.sha256(sid.encode()).hexdigest() in r.getMessage()
             for r in caplog.records
         )
     finally:
         hy.close()
 
 
-def test_digest_stays_quiet_on_the_stub_empty_array(cfg, caplog):
-    """`[]` is a retryable wrong shape but remains quiet for the stub default.
-
-    Warning on it would fire on every stub-configured dream — the no-LLM
-    default this project ships — and drown the real signal. Quiet must not be
-    confused with successful coverage.
-    """
+def test_digest_empty_array_has_one_bounded_attempt_diagnostic(cfg, caplog):
+    """The legacy shape event stays quiet, but every held attempt is audible."""
     hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
     try:
         sid = "s_stub_digest"
@@ -672,7 +670,10 @@ def test_digest_stays_quiet_on_the_stub_empty_array(cfg, caplog):
                 max_tokens=hy.config.dream_digest_max_tokens,
                 max_chars=hy.config.dream_digest_max_chars,
             )
-        assert not any("shape_failure" in r.message for r in caplog.records)
+        assert not any("digest.shape_failure" in r.message for r in caplog.records)
+        attempts = [r for r in caplog.records if "digest.attempt_failure" in r.message]
+        assert len(attempts) == 1 and "reason=shape_failure" in attempts[0].message
+        assert sid not in attempts[0].message
         assert digest is not None and digest.parse_failed is True
         assert digest.covered_message_id is None
     finally:
@@ -891,7 +892,10 @@ def test_digest_rejects_fields_that_compatibility_cleaners_would_truncate(cfg, f
         }
         if field == "summary":
             payload["summary"] = "s" * 501
-            expected = "summary_output_cap"
+            # The sole length failure now receives one bounded correction;
+            # this fixed stub repeats the full object, which is not the
+            # correction's strict summary-only response schema.
+            expected = "shape_failure"
         else:
             payload["procedures"] = [{
                 "name": "Deploy service",

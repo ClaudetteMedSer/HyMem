@@ -343,7 +343,11 @@ def test_dream_status_endpoint(client):
     }
     assert body["quarantined_facts"] == 0
     assert body["quarantined_facts_malformed"] == 0
-    assert body["dream_status_schema"] == "hymem-dream-status-v7"
+    assert body["dream_status_schema"] == "hymem-dream-status-v8"
+    assert body["summary_healthy"] is True
+    assert body["summary_degraded_sessions"] == 0
+    assert body["summary_missing_sessions"] == 0
+    assert body["malformed_summaries"] == 0
     assert body["phase1_backlog_status"] == "current_producer"
     assert body["pending_chunks_authoritative"] is True
     assert isinstance(body["phase1_generation_key"], str)
@@ -1403,7 +1407,9 @@ def test_context_does_not_expose_unowned_global_rules(client, hy_with_embed):
     r = client.get("/v3/workspaces/hermes/sessions/s-rules/context")
     assert r.status_code == 200
     summary = r.json()["summary"]
-    assert summary is None
+    assert summary["content"].startswith("[Automatic summary is stale or missing;")
+    assert "never suggest docker" not in summary["content"]
+    assert r.json()["summary_health"]["missing"] is True
 
 
 def test_context_summary_false_does_not_expose_unowned_rules(client, hy_with_embed):

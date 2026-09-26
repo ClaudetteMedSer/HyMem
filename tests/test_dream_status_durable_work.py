@@ -42,7 +42,7 @@ def _pipeline_llm(
             "typed user-profile facts": (
                 profile if profile is not None else json.dumps({"items": []})
             ),
-            "Return the JSON array of narrative facts now.": (
+            "Return the JSON object of narrative facts now.": (
                 fact_items if fact_items is not None else "[]"
             ),
             "Return the JSON object now.": (

@@ -61,6 +61,7 @@ from benchmarks.strictness import (
     build_manifest,
     code_hash,
     converge_indexing,
+    INDEXING_COMPLETION_POLICY,
     content_hash,
     durable_indexing_status,
     embedding_backlog_status,
@@ -91,7 +92,7 @@ from benchmarks.extraction_canary import (
     validate_extraction_canary_config_binding,
     validate_extraction_canary_report,
 )
-from longmemeval_adapter import (
+from benchmarks.longmemeval_adapter import (
     PINNED_DEEPSEEK_MODEL,
     THINKING_DISABLED,
     _detect_ability,
@@ -671,9 +672,10 @@ class LLMClient:
 # (e.g. "gemini:gemini-2.5-flash"); a bare model name stays on DeepSeek for
 # backward-compatible parsing of explicitly selected historical model ids.
 ANSWER_PROVIDERS = {
-    "deepseek": ("https://api.deepseek.com", ("HYMEM_LLM_API_KEY", "DEEPSEEK_API_KEY")),
-    "gemini":   ("https://generativelanguage.googleapis.com/v1beta/openai", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
-    "openai":   ("https://api.openai.com/v1", ("OPENAI_API_KEY",)),
+    "deepseek":  ("https://api.deepseek.com", ("HYMEM_LLM_API_KEY", "DEEPSEEK_API_KEY")),
+    "gemini":    ("https://generativelanguage.googleapis.com/v1beta/openai", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
+    "openai":    ("https://api.openai.com/v1", ("OPENAI_API_KEY",)),
+    "deepinfra": ("https://api.deepinfra.com/v1", ("DEEPINFRA_API_KEY", "HYMEM_LLM_API_KEY")),
 }
 
 
@@ -766,21 +768,22 @@ def select_judge_ideal(judge_gold: bool, gold_text: str | None,
 
 def apply_thinking_default(role: str, model: str, provider: str,
                            absent: bool, obj: dict) -> tuple[dict, bool]:
-    """Model-pin pre-reg §6: default v4-flash to thinking-disabled when the
+    """Default the current Flash service to thinking-disabled when the
     operator passed no flag at all.
 
-    The match term is `"v4-flash" in model`, NOT `"deepseek" in model`. The
-    latter is the library client's gate (`hymem/contrib/openai_client.py`)
-    and it would also fire on the retired `deepseek-chat` alias. Historical
-    comparator artifacts used that alias without this body, so reproducing
-    those request bytes requires an explicit model override. The live default
-    is the pinned v4-flash path below.
+    Keep the old `"v4-flash" in model` transform as well: historical comparator
+    validation must reproduce its original request body without granting live
+    admission to retired names. Do not generalize to every DeepSeek model.
 
     ABSENT is not EMPTY. `--{role}-extra-body ''` or `'{}'` is the operator
     explicitly asking for no extra body, and a convenience must never override
     an explicit statement -- so those keep `{}` and the guard then refuses the
     run, which is the correct outcome for a request that cannot work."""
-    if not absent or provider != "deepseek" or "v4-flash" not in model:
+    is_flash = (
+        model.casefold() == "deepseek-flash"
+        or "v4-flash" in model
+    )
+    if not absent or provider != "deepseek" or not is_flash:
         return obj, False
     # Deep, not `dict(...)`: a shallow copy shares the nested dict, so one
     # run mutating its own extra_body would edit every later run's default.
@@ -790,27 +793,27 @@ def apply_thinking_default(role: str, model: str, provider: str,
 def check_model_pin(role: str, model: str, provider: str, extra_body: dict) -> None:
     """Refuse the two ways a model pin turns into silent empty completions.
 
-    (1) A v4-flash DeepSeek model WITHOUT thinking disabled answers in
-        `reasoning_content` and leaves `content` empty. `_rejudge_run` has
-        aborted on this since the gold-delta pre-registration, but the normal
-        answer/judge path had no guard at all -- a bare
-        `--answer-model deepseek-v4-flash` ran straight into it and the run
-        looked like a capability result.
+    (1) Flash reasoning can consume the bounded answer budget before ordinary
+        content is produced. This benchmark requires its non-reasoning body;
+        historical v4-flash transformations retain the same guard.
     (2) DeepSeek's `thinking` key sent to OpenAI/Gemini is a 400. The ANSWERER
         is provider-swappable (ANSWER_PROVIDERS), so this is reachable by flag
         combination; the judge is DeepSeek-only and cannot hit it.
     """
     thinking = extra_body.get("thinking")
-    if provider != "deepseek" and thinking is not None:
+    if provider not in ("deepseek", "deepinfra") and thinking is not None:
         print(f"ERROR: {role} provider {provider!r} rejects DeepSeek's `thinking` key "
               f"(HTTP 400). Drop it from --{role}-extra-body.")
         sys.exit(2)
-    if provider == "deepseek" and "v4-flash" in model and \
+    is_flash = (
+        model.casefold() == "deepseek-flash"
+        or "v4-flash" in model
+    )
+    if provider in ("deepseek", "deepinfra") and is_flash and \
             (thinking or {}).get("type") != "disabled":
         print(f"ERROR: {role} model {model!r} requires "
               f"--{role}-extra-body '{{\"thinking\": {{\"type\": \"disabled\"}}}}'. "
-              "Without it the model writes to reasoning_content, this client reads "
-              "content, and every empty read scores 0.")
+              "Reasoning can exhaust this benchmark's bounded content budget.")
         sys.exit(2)
 
 
@@ -3706,6 +3709,11 @@ def _run_main(
                         help="Exploratory run with no pre-registration. Recorded as "
                              "prereg: null in the artifact, so such a run stays "
                              "distinguishable from a canonical one.")
+    parser.add_argument("--skip-extraction-canary", action="store_true",
+                        help="Operator override for non-official pipeline providers: "
+                             "record zero-work canary evidence with skip_reason="
+                             "operator_override instead of running the Phase-1 "
+                             "extraction canary. Artifact stays marked non-comparable.")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
                         help="E1 narrative-facts READ side (cfg.facts_enabled). None = "
@@ -4005,6 +4013,7 @@ def _run_main(
         "indexing_max_cycles": args.indexing_max_cycles,
         "indexing_timeout_s": args.indexing_timeout_s,
         "indexing_require_healthy": True,
+        "indexing_completion_policy": INDEXING_COMPLETION_POLICY,
         "embedding": public_embedding_config(args.embedding_config),
         "facts": args.facts,
         "facts_extraction": args.facts_extraction,
@@ -4334,42 +4343,53 @@ def _run_main(
             # Exercise the exact indexing prompt/parser/validator before the
             # first conversation store is created. One dedicated client keeps
             # this once-per-run preflight out of scored pipeline usage.
-            try:
-                extraction_canary_report = run_configured_extraction_canary(
-                    api_key=pipeline_key,
-                    base_url=args.hymem_base_url,
-                    model=args.hymem_model,
-                    thinking=args.hymem_thinking,
+            if args.skip_extraction_canary:
+                print("WARNING: extraction canary SKIPPED (operator override; "
+                      "non-official pipeline provider). Zero-work evidence "
+                      "recorded as skip_reason=operator_override; this run's "
+                      "pipeline evidence is non-comparable with canonical runs.",
+                      flush=True)
+                extraction_canary_report = skipped_extraction_canary(
+                    "operator_override",
                     prompt_version=extraction_prompt_version,
                 )
-                validate_extraction_canary_report(
-                    extraction_canary_report,
-                    expected_mode="required",
-                    expected_client=extraction_canary_client_policy(
+            else:
+                try:
+                    extraction_canary_report = run_configured_extraction_canary(
+                        api_key=pipeline_key,
                         base_url=args.hymem_base_url,
                         model=args.hymem_model,
                         thinking=args.hymem_thinking,
-                    ),
-                    require_client_closed=True,
-                    expected_prompt_version=extraction_prompt_version,
-                )
-            except ExtractionCanaryError as exc:
-                extraction_canary_report = dict(exc.report)
-                validate_extraction_canary_report(
-                    extraction_canary_report,
-                    expected_mode="failed",
-                    expected_client=extraction_canary_client_policy(
-                        base_url=args.hymem_base_url,
-                        model=args.hymem_model,
-                        thinking=args.hymem_thinking,
-                    ),
-                    require_client_closed=True,
-                    expected_prompt_version=extraction_prompt_version,
-                )
-                ledger.update_execution_segment(
-                    segment_id, _segment("running")
-                )
-                raise
+                        prompt_version=extraction_prompt_version,
+                    )
+                    validate_extraction_canary_report(
+                        extraction_canary_report,
+                        expected_mode="required",
+                        expected_client=extraction_canary_client_policy(
+                            base_url=args.hymem_base_url,
+                            model=args.hymem_model,
+                            thinking=args.hymem_thinking,
+                        ),
+                        require_client_closed=True,
+                        expected_prompt_version=extraction_prompt_version,
+                    )
+                except ExtractionCanaryError as exc:
+                    extraction_canary_report = dict(exc.report)
+                    validate_extraction_canary_report(
+                        extraction_canary_report,
+                        expected_mode="failed",
+                        expected_client=extraction_canary_client_policy(
+                            base_url=args.hymem_base_url,
+                            model=args.hymem_model,
+                            thinking=args.hymem_thinking,
+                        ),
+                        require_client_closed=True,
+                        expected_prompt_version=extraction_prompt_version,
+                    )
+                    ledger.update_execution_segment(
+                        segment_id, _segment("running")
+                    )
+                    raise
             ledger.update_execution_segment(segment_id, _segment("running"))
             print_extraction_canary(extraction_canary_report)
 

@@ -158,6 +158,10 @@ def _adapter(reports, statuses, *, facts_quarantined=0):
 def _status(**overrides):
     value = {
         "dream_status_schema": DREAM_STATUS_SCHEMA_VERSION,
+        "summary_degraded_sessions": 0,
+        "summary_missing_sessions": 0,
+        "malformed_summaries": 0,
+        "summary_healthy": True,
         "pending_source_materialization": 0,
         "pending_chunks": 0,
         "pending_digests": 0,
@@ -890,6 +894,7 @@ def _healthy_indexing(scope_id="locomo:conv"):
         },
         "aggregation_enabled": False,
         "in_progress": False,
+        "summary_healthy": True,
     }
     run = {
         "trigger": "end_of_history",
@@ -897,6 +902,8 @@ def _healthy_indexing(scope_id="locomo:conv"):
         "report_count": 1,
         "complete": True,
         "healthy": True,
+        "summary_healthy": True,
+        "outcome": "success",
         "failure_reason": None,
         "elapsed_s": 0.1,
         "dream_report_totals": dict(totals),
@@ -908,11 +915,14 @@ def _healthy_indexing(scope_id="locomo:conv"):
     }
     return {
         "protocol": msc.INDEXING_PROVENANCE_VERSION,
+        "indexing_completion_policy": msc.INDEXING_COMPLETION_POLICY,
         "scope_id": scope_id,
         "mode": "converged",
         "comparable": True,
         "complete": True,
         "healthy": True,
+        "summary_healthy": True,
+        "outcome": "success",
         "convergence_count": 1,
         "cycles": 1,
         "settings": {

@@ -1,6 +1,6 @@
 """Authoritative narrative-fact extraction and lifecycle (schema v46).
 
-The gated ``facts.v2`` prompt still sees ``role: content`` lines. Its input now
+The ``facts.v4`` capacity-aware prompt sees ``role: content`` lines. Its input
 comes from the validated lossless-message stream, can resume inside one large
 turn, and publishes an exact occurrence manifest. Each bounded source slice is
 an authority unit: a later successful replay replaces that unit's current fact
@@ -17,7 +17,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date as calendar_date
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 from hymem.config import HyMemConfig, MAX_FACTS_PER_EXTRACTION_UNIT
 from hymem.core import db as core_db
@@ -36,11 +36,13 @@ from hymem.dreaming.lossless import (
 from hymem.dreaming.message_coverage import LOSSLESS_COVERAGE_VERSION
 from hymem.extraction.jsonio import loads_exact_or_fenced
 from hymem.extraction.llm import LLMClient, LLMRequest
-from hymem.extraction.prompts import FACTS_SYSTEM, FACTS_USER_TEMPLATE
+from hymem.extraction.prompts import (
+    FACTS_CAPACITY_TEMPLATE, FACTS_SYSTEM, FACTS_USER_TEMPLATE,
+)
 
 log = logging.getLogger("hymem.dreaming.facts")
 
-FACTS_PROMPT_VERSION = "facts.v2"
+FACTS_PROMPT_VERSION = "facts.v4"
 FACT_SOURCE_MANIFEST_VERSION = "fact-source-manifest-v1"
 FACT_RESULT_VERSION = "fact-result-v1"
 FACT_SLICE_VERSION = "fact-slice-v1"
@@ -63,6 +65,9 @@ FACT_MAX_ENTITIES_PER_ITEM = 64
 FACT_MAX_ENTITY_CHARS = 200
 
 _MAX_FACT_CHARS = 600
+FactFailureReason = Literal[
+    "invalid_json", "invalid_envelope", "invalid_items", "output_capacity_exceeded",
+]
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _FACT_RETRY_RE = re.compile(
     r"^facts-lossless-v1\|prompt=facts\.v\d{1,6}\|chars=\d{1,9}\|"
@@ -100,6 +105,8 @@ class FactsExtraction:
     # the generation it read so concurrent workers cannot append a revision to
     # state they never observed.
     expected_generation: int | None = None
+    # Append diagnostics without changing any pre-v4 positional constructor slot.
+    failure_reason: FactFailureReason | None = None
 
 
 def _sha256_json(payload: object) -> str:
@@ -716,7 +723,33 @@ def extract_facts(
     start_offset: int = 0,
     max_chars: int | None = None,
 ) -> FactsExtraction | None:
-    """Extract one bounded lossless slice, resuming inside oversized turns."""
+    """Extract a fresh lossless slice with at most two bounded completions.
+
+    A capacity rejection may retry one strictly smaller source prefix. The
+    successful prefix owns its exact cursor interval; the remaining source
+    stays pending. Historical outcomes use ``reextract_fact_outcome`` instead
+    and never change their published boundaries to make output fit.
+    """
+    return _extract_facts_fresh(
+        conn, session_id, llm, cfg, since_message_id=since_message_id,
+        partial_message_id=partial_message_id, start_offset=start_offset,
+        max_chars=max_chars, allow_capacity_retry=True,
+    )
+
+
+def _extract_facts_fresh(
+    conn: sqlite3.Connection,
+    session_id: str,
+    llm: LLMClient,
+    cfg: HyMemConfig,
+    *,
+    since_message_id: int | None,
+    partial_message_id: int | None,
+    start_offset: int,
+    max_chars: int | None,
+    allow_capacity_retry: bool,
+) -> FactsExtraction | None:
+    """Select one exact fresh prefix; only the first pass may shrink once."""
     if start_offset < 0 or (partial_message_id is None) != (start_offset == 0):
         raise ValueError("invalid facts partial cursor")
     messages = covered_messages_after(
@@ -829,16 +862,31 @@ def extract_facts(
         source_occurrences=occurrences,
         publication_version=facts_config_version(cfg, client=llm),
     )
-    request = LLMRequest(
-        system=FACTS_SYSTEM,
-        user=FACTS_USER_TEMPLATE.format(text=combined),
-        response_format="json",
-        max_tokens=cfg.dream_digest_max_tokens,
+    raw = llm.complete(build_facts_request(combined, cfg))
+    items, failure_reason = _validate_fact_response(
+        raw, max_items=cfg.dream_max_facts_per_session,
     )
-    raw = llm.complete(request)
-    items = validate_fact_items(raw, max_items=cfg.dream_max_facts_per_session)
     if items is None:
-        return FactsExtraction(parse_failed=True, **common)
+        _log_fact_rejection(
+            session_id, slice_key, "fresh", failure_reason,
+        )
+        if allow_capacity_retry and failure_reason == "output_capacity_exceeded":
+            # Shrinking the configured budget alone can resend identical
+            # bytes when a short tail already fits below half that budget.
+            # Base recovery on the actual selected source, preserving the
+            # existing semantic floor and original before-cursor.
+            smaller_max = facts_attempt_max_chars(min(max_chars, len(combined)), 1)
+            if smaller_max < len(combined):
+                return _extract_facts_fresh(
+                    conn, session_id, llm, cfg,
+                    since_message_id=since_message_id,
+                    partial_message_id=partial_message_id,
+                    start_offset=start_offset, max_chars=smaller_max,
+                    allow_capacity_retry=False,
+                )
+        return FactsExtraction(
+            parse_failed=True, failure_reason=failure_reason, **common,
+        )
     tail = facts_tail_message_id(conn, session_id)
     return FactsExtraction(
         items=canonical_fact_items(items),
@@ -847,6 +895,85 @@ def extract_facts(
         next_message_offset=next_offset,
         caught_up=next_partial is None and covered == tail,
         **common,
+    )
+
+
+def build_facts_request(rendered: str, cfg: HyMemConfig) -> LLMRequest:
+    """Use one bounded output contract for new and exact historical units.
+
+    Output limits never authorize selecting a subset of supported facts.
+    Explicit overflow holds the unit for retry; a historical unit retains its
+    original source boundaries throughout that retry.
+    """
+    return LLMRequest(
+        system=FACTS_SYSTEM + FACTS_CAPACITY_TEMPLATE.format(
+            max_items=cfg.dream_max_facts_per_session,
+            max_text_chars=_MAX_FACT_CHARS,
+            max_entities=FACT_MAX_ENTITIES_PER_ITEM,
+            max_entity_chars=FACT_MAX_ENTITY_CHARS,
+        ),
+        user=FACTS_USER_TEMPLATE.format(text=rendered),
+        response_format="json",
+        max_tokens=cfg.dream_digest_max_tokens,
+    )
+
+
+def _validate_fact_response(
+    raw: object, *, max_items: int,
+) -> tuple[list[dict] | None, FactFailureReason | None]:
+    """Classify rejection without accepting or salvaging any partial result."""
+    parsed = loads_exact_or_fenced(raw) if isinstance(raw, str) else raw
+    if parsed is None and isinstance(raw, str):
+        # The shared parser uses None for both rejection and JSON null. Null
+        # is syntactically valid but cannot be a facts envelope, fenced or bare.
+        text = raw.strip()
+        if text != "null" and re.fullmatch(
+            r"```(?i:json)?\s*null\s*```", text,
+        ) is None:
+            return None, "invalid_json"
+    if (
+        isinstance(parsed, dict)
+        and set(parsed) == {"facts", "complete"}
+        and isinstance(parsed["facts"], list)
+        and not parsed["facts"]
+        and parsed["complete"] is False
+    ):
+        return None, "output_capacity_exceeded"
+    items = validate_fact_items(parsed, max_items=max_items)
+    if items is not None:
+        return items, None
+    candidate = parsed
+    if isinstance(candidate, dict) and set(candidate) == {"facts"}:
+        candidate = candidate["facts"]
+    if not isinstance(candidate, list):
+        return None, "invalid_envelope"
+    # Only individually valid over-cap sets are classified as capacity.
+    # Bound this secondary diagnostic work by the authority-ledger ceiling;
+    # malformed or larger unchecked sets remain invalid_items and never pass.
+    if (
+        max_items < len(candidate) <= FACT_MAX_ACTIVE_ITEMS_PER_OUTCOME
+        and validate_fact_items(candidate, max_items=len(candidate)) is not None
+    ):
+        return None, "output_capacity_exceeded"
+    return None, "invalid_items"
+
+
+def fact_diagnostic_session_key(session_id: str) -> str:
+    """Stable store-to-log attribution without emitting arbitrary session IDs."""
+    return _sha256_json({
+        "version": "fact-diagnostic-session-v1", "session_id": session_id,
+    })
+
+
+def _log_fact_rejection(
+    session_id: str, slice_key: str, mode: Literal["fresh", "replay"],
+    reason: FactFailureReason | None,
+) -> None:
+    # Benchmark supervisors retain ordinary warning logs. Never record reply
+    # text, envelope keys, fact/entity values, or untrusted identifier spelling.
+    log.warning(
+        "facts.output_rejected reason=%s mode=%s session_key=%s slice_key=%s",
+        reason, mode, fact_diagnostic_session_key(session_id), slice_key,
     )
 
 
@@ -974,15 +1101,17 @@ def reextract_fact_outcome(
     )
     if all(not fragment.strip() for fragment in source_fragments):
         return FactsExtraction(items=[], **common)
-    raw = llm.complete(LLMRequest(
-        system=FACTS_SYSTEM,
-        user=FACTS_USER_TEMPLATE.format(text=rendered),
-        response_format="json",
-        max_tokens=cfg.dream_digest_max_tokens,
-    ))
-    items = validate_fact_items(raw, max_items=cfg.dream_max_facts_per_session)
+    raw = llm.complete(build_facts_request(rendered, cfg))
+    items, failure_reason = _validate_fact_response(
+        raw, max_items=cfg.dream_max_facts_per_session,
+    )
     if items is None:
-        return FactsExtraction(parse_failed=True, **common)
+        _log_fact_rejection(
+            outcome["session_id"], slice_key, "replay", failure_reason,
+        )
+        return FactsExtraction(
+            parse_failed=True, failure_reason=failure_reason, **common,
+        )
     return FactsExtraction(items=canonical_fact_items(items), **common)
 
 

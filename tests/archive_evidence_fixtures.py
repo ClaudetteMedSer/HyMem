@@ -50,6 +50,7 @@ def healthy_convergence(config):
         "cycles": 1, "max_cycles": config["indexing_max_cycles"],
         "timeout_s": config["indexing_timeout_s"], "elapsed_s": 0.01,
         "complete": True, "healthy": True, "failure_reason": None,
+        "summary_healthy": True, "outcome": "success",
         "reports": [_current_indexing_report()],
         "final_status": _current_indexing_status(), "quarantined": {},
     }

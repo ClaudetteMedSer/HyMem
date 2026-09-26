@@ -451,6 +451,111 @@ def test_expiry_at_premaintenance_boundary_rolls_back_and_starts_no_vacuum(
         hy.close()
 
 
+def test_bounded_surplus_episode_vectors_are_pruned_before_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    from hymem import StubEmbeddingClient
+    from hymem.dreaming import runner
+    from hymem.dreaming.aggregation_material import embedding_storage_identity
+    from hymem.extraction.llm import StubLLMClient
+
+    pytest.importorskip("sqlite_vec")
+    cfg = _maintenance_config(tmp_path, aggregation_nodes_enabled=True,
+                              vacuum_after_prune=False)
+    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
+    model, dim = embedding_storage_identity(StubEmbeddingClient())
+    core_db.ensure_vec_table(hy.conn, dim, model=model)
+    if not core_db.has_vec_table(hy.conn, table="vec_episodes"):
+        hy.close()
+        pytest.skip("vec extension unavailable")
+    hy.conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
+                    (42, core_db._pack_vector([0.0] * dim)))
+    calls = []
+    original_build = runner.build_aggregation_nodes
+
+    def build(*_args, **_kwargs):
+        assert core_db.vec_episodes_aligned(hy.conn)
+        calls.append(True)
+        return original_build(*_args, **_kwargs)
+
+    monkeypatch.setattr(runner, "build_aggregation_nodes", build)
+    monkeypatch.setattr(core_db, "resync_rowid_shadows",
+                        lambda _conn: pytest.fail("broad resync forbidden"))
+    try:
+        report = hy.dream(deadline=MonotonicDeadline(10.0, clock=FakeClock()))
+        assert calls == [True]
+        assert report.aggregation_build_exceptions == 0
+        assert hy.conn.execute("SELECT count(*) FROM vec_episodes").fetchone()[0] == 0
+    finally:
+        hy.close()
+
+
+@pytest.mark.parametrize("failure", ["deadline", "lease", "verification", "sql"])
+def test_surplus_episode_repair_rolls_back_at_fenced_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, failure,
+) -> None:
+    from hymem import StubEmbeddingClient
+    from hymem.dreaming.aggregation_material import embedding_storage_identity
+    from hymem.extraction.llm import StubLLMClient
+    import sqlite3
+
+    pytest.importorskip("sqlite_vec")
+    hy = HyMem(_maintenance_config(tmp_path), llm=StubLLMClient(default="[]"))
+    model, dim = embedding_storage_identity(StubEmbeddingClient())
+    core_db.ensure_vec_table(hy.conn, dim, model=model)
+    if not core_db.has_vec_table(hy.conn, table="vec_episodes"):
+        hy.close()
+        pytest.skip("vec extension unavailable")
+    hy.conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
+                    (42, core_db._pack_vector([0.0] * dim)))
+    clock = FakeClock()
+    fence = None
+    if failure == "lease":
+        hy.conn.execute("INSERT INTO run_lock(name,holder,acquired_at) "
+                        "VALUES ('test','owned',datetime('now'))")
+        fence = core_db.activate_transaction_lease_fence(
+            hy.conn, name="test", holder="owned")
+
+    def after_delete(conn):
+        assert conn.execute("SELECT count(*) FROM vec_episodes").fetchone()[0] == 0
+        if failure == "deadline":
+            clock.advance(1.0)
+        if failure == "lease":
+            conn.execute("UPDATE run_lock SET holder='replacement' WHERE name='test'")
+        return failure != "verification"
+
+    monkeypatch.setattr(core_db, "vec_episodes_aligned", after_delete)
+    signal = {"deadline": DeadlineExceeded, "lease": core_db.LeaseOwnershipLost,
+              "verification": RuntimeError, "sql": sqlite3.OperationalError}[failure]
+    repair_conn = hy.conn
+    if failure == "sql":
+        class FinalReadFault:
+            reads = 0
+
+            def __getattr__(self, name):
+                return getattr(hy.conn, name)
+
+            def execute(self, statement, *args):
+                if statement == "SELECT rowid,embedding FROM vec_episodes":
+                    self.reads += 1
+                    if self.reads == 2:
+                        raise sqlite3.OperationalError("synthetic final read fault")
+                return hy.conn.execute(statement, *args)
+
+        repair_conn = FinalReadFault()
+        monkeypatch.setattr(core_db, "_load_vec_extension", lambda _conn: True)
+    try:
+        with use_deadline(MonotonicDeadline(1.0, clock=clock)):
+            with pytest.raises(signal):
+                core_db.prune_extra_episode_vectors(repair_conn)
+        assert hy.conn.execute("SELECT rowid FROM vec_episodes").fetchone()[0] == 42
+        assert not hy.conn.in_transaction
+    finally:
+        if fence is not None:
+            core_db.deactivate_transaction_lease_fence(fence)
+        hy.close()
+
+
 def test_bounded_misaligned_rowid_shadows_fail_closed_without_resync(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ) -> None:
@@ -781,7 +886,8 @@ def test_network_clients_cap_each_request_to_exact_remaining_time(
                 llm_calls.append(request)
                 return SimpleNamespace(
                     choices=[SimpleNamespace(
-                        message=SimpleNamespace(content="ok")
+                        message=SimpleNamespace(content="ok"),
+                        finish_reason="stop",
                     )],
                     usage=None,
                 )
@@ -857,7 +963,8 @@ def test_late_network_responses_are_attempted_but_never_counted_successful(
                 cross_if_late()
                 return SimpleNamespace(
                     choices=[SimpleNamespace(
-                        message=SimpleNamespace(content="ok")
+                        message=SimpleNamespace(content="ok"),
+                        finish_reason="stop",
                     )],
                     usage=SimpleNamespace(
                         prompt_tokens=1, completion_tokens=1, total_tokens=2,
@@ -913,7 +1020,8 @@ def test_late_network_responses_are_attempted_but_never_counted_successful(
         llm.complete(LLMRequest(system="s", user="late"))
     assert llm.request_attempts == 2
     assert llm.call_count == llm.successful_responses == 1
-    assert llm.token_usage_available is False
+    assert llm.token_usage_available is True
+    assert llm.total_tokens == 4
 
     clock.now = 0.0
     with use_deadline(MonotonicDeadline(1.0, clock=clock)), pytest.raises(

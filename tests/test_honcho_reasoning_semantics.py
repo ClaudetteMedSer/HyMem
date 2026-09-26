@@ -314,6 +314,14 @@ def test_session_context_target_and_limit_to_session_match_sdk_contract(
     assert "current sentinel" in directional
     assert "other sentinel" not in directional
     assert directional_body["peer_card"] == [directional]
+    assert directional_body["summary_health"] == {
+        "summary_healthy": False, "degraded": True, "missing": True,
+        "malformed": False,
+    }
+    assert directional_body["summary"]["content"] == (
+        "[Automatic summary is stale or missing; preserved historical "
+        "context may omit newer conversation content.]"
+    )
     expected_directional_tokens = (
         estimate_tokens(
             "role:system\ncontent:"
@@ -323,6 +331,11 @@ def test_session_context_target_and_limit_to_session_match_sdk_contract(
         + estimate_tokens(
             "role:system\ncontent:"
             f"<peer_card>{directional_body['peer_card']}</peer_card>"
+        )
+        + 4
+        + estimate_tokens(
+            "role:system\ncontent:"
+            f"<summary>{directional_body['summary']['content']}</summary>"
         )
         + 4
         + sum(
@@ -336,6 +349,7 @@ def test_session_context_target_and_limit_to_session_match_sdk_contract(
         )
     )
     assert directional_body["context_token_count"] == expected_directional_tokens
+    assert expected_directional_tokens <= directional_body["context_token_budget"]
 
     local_body = dialectic_client.get(
         "/v3/workspaces/w/sessions/current/context",

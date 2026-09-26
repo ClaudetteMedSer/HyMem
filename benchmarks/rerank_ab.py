@@ -72,6 +72,7 @@ from longmemeval_adapter import (  # noqa: E402
 )
 
 from hymem.query.augment import MessageHit, _message_fts_search  # noqa: E402
+from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL  # noqa: E402
 from hymem.query.rerank import (  # noqa: E402
     _get_cross_encoder,
     cross_encoder_rerank,
@@ -374,7 +375,7 @@ def main() -> None:
     ap.add_argument("--ce-model", default=MXBAI, help="M1's cross-encoder model")
     ap.add_argument("--bge-model", default=BGE_M3, help="M2's challenger model")
     ap.add_argument("--api-key", default="", help="LLM arm (M1 only)")
-    ap.add_argument("--model", default="deepseek-v4-flash", help="LLM arm model")
+    ap.add_argument("--model", default=RECOMMENDED_DEEPSEEK_MODEL, help="LLM arm model")
     ap.add_argument("--sim", action="store_true",
                     help="fake rerankers — plumbing only, numbers are meaningless")
     ap.add_argument("--out", type=Path, default=None, help="write the summary JSON")

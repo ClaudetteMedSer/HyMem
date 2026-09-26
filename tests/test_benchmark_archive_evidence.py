@@ -169,7 +169,8 @@ def test_unavailable_historical_usage_preserves_lower_bound_and_unavailable_tota
 ])
 def test_skipped_indexing_exact_mode_scope_and_types(scope, mutate):
     receipt = skipped_indexing(scope)
-    config = {"sim": True, "no_dream": True, "indexing_max_cycles": 100, "indexing_timeout_s": 3600.0}
+    config = {"sim": True, "no_dream": True, "indexing_max_cycles": 100, "indexing_timeout_s": 3600.0,
+              "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1"}
     validate_scoped_indexing(receipt, scope_id=scope, config=config)
     mutate(receipt)
     with pytest.raises(BenchmarkIntegrityError):
@@ -186,7 +187,8 @@ def test_skipped_indexing_exact_mode_scope_and_types(scope, mutate):
     lambda r: r["runs"][0]["final_cycle"].update(chunk_extraction_failures=1),
 ])
 def test_live_scoped_receipt_cannot_claim_unhealthy_completion(scope, mutate):
-    args = SimpleNamespace(sim=False, no_dream=False, indexing_max_cycles=100, indexing_timeout_s=3600.0)
+    args = SimpleNamespace(sim=False, no_dream=False, indexing_max_cycles=100, indexing_timeout_s=3600.0,
+                           indexing_completion_policy="source-backed-index-with-explicit-summary-degradation-v1")
     receipt = scoped_indexing(scope, args)
     validate_scoped_indexing(receipt, scope_id=scope, config=vars(args))
     mutate(receipt)
@@ -216,7 +218,8 @@ def test_emitted_simulation_cannot_be_promoted_even_with_all_public_hashes_rebou
 
 
 def test_raw_convergence_requires_current_healthy_completion():
-    config = {"indexing_max_cycles": 100, "indexing_timeout_s": 3600.0}
+    config = {"indexing_max_cycles": 100, "indexing_timeout_s": 3600.0,
+              "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1"}
     receipt = healthy_convergence(config)
     assert validate_convergence_summary(receipt, config=config)
     for key, value in (("pending_chunks", 1200), ("pending_chunks", False), ("in_progress", True)):
@@ -230,7 +233,8 @@ def test_raw_convergence_requires_current_healthy_completion():
 def test_actual_failed_convergence_writer_remains_failed_readable(failure):
     from benchmarks.strictness import converge_indexing, IndexingConvergenceError, sanitize_for_artifact
     from tests.test_lme_protocol_hardening import _current_indexing_status, _current_indexing_report
-    config = {"indexing_max_cycles": 100, "indexing_timeout_s": 3600.0}
+    config = {"indexing_max_cycles": 100, "indexing_timeout_s": 3600.0,
+              "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1"}
     status = _current_indexing_status()
     if failure == "phase1":
         status.update(phase1_backlog_status="producer_unavailable", pending_chunks_authoritative=False,
@@ -367,7 +371,8 @@ def test_rehashed_beam_extraction_attempts_cannot_exceed_pipeline_meter():
 
 @pytest.mark.parametrize("scope", ["msc:q1", "locomo:c1"])
 def test_scoped_extraction_attempts_cannot_exceed_pipeline_meter(scope):
-    args = SimpleNamespace(sim=False, no_dream=False, indexing_max_cycles=100, indexing_timeout_s=3600.0)
+    args = SimpleNamespace(sim=False, no_dream=False, indexing_max_cycles=100, indexing_timeout_s=3600.0,
+                           indexing_completion_policy="source-backed-index-with-explicit-summary-degradation-v1")
     receipt = scoped_indexing(scope, args)
     receipt["dream_report_totals"]["chunk_extraction_provider_attempts"] = 1
     receipt["runs"][0]["dream_report_totals"]["chunk_extraction_provider_attempts"] = 1

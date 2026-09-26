@@ -301,6 +301,7 @@ def test_canary_uses_real_phase1_contract_and_requires_exact_claim_fields():
     assert extraction_canary_module._LIST_CONTROL in controls_payload["content"]
     assert extraction_canary_module._FENCED_CODE_CONTROL in controls_payload["content"]
     assert report["execution_path"] == {
+        "provider_output_truncations": 0,
         "primary_requests": 4,
         "empty_verification_requests": 2,
         "omission_verification_requests": 2,
@@ -492,9 +493,12 @@ def test_representative_canary_fails_if_table_context_is_removed(monkeypatch):
     with pytest.raises(ExtractionCanaryError) as caught:
         run_extraction_canary(_representative_client())
 
-    assert caught.value.report["failure_reason"] == "resource_limit"
-    assert caught.value.report["completion_calls"] == 0
-    assert caught.value.report["execution_path"]["table_claim_requests"] == 0
+    # Intact admission can preserve the parent, but cannot forge the canary's
+    # required contextual extraction path or supported-claim evidence.
+    assert caught.value.report["failure_reason"] == "supported_claim_evidence_missing"
+    assert caught.value.report["completion_calls"] > 0
+    assert caught.value.report["execution_path"]["table_claim_exact_context_requests"] == 0
+    assert 0 in caught.value.report["missing_expected_claim_indexes"]
 
 
 @pytest.mark.parametrize("forged_field", ["header", "prelude"])
@@ -548,9 +552,10 @@ def test_representative_canary_fails_if_prose_context_is_removed(monkeypatch):
     with pytest.raises(ExtractionCanaryError) as caught:
         run_extraction_canary(_representative_client())
 
-    assert caught.value.report["failure_reason"] == "resource_limit"
-    assert caught.value.report["completion_calls"] == 0
-    assert caught.value.report["execution_path"]["prose_claim_requests"] == 0
+    assert caught.value.report["failure_reason"] == "supported_claim_evidence_missing"
+    assert caught.value.report["completion_calls"] > 0
+    assert caught.value.report["execution_path"]["prose_claim_exact_context_requests"] == 0
+    assert 1 in caught.value.report["missing_expected_claim_indexes"]
 
 
 def test_representative_canary_fails_if_prose_context_is_forged(monkeypatch):
@@ -925,7 +930,7 @@ def test_canary_does_not_touch_an_existing_store(tmp_path: Path):
 
 
 def test_canary_prompt_provenance_tracks_benchmark_hymem_default(tmp_path: Path):
-    assert EXTRACTION_CANARY_VERSION == "hymem-phase1-extraction-canary-v17"
+    assert EXTRACTION_CANARY_VERSION == "hymem-phase1-extraction-canary-v20"
     assert EXTRACTION_CANARY_PROMPT_VERSION == "v20"
     assert EXTRACTION_CANARY_FIXTURE_VERSION == (
         "hymem-phase1-context-paths-four-leaf-v7"

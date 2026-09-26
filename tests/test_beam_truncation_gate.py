@@ -70,7 +70,7 @@ def test_a_truncated_row_never_becomes_a_counted_score(captured):
     truncated reply; nothing downstream may treat it as the judge's verdict."""
     captured["reply"] = {"choices": [{"message": {"content": TRUNCATED},
                                       "finish_reason": "length"}]}
-    llm = ba.LLMClient("deepseek-v4-flash", "k")
+    llm = ba.LLMClient("deepseek-flash", "k")
     out = ba.judge_answer(llm, "q", "ideal", ["r"], "a", return_raw=True)
     assert out["score"] == 0.0 and out["scores"] == []       # the fabrication
     assert '"scores": [1]' in out["judge_raw"]               # what was really said

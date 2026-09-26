@@ -23,6 +23,7 @@ from hymem.contrib.endpoint_policy import (
     TRANSPORT_SECURITY_NONE,
     validate_recorded_embedding_endpoint,
     validate_http_endpoint,
+    validate_public_attestation,
     secret_free_endpoint_identity,
 )
 from hymem.dreaming.lossless import (
@@ -53,6 +54,9 @@ try:
     )
     from .strictness import (
         BENCHMARK_INDEXING_STATUS_VERSION,
+        INDEXING_COMPLETION_POLICY,
+        SUMMARY_STATUS_FIELDS,
+        validated_summary_health,
         BenchmarkIntegrityError,
         STRICT_PROTOCOL_VERSION,
         content_hash,
@@ -66,6 +70,9 @@ except (ImportError, ValueError):  # direct benchmark-script import
     )
     from strictness import (  # type: ignore
         BENCHMARK_INDEXING_STATUS_VERSION,
+        INDEXING_COMPLETION_POLICY,
+        SUMMARY_STATUS_FIELDS,
+        validated_summary_health,
         BenchmarkIntegrityError,
         STRICT_PROTOCOL_VERSION,
         content_hash,
@@ -113,7 +120,7 @@ LME_OFFICIAL_JUDGE_MAX_TOKENS = 10
 LME_OFFICIAL_VERDICT_PARSER = "substring-yes-in-lower-v1"
 LME_UPSTREAM_RETRY_POLICY = "unbounded-openai-backoff-v1"
 LME_LOCAL_RETRY_POLICY = "bounded-three-attempt-backoff-v1"
-LME_INDEXING_SUMMARY_VERSION = "hymem-lme-indexing-summary-v5"
+LME_INDEXING_SUMMARY_VERSION = "hymem-lme-indexing-summary-v6"
 LME_INDEXING_COVERAGE_DETAIL_LIMIT = 100
 LME_HISTORICAL_LOCAL_JUDGE_PROMPTS_EXACT_OFFICIAL = False
 # Compatibility alias for older imports.  Strict evidence uses the longer,
@@ -251,7 +258,7 @@ _INDEXING_AGGREGATION_BLOCKING_VALUES = frozenset({
 })
 _INDEXING_SUMMARY_COMMON_FIELDS = frozenset({
     "schema", "outcome", "cycles", "max_cycles", "timeout_s", "elapsed_s",
-    "complete", "healthy", "reports", "final_status", "cleanup_errors",
+    "complete", "healthy", "summary_healthy", "reports", "final_status", "cleanup_errors",
 })
 _INDEXING_PENDING_FIELDS = frozenset({
     "pending_source_materialization",
@@ -775,9 +782,25 @@ def _validate_model(
     return value
 
 
+def _archived_canary_validators():
+    # Archive-only dependency: live admission and its semantic code identity
+    # neither import nor execute this historical commitment reader. Full source
+    # manifests still pin its bytes for archive review and packaging.
+    if __package__:
+        from .extraction_canary_archive import (
+            validate_archived_canary_config, validate_archived_canary_report,
+        )
+    else:
+        from extraction_canary_archive import (
+            validate_archived_canary_config, validate_archived_canary_report,
+        )
+    return validate_archived_canary_config, validate_archived_canary_report
+
+
 def _validate_segment_extraction_canary(
     segment: Mapping[str, Any], *, pipeline: Mapping[str, Any], no_dream: bool,
-    prompt_version: str,
+    prompt_version: str, archive_policy: Mapping[str, Any] | None = None,
+    archive_effective_config: Mapping[str, Any] | None = None,
 ) -> None:
     """Bind every segment probe to its actual work and pipeline posture."""
 
@@ -819,15 +842,22 @@ def _validate_segment_extraction_canary(
                 "LongMemEval extraction canary endpoint identity is not secret-free"
             )
     try:
-        validate_extraction_canary_report(
-            report,
+        context = dict(
             expected_mode=mode,
             expected_client=(
                 pipeline if mode in {"required", "failed"} else None
             ),
             require_client_closed=mode in {"required", "failed"},
-            expected_prompt_version=prompt_version,
         )
+        if archive_policy is not None:
+            _archived_canary_validators()[1](
+                report, policy=archive_policy,
+                effective_config=archive_effective_config, **context,
+            )
+        else:
+            validate_extraction_canary_report(
+                report, expected_prompt_version=prompt_version, **context,
+            )
     except BenchmarkIntegrityError as exc:
         raise BenchmarkIntegrityError(
             "LongMemEval extraction canary evidence is invalid"
@@ -1061,6 +1091,7 @@ def _canonical_final_indexing_status(value: object) -> dict[str, Any]:
             "LongMemEval indexing final status has an unsupported benchmark schema"
         )
     _require_current_phase1_authority(value)
+    summary_health = validated_summary_health(value)
 
     known_terminal = {"terminal_loss_chunks", "terminal_loss_reasons"}
     known_coverage = {
@@ -1256,6 +1287,7 @@ def _canonical_final_indexing_status(value: object) -> dict[str, Any]:
         "in_progress": in_progress,
         "aggregation_generation": aggregation_generation,
         "aggregation_material": aggregation_material,
+        "summary_health": summary_health,
     }
 
 
@@ -1343,7 +1375,11 @@ def canonicalize_lme_indexing_summary(summary: object) -> dict[str, Any]:
     cycles = _bounded_count(summary.get("cycles"), label="indexing cycle count")
     result: dict[str, Any] = {
         "schema": LME_INDEXING_SUMMARY_VERSION,
-        "outcome": "success" if failure is None else "failure",
+        "outcome": (
+            "failure" if failure is not None
+            else "success" if final_status["summary_health"]["summary_healthy"]
+            else "success_with_summary_degradation"
+        ),
         "cycles": cycles,
         "max_cycles": _bounded_count(
             summary.get("max_cycles"), label="indexing max cycle count", positive=True,
@@ -1352,6 +1388,10 @@ def canonicalize_lme_indexing_summary(summary: object) -> dict[str, Any]:
         "elapsed_s": summary.get("elapsed_s"),
         "complete": complete,
         "healthy": healthy,
+        "summary_healthy": (
+            final_status["summary_health"]["summary_healthy"]
+            if final_status is not None else None
+        ),
         "reports": reports,
         "final_status": final_status,
         "cleanup_errors": [],
@@ -1368,10 +1408,15 @@ def _validate_canonical_final_status(value: object) -> Mapping[str, Any]:
         "pending", "malformed", "quarantined", "terminal_loss",
         "coverage_integrity", "in_progress", "aggregation_generation",
         "aggregation_material",
+        "summary_health",
         *DREAM_STATUS_PHASE1_AUTHORITY_FIELDS,
     }:
         raise BenchmarkIntegrityError("LongMemEval indexing final status is malformed")
     _require_current_phase1_authority(value)
+    summary_health = value.get("summary_health")
+    if not isinstance(summary_health, Mapping) or set(summary_health) != set(SUMMARY_STATUS_FIELDS):
+        raise BenchmarkIntegrityError("LongMemEval summary health fields differ")
+    validated_summary_health(summary_health)
     if (
         value.get("dream_status_schema") != DREAM_STATUS_SCHEMA_VERSION
         or value.get("benchmark_indexing_status_schema")
@@ -1395,6 +1440,8 @@ def _validate_canonical_final_status(value: object) -> Mapping[str, Any]:
             )
         for key, count in counts.items():
             _bounded_count(count, label=f"indexing {label} counter")
+    if value["malformed"]["malformed_summaries"] != summary_health["malformed_summaries"]:
+        raise BenchmarkIntegrityError("LongMemEval malformed summary evidence disagrees")
     terminal = value.get("terminal_loss")
     if not isinstance(terminal, Mapping) or set(terminal) != {"chunks", "reasons"}:
         raise BenchmarkIntegrityError("LongMemEval terminal-loss evidence is malformed")
@@ -1596,7 +1643,7 @@ def _validate_canonical_final_status(value: object) -> Mapping[str, Any]:
 
 
 def _validated_pipeline_aggregation_producer(
-    pipeline: Mapping[str, Any],
+    pipeline: Mapping[str, Any], *, archive_only: bool = False,
 ) -> Mapping[str, Any]:
     """Validate the manifested producer even when no final status exists."""
 
@@ -1607,6 +1654,55 @@ def _validated_pipeline_aggregation_producer(
         expected_declaration = expected_producer.get("declaration")
         if not isinstance(expected_declaration, Mapping):
             raise ValueError("aggregation declaration is absent")
+        if archive_only:
+            # These hashes commit to historical request/retry inputs; their
+            # preimages (including old runtime versions) were not archived.
+            # Validate the commitment and recorded crosslinks, never rebuild
+            # it with today's code or infer current execution eligibility.
+            if (
+                expected_producer["identity_exact"] is not True
+                or expected_producer["reuse_scope"] != "durable"
+                or expected_declaration["client_id"]
+                != "hymem.contrib.openai_client.OpenAICompatibleClient"
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    expected_declaration["implementation"],
+                ) is None
+                or expected_declaration["model"] != pipeline.get("model")
+                or expected_declaration["endpoint_origin"]
+                != pipeline.get("endpoint_origin")
+                or expected_declaration["endpoint_sha256"]
+                != pipeline.get("endpoint_sha256")
+            ):
+                raise ValueError("historical aggregation producer differs")
+            validate_public_attestation(
+                pipeline.get("transport_package_version"),
+                label="recorded OpenAI transport package version", max_bytes=256,
+            )
+            timeout = _finite_number(pipeline.get("request_timeout_seconds"))
+            if timeout is None or timeout <= 0:
+                raise ValueError("recorded OpenAI request timeout is invalid")
+            revision = pipeline.get("deployment_revision_sha256")
+            tenant = pipeline.get("deployment_tenant_sha256")
+            if revision is None and tenant is None:
+                # Known strict-v1 requested-service contracts, kept as data
+                # rather than derived from today's active-model policy. This
+                # is not a claim of fixed or currently available weights.
+                if (
+                    pipeline.get("model") not in {
+                        "deepseek-v4-flash", "deepseek-flash",
+                    }
+                    or pipeline.get("endpoint_origin")
+                    != "https://api.deepseek.com"
+                ):
+                    raise ValueError("historical deployment attestation absent")
+            elif any(
+                not isinstance(item, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None
+                for item in (revision, tenant)
+            ):
+                raise ValueError("historical deployment attestation invalid")
+            return expected_producer
         from hymem.contrib.openai_client import (
             openai_compatible_producer_declaration,
         )
@@ -1663,11 +1759,13 @@ def _validated_pipeline_aggregation_producer(
 
 def _validate_aggregation_pipeline_binding(
     final_status: Mapping[str, Any] | None,
-    pipeline: Mapping[str, Any],
+    pipeline: Mapping[str, Any], *, archive_only: bool = False,
 ) -> None:
     """Cross-check an enabled aggregation producer against the run target."""
 
-    expected_producer = _validated_pipeline_aggregation_producer(pipeline)
+    expected_producer = _validated_pipeline_aggregation_producer(
+        pipeline, archive_only=archive_only,
+    )
     if final_status is None:
         return
     certificate = final_status.get("aggregation_generation")
@@ -1682,6 +1780,73 @@ def _validate_aggregation_pipeline_binding(
         )
 
 
+def _indexing_snapshot_is_mechanically_complete(
+    final: Mapping[str, Any] | None,
+    reports: list[dict[str, Any]],
+    cycles: int,
+) -> bool:
+    """Mirror convergence's drainage predicate, not its usable-health test.
+
+    Arguments have already passed status/report shape validation. Durable
+    quarantine, source loss and malformed-authority findings are not pending
+    work: they make a drained index unhealthy, and may also coexist with work
+    that is still pending or failed in the last cycle.
+    """
+
+    return bool(
+        final is not None and cycles > 0 and len(reports) == cycles
+        and not any(final["pending"].values())
+        and not final["in_progress"]
+        and not any(reports[-1][key] for key in _INDEXING_REPORT_BOOLEAN_FIELDS)
+        and not any(reports[-1][key] for key in _INDEXING_CYCLE_FAILURE_FIELDS)
+    )
+
+
+def _validate_immediate_durable_indexing_failure(
+    code: str,
+    *,
+    complete: bool,
+    final: Mapping[str, Any] | None,
+    reports: list[dict[str, Any]],
+    cycles: int,
+) -> None:
+    """Accept honest early failure without inventing successful drainage.
+
+    These failures stop convergence immediately, even while another tier is
+    pending. Their completion flag must describe the actual last snapshot.
+    Coverage retry exhaustion and deadline failures have different semantics
+    and deliberately do not use this equality check.
+    """
+
+    if code == "quarantined_extraction":
+        if final is None or not any(final["quarantined"].values()):
+            raise BenchmarkIntegrityError(
+                "LongMemEval quarantine failure lacks durable quarantine evidence"
+            )
+    elif code == "terminal_extraction_source_loss":
+        if final is None or final["terminal_loss"]["chunks"] <= 0:
+            raise BenchmarkIntegrityError(
+                "LongMemEval terminal-loss failure lacks durable loss evidence"
+            )
+    elif code == "malformed_durable_state":
+        if final is None or not any(final["malformed"].values()):
+            raise BenchmarkIntegrityError(
+                "LongMemEval malformed-state failure lacks durable evidence"
+            )
+    else:
+        return
+    if cycles <= 0 or len(reports) != cycles:
+        raise BenchmarkIntegrityError(
+            "LongMemEval durable indexing failure lacks a completed cycle"
+        )
+    if complete is not _indexing_snapshot_is_mechanically_complete(
+        final, reports, cycles,
+    ):
+        raise BenchmarkIntegrityError(
+            "LongMemEval durable failure mechanical completion contradicts its work"
+        )
+
+
 def _validate_versioned_indexing(
     summary: Mapping[str, Any], *, require_healthy: bool, allow_failure: bool,
 ) -> bool:
@@ -1689,7 +1854,7 @@ def _validate_versioned_indexing(
     expected_fields = set(_INDEXING_SUMMARY_COMMON_FIELDS)
     if outcome == "failure":
         expected_fields.add("failure")
-    elif outcome != "success":
+    elif outcome not in {"success", "success_with_summary_degradation"}:
         raise BenchmarkIntegrityError("LongMemEval indexing outcome is malformed")
     if set(summary) != expected_fields:
         raise BenchmarkIntegrityError("LongMemEval indexing summary fields differ")
@@ -1733,14 +1898,24 @@ def _validate_versioned_indexing(
             raise BenchmarkIntegrityError(
                 "LongMemEval indexing cleanup evidence is malformed"
             )
-    if outcome == "success" and cleanup:
+    if outcome != "failure" and cleanup:
         raise BenchmarkIntegrityError(
             "LongMemEval successful indexing cannot contain cleanup failures"
         )
     final = summary.get("final_status")
     if final is not None:
         final = _validate_canonical_final_status(final)
-    if outcome == "success":
+    summary_healthy = summary.get("summary_healthy")
+    if summary_healthy is not (
+        final["summary_health"]["summary_healthy"] if final is not None else None
+    ):
+        raise BenchmarkIntegrityError("LongMemEval summary health disagrees with final status")
+    if outcome != "failure":
+        expected_outcome = (
+            "success" if summary_healthy is True else "success_with_summary_degradation"
+        )
+        if outcome != expected_outcome:
+            raise BenchmarkIntegrityError("LongMemEval indexing outcome hides summary degradation")
         if not complete or not healthy or final is None or cycles <= 0 or elapsed > timeout:
             raise BenchmarkIntegrityError("LongMemEval successful indexing state is inconsistent")
         if any(reports[-1][key] for key in _INDEXING_REPORT_BOOLEAN_FIELDS) or any(
@@ -1796,44 +1971,15 @@ def _validate_versioned_indexing(
         raise BenchmarkIntegrityError(
             "LongMemEval unavailable producer contradicts its authority evidence"
         )
-    if code == "quarantined_extraction" and (
-        final is None or not any(final["quarantined"].values())
+    _validate_immediate_durable_indexing_failure(
+        code, complete=complete, final=final, reports=reports, cycles=cycles,
+    )
+    if complete and not _indexing_snapshot_is_mechanically_complete(
+        final, reports, cycles,
     ):
         raise BenchmarkIntegrityError(
-            "LongMemEval quarantine failure lacks durable quarantine evidence"
+            "LongMemEval mechanically complete failure has blocking work"
         )
-    if code == "terminal_extraction_source_loss" and (
-        final is None or final["terminal_loss"]["chunks"] <= 0
-    ):
-        raise BenchmarkIntegrityError(
-            "LongMemEval terminal-loss failure lacks durable loss evidence"
-        )
-    if code == "malformed_durable_state" and (
-        final is None or not any(final["malformed"].values())
-    ):
-        raise BenchmarkIntegrityError(
-            "LongMemEval malformed-state failure lacks durable evidence"
-        )
-    if code in {
-        "quarantined_extraction", "terminal_extraction_source_loss",
-        "malformed_durable_state",
-    } and not complete:
-        raise BenchmarkIntegrityError(
-            "LongMemEval extraction-loss failure lacks mechanical completion"
-        )
-    if complete:
-        if (
-            final is None or cycles <= 0 or sum(final["pending"].values()) != 0
-            or final["in_progress"]
-            or any(reports[-1][key] for key in _INDEXING_REPORT_BOOLEAN_FIELDS)
-            or any(
-                reports[-1][key] != 0
-                for key in _INDEXING_CYCLE_FAILURE_FIELDS
-            )
-        ):
-            raise BenchmarkIntegrityError(
-                "LongMemEval mechanically complete failure has blocking work"
-            )
     if code == "max_cycles_exhausted" and cycles != max_cycles:
         raise BenchmarkIntegrityError(
             "LongMemEval max-cycle failure did not exhaust its cycle bound"
@@ -1924,18 +2070,16 @@ def _validate_legacy_indexing(
     )
     if healthy is not computed_healthy:
         raise BenchmarkIntegrityError("LongMemEval indexing health flag is inconsistent")
+    if healthy and canonical_final["summary_health"]["summary_healthy"] is not True:
+        raise BenchmarkIntegrityError("legacy LongMemEval indexing cannot represent summary degradation")
+    # Preserve legacy missing-field defaults, but never ignore a supplied
+    # digest/fact/profile/aggregation failure or malformed budget flag.
+    canonical_reports = [_canonical_indexing_report(report) for report in reports]
     if healthy:
         if reason is not None or cycles <= 0 or elapsed > timeout:
             raise BenchmarkIntegrityError("LongMemEval successful indexing state is inconsistent")
-        if (
-            reports[-1].get("budget_exhausted")
-            or reports[-1].get("skipped_locked")
-            or _finite_number(
-                reports[-1].get("aggregation_fusion_failures", 0), integer=True
-            ) != 0
-            or _finite_number(
-                reports[-1].get("aggregation_build_exceptions", 0), integer=True
-            ) != 0
+        if not _indexing_snapshot_is_mechanically_complete(
+            canonical_final, canonical_reports, cycles,
         ):
             raise BenchmarkIntegrityError(
                 "LongMemEval successful indexing final cycle is not clean"
@@ -1963,25 +2107,12 @@ def _validate_legacy_indexing(
         raise BenchmarkIntegrityError(
             "LongMemEval coverage failure lacks durable coverage evidence"
         )
-    if failure["code"] in {
-        "quarantined_extraction", "terminal_extraction_source_loss",
-    } and not complete:
-        raise BenchmarkIntegrityError(
-            "LongMemEval extraction-loss failure lacks mechanical completion"
-        )
-    if complete and (
-        canonical_final is None
-        or cycles <= 0 or sum(canonical_final["pending"].values()) != 0
-        or sum(canonical_final["malformed"].values()) != 0
-        or canonical_final["in_progress"]
-        or reports[-1].get("budget_exhausted") is not False
-        or reports[-1].get("skipped_locked") is not False
-        or _finite_number(
-            reports[-1].get("aggregation_fusion_failures", 0), integer=True
-        ) != 0
-        or _finite_number(
-            reports[-1].get("aggregation_build_exceptions", 0), integer=True
-        ) != 0
+    _validate_immediate_durable_indexing_failure(
+        failure["code"], complete=complete, final=canonical_final,
+        reports=canonical_reports, cycles=cycles,
+    )
+    if complete and not _indexing_snapshot_is_mechanically_complete(
+        canonical_final, canonical_reports, cycles,
     ):
         raise BenchmarkIntegrityError(
             "LongMemEval mechanically complete failure has blocking work"
@@ -2182,7 +2313,33 @@ def validate_strict_artifact(
     data: object, *, path: Path | None = None,
     require_scored: bool | None = None,
 ) -> dict[str, Any]:
-    """Validate a strict LME evidence envelope and recompute every score."""
+    """Validate strict evidence against the current producer implementation."""
+
+    return _validate_artifact(data, path=path, require_scored=require_scored,
+                              archive_only=False)
+
+
+def validate_archived_artifact(
+    data: object, *, path: Path | None = None,
+    require_scored: bool | None = None,
+) -> dict[str, Any]:
+    """Validate historical commitments, not eligibility for new execution.
+
+    Envelope, accounting, score, source and checkpoint checks still apply.
+    Historical request/retry preimages are unavailable. This explicit reader
+    does not reconstruct them from today's runtime or admit execution, resume,
+    or official prediction export.
+    """
+    result = _validate_artifact(data, path=path, require_scored=require_scored,
+                                archive_only=True)
+    return {**result, "validation_assurance": "historical_commitment_only",
+            "live_execution_eligible": False}
+
+
+def _validate_artifact(
+    data: object, *, path: Path | None,
+    require_scored: bool | None, archive_only: bool,
+) -> dict[str, Any]:
 
     if not isinstance(data, Mapping):
         raise BenchmarkIntegrityError("LongMemEval artifact root must be an object")
@@ -2220,6 +2377,8 @@ def validate_strict_artifact(
         raise BenchmarkIntegrityError("LongMemEval manifest config hash is invalid")
     if manifest.get("model_hash") != content_hash(models):
         raise BenchmarkIntegrityError("LongMemEval manifest model hash is invalid")
+    if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+        raise BenchmarkIntegrityError("LongMemEval indexing completion policy differs")
     for field in ("code_hash", "data_hash", "expected_ids_hash"):
         value = manifest.get(field)
         if not isinstance(value, str) or re.fullmatch(
@@ -2562,7 +2721,11 @@ def validate_strict_artifact(
         secret_free_endpoint=True,
     )
     try:
-        validate_extraction_canary_config_binding(
+        canary_validator = (
+            _archived_canary_validators()[0] if archive_only
+            else validate_extraction_canary_config_binding
+        )
+        canary_validator(
             config.get("extraction_canary"),
             config.get("effective_hymem_config"),
         )
@@ -2596,7 +2759,7 @@ def validate_strict_artifact(
             raise BenchmarkIntegrityError(
                 f"LongMemEval {label} model identity fields differ"
             )
-    _validated_pipeline_aggregation_producer(pipeline)
+    _validated_pipeline_aggregation_producer(pipeline, archive_only=archive_only)
     def expected_provider(endpoint: str) -> str:
         official = validate_http_endpoint(
             endpoint, label="model identity"
@@ -2758,6 +2921,16 @@ def validate_strict_artifact(
             not isinstance(failure, str) or not failure.strip()
         ):
             raise BenchmarkIntegrityError("LongMemEval failure evidence is malformed")
+        # Scored checkpoint reconciliation writes this flag on every row.
+        # Older artifacts may omit it, but a present value must agree exactly
+        # with the failure evidence (bool is required; 0/1 are not flags).
+        if "strict_failure" in row and (
+            type(row["strict_failure"]) is not bool
+            or row["strict_failure"] is not bool(failure)
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval strict failure flag differs from row outcome"
+            )
         verdict = row.get("correct")
         if scored_run:
             if row.get("retrieval_only") is True or not isinstance(verdict, bool):
@@ -2782,6 +2955,7 @@ def validate_strict_artifact(
             )
             _validate_aggregation_pipeline_binding(
                 row_indexing.get("final_status"), pipeline,
+                archive_only=archive_only,
             )
             normalized_row_indexing = dict(row_indexing)
             if normalized_row_indexing.get("schema") != LME_INDEXING_SUMMARY_VERSION:
@@ -2859,7 +3033,7 @@ def validate_strict_artifact(
                     )
                 allowed_failure_fields = {
                     "question_id", "question_type", "correct",
-                    "benchmark_failure", "retrieval_only", "oracle_ability",
+                    "benchmark_failure", "strict_failure", "retrieval_only", "oracle_ability",
                     "detected_ability", "ability_used", "distill_fired",
                     "distill_calls", "indexing", "memory_pipeline_usage",
                     "embedding_usage", "lifecycle_errors",
@@ -3033,6 +3207,8 @@ def validate_strict_artifact(
         _validate_segment_extraction_canary(
             segment, pipeline=pipeline, no_dream=config["no_dream"],
             prompt_version=config["effective_hymem_config"]["prompt_version"],
+            archive_policy=config["extraction_canary"] if archive_only else None,
+            archive_effective_config=config["effective_hymem_config"] if archive_only else None,
         )
         if segment.get("model_identities") != models:
             raise BenchmarkIntegrityError(
@@ -3382,6 +3558,16 @@ def validate_strict_artifact(
         "rows": rows,
         "scores": recomputed,
         "counts": normalized_counts,
+        "summary_degraded_questions": sum(
+            row.get("indexing", {}).get("outcome") == "success_with_summary_degradation"
+            for row in rows if isinstance(row.get("indexing"), Mapping)
+        ),
+        "summary_degraded_sessions": sum(
+            row["indexing"]["final_status"]["summary_health"]["summary_degraded_sessions"]
+            for row in rows
+            if isinstance(row.get("indexing"), Mapping)
+            and row["indexing"].get("outcome") == "success_with_summary_degradation"
+        ),
         "answer_calls": call_totals["reader"] if exact_usage else None,
         "judge_calls": call_totals["judge"] if exact_usage else None,
         "retrieval_calls": call_totals["retrieval"] if exact_usage else None,

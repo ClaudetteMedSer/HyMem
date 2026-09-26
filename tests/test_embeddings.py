@@ -410,15 +410,20 @@ def test_embedding_cache_skips_repeat_chunk_text_across_dreams(cfg):
         hy.close()
 
 
-def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
-    """The first chunk-embedding request and Phase 1 make progress together.
+def _assert_chunk_embedding_overlaps_phase1(
+    cfg, monkeypatch, *, join_before_phase1=False, release_embedding=None,
+):
+    """Exercise real providers with a causal handshake at the worker boundary.
 
-    The event handshake asserts the actual happens-before relationship instead
-    of inferring it from a wall-clock threshold.  The embedding worker waits
-    until the first Phase-1 provider call has entered; that provider call only
-    releases it after observing the embed request still in flight.  A serial
-    implementation therefore times out the handshake and fails
-    deterministically.
+    A slow Phase-1 preflight must not release the embedding worker.  Only the
+    first provider call, an explicit future join, or executor cleanup can
+    release it.  The first provider waits for the real embedding callable to
+    finish before returning, so successful observations prove overlapping
+    execution, not merely that work was submitted to an executor.
+
+    The serial negative control joins the embedding future inside submit().
+    The join releases the worker without claiming Phase 1 has entered, so the
+    same overlap assertions reject serialization without waiting for a timer.
 
     Prompt v20 performs a primary extraction and one omission-verification pass
     for every non-empty terminal result, hence exactly two Phase-1 calls for
@@ -429,8 +434,12 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
 
     from hymem.extraction.llm import LLMRequest
 
-    sync_timeout = 2.0
+    # This is only a failed-worker safety bound after provider entry; there is
+    # deliberately no timer spanning the variable-duration Phase-1 preflight.
+    sync_timeout = 30.0
     embed_started = threading.Event()
+    if release_embedding is None:
+        release_embedding = threading.Event()
     phase1_entered_while_embedding = threading.Event()
     embed_observed_phase1 = threading.Event()
     phase1_observed_embed_inflight = threading.Event()
@@ -438,6 +447,16 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
 
     from concurrent.futures import ThreadPoolExecutor as _RealThreadPoolExecutor
     from hymem.dreaming import runner as runner_mod
+
+    class ObservedFuture:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def result(self, *args, **kwargs):
+            # A serial join must finish without deadlocking the test, but must
+            # not forge the provider-entry event used by the success oracle.
+            release_embedding.set()
+            return self._inner.result(*args, **kwargs)
 
     class CoordinatedExecutor:
         """Instrument the worker boundary without altering producer identity."""
@@ -448,16 +467,23 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
         def submit(self, function):
             def coordinated():
                 embed_started.set()
-                if phase1_entered_while_embedding.wait(sync_timeout):
-                    embed_observed_phase1.set()
                 try:
+                    release_embedding.wait()
+                    if phase1_entered_while_embedding.is_set():
+                        embed_observed_phase1.set()
                     return function()
                 finally:
                     first_embed_finished.set()
 
-            return self._inner.submit(coordinated)
+            future = ObservedFuture(self._inner.submit(coordinated))
+            if join_before_phase1:
+                future.result(timeout=sync_timeout)
+            return future
 
         def shutdown(self, *args, **kwargs):
+            # The runner also shuts down on preflight/provider failures.  Free
+            # the handshake before joining, even if Phase 1 was never reached.
+            release_embedding.set()
             return self._inner.shutdown(*args, **kwargs)
 
     monkeypatch.setattr(runner_mod, "ThreadPoolExecutor", CoordinatedExecutor)
@@ -470,10 +496,17 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
         def complete(self, request: LLMRequest) -> str:
             if "source_message_id (integer)" in request.system:
                 self.phase1_calls += 1
-                if self.phase1_calls == 1 and embed_started.wait(sync_timeout):
+                if self.phase1_calls == 1:
+                    assert embed_started.wait(sync_timeout), (
+                        "the chunk embedding worker never started"
+                    )
                     if not first_embed_finished.is_set():
                         phase1_observed_embed_inflight.set()
                         phase1_entered_while_embedding.set()
+                    release_embedding.set()
+                    assert first_embed_finished.wait(sync_timeout), (
+                        "the chunk embedding worker did not finish after release"
+                    )
             return super().complete(request)
 
     embed = StubEmbeddingClient()
@@ -506,6 +539,14 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
         report = hy.dream()
 
         assert report.chunks_embedded >= 5
+        assert embed.calls
+        model, dim = embedding_storage_identity(hy._embed)
+        embedded_rows = hy.conn.execute(
+            "SELECT model, dim FROM chunk_embeddings"
+        ).fetchall()
+        assert len(embedded_rows) >= 5
+        assert all(row["model"] == model and row["dim"] == dim
+                   for row in embedded_rows)
         assert llm.phase1_calls == 5 * 2
         assert phase1_observed_embed_inflight.is_set(), (
             "Phase 1 did not observe the chunk embedding request in flight"
@@ -514,7 +555,78 @@ def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
             "the chunk embedding request finished before Phase 1 entered"
         )
     finally:
+        release_embedding.set()
         hy.close()
+
+
+def test_chunk_embedding_runs_in_parallel_with_phase1(cfg, monkeypatch):
+    _assert_chunk_embedding_overlaps_phase1(cfg, monkeypatch)
+
+
+def test_chunk_embedding_overlap_wait_has_no_preflight_timer(cfg, monkeypatch):
+    from hymem.dreaming import phase1
+
+    real_extract = phase1.extract_chunk_results
+    worker_waiting = threading.Event()
+    wait_timeouts = []
+
+    class ObservedRelease(threading.Event):
+        def wait(self, timeout=None):
+            wait_timeouts.append(timeout)
+            worker_waiting.set()
+            return super().wait(timeout)
+
+    def observed_preflight(*args, **kwargs):
+        # Confirm the worker is waiting in the real pre-provider gap.  Check
+        # the wait contract directly, not whether a chosen sleep was long
+        # enough to expire it on this machine.
+        assert worker_waiting.wait(30.0)
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(phase1, "extract_chunk_results", observed_preflight)
+    _assert_chunk_embedding_overlaps_phase1(
+        cfg, monkeypatch, release_embedding=ObservedRelease(),
+    )
+    assert wait_timeouts == [None], "embedding wait must not expire during preflight"
+
+
+def test_chunk_embedding_overlap_oracle_rejects_serial_execution(cfg, monkeypatch):
+    with pytest.raises(
+        AssertionError,
+        match="Phase 1 did not observe the chunk embedding request in flight",
+    ):
+        _assert_chunk_embedding_overlaps_phase1(
+            cfg, monkeypatch, join_before_phase1=True,
+        )
+
+
+def test_chunk_embedding_overlap_cleans_up_failed_phase1_preflight(cfg, monkeypatch):
+    from hymem.dreaming import phase1
+
+    worker_waiting = threading.Event()
+    owned_workers = []
+
+    class ObservedRelease(threading.Event):
+        def wait(self, timeout=None):
+            owned_workers.append(threading.current_thread())
+            worker_waiting.set()
+            return super().wait(timeout)
+
+    class FailedPreflight(BaseException):
+        """Bypass normal extraction retry handling to exercise runner cleanup."""
+
+    def fail_preflight(*args, **kwargs):
+        assert worker_waiting.wait(30.0)
+        assert owned_workers[0].is_alive()
+        raise FailedPreflight()
+
+    monkeypatch.setattr(phase1, "extract_chunk_results", fail_preflight)
+    with pytest.raises(FailedPreflight):
+        _assert_chunk_embedding_overlaps_phase1(
+            cfg, monkeypatch, release_embedding=ObservedRelease(),
+        )
+    assert len(owned_workers) == 1
+    assert not owned_workers[0].is_alive()
 
 
 def test_background_embed_failure_falls_back_to_post_loop_fetch(cfg, monkeypatch):

@@ -4,11 +4,15 @@
     and rejects suspiciously short LLM outputs.
   * `persist_session_summary` writes to `sessions.summary` so the
     Honcho context endpoint can prefer it over the MEMORY.md dump.
-  * Quote-wrapped LLM output is stripped; over-cap output is held for retry
-  without advancing the durable digest cursor.
+  * Quote-wrapped LLM output is stripped; over-cap output leaves an explicit
+    summary gap without blocking valid item indexing. Only independent,
+    explicitly requested summary recovery can heal that gap.
 """
 
 from __future__ import annotations
+
+import json
+from dataclasses import replace
 
 import pytest
 
@@ -38,15 +42,26 @@ def _summary_llm(summary: str) -> StubLLMClient:
 
 
 class _SequencedSummaryLLM:
-    def __init__(self, summaries: list[str]):
+    def __init__(self, summaries: list[str], *, repair_summaries: list[str] | None = None,
+                 recovery_summaries: list[str] | None = None):
         self.summaries = list(summaries)
+        self.repair_summaries = list(repair_summaries or [])
+        self.recovery_summaries = list(recovery_summaries or [])
         self.calls = []
 
     def complete(self, request) -> str:
         import json
 
         self.calls.append(request)
-        if "Return the JSON object now" not in request.user:
+        if request.system.startswith("You regenerate one rolling conversation summary"):
+            assert self.recovery_summaries, "unexpected extra independent summary recovery"
+            return json.dumps({"summary": self.recovery_summaries.pop(0)})
+        if request.system.startswith("You compact one rolling conversation summary"):
+            assert self.repair_summaries, "unexpected extra summary-only correction"
+            return json.dumps({"summary": self.repair_summaries.pop(0)})
+        if not request.system.startswith("You analyze one conversation session"):
+            if "single pass" in request.system:
+                return '{"triples":[],"markers":[],"complete":true}'
             return "[]"
         assert self.summaries, "unexpected extra digest retry"
         return json.dumps({
@@ -174,41 +189,74 @@ def test_quoted_summary_is_unwrapped(cfg):
 
 
 def test_long_summary_holds_cursor_and_heals_on_retry(cfg):
-    """An over-cap response is a failed outcome, never silent truncation."""
+    """An over-cap response holds only the summary frontier, never truncates."""
     long = "a" * 1200
     healed = "Reviewed the deployment runbook and recorded the exact outcome."
-    llm = _SequencedSummaryLLM([long, healed])
-    hy = HyMem(cfg, llm=llm)
+    # First attempt: valid full object except length, then one still-over-cap
+    # summary-only correction. Item indexing finishes; recovery is a distinct,
+    # explicitly requested source walk rather than another indexing dream.
+    llm = _SequencedSummaryLLM([long], repair_summaries=[long], recovery_summaries=[healed])
+    hy = HyMem(replace(cfg, facts_extraction_enabled=False,
+                       profile_extraction_enabled=False, aggregation_nodes_enabled=False), llm=llm)
     try:
         sid = "s_long"
         _seed_session(hy, sid, [
             ("assistant", "ok"),
             ("user", "A user turn long enough to clear the salience minimum threshold for chunking."),
         ])
-        failed = hy.dream()
+        indexed = hy.dream()
         row = hy.conn.execute(
-            "SELECT summary, digest_cursor_message_id, digest_retry_count, "
-            "digest_quarantined FROM sessions WHERE id = ?", (sid,),
+            "SELECT * FROM sessions WHERE id = ?", (sid,),
         ).fetchone()
         assert row["summary"] is None
-        assert row["digest_cursor_message_id"] is None
-        assert row["digest_retry_count"] == 1
+        assert row["auto_summary_message_id"] is row["auto_summary_generation"] is None
+        assert row["digest_cursor_message_id"] == row["digest_published_message_id"] == row["coverage_message_id"]
+        assert row["digest_retry_count"] == 0
         assert row["digest_quarantined"] == 0
-        assert failed.digest_failures == 1
-        assert failed.budget_exhausted is True
+        assert row["summary_failure_count"] == 1 and row["summary_failure_reason"] == "summary_output_cap"
+        assert indexed.digest_failures == 0
+        assert indexed.budget_exhausted is False
+        status = hy.dream_status()
+        assert status["summary_degraded_sessions"] == status["summary_missing_sessions"] == 1
+        assert status["pending_digests"] == status["malformed_summaries"] == 0
+        assert status["summary_healthy"] is False
+        primary_calls = [c for c in llm.calls
+                         if c.system.startswith("You analyze one conversation session")]
+        repair_calls = [c for c in llm.calls
+                        if c.system.startswith("You compact one rolling conversation summary")]
+        assert len(primary_calls) == len(repair_calls) == 1
+        assert json.loads(repair_calls[0].user) == {
+            "original_generation_input": primary_calls[0].user,
+        }
+        assert long not in repair_calls[0].user + repair_calls[0].system
 
-        succeeded = hy.dream()
+        before = len(llm.calls)
+        assert hy.dream().digest_failures == 0
+        assert len(llm.calls) == before
+        assert hy.dream_status()["summary_healthy"] is False
+        succeeded = hy.recover_summaries(max_calls=1, session_id=sid)
         healed_row = hy.conn.execute(
-            "SELECT summary, coverage_message_id, digest_cursor_message_id, "
-            "digest_retry_count, digest_retry_config_version, digest_quarantined "
-            "FROM sessions WHERE id = ?", (sid,),
+            "SELECT * FROM sessions WHERE id = ?", (sid,),
         ).fetchone()
         assert healed_row["summary"] == healed
         assert healed_row["digest_cursor_message_id"] == healed_row["coverage_message_id"]
         assert healed_row["digest_retry_count"] == 0
         assert healed_row["digest_retry_config_version"] is None
         assert healed_row["digest_quarantined"] == 0
-        assert succeeded.digest_failures == 0
+        assert healed_row["digest_published_generation"] == row["digest_published_generation"]
+        assert healed_row["digest_published_message_id"] == row["digest_published_message_id"]
+        assert healed_row["auto_summary_message_id"] == healed_row["digest_published_message_id"]
+        assert healed_row["auto_summary_generation"] == healed_row["digest_published_generation"]
+        assert healed_row["summary_failure_reason"] is None and healed_row["summary_failure_count"] == 0
+        assert hy.dream_status()["summary_healthy"] is True
+        assert succeeded["calls"] == succeeded["published"] == 1 and succeeded["remaining"] == 0
+        assert len([c for c in llm.calls
+                    if c.system.startswith("You analyze one conversation session")]) == 1
+        assert len([c for c in llm.calls
+                    if c.system.startswith("You compact one rolling conversation summary")]) == 1
+        assert len([c for c in llm.calls
+                    if c.system.startswith("You regenerate one rolling conversation summary")]) == 1
+        assert llm.summaries == llm.repair_summaries == llm.recovery_summaries == []
     finally:
         hy.close()
 

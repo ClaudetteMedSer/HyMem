@@ -39,7 +39,7 @@ def test_second_bootstrap_preserves_an_active_cross_process_lease(
         root=tmp_path,
         llm_api_key="test-purpose-key",
         llm_base_url="https://api.deepseek.com",
-        llm_model="deepseek-v4-flash",
+        llm_model="deepseek-flash",
         embedding_api_key=None,
         embedding_base_url=bootstrap.DEFAULT_EMBEDDING_BASE_URL,
         embedding_model=bootstrap.DEFAULT_EMBEDDING_MODEL,
@@ -258,16 +258,134 @@ def test_rollback_failure_never_masks_original_transaction_exception(tmp_path):
         observer.close()
 
 
+_CONTROL_TIMEOUT_SECONDS = 30.0
+
+
 class _BlockingLLM:
     def __init__(self):
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.returned = threading.Event()
+        self.provider_or_finished = threading.Event()
 
     def complete(self, _request: LLMRequest) -> str:
         self.entered.set()
-        if not self.release.wait(timeout=5.0):
+        self.provider_or_finished.set()
+        # This is a deadlock guard after provider entry, not a deadline for
+        # variable-duration dream preflight or an automatic successful reply.
+        if not self.release.wait(timeout=_CONTROL_TIMEOUT_SECONDS):
             raise AssertionError("test provider was not released")
+        self.returned.set()
         return "[]"
+
+
+@contextlib.contextmanager
+def _while_provider_blocked(llm, action):
+    """Keep the dream on its owner thread; control only the blocked call.
+
+    The controller has no preflight timer. A dream that fails or completes
+    without calling the provider cancels it in finally. In particular, SQLite
+    is never closed beneath a still-running dream worker during test cleanup.
+    """
+    failures: list[BaseException] = []
+    action_finished = threading.Event()
+
+    def control():
+        try:
+            llm.provider_or_finished.wait()
+            if not llm.entered.is_set():
+                return
+            assert not llm.release.is_set()
+            assert not llm.returned.is_set()
+            action()
+            assert not llm.returned.is_set()
+            action_finished.set()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            llm.release.set()
+
+    controller = threading.Thread(target=control, name="test-dream-lease-control")
+    controller.start()
+    body_completed = False
+    try:
+        yield controller
+        body_completed = True
+    finally:
+        llm.provider_or_finished.set()
+        llm.release.set()
+        controller.join(timeout=_CONTROL_TIMEOUT_SECONDS)
+        assert not controller.is_alive(), "lease test controller did not finish"
+        if failures:
+            raise failures[0]
+    if body_completed:
+        assert llm.entered.is_set(), "dream never entered the blocked provider"
+        assert action_finished.is_set(), "blocked-provider control did not run"
+
+
+def test_blocked_provider_controller_cancels_on_early_failure():
+    llm = _BlockingLLM()
+    actions = []
+    primary = KeyboardInterrupt("dream failed before provider entry")
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        with _while_provider_blocked(llm, lambda: actions.append("ran")) as controller:
+            raise primary
+
+    assert caught.value is primary
+    assert not controller.is_alive()
+    assert actions == []
+    assert not llm.entered.is_set()
+    assert llm.release.is_set()
+
+
+def test_blocked_provider_controller_requires_actual_provider_entry():
+    llm = _BlockingLLM()
+    actions = []
+    with pytest.raises(AssertionError, match="dream never entered"):
+        with _while_provider_blocked(llm, lambda: actions.append("ran")) as controller:
+            pass
+    assert not controller.is_alive()
+    assert actions == []
+
+
+def test_blocked_provider_controller_failure_releases_the_provider():
+    llm = _BlockingLLM()
+    primary = KeyboardInterrupt("controller failed during blocked call")
+
+    def fail_control():
+        assert llm.entered.is_set()
+        assert not llm.returned.is_set()
+        raise primary
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        with _while_provider_blocked(llm, fail_control) as controller:
+            llm.complete(LLMRequest(system="test", user="test", max_tokens=8))
+
+    assert caught.value is primary
+    assert not controller.is_alive()
+    assert llm.release.is_set()
+    assert llm.returned.is_set()
+
+
+def test_blocked_provider_controller_has_no_preflight_deadline():
+    llm = _BlockingLLM()
+    readiness = threading.Event()
+    wait_timeouts = []
+
+    class ObservedReadiness:
+        def wait(self, timeout=None):
+            wait_timeouts.append(timeout)
+            return readiness.wait(timeout=timeout)
+
+        def set(self):
+            readiness.set()
+
+    llm.provider_or_finished = ObservedReadiness()
+    with _while_provider_blocked(llm, lambda: None) as controller:
+        llm.complete(LLMRequest(system="test", user="test", max_tokens=8))
+    assert not controller.is_alive()
+    assert wait_timeouts == [None]
 
 
 def test_forced_takeover_while_provider_blocked_publishes_nothing(
@@ -297,36 +415,28 @@ def test_forced_takeover_while_provider_blocked_publishes_nothing(
     hy.close_session("lease-loss")
     hy._token_overlap_index = {"stale": ["cached-canonical"]}
     contender = core_db.connect(cfg.db_path)
-    caught: list[BaseException] = []
+    successor = "forced-successor"
 
-    def dream():
-        try:
-            hy.dream()
-        except BaseException as exc:
-            caught.append(exc)
+    def force_takeover():
+        # This connection belongs only to the controller, including cleanup.
+        with contextlib.closing(core_db.connect(cfg.db_path)) as controller_conn:
+            row = controller_conn.execute(
+                "SELECT holder FROM run_lock WHERE name='dreaming'"
+            ).fetchone()
+            assert row is not None
+            changed = controller_conn.execute(
+                "UPDATE run_lock SET holder=?,acquired_at=CURRENT_TIMESTAMP "
+                "WHERE name='dreaming' AND holder=?",
+                (successor, row["holder"]),
+            )
+            assert changed.rowcount == 1
 
-    thread = threading.Thread(target=dream)
-    thread.start()
     try:
-        assert llm.entered.wait(timeout=5.0)
-        row = contender.execute(
-            "SELECT holder FROM run_lock WHERE name='dreaming'"
-        ).fetchone()
-        assert row is not None
-        old_token = row["holder"]
-        successor = "forced-successor"
-        contender.execute(
-            "UPDATE run_lock SET holder=?,acquired_at=CURRENT_TIMESTAMP "
-            "WHERE name='dreaming' AND holder=?",
-            (successor, old_token),
-        )
-        llm.release.set()
-        thread.join(timeout=5.0)
+        with _while_provider_blocked(llm, force_takeover):
+            with pytest.raises(DreamLeaseLost) as caught:
+                hy.dream()
 
-        assert not thread.is_alive()
-        assert len(caught) == 1
-        assert isinstance(caught[0], DreamLeaseLost)
-        assert isinstance(caught[0].__cause__, core_db.LeaseOwnershipLost)
+        assert isinstance(caught.value.__cause__, core_db.LeaseOwnershipLost)
         assert hy._token_overlap_index is None
         assert hy.conn.execute("SELECT * FROM processed_chunks").fetchall() == []
         assert hy.conn.execute("SELECT * FROM knowledge_graph").fetchall() == []
@@ -343,8 +453,6 @@ def test_forced_takeover_while_provider_blocked_publishes_nothing(
         assert run["ended_at"] is not None
         assert run["error"] == "lease_lost"
     finally:
-        llm.release.set()
-        thread.join(timeout=5.0)
         contender.execute("DELETE FROM run_lock WHERE name='dreaming'")
         contender.close()
         hy.close()
@@ -372,11 +480,15 @@ def test_periodic_renewal_prevents_takeover_during_one_blocked_provider_call(
     real_refresh = runner._refresh_lock
 
     def observe_refresh(connection, holder):
-        # Hold only the dedicated connection at its renewal boundary. The
-        # foreground connection must still perform its initial pre-provider
-        # refresh so the dream enters the call normally.
-        if connection is not owner_connection:
-            assert allow_periodic_renewal.wait(timeout=5.0)
+        # Defer dedicated ticks until the controller has observed staleness.
+        # Do not block the heartbeat thread during variable-duration preflight:
+        # a dream failing before provider entry must still be able to stop it.
+        # The foreground's initial/pre-provider refreshes remain real.
+        if (
+            connection is not owner_connection
+            and not allow_periodic_renewal.is_set()
+        ):
+            return
         result = real_refresh(connection, holder)
         if connection is not owner_connection and lease_backdated.is_set():
             renewed_after_backdate.set()
@@ -392,55 +504,42 @@ def test_periodic_renewal_prevents_takeover_during_one_blocked_provider_call(
     )
     hy.close_session("slow-provider")
     observer = core_db.connect(cfg.db_path)
-    caught: list[BaseException] = []
 
-    def dream():
-        try:
-            hy.dream()
-        except BaseException as exc:
-            caught.append(exc)
-
-    thread = threading.Thread(target=dream)
-    thread.start()
-    try:
-        assert llm.entered.wait(timeout=5.0)
-
+    def check_renewal():
         # Deterministically move the blocked call beyond its shortened TTL;
         # relying on a 1.25-second sleep is insufficient because SQLite's
         # CURRENT_TIMESTAMP has one-second precision and staleness uses strict
         # `<`. The gated dedicated heartbeat cannot repair this row until the
         # stale state has first been observed below.
-        observer.execute(
-            "UPDATE run_lock SET acquired_at=datetime('now','-1 hour') "
-            "WHERE name='dreaming'"
-        )
-        stale = observer.execute(
-            "SELECT 1 FROM run_lock WHERE name='dreaming' "
-            "AND acquired_at < datetime('now','-1 second')"
-        ).fetchone()
-        assert stale is not None
-        lease_backdated.set()
-        allow_periodic_renewal.set()
-        assert renewed_after_backdate.wait(timeout=2.0)
+        with contextlib.closing(core_db.connect(cfg.db_path)) as controller_conn:
+            controller_conn.execute(
+                "UPDATE run_lock SET acquired_at=datetime('now','-1 hour') "
+                "WHERE name='dreaming'"
+            )
+            stale = controller_conn.execute(
+                "SELECT 1 FROM run_lock WHERE name='dreaming' "
+                "AND acquired_at < datetime('now','-1 second')"
+            ).fetchone()
+            assert stale is not None
+            lease_backdated.set()
+            allow_periodic_renewal.set()
+            assert renewed_after_backdate.wait(timeout=_CONTROL_TIMEOUT_SECONDS)
 
-        assert thread.is_alive()
-        assert runner._acquire_lock(observer, "would-be-successor") is False
-        stale = observer.execute(
-            "SELECT 1 FROM run_lock WHERE name='dreaming' "
-            "AND acquired_at < datetime('now','-1 second')"
-        ).fetchone()
-        assert stale is None
+            assert not llm.returned.is_set()
+            assert runner._acquire_lock(controller_conn, "would-be-successor") is False
+            stale = controller_conn.execute(
+                "SELECT 1 FROM run_lock WHERE name='dreaming' "
+                "AND acquired_at < datetime('now','-1 second')"
+            ).fetchone()
+            assert stale is None
 
-        llm.release.set()
-        thread.join(timeout=5.0)
-        assert not thread.is_alive()
-        assert caught == []
+    try:
+        with _while_provider_blocked(llm, check_renewal):
+            hy.dream()
         assert observer.execute(
             "SELECT * FROM run_lock WHERE name='dreaming'"
         ).fetchall() == []
     finally:
-        llm.release.set()
-        thread.join(timeout=5.0)
         observer.execute("DELETE FROM run_lock WHERE name='dreaming'")
         observer.close()
         hy.close()

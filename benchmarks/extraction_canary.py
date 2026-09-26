@@ -44,7 +44,7 @@ from hymem.extraction.contract import (
     validate_effective_config_extraction_contract,
 )
 from hymem.extraction.jsonio import loads_exact_or_fenced
-from hymem.extraction.llm import LLMClient
+from hymem.extraction.llm import LLMClient, LLMOutputTruncatedError
 from hymem.extraction.retry import DEFAULT_RETRY_ATTEMPTS
 from hymem.extraction.triples import normalize_combined_triple_item
 
@@ -53,7 +53,7 @@ from hymem.extraction.triples import normalize_combined_triple_item
 # pass now proves that provider requests carried the exact table-header/prelude
 # and adjacent-prose contexts needed by two deliberately non-self-contained
 # claims, while list and fence controls remained atomic.
-EXTRACTION_CANARY_VERSION = "hymem-phase1-extraction-canary-v17"
+EXTRACTION_CANARY_VERSION = "hymem-phase1-extraction-canary-v20"
 EXTRACTION_CANARY_TABLE_SOURCE_MESSAGE_ID = 9_271_604_311
 EXTRACTION_CANARY_PROSE_SOURCE_MESSAGE_ID = 9_271_604_312
 EXTRACTION_CANARY_SOURCE_MESSAGE_IDS = (
@@ -253,6 +253,7 @@ _CANARY_EXPECTED_CLAIMS = (
     ),
 )
 _NORMAL_EXECUTION_PATH = {
+    "provider_output_truncations": 0,
     "primary_requests": 4,
     "empty_verification_requests": 2,
     "omission_verification_requests": 2,
@@ -284,6 +285,7 @@ _POLICY_KEYS = frozenset({
     "extraction_contract",
     "fixture_version", "fixture_sha256", "source_content_chars",
     "source_split_policy_version", "clean_empty_recovery_policy_version",
+    "contract_repair_policy_version",
     "source_message_ids", "table_continuation_claim_sha256",
     "prose_boundary_claim_sha256", "list_control_sha256",
     "fenced_code_control_sha256", "normal_pass_completion_calls",
@@ -316,6 +318,7 @@ _EVIDENCE_KEYS = frozenset({
     "object_properties",
 })
 _EXECUTION_PATH_KEYS = frozenset({
+    "provider_output_truncations",
     "primary_requests",
     "empty_verification_requests",
     "omission_verification_requests",
@@ -361,7 +364,7 @@ _FAILURE_REASONS = frozenset({
 _SAFE_FAILURE_DETAIL = re.compile(r"^[a-z0-9_.\[\]-]+:[a-z0-9_]+$")
 _EXPECTED_MODES = frozenset({
     "required", "failed", "pending", "simulation", "no_dream",
-    "no_pending_work",
+    "no_pending_work", "operator_override",
 })
 
 
@@ -384,6 +387,9 @@ def extraction_canary_policy(
         ),
         "clean_empty_recovery_policy_version": (
             chunk_extraction.CLEAN_EMPTY_RECOVERY_POLICY_VERSION
+        ),
+        "contract_repair_policy_version": (
+            chunk_extraction.CONTRACT_REPAIR_POLICY_VERSION
         ),
         "source_message_ids": list(EXTRACTION_CANARY_SOURCE_MESSAGE_IDS),
         "table_continuation_claim_sha256": (
@@ -447,7 +453,8 @@ def skipped_extraction_canary(
 ) -> dict[str, Any]:
     """Exact zero-work evidence for an intentionally unattempted canary."""
 
-    if reason not in {"simulation", "no_dream", "no_pending_work"}:
+    if reason not in {"simulation", "no_dream", "no_pending_work",
+                      "operator_override"}:
         raise ValueError("unknown extraction-canary skip reason")
     report = {
         **extraction_canary_policy(prompt_version=prompt_version),
@@ -597,7 +604,7 @@ def _nonnegative_number(value: object, *, integer: bool = False):
 
 def _validate_usage(
     value: object, *, completion_calls: int, provider_attempts: int,
-    passed: bool,
+    passed: bool, provider_output_truncations: int,
 ) -> None:
     if not isinstance(value, Mapping) or set(value) != _USAGE_KEYS:
         raise _integrity("usage shape is invalid")
@@ -631,9 +638,9 @@ def _validate_usage(
     if (
         calls != successes
         or attempts != provider_attempts
-        or calls > completion_calls
+        or calls + provider_output_truncations > completion_calls
         or attempts < completion_calls
-        or (passed and calls != completion_calls)
+        or (passed and calls + provider_output_truncations != completion_calls)
     ):
         raise _integrity("usage counters do not reconcile")
 
@@ -661,10 +668,11 @@ def _validate_execution_path(
     completion_calls: int,
     initial_leaves: int,
     passed: bool,
-) -> None:
+    policy: Mapping[str, Any],
+) -> int:
     """Validate bounded evidence derived from the actual provider requests."""
 
-    if not isinstance(value, Mapping) or set(value) != _EXECUTION_PATH_KEYS:
+    if not isinstance(value, Mapping) or set(value) != set(policy["normal_execution_path"]):
         raise _integrity("execution path shape is invalid")
     path = dict(value)
     source_ids = path.pop("source_message_ids_seen")
@@ -676,7 +684,7 @@ def _validate_execution_path(
         raise _integrity("execution path structural probes are invalid")
     if (
         not isinstance(source_ids, list)
-        or len(source_ids) > len(EXTRACTION_CANARY_SOURCE_MESSAGE_IDS)
+        or len(source_ids) > len(policy["source_message_ids"])
         or any(
             isinstance(item, bool) or not isinstance(item, int) or item < 1
             for item in source_ids
@@ -689,6 +697,9 @@ def _validate_execution_path(
         for item in path.values()
     ):
         raise _integrity("execution path counters are invalid")
+    truncations = path.get("provider_output_truncations", 0)
+    if truncations > completion_calls:
+        raise _integrity("truncation count exceeds requests")
 
     primary = path["primary_requests"]
     empty = path["empty_verification_requests"]
@@ -738,7 +749,7 @@ def _validate_execution_path(
         or omission < 2
         or path["parsed_source_records"] != completion_calls
         or path["source_record_parse_failures"] != 0
-        or source_ids != list(EXTRACTION_CANARY_SOURCE_MESSAGE_IDS)
+        or source_ids != policy["source_message_ids"]
         or path["table_claim_requests"] < 2
         or path["table_claim_exact_context_requests"]
         != path["table_claim_requests"]
@@ -760,10 +771,11 @@ def _validate_execution_path(
         raise _integrity("passed report did not exercise exact context paths")
     if (
         passed
-        and completion_calls == EXTRACTION_CANARY_NORMAL_PASS_COMPLETION_CALLS
-        and not _strict_equal(value, _NORMAL_EXECUTION_PATH)
+        and completion_calls == policy["normal_pass_completion_calls"]
+        and not _strict_equal(value, policy["normal_execution_path"])
     ):
         raise _integrity("normal execution path differs from exact policy")
+    return truncations
 
 
 class _RecordingClient:
@@ -773,13 +785,18 @@ class _RecordingClient:
         self.delegate = delegate
         self.requests: list[Any] = []
         self.responses: list[tuple[Any, Any]] = []
+        self.provider_output_truncations = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
 
     def complete(self, request: Any) -> str:
         self.requests.append(request)
-        response = self.delegate.complete(request)
+        try:
+            response = self.delegate.complete(request)
+        except LLMOutputTruncatedError:
+            self.provider_output_truncations += 1
+            raise
         self.responses.append((request, response))
         return response
 
@@ -878,7 +895,8 @@ def _response_expected_claim_indexes(response: object) -> list[int]:
                 key in normalized and _strict_equal(normalized[key], value)
                 for key, value in expected.items()
             ):
-                indexes.append(index)
+                if index not in indexes:
+                    indexes.append(index)
     return indexes
 
 
@@ -1092,8 +1110,8 @@ def _validate_client(
             raise _integrity("client differs from memory pipeline")
 
 
-def _validate_claim_evidence(value: object) -> list[int]:
-    if not isinstance(value, list) or len(value) > len(_CANARY_EXPECTED_CLAIMS):
+def _validate_claim_evidence(value: object, expected_claims: list[dict]) -> list[int]:
+    if not isinstance(value, list) or len(value) > len(expected_claims):
         raise _integrity("claim evidence shape is invalid")
     indexes: list[int] = []
     for evidence in value:
@@ -1102,13 +1120,13 @@ def _validate_claim_evidence(value: object) -> list[int]:
         index = evidence.get("expected_claim_index")
         if (
             isinstance(index, bool) or not isinstance(index, int)
-            or index < 0 or index >= len(_CANARY_EXPECTED_CLAIMS)
+            or index < 0 or index >= len(expected_claims)
             or index in indexes
         ):
             raise _integrity("claim evidence indexes are invalid")
         expected = {
             "expected_claim_index": index,
-            **extraction_canary_policy()["expected_claims"][index],
+            **expected_claims[index],
         }
         if not _strict_equal(dict(evidence), expected):
             raise _integrity("claim evidence does not match the canary contract")
@@ -1133,28 +1151,49 @@ def validate_extraction_canary_report(
     The function intentionally emits structural errors only.
     """
 
+    policy = extraction_canary_policy(prompt_version=expected_prompt_version)
+    return _validate_report_with_policy(
+        value, policy=policy, expected_mode=expected_mode,
+        expected_client=expected_client, require_client_closed=require_client_closed,
+    )
+
+
+def _validate_report_with_policy(
+    value: object, *, policy: Mapping[str, Any], expected_mode: str,
+    expected_client: Mapping[str, Any] | None = None,
+    require_client_closed: bool = False,
+) -> dict[str, Any]:
+    """Private core: policy must come from a strict current/archive validator.
+
+    Historical callers supply a frozen known-version policy with a structurally
+    validated recorded contract, never a reconstructed current producer.
+    """
     if expected_mode not in _EXPECTED_MODES:
         raise _integrity("validation mode is unsupported")
     if not isinstance(value, Mapping):
         raise _integrity("report is absent")
     report = dict(value)
-    validate_extraction_canary_policy(
-        {key: report[key] for key in _POLICY_KEYS if key in report},
-        expected_prompt_version=expected_prompt_version,
-    )
+    # Archive callers supply a literal known historical policy whose key set
+    # predates repair. Current callers have already validated current keys.
+    policy_keys = frozenset(policy)
+    if not _strict_equal(
+        {key: report[key] for key in policy_keys if key in report}, dict(policy),
+    ):
+        raise _integrity("policy identity is unsupported")
 
     if expected_mode == "pending":
-        if set(report) != _POLICY_KEYS | {"status"} or report.get("status") != "pending":
+        if set(report) != policy_keys | {"status"} or report.get("status") != "pending":
             raise _integrity("pending report shape is invalid")
         return report
 
-    if expected_mode in {"simulation", "no_dream", "no_pending_work"}:
+    if expected_mode in {"simulation", "no_dream", "no_pending_work",
+                         "operator_override"}:
         expected_status = (
             "not_run_no_pending"
             if expected_mode == "no_pending_work" else "skipped_non_comparable"
         )
         if (
-            set(report) != _POLICY_KEYS | _SKIP_EXTRA_KEYS
+            set(report) != policy_keys | _SKIP_EXTRA_KEYS
             or report.get("status") != expected_status
             or report.get("skip_reason") != expected_mode
             or type(report.get("completion_calls")) is not int
@@ -1168,7 +1207,7 @@ def validate_extraction_canary_report(
         return report
 
     failed = expected_mode == "failed"
-    expected_keys = _POLICY_KEYS | _LIVE_COMMON_KEYS | (
+    expected_keys = policy_keys | _LIVE_COMMON_KEYS | (
         _FAILED_EXTRA_KEYS if failed else frozenset()
     )
     if set(report) != expected_keys:
@@ -1181,30 +1220,54 @@ def validate_extraction_canary_report(
     if (
         type(completion_calls) is not int
         or completion_calls < (0 if failed else 1)
-        or completion_calls > EXTRACTION_CANARY_MAX_COMPLETION_CALLS
+        or completion_calls > policy["max_completion_calls"]
         or type(provider_attempts) is not int
         or provider_attempts < completion_calls
-        or provider_attempts > EXTRACTION_CANARY_MAX_PROVIDER_ATTEMPTS
+        or provider_attempts > policy["max_provider_attempts"]
         or type(initial_leaves) is not int
         or initial_leaves < 0
-        or initial_leaves > EXTRACTION_CANARY_EXPECTED_PREPARTITION_LEAVES
+        or initial_leaves > policy["expected_prepartition_leaves"]
     ):
         raise _integrity("attempt counters are invalid")
     if (
         not failed
-        and completion_calls < EXTRACTION_CANARY_MIN_PASS_COMPLETION_CALLS
+        and completion_calls < policy["minimum_pass_completion_calls"]
     ):
         raise _integrity("passed report lacks omission verification")
-    _validate_usage(
-        report.get("usage"), completion_calls=completion_calls,
-        provider_attempts=provider_attempts, passed=not failed,
-    )
-    _validate_execution_path(
+    truncations = _validate_execution_path(
         report.get("execution_path"),
         completion_calls=completion_calls,
         initial_leaves=initial_leaves,
         passed=not failed,
+        policy=policy,
     )
+    _validate_usage(
+        report.get("usage"), completion_calls=completion_calls,
+        provider_attempts=provider_attempts, passed=not failed,
+        provider_output_truncations=truncations,
+    )
+    # Emissions require admitted text. A typed truncation contains no response
+    # payload and cannot substantiate a claim, even when its request was valid.
+    admitted = report["usage"]["calls"]
+    path = report["execution_path"]
+    if not failed and admitted < policy["minimum_pass_completion_calls"]:
+        raise _integrity("passed report lacks admitted verification responses")
+    if "provider_output_truncations" in path and (
+        any(path[f"{claim}_claim_exact_context_emissions"]
+            + path[f"{claim}_claim_wrong_context_emissions"] > admitted
+            for claim in ("table", "prose"))
+        or (not failed and (
+            path["table_claim_exact_context_emissions"]
+            + path["prose_claim_exact_context_emissions"] > admitted
+        ))
+    ):
+        raise _integrity("claim emissions exceed admitted responses")
+    if "provider_output_truncations" in path and any(
+        path[f"{claim}_claim_exact_context_emissions"]
+        > path[f"{claim}_claim_exact_context_requests"]
+        for claim in ("table", "prose")
+    ):
+        raise _integrity("claim emissions exceed exact-context requests")
     _validate_client(report.get("client"), expected_client=expected_client)
     closed = report.get("client_closed")
     if closed is not None and not isinstance(closed, bool):
@@ -1212,14 +1275,15 @@ def validate_extraction_canary_report(
     if require_client_closed and closed is not True:
         raise _integrity("configured client was not closed successfully")
 
-    evidence_indexes = _validate_claim_evidence(report.get("claim_evidence"))
+    expected_claims = policy["expected_claims"]
+    evidence_indexes = _validate_claim_evidence(report.get("claim_evidence"), expected_claims)
     matched = report.get("matched_supported_claims")
     missing = report.get("missing_expected_claim_indexes")
     triple_count = report.get("valid_triples_returned")
     marker_count = report.get("valid_markers_returned")
     duplicate_count = report.get("duplicate_triples_collapsed")
     expected_missing = [
-        index for index in range(len(_CANARY_EXPECTED_CLAIMS))
+        index for index in range(len(expected_claims))
         if index not in evidence_indexes
     ]
     if (
@@ -1231,12 +1295,12 @@ def validate_extraction_canary_report(
     ):
         raise _integrity("claim evidence counts do not reconcile")
     if not failed and (
-        evidence_indexes != list(range(len(_CANARY_EXPECTED_CLAIMS)))
-        or matched != len(_CANARY_EXPECTED_CLAIMS) or missing
-        or triple_count != len(_CANARY_EXPECTED_CLAIMS)
+        evidence_indexes != list(range(len(expected_claims)))
+        or matched != len(expected_claims) or missing
+        or triple_count != len(expected_claims)
         or marker_count != 0
         or duplicate_count != 0
-        or initial_leaves != EXTRACTION_CANARY_EXPECTED_PREPARTITION_LEAVES
+        or initial_leaves != policy["expected_prepartition_leaves"]
     ):
         raise _integrity("passed report is not the exact behavioral canary result")
     if failed:
@@ -1344,6 +1408,12 @@ def run_extraction_canary(
             recording_client.requests, recording_client.responses,
         ),
     }
+    base["execution_path"]["provider_output_truncations"] = (
+        recording_client.provider_output_truncations
+    )
+    if (result.completion_calls != len(recording_client.requests)
+            or base["usage"]["calls"] != len(recording_client.responses)):
+        raise _integrity("recorded completion outcomes do not reconcile")
     if result.failed:
         report = {
             **base,

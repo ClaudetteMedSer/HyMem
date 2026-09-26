@@ -47,6 +47,7 @@ class _RecordingCompletions:
 
         class _Choice:
             message = _Message()
+            finish_reason = "stop"
 
         class _Response:
             choices = [_Choice()]
@@ -101,7 +102,7 @@ def _complete(client: OpenAICompatibleClient, response_format: str = "text") -> 
 
 
 def test_default_construction_sends_thinking_disabled(calls) -> None:
-    # Defaults resolve to the DeepSeek base URL + deepseek-v4-flash, which is
+    # Defaults resolve to the DeepSeek base URL + deepseek-flash, which is
     # exactly the configuration the body key exists for.
     _complete(OpenAICompatibleClient())
     assert calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
@@ -120,7 +121,7 @@ def test_request_identity_fields_are_immutable_after_construction(calls) -> None
             setattr(client, field, value)
     assert client.aggregation_producer_declaration() == baseline
     _complete(client)
-    assert calls[0]["model"] == "deepseek-v4-flash"
+    assert calls[0]["model"] == "deepseek-flash"
 
 
 def test_retry_default_change_rotates_aggregation_producer_identity(
@@ -390,6 +391,7 @@ def _provider_response(content: str) -> Any:
     message.content = content
     choice = _Choice()
     choice.message = message
+    choice.finish_reason = "stop"
     response = _Response()
     response.choices = [choice]
     return response
@@ -532,7 +534,7 @@ def test_deepseek_regional_host_still_sends_it(calls) -> None:
 def test_deepseek_model_behind_a_gateway_still_sends_it(calls) -> None:
     _complete(
         OpenAICompatibleClient(
-            base_url="https://gateway.internal/v1", model="deepseek-v4-flash"
+            base_url="https://gateway.internal/v1", model="deepseek-flash"
         )
     )
     assert calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}

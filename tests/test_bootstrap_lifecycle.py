@@ -67,7 +67,7 @@ def _env(tmp_path: Path, *, remote_embedding: bool = True) -> bootstrap.EnvConfi
         root=tmp_path,
         llm_api_key="purpose-key",
         llm_base_url="https://api.deepseek.com",
-        llm_model="deepseek-v4-flash",
+        llm_model="deepseek-flash",
         embedding_api_key="embedding-key" if remote_embedding else None,
         embedding_base_url=(
             "https://api.openai.com/v1"

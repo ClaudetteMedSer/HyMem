@@ -140,18 +140,45 @@ def persist_auto_session_summary(
     )
 
 
-def effective_session_summary(row: sqlite3.Row | None) -> str:
+def effective_session_summary(
+    row: sqlite3.Row | None, *, summary_health: dict | None = None,
+) -> str:
     """Render the operator/legacy and rolling automatic summary coherently."""
     if row is None:
         return ""
     summary = row["summary"] or ""
     auto = row["auto_summary"] or ""
     source = row["summary_source"]
+    notice = ""
+    if summary_health is not None:
+        required = ("summary_healthy", "degraded", "missing", "malformed")
+        if any(type(summary_health.get(key)) is not bool for key in required):
+            raise ValueError("summary health is unverified")
+        if (summary_health["summary_healthy"] != (
+                not summary_health["degraded"] and not summary_health["malformed"])
+                or (summary_health["missing"] and not summary_health["degraded"])
+                or (summary_health["malformed"] and
+                    (summary_health["degraded"] or summary_health["missing"]))):
+            raise ValueError("summary health is inconsistent")
+        if summary_health["malformed"]:
+            # Unverified automatic text must not be presented as current
+            # context. Operator/legacy text retains its separate attribution.
+            auto = ""
+            if source == "auto":
+                summary = ""
+            notice = "[Automatic summary state is unverified; automatic context withheld.]"
+        elif summary_health["degraded"]:
+            notice = (
+                "[Automatic summary is stale or missing; preserved historical "
+                "context may omit newer conversation content.]"
+            )
+    def render(text: str) -> str:
+        return notice + ("\n" + text if text else "") if notice else text
     if source == "auto":
-        return auto or summary
+        return render(auto or summary)
     if summary and auto and summary != auto:
-        return (
+        return render(
             f"Operator/legacy summary: {summary}\n\n"
             f"Automatic rolling summary: {auto}"
         )
-    return summary or auto
+    return render(summary or auto)

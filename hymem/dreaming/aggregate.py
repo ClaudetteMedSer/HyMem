@@ -48,6 +48,7 @@ from collections.abc import Callable, Mapping
 from hymem.config import HyMemConfig
 from hymem.deadline import check_current_deadline
 from hymem.core import db as core_db
+from hymem.core.embedding_batches import embed_bounded
 from hymem.core.vectors import decode_vector, encode_vector
 from hymem.dreaming.aggregation_provenance import (
     AGGREGATION_CLUSTER_SALT,
@@ -1484,11 +1485,10 @@ def _prepare_candidate_node_embeddings(
             from_cache[index] = True
 
     if miss_texts:
-        if verify_material is not None:
-            verify_material()
-        embedded = embedder.embed(miss_texts)
-        if verify_material is not None:
-            verify_material()
+        embedded = embed_bounded(
+            embedder, miss_texts, identity=lambda: _embedding_identity(embedder),
+            expected_model=model, boundary=verify_material,
+        )
         if len(embedded) != len(miss_texts):
             raise RuntimeError(
                 f"embedding client returned {len(embedded)} vectors for "
@@ -1497,11 +1497,12 @@ def _prepare_candidate_node_embeddings(
         final_dim = _post_embed_identity(embedder, expected_model=model)
         if final_dim != initial_dim and any(from_cache):
             redo_indices = [index for index, hit in enumerate(from_cache) if hit]
-            if verify_material is not None:
-                verify_material()
-            redo = embedder.embed([candidates[index][1] for index in redo_indices])
-            if verify_material is not None:
-                verify_material()
+            redo = embed_bounded(
+                embedder, [candidates[index][1] for index in redo_indices],
+                identity=lambda: _embedding_identity(embedder),
+                expected_model=model, boundary=verify_material,
+                required_dim=final_dim,
+            )
             if len(redo) != len(redo_indices):
                 raise RuntimeError(
                     "embedding client returned the wrong number of node vectors"
@@ -1609,7 +1610,10 @@ def fetch_node_embeddings(
             from_cache[index] = True
 
     if miss_texts:
-        embedded = embedder.embed(miss_texts)
+        embedded = embed_bounded(
+            embedder, miss_texts, identity=lambda: _embedding_identity(embedder),
+            expected_model=model,
+        )
         if len(embedded) != len(miss_texts):
             raise RuntimeError(
                 f"embedding client returned {len(embedded)} vectors for "
@@ -1618,7 +1622,11 @@ def fetch_node_embeddings(
         final_dim = _post_embed_identity(embedder, expected_model=model)
         if final_dim != initial_dim and any(from_cache):
             redo_indices = [i for i, hit in enumerate(from_cache) if hit]
-            redo = embedder.embed([pending[i][1] for i in redo_indices])
+            redo = embed_bounded(
+                embedder, [pending[i][1] for i in redo_indices],
+                identity=lambda: _embedding_identity(embedder),
+                expected_model=model, required_dim=final_dim,
+            )
             if len(redo) != len(redo_indices):
                 raise RuntimeError(
                     "embedding client returned the wrong number of node vectors"

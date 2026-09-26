@@ -7,7 +7,6 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
-import sys
 import time
 
 import pytest
@@ -15,7 +14,7 @@ import pytest
 from hymem.core import db
 from hymem.deadline import DeadlineExceeded, MonotonicDeadline, use_deadline
 from tests.test_orphan_quarantine_rehearsal import (
-    source, _logical, _reference, historical_cli_command,
+    source, _logical, _reference, historical_cli_command, current_cli_runtime,
 )
 from tools.deployment import apply_orphan_quarantine as application
 
@@ -404,14 +403,15 @@ def test_standalone_cli_loads_staged_sibling_despite_older_tools_package(operati
     assert json.loads(result.stdout)["status"] == "verified_applied"
 
 
-def test_unmodified_current_runtime_refuses_historical_application_cli(operation):
+def test_unmodified_current_runtime_refuses_historical_application_cli(operation, tmp_path, current_cli_runtime):
     path, destination, reference = operation
     before = _snapshot(path)
+    python, environment = current_cli_runtime
     result = subprocess.run(
-        [sys.executable, str(application.__file__), "--source", str(path),
+        [*python, str(application.__file__), "--source", str(path),
          "--artifact-dir", str(destination), "--reference-sha256", reference,
          "--expected-schema", "59", "--apply"],
-        capture_output=True, text=True, timeout=30,
+        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 1 and result.stderr == ""
     assert json.loads(result.stdout) == {

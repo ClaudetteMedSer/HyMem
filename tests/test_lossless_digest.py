@@ -1084,7 +1084,7 @@ def test_derived_write_failure_rolls_back_all_digest_progress(cfg, monkeypatch):
 
         with monkeypatch.context() as patcher:
             patcher.setattr(
-                "hymem.dreaming.runner.persist_auto_session_summary",
+                    "hymem.dreaming.runner.mark_summary_current",
                 _fail_write,
             )
             with pytest.raises(RuntimeError, match="injected summary write failure"):

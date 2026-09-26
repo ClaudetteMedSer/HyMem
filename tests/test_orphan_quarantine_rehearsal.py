@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -18,7 +20,39 @@ from hymem.dreaming.aggregation_material import embedding_storage_identity
 from hymem.extraction.embeddings import MappedStubEmbeddingClient, embedding_text_hash
 
 
-_SCRIPT = Path(__file__).resolve().parents[1] / "tools/deployment/rehearse_orphan_quarantine.py"
+_REPO = Path(__file__).resolve().parents[1]
+_SCRIPT = _REPO / "tools/deployment/rehearse_orphan_quarantine.py"
+_CURRENT_CLI_PYTHON = [sys.executable, "-s", "-S", "-B", "-P"]
+
+
+def current_cli_environment(dependencies):
+    """Bind only this child to the checkout; never inherit an ambient package.
+
+    The direct-script child disables site/editable hooks and implicit cwd/script
+    imports. Its only extra search roots are this checkout and a private copy
+    of sqlite-vec, needed for the rehearsal's pre-refusal clone validation.
+    """
+    if Path(db.__file__).resolve() != _REPO / "hymem/core/db.py":
+        raise RuntimeError("current_cli_checkout_identity_mismatch")
+    environment = dict(os.environ)
+    environment.pop("PYTHONHOME", None)
+    environment["PYTHONPATH"] = os.pathsep.join((str(_REPO), str(dependencies)))
+    return environment
+
+
+@pytest.fixture
+def current_cli_runtime(tmp_path):
+    dependencies = tmp_path / "current-cli-dependencies"
+    environment = current_cli_environment(dependencies)
+    dependencies.mkdir()
+    spec = importlib.util.find_spec("sqlite_vec")
+    if spec is not None:
+        # Copy only the installed dependency, not site-packages or .pth hooks.
+        shutil.copytree(
+            Path(spec.origin).parent, dependencies / "sqlite_vec",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pth"),
+        )
+    return _CURRENT_CLI_PYTHON, environment
 
 
 def historical_cli_command(script):
@@ -286,20 +320,73 @@ def test_cli_output_never_contains_paths_identifiers_or_source_text(helper, sour
     assert json.loads(bad.stdout)["reason"] == "invalid_arguments"
 
 
-def test_unmodified_current_runtime_refuses_historical_quarantine_cli(helper, source, tmp_path):
+def test_unmodified_current_runtime_refuses_historical_quarantine_cli(helper, source, tmp_path, current_cli_runtime):
     path, _ = source
-    before = _logical(helper, path)
+    before_file, before = _digest(path), _logical(helper, path)
+    python, environment = current_cli_runtime
+    destination = tmp_path / "current-cli"
     result = subprocess.run(
-        [sys.executable, str(_SCRIPT), "--source", str(path),
-         "--rehearsal-dir", str(tmp_path / "current-cli"),
+        [*python, str(_SCRIPT), "--source", str(path),
+         "--rehearsal-dir", str(destination),
          "--reference-sha256", _reference(helper, path)],
-        capture_output=True, text=True, timeout=40,
+        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=40,
     )
     assert result.returncode == 1 and result.stderr == ""
     assert json.loads(result.stdout) == {
         "status": "refused", "reason": "reviewed_schema_required", "source_writes": 0,
     }
-    assert _logical(helper, path) == before
+    assert _digest(path) == before_file and _logical(helper, path) == before
+    # Rehearsal retains its diagnostic clones before refusing; no quarantine
+    # or restore artifact is legitimate under the unmodified current runtime.
+    assert _logical(helper, destination / "baseline.sqlite") == before
+    assert _logical(helper, destination / "working.sqlite") == before
+    assert not (destination / "quarantine.sqlite").exists()
+    assert not (destination / "baseline-restored.sqlite").exists()
+
+
+def test_current_cli_runtime_is_source_only_and_ignores_ambient_python_paths(current_cli_runtime, tmp_path, monkeypatch):
+    python, environment = current_cli_runtime
+    shadow = tmp_path / "ambient"
+    (shadow / "hymem").mkdir(parents=True)
+    (shadow / "hymem/__init__.py").write_text("raise RuntimeError('wrong ambient hymem')\n")
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+    monkeypatch.setenv("PYTHONHOME", str(shadow))
+    rebuilt = current_cli_environment(tmp_path / "current-cli-dependencies")
+    assert rebuilt["PYTHONPATH"] == environment["PYTHONPATH"]
+    environment = rebuilt
+    assert "PYTHONHOME" not in environment
+    assert environment["PYTHONPATH"].split(os.pathsep) == [
+        str(_REPO), str(tmp_path / "current-cli-dependencies"),
+    ]
+    result = subprocess.run(
+        [*python, "-c",
+         "import hashlib,json,sys; from pathlib import Path; import hymem; "
+         "from hymem.core import db; "
+         "assert 'site' not in sys.modules; assert sys.flags.no_site; "
+         "assert sys.flags.no_user_site and sys.flags.safe_path; "
+         "print(json.dumps({'package': str(Path(hymem.__file__).resolve()), "
+         "'db': str(Path(db.__file__).resolve()), "
+         "'db_sha256': hashlib.sha256(Path(db.__file__).read_bytes()).hexdigest(), "
+         "'schema': db.EXPECTED_SCHEMA_VERSION, "
+         "'migrations': [v for v, _ in db._discover_migrations()]}))"],
+        cwd=shadow, env=environment, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0 and result.stderr == ""
+    assert json.loads(result.stdout) == {
+        "package": str(_REPO / "hymem/__init__.py"),
+        "db": str(_REPO / "hymem/core/db.py"),
+        "db_sha256": _digest(_REPO / "hymem/core/db.py"),
+        "schema": db.EXPECTED_SCHEMA_VERSION,
+        "migrations": [v for v, _ in db._discover_migrations()],
+    }
+    assert db.EXPECTED_SCHEMA_VERSION > 59
+
+
+def test_current_cli_environment_rejects_wrong_checkout_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "__file__", str(tmp_path / "ambient/hymem/core/db.py"))
+    with pytest.raises(RuntimeError, match="current_cli_checkout_identity_mismatch"):
+        current_cli_environment(tmp_path / "dependencies")
+    assert not (tmp_path / "dependencies").exists()
 
 
 def test_existing_vector_shadows_require_extension(helper, source, tmp_path, monkeypatch):

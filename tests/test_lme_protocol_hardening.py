@@ -25,6 +25,7 @@ from benchmarks.strictness import (
     build_manifest,
     content_hash,
     embedding_usage_snapshot,
+    publish_checkpoint_artifact,
     usage_snapshot,
 )
 from hymem.extraction.contract import extraction_contract_binding
@@ -147,6 +148,7 @@ def _base_identity():
         "official_denominator_validated": False,
         "source_order_validated": False,
         "indexing_require_healthy": True,
+        "indexing_completion_policy": protocol.INDEXING_COMPLETION_POLICY,
         "historical_local_judge_prompts_exact_official": False,
         "official_judge_match": False,
         "judge_transport_retry_policy": protocol.LME_LOCAL_RETRY_POLICY,
@@ -602,6 +604,9 @@ def _current_indexing_report(**overrides) -> dict:
 def _current_indexing_status(**overrides) -> dict:
     status = {
         "dream_status_schema": protocol.DREAM_STATUS_SCHEMA_VERSION,
+        "summary_degraded_sessions": 0,
+        "summary_missing_sessions": 0,
+        "summary_healthy": True,
         "benchmark_indexing_status_schema": (
             protocol.BENCHMARK_INDEXING_STATUS_VERSION
         ),
@@ -757,7 +762,7 @@ def test_successful_indexing_summary_rejects_cleanup_failure_forgery():
 def test_lme_v3_preserves_all_durable_health_and_schema_identity():
     summary = _canonical_indexing_summary(failed=False)
     final = summary["final_status"]
-    assert summary["schema"] == "hymem-lme-indexing-summary-v5"
+    assert summary["schema"] == "hymem-lme-indexing-summary-v6"
     assert final["dream_status_schema"] == protocol.DREAM_STATUS_SCHEMA_VERSION
     assert final["benchmark_indexing_status_schema"] == (
         protocol.BENCHMARK_INDEXING_STATUS_VERSION
@@ -893,7 +898,7 @@ def test_lme_v3_rejects_prior_summary_and_nested_status_schema():
 
 
 @pytest.mark.parametrize(
-    "field_name", protocol._INDEXING_CYCLE_FAILURE_FIELDS,
+    "field_name", sorted(protocol._INDEXING_CYCLE_FAILURE_FIELDS),
 )
 def test_lme_v3_success_rejects_every_positive_final_cycle_error(field_name):
     summary = _canonical_indexing_summary(failed=False)
@@ -2154,6 +2159,163 @@ def test_question_lifecycle_records_coverage_failure_before_reader_or_judge(
     assert "secret source bytes" not in encoded and "Bearer token" not in encoded
 
 
+@pytest.fixture(params=["coverage_integrity_failure", "quarantined_extraction"])
+def generated_indexing_failure_archive(request, monkeypatch, tmp_path):
+    """Use the question writer and physical checkpoint, not a forged row."""
+    code = request.param
+    if code == "coverage_integrity_failure":
+        summary = _canonical_indexing_summary(failed=True)
+    else:
+        summary = _canonical_indexing_summary(failed=False)
+        summary.update({
+            "outcome": "failure", "healthy": False,
+            "failure": {"code": "quarantined_extraction", "exception_type": None},
+        })
+        summary["final_status"]["quarantined"]["quarantined_chunks"] = 1
+        assert protocol._validate_indexing(summary, allow_incomplete=True) is False
+
+    class Adapter:
+        pipeline_llm = None
+        embedding_client = None
+        last_indexing_summary = None
+
+        def open(self):
+            return self
+
+        def close(self):
+            pass
+
+        def ingest_sessions(self, *_args, **_kwargs):
+            return {"sessions": 1, "messages": 1, "chars": 5,
+                    "empty_messages_skipped": 0}
+
+        def dream_and_wait(self, *_args, **_kwargs):
+            self.last_indexing_summary = deepcopy(summary)
+            raise IndexingConvergenceError("private source bytes", summary)
+
+        def search(self, *_args, **_kwargs):
+            raise AssertionError("failed indexing must stop before retrieval")
+
+    class NeverCalled:
+        def chat(self, *_args, **_kwargs):
+            raise AssertionError("failed indexing must stop before scoring")
+
+    monkeypatch.setattr(lme, "_adapter_for_args", lambda *_args: Adapter())
+    args = SimpleNamespace(
+        keep_db=False, embeddings=False, top_k=5, auto_ability=True,
+        no_dream=False, graph_facts_first=False, permissive_default=False,
+        distill=False, distill_prompt_version=lme.DEFAULT_DISTILL_PROMPT_VERSION,
+        retrieval_only=False, max_input_tokens=16000, max_input_bytes=60000,
+        token_counter=None, judge_protocol="legacy-custom",
+        indexing_max_cycles=2, indexing_timeout_s=10.0,
+        indexing_require_healthy=True,
+    )
+    row = lme._evaluate_one_question(
+        0, 1, {
+            "question_id": "qid", "question_type": "multi-session",
+            "question": "What happened?", "answer": "gold",
+            "question_date": "2026-09-05",
+            "haystack_sessions": [[{"role": "user", "content": "source"}]],
+            "haystack_session_ids": ["session"],
+            "haystack_dates": ["2026-09-04"],
+            "answer_session_ids": ["session"],
+        }, args, NeverCalled(), NeverCalled(), "unused",
+    )
+    template = _indexing_failure_artifact()
+    template["execution"]["segments"][0]["indexing_runs"][0]["summary"] = deepcopy(summary)
+    template["execution"]["segments"][0]["latest_indexing"]["summary"] = deepcopy(summary)
+    checkpoint = tmp_path / "indexing-failure.checkpoint.json"
+    archive = tmp_path / "indexing-failure.archive.json"
+    with AtomicCheckpoint(
+        checkpoint, manifest=template["manifest"], expected_ids=["qid"],
+        scored=True,
+    ) as ledger:
+        ledger.record(
+            "qid", row=row,
+            execution_segment=template["execution"]["segments"][0],
+        )
+        durable = json.loads(checkpoint.read_text())
+        assert durable["entries"]["qid"]["status"] == "failed"
+        assert durable["entries"]["qid"]["row"]["benchmark_failure"] == (
+            f"indexing_failure:{code}"
+        )
+        assert "strict_failure" not in durable["entries"]["qid"]["row"]
+        reconciled = list(ledger.reconcile().rows)
+        assert reconciled[0]["strict_failure"] is True
+        payload = {
+            key: deepcopy(value) for key, value in template.items()
+            if key not in {"created_at", "manifest", "config", "models",
+                           "execution", "per_question", "result_digest"}
+        }
+        payload["result_digest"] = content_hash(reconciled)
+        published = publish_checkpoint_artifact(
+            ledger, archive, payload=payload,
+        )
+    archived = json.loads(archive.read_text())
+    assert archived == published
+    return archived
+
+
+def test_real_indexing_failure_writer_checkpoint_archive_validates(
+    generated_indexing_failure_archive,
+):
+    artifact = generated_indexing_failure_archive
+    assert artifact["per_question"][0]["strict_failure"] is True
+    assert artifact["per_question"][0]["benchmark_failure"] == (
+        "indexing_failure:" + artifact["per_question"][0]["indexing"]["failure"]["code"]
+    )
+    validated = protocol.validate_strict_artifact(artifact)
+    assert validated["counts"]["failed"] == 1
+    assert validated["counts"]["completed"] == 0
+    assert protocol.validate_archived_artifact(artifact)["counts"]["failed"] == 1
+
+
+@pytest.mark.parametrize("flag", [False, 0, 1, "true", None])
+def test_generated_indexing_failure_rejects_false_or_untyped_flag(
+    generated_indexing_failure_archive, flag,
+):
+    artifact = deepcopy(generated_indexing_failure_archive)
+    artifact["per_question"][0]["strict_failure"] = flag
+    _refresh_result_digest(artifact)
+    with pytest.raises(BenchmarkIntegrityError, match="strict failure flag"):
+        protocol.validate_strict_artifact(artifact)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("unknown_field", False),
+    ("hypothesis", "forged answer"),
+    ("judge_raw", "yes"),
+])
+def test_generated_indexing_failure_rejects_extra_evidence(
+    generated_indexing_failure_archive, field, value,
+):
+    artifact = deepcopy(generated_indexing_failure_archive)
+    artifact["per_question"][0][field] = value
+    _refresh_result_digest(artifact)
+    with pytest.raises(BenchmarkIntegrityError, match="evidence|fields differ"):
+        protocol.validate_strict_artifact(artifact)
+
+
+def test_optional_strict_failure_flag_is_consistent_on_success_and_legacy_rows():
+    artifact = make_artifact()
+    artifact["per_question"][0]["strict_failure"] = False
+    _refresh_result_digest(artifact)
+    assert protocol.validate_strict_artifact(artifact)["counts"]["completed"] == 1
+    artifact["per_question"][0]["strict_failure"] = True
+    _refresh_result_digest(artifact)
+    with pytest.raises(BenchmarkIntegrityError, match="strict failure flag"):
+        protocol.validate_strict_artifact(artifact)
+    del artifact["per_question"][0]["strict_failure"]
+    _refresh_result_digest(artifact)
+    assert protocol.validate_strict_artifact(artifact)["counts"]["completed"] == 1
+    legacy_failed = _indexing_failure_artifact()
+    assert "strict_failure" not in legacy_failed["per_question"][0]
+    assert protocol.validate_archived_artifact(legacy_failed)["counts"]["failed"] == 1
+    unscored = make_artifact(retrieval_only=True)
+    assert "strict_failure" not in unscored["per_question"][0]
+    assert protocol.validate_strict_artifact(unscored)["counts"]["completed"] == 1
+
+
 @pytest.mark.parametrize(
     "error_type", [BenchmarkIntegrityError, BenchmarkCleanupError]
 )
@@ -2432,6 +2594,10 @@ def test_mechanically_complete_failure_has_exact_nonblocking_state(mutate):
 def test_extraction_loss_failures_require_mechanical_completion():
     for code in ("quarantined_extraction", "terminal_extraction_source_loss"):
         summary = _canonical_indexing_summary(failed=True)
+        # This negative case claims incomplete mechanical drainage despite a
+        # clean final cycle. The shared coverage-failure fixture otherwise
+        # carries a cycle-local failure, making complete=False truthful.
+        summary["reports"][-1]["coverage_integrity_failures"] = 0
         summary.update({"complete": False})
         summary["failure"] = {"code": code, "exception_type": None}
         if code == "quarantined_extraction":

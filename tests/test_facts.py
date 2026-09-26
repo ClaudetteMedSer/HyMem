@@ -36,7 +36,7 @@ from hymem.rules import Rule
 
 # The unique closer of FACTS_USER_TEMPLATE — routes stubs and counts calls
 # without colliding with the digest/triple/profile prompts.
-_FACTS_CLOSER = "Return the JSON array of narrative facts now"
+_FACTS_CLOSER = "Return the JSON object of narrative facts now"
 
 
 # --- helpers ---------------------------------------------------------------

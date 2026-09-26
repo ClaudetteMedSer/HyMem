@@ -25,6 +25,7 @@ def _args(**overrides):
         "embeddings": False, "rules_extraction": None, "graph_multihop": False,
         "facts": None, "facts_extraction": None, "indexing_max_cycles": 10,
         "indexing_timeout_s": 30.0, "top_k": 10, "dump_context": False,
+        "indexing_completion_policy": msc.INDEXING_COMPLETION_POLICY,
         "dump_topk": False,
         "keep_db": False, "db_dir": None, "fresh": False,
         "message_fts_top_k": None, "rerank_top_k": None, "fts_top_k": None,

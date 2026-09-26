@@ -23,6 +23,10 @@ INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
 -- loader could otherwise recreate a wholly dropped aggregation domain empty.
 INSERT OR IGNORE INTO schema_meta(key, value)
 VALUES ('aggregation_typed_provenance_schema', '55');
+INSERT OR IGNORE INTO schema_meta(key, value)
+VALUES ('summary_frontier_schema', '62');
+INSERT OR IGNORE INTO schema_meta(key, value)
+VALUES ('summary_recovery_schema', '63');
 
 -- Raw session log. Hermes pushes messages in; HyMem owns the table.
 CREATE TABLE IF NOT EXISTS sessions (
@@ -116,6 +120,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- marker remains on the last complete generation, then switches it in the
     -- same transaction that retires the old rows.
     digest_published_generation TEXT,
+    -- Independent completed item-publication frontier. A rejected rolling
+    -- summary must never move its own frontier or block validated items.
+    digest_published_message_id INTEGER CHECK (
+        digest_published_message_id IS NULL OR
+        (typeof(digest_published_message_id) = 'integer' AND digest_published_message_id > 0)
+    ),
     digest_retry_count INTEGER NOT NULL DEFAULT 0
         CHECK (digest_retry_count >= 0),
     digest_retry_config_version TEXT,
@@ -129,6 +139,20 @@ CREATE TABLE IF NOT EXISTS sessions (
     auto_summary_message_id INTEGER,
     auto_summary_partial_message_id INTEGER,
     auto_summary_message_offset INTEGER NOT NULL DEFAULT 0,
+    auto_summary_generation TEXT CHECK (
+        auto_summary_generation IS NULL OR
+        (typeof(auto_summary_generation) = 'text' AND length(auto_summary_generation) > 0)
+    ),
+    summary_failure_reason TEXT CHECK (
+        summary_failure_reason IS NULL OR
+        (typeof(summary_failure_reason) = 'text' AND length(summary_failure_reason) BETWEEN 1 AND 80
+         AND summary_failure_reason NOT GLOB '*[^a-z0-9_]*'
+         AND summary_failure_reason IN ('summary_output_cap','summary_shape_failure','summary_validation_failure',
+                                        'parse_failure','output_truncated','shape_failure','prior_summary_gap'))
+    ),
+    summary_failure_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        typeof(summary_failure_count) = 'integer' AND summary_failure_count >= 0
+    ),
     summary_source TEXT CHECK (summary_source IN ('auto','operator','legacy'))
 );
 
@@ -498,7 +522,14 @@ CREATE TABLE IF NOT EXISTS kg_claim_extraction_outcomes (
     result_hash TEXT NOT NULL,
     succeeded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     phase1_generation_key TEXT
-        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT
+        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
+    local_replay_proof TEXT CHECK (
+        local_replay_proof IS NULL OR (
+            length(local_replay_proof) = 71
+            AND substr(local_replay_proof, 1, 7) = 'sha256:'
+            AND substr(local_replay_proof, 8) NOT GLOB '*[^0-9a-f]*'
+        )
+    )
 );
 CREATE TRIGGER IF NOT EXISTS kg_claim_extraction_outcomes_insert_guard
 BEFORE INSERT ON kg_claim_extraction_outcomes
@@ -1335,6 +1366,13 @@ CREATE TABLE IF NOT EXISTS digest_staging (
     generation TEXT NOT NULL,
     slice_key TEXT NOT NULL,
     summary TEXT NOT NULL CHECK (length(summary) <= 500),
+    summary_failure_reason TEXT CHECK (
+        summary_failure_reason IS NULL OR
+        (typeof(summary_failure_reason) = 'text' AND length(summary_failure_reason) BETWEEN 1 AND 80
+         AND summary_failure_reason NOT GLOB '*[^a-z0-9_]*'
+         AND summary_failure_reason IN ('summary_output_cap','summary_shape_failure','summary_validation_failure',
+                                        'parse_failure','output_truncated','shape_failure','prior_summary_gap'))
+    ),
     procedures_json TEXT NOT NULL CHECK (json_valid(procedures_json)),
     episodes_json TEXT NOT NULL CHECK (json_valid(episodes_json)),
     source_sha256 TEXT NOT NULL CHECK (length(source_sha256) = 64),
@@ -1348,6 +1386,31 @@ CREATE TABLE IF NOT EXISTS digest_staging (
 );
 
 -- Procedural memory: step-by-step workflows extracted from conversations.
+-- Private independent summary recovery is intentionally omitted from exports.
+CREATE TABLE IF NOT EXISTS summary_recovery (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    config_version TEXT NOT NULL,
+    walk_id TEXT NOT NULL CHECK (length(walk_id)=32 AND walk_id NOT GLOB '*[^0-9a-f]*'),
+    target_generation TEXT NOT NULL,
+    target_message_id INTEGER NOT NULL CHECK (typeof(target_message_id)='integer' AND target_message_id>0),
+    base_sha256 TEXT NOT NULL CHECK (length(base_sha256)=64 AND base_sha256 NOT GLOB '*[^0-9a-f]*'),
+    target_source_sha256 TEXT NOT NULL CHECK (length(target_source_sha256)=64 AND target_source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    cursor_message_id INTEGER CHECK (cursor_message_id IS NULL OR (typeof(cursor_message_id)='integer' AND cursor_message_id>0)),
+    cursor_partial_message_id INTEGER CHECK (cursor_partial_message_id IS NULL OR (typeof(cursor_partial_message_id)='integer' AND cursor_partial_message_id>0)),
+    cursor_offset INTEGER NOT NULL DEFAULT 0 CHECK (typeof(cursor_offset)='integer' AND cursor_offset>=0),
+    draft TEXT NOT NULL CHECK (typeof(draft)='text' AND length(draft)<=500),
+    source_sha256 TEXT NOT NULL CHECK (length(source_sha256)=64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    attempt_limit INTEGER NOT NULL CHECK (typeof(attempt_limit)='integer' AND attempt_limit BETWEEN 1 AND 100),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (typeof(attempts)='integer' AND attempts BETWEEN 0 AND 100),
+    failure_reason TEXT CHECK (failure_reason IS NULL OR failure_reason IN
+        ('summary_output_cap','summary_shape_failure','summary_validation_failure',
+         'parse_failure','output_truncated','shape_failure')),
+    state_sha256 TEXT NOT NULL CHECK (length(state_sha256)=64 AND state_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK ((cursor_partial_message_id IS NULL AND cursor_offset=0)
+           OR (cursor_partial_message_id IS NOT NULL AND cursor_offset>0)),
+    CHECK (attempts<=attempt_limit)
+);
+
 CREATE TABLE IF NOT EXISTS procedures (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

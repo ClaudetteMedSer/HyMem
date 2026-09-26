@@ -24,6 +24,7 @@ from hymem.extraction.jsonio import (
 from hymem.extraction.llm import (
     LLMClient,
     LLMRequest,
+    LLMOutputTruncatedError,
     measure_provider_attempts,
 )
 from hymem.extraction.markers import (
@@ -75,6 +76,11 @@ _CHUNK_EXTRACTION_INTEGRITY_FUNCTION = chunk_extraction_support_integrity
 # predictable 8192-token failure. These limits fail the whole chunk rather than
 # silently dropping input.
 _MAX_LEAF_INPUT_CHARS = 4000
+# The ordinary partition target is not a proof that a larger semantic atom is
+# invalid. If the safe splitter cannot divide a unit, permit one intact input
+# under a separate hard ceiling; never discard its source or context to fit.
+INPUT_ADMISSION_POLICY_VERSION = "hymem-bounded-whole-unit-input-v1"
+_MAX_UNSPLITTABLE_INPUT_CHARS = 8000
 _MAX_PREPARTITION_LEAVES = 32
 _MAX_SPLIT_DEPTH = 8
 # Recursive subdivision is hard-bounded in logical ``LLMClient.complete`` calls.
@@ -92,7 +98,7 @@ SHIPPED_MAX_EXTRACTION_PROVIDER_ATTEMPTS_PER_CHUNK = (
 )
 _MIN_FRAGMENT_CONTENT_CHARS = 96
 # Source records are split only at deterministic semantic/structural
-# boundaries.  V9 keeps fenced code, list items/continuations, heading/first-
+# boundaries.  V11 keeps fenced code, list items/continuations, heading/first-
 # body pairs, and defensible colon-intro/introduced-block pairs atomic. A large
 # canonical table is the one exception: it may split at a proven body-row edge,
 # and a continuation carries exact, separately labelled same-source heading or
@@ -105,9 +111,12 @@ _MIN_FRAGMENT_CONTENT_CHARS = 96
 # receives one bounded, exact preceding source window so a relationship that
 # crosses an otherwise valid sentence/paragraph boundary remains visible. The
 # repeated window is context only and never independently owns an item.
+# Explicit unit-labelled whitespace numeric tables may split at proven whole-
+# row edges, carrying their exact header and bounded introducing prelude as
+# labelled, non-owning context. Headerless and malformed numeric grids hold.
 # This identifier is part of the benchmark canary policy so a scored run cannot
 # silently reuse evidence produced under an older splitter.
-SOURCE_RECORD_SPLIT_POLICY_VERSION = "hymem-source-semantic-split-v10"
+SOURCE_RECORD_SPLIT_POLICY_VERSION = "hymem-source-semantic-split-v11"
 # Right-hand canonical-table fragments retain exact original ``content`` and
 # offsets. This separately labelled context carries the table's original
 # header+delimiter bytes and, for an introduced table, its exact heading/colon
@@ -115,6 +124,13 @@ SOURCE_RECORD_SPLIT_POLICY_VERSION = "hymem-source-semantic-split-v10"
 SOURCE_FRAGMENT_CONTEXT_VERSION = (
     "hymem-canonical-markdown-table-fragment-context-v2"
 )
+# A whitespace table is structural only when every column has an explicit
+# bracketed unit and every body row has exactly that many decimal-form cells.
+# Its continuation repeats the exact header as interpretation context, while
+# source offsets and citations continue to refer only to owned body rows.
+SOURCE_NUMERIC_TABLE_CONTEXT_VERSION = "hymem-unit-numeric-table-context-v1"
+_MAX_NUMERIC_TABLE_HEADER_CHARS = 320
+_MAX_NUMERIC_TABLE_PRELUDE_CHARS = 320
 # Unlike the table header contract, this context is an exact suffix immediately
 # preceding a prose continuation. Its bounded applicability on both sides of
 # the cut prevents a recursively split record from accumulating unbounded
@@ -134,10 +150,21 @@ _MAX_CONVERSATION_CONTEXT_APPLICABILITY_CHARS = 320
 # A terminal primary-empty result is never authoritative until that exact
 # source unit has received one direct empty-verification call.  Keeping this
 # identity separate from prompt wording lets benchmark artifacts reject the
-# former cue-split policy, which suppressed verification on child leaves.
+# former cue-split policy, which suppressed verification on child leaves, and
+# the cue/length veto on otherwise complete bounded whole-unit empty pairs.
 CLEAN_EMPTY_RECOVERY_POLICY_VERSION = (
-    "hymem-terminal-clean-empty-verification-v2"
+    "hymem-terminal-clean-empty-verification-v3"
 )
+CONTRACT_REPAIR_POLICY_VERSION = "hymem-source-only-contract-repair-v1"
+CHUNK_CONTRACT_REPAIR_USER_SUFFIX = """
+
+CONTRACT REPAIR PASS (same source and same verification role):
+The previous response failed these static contract checks: {diagnostics}.
+Re-extract the entire response from the source above. Use only the permitted
+predicates and return every required key. Do not infer facts from diagnostic
+codes, omit supported items to avoid validation, or treat rejected output as
+evidence. The original completeness, citation, and array limits still apply.
+"""
 _NEAR_BALANCED_BOUNDARY_CHARS = 512
 _MAX_TRIPLES_PER_RESPONSE = 24
 _MAX_MARKERS_PER_RESPONSE = 12
@@ -225,6 +252,7 @@ class _ExtractionUnit:
     # child so a recursively split continuation never needs to be reclassified
     # as a generic headerless grid.
     trusted_table_boundaries: tuple[int, ...] = ()
+    trusted_numeric_boundaries: tuple[int, ...] = ()
     # Exact, separately labelled preceding source slices for interpretation;
     # these are deliberately absent from source_records and allowed_ids.
     context_records: tuple[tuple[int, str], ...] = ()
@@ -534,10 +562,16 @@ def _valid_source_fragment_context(
         return False
     keys = set(value)
     kind = value.get("kind")
-    if kind == "canonical_markdown_table_header":
+    numeric = kind in {
+        "unit_numeric_table_header", "introduced_unit_numeric_table_header"
+    }
+    if kind in {"canonical_markdown_table_header", "unit_numeric_table_header"}:
         if keys != _SOURCE_FRAGMENT_CONTEXT_BASE_FIELDS:
             return False
-    elif kind == "introduced_canonical_markdown_table_header":
+    elif kind in {
+        "introduced_canonical_markdown_table_header",
+        "introduced_unit_numeric_table_header",
+    }:
         if keys != _SOURCE_FRAGMENT_CONTEXT_FIELDS:
             return False
     else:
@@ -547,7 +581,10 @@ def _valid_source_fragment_context(
     applies_through = value.get("applies_through_source_content_end")
     content = value.get("content")
     base_valid = (
-        value.get("version") == SOURCE_FRAGMENT_CONTEXT_VERSION
+        value.get("version") == (
+            SOURCE_NUMERIC_TABLE_CONTEXT_VERSION
+            if numeric else SOURCE_FRAGMENT_CONTEXT_VERSION
+        )
         and isinstance(content, str)
         and bool(content)
         and not isinstance(start, bool)
@@ -558,9 +595,14 @@ def _valid_source_fragment_context(
         and isinstance(applies_through, int)
         and 0 <= start < end == start + len(content)
         and end <= fragment_start < applies_through
-        and _is_canonical_table_header_context(content)
+        and (
+            _is_unit_numeric_header_context(content)
+            if numeric else _is_canonical_table_header_context(content)
+        )
     )
-    if not base_valid or kind == "canonical_markdown_table_header":
+    if not base_valid or kind in {
+        "canonical_markdown_table_header", "unit_numeric_table_header"
+    }:
         return base_valid
 
     prelude_start = value.get("prelude_source_content_start")
@@ -578,6 +620,7 @@ def _valid_source_fragment_context(
         and _valid_source_fragment_prelude(
             value.get("prelude_kind"), prelude_content
         )
+        and (not numeric or len(prelude_content) <= _MAX_NUMERIC_TABLE_PRELUDE_CHARS)
     )
 
 
@@ -807,6 +850,15 @@ class _MarkdownLine:
 
 @dataclass(frozen=True)
 class _MarkdownTableBlock:
+    start_line: int
+    end_line: int
+    header_end: int
+    table_end: int
+    row_boundaries: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _UnitNumericTableBlock:
     start_line: int
     end_line: int
     header_end: int
@@ -1243,6 +1295,106 @@ def _strict_markdown_table_cells(line: str) -> tuple[str, ...] | None:
     return tuple(cell.strip() for cell in stripped[1:-1].split("|"))
 
 
+_UNIT_NUMERIC_VALUE_RE = re.compile(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z"
+)
+_UNIT_NUMERIC_UNIT_RE = re.compile(r"\[[^\s\[\]]{1,24}\]\Z")
+
+
+def _unit_numeric_header_columns(line: str) -> int | None:
+    """Recognize an explicit label and bracketed unit for every column."""
+
+    if not line or len(line) > _MAX_NUMERIC_TABLE_HEADER_CHARS or "\t" in line:
+        return None
+    fields = line.split(" ")
+    fields = [field for field in fields if field]
+    if len(fields) < 4 or len(fields) % 2:
+        return None
+    for label, unit in zip(fields[::2], fields[1::2]):
+        if (
+            len(label) > 32 or not label.isidentifier()
+            or _UNIT_NUMERIC_UNIT_RE.fullmatch(unit) is None
+        ):
+            return None
+    return len(fields) // 2
+
+
+def _is_unit_numeric_header_context(content: str) -> bool:
+    lines = _markdown_lines(content)
+    return (
+        len(lines) == 1
+        and lines[0].end == len(content)
+        and content.endswith("\n")
+        and _unit_numeric_header_columns(lines[0].text) is not None
+    )
+
+
+def _unit_numeric_table_blocks(
+    text: str,
+    *,
+    lines: tuple[_MarkdownLine, ...] | None = None,
+    fenced_spans: tuple[tuple[int, int], ...] | None = None,
+) -> tuple[_UnitNumericTableBlock, ...]:
+    """Prove complete, row-atomic whitespace tables with explicit unit headers.
+
+    A blank line or EOF terminates a block. Any malformed nonblank row before
+    that terminator invalidates the block rather than turning prose or a
+    ragged row into an independently empty child.
+    """
+
+    source_lines = _markdown_lines(text) if lines is None else lines
+    fences = (
+        _fenced_code_spans(text, source_lines)
+        if fenced_spans is None else fenced_spans
+    )
+    blocks: list[_UnitNumericTableBlock] = []
+    index = 0
+    while index + 3 < len(source_lines):
+        header = source_lines[index]
+        count = _unit_numeric_header_columns(header.text)
+        if (
+            count is None
+            or (index and source_lines[index - 1].text.strip(" \t"))
+            or _offset_in_spans(header.start, fences)
+            or not header.text.strip(" \t")
+            or not _has_supported_markdown_line_ending(text, header)
+            or not text[header.start:header.end].endswith("\n")
+        ):
+            index += 1
+            continue
+        cursor = index + 1
+        while cursor < len(source_lines) and source_lines[cursor].text.strip(" \t"):
+            cursor += 1
+        rows = source_lines[index + 1:cursor]
+        if (
+            len(rows) < 3
+            or any(_offset_in_spans(row.start, fences) for row in rows)
+            or any(not _has_supported_markdown_line_ending(text, row) for row in rows)
+            or any(
+                len(row.text) > 512
+                or "\t" in row.text
+                or len(row.text.split()) != count
+                or any(
+                    len(value) > 32
+                    or _UNIT_NUMERIC_VALUE_RE.fullmatch(value) is None
+                    for value in row.text.split()
+                )
+                for row in rows
+            )
+        ):
+            index += 1
+            continue
+        blocks.append(_UnitNumericTableBlock(
+            start_line=index,
+            end_line=cursor,
+            header_end=header.end,
+            table_end=rows[-1].end,
+            row_boundaries=tuple(row.end for row in rows[:-1]),
+        ))
+        index = cursor
+    return tuple(blocks)
+
+
 def _is_canonical_table_header_context(content: str) -> bool:
     """Require exactly one canonical header and delimiter, with exact EOLs."""
 
@@ -1399,7 +1551,14 @@ def _canonical_table_context_for_cut(
     establish their own context.
     """
 
-    if inherited_context is not None and cut < local_discovery_start:
+    if (
+        inherited_context is not None
+        and inherited_context.get("kind") in {
+            "canonical_markdown_table_header",
+            "introduced_canonical_markdown_table_header",
+        }
+        and cut < local_discovery_start
+    ):
         return dict(inherited_context)
 
     suffix = text[local_discovery_start:]
@@ -1449,6 +1608,95 @@ def _canonical_table_context_for_cut(
                 "kind": "introduced_canonical_markdown_table_header",
                 "prelude_kind": prelude.kind,
                 "prelude_content": suffix[prelude.start:prelude.end],
+                "prelude_source_content_start": (
+                    base_start + local_discovery_start + prelude.start
+                ),
+                "prelude_source_content_end": (
+                    base_start + local_discovery_start + prelude.end
+                ),
+            })
+        return context
+    return None
+
+
+def _unit_numeric_boundary_points(
+    text: str,
+    inherited: tuple[int, ...] = (),
+    *,
+    local_discovery_start: int = 0,
+) -> tuple[int, ...]:
+    discovery_start = min(max(local_discovery_start, 0), len(text))
+    local = (
+        discovery_start + cut
+        for block in _unit_numeric_table_blocks(text[discovery_start:])
+        for cut in block.row_boundaries
+    )
+    return tuple(sorted({
+        cut for cut in (*inherited, *local) if 0 < cut < len(text)
+    }))
+
+
+def _unit_numeric_context_for_cut(
+    text: str,
+    *,
+    cut: int,
+    base_start: int,
+    inherited_context: dict | None,
+    local_discovery_start: int,
+) -> dict | None:
+    if (
+        inherited_context is not None
+        and inherited_context.get("kind") in {
+            "unit_numeric_table_header", "introduced_unit_numeric_table_header"
+        }
+        and cut < local_discovery_start
+    ):
+        return dict(inherited_context)
+
+    suffix = text[local_discovery_start:]
+    lines = _markdown_lines(suffix)
+    fenced_spans = _fenced_code_spans(suffix, lines)
+    list_blocks = _list_blocks(lines, fenced_spans)
+    opaque_spans = _normalized_protected_spans([
+        *fenced_spans,
+        *(span for block in list_blocks for span in block.item_spans),
+    ])
+    heading_ranges = _heading_line_ranges(lines, opaque_spans)
+    blocks = _unit_numeric_table_blocks(
+        suffix, lines=lines, fenced_spans=fenced_spans,
+    )
+    preludes = {
+        prelude.table_start_line: prelude
+        for prelude in _introduced_table_preludes(
+            suffix, lines=lines, opaque_spans=opaque_spans,
+            heading_ranges=heading_ranges,
+            table_blocks=blocks,
+        )
+    }
+    local_cut = cut - local_discovery_start
+    for block in blocks:
+        if local_cut not in block.row_boundaries:
+            continue
+        header_start = local_discovery_start + lines[block.start_line].start
+        header_end = local_discovery_start + block.header_end
+        table_end = local_discovery_start + block.table_end
+        context = {
+            "version": SOURCE_NUMERIC_TABLE_CONTEXT_VERSION,
+            "kind": "unit_numeric_table_header",
+            "content": text[header_start:header_end],
+            "source_content_start": base_start + header_start,
+            "source_content_end": base_start + header_end,
+            "applies_through_source_content_end": base_start + table_end,
+        }
+        prelude = preludes.get(block.start_line)
+        if prelude is not None:
+            prelude_content = suffix[prelude.start:prelude.end]
+            if len(prelude_content) > _MAX_NUMERIC_TABLE_PRELUDE_CHARS:
+                return None
+            context.update({
+                "kind": "introduced_unit_numeric_table_header",
+                "prelude_kind": prelude.kind,
+                "prelude_content": prelude_content,
                 "prelude_source_content_start": (
                     base_start + local_discovery_start + prelude.start
                 ),
@@ -1780,12 +2028,19 @@ def _markdown_block_analysis(text: str) -> _MarkdownBlockAnalysis:
     table_blocks = _markdown_table_blocks(
         text, lines=lines, fenced_spans=fenced_spans
     )
+    numeric_blocks = tuple(
+        block for block in _unit_numeric_table_blocks(
+            text, lines=lines, fenced_spans=fenced_spans,
+        )
+        if not _offset_in_spans(lines[block.start_line].start, opaque_spans)
+    )
+    table_like_blocks = (*table_blocks, *numeric_blocks)
     introduced_table_preludes = _introduced_table_preludes(
         text,
         lines=lines,
         opaque_spans=opaque_spans,
         heading_ranges=heading_ranges,
-        table_blocks=table_blocks,
+        table_blocks=table_like_blocks,
     )
     introduced_table_start_lines = {
         prelude.table_start_line for prelude in introduced_table_preludes
@@ -1796,7 +2051,7 @@ def _markdown_block_analysis(text: str) -> _MarkdownBlockAnalysis:
     }
 
     list_by_start = {block.start_line: block for block in list_blocks}
-    table_by_start = {block.start_line: block for block in table_blocks}
+    table_by_start = {block.start_line: block for block in table_like_blocks}
     line_index_by_start = {line.start: index for index, line in enumerate(lines)}
     fence_by_start = {
         line_index_by_start[span[0]]: span
@@ -1869,7 +2124,7 @@ def _markdown_block_analysis(text: str) -> _MarkdownBlockAnalysis:
         bind_colon_intro(block.start_line, block.item_spans[-1][1])
     for start_line, span in fence_by_start.items():
         bind_colon_intro(start_line, span[1])
-    for block in table_blocks:
+    for block in table_like_blocks:
         bind_colon_intro(block.start_line, block.table_end)
 
     for start, end in fenced_spans:
@@ -1882,7 +2137,7 @@ def _markdown_block_analysis(text: str) -> _MarkdownBlockAnalysis:
         block_end = block.item_spans[-1][1]
         if 0 < block_end < len(text):
             structural.add(block_end)
-    for block in table_blocks:
+    for block in table_like_blocks:
         block_end = block.table_end
         if 0 < block_end < len(text):
             structural.add(block_end)
@@ -1899,7 +2154,7 @@ def _markdown_block_analysis(text: str) -> _MarkdownBlockAnalysis:
     ))
     contextual_table_boundaries = tuple(sorted({
         cut
-        for block in table_blocks
+        for block in table_like_blocks
         if block.start_line in introduced_table_start_lines
         for cut in block.row_boundaries
         if 0 < cut < len(text)
@@ -1921,6 +2176,7 @@ def _semantic_split_point(
     text: str,
     *,
     trusted_table_boundaries: tuple[int, ...] = (),
+    trusted_numeric_boundaries: tuple[int, ...] = (),
     table_discovery_start: int = 0,
 ) -> int | None:
     """Choose a deterministic boundary without cutting a semantic unit.
@@ -1986,6 +2242,13 @@ def _semantic_split_point(
         )
         if table_admissible(cut)
     ])
+    # Unit-labelled numeric rows are admissible only when a source-backed
+    # caller supplied proven row edges. A source-less excerpt cannot carry
+    # the exact header/ownership context required by a continuation.
+    tiers.append([
+        cut for cut in trusted_numeric_boundaries
+        if table_admissible(cut)
+    ])
 
     near = min(_NEAR_BALANCED_BOUNDARY_CHARS, max(lower, len(text) // 4))
     for candidates in tiers:
@@ -2027,13 +2290,19 @@ def _conversation_context_slice(
 
     content = payload["content"]
     inherited = payload.get("source_fragment_context")
-    suffix = _conversation_context_suffix(content, limit)
-    if suffix is not None:
-        return suffix, inherited
     base_start = (
         0 if payload.get("source_record_version") == "hymem-claim-source-v2"
         else payload["source_content_start"]
     )
+    suffix = _conversation_context_suffix(content, limit)
+    if suffix is not None:
+        if (
+            inherited is not None
+            and base_start + len(content) - len(suffix)
+            >= inherited["applies_through_source_content_end"]
+        ):
+            inherited = None
+        return suffix, inherited
     discovery_start = _inherited_table_context_local_end(
         payload, base_start=base_start, content_length=len(content),
     )
@@ -2055,6 +2324,23 @@ def _conversation_context_slice(
         )
         if table_context is not None:
             return content[cut:], table_context
+    for cut in _unit_numeric_boundary_points(
+        content, (), local_discovery_start=discovery_start,
+    ):
+        if not (
+            len(content) - limit <= cut < len(content)
+            and (
+                not _cut_inside_spans(cut, blocks.protected_spans)
+                or cut in blocks.contextual_table_boundaries
+            )
+        ):
+            continue
+        numeric_context = _unit_numeric_context_for_cut(
+            content, cut=cut, base_start=base_start,
+            inherited_context=inherited, local_discovery_start=discovery_start,
+        )
+        if numeric_context is not None:
+            return content[cut:], numeric_context
     return None
 
 
@@ -2158,6 +2444,7 @@ def _source_unit(
     *,
     context_records: tuple[tuple[int, str], ...] = (),
     trusted_table_boundaries: tuple[int, ...] = (),
+    trusted_numeric_boundaries: tuple[int, ...] = (),
 ) -> _ExtractionUnit:
     """Render context and owned records, retaining one-sided applicability."""
 
@@ -2178,12 +2465,14 @@ def _source_unit(
         source_records=records,
         context_records=retained,
         trusted_table_boundaries=trusted_table_boundaries,
+        trusted_numeric_boundaries=trusted_numeric_boundaries,
     )
 
 
 def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit] | None:
     records = unit.source_records
     table_boundaries: tuple[int, ...] = ()
+    numeric_boundaries: tuple[int, ...] = ()
     right_context = unit.context_records
     if records is not None:
         if len(records) > 1:
@@ -2224,9 +2513,15 @@ def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit
                 unit.trusted_table_boundaries,
                 local_discovery_start=local_discovery_start,
             )
+            numeric_boundaries = _unit_numeric_boundary_points(
+                content,
+                unit.trusted_numeric_boundaries,
+                local_discovery_start=local_discovery_start,
+            )
             cut = _semantic_split_point(
                 content,
                 trusted_table_boundaries=table_boundaries,
+                trusted_numeric_boundaries=numeric_boundaries,
                 table_discovery_start=local_discovery_start,
             )
             if cut is None:
@@ -2254,12 +2549,26 @@ def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit
                 and right_table_context is None
             ):
                 return None
+            right_numeric_context = (
+                _unit_numeric_context_for_cut(
+                    content,
+                    cut=cut,
+                    base_start=base_start,
+                    inherited_context=inherited_context,
+                    local_discovery_start=local_discovery_start,
+                )
+                if cut in numeric_boundaries else None
+            )
+            if cut in numeric_boundaries and right_numeric_context is None:
+                return None
             left_record = _fragment_record(records[0], start=0, end=cut)
             right_record = _fragment_record(
                 records[0],
                 start=cut,
                 end=len(content),
-                source_fragment_context=right_table_context,
+                source_fragment_context=(
+                    right_numeric_context or right_table_context
+                ),
                 source_boundary_context=right_boundary_context,
             )
             if left_record is None or right_record is None:
@@ -2276,6 +2585,10 @@ def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit
                     tuple(point for point in table_boundaries if point < cut)
                     if len(records) == 1 else ()
                 ),
+                trusted_numeric_boundaries=(
+                    tuple(point for point in numeric_boundaries if point < cut)
+                    if len(records) == 1 else ()
+                ),
             ),
             _source_unit(
                 right_records,
@@ -2284,6 +2597,14 @@ def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit
                     tuple(
                         point - cut
                         for point in table_boundaries
+                        if point > cut
+                    )
+                    if len(records) == 1 else ()
+                ),
+                trusted_numeric_boundaries=(
+                    tuple(
+                        point - cut
+                        for point in numeric_boundaries
                         if point > cut
                     )
                     if len(records) == 1 else ()
@@ -2322,24 +2643,43 @@ def _split_unit(unit: _ExtractionUnit) -> tuple[_ExtractionUnit, _ExtractionUnit
     )
 
 
+def _bounded_whole_unit_allowed(unit: _ExtractionUnit, depth: int) -> bool:
+    """Whether an unsplittable oversized unit fits the intact-input envelope.
+
+    Call only after the existing safe splitter returned None. This is input
+    admission, not recovery from failed children or a waiver of tree limits.
+    Count encoded context and owned records together, exactly as transmitted.
+    """
+    return (
+        depth < _MAX_SPLIT_DEPTH
+        and _MAX_LEAF_INPUT_CHARS < len(unit.text)
+        <= _MAX_UNSPLITTABLE_INPUT_CHARS
+    )
+
+
 def _prepartition(
     unit: _ExtractionUnit,
 ) -> tuple[list[tuple[_ExtractionUnit, int]] | None, ChunkResult | None]:
     leaves: list[tuple[_ExtractionUnit, int]] = []
     failure_details: list[str] = []
 
+    def add_leaf(current: _ExtractionUnit, depth: int) -> bool:
+        leaves.append((current, depth))
+        if len(leaves) <= _MAX_PREPARTITION_LEAVES:
+            return True
+        failure_details.append("input:prepartition_limit_exceeded")
+        return False
+
     def visit(current: _ExtractionUnit, depth: int) -> bool:
         if len(current.text) <= _MAX_LEAF_INPUT_CHARS:
-            leaves.append((current, depth))
-            if len(leaves) <= _MAX_PREPARTITION_LEAVES:
-                return True
-            failure_details.append("input:prepartition_limit_exceeded")
-            return False
+            return add_leaf(current, depth)
         if depth >= _MAX_SPLIT_DEPTH:
             failure_details.append("split:max_depth_reached")
             return False
         split = _split_unit(current)
         if split is None:
+            if _bounded_whole_unit_allowed(current, depth):
+                return add_leaf(current, depth)
             failure_details.append("split:no_admissible_semantic_boundary")
             return False
         return visit(split[0], depth + 1) and visit(split[1], depth + 1)
@@ -2362,20 +2702,6 @@ def _unit_has_explicit_cue(unit: _ExtractionUnit) -> bool:
         ):
             return True
     return False
-
-
-def _unit_semantic_content_chars(unit: _ExtractionUnit) -> int:
-    """Underlying content length, excluding source-record JSON metadata."""
-
-    if unit.source_records is None:
-        return len(unit.text)
-    total = 0
-    for record in unit.source_records:
-        payload = _source_payload(record)
-        if payload is None:  # validated at the public boundary
-            return len(unit.text)
-        total += len(payload["content"])
-    return total
 
 
 def _consistent_unique_triples(
@@ -2587,11 +2913,12 @@ def extract_chunk(
     else:
         unit = _ExtractionUnit(text=text)
 
-    def attempt(
+    def single_attempt(
         current: _ExtractionUnit,
         *,
         verification: str | None = None,
         accepted: ChunkResult | None = None,
+        repair_diagnostics: tuple[str, ...] | None = None,
     ) -> tuple[ChunkResult, str | None]:
         if (
             budget.completion_calls
@@ -2612,6 +2939,10 @@ def extract_chunk(
         else:
             request_system = empty_verification_system if verification else system
             request_user = CHUNK_EXTRACTION_USER_TEMPLATE.format(text=current.text)
+        if repair_diagnostics is not None:
+            request_user += CHUNK_CONTRACT_REPAIR_USER_SUFFIX.format(
+                diagnostics=json.dumps(repair_diagnostics)
+            )
         request = LLMRequest(
             system=request_system,
             user=request_user,
@@ -2622,6 +2953,10 @@ def extract_chunk(
         try:
             with measure_provider_attempts(client) as attempt_measurement:
                 raw = client.complete(request)
+        except LLMOutputTruncatedError:
+            # Provider-confirmed length exhaustion may subdivide only the
+            # original source. Rejected partial text has no item authority.
+            return _failure("incomplete_response", "provider:finish_length"), None
         except Exception as exc:
             log.warning(
                 "chunk_extraction.call_failure error_type=%s", type(exc).__name__
@@ -2792,6 +3127,50 @@ def extract_chunk(
             duplicate_triples_collapsed=duplicate_triples_collapsed,
         ), raw
 
+    def attempt(
+        current: _ExtractionUnit,
+        *,
+        verification: str | None = None,
+        accepted: ChunkResult | None = None,
+    ) -> tuple[ChunkResult, str | None]:
+        # Repair is one direct call through the complete validator, never a
+        # recursive recovery/verifier loop. Rejected output never enters its
+        # request; an omission repair retains only the already validated
+        # primary comparison context and the original source/role.
+        result, raw = single_attempt(
+            current, verification=verification, accepted=accepted
+        )
+        if not result.failed:
+            return result, raw
+        stage = f"stage:{verification or 'primary'}"
+        result.failure_details = _bounded_details(
+            [stage], result.failure_details
+        )
+        if result.failure_reason not in {"contract_failure", "item_validation_failure"}:
+            return result, raw
+        original_details = result.failure_details
+        repaired, repaired_raw = single_attempt(
+            current, verification=verification, accepted=accepted,
+            repair_diagnostics=original_details,
+        )
+        if repaired.failed:
+            repaired.failure_details = _bounded_details(
+                [stage, "repair:failed"], repaired.failure_details,
+                [f"original:{result.failure_reason}"], original_details,
+            )
+            return repaired, repaired_raw
+        # Empty repair cannot erase the outstanding validation obligation in
+        # any role, especially an invalid additional omission item. Rejected
+        # items have no factual authority, but neither does discarding them
+        # establish completeness. A contract failure stays terminal rather
+        # than letting another EMPTY retry certify away the invalid response.
+        if not repaired.triples and not repaired.markers:
+            return _failure(
+                "contract_failure", stage, "repair:empty_after_invalid",
+                *original_details,
+            ), repaired_raw
+        return repaired, repaired_raw
+
     split_recoverable = {
         "parse_failure",
         "shape_failure",
@@ -2830,21 +3209,24 @@ def extract_chunk(
 
     def recover(current: _ExtractionUnit, depth: int) -> ChunkResult:
         # A recovery split can add context metadata to its children. Apply the
-        # same hard input ceiling as initial prepartitioning before any call.
+        # same split-first/intact-input envelope as initial prepartitioning.
         if len(current.text) > _MAX_LEAF_INPUT_CHARS:
             split = _split_unit(current) if depth < _MAX_SPLIT_DEPTH else None
             if split is None:
-                return _failure("resource_limit", "input:context_leaf_limit_exceeded")
-            left = recover(split[0], depth + 1)
-            if left.failed:
-                return _failed_split_after_left(left)
-            return _merge_results(left, recover(split[1], depth + 1))
+                if not _bounded_whole_unit_allowed(current, depth):
+                    return _failure("resource_limit", "input:context_leaf_limit_exceeded")
+                # Continue into the existing primary/verification ladder with
+                # this exact unit. Do not recursively retry the same input.
+            else:
+                left = recover(split[0], depth + 1)
+                if left.failed:
+                    return _failed_split_after_left(left)
+                return _merge_results(left, recover(split[1], depth + 1))
         verifier_failed = False
         verifier_split_recoverable = False
         result, _raw = attempt(current)
         if not result.failed:
             if not result.triples and not result.markers:
-                unresolved_cue_detail: str | None = None
                 if _unit_has_explicit_cue(current):
                     split = (
                         _split_unit(current)
@@ -2861,30 +3243,18 @@ def extract_chunk(
                             return _failed_split_after_left(left)
                         right = recover(split[1], depth + 1)
                         return _merge_results(left, right)
-                    if (
-                        _unit_semantic_content_chars(current)
-                        >= 2 * _MIN_FRAGMENT_CONTENT_CHARS
-                    ):
-                        unresolved_cue_detail = (
-                            "split:max_depth_reached"
-                            if depth >= _MAX_SPLIT_DEPTH
-                            else "split:no_admissible_semantic_boundary"
-                        )
                 # This is a direct, one-shot call rather than a recursive
                 # ``recover`` invocation.  Its output can receive the standard
                 # omission pass when non-empty, but can never trigger an
-                # EMPTY-of-EMPTY loop.  Even an unsplittable suspicious unit
-                # gets this genuine second look before being held fail-closed.
+                # EMPTY-of-EMPTY loop. This exact whole unit already fits the
+                # hard input ceiling. If safe subdivision is unavailable, a
+                # cue match cannot turn two complete empty responses into an
+                # invented resource failure. Actual response/budget failures
+                # remain failures, including the terminal-retry path below.
                 result, _verified_raw = attempt(current, verification="empty")
                 if result.failed:
-                    if unresolved_cue_detail is not None:
-                        result.failure_details = _bounded_details(
-                            result.failure_details, [unresolved_cue_detail]
-                        )
                     return result
                 if not result.triples and not result.markers:
-                    if unresolved_cue_detail is not None:
-                        return _failure("resource_limit", unresolved_cue_detail)
                     return result
             if result.triples or result.markers:
                 # A non-empty complete=true response is not, by itself, a

@@ -229,6 +229,7 @@ def record_claim_extraction_outcome(
     chunk_id: str,
     prompt_version: str,
     phase1_generation_key: str | None = None,
+    local_replay_proof: str | None = None,
 ) -> bool:
     """Publish the latest successful, source-validated result for a chunk.
 
@@ -396,21 +397,21 @@ def record_claim_extraction_outcome(
             conn.execute(
                 "INSERT INTO kg_claim_extraction_outcomes(" 
                 "chunk_id,prompt_version,prompt_generation,result_hash,"
-                "phase1_generation_key) VALUES (?,?,?,?,?)",
+                "phase1_generation_key,local_replay_proof) VALUES (?,?,?,?,?,?)",
                 (
                     chunk_id, prompt_version, generation, result_hash,
-                    phase1_generation_key,
+                    phase1_generation_key, local_replay_proof,
                 ),
             )
         else:
             conn.execute(
                 "UPDATE kg_claim_extraction_outcomes SET prompt_version=?,"
                 "prompt_generation=?,result_hash=?,phase1_generation_key=?,"
-                "succeeded_at=CURRENT_TIMESTAMP "
+                "local_replay_proof=?,succeeded_at=CURRENT_TIMESTAMP "
                 "WHERE chunk_id=?",
                 (
                     prompt_version, generation, result_hash,
-                    phase1_generation_key, chunk_id,
+                    phase1_generation_key, local_replay_proof, chunk_id,
                 ),
             )
     _publish_chunk_evidence(conn, chunk_id)
@@ -418,21 +419,42 @@ def record_claim_extraction_outcome(
 
 
 def refresh_claim_extraction_outcomes(
-    conn: sqlite3.Connection, chunk_ids: Iterable[str]
+    conn: sqlite3.Connection, chunk_ids: Iterable[str], *,
+    preserve_unchanged_local_proof: bool = False,
 ) -> None:
     """Refresh hashes after an authorized edge-natural/provenance merge."""
     ids = sorted({str(chunk_id) for chunk_id in chunk_ids if chunk_id})
     if not ids:
         return
     from hymem.core.db import evidence_mutation
+    has_local_proof = any(
+        row["name"] == "local_replay_proof"
+        for row in conn.execute(
+            "PRAGMA table_info(kg_claim_extraction_outcomes)"
+        ).fetchall()
+    )
 
     with evidence_mutation(conn):
         for chunk_id in ids:
-            conn.execute(
-                "UPDATE kg_claim_extraction_outcomes SET result_hash=? "
-                "WHERE chunk_id=?",
-                (claim_observation_result_hash(conn, chunk_id), chunk_id),
-            )
+            result_hash = claim_observation_result_hash(conn, chunk_id)
+            if not has_local_proof:
+                conn.execute(
+                    "UPDATE kg_claim_extraction_outcomes SET result_hash=? "
+                    "WHERE chunk_id=?", (result_hash, chunk_id),
+                )
+            elif preserve_unchanged_local_proof:
+                conn.execute(
+                    "UPDATE kg_claim_extraction_outcomes SET result_hash=?,"
+                    "local_replay_proof=CASE WHEN result_hash=? "
+                    "THEN local_replay_proof ELSE NULL END WHERE chunk_id=?",
+                    (result_hash, result_hash, chunk_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE kg_claim_extraction_outcomes SET result_hash=?,"
+                    "local_replay_proof=NULL WHERE chunk_id=?",
+                    (result_hash, chunk_id),
+                )
 
 
 def claim_retirement_authority(
@@ -2285,6 +2307,13 @@ def move_edge_provenance(
         observation_chunk_ids = {
             str(observation["chunk_id"]) for observation in observations
         }
+        observation_chunk_ids.update(
+            str(row["chunk_id"])
+            for row in conn.execute(
+                "SELECT DISTINCT chunk_id FROM kg_claim_observations "
+                "WHERE edge_id=?", (survivor_id,),
+            ).fetchall()
+        )
         for observation in observations:
             mapped_evidence = id_map.get(
                 int(observation["evidence_id"]), int(observation["evidence_id"])

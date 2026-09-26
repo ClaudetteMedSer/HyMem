@@ -368,6 +368,7 @@ def _make_strict_beam(path: Path, *, segment_status="complete"):
         "max_input_tokens": 16000, "indexing_max_cycles": 100,
         "indexing_timeout_s": 3600.0,
         "indexing_require_healthy": True,
+        "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1",
         "facts": True, "facts_extraction": False,
         "embedding": embedding,
         "effective_hymem_config": {

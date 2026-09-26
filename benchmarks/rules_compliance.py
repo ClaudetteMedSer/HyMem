@@ -45,6 +45,7 @@ from pathlib import Path
 
 from hymem import HyMem, HyMemConfig
 from hymem.contrib.model_policy import (
+    RECOMMENDED_DEEPSEEK_MODEL,
     DeprecatedModelAliasError,
     require_active_model,
 )
@@ -234,11 +235,11 @@ def _report(res: dict, s: dict, verbose: bool) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Idea B rules-adherence box gate.")
-    ap.add_argument("--answer-model", default="deepseek-v4-flash",
+    ap.add_argument("--answer-model", default=RECOMMENDED_DEEPSEEK_MODEL,
                     help="answerer model; 'stub' for a no-API plumbing run")
     ap.add_argument("--answer-base-url", default=None)
     ap.add_argument("--answer-api-key", default=None)
-    ap.add_argument("--judge-model", default="deepseek-v4-flash",
+    ap.add_argument("--judge-model", default=RECOMMENDED_DEEPSEEK_MODEL,
                     help="judge model; 'stub' for a plumbing run")
     ap.add_argument("--judge-base-url", default=None)
     ap.add_argument("--judge-api-key", default=None)

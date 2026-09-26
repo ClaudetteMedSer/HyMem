@@ -105,10 +105,10 @@ def resolve(conn: sqlite3.Connection, surface: str) -> str:
 def register_alias(conn: sqlite3.Connection, surface: str, canonical: str) -> None:
     """Map a pure surface form onto an existing canonical id.
 
-    If the normalized surface already owns canonical state, this operation
-    would strand that state behind the new alias because ``resolve`` is
-    intentionally one hop.  Such identity changes must use :func:`merge`,
-    which rewrites and re-hashes every provenance-bearing domain.
+    A new mapping cannot replace an identity that already owns canonical
+    state: ``resolve`` is intentionally one hop, so that change requires
+    :func:`merge`. Re-registering an unchanged mapping is a no-op, including
+    when historical state still names the alias key.
     """
     if not isinstance(surface, str) or not isinstance(canonical, str):
         raise ValueError("entity alias and canonical must be strings")
@@ -130,6 +130,8 @@ def register_alias(conn: sqlite3.Connection, surface: str, canonical: str) -> No
         and str(existing_alias["canonical"]) != canonical
     ):
         raise ValueError("entity alias already maps to another canonical identity")
+    if existing_alias is not None:
+        return
     if alias != canonical:
         owned = False
         scalar_owners = (
@@ -678,3 +680,22 @@ def merge(
         )
 
         refresh_phase1_auxiliary_outcomes(conn, auxiliary_identities)
+        # A merge can change only auxiliary identity rows while every claim
+        # remains on an existing edge. Those chunks still lose their local
+        # ordered-input replay proof; no historical proof is reconstructed.
+        if "local_replay_proof" in {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(kg_claim_extraction_outcomes)"
+            ).fetchall()
+        }:
+            from hymem.core.db import evidence_mutation
+
+            with evidence_mutation(conn):
+                conn.executemany(
+                    "UPDATE kg_claim_extraction_outcomes SET "
+                    "local_replay_proof=NULL WHERE chunk_id=?",
+                    [(chunk_id,) for chunk_id in sorted({
+                        chunk_id for chunk_id, _ in auxiliary_identities
+                    })],
+                )

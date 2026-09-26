@@ -14,17 +14,20 @@ import argparse
 import json
 import math
 import re
+import sys
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hymem.contrib.endpoint_policy import (
     TRANSPORT_SECURITY_NONE,
     validate_http_endpoint,
     validate_recorded_embedding_endpoint,
 )
-from hymem.contrib.model_policy import require_active_model
 
 try:  # package imports in tests
     from .archive_evidence import (validate_checkpoint_attestation, validate_scoped_indexing,
@@ -35,6 +38,7 @@ try:  # package imports in tests
     )
     from .strictness import (
         CHECKPOINT_VERSION,
+        INDEXING_COMPLETION_POLICY,
         STRICT_PROTOCOL_VERSION,
         BenchmarkIntegrityError,
         content_hash,
@@ -50,6 +54,7 @@ except (ImportError, ValueError):  # direct CLI
     )
     from strictness import (  # type: ignore
         CHECKPOINT_VERSION,
+        INDEXING_COMPLETION_POLICY,
         STRICT_PROTOCOL_VERSION,
         BenchmarkIntegrityError,
         content_hash,
@@ -271,6 +276,11 @@ def _validate_embedding_usage(
 def _validate_model_identity(
     models: Mapping[str, Any], *, scored: bool, simulation: bool,
 ) -> None:
+    """Validate recorded identity, not current provider/model availability.
+
+    The live adapters enforce retirement policy before execution. Applying it
+    here would retroactively revoke immutable archives when that policy changes.
+    """
     if set(models) != {"reader", "judge", "memory_pipeline", "embedding"}:
         raise _fail("model identity is incomplete")
     for role in ("reader", "judge", "memory_pipeline", "embedding"):
@@ -341,7 +351,6 @@ def _validate_model_identity(
         ):
             raise _fail("live provider model identity is absent")
         try:
-            require_active_model(model, role=f"MSC {label}")
             endpoint = validate_http_endpoint(role.get("base_url"), label=label)
         except (TypeError, ValueError) as exc:
             raise _fail("live provider identity is unsafe") from exc
@@ -452,6 +461,8 @@ def _expected_effective_hymem_config(
 def _validate_config(
     config: Mapping[str, Any], *, models: Mapping[str, Any],
 ) -> None:
+    if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+        raise _fail("indexing completion policy differs")
     for field in (
         "embeddings", "graph_multihop", "no_dream", "dream_per_session",
         "dump_context", "sim", "label_free_answer_path", "scored_run",

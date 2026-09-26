@@ -279,9 +279,14 @@ def _immutable_code_constant(
     # unusually deep input; the ordinary depth-limited serializer still runs.
     if depth > 12:
         return False
-    if value is None or type(value) in (bool, int, str, float, bytes):
+    value_type = type(value)
+    if value is None or any(
+        value_type is candidate for candidate in (bool, int, str, float, bytes)
+    ):
         return True
-    if type(value) not in (tuple, frozenset, types.CodeType):
+    if not any(
+        value_type is candidate for candidate in (tuple, frozenset, types.CodeType)
+    ):
         return False
     if verified is None:
         verified = set()
@@ -377,7 +382,11 @@ def _code_global_names(code: types.CodeType) -> tuple[str, ...]:
         return _uncached_code_global_names(code)
 
 
-def _loaded_identity_value(value: object, *, depth: int = 0) -> object:
+def _loaded_identity_record(
+    value: object, *, depth: int = 0, visit: Callable[..., object] | None = None,
+) -> object:
+    if visit is None:
+        visit = _loaded_identity_record
     if depth > 12:
         return ["depth-limit", type(value).__module__, type(value).__qualname__]
     if value is None or isinstance(value, (bool, int, str)):
@@ -395,24 +404,24 @@ def _loaded_identity_value(value: object, *, depth: int = 0) -> object:
                 item = cell.cell_contents
             except ValueError:
                 item = ("empty-cell",)
-            closure.append(_loaded_identity_value(item, depth=depth + 1))
+            closure.append(visit(item, depth=depth + 1))
         return [
             "function", value.__module__, value.__qualname__,
             _loaded_code_record(value.__code__),
-            _loaded_identity_value(value.__defaults__, depth=depth + 1),
-            _loaded_identity_value(value.__kwdefaults__, depth=depth + 1),
+            visit(value.__defaults__, depth=depth + 1),
+            visit(value.__kwdefaults__, depth=depth + 1),
             closure,
         ]
     if isinstance(value, (staticmethod, classmethod)):
-        return [type(value).__name__, _loaded_identity_value(
+        return [type(value).__name__, visit(
             value.__func__, depth=depth + 1,
         )]
     if isinstance(value, property):
         return [
             "property",
-            _loaded_identity_value(value.fget, depth=depth + 1),
-            _loaded_identity_value(value.fset, depth=depth + 1),
-            _loaded_identity_value(value.fdel, depth=depth + 1),
+            visit(value.fget, depth=depth + 1),
+            visit(value.fset, depth=depth + 1),
+            visit(value.fdel, depth=depth + 1),
         ]
     if isinstance(value, type):
         members: list[list[object]] = []
@@ -427,7 +436,7 @@ def _loaded_identity_value(value: object, *, depth: int = 0) -> object:
                 or name.isupper()
             ):
                 members.append([
-                    name, _loaded_identity_value(member, depth=depth + 1),
+                    name, visit(member, depth=depth + 1),
                 ])
         return [
             "class", value.__module__, value.__qualname__,
@@ -437,30 +446,212 @@ def _loaded_identity_value(value: object, *, depth: int = 0) -> object:
     if isinstance(value, Mapping):
         items = [
             [
-                _loaded_identity_value(key, depth=depth + 1),
-                _loaded_identity_value(item, depth=depth + 1),
+                visit(key, depth=depth + 1),
+                visit(item, depth=depth + 1),
             ]
             for key, item in value.items()
         ]
-        items.sort(key=lambda item: json.dumps(
-            item[0], ensure_ascii=True, sort_keys=True, separators=(",", ":"),
-        ))
+        items.sort(key=lambda item: _identity_record_sort_key(item[0]))
         return ["mapping", items]
     if isinstance(value, (tuple, list)):
         return [type(value).__name__, [
-            _loaded_identity_value(item, depth=depth + 1) for item in value
+            visit(item, depth=depth + 1) for item in value
         ]]
     if isinstance(value, (set, frozenset)):
         items = [
-            _loaded_identity_value(item, depth=depth + 1) for item in value
+            visit(item, depth=depth + 1) for item in value
         ]
-        items.sort(key=lambda item: json.dumps(
-            item, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
-        ))
+        items.sort(key=_identity_record_sort_key)
         return [type(value).__name__, items]
     if isinstance(value, re.Pattern):
         return ["regex", value.pattern, value.flags]
     return ["typed-opaque", type(value).__module__, type(value).__qualname__]
+
+
+def _loaded_identity_value(value: object, *, depth: int = 0) -> object:
+    """Return a fresh ordinary record tree, including independent alias copies."""
+
+    return _loaded_identity_record(value, depth=depth)
+
+
+class _LoadedIdentityFragment:
+    """An internal, already canonical JSON value; never a caller-owned record."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+def _identity_record_sort_key(value: object) -> str:
+    if type(value) is _LoadedIdentityFragment:
+        return value.text
+    # These are JSON's exact primitive encodings. Avoid constructing a whole
+    # encoder for each literal field in an already-built identity record.
+    if type(value) is str:
+        return json.encoder.encode_basestring_ascii(value)
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) is int:
+        return str(value)
+    return json.dumps(
+        value, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    )
+
+
+def _identity_record_json(value: object) -> str:
+    """Compose canonical JSON without re-encoding repeated record subtrees."""
+
+    if type(value) is _LoadedIdentityFragment:
+        return value.text
+    if type(value) is list:
+        return "[" + ",".join(_identity_record_json(item) for item in value) + "]"
+    if type(value) is dict:
+        if not all(type(key) is str for key in value):
+            # Runtime-domain metadata can be mutated to contain JSON-legal
+            # numeric keys. JSON quotes/converts those keys before emission.
+            return _identity_record_sort_key(value)
+        return "{" + ",".join(
+            _identity_record_sort_key(key) + ":" + _identity_record_json(value[key])
+            for key in sorted(value)
+        ) + "}"
+    return _identity_record_sort_key(value)
+
+
+class _LoadedIdentityEncoder:
+    """Share depth-specific JSON fragments during exactly one identity read.
+
+    Generated dataclass methods close over their class. Expanding that graph
+    separately through every method and binding multiplies work until the
+    depth limit, despite observing identical object/depth pairs. Both traversal
+    and JSON serialization can reuse their fragments, without changing the
+    old depth-limited commitment or caching mutable state across reads.
+
+    The input references prevent id reuse; the per-call entry cap bounds
+    retention. No context is global or thread-local, so user hooks that reenter
+    identity construction get a separate context. Dynamic subclasses and
+    opaque code constants form barriers: clear prior observations and do not
+    retain enclosing records whose traversal could have executed user hooks.
+    """
+
+    __slots__ = ("_memo", "_memo_bytes", "_epoch")
+    _MAX_ENTRIES = 4096
+    _MAX_BYTES = 8 * 1024 * 1024
+
+    def __init__(self) -> None:
+        self._memo: dict[
+            tuple[int, int], tuple[object, _LoadedIdentityFragment]
+        ] = {}
+        self._memo_bytes = 0
+        self._epoch = 0
+
+    def _barrier(self) -> None:
+        self._memo.clear()
+        self._memo_bytes = 0
+        self._epoch += 1
+
+    def value(self, value: object, *, depth: int = 0) -> _LoadedIdentityFragment:
+        key = (id(value), depth)
+        cached = self._memo.get(key)
+        if cached is not None:
+            return cached[1]
+
+        # Only built-in containers/descriptors have hook-free structural reads.
+        # Subclasses retain the original serializer's per-occurrence behavior.
+        value_type = type(value)
+        safe = (
+            value is None or value_type is str or value_type is int
+            or value_type is types.FunctionType or value_type is type
+            or value_type is tuple or value_type is dict or value_type is list
+            or value_type is bool or value_type is float or value_type is bytes
+            or value_type is types.CodeType or value_type is staticmethod
+            or value_type is classmethod or value_type is property
+            or value_type is set or value_type is frozenset
+            or value_type is re.Pattern
+        )
+        if safe and depth <= 12 and isinstance(
+            value, (types.CodeType, types.FunctionType),
+        ):
+            code = value.__code__ if isinstance(value, types.FunctionType) else value
+            try:
+                # Reuse the existing immutable-piece cache. Its eligibility
+                # check is hook-free and rejects synthetic mutable constants
+                # before serializing them, so their observation order remains
+                # that of the ordinary record builder below.
+                _immutable_loaded_code_sha256(_CodeIdentity(code))
+            except TypeError:
+                safe = False
+        if not safe:
+            self._barrier()
+        epoch = self._epoch
+        try:
+            if (
+                value_type is types.FunctionType
+                and value.__closure__ is None
+                and value.__defaults__ is None
+                and value.__kwdefaults__ is None
+            ):
+                # This fixed-size record cannot contain a shared descendant.
+                # Let the C JSON encoder process it in one operation.
+                text = _identity_record_sort_key(_loaded_identity_record(
+                    value, depth=depth,
+                ))
+            else:
+                text = _identity_record_json(_loaded_identity_record(
+                    value, depth=depth, visit=self.value,
+                ))
+            result = _LoadedIdentityFragment(text)
+        finally:
+            if not safe:
+                self._barrier()
+        if (
+            safe and self._epoch == epoch
+            and len(self._memo) < self._MAX_ENTRIES
+            and self._memo_bytes + len(result.text) <= self._MAX_BYTES
+        ):
+            self._memo[key] = (value, result)
+            self._memo_bytes += len(result.text)
+        return result
+
+
+def _flat_identity_state(value: object) -> bool:
+    """Recognize small hook-free trees that need no fragment bookkeeping."""
+
+    def atom(item: object) -> bool:
+        item_type = type(item)
+        return (
+            item is None or item_type is bool or item_type is int
+            or item_type is str or item_type is float or item_type is bytes
+        )
+
+    if atom(value):
+        return True
+    if type(value) is tuple or type(value) is list:
+        return len(value) <= 32 and all(atom(item) for item in value)
+    if type(value) is dict:
+        return len(value) <= 32 and all(
+            atom(key) and atom(item) for key, item in value.items()
+        )
+    return False
+
+
+def _loaded_identity_fragment(value: object) -> _LoadedIdentityFragment:
+    # Most ordinary module functions have no closure and only scalar defaults.
+    # Preserve their cheap one-shot C encoding; the memoized path is for the
+    # shared/cyclic state that actually benefits from it. No state is retained
+    # across roots, including roots separated by discovery hooks.
+    if _flat_identity_state(value) or (
+        type(value) is types.FunctionType
+        and not value.__closure__
+        and _flat_identity_state(value.__defaults__)
+        and _flat_identity_state(value.__kwdefaults__)
+    ):
+        return _LoadedIdentityFragment(_identity_record_sort_key(
+            _loaded_identity_value(value),
+        ))
+    return _LoadedIdentityEncoder().value(value)
 
 
 def canonical_callable_sha256(*callables: Callable[..., object]) -> str:
@@ -471,14 +662,13 @@ def canonical_callable_sha256(*callables: Callable[..., object]) -> str:
     after package files are atomically replaced during a rolling deploy.
     """
 
-    payload = json.dumps(
+    payload = _identity_record_json(
         {
             "runtime": _LOADED_CODE_RUNTIME_DOMAIN,
             "callables": [
-                _loaded_identity_value(function) for function in callables
+                _loaded_identity_fragment(function) for function in callables
             ],
         },
-        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
@@ -618,12 +808,11 @@ def canonical_module_sha256(*modules: object) -> str:
             constant = member_name.lstrip("_").isupper()
             if defined_here or constant:
                 members.append([
-                    member_name, _loaded_identity_value(value),
+                    member_name, _loaded_identity_fragment(value),
                 ])
         normalized.append(["module", name, members])
-    payload = json.dumps(
+    payload = _identity_record_json(
         {"runtime": _LOADED_CODE_RUNTIME_DOMAIN, "modules": normalized},
-        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
@@ -670,7 +859,9 @@ def canonical_module_slice_sha256(module: object, *roots: str) -> str:
         if name in selected:
             continue
         value = namespace[name]
-        selected[name] = _loaded_identity_value(value)
+        # Discovery below may invoke caller-controlled descriptor/module hooks.
+        # Do not carry observations across separately discovered bindings.
+        selected[name] = _loaded_identity_fragment(value)
         for code in code_objects(value):
             for dependency in _code_global_names(code):
                 if dependency not in namespace:
@@ -683,14 +874,13 @@ def canonical_module_slice_sha256(module: object, *roots: str) -> str:
                     or dependency.startswith("_")
                 ):
                     pending.append(dependency)
-    payload = json.dumps(
+    payload = _identity_record_json(
         {
             "runtime": _LOADED_CODE_RUNTIME_DOMAIN,
             "module": module_name,
             "roots": sorted(set(roots)),
             "bindings": [[name, selected[name]] for name in sorted(selected)],
         },
-        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 

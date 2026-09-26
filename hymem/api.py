@@ -21,6 +21,7 @@ from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.deadline import MonotonicDeadline
 from hymem.core import db as core_db
+from hymem.core.embedding_batches import EmbeddingInputTooLarge, EmbeddingResponseInvalid
 from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.dreaming import canonicalize as canon
 from hymem.dreaming import evidence as evidence_ledger
@@ -440,6 +441,16 @@ class HyMem:
                 if pending is not None:
                     with core_db.transaction(self.conn):
                         persist_message_embeddings(self.conn, pending)
+            except EmbeddingInputTooLarge:
+                log.error(
+                    "embedding.message_input_too_large batch_size=%d", len(batch)
+                )
+                continue
+            except EmbeddingResponseInvalid:
+                log.error(
+                    "embedding.message_response_invalid batch_size=%d", len(batch)
+                )
+                continue
             except Exception as exc:  # provider failure leaves retryable rows
                 consecutive_failures += 1
                 log.error(
@@ -995,6 +1006,28 @@ class HyMem:
 
     # ---- dreaming ----------------------------------------------------
 
+    def recover_summaries(
+        self, *, max_calls: int = 1, max_attempts: int = 3,
+        max_chars: int = 8000, max_tokens: int = 3072,
+        timeout_seconds: float = 120.0, session_id: str | None = None,
+    ) -> dict:
+        """Explicit, bounded context repair, independent of item indexing.
+
+        This may spend LLM calls. It never extracts or republishes items and
+        never turns a partial summary into current context. The worker owns
+        the same cross-process lease as dreaming; callers must not already
+        own a transaction. Exhausted source slices stay visibly degraded.
+        """
+        if self._llm is None:
+            raise RuntimeError("HyMem.recover_summaries requires an LLMClient")
+        from hymem.dreaming.summary_recovery import run_summary_recovery
+
+        return run_summary_recovery(
+            self.conn, self._llm, max_calls=max_calls, max_attempts=max_attempts,
+            max_chars=max_chars, max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds, session_id=session_id,
+        )
+
     def dream(
         self,
         *,
@@ -1214,6 +1247,13 @@ class HyMem:
             stamps still owed below their exact quarantine bounds.
           - `malformed_*`: structurally invalid cursor/retry/authority state.
             These counters are health blockers and never convert to success.
+          - `summary_degraded_sessions`, `summary_missing_sessions`, and
+            `summary_healthy`: independent context-summary coverage health.
+            Valid stale/missing summaries do not block source-backed item
+            indexing; their counters survive no-op dreams. Malformed summary
+            metadata remains blocking. Health proves accepted structure and
+            contiguous source input, not the semantic truth of model output.
+            Explicit `recover_summaries` work has its own provider-call budget.
           - `terminal_loss_chunks`: chunks whose exact source manifest is
             irrecoverably absent. They are not successful and never reopen on
             a prompt change; `terminal_loss_reasons` provides the breakdown.

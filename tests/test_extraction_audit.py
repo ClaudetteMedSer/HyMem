@@ -193,7 +193,7 @@ def test_migration_is_empty_and_reopen_heals_only_owned_support(store, stamp):
     conn.execute("UPDATE schema_meta SET value=? WHERE key='schema_version'", (str(stamp),))
     original = audit.carrier_record(conn, owner)
     db.initialize(conn)
-    assert db.schema_version(conn) == 61
+    assert db.schema_version(conn) == db.EXPECTED_SCHEMA_VERSION
     assert audit.carrier_record(conn, owner) == original
     assert conn.execute("SELECT COUNT(*) FROM kg_evidence_extraction_audit").fetchone()[0] == 0
     with db.evidence_history_mutation(conn):

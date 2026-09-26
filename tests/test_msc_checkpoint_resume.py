@@ -1386,9 +1386,9 @@ def test_registry_rejects_score_affecting_config_semantic_tamper(
         ),
         (
             lambda m: m["memory_pipeline"].__setitem__(
-                "model", "deepseek-chat"
+                "model", " deepseek-chat"
             ),
-            "provider identity is unsafe",
+            "model identity is absent",
         ),
         (
             lambda m: m["embedding"].__setitem__("backend", "forged"),

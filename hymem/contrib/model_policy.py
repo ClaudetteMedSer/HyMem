@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from hymem.contrib.implementation_identity import import_time_source_sha256
 
-RECOMMENDED_DEEPSEEK_MODEL = "deepseek-v4-flash"
+RECOMMENDED_DEEPSEEK_MODEL = "deepseek-flash"
 DEPRECATED_DEEPSEEK_ALIASES = frozenset({
     "deepseek-chat",
     "deepseek-reasoner",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
 })
 
 

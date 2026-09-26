@@ -183,6 +183,7 @@ def _strict_artifact() -> dict:
         "indexing_max_cycles": 100,
         "indexing_timeout_s": 3600.0,
         "indexing_require_healthy": True,
+        "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1",
         "judge_protocol": "official",
         "official_judge_protocol_match": True,
         "official_protocol_aligned": True,

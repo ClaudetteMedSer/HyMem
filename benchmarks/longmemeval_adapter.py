@@ -57,6 +57,7 @@ from hymem.contrib.endpoint_policy import (  # noqa: E402
 )
 from hymem.contrib.model_policy import (  # noqa: E402
     DeprecatedModelAliasError,
+    RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
 )
 
@@ -65,6 +66,7 @@ from benchmarks.strictness import (
     BenchmarkCleanupError,
     BenchmarkIntegrityError,
     IndexingConvergenceError,
+    INDEXING_COMPLETION_POLICY,
     OwnedResourceScope,
     PythonSourceSlice,
     aggregate_embedding_usage_snapshots,
@@ -366,15 +368,15 @@ DEFAULT_INDEXING_TIMEOUT_S = 3600.0
 # DeepSeek API
 DEEPSEEK_API_KEY = ""
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-PINNED_DEEPSEEK_MODEL = "deepseek-v4-flash"
+PINNED_DEEPSEEK_MODEL = RECOMMENDED_DEEPSEEK_MODEL
 ANSWER_MODEL = PINNED_DEEPSEEK_MODEL
 JUDGE_MODEL = PINNED_DEEPSEEK_MODEL
 
-# Local embedding server (lever L1) — the FastEmbed ONNX server Hermes runs in
-# production. These are the OUT-OF-THE-BOX defaults for --embeddings so the flag
-# works with no env setup; every field is still overridable via HYMEM_EMBEDDING_*.
-# DeepSeek has no embeddings API, so this benchmark deliberately points at its
-# own local FastEmbed service. api_key="local" because that service ignores it.
+# Local embedding defaults for lever L1. Enabling --embeddings still requires
+# a running service plus explicit deployment revision and tenant attestation.
+# A container must use a reachable endpoint, including /v1 for this service;
+# trusted non-loopback HTTP also needs an explicit transport opt-in. The adapter
+# pins the dimension; HYMEM_EMBEDDING_* may override these defaults.
 LOCAL_EMBED_BASE_URL = "http://localhost:8766/v1"
 LOCAL_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 LOCAL_EMBED_DIM = 384
@@ -714,12 +716,11 @@ def resolve_model_extra_body(
 ) -> tuple[dict, bool]:
     """Return a safe, effective raw request body extension.
 
-    DeepSeek v4-flash writes its usable answer to the ordinary ``content``
-    field only when thinking is disabled.  An omitted body therefore gets the
-    required vendor extension automatically on the actual DeepSeek endpoint.
-    A caller-provided body remains authoritative, but a DeepSeek v4-flash body
-    that would leave thinking enabled is rejected instead of producing a
-    capability score from empty completions.
+    The bounded raw benchmark paths use non-reasoning Flash requests so that
+    reasoning cannot consume the answer budget. An omitted body gets that
+    vendor extension on the actual DeepSeek endpoint. An explicit incompatible
+    body is rejected. This pure transformation also retains the old v4-flash
+    handling for historical artifact validation; it is not live admission.
 
     The endpoint check is deliberately exact-host.  A custom OpenAI-compatible
     gateway never receives a DeepSeek-only key merely because its model name
@@ -734,21 +735,28 @@ def resolve_model_extra_body(
     was_absent = extra_body is None
     host = (urlsplit(normalized_base).hostname or "").casefold()
     is_deepseek_endpoint = host == "api.deepseek.com"
-    is_v4_flash = "v4-flash" in model.casefold()
+    is_flash = (
+        model.casefold() == "deepseek-flash"
+        or "v4-flash" in model.casefold()
+    )
 
-    if was_absent and is_deepseek_endpoint and is_v4_flash:
+    if was_absent and is_deepseek_endpoint and is_flash:
         return copy.deepcopy(THINKING_DISABLED), True
-    if is_deepseek_endpoint and is_v4_flash:
+    if is_deepseek_endpoint and is_flash:
         thinking = body.get("thinking")
         if not isinstance(thinking, dict) or thinking.get("type") != "disabled":
             raise BenchmarkIntegrityError(
-                "DeepSeek v4-flash requires thinking.type='disabled'; omit "
+                "DeepSeek Flash requires thinking.type='disabled'; omit "
                 "the extra-body option to use the safe default"
             )
     return body, False
 
 
 # ── LLM Client ──────────────────────────────────────────────────────
+
+class LLMResponseError(RuntimeError):
+    """A received response failed admission; resubmitting is not a retry."""
+
 
 class LLMClient:
     def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
@@ -796,6 +804,7 @@ class LLMClient:
         self.total_latency_s = 0.0
         self.token_usage_available = False
         self._usage_complete = True
+        self._accounted_response_attempts = 0
         self.last_error: str | None = None
         # Guards the two counters so they aggregate correctly when many worker
         # threads share this client (--workers > 1).
@@ -807,25 +816,13 @@ class LLMClient:
         last_exception_type = "Exception"
         for attempt in range(3):
             try:
-                content, usage = self._call(messages, temperature, max_tokens)
-                with self._lock:
-                    required = ("prompt_tokens", "completion_tokens", "total_tokens")
-                    valid = all(
-                        isinstance(usage.get(key), (int, float))
-                        and not isinstance(usage.get(key), bool)
-                        and usage[key] >= 0
-                        for key in required
-                    )
-                    if valid:
-                        self.prompt_tokens += usage["prompt_tokens"]
-                        self.completion_tokens += usage["completion_tokens"]
-                        self.total_tokens += usage["total_tokens"]
-                    else:
-                        self._usage_complete = False
-                    self.token_usage_available = (
-                        self.successful_responses > 0 and self._usage_complete
-                    )
+                content, _usage = self._call(messages, temperature, max_tokens)
                 return content
+            except LLMResponseError as e:
+                # A received response is accounted, then rejected once. A
+                # second paid response cannot be called a transport retry.
+                last_exception_type = _bounded_exception_type(e)
+                break
             except Exception as e:
                 last_error = str(e)
                 last_exception_type = _bounded_exception_type(e)
@@ -837,12 +834,6 @@ class LLMClient:
                     self.token_usage_available = False
                 if "429" in last_error or "rate" in last_error.lower():
                     time.sleep(15 * (attempt + 1))
-                elif "null content" in last_error and "finish=length" in last_error:
-                    # Deterministic truncation: the reasoning model burned the
-                    # output budget and emitted no answer. Retrying with the SAME
-                    # cap re-spends the call for the same result — fail fast and
-                    # let the caller's parse-failure ceiling catch the aggregate.
-                    break
                 elif attempt < 2:
                     time.sleep(3)
                 else:
@@ -865,6 +856,7 @@ class LLMClient:
         started = time.monotonic()
         with self._lock:
             self.request_attempts += 1
+            self.token_usage_available = False
         try:
             resp = http.post(
                 f"{self.base_url}/chat/completions",
@@ -873,31 +865,64 @@ class LLMClient:
                 timeout=120,
             )
             resp.raise_for_status()
-            data = resp.json()
+        except Exception:
+            with self._lock:
+                self._usage_complete = False
+                self.token_usage_available = False
+            raise
         finally:
             with self._lock:
                 self.total_latency_s += time.monotonic() - started
-        content = data["choices"][0]["message"].get("content")
-        if content is None:
-            # A 200 with content=null. Transient provider behavior should be
-            # retried like a 429; a null from finish_reason=length is
-            # deterministic truncation (chat() fails that one fast). Either
-            # way, returning None used to crash callers (`None.startswith`) —
-            # raising makes the failure explicit and countable.
-            raise RuntimeError(
-                f"null content (finish={data['choices'][0].get('finish_reason')})")
-        if not isinstance(content, str):
-            raise RuntimeError(
-                "non-string content "
-                f"(finish={data['choices'][0].get('finish_reason')})"
+        try:
+            data = resp.json()
+        except Exception as exc:
+            with self._lock:
+                self._usage_complete = False
+                self.token_usage_available = False
+            raise LLMResponseError("LLM response is not JSON") from exc
+        usage = data.get("usage") if type(data) is dict else None
+        required = ("prompt_tokens", "completion_tokens", "total_tokens")
+        try:
+            valid = type(usage) is dict and all(
+                isinstance(usage.get(key), (int, float))
+                and not isinstance(usage[key], bool)
+                and math.isfinite(float(usage[key]))
+                and usage[key] >= 0 and usage[key] == int(usage[key])
+                for key in required
+            ) and usage["total_tokens"] == (
+                usage["prompt_tokens"] + usage["completion_tokens"]
             )
+        except (OverflowError, ValueError):
+            valid = False
+        with self._lock:
+            self._accounted_response_attempts += 1
+            if valid:
+                self.prompt_tokens += int(usage["prompt_tokens"])
+                self.completion_tokens += int(usage["completion_tokens"])
+                self.total_tokens += int(usage["total_tokens"])
+            else:
+                self._usage_complete = False
+            self.token_usage_available = (
+                self._usage_complete
+                and self._accounted_response_attempts == self.request_attempts
+            )
+        choices = data.get("choices") if type(data) is dict else None
+        if type(choices) is not list or not choices or type(choices[0]) is not dict:
+            raise LLMResponseError("LLM response has no valid first choice")
+        # Retain the requested n>1 first-choice policy; a later choice cannot
+        # rescue a rejected first one.
+        choice = choices[0]
+        finish = choice.get("finish_reason")
+        if type(finish) is not str or finish != "stop":
+            raise LLMResponseError("LLM response did not finish with stop")
+        message = choice.get("message")
+        content = message.get("content") if type(message) is dict else None
+        if type(content) is not str:
+            raise LLMResponseError("LLM response content is not a string")
         with self._lock:
             self.call_count += 1
             self.successful_responses += 1
-        return (
-            content,
-            data.get("usage", {}),
-        )
+        return content, usage if type(usage) is dict else {}
 
     def close(self) -> None:
         """End this wrapper's lifecycle exactly once.
@@ -1212,12 +1237,12 @@ class HyMemAdapter:
             self.pipeline_llm = self._owned_resources.own(
                 llm, label="memory pipeline client"
             )
-            # Optional semantic-recall A/B (lever L1). Drives the SAME local FastEmbed
-            # server Hermes uses in production. Pass this benchmark's local FastEmbed
-            # defaults explicitly so --embeddings works with ZERO env setup. DeepSeek
-            # has no embeddings API; HYMEM_EMBEDDING_* can instead select a real
-            # embedding endpoint. Off by default: the headline baseline is lexical-only
-            # (a paired comparison).
+            # Optional semantic-recall A/B (lever L1); lexical-only by default.
+            # --embeddings requires a running, reachable embedding service and explicit
+            # deployment revision/tenant; the adapter pins the dimension automatically.
+            # HYMEM_EMBEDDING_* can override local FastEmbed defaults. Include /v1 in
+            # the base URL when required by the service. Non-loopback internal HTTP
+            # requires HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP=1.
             embedding_client = None
             if self.embeddings:
                 from hymem.contrib.openai_embedding_client import (
@@ -4520,6 +4545,12 @@ def _run_main(
         "--no-prereg", action="store_true",
         help="explicitly mark this run exploratory/development-only",
     )
+    parser.add_argument(
+        "--skip-extraction-canary", action="store_true",
+        help="operator override for non-official pipeline providers: record "
+             "zero-work canary evidence with skip_reason=operator_override "
+             "instead of running the Phase-1 extraction canary",
+    )
     parser.add_argument("--keep-db", action="store_true")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of questions to evaluate concurrently. "
@@ -4604,12 +4635,23 @@ def _run_main(
                              "it (skip L2b). If it doesn't recover MS, the loss is downstream "
                              "(packing/budget, → L3), not the reranker. Default None = config.")
     parser.add_argument("--embeddings", action="store_true",
-                        help="LEVER L1: enable semantic vector recall. Works with NO env "
-                             f"setup — defaults to the local FastEmbed server "
+                        help="LEVER L1: enable semantic vector recall. Requires a running "
+                             f"embedding server; endpoint/model/dimension defaults are "
                              f"({LOCAL_EMBED_MODEL} @ {LOCAL_EMBED_BASE_URL}, dim "
-                             f"{LOCAL_EMBED_DIM}, api_key='local') that Hermes runs in "
-                             "production. Override any field with HYMEM_EMBEDDING_API_KEY/"
-                             "_BASE_URL/_MODEL/_DIM to point at a different server. DEFAULT "
+                             f"{LOCAL_EMBED_DIM}). Also set --embedding-deployment-revision "
+                             "and --embedding-deployment-tenant, or "
+                             "HYMEM_EMBEDDING_DEPLOYMENT_REVISION and "
+                             "HYMEM_EMBEDDING_DEPLOYMENT_TENANT. The adapter pins the "
+                             "dimension automatically; HYMEM_EMBEDDING_PIN_DIMENSION is "
+                             "not required here. For a server outside the container, use "
+                             "a reachable --embedding-base-url (including /v1 for this "
+                             "FastEmbed service); trusted internal HTTP additionally "
+                             "requires HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP=1. "
+                             "Endpoint and identity checks remain strict. Override the "
+                             "server settings with --embedding-base-url, --embedding-model, "
+                             "--embedding-dim, --embedding-api-key or "
+                             "HYMEM_EMBEDDING_BASE_URL, HYMEM_EMBEDDING_MODEL, "
+                             "HYMEM_EMBEDDING_DIM, HYMEM_EMBEDDING_API_KEY. DEFAULT "
                              "OFF (lexical-only baseline); run paired on --seed to measure "
                              "the recall the FTS-only path leaves behind.")
     parser.add_argument("--embedding-base-url", default=None)
@@ -5046,6 +5088,7 @@ def _run_main(
         ),
         "prereg": args.prereg_obj,
         "indexing_require_healthy": bool(args.indexing_require_healthy),
+        "indexing_completion_policy": INDEXING_COMPLETION_POLICY,
         "embedding_runtime": embedding_identity,
         "context_policy": args.context_policy_obj,
         "extraction_canary": extraction_canary_policy(
@@ -5592,7 +5635,22 @@ def _run_main(
 
     if work_total:
         ledger.update_execution_segment(segment_id, _segment("running", 0))
-        if not args.no_dream:
+        if args.skip_extraction_canary:
+            print("WARNING: extraction canary SKIPPED (operator override; "
+                  "non-official pipeline provider). Zero-work evidence "
+                  "recorded as skip_reason=operator_override; this run's "
+                  "pipeline evidence is non-comparable with canonical runs.",
+                  flush=True)
+            extraction_canary_report = skipped_extraction_canary(
+                "operator_override",
+                prompt_version=extraction_prompt_version,
+            )
+            _validate_pipeline_extraction_canary(
+                extraction_canary_report, args, mode="operator_override",
+            )
+            ledger.update_execution_segment(segment_id, _segment("running", 0))
+            print_extraction_canary(extraction_canary_report)
+        elif not args.no_dream:
             try:
                 extraction_canary_report = run_configured_extraction_canary(
                     api_key=pipeline_key,

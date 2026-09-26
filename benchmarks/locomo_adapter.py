@@ -111,6 +111,7 @@ from msc_adapter import (
     run_or_record_indexing_failure,
 )
 from benchmarks.strictness import (
+    INDEXING_COMPLETION_POLICY,
     AtomicCheckpoint,
     BenchmarkCleanupError,
     BenchmarkIntegrityError,
@@ -157,12 +158,13 @@ from benchmarks.extraction_canary import (
 from hymem.contrib.endpoint_policy import validate_http_endpoint
 from hymem.contrib.model_policy import (
     DeprecatedModelAliasError,
+    RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
 )
 
-_ANSWER_MODEL = "deepseek-v4-flash"
-_JUDGE_MODEL = "deepseek-v4-flash"
-_HYMEM_MODEL = "deepseek-v4-flash"
+_ANSWER_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+_JUDGE_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+_HYMEM_MODEL = RECOMMENDED_DEEPSEEK_MODEL
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 _MAX_CONVERSATION_ID_LENGTH = 128
@@ -860,6 +862,7 @@ def _strict_identity(args) -> tuple[dict[str, Any], dict[str, Any]]:
         "no_dream": bool(args.no_dream),
         "dream_per_session": bool(args.dream_per_session),
         "indexing_max_cycles": args.indexing_max_cycles,
+        "indexing_completion_policy": INDEXING_COMPLETION_POLICY,
         "indexing_timeout_s": float(args.indexing_timeout_s),
         "fresh_store": bool(args.fresh),
         "persistent_store": bool(args.db_dir),
@@ -1361,6 +1364,8 @@ def evaluate_conversation(
                 "indexing_scope_id": indexing["scope_id"],
                 "indexing_complete": bool(indexing["complete"]),
                 "indexing_healthy": bool(indexing["healthy"]),
+                **({"indexing_summary_healthy": indexing["summary_healthy"]}
+                   if "summary_healthy" in indexing else {}),
                 "indexing_comparable": bool(indexing["comparable"]),
                 "benchmark_comparable": bool(
                     indexing["comparable"] and benchmark_non_comparable is None
@@ -1821,6 +1826,12 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
                          "writes a flip-compatible copy to --out or *.rejudged.json")
     ap.add_argument("--sim", action="store_true", help="offline: StubLLM, no API")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--skip-extraction-canary", action="store_true",
+        help="operator override for non-official pipeline providers: record "
+             "zero-work canary evidence with skip_reason=operator_override "
+             "instead of running the Phase-1 extraction canary",
+    )
     add_strict_run_arguments(ap)
     args = ap.parse_args()
 
@@ -2457,6 +2468,17 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
                 extraction_canary_mode = "simulation"
             elif args.no_dream:
                 extraction_canary_mode = "no_dream"
+            elif args.skip_extraction_canary:
+                extraction_canary_mode = "operator_override"
+                print("WARNING: extraction canary SKIPPED (operator override; "
+                      "non-official pipeline provider). Zero-work evidence "
+                      "recorded as skip_reason=operator_override; this run's "
+                      "pipeline evidence is non-comparable with canonical runs.",
+                      flush=True)
+                extraction_canary_report = skipped_extraction_canary(
+                    "operator_override",
+                    prompt_version=extraction_prompt_version,
+                )
             else:
                 extraction_canary_mode = "required"
                 try:

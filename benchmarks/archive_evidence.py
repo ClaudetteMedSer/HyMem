@@ -11,9 +11,9 @@ import re
 from collections.abc import Mapping
 
 try:
-    from .strictness import BenchmarkIntegrityError, CHECKPOINT_VERSION, content_hash
+    from .strictness import BenchmarkIntegrityError, CHECKPOINT_VERSION, INDEXING_COMPLETION_POLICY, content_hash
 except ImportError:
-    from strictness import BenchmarkIntegrityError, CHECKPOINT_VERSION, content_hash
+    from strictness import BenchmarkIntegrityError, CHECKPOINT_VERSION, INDEXING_COMPLETION_POLICY, content_hash
 
 CHECKPOINT_ATTESTATION_VERSION = "hymem-benchmark-checkpoint-attestation-v1"
 _MAX_COUNT = 2_147_483_647
@@ -175,6 +175,8 @@ def validate_scoped_indexing(summary, *, scope_id, config, failed=False):
     """
     if not isinstance(summary, dict):
         _fail("indexing receipt is not an object")
+    if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+        _fail("indexing completion policy differs")
     if failed:
         _validate_scoped_failure(summary, scope_id=scope_id, config=config)
         return False
@@ -232,6 +234,8 @@ def _validate_scoped_indexing_content(summary, *, scope_id, config):
                                  _validate_indexing_usage)
     if not isinstance(summary, dict):
         _fail("indexing receipt is not an object")
+    if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+        _fail("indexing completion policy differs")
     simulation = config.get("sim") is True
     skip_reason = "simulation" if simulation else "no_dream" if config.get("no_dream") is True else None
     if skip_reason is None:
@@ -413,7 +417,7 @@ def validate_scoped_row(row, *, scope_id, receipts):
         if not isinstance(row["indexing"], Mapping) or row["indexing"] not in candidates:
             _fail("row indexing receipt is not owned by its source execution")
         candidates = [row["indexing"]]
-    flags = {key: row[key] for key in ("indexing_complete", "indexing_healthy", "indexing_comparable") if key in row}
+    flags = {key: row[key] for key in ("indexing_complete", "indexing_healthy", "indexing_comparable", "indexing_summary_healthy") if key in row}
     if flags and (any(type(value) is not bool for value in flags.values()) or not any(
         all(receipt.get(key.removeprefix("indexing_")) is value for key, value in flags.items())
         for receipt in candidates
@@ -439,7 +443,9 @@ def validate_convergence_summary(summary, *, config, allow_failure=False):
     _canonical_final_indexing_status = protocol._canonical_final_indexing_status
     if not isinstance(summary, Mapping):
         _fail("convergence summary is absent")
-    core = {"cycles", "max_cycles", "timeout_s", "elapsed_s", "complete", "healthy", "failure_reason", "reports", "final_status", "quarantined"}
+    if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+        _fail("indexing completion policy differs")
+    core = {"cycles", "max_cycles", "timeout_s", "elapsed_s", "complete", "healthy", "summary_healthy", "outcome", "failure_reason", "reports", "final_status", "quarantined"}
     if not core.issubset(summary) or set(summary) - core - {"protocol", "trigger", "initial_status", "cleanup_errors"}:
         _fail("convergence summary fields are malformed")
     cycles = summary["cycles"]
@@ -454,16 +460,24 @@ def validate_convergence_summary(summary, *, config, allow_failure=False):
             _fail("convergence timing is malformed")
     if summary["timeout_s"] <= 0 or type(summary["complete"]) is not bool or type(summary["healthy"]) is not bool:
         _fail("convergence outcome is malformed")
+    if summary["summary_healthy"] is not None and type(summary["summary_healthy"]) is not bool:
+        _fail("convergence summary health is malformed")
     reports = summary["reports"]
     if not isinstance(reports, list) or len(reports) != cycles:
         _fail("convergence report count differs")
     if summary["complete"] and summary["healthy"]:
+        if config.get("indexing_completion_policy") != protocol.INDEXING_COMPLETION_POLICY:
+            _fail("indexing completion policy differs")
         normalized = [protocol._canonical_indexing_report(report, require_current_failures=True) for report in reports]
         if (not cycles or summary["failure_reason"] is not None
                 or summary["elapsed_s"] > summary["timeout_s"]
                 or summary["quarantined"] != {} or summary.get("cleanup_errors", []) != []):
             _fail("successful convergence contradicts failure evidence")
         final = _canonical_final_indexing_status(summary["final_status"])
+        summary_healthy = final["summary_health"]["summary_healthy"]
+        expected_outcome = "success" if summary_healthy else "success_with_summary_degradation"
+        if summary["summary_healthy"] is not summary_healthy or summary["outcome"] != expected_outcome:
+            _fail("convergence outcome hides or invents summary degradation")
         if (any(final["pending"].values()) or any(final["malformed"].values())
                 or any(final["quarantined"].values()) or final["terminal_loss"]["chunks"]
                 or final["coverage_integrity"]["failures"] or final["in_progress"]
@@ -475,6 +489,8 @@ def validate_convergence_summary(summary, *, config, allow_failure=False):
         or re.fullmatch(r"cycle_exception:[A-Za-z_][A-Za-z0-9_.]{0,127}", reason) is not None)
     if not allow_failure or summary["healthy"] is not False or not known_failure:
         _fail("convergence did not finish healthy")
+    if summary["outcome"] != "failure":
+        _fail("failed convergence claims a successful outcome")
     if summary["complete"] and reason not in protocol._MECHANICALLY_COMPLETE_FAILURE_CODES:
         _fail("failed convergence contradicts mechanical completion")
     # Failed receipts can truthfully describe a malformed provider/status

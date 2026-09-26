@@ -995,9 +995,9 @@ def test_ambiguous_punctuation_cannot_certify_fragmented_claim_empty(
 
     content = (
         "The Amsterdam deployment record "
-        + ("x" * 2050)
+        + ("x" * 4050)
         + internal_punctuation
-        + ("y" * 2050)
+        + ("y" * 4050)
         + " remains authoritative in Amsterdam."
     )
     llm = StubLLMClient(default=_complete({"triples": [], "markers": []}))
@@ -1098,8 +1098,8 @@ def test_dense_headerless_record_grid_fails_closed_without_provider_spend(
 ):
     """Even record-shaped rows need a header to prove their semantics."""
 
-    content = _dense_headerless_table(newline=newline)
-    assert len(content) > chunk_extraction._MAX_LEAF_INPUT_CHARS
+    content = _dense_headerless_table(240, newline=newline)
+    assert len(content) > chunk_extraction._MAX_UNSPLITTABLE_INPUT_CHARS
     assert chunk_extraction._markdown_table_boundary_points(content) == []
     assert chunk_extraction._semantic_split_point(content) is None
 
@@ -1254,7 +1254,7 @@ def test_unmatched_fence_protects_through_eof_and_holds_without_provider_spend(
 ):
     content = newline.join([
         "   ````python",
-        *(("inside. Another sentence." + newline + newline) for _ in range(180)),
+        *(("inside. Another sentence." + newline + newline) for _ in range(360)),
         "```",  # shorter than the opener, so it is source text, not a close
         "| a | b |",
         "| --- | --- |",
@@ -1502,9 +1502,9 @@ def test_one_oversized_list_item_with_continuations_holds_without_provider_spend
     content = newline.join([
         "Important claims:",
         "",
-        "- first clause " + ("x" * 2100) + ". Another sentence.",
+        "- first clause " + ("x" * 4100) + ". Another sentence.",
         "",
-        "  continuation clause " + ("y" * 2100) + ".",
+        "  continuation clause " + ("y" * 4100) + ".",
         "    - nested-looking clause " + ("z" * 300) + ".",
     ])
     assert len(content) > chunk_extraction._MAX_LEAF_INPUT_CHARS
@@ -2078,7 +2078,7 @@ def test_source_less_table_holds_when_header_context_cannot_be_carried():
     content = "\n".join([
         "| person | preferred database |",
         "| --- | --- |",
-        *(f"| person_{index} | database_{index} |" for index in range(260)),
+        *(f"| person_{index} | database_{index} |" for index in range(320)),
     ])
     assert chunk_extraction._semantic_split_point(content) in (
         chunk_extraction._markdown_table_boundary_points(content)
@@ -2489,7 +2489,9 @@ def test_sentence_punctuation_inside_table_cell_never_bisects_row(
     ],
 )
 def test_malformed_pipe_prose_does_not_enable_soft_newline_splits(content: str):
-    assert len(content) > chunk_extraction._MAX_LEAF_INPUT_CHARS
+    # Keep the original malformed boundary cases, beyond intact admission too.
+    content = content + "\n" + content
+    assert len(content) > chunk_extraction._MAX_UNSPLITTABLE_INPUT_CHARS
     assert chunk_extraction._markdown_table_boundary_points(content) == []
     assert chunk_extraction._semantic_split_point(content) is None
 
@@ -2541,7 +2543,7 @@ def test_internal_period_forms_are_not_sentence_boundaries(body: str):
 def test_literal_unseparated_midpoint_claim_is_held_without_provider_spend():
     """A terminal followed by token data is not a safe sentence boundary."""
 
-    content = ("x" * 2100) + _MIDPOINT_CROSSING_CLAIM + ("y" * 2100)
+    content = ("x" * 4100) + _MIDPOINT_CROSSING_CLAIM + ("y" * 4100)
     legacy_midpoint = len(content) // 2
     assert _MIDPOINT_CROSSING_CLAIM not in content[:legacy_midpoint + 64]
     assert _MIDPOINT_CROSSING_CLAIM not in content[legacy_midpoint - 64:]
@@ -2565,7 +2567,7 @@ def test_soft_newline_inside_padded_claim_is_held_without_provider_spend():
     """A display wrap cannot authorize two independently empty fragments."""
 
     claim = "The deployment depends\non PostgreSQL."
-    content = ("x" * 2100) + claim + ("y" * 2100)
+    content = ("x" * 4100) + claim + ("y" * 4100)
     soft_cut = content.index("\n") + 1
     assert "deployment depends" in content[:soft_cut]
     assert "on PostgreSQL" in content[soft_cut:]
@@ -2585,8 +2587,10 @@ def test_soft_newline_inside_padded_claim_is_held_without_provider_spend():
     assert llm.calls == []
 
 
-def test_source_less_unbreakable_claim_cannot_become_authoritative_empty():
+def test_source_less_bounded_unbreakable_unit_gets_whole_unit_empty_verification():
     text = "Application uses " + ("x" * 374) + " PostgreSQL."
+    assert len(text) <= chunk_extraction._MAX_LEAF_INPUT_CHARS
+    assert chunk_extraction._semantic_split_point(text) is None
     legacy_midpoint = len(text) // 2
     for fragment in (text[:legacy_midpoint + 64], text[legacy_midpoint - 64:]):
         assert not (
@@ -2596,14 +2600,15 @@ def test_source_less_unbreakable_claim_cannot_become_authoritative_empty():
 
     result = extract_chunk(llm, text)
 
-    assert result.failed is True
-    assert result.failure_reason == "resource_limit"
-    assert "split:no_admissible_semantic_boundary" in result.failure_details
+    assert result.failed is False
+    assert result.failure_reason is None
+    assert result.failure_details == ()
     assert result.triples == [] and result.markers == []
-    # Split safety cannot be established, but the terminal primary empty still
-    # receives exactly one genuine second look before the unit is held.
+    # Inherited v3 contract: cue/length alone cannot reject two valid replies.
+    # Neither call may silently split or truncate the indivisible claim.
     assert result.completion_calls == result.provider_attempts == 2
     assert len(llm.calls) == 2
+    assert all(call.user.split('"""', 2)[1].strip() == text for call in llm.calls)
     assert "VERIFICATION PASS" not in llm.calls[0].system
     assert "EMPTY VERIFICATION PASS" in llm.calls[1].system
 
@@ -2765,7 +2770,7 @@ def test_unbreakable_oversized_source_fails_closed_before_provider_call():
     result = extract_chunk(
         llm,
         "ignored legacy rendering",
-        source_records=(_source_record(17, "x" * 5000),),
+        source_records=(_source_record(17, "x" * 9000),),
     )
     assert result.failed is True
     assert result.failure_reason == "resource_limit"
@@ -3482,7 +3487,7 @@ def test_phase1_runner_holds_unsafe_unsplittable_source_without_processed_row(cf
         aggregation_nodes_enabled=False,
     ), llm=llm)
     try:
-        unsafe = ("x" * 2100) + _MIDPOINT_CROSSING_CLAIM + ("y" * 2100)
+        unsafe = ("x" * 4100) + _MIDPOINT_CROSSING_CLAIM + ("y" * 4100)
         chunk = _seed_chunk(hy, "unsafe-semantic-unit", content=unsafe)
 
         report = hy.dream(session_ids=[chunk.session_id])

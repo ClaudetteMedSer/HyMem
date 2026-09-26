@@ -45,7 +45,7 @@ try:  # package import (tests): benchmarks.locomo_registry
         validate_extraction_canary_config_binding,
         validate_extraction_canary_report,
     )
-    from .strictness import CHECKPOINT_VERSION, STRICT_PROTOCOL_VERSION, content_hash
+    from .strictness import CHECKPOINT_VERSION, INDEXING_COMPLETION_POLICY, STRICT_PROTOCOL_VERSION, content_hash
 except (ImportError, ValueError):  # direct CLI: python benchmarks/locomo_registry.py
     from archive_evidence import (validate_checkpoint_attestation, validate_scoped_indexing,
                                   validate_scoped_row, validate_scoped_pipeline_usage)
@@ -55,7 +55,7 @@ except (ImportError, ValueError):  # direct CLI: python benchmarks/locomo_regist
         validate_extraction_canary_report,
     )
     from strictness import (  # type: ignore
-        CHECKPOINT_VERSION, STRICT_PROTOCOL_VERSION, content_hash,
+        CHECKPOINT_VERSION, INDEXING_COMPLETION_POLICY, STRICT_PROTOCOL_VERSION, content_hash,
     )
 
 DB_ENV = "LOCOMO_REGISTRY_DB"
@@ -348,6 +348,8 @@ def _validate_strict_locomo(data: dict) -> tuple[list[dict], dict, dict]:
         raise ValueError("strict LoCoMo top-level identity differs from manifest")
     if manifest.get("config_hash") != content_hash(config):
         raise ValueError("strict LoCoMo config hash is invalid")
+    if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+        raise ValueError("strict LoCoMo indexing completion policy differs")
     if manifest.get("model_hash") != content_hash(models):
         raise ValueError("strict LoCoMo model hash is invalid")
     for field in ("code_hash", "data_hash", "expected_ids_hash"):

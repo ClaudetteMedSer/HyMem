@@ -137,6 +137,7 @@ from longmemeval_adapter import (  # noqa: E402
 # will actually use (Latin accent folding + Unicode-safe literal query terms).
 from hymem.query.augment import _fts_safe_text, _fold_diacritics  # noqa: E402
 from hymem.contrib.model_policy import (  # noqa: E402
+    RECOMMENDED_DEEPSEEK_MODEL,
     DeprecatedModelAliasError,
     require_active_model,
 )
@@ -1048,7 +1049,7 @@ def main() -> None:
                     help="canned extraction, no LLM — plumbing only; its "
                          "containment number is an upper bound, not evidence")
     ap.add_argument("--api-key", default="", help="reader/extractor API key")
-    ap.add_argument("--model", default="deepseek-v4-flash", help="extraction model")
+    ap.add_argument("--model", default=RECOMMENDED_DEEPSEEK_MODEL, help="extraction model")
     ap.add_argument("--base-url", default=DEEPSEEK_BASE_URL,
                     help="OpenAI-compatible endpoint for --model (default: DeepSeek; "
                          "point at OpenRouter etc. when --model is a hosted model)")

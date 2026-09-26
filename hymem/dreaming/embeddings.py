@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Iterator, Sequence, cast
 
 from hymem.core import db as core_db
+from hymem.core.embedding_batches import EmbeddingInputTooLarge, embed_bounded
 from hymem.core.graph import live_edge_predicate
 from hymem.core.vectors import decode_vector, encode_vector
 from hymem.dreaming.lossless import (
@@ -21,6 +22,8 @@ from hymem.extraction.embeddings import EmbeddingClient, embedding_text_hash
 
 
 MESSAGE_EMBEDDING_BATCH_SIZE = 64
+CHUNK_EMBEDDING_BATCH_SIZE = 16
+CHUNK_EMBEDDING_MAX_CHARS = 128_000
 FACT_EMBEDDING_BATCH_SIZE = 64
 FACT_EMBEDDING_SCAN_SIZE = 256
 
@@ -127,29 +130,103 @@ class ChunkEmbedRequest:
     dim: int
 
 
+def chunk_embedding_id_batches(
+    conn: sqlite3.Connection,
+    *,
+    exclude_ids: set[str] | None = None,
+    batch_size: int = CHUNK_EMBEDDING_BATCH_SIZE,
+    max_chars: int = CHUNK_EMBEDDING_MAX_CHARS,
+) -> Iterator[tuple[str, ...]]:
+    """Page extraction chunks once by id, bounding ordinary row/text groups.
+
+    Current embeddings are checked by the fetch step. Scanning all chunk ids
+    here also lets stale or corrupt rows be repaired without a full-table
+    result or an unbounded SQLite parameter list. An oversized source is a
+    singleton so fetch can first check whether it is current or cached; only
+    an oversized provider miss is rejected.
+    """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("chunk embedding batch size must be positive")
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars <= 0:
+        raise ValueError("chunk embedding character limit must be positive")
+    excluded = exclude_ids or set()
+    after: str | None = None
+    batch: list[str] = []
+    chars = 0
+    while True:
+        if after is None:
+            rows = conn.execute(
+                "SELECT id, text FROM chunks WHERE chunk_kind = 'extraction' "
+                "ORDER BY id LIMIT ?", (batch_size,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, text FROM chunks "
+                "WHERE chunk_kind = 'extraction' AND id > ? "
+                "ORDER BY id LIMIT ?", (after, batch_size),
+            ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            chunk_id = row["id"]
+            after = chunk_id
+            if chunk_id in excluded:
+                continue
+            text_chars = len(row["text"])
+            if batch and (len(batch) >= batch_size or chars + text_chars > max_chars):
+                yield tuple(batch)
+                batch = []
+                chars = 0
+            if text_chars > max_chars:
+                yield (chunk_id,)
+                continue
+            batch.append(chunk_id)
+            chars += text_chars
+    if batch:
+        yield tuple(batch)
+
+
 def fetch_chunk_embeddings(
     conn: sqlite3.Connection,
     embedder: EmbeddingClient,
     *,
     exclude_ids: set[str] | None = None,
+    chunk_ids: Sequence[str] | None = None,
 ) -> PendingChunkEmbeddings | None:
     """Read pending chunks and embed them, consulting embedding_cache first.
 
     ``exclude_ids`` lets the dream runner keep newly materialized low-priority
     baseline work out of this catch-all batch until that work is actually
-    scheduled. Returns None when there are no chunks to embed.
+    scheduled. With no explicit ``chunk_ids``, returns the first bounded batch
+    with pending work; callers draining the full backlog use
+    ``chunk_embedding_id_batches``. Returns None when there is no pending work.
     """
+    if chunk_ids is None:
+        for batch in chunk_embedding_id_batches(conn, exclude_ids=exclude_ids):
+            pending = fetch_chunk_embeddings(
+                conn, embedder, exclude_ids=exclude_ids, chunk_ids=batch
+            )
+            if pending is not None:
+                return pending
+        return None
+    ids = tuple(dict.fromkeys(chunk_ids))
+    if not ids:
+        return None
+    if len(ids) > CHUNK_EMBEDDING_BATCH_SIZE:
+        raise ValueError("chunk embedding batch exceeds row limit")
     model, dim = _embedding_identity(embedder)
     all_rows = conn.execute(
-        """
+        f"""
         SELECT c.id, c.rowid, c.text,
                e.vector_json AS stored_vector, e.model AS stored_model,
                e.dim AS stored_dim, e.text_hash AS stored_text_hash
         FROM chunks c
         LEFT JOIN chunk_embeddings e ON e.chunk_id = c.id
         WHERE c.chunk_kind = 'extraction'
+          AND c.id IN ({','.join('?' * len(ids))})
         ORDER BY c.id
-        """
+        """,
+        ids,
     ).fetchall()
     excluded = exclude_ids or set()
     rows = []
@@ -196,7 +273,11 @@ def fetch_chunk_embeddings(
             miss_texts.append(texts[i])
 
     if miss_texts:
-        embedded = embedder.embed(miss_texts)
+        if any(len(text) > CHUNK_EMBEDDING_MAX_CHARS for text in miss_texts):
+            raise EmbeddingInputTooLarge(
+                "chunk embedding provider payload exceeds character limit"
+            )
+        embedded = _embed_provider(embedder, miss_texts, model)
         if len(embedded) != len(miss_texts):
             raise RuntimeError(
                 f"embedding client returned {len(embedded)} vectors for {len(miss_texts)} chunks"
@@ -300,6 +381,16 @@ def _post_embed_identity(
     if model != expected_model:
         raise RuntimeError("embedding client changed model during batch")
     return dim
+
+
+def _embed_provider(
+    embedder: EmbeddingClient, texts: Sequence[str], model: str,
+    *, required_dim: int | None = None,
+) -> list[list[float]]:
+    return embed_bounded(
+        embedder, texts, identity=lambda: _embedding_identity(embedder),
+        expected_model=model, required_dim=required_dim,
+    )
 
 
 def message_embedding_id_batches(
@@ -468,7 +559,7 @@ def fetch_message_embeddings(
             miss_texts.append(validate_message_coverage_row(row).content)
 
     if miss_texts:
-        fresh = embedder.embed(miss_texts)
+        fresh = _embed_provider(embedder, miss_texts, model)
         if len(fresh) != len(miss_texts):
             raise RuntimeError(
                 "embedding client returned the wrong number of message vectors"
@@ -491,7 +582,7 @@ def fetch_message_embeddings(
                 ).content
                 for text_hash in redo_hashes
             ]
-            redo = embedder.embed(redo_texts)
+            redo = _embed_provider(embedder, redo_texts, model, required_dim=final_dim)
             if len(redo) != len(redo_texts):
                 raise RuntimeError(
                     "embedding client returned the wrong number of message vectors"
@@ -830,7 +921,7 @@ def fetch_edge_embeddings(
                 miss_texts.append(text)
 
         if miss_texts:
-            vectors = embedder.embed(miss_texts)
+            vectors = _embed_provider(embedder, miss_texts, model)
             if len(vectors) != len(miss_texts):
                 raise RuntimeError(
                     f"embedding client returned {len(vectors)} vectors "
@@ -1080,7 +1171,7 @@ def fetch_episode_embeddings(
             miss_texts = [pending_texts[i] for i in miss_indices]
         if not pending_ids:
             return None
-        embedded = embedder.embed(miss_texts)
+        embedded = _embed_provider(embedder, miss_texts, model)
         if len(embedded) != len(miss_texts):
             raise RuntimeError(
                 f"embedding client returned {len(embedded)} vectors for "
@@ -1261,7 +1352,7 @@ def fetch_fact_embeddings(
             miss_texts.append(texts[i])
 
     if miss_texts:
-        embedded = embedder.embed(miss_texts)
+        embedded = _embed_provider(embedder, miss_texts, model)
         if len(embedded) != len(miss_texts):
             raise RuntimeError(
                 f"embedding client returned {len(embedded)} vectors for "

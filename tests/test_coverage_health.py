@@ -30,7 +30,7 @@ def store(tmp_path):
 def _cfg(path):
     return EnvConfig(
         root=path.parent, llm_api_key=None, llm_base_url="https://api.deepseek.com",
-        llm_model="deepseek-v4-flash", embedding_api_key=None,
+        llm_model="deepseek-flash", embedding_api_key=None,
         embedding_base_url="local://feature-hash", embedding_model="health-test",
         embedding_dim=3, embedding_backend="local_feature_hash",
         embedding_fallback_reason=None, aggregation_nodes_enabled=False,
@@ -152,7 +152,8 @@ def test_doctor_cli_now_fails_for_uncited_invalid_coverage(store, monkeypatch, c
     monkeypatch.setattr(doctor, "_check_embedding", lambda _: (doctor._Result(doctor.OK, "offline", "ok"), None, None))
     assert doctor.run_doctor() == 1
     output = capsys.readouterr().out
-    assert "[FAIL] lossless coverage integrity" in output and "1 failure(s)" in output
+    assert "[FAIL] lossless coverage integrity" in output
+    assert "[FAIL] summary context health" in output and "2 failure(s)" in output
     assert "private-source-secret" not in output and "private-session" not in output
 
 

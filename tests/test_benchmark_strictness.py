@@ -51,6 +51,9 @@ def _manifest(ids=("q1", "q2", "q3"), *, config=None):
 def _current_indexing_status(**overrides):
     value = {
         "dream_status_schema": strictness.DREAM_STATUS_SCHEMA_VERSION,
+        "summary_degraded_sessions": 0,
+        "summary_missing_sessions": 0,
+        "summary_healthy": True,
         **{key: 0 for key in strictness.DURABLE_PENDING_FIELDS},
         **{key: 0 for key in strictness.DURABLE_MALFORMED_FIELDS},
         **{key: 0 for key in strictness._DURABLE_QUARANTINE_FIELDS},

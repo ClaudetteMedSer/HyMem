@@ -48,7 +48,7 @@ from hymem.dreaming.user_profile import (
 )
 
 
-DREAM_STATUS_SCHEMA_VERSION = "hymem-dream-status-v7"
+DREAM_STATUS_SCHEMA_VERSION = "hymem-dream-status-v8"
 DURABLE_PENDING_FIELDS = (
     "pending_source_materialization",
     "pending_chunks",
@@ -62,9 +62,12 @@ DURABLE_MALFORMED_FIELDS = (
     "malformed_digests",
     "malformed_profiles",
     "malformed_facts",
+    "malformed_summaries",
 )
 
-# Exact v7 health projection used by completion-claim consumers. V7 binds
+# Exact v8 health projection distinguishes source-backed item completion from
+# explicitly degraded summary context. Malformed summary state remains fatal.
+# V7 binds
 # digest/profile/facts completion to the effective memory producer and loaded
 # implementation; an old v6 zero is not proof of this stronger guarantee. V3 made
 # Phase-1 completion producer-generation-aware; a v2 prompt-only zero cannot
@@ -90,6 +93,7 @@ DREAM_STATUS_BLOCKING_COUNT_FIELDS = (
     "malformed_digests",
     "malformed_profiles",
     "malformed_facts",
+    "malformed_summaries",
     "pending_aggregation",
 )
 DREAM_STATUS_BOOLEAN_GATE_FIELDS = ("in_progress",)
@@ -124,6 +128,8 @@ DREAM_STATUS_HEALTH_DETAIL_FIELDS = (
 # not independent completion gates.  The blocking current aggregation state is
 # represented by pending_aggregation above.
 DREAM_STATUS_DIAGNOSTIC_COUNT_FIELDS = (
+    "summary_degraded_sessions",
+    "summary_missing_sessions",
     "aggregation_active_build_attempts",
     "aggregation_active_caught_exceptions",
     "aggregation_active_fusion_failures",
@@ -132,7 +138,7 @@ DREAM_STATUS_DIAGNOSTIC_COUNT_FIELDS = (
     "aggregation_superseded_pending_configs",
     "extraction_provider_attempt_budget",
 )
-DREAM_STATUS_DIAGNOSTIC_BOOLEAN_FIELDS = ("aggregation_enabled",)
+DREAM_STATUS_DIAGNOSTIC_BOOLEAN_FIELDS = ("aggregation_enabled", "summary_healthy")
 DREAM_STATUS_DIAGNOSTIC_CONFIG_VERSION_FIELDS = (
     "aggregation_config_version",
     "aggregation_last_success_config_version",
@@ -174,6 +180,7 @@ DREAM_STATUS_RECOGNIZED_HEALTH_FIELDS = frozenset((
 # must either join the explicit schema above or force consumers to report the
 # snapshot as unverified under the unchanged schema marker.
 DREAM_STATUS_HEALTH_NAME_FRAGMENTS = (
+    "summary",
     "pending",
     "malformed",
     "quarantin",
@@ -223,6 +230,42 @@ def is_health_like_dream_status_field(field_name: object) -> bool:
         fragment in normalized
         for fragment in DREAM_STATUS_HEALTH_NAME_FRAGMENTS
     )
+
+
+def summary_health_projection_is_valid(status: dict) -> bool:
+    """Validate the relationship between nonblocking summary counters."""
+    names = ("summary_degraded_sessions", "summary_missing_sessions", "malformed_summaries")
+    if any(type(status.get(name)) is not int or not 0 <= status[name] <= 2_147_483_647
+           for name in names):
+        return False
+    return bool(
+        status["summary_missing_sessions"] <= status["summary_degraded_sessions"]
+        and type(status.get("summary_healthy")) is bool
+        and status["summary_healthy"] == (
+            status["summary_degraded_sessions"] == 0 and status["malformed_summaries"] == 0
+        )
+    )
+
+
+def durable_summary_status(conn: sqlite3.Connection) -> dict[str, int | bool]:
+    """Read durable summary health; a later no-op cycle must not hide a gap."""
+    from hymem.dreaming.summary_state import classify_summary_state
+
+    degraded = missing = malformed = 0
+    for row in conn.execute("SELECT id FROM sessions ORDER BY id").fetchall():
+        state = classify_summary_state(conn, row["id"])
+        degraded += int(state["degraded"])
+        missing += int(state["missing"])
+        malformed += int(state["malformed"])
+    result = {
+        "summary_degraded_sessions": degraded,
+        "summary_missing_sessions": missing,
+        "malformed_summaries": malformed,
+        "summary_healthy": degraded == 0 and malformed == 0,
+    }
+    if not summary_health_projection_is_valid(result):
+        raise RuntimeError("summary health classification is inconsistent")
+    return result
 
 
 def _int_or_none(value: object) -> bool:
@@ -749,4 +792,5 @@ def durable_dream_work_status(
         **_digest_status(conn, cfg, rows, client),
         **_profile_status(conn, cfg, rows, client),
         **_fact_status(conn, cfg, rows, client),
+        **durable_summary_status(conn),
     }

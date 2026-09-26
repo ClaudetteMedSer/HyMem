@@ -20,7 +20,7 @@ from hymem.extraction.embeddings import LocalHashEmbeddingClient
 def partial_switch(tmp_path):
     cfg = EnvConfig(
         root=tmp_path, llm_api_key=None, llm_base_url="https://api.deepseek.com",
-        llm_model="deepseek-v4-flash", embedding_api_key=None,
+        llm_model="deepseek-flash", embedding_api_key=None,
         embedding_base_url="local://feature-hash", embedding_model="new-producer",
         embedding_dim=3, embedding_backend="local_feature_hash",
         embedding_fallback_reason=None, aggregation_nodes_enabled=False,

@@ -3892,7 +3892,25 @@ def _query_embedding_with_status(
         )
 
     try:
-        batch = embedder.embed([query])
+        from hymem.core.embedding_batches import (
+            EmbeddingInputTooLarge, EmbeddingResponseInvalid, embed_bounded,
+        )
+        batch = embed_bounded(
+            embedder, [query], identity=lambda: _embedding_identity(embedder),
+            expected_model=model_before,
+        )
+    except EmbeddingInputTooLarge:
+        return None, SemanticStatus(
+            configured=True, attempted=False, available=False,
+            backend=backend, quality=quality, model=model, dim=dim,
+            reason="input_too_large", fallback_reason=fallback_reason,
+        )
+    except EmbeddingResponseInvalid:
+        return None, SemanticStatus(
+            configured=True, attempted=True, available=False,
+            backend=backend, quality=quality, model=model, dim=dim,
+            reason="malformed_vector", fallback_reason=fallback_reason,
+        )
     except Exception as exc:
         log.warning(
             "semantic retrieval unavailable for this query: backend=%s error=%s",

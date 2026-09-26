@@ -52,7 +52,7 @@ try:  # package import (tests): benchmarks.run_registry
         validate_extraction_canary_config_binding,
         validate_extraction_canary_report,
     )
-    from .strictness import content_hash
+    from .strictness import INDEXING_COMPLETION_POLICY, content_hash
     from .run_registry import (
         DEFAULT_REGISTRY_DIR,
         _coerce,
@@ -68,7 +68,7 @@ except (ImportError, ValueError):  # direct CLI: python benchmarks/beam_registry
         validate_extraction_canary_config_binding,
         validate_extraction_canary_report,
     )
-    from strictness import content_hash
+    from strictness import INDEXING_COMPLETION_POLICY, content_hash
     from run_registry import (
         DEFAULT_REGISTRY_DIR,
         _coerce,
@@ -1103,6 +1103,8 @@ def _validate_strict_envelope(data: dict) -> tuple[list[dict], dict, dict]:
         raise ValueError("strict BEAM top-level models differ from manifest")
     if manifest.get("config_hash") != content_hash(config):
         raise ValueError("strict BEAM manifest config hash is invalid")
+    if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+        raise ValueError("strict BEAM indexing completion policy differs")
     if manifest.get("model_hash") != content_hash(models):
         raise ValueError("strict BEAM manifest model hash is invalid")
     for field in ("code_hash", "data_hash"):

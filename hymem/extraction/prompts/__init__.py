@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from hymem.contrib.implementation_identity import import_time_source_sha256
+from hymem.dreaming.summary_policy import SUMMARY_OVERVIEW_POLICY
 
 EXTRACTION_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
 
@@ -302,17 +303,18 @@ source_message_id (integer).
 - A fragment record carries `source_content_start` and `source_content_end` as
   absolute character offsets into its original source message. Treat the
   fragment as the excerpt, but continue to cite its unchanged source_message_id.
-- A canonical-table continuation may additionally carry
-  `source_fragment_context`. Its separately labelled `content` is an exact
-  earlier header+delimiter slice from the same source record; use those column
-  labels only to interpret table rows in the fragment up to
-  `applies_through_source_content_end`. It is context, not part of the fragment:
-  never extract an item supported only by this repeated header context.
-  When `kind` is `introduced_canonical_markdown_table_header`, the separately
-  labelled `prelude_content` is also an exact earlier ATX/Setext heading or
-  colon-led paragraph from that source. Use it only to interpret the table rows
-  covered by the same applicability end. It is not fragment evidence either:
-  never extract an item supported only by the repeated prelude or header.
+- A table continuation may additionally carry `source_fragment_context`.
+  Its separately labelled `content` is an exact earlier header slice from the
+  same source record: header+delimiter for a canonical Markdown table, or a
+  single header with an explicit bracketed unit for every numeric column when
+  `kind` is `unit_numeric_table_header` or
+  `introduced_unit_numeric_table_header`. Use the labels and units only to
+  interpret owned rows before `applies_through_source_content_end`. The header
+  is context, not fragment evidence: never extract an item supported only by
+  the repeated header. For either `introduced_*` kind, the separately labelled
+  `prelude_content` is an exact earlier ATX/Setext heading or colon-led
+  paragraph from that source. Use it only to interpret covered rows; never
+  extract an item supported only by the repeated prelude.
 - A right-hand prose continuation may carry `source_boundary_context`. Its
   separately labelled `content` is an exact, bounded suffix immediately before
   `source_content_start` in the same source message. Use it only to finish a
@@ -545,7 +547,16 @@ PROCEDURE_USER_TEMPLATE = """Conversation:
 Return the JSON array now."""
 
 
-SESSION_DIGEST_SYSTEM = """You analyze one conversation session and produce three things in a single pass: its episodes, a one-sentence summary, and any step-by-step procedures.
+SESSION_SUMMARY_MAX_CHARS = 500
+SESSION_DIGEST_SUMMARY_LIMIT = (
+    f" The summary must be at most {SESSION_SUMMARY_MAX_CHARS} Unicode code points "
+    "after trimming leading and trailing whitespace, including spaces and "
+    "punctuation; JSON escaping does not add characters. Aim for 350 "
+    "characters to leave headroom. Recompose concisely rather than appending "
+    "to the prior wording."
+)
+
+SESSION_DIGEST_SYSTEM = """You analyze one conversation session and produce three things in a single pass: its episodes, a bounded factual overview, and any step-by-step procedures.
 
 Each input segment is tagged like `[chunk msgcov_abc123]` — copy the exact chunk id shown in square brackets when citing it.
 
@@ -561,7 +572,7 @@ Output a strict JSON OBJECT (not an array) with exactly these three keys:
 - chunk_ids (list of strings): The exact `msgcov_...` ids you grouped, in conversation order. Must be non-empty and contain only ids that appear in the input.
 Empty array [] is valid if there are no clear episodes.
 
-"summary": a single string — an UPDATED one-sentence summary covering BOTH the prior automatic summary and the new material. Preserve earlier accomplishments, decisions, problems solved, and topics unless the new material explicitly supersedes them; add the new concrete outcome. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid only when both inputs contain nothing to summarize.
+"summary": a single string. Empty string "" is valid only when both inputs contain nothing to summarize. The following policy applies ONLY to this top-level summary, never to episode summaries or procedure details: """ + SUMMARY_OVERVIEW_POLICY + """
 
 "procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
 - name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
@@ -627,7 +638,7 @@ Return the JSON object now."""
 # The summary/procedures halves are deliberately identical in CONTRACT to the
 # blob prompt: only the episode unit is under test, and holding the other two
 # tiers fixed is what makes the probe's arms comparable.
-SESSION_DIGEST_GRANULAR_SYSTEM = """You re-read one conversation session and produce three things in a single pass: decision-grained episodes, a one-sentence summary, and any step-by-step procedures.
+SESSION_DIGEST_GRANULAR_SYSTEM = """You re-read one conversation session and produce three things in a single pass: decision-grained episodes, a bounded factual overview, and any step-by-step procedures.
 
 Each input segment is tagged like `[chunk msgcov_abc123]` — copy the exact chunk id shown in square brackets when citing it.
 
@@ -645,7 +656,7 @@ Output a strict JSON OBJECT (not an array) with exactly these three keys:
 - chunk_ids (list of strings): The exact `msgcov_...` ids that support THIS episode, in conversation order. Must be non-empty and contain only ids that appear in the input. Cite the narrowest set that supports it — do not attach every chunk to every episode.
 NO QUOTA. A substantive working session usually yields 3 to 8 episodes; a session that decided one thing yields one; small talk yields []. Those numbers describe what such sessions contain, they are not a target to fill, and [] is always available to you.
 
-"summary": a single string — an UPDATED one-sentence summary covering BOTH the prior automatic summary and the new material. Preserve earlier accomplishments, decisions, problems solved, and topics unless the new material explicitly supersedes them; add the new concrete outcome. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid only when both inputs contain nothing to summarize.
+"summary": a single string. Empty string "" is valid only when both inputs contain nothing to summarize. The following policy applies ONLY to this top-level summary, never to episode summaries or procedure details: """ + SUMMARY_OVERVIEW_POLICY + """
 
 "procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
 - name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
@@ -737,15 +748,12 @@ Return the profile JSON object now."""
 
 
 # Narrative-facts extraction (E1; authoritative source/lifecycle schema v46).
-# This text is the VERBATIM
-# `FACTS_PROMPT_V2` that cleared the G-F1b extraction-faithfulness gate
-# (2026-08-02, 123/123 strict on the healed full-source sample) — moving it
-# unchanged is what carries the gate's verdict over to production, so any
-# rewording, however small, re-enters the gate: bump FACTS_PROMPT_VERSION in
-# hymem/dreaming/facts.py, flip facts_extraction_enabled off, re-clear
-# benchmarks/fact_probe.py at ≥0.90, then re-enable. The draft arms and the
-# v1→v2 defect analysis stay in fact_probe.py (the instrument), not here.
-# The user-template closer ("Return the JSON array of narrative facts now.")
+# facts.v4 keeps the v2 factual instructions, aligns the success envelope with
+# JSON-object transport, and advertises the configured output bounds through
+# the shared fresh/historical request builder. Never select a subset to fit.
+# The historical v2 G-F1b verdict does not attest this revised prompt; the
+# production request requires its own extraction-faithfulness validation.
+# The user-template closer ("Return the JSON object of narrative facts now.")
 # is unique so test stubs keyed on the digest/triple/profile closers never
 # route here.
 
@@ -755,14 +763,14 @@ A narrative fact is a single, self-contained statement of something that happene
 
 THE ONLY RULE THAT MATTERS: every name, number, date, price, quantity and claim you write must ALREADY BE PRESENT in the turns below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal fact is correct; a rich fact containing one invented detail is a failure.
 
-Output a strict JSON array. Each item has exactly:
+Output a strict JSON object with exactly one key, "facts", whose value is an array: {"facts": [...]}. Do not add other top-level keys, prose, markdown, or code fences. Each item in "facts" has exactly:
 - text (string): the fact, one sentence, self-contained. Name the people, things and values explicitly instead of using "he", "it", "that", "the project" — but only names that appear in the turns.
 - date (string or null): use YYYY-MM-DD ONLY when the conversation itself writes that date. If the turns say "recently", "last week", "a few days ago", or say nothing about when — use null. Never derive a date from the session date. Never guess.
 - entities (array of strings): the concrete people, products, places, tools or organizations the fact is about, exactly as written in the turns.
 
 Rules:
 - VERBATIM VALUES. Names, numbers, dates, versions, prices and quantities exactly as the turns state them. Never round, convert, or normalize.
-- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields [] — that is a GOOD answer, not a failure, and [] is always available to you.
+- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields {"facts": []} — that is a GOOD answer, not a failure, and {"facts": []} is always available to you.
 - Never extract the assistant's suggestions, recommendations, or hypotheticals as facts about the user. "You could try X" is not "the user uses X".
 - One fact per exchange, decision, event or outcome — not one per turn. Combine a question and its answer into the single fact they establish.
 - Self-contained means resolvable alone: "Atta moved the MedFlow deploy to fly.io" — not "he moved it there".
@@ -779,7 +787,18 @@ FACTS_USER_TEMPLATE = """Conversation:
 {text}
 \"\"\"
 
-Return the JSON array of narrative facts now."""
+Return the JSON object of narrative facts now."""
+
+
+FACTS_CAPACITY_TEMPLATE = """
+Output capacity for this exact conversation excerpt:
+- A complete result may contain at most {max_items} facts. This is a maximum, NOT a target or a quota.
+- Each fact's text must be at most {max_text_chars} characters after trimming outer whitespace. Count Unicode code points, including spaces and punctuation; JSON escaping does not add characters.
+- Each fact may have at most {max_entities} entities, each at most {max_entity_chars} characters after trimming outer whitespace. Do not shorten or alter a source name to fit.
+- Extract the complete set of supported narrative facts under the rules above. Never choose only the first, best, or most important facts to fit a limit. Never omit a supported fact, truncate a value, or merge unrelated facts merely to fit.
+- If that complete set cannot fit any of these limits, do NOT return a partial result or a successful empty result. Instead return exactly {{"facts": [], "complete": false}}. This is the only exception to the one-key success envelope: it signals incomplete extraction and requests retry without claiming any source coverage. Do not include partial facts or extra keys.
+- Otherwise return the complete result as exactly {{"facts": [...]}} without a "complete" key. Use {{"facts": []}} only when this excerpt genuinely establishes no supported narrative facts, never to hide overflow.
+"""
 
 
 RERANK_SYSTEM = """You evaluate the relevance of conversation excerpts to a user query.

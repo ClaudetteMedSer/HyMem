@@ -9,7 +9,8 @@ answer, and which would have surfaced the 2026-08-26 aggregation-default
 flip had it existed.
 
 Usage:
-  lme_registry.py ingest [FILE ...]      Add runs from JSON files (default: all archives)
+  lme_registry.py ingest [FILE ...] [--historical-commitments]
+                                       Add runs (default: all archives)
   lme_registry.py list [--limit N] [--flag COL]   Print table
   lme_registry.py query "SQL"            Raw query against the DB
   lme_registry.py audit [--strict]       Date-check the aggregation label
@@ -20,6 +21,11 @@ If a key is absent (e.g. older format, or a lever that was not recorded),
 the value is stored as NULL — this registry does not guess; the
 date-check / provenance analysis is done on top of NULLs, not inside
 them.
+
+Strict ingestion reconstructs current producer identity. The explicit
+--historical-commitments reader validates preserved historical commitments
+and score/accounting evidence, records its weaker assurance, and never
+authorizes current execution. It is not a fallback after validation failure.
 """
 import json
 import math
@@ -28,16 +34,18 @@ import sqlite3
 import sys
 from pathlib import Path
 
-try:  # package import (tests): benchmarks.run_registry
-    from . import run_registry as rr
-    from .strictness import (
-        BenchmarkIntegrityError, content_hash, read_artifact_or_pointer,
-    )
-    from .lme_protocol import strict_intent, validate_strict_artifact
-except (ImportError, ValueError):  # direct CLI: python benchmarks/lme_registry.py
-    import run_registry as rr
-    from strictness import BenchmarkIntegrityError, content_hash, read_artifact_or_pointer
-    from lme_protocol import strict_intent, validate_strict_artifact
+# Direct execution exposes benchmarks/, not its sibling hymem package. Resolve
+# this checkout before using the same package imports as ``python -m``. Do not
+# catch ImportError here: a failure inside a dependency must remain visible.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "benchmarks"
+
+from . import run_registry as rr
+from .strictness import (
+    BenchmarkIntegrityError, content_hash, read_artifact_or_pointer,
+)
+from .lme_protocol import strict_intent, validate_archived_artifact, validate_strict_artifact
 
 DB = Path(os.environ.get("LME_REGISTRY_DB", "/home/node/.hermes/benchmarks/lme_runs.db"))
 BENCH_DIR = Path(os.environ.get("LME_BENCH_DIR", "/home/node/.hermes/benchmarks"))
@@ -134,6 +142,9 @@ CREATE TABLE IF NOT EXISTS runs (
     protocol_split             TEXT,
     calibration_receipt_hash   TEXT,
     strict_validated           INTEGER,
+    archive_validated          INTEGER,
+    validation_assurance       TEXT,
+    live_execution_eligible    INTEGER,
     official_comparable        INTEGER,
     development_only           INTEGER,
     official_denominator_validated INTEGER,
@@ -181,6 +192,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_aggr ON runs(aggregation_nodes_enabled);
 
 ADDITIVE_COLUMNS = {
     "run_id": "TEXT", "protocol": "TEXT", "strict_validated": "INTEGER",
+    "archive_validated": "INTEGER", "validation_assurance": "TEXT",
+    "live_execution_eligible": "INTEGER",
     "protocol_split": "TEXT", "calibration_receipt_hash": "TEXT",
     "official_comparable": "INTEGER", "development_only": "INTEGER",
     "official_denominator_validated": "INTEGER",
@@ -461,8 +474,12 @@ def _load_registry_artifact(path: Path) -> tuple[dict, str, str, str]:
     return data, archive, digest, compatibility
 
 
-def ingest_file(con, path: Path, overrides: dict | None = None):
+def ingest_file(con, path: Path, overrides: dict | None = None, *,
+                validation_scope: str = "current"):
     """Insert one run JSON. Returns 'inserted' | 'skipped' | 'error'."""
+    if validation_scope not in {"current", "historical"}:
+        return "error: unknown LongMemEval validation scope"
+    historical = validation_scope == "historical"
     overrides = overrides or {}
     try:
         data, archive, artifact_digest, pointer_compatibility = (
@@ -476,7 +493,8 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         if overrides:
             return "error: strict LongMemEval artifacts reject analyst overrides"
         try:
-            validated = validate_strict_artifact(data, path=path)
+            validator = validate_archived_artifact if historical else validate_strict_artifact
+            validated = validator(data, path=path)
         except (BenchmarkIntegrityError, ValueError, TypeError) as exc:
             # Strict intent is fail-closed: malformed evidence never falls back
             # to permissive legacy parsing.
@@ -574,9 +592,17 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         "scores": scores,
         "models": data.get("models") if strict else None,
         "execution": data.get("execution") if strict else None,
-        "strict_validation": (
+        "strict_validation" if historical else "archive_validation": None,
+        "archive_validation" if historical else "strict_validation": (
             {
+                "validation_assurance": (
+                    "historical_commitment_only" if historical
+                    else "current_producer_reconstructed"
+                ),
+                "live_execution_eligible": False if historical else None,
                 "run_id": validated["run_id"],
+                "summary_degraded_questions": validated["summary_degraded_questions"],
+                "summary_degraded_sessions": validated["summary_degraded_sessions"],
                 "official_protocol_aligned": validated["official_protocol_aligned"],
                 "official_scoring_semantics_aligned": validated[
                     "official_scoring_semantics_aligned"
@@ -641,7 +667,8 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         ),
         "total_tokens": total_tokens, "elapsed_s": elapsed_s,
         "flags_provenance": (
-            "strict-v1 validated durable evidence" if strict else prov
+            ("strict-v1 historical commitment only" if historical
+             else "strict-v1 validated durable evidence") if strict else prov
         ),
         "extras": json.dumps(extras, default=str),
         "run_id": validated.get("run_id") if validated else None,
@@ -650,7 +677,13 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         "calibration_receipt_hash": (
             manifest.get("calibration_receipt_hash") if strict else None
         ),
-        "strict_validated": int(strict),
+        "strict_validated": int(strict and not historical),
+        "archive_validated": int(strict and historical),
+        "validation_assurance": (
+            ("historical_commitment_only" if historical
+             else "current_producer_reconstructed") if validated else None
+        ),
+        "live_execution_eligible": 0 if validated and historical else None,
         "official_comparable": _to_int(
             validated.get("official_comparable") if validated else None
         ),
@@ -765,7 +798,7 @@ OVERRIDE_COLUMNS = {
 }
 
 
-def cmd_ingest(files, overrides=None):
+def cmd_ingest(files, overrides=None, *, validation_scope="current"):
     con = connect()
     if not files:
         files = sorted(BENCH_DIR.glob("longmemeval-v2-hymem*.json"))
@@ -774,7 +807,7 @@ def cmd_ingest(files, overrides=None):
         files = [f for f in files if f.name != "longmemeval-v2-hymem.json"]
     stats = {}
     for f in files:
-        r = ingest_file(con, Path(f), overrides)
+        r = ingest_file(con, Path(f), overrides, validation_scope=validation_scope)
         stats[r] = stats.get(r, 0) + 1
     con.commit()
     total = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
@@ -1062,17 +1095,21 @@ def main():
     cmd = sys.argv[1]
     if cmd == "ingest":
         ov = {}
+        validation_scope = "current"
         args = sys.argv[2:]
         i = 0
         while i < len(args):
-            if args[i] == "--set" and i + 1 < len(args):
+            if args[i] == "--historical-commitments":
+                validation_scope = "historical"
+                args.pop(i)
+            elif args[i] == "--set" and i + 1 < len(args):
                 k, v = args[i + 1].split("=", 1)
                 ov[k] = v
                 args.pop(i)
                 args.pop(i)
             else:
                 i += 1
-        cmd_ingest(args or None, ov)  # noqa: E1123
+        cmd_ingest(args or None, ov, validation_scope=validation_scope)
     elif cmd == "backfill":
         if cmd_backfill():
             sys.exit(1)   # §6.5: unreachable rows were not migrated

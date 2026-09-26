@@ -52,7 +52,7 @@ class _Closable:
 def _doctor_llm_config():
     return SimpleNamespace(
         llm_base_url="https://api.deepseek.com/v1",
-        llm_model="deepseek-v4-flash",
+        llm_model="deepseek-flash",
         has_llm_key=True,
         llm_api_key="provider-key-must-not-leak",
     )

@@ -51,6 +51,7 @@ def test_actual_simulation_pipeline_to_registry_without_receipt_seams(
 def test_actual_prepare_indexing_published_and_reused_store_receipts(tmp_path, scope):
     from tests.test_msc_checkpoint_resume import _example
     args = SimpleNamespace(sim=False, no_dream=False, dream_per_session=False,
+                           indexing_completion_policy="source-backed-index-with-explicit-summary-degradation-v1",
                            indexing_max_cycles=10, indexing_timeout_s=30.0)
     # A real temporary memory store with its maintained offline producer. Only
     # the provider is a stub; ingest, dream, publication and attestation run.
@@ -77,6 +78,7 @@ def test_actual_prepare_indexing_failure_envelopes_remain_readable(
 ):
     from tests.test_msc_checkpoint_resume import _example
     args = SimpleNamespace(sim=False, no_dream=False, dream_per_session=False,
+                           indexing_completion_policy="source-backed-index-with-explicit-summary-degradation-v1",
                            indexing_max_cycles=10, indexing_timeout_s=30.0)
     adapter = _offline_adapter(tmp_path)
     try:
@@ -128,6 +130,7 @@ def test_actual_prepare_indexing_failure_envelopes_remain_readable(
 ])
 def test_store_pointer_shape_lifecycle_and_available_digest_binding(skipped, mutate):
     args = SimpleNamespace(sim=skipped, no_dream=skipped,
+                           indexing_completion_policy="source-backed-index-with-explicit-summary-degradation-v1",
                            indexing_max_cycles=100, indexing_timeout_s=3600.0)
     summary = skipped_indexing("msc:q1") if skipped else scoped_indexing("msc:q1", args)
     assert validate_scoped_indexing(summary, scope_id="msc:q1", config=vars(args)) is not skipped

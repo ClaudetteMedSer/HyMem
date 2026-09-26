@@ -224,6 +224,8 @@ def test_transient_aggregation_failure_heals_during_convergence(
             status=lambda: durable_indexing_status(hy, None),
             max_cycles=3,
             timeout_s=10,
+            # This checks health transitions, independent of host setup cost.
+            _clock=lambda: 0.0,
         )
         assert summary["cycles"] == 2
         assert summary["complete"] is True
@@ -262,12 +264,67 @@ def test_permanent_aggregation_failure_exhausts_convergence_cap(
                 status=lambda: durable_indexing_status(hy, None),
                 max_cycles=2,
                 timeout_s=10,
+                # The cycle cap, rather than elapsed setup time, is under test.
+                _clock=lambda: 0.0,
             )
         assert failed.value.summary["failure_reason"] == "max_cycles_exhausted"
         assert failed.value.summary["cycles"] == 2
         assert failed.value.summary["final_status"]["pending_aggregation"] == 1
         assert hy.dream_status()["aggregation_active_build_attempts"] == 2
         assert hy.dream_status()["aggregation_total_fusion_failures"] == 2
+    finally:
+        hy.close()
+
+
+@pytest.mark.parametrize("max_cycles", [1, 3])
+def test_aggregation_convergence_expiry_interrupts_setup_before_cycle_cap(
+    tmp_path, monkeypatch, max_cycles,
+):
+    from hymem.dreaming import runner
+
+    now = 0.0
+    real_acquire = runner._acquire_lock
+
+    def acquire_then_expire(conn, holder):
+        nonlocal now
+        acquired = real_acquire(conn, holder)
+        now = 10.0
+        return acquired
+
+    monkeypatch.setattr(runner, "_acquire_lock", acquire_then_expire)
+    monkeypatch.setattr(
+        runner,
+        "build_aggregation_nodes",
+        lambda *args, **kwargs: pytest.fail(
+            "expired setup must not start aggregation"
+        ),
+    )
+    hy = _memory(_cfg(tmp_path))
+    try:
+        with pytest.raises(IndexingConvergenceError) as failed:
+            converge_indexing(
+                hy.dream,
+                status=lambda: pytest.fail(
+                    "interrupted setup must not read completion status"
+                ),
+                max_cycles=max_cycles,
+                timeout_s=10,
+                _clock=lambda: now,
+            )
+
+        summary = failed.value.summary
+        assert summary["failure_reason"] == "timeout_during_cycle"
+        assert summary["cycles"] == 0
+        assert summary["reports"] == []
+        assert summary["complete"] is False
+        assert summary["healthy"] is False
+        assert summary["elapsed_s"] == 10.0
+        assert hy.conn.execute("SELECT * FROM run_lock").fetchall() == []
+        run = hy.conn.execute(
+            "SELECT ended_at,error FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert run["ended_at"] is not None
+        assert run["error"] == "setup_interrupted"
     finally:
         hy.close()
 

@@ -140,6 +140,9 @@ _OPERATIONAL_TABLES = frozenset({
     "dream_runs",
     "extraction_feedback",
     "run_lock",
+    # Private recovery work is neither retrieval material nor publication
+    # authority. Public summary text/frontiers remain attested in sessions.
+    "summary_recovery",
 })
 
 _FTS_TABLES = frozenset({

@@ -1,4 +1,4 @@
-# DeepSeek model deprecation & migration (2026-07-24)
+# DeepSeek requested-service migration (updated 2026-09-17)
 
 **Deprecated aliases:** `deepseek-chat` and `deepseek-reasoner` are not valid
 current configuration choices. They returned 400s beginning 2026-07-24; an
@@ -6,7 +6,13 @@ August 30 probe briefly found `deepseek-chat` resolving again, but that only
 demonstrated why a mutable alias is unsuitable for reproducible runs. Historical
 artifacts below retain the name as provenance, never as a recommendation.
 
-**Current pin:** `deepseek-v4-flash` + `thinking: {"type": "disabled"}`.
+**Current requested service:** `deepseek-flash` + `thinking: {"type": "disabled"}`.
+DeepSeek now documents the old `deepseek-v4-flash` and
+`deepseek-v4-flash-vision-exp` names as retired and routed to its newer Flash
+backend. They are rejected for new execution, not silently renamed. The current
+public service name is not an immutable weights pin. See
+[DeepSeek's model documentation](https://api-docs.deepseek.com/).
+
 HyMem's library client applies that body automatically in its default `auto`
 mode. Current repository defaults for LME, BEAM, MSC, and LoCoMo use the same model; their raw
 DeepSeek reader/judge paths also default the body safely. A custom endpoint is
@@ -44,7 +50,7 @@ Use a paired, staged protocol:
    and omission behavior. Read-side-only changes can often reuse one fixed,
    target-built store and vary only the paired reader/retrieval arm.
 5. Promote only a pre-declared winner, then rerun the full definitive protocol
-   with exact `deepseek-v4-flash`, the fixed judge, and all normal strict artifact
+   with the recorded `deepseek-flash` requested service, the fixed judge, and all normal strict artifact
    checks. Do not merge cheap-model and target-model scores or report the screen
    as benchmark parity.
 
@@ -53,16 +59,24 @@ only evidence to spend the more expensive target-model run; model × architectur
 rank reversals remain plausible for extraction reasoning, long-context recall,
 strict structured output, answer synthesis, and judge behavior.
 
-**Active enforcement:** live constructors reject `deepseek-chat` and
-`deepseek-reasoner` (case/outer-whitespace normalized), including provider
+**Active enforcement:** live constructors reject `deepseek-chat`,
+`deepseek-reasoner`, `deepseek-v4-flash`, and `deepseek-v4-flash-vision-exp`
+(case/outer-whitespace normalized), including provider
 forms such as `deepseek:deepseek-chat` and `deepseek/deepseek-chat`. The gate
 runs before credential resolution, SDK construction, HTTP calls, and scored
 benchmark dataset/store work. Exact versioned identities such as
 `deepseek-chat-v4` are not rejected by substring guessing. Historical
-artifacts and registries remain readable; the restriction applies only when a
-model identity is selected for active execution.
+artifacts remain unchanged. LME's explicit archive-only reader can validate
+historical commitments without reconstructing today's producer; it does not
+grant live execution eligibility or strict current-protocol admission.
 
-**NEVER `deepseek-v4-pro` for answer/judge/distill reads.** It is a reasoning model: output lands in `reasoning_content` instead of `content`, so every client reading `choices[0].message.content` gets empty strings — answer/judge/distill calls silently fail. Reasoning tokens also burn the `max_tokens` budget: small calls (judge `max_tokens=10`, distill `max_tokens=256`) exhaust everything on reasoning before producing content.
+**Reasoning needs its own validated budget.** Reasoning output and ordinary
+content are separate; reasoning mode does not inherently prevent a content
+answer, but it can exhaust `max_tokens` before that answer is produced. Current
+bounded benchmark defaults remain thinking-disabled. An experiment using
+reasoning must record its effort, budget, truncations, cost, and effective
+request, and must not substitute private reasoning for the required answer.
+See [DeepSeek's thinking-mode guide](https://api-docs.deepseek.com/guides/thinking_mode/).
 
 ## `HYMEM_LLM_THINKING` (gated client, landed upstream d6ebaa5 2026-08-05)
 
@@ -75,10 +89,23 @@ Vocabulary: `auto` / `disabled` / `enabled` / `off` (invalid value raises `Value
 
 The adapters retain `--judge-extra-body` and `--answer-extra-body` for explicit
 provider overrides. When those options are omitted and the request targets the
-DeepSeek endpoint with a v4-flash model, the effective body defaults to
+DeepSeek endpoint with the current Flash service, the effective body defaults to
 `{"thinking":{"type":"disabled"}}` before any spend, including rejudge paths.
 An explicit incompatible body fails closed. Other endpoints receive no implicit
 DeepSeek extension; pass one explicitly only when that gateway documents it.
+Pure historical body transformations retain their old v4-flash behavior;
+those transformations are deliberately separate from live-model admission.
+
+## Identity and deployment consequences
+
+The official-endpoint producer contract is now
+`official-deepseek-flash-request-service-at-api.deepseek.com-v1`. Its exactness
+binds local request implementation and requested service, not provider weights.
+Custom endpoints still require both public deployment revision and tenant
+attestations; the official exception does not accept a partial attestation.
+Changing the model/request implementation rotates producer and generation
+identities, so existing derived material may need rebuilding. Stored artifacts
+are never renamed to conceal that change.
 
 ## Historical timeline and current state
 
@@ -105,9 +132,9 @@ expensive answer path had no guard at all. Artifacts record `answer_extra_body` 
 `judge_extra_body`, so a reader no longer has to infer from the code whether thinking was
 disabled.
 
-**Current repository state, 2026-09-06:** defaults are pinned to
-`deepseek-v4-flash`. Omitted raw-client bodies are resolved to thinking-disabled
-only on DeepSeek v4-flash; BEAM's memory pipeline uses `auto`, as do LME, MSC,
+**Current repository state, 2026-09-17:** defaults request
+`deepseek-flash`. Omitted raw-client bodies are resolved to thinking-disabled
+on the official DeepSeek Flash endpoint; BEAM's memory pipeline uses `auto`, as do LME, MSC,
 and LoCoMo. Historical aliases remain only in dated plans, result filenames,
 registry fixtures, and pure compatibility transformations; they cannot be used
 to construct a live client. This is not an attestation of any already-running
@@ -115,24 +142,23 @@ remote process; verify its effective environment after deployment.
 
 | File | What |
 |---|---|
-| `hymem/contrib/openai_client.py` | Default fallback → `deepseek-v4-flash` |
-| `hymem/bootstrap.py` | `DEFAULT_LLM_MODEL` → `deepseek-v4-flash` |
-| `benchmarks/longmemeval_adapter.py` | Reader, legacy judge, and memory-pipeline defaults → `deepseek-v4-flash`; raw DeepSeek v4 bodies default thinking-disabled and reject an incompatible explicit body. |
-| `benchmarks/beam_adapter.py` | Reader, legacy judge, and memory-pipeline defaults → `deepseek-v4-flash`; pipeline thinking → `auto`. |
-| `benchmarks/msc_adapter.py`, `benchmarks/locomo_adapter.py` | Reader, judge, and memory-pipeline defaults → `deepseek-v4-flash`; raw clients inherit LME's safe request-body resolution. |
-| `~/.agent37/hooks/post-restart.sh` | `HYMEM_LLM_MODEL` → `deepseek-v4-flash` |
-| `~/.hermes/bin/hymem-server-wrapper` | `HYMEM_LLM_MODEL` — the SINGLE source for MCP-server env; was the LAST live `deepseek-chat` reference (2026-08-07). After patching, kill the `hymem-server` CHILDREN only — watchdogs respawn them with the new env; verify `/proc/<pid>/environ`. Killing the watchdogs kills the bridge. |
+| `hymem/contrib/model_policy.py` | Shared `RECOMMENDED_DEEPSEEK_MODEL = "deepseek-flash"` and retired-name admission policy |
+| `hymem/contrib/openai_client.py`, `hymem/bootstrap.py` | Client/server defaults reference that shared service name |
+| `benchmarks/longmemeval_adapter.py`, `benchmarks/beam_adapter.py` | Reader, legacy judge, and memory-pipeline defaults share that name; raw Flash bodies default thinking-disabled and reject an incompatible explicit body |
+| `benchmarks/msc_adapter.py`, `benchmarks/locomo_adapter.py` | Same defaults; raw clients inherit LME's safe request-body resolution |
 
 `HYMEM_LLM_MODEL` overrides code defaults. Deployments must remove any deprecated
-alias from wrappers/hooks, set `HYMEM_LLM_MODEL=deepseek-v4-flash` and
-`HYMEM_LLM_THINKING=auto` (or `disabled`), restart Honcho, and verify the
-effective process environment. A current build will now refuse startup/client
+alias from every applicable MCP wrapper and Honcho launcher, set
+`HYMEM_LLM_MODEL=deepseek-flash` and `HYMEM_LLM_THINKING=auto` (or `disabled`),
+use the deployment's maintained restart procedure, and verify every effective
+process environment without printing credentials. Do not assume killing an MCP
+child respawns it. A current build will refuse startup/client
 construction instead of silently spending against the retired alias;
 repository changes cannot update a remote process environment.
 
 ## Non-DeepSeek reasoning models
 
-`gpt-oss-120b` via OpenRouter may land output in `reasoning` instead of
-`content`. `LLMClient._call()` needs the three-way fallback: `content or
-reasoning or reasoning_content`. The historical migration context is retained
+Historically, `gpt-oss-120b` via OpenRouter sometimes exhausted its budget on
+reasoning. A missing ordinary answer is a failed completion, not permission to
+grade private reasoning as an answer. The historical migration context is retained
 in [the BEAM model-pin pre-registration](../docs/plans/2026-09-01-beam-model-pin-pre-reg.md).

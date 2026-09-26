@@ -34,7 +34,7 @@ from hymem.query import augment as augment_module
 from hymem.query.augment import _fact_search
 
 
-_CLOSER = "Return the JSON array of narrative facts now"
+_CLOSER = "Return the JSON object of narrative facts now"
 
 
 def _quiet_config(cfg: HyMemConfig, **changes) -> HyMemConfig:
@@ -859,7 +859,13 @@ def test_fact_embedding_scan_cursor_batches_and_reuses_cross_page_proof(
             hy.conn, initial_embedder, batch_size=36
         )
         assert initial is not None and len(initial.fact_ids) == 36
-        assert max(map(len, initial_embedder.calls)) == 36
+        assert [len(batch) for batch in initial_embedder.calls] == [16, 16, 4]
+        assert [text for batch in initial_embedder.calls for text in batch] == [
+            hy.conn.execute(
+                "SELECT text FROM narrative_facts WHERE id=?", (fact_id,)
+            ).fetchone()[0]
+            for fact_id in initial.fact_ids
+        ]
         with core_db.transaction(hy.conn):
             persist_fact_embeddings(hy.conn, initial)
 
