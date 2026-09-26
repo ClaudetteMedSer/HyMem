@@ -23,6 +23,7 @@ from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL
 os.chdir("/home/node/HyMem")
 
 from benchmarks.extraction_canary import (
+    _FAILURE_REASONS,
     ExtractionCanaryError,
     run_configured_extraction_canary,
 )
@@ -43,7 +44,25 @@ def log(message: str) -> None:
         fh.write(line + "\n")
 
 
-log(f"WATCH_START interval={INTERVAL_S}s max_probes={MAX_PROBES} log={log_path}")
+def failure_diagnostic(report: object) -> str:
+    """Render only closed reason labels and bounded, genuine integer counters."""
+    report = report if type(report) is dict else {}
+    reason = report.get("failure_reason")
+    reason = reason if type(reason) is str and reason in _FAILURE_REASONS else "unknown"
+    path = report.get("execution_path")
+    path = path if type(path) is dict else {}
+    counters = []
+    for label, field in (
+        ("prose_em", "prose_claim_exact_context_emissions"),
+        ("table_em", "table_claim_exact_context_emissions"),
+    ):
+        value = path.get(field)
+        safe = str(value) if type(value) is int and 0 <= value <= 2**63 - 1 else "unknown"
+        counters.append(f"{label}={safe}")
+    return reason + " " + " ".join(counters)
+
+
+log(f"WATCH_START interval={INTERVAL_S}s max_probes={MAX_PROBES}")
 
 consecutive_errors = 0
 for n in range(1, MAX_PROBES + 1):
@@ -60,16 +79,10 @@ for n in range(1, MAX_PROBES + 1):
         verdict = "PASS"
     except ExtractionCanaryError as exc:
         verdict = "FAIL"
-        report = getattr(exc, "report", None) or {}
-        reason = report.get("failure_reason") or "unknown"
-        path = report.get("execution_path") or {}
-        reason += (
-            f" prose_em={path.get('prose_claim_exact_context_emissions')}"
-            f" table_em={path.get('table_claim_exact_context_emissions')}"
-        )
+        reason = failure_diagnostic(getattr(exc, "report", None))
     except Exception as exc:  # noqa: BLE001 - watcher must survive probe errors
         verdict = "ERROR"
-        reason = f"{type(exc).__name__}: {exc}"
+        reason = "probe_error"
 
     duration = time.time() - t0
     log(

@@ -448,9 +448,32 @@ class DreamLLM:
         if request.system.startswith("You regenerate one rolling conversation summary"):
             return json.dumps({"summary": "Successfully recorded the complete conversation material."
                                if self.repair_succeeds else "x" * 684})
+        if request.system.startswith("Regenerate a length-feasible summary from the original generation inputs."):
+            summary = ("Successfully recorded the complete conversation material."
+                       if self.repair_succeeds else "x" * 684)
+            return json.dumps({"alternatives": [summary] * 3})
         if "single pass" in request.system:
             return '{"triples":[],"markers":[],"complete":true}'
         return "[]"
+
+
+@pytest.mark.parametrize("repair_succeeds", [False, True])
+def test_dream_llm_recovery_response_grammar(repair_succeeds):
+    from hymem.dreaming import summary_recovery
+
+    llm = DreamLLM(repair_succeeds=repair_succeeds)
+    primary = LLMRequest(system=summary_recovery.SUMMARY_RECOVERY_SYSTEM, user="Original source content")
+    repair = summary_recovery._cap_recovery_request(primary, 684)
+    primary_response = json.loads(llm.complete(primary))
+    repair_response = json.loads(llm.complete(repair))
+    assert set(primary_response) == {"summary"}
+    assert set(repair_response) == {"alternatives"}
+    assert repair_response["alternatives"] == [primary_response["summary"]] * 3
+    parser = summary_recovery._parse_repair_alternatives
+    assert parser(json.dumps(primary_response)) == (None, "shape_failure")
+    assert parser(json.dumps(repair_response)) == (
+        (primary_response["summary"], None) if repair_succeeds else (None, "summary_output_cap")
+    )
 
 
 def test_dream_retry_reopen_status_portability_and_success_reset(cfg, tmp_path):
@@ -570,9 +593,16 @@ def test_dream_retry_reopen_status_portability_and_success_reset(cfg, tmp_path):
         assert row["digest_retry_config_version"] is None
         assert row["digest_cursor_partial_message_id"] is None
         assert healed.dream_status()["summary_healthy"] is True
-        recovery_calls = [r for r in llm.calls if r.system.startswith("You regenerate one rolling conversation summary")]
-        assert len(recovery_calls) == 2 and recovery_calls[0].user == recovery_calls[1].user
-        assert "Earlier source content remains unchanged." in recovery_calls[1].user
-        assert "Source content remains unchanged. " * 450 in recovery_calls[1].user
+        primary_recovery_calls = [r for r in llm.calls if r.system.startswith(
+            "You regenerate one rolling conversation summary")]
+        repair_recovery_calls = [r for r in llm.calls if r.system.startswith(
+            "Regenerate a length-feasible summary from the original generation inputs.")]
+        assert len(primary_recovery_calls) == len(repair_recovery_calls) == 1
+        original_input = primary_recovery_calls[0].user
+        assert json.loads(repair_recovery_calls[0].user) == {
+            "original_generation_input": original_input,
+        }
+        assert "Earlier source content remains unchanged." in original_input
+        assert "Source content remains unchanged. " * 450 in original_input
     finally:
         healed.close()

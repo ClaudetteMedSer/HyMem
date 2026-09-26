@@ -110,14 +110,14 @@ def test_bounded_empty_pair_at_split_depth_limit_still_verifies_whole_unit(monke
     assert client.calls[0].user.split('"""', 2)[1].strip() == text
 
 
-@pytest.mark.parametrize(("first", "reason", "calls"), [
-    (_response(complete=False), "incomplete_response", 2),
-    ('{"triples": [', "parse_failure", 2),
-    ('{"triples": [BROKEN', "parse_failure", 1),
-    (_response({"subject": "missing-required-fields"}), "item_validation_failure", 2),
+@pytest.mark.parametrize(("first", "reason", "calls", "contract_repair"), [
+    (_response(complete=False), "incomplete_response", 2, False),
+    ('{"triples": [', "parse_failure", 2, False),
+    ('{"triples": [BROKEN', "parse_failure", 1, False),
+    (_response({"subject": "missing-required-fields"}), "contract_failure", 2, True),
 ])
 def test_actual_incomplete_or_invalid_primary_cannot_be_certified_by_empty_retry(
-    first, reason, calls,
+    first, reason, calls, contract_repair,
 ):
     text = _sentence("Can you explain why a hypothetical oscillator uses a spring", 240)
     client = _SequenceClient(first, _response())
@@ -127,7 +127,13 @@ def test_actual_incomplete_or_invalid_primary_cannot_be_certified_by_empty_retry
     assert result.failed and result.failure_reason == reason
     assert result.triples == [] and result.markers == []
     assert result.completion_calls == result.provider_attempts == len(client.calls) == calls
-    assert "split:no_admissible_semantic_boundary" in result.failure_details
+    if contract_repair:
+        assert "repair:empty_after_invalid" in result.failure_details
+        assert client.calls[1].system == client.calls[0].system
+        assert "CONTRACT REPAIR PASS" in client.calls[1].user
+        assert client.calls[0].user in client.calls[1].user
+    else:
+        assert "split:no_admissible_semantic_boundary" in result.failure_details
 
 
 def test_actual_incompleteness_at_depth_limit_is_not_a_clean_empty_pair(monkeypatch):
@@ -145,22 +151,29 @@ def test_actual_incompleteness_at_depth_limit_is_not_a_clean_empty_pair(monkeypa
     assert result.completion_calls == 2
 
 
-@pytest.mark.parametrize(("verification", "reason"), [
-    (_response(complete=False), "incomplete_response"),
-    ('{"triples": [', "parse_failure"),
-    ('{"triples": [BROKEN', "parse_failure"),
-    (_response({"subject": "missing-required-fields"}), "item_validation_failure"),
-    ('{"triples": [], "markers": []}', "contract_failure"),
+@pytest.mark.parametrize(("verification", "reason", "contract_repair"), [
+    (_response(complete=False), "incomplete_response", False),
+    ('{"triples": [', "parse_failure", False),
+    ('{"triples": [BROKEN', "parse_failure", False),
+    (_response({"subject": "missing-required-fields"}), "contract_failure", True),
+    ('{"triples": [], "markers": []}', "contract_failure", True),
 ])
-def test_empty_primary_still_requires_a_complete_valid_verification(verification, reason):
+def test_empty_primary_still_requires_a_complete_valid_verification(verification, reason, contract_repair):
     text = _sentence("A hypothetical service depends on a database in this", 240)
-    client = _SequenceClient(_response(), verification)
+    client = _SequenceClient(_response(), verification, *([_response()] if contract_repair else []))
 
     result = chunk.extract_chunk(client, text)
 
     assert result.failed and result.failure_reason == reason
     assert result.triples == [] and result.markers == []
-    assert result.completion_calls == result.provider_attempts == len(client.calls) == 2
+    assert result.completion_calls == result.provider_attempts == len(client.calls) == (3 if contract_repair else 2)
+    if contract_repair:
+        assert "repair:empty_after_invalid" in result.failure_details
+        assert "stage:empty" in result.failure_details
+        assert client.calls[2].system == client.calls[1].system
+        assert "EMPTY VERIFICATION PASS" in client.calls[2].system
+        assert client.calls[1].user in client.calls[2].user
+        assert "CONTRACT REPAIR PASS" in client.calls[2].user
 
 
 def test_bounded_empty_is_not_published_without_verification_budget():
@@ -174,6 +187,53 @@ def test_bounded_empty_is_not_published_without_verification_budget():
     assert "calls:max_exceeded" in result.failure_details
     assert result.triples == [] and result.markers == []
     assert result.completion_calls == result.provider_attempts == len(client.calls) == 1
+
+
+@pytest.mark.parametrize(("limit", "omission", "reason", "calls"), [
+    (3, _response(), None, 3),
+    (2, _response(), "resource_limit", 2),
+    (3, _response(complete=False), "incomplete_response", 3),
+])
+@pytest.mark.parametrize("empty_verification_repair", [False, True])
+def test_terminal_contract_repair_requires_source_exact_omission_certification(
+    limit, omission, reason, calls, empty_verification_repair,
+):
+    source = _source(_sentence("I use PostgreSQL for storage in this", 240, terminal="."))
+    prefix = [_response()] if empty_verification_repair else []
+    limit += len(prefix)
+    calls += len(prefix)
+    client = _SequenceClient(*prefix,
+        _response({"subject": "missing-required-fields"}),
+        _response(_claim("PostgreSQL")), omission,
+    )
+
+    result = chunk.extract_chunk(
+        client, "ignored", source_records=(source,), completion_call_limit=limit,
+    )
+
+    assert result.completion_calls == result.provider_attempts == len(client.calls) == calls
+    assert [call.user.split('"""', 2)[1].strip() for call in client.calls] == [source[1]] * calls
+    assert "VERIFICATION PASS" not in client.calls[0].system
+    invalid_index = len(prefix)
+    repair = client.calls[invalid_index + 1]
+    assert repair.system == client.calls[invalid_index].system
+    assert client.calls[invalid_index].user in repair.user
+    assert "CONTRACT REPAIR PASS" in repair.user
+    if empty_verification_repair:
+        assert "EMPTY VERIFICATION PASS" in repair.system
+    else:
+        assert "VERIFICATION PASS" not in repair.system
+    if calls == 3 + len(prefix):
+        assert "OMISSION VERIFICATION PASS" in client.calls[-1].system
+    if reason is None:
+        assert not result.failed
+        assert [triple.object for triple in result.triples] == ["PostgreSQL"]
+        assert result.markers == []
+    else:
+        assert result.failed and result.failure_reason == "branch_incomplete"
+        assert f"right:{reason}" in result.failure_details
+        assert "right.stage:omission" in result.failure_details
+        assert result.triples == [] and result.markers == []
 
 
 def test_long_terminal_claim_recovered_by_empty_check_gets_exact_omission_pass():

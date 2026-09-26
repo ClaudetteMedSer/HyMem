@@ -55,8 +55,8 @@ def with_retry(
                 break
             delay = min(base_delay * (2 ** attempt), max_delay)
             log.warning(
-                "%s failed (attempt %d/%d): %s; retrying in %.1fs",
-                label, attempt + 1, attempts, exc, delay,
+                "External call failed (attempt %d/%d); retrying in %.1fs",
+                attempt + 1, attempts, delay,
             )
             if deadline is None:
                 time.sleep(delay)
