@@ -22,6 +22,7 @@ from hymem.dreaming.procedures import (
     persist_procedures,
 )
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import synthetic_fidelity_approval, synthetic_format_approval
 
 
 # --- helpers ---------------------------------------------------------------
@@ -37,6 +38,9 @@ class _ProcedureDigestLLM:
 
     def complete(self, request) -> str:
         self.calls.append(request)
+        approval = synthetic_fidelity_approval(request) or synthetic_format_approval(request)
+        if approval is not None:
+            return approval
         if "Return the JSON object now" not in request.user:
             return "[]"
         # The strict digest contract admits only producer-rendered NEW

@@ -22,7 +22,7 @@ def semantic_generation_suffix(tier: str, client: object | None) -> str:
     if client is None:
         return ""
     from hymem.dreaming import (
-        canonicalize, digest, episodes, facts, lossless, procedures, summary,
+        canonicalize, digest, episodes, facts, lossless, procedures, summary, summary_policy,
         user_profile,
     )
     from hymem.extraction import jsonio
@@ -30,7 +30,7 @@ def semantic_generation_suffix(tier: str, client: object | None) -> str:
     from hymem.dreaming import runner
 
     if tier == "digest":
-        modules = (digest, episodes, procedures, summary)
+        modules = (digest, episodes, procedures, summary, summary_policy)
         dispatch = (
             "extract_session_digest", "persist_episodes", "persist_procedures",
             "publish_digest_procedures",

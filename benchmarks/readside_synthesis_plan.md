@@ -7,7 +7,8 @@
 > HyMem has not rerun a replacement score under the new strict LME envelope.
 > Every `deepseek-chat` setting below names the now-retired mutable alias used by
 > that historical experiment; it is provenance, not a runnable default or
-> recommendation. Current runs pin `deepseek-v4-flash` with thinking disabled.
+> recommendation. Current runs request `deepseek-flash` with thinking disabled;
+> the public service name does not pin immutable model weights.
 
 *Written 2026-07-24, branch `Beam-optimisation`. Companion to
 `benchmarks/raptor_digest_plan.md` (RAPTOR product thread),

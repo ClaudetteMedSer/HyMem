@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import contextmanager
 from dataclasses import replace
 from queue import Empty, Queue
@@ -25,6 +26,7 @@ from hymem.query.fusion import (
 )
 from hymem.query.graph_state import GraphEvidenceCitation
 from tests.conftest import make_routed_llm, seed_edge
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 
 def test_asgi_lifespan_orders_start_body_then_owned_shutdown(monkeypatch):
@@ -862,6 +864,7 @@ class _ControlledScheduler:
 
 @contextmanager
 def _controlled_scheduler(hy, monkeypatch, *, real_dream=True):
+    from hymem.dreaming import digest
     from hymem.extraction.prompts import SESSION_DIGEST_SYSTEM, USER_PROFILE_SYSTEM
 
     # Unlike the general fixture's standalone [], these are valid responses to
@@ -872,6 +875,8 @@ def _controlled_scheduler(hy, monkeypatch, *, real_dream=True):
     # which also occurs in the digest prompt.
     llm.fixtures.clear()
     llm.fixtures.update({
+        digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+        digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
         SESSION_DIGEST_SYSTEM: (
             '{"episodes":[],"summary":"Local development was discussed.","procedures":[]}'
         ),

@@ -39,6 +39,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+# Direct CLI and sibling-script imports need the checkout on the import path.
+if not __package__:
+    _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+
 from hymem.deadline import DeadlineExceeded, MonotonicDeadline
 from hymem.dreaming.status import (
     DREAM_STATUS_SCHEMA_VERSION,

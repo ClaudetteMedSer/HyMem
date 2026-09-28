@@ -12,13 +12,17 @@ from hymem.dreaming.chunks import (
     extract_high_salience_chunks,
 )
 from hymem.dreaming.retention import prune_chunks
+from hymem.dreaming.digest import _DIGEST_FIDELITY_SYSTEM, _DIGEST_FORMAT_ADJUDICATION_SYSTEM
 from hymem.extraction.llm import StubLLMClient
 from hymem.extraction.contract import extraction_cache_key
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 
 def _llm() -> StubLLMClient:
     return StubLLMClient(
         fixtures={
+            _DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            _DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "Return the JSON object now": json.dumps({
                 "episodes": [],
                 "summary": "complete tail",
@@ -168,6 +172,8 @@ def test_baseline_budget_is_global_across_sessions(cfg):
 def test_consumed_baseline_budget_reports_retryable_attempt_as_pending(cfg):
     llm = StubLLMClient(
         fixtures={
+            _DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            _DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "Return the JSON object now": json.dumps({
                 "episodes": [],
                 "summary": "complete tail",

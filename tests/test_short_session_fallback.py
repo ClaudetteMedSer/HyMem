@@ -20,6 +20,7 @@ from hymem.core.db import connect, initialize
 from hymem.dreaming.chunks import _chunk_id, extract_fallback_chunk
 from hymem.dreaming.lossless import coverage_chunk_id
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import VerificationStubLLM
 
 
 # --- helpers ---------------------------------------------------------------
@@ -39,7 +40,7 @@ def _digest_llm(
         "summary": summary,
         "procedures": procedures or [],
     }
-    return StubLLMClient(
+    return VerificationStubLLM(
         fixtures={"Return the JSON object now": json.dumps(payload)},
         default=json.dumps({
             "triples": [],

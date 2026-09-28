@@ -14,17 +14,23 @@ import argparse
 import json
 import math
 import re
+import sys
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# This CLI imports HyMem before it reaches the shared benchmark helpers.
+if not __package__:
+    _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
 
 from hymem.contrib.endpoint_policy import (
     TRANSPORT_SECURITY_NONE,
     validate_http_endpoint,
     validate_recorded_embedding_endpoint,
 )
-from hymem.contrib.model_policy import require_active_model
 
 try:  # package imports in tests
     from .archive_evidence import (validate_checkpoint_attestation, validate_scoped_indexing,
@@ -271,6 +277,11 @@ def _validate_embedding_usage(
 def _validate_model_identity(
     models: Mapping[str, Any], *, scored: bool, simulation: bool,
 ) -> None:
+    """Validate recorded identity, not current provider/model availability.
+
+    The live adapters enforce retirement policy before execution. Applying it
+    here would retroactively revoke immutable archives when that policy changes.
+    """
     if set(models) != {"reader", "judge", "memory_pipeline", "embedding"}:
         raise _fail("model identity is incomplete")
     for role in ("reader", "judge", "memory_pipeline", "embedding"):
@@ -341,7 +352,6 @@ def _validate_model_identity(
         ):
             raise _fail("live provider model identity is absent")
         try:
-            require_active_model(model, role=f"MSC {label}")
             endpoint = validate_http_endpoint(role.get("base_url"), label=label)
         except (TypeError, ValueError) as exc:
             raise _fail("live provider identity is unsafe") from exc

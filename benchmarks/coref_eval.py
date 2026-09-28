@@ -44,6 +44,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hymem.query.coref import QueryRewrite, rewrite_query  # noqa: E402
 from hymem.session import Message  # noqa: E402
+from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL  # noqa: E402
 
 _INSERT_EDGE = """
     INSERT INTO knowledge_graph
@@ -256,7 +257,7 @@ def main() -> None:
             over["coref_llm_enabled"] = True
             llm = OpenAICompatibleClient(
                 api_key=args.api_key, base_url="https://api.deepseek.com",
-                model="deepseek-v4-flash",
+                model=RECOMMENDED_DEEPSEEK_MODEL,
             )
         cfg = dataclasses.replace(base, **over)
         print(f"[cfg] max_turns={cfg.coref_max_turns} "

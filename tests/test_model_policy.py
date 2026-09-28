@@ -36,6 +36,12 @@ import rules_compliance  # noqa: E402
         ("openai:deepseek-chat", "deepseek-chat"),
         ("deepseek/deepseek-chat", "deepseek-chat"),
         ("openrouter: DeepSeek / DeepSeek-Chat", "deepseek-chat"),
+        ("deepseek-v4-flash", "deepseek-v4-flash"),
+        (" DEEPSEEK-V4-FLASH ", "deepseek-v4-flash"),
+        ("openai:DeepSeek-V4-Flash", "deepseek-v4-flash"),
+        ("deepseek/deepseek-v4-flash", "deepseek-v4-flash"),
+        ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"),
+        ("openrouter: DeepSeek / DEEPSEEK-V4-FLASH-VISION-EXP", "deepseek-v4-flash-vision-exp"),
     ],
 )
 def test_policy_recognizes_only_exact_normalized_alias_slots(model, alias):
@@ -44,7 +50,7 @@ def test_policy_recognizes_only_exact_normalized_alias_slots(model, alias):
         require_active_model(model, role="test role")
     message = str(caught.value)
     assert alias in message
-    assert "deepseek-v4-flash" in message
+    assert "deepseek-flash" in message
     assert "auto" in message and "disabled" in message
 
 
@@ -55,7 +61,8 @@ def test_policy_recognizes_only_exact_normalized_alias_slots(model, alias):
         "deepseek-reasoner-v2",
         "my-deepseek-chat-model",
         "org/deepseek-chat",
-        "deepseek-v4-flash",
+        "deepseek-flash",
+        "deepseek-v4-flash-custom",
         "openai:gpt-4.1-mini",
         None,
     ],
@@ -65,7 +72,10 @@ def test_policy_has_no_substring_false_positives(model):
     require_active_model(model)
 
 
-@pytest.mark.parametrize("model", ["deepseek-chat", "deepseek-reasoner"])
+@pytest.mark.parametrize("model", [
+    "deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash",
+    " DEEPSEEK-V4-FLASH-VISION-EXP ", "openrouter:deepseek/deepseek-v4-flash",
+])
 def test_library_constructor_rejects_explicit_alias_before_secret_resolution(
     monkeypatch, model,
 ):
@@ -77,7 +87,7 @@ def test_library_constructor_rejects_explicit_alias_before_secret_resolution(
         "resolve_llm_api_key",
         lambda *_args, **_kwargs: resolved.append(True),
     )
-    with pytest.raises(DeprecatedModelAliasError, match="deepseek-v4-flash"):
+    with pytest.raises(DeprecatedModelAliasError, match="deepseek-flash"):
         client_module.OpenAICompatibleClient(model=model)
     assert resolved == []
 
@@ -122,7 +132,7 @@ def test_server_bootstrap_rejects_deprecated_env_before_key_or_store(monkeypatch
     monkeypatch.delenv("HYMEM_LLM_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    with pytest.raises(DeprecatedModelAliasError, match="deepseek-v4-flash"):
+    with pytest.raises(DeprecatedModelAliasError, match="deepseek-flash"):
         build_from_env()
 
 
@@ -142,7 +152,7 @@ def test_doctor_reports_actionable_deprecated_env_error(monkeypatch):
     result = _check_llm(cfg)
     assert result.status == FAIL
     assert "deepseek-chat" in result.detail
-    assert "deepseek-v4-flash" in result.detail
+    assert "deepseek-flash" in result.detail
     assert constructed == []
 
 
@@ -193,7 +203,7 @@ def test_former_warning_only_helpers_now_fail_before_sdk_construction(
         lambda *_args, **_kwargs: constructed.append(True),
     )
     kwargs = {"stub_reply": "stub"} if builder is rules_compliance._build_llm else {}
-    with pytest.raises(DeprecatedModelAliasError, match="deepseek-v4-flash"):
+    with pytest.raises(DeprecatedModelAliasError, match="deepseek-flash"):
         builder(*args, **kwargs)
     assert constructed == []
 
@@ -241,7 +251,7 @@ def test_paid_fact_probe_rejects_before_source_or_dataset_load(monkeypatch, caps
         fact_probe.main()
     assert caught.value.code == 2
     assert touched == []
-    assert "deepseek-v4-flash" in capsys.readouterr().err
+    assert "deepseek-flash" in capsys.readouterr().err
 
 
 def test_fact_probe_cost_only_keeps_historical_model_label_readable(

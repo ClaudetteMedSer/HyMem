@@ -40,6 +40,7 @@ from hymem.dreaming.user_profile import profile_user_tail_message_id
 from hymem.dreaming.retention import prune_episodes_and_procedures
 from hymem.extraction.llm import LLMRequest
 from hymem.query.augment import _episode_search
+from tests.digest_verification_fixtures import synthetic_fidelity_approval, synthetic_format_approval
 
 
 class RollingLLM:
@@ -61,6 +62,9 @@ class RollingLLM:
 
     def complete(self, request: LLMRequest) -> str:
         self.calls.append(request)
+        approval = synthetic_fidelity_approval(request) or synthetic_format_approval(request)
+        if approval is not None:
+            return approval
         if request.system.startswith((
             "You analyze one conversation session",
             "You re-read one conversation session",
@@ -153,6 +157,9 @@ class FailingDigestLLM:
 
     def complete(self, request: LLMRequest) -> str:
         self.calls.append(request)
+        approval = synthetic_fidelity_approval(request) or synthetic_format_approval(request)
+        if approval is not None:
+            return approval
         if request.system.startswith("You analyze one conversation session"):
             if self.healthy:
                 return '{"episodes":[],"summary":"","procedures":[]}'

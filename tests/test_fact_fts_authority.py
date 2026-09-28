@@ -9,7 +9,7 @@ from hymem.core import db as core_db
 from hymem.extraction.llm import StubLLMClient
 
 
-_FACTS_CLOSER = "Return the JSON array of narrative facts now"
+_FACTS_CLOSER = "Return the JSON object of narrative facts now"
 _TOKEN = "quasarneedle"
 
 

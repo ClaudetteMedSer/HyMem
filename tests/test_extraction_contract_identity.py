@@ -182,6 +182,24 @@ def test_source_split_policy_changes_derived_cache_key_without_prompt_bump(
     assert contract.extraction_cache_key("v20") != current
 
 
+def test_bounded_terminal_empty_policy_versions_cache_and_canary_identity(monkeypatch):
+    current = contract.extraction_cache_key("v20")
+    policy = extraction_canary_policy(prompt_version="v20")
+    version = "hymem-terminal-clean-empty-verification-v3"
+    assert chunk_module.CLEAN_EMPTY_RECOVERY_POLICY_VERSION == version
+    assert contract._contract_components("v20")["recovery_policy"]["clean_empty"] == version
+    assert policy["clean_empty_recovery_policy_version"] == version
+
+    monkeypatch.setattr(
+        chunk_module,
+        "CLEAN_EMPTY_RECOVERY_POLICY_VERSION",
+        "hymem-terminal-clean-empty-verification-v2",
+    )
+    assert contract.extraction_cache_key("v20") != current
+    assert extraction_canary_policy(prompt_version="v20") != policy
+    assert contract.ACTIVE_EXTRACTION_PROMPT_VERSION == "v20"
+
+
 def test_json_ceiling_classifier_is_bound_into_cache_and_canary_policy(cfg):
     from benchmarks.extraction_canary import extraction_canary_policy
     from hymem.extraction import jsonio

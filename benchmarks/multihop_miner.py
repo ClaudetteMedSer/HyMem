@@ -47,7 +47,7 @@ Two modes:
     (isolated per-question store). Each question uses bounded, durable-status
     convergence; `--from` optionally restricts to a run's qids. Dreams with
     `--dream-model` (default
-    deepseek-v4-flash — thinking MUST be disabled, the box's patched client);
+    deepseek-flash — thinking disabled by the maintained client);
     `--dream-model stub` is a no-op plumbing test.
 
     python benchmarks/multihop_miner.py \
@@ -83,6 +83,7 @@ from hymem.query.augment import _multihop_edges  # noqa: E402
 from hymem.query.entities import match_known_entities  # noqa: E402
 from hymem.contrib.model_policy import (  # noqa: E402
     DeprecatedModelAliasError,
+    RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
 )
 
@@ -401,9 +402,9 @@ def main() -> None:
     ap.add_argument("--types", default=",".join(sorted(_MINE_TYPES)),
                     help="comma-separated question_types to mine (default MR+TR)")
     # per-question dreaming
-    ap.add_argument("--dream-model", default="deepseek-v4-flash",
+    ap.add_argument("--dream-model", default=RECOMMENDED_DEEPSEEK_MODEL,
                     help="per-question mode: extraction LLM. Thinking MUST be disabled for "
-                         "v4-flash (the box's patched openai_client). 'stub' = no-op plumbing test.")
+                         "Flash (the maintained openai_client). 'stub' = no-op plumbing test.")
     ap.add_argument("--dream-base-url", default=None,
                     help="per-question mode: extraction endpoint (else env HYMEM_LLM_BASE_URL)")
     ap.add_argument("--dream-api-key", default=None,

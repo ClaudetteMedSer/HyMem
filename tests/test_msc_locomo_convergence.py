@@ -24,10 +24,12 @@ from benchmarks.msc_adapter import (
     run_or_record_indexing_failure,
 )
 from hymem import HyMem, HyMemConfig
+from hymem.dreaming import digest
 from hymem.dreaming.status import DREAM_STATUS_SCHEMA_VERSION
 from hymem.dreaming.runner import DreamReport
 from hymem.extraction.llm import StubLLMClient
 from hymem.extraction.producer import Phase1ProducerDeclaration
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 
 class _ScalarConn:
@@ -232,6 +234,8 @@ def test_durable_status_rejects_unavailable_phase1_producer_authority():
 def test_exact_one_chunk_budget_drain_converges_with_max_cycles_one(tmp_path):
     llm = StubLLMClient(
         fixtures={
+            digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "Return the JSON object now": json.dumps({
                 "episodes": [],
                 "summary": "Indexed the exact memory completely.",
@@ -267,6 +271,8 @@ def test_exact_one_chunk_budget_drain_converges_with_max_cycles_one(tmp_path):
             status=hy.dream_status,
             max_cycles=1,
             timeout_s=10,
+            # Exercise exact budget drainage without a host-speed assumption.
+            _clock=lambda: 0.0,
         )
 
         assert summary["complete"] is True

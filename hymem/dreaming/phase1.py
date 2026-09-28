@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 
 from hymem.config import HyMemConfig
+from hymem.core.embedding_batches import embed_bounded
 from hymem.contrib.implementation_identity import import_time_source_sha256
 from hymem.dreaming import canonicalize
 from hymem.dreaming import evidence
@@ -625,10 +626,10 @@ def prepare_dedup_vectors(
     Embedding every new candidate guarantees both the cross-cycle path
     (``_find_near_duplicate_edge``) and the same-wave path have a vector to use.
 
-    Cost tradeoff: this issues one embed per distinct new-triple text per chunk,
+    Cost tradeoff: this embeds every distinct new-triple text per chunk,
     rather than only for texts with an eligible existing edge — i.e. strictly
-    more embed calls than before. They remain batched into a single ``embed()``
-    per chunk and run OUTSIDE the write lock, and deduplicating the graph is the
+    more embedding work than before. Requests are bounded to 16 texts and
+    run OUTSIDE the write lock, and deduplicating the graph is the
     whole point, so the extra embeds are an accepted cost.
 
     Returns ``{}`` when dedup is disabled or no embedding client is wired.
@@ -670,7 +671,11 @@ def prepare_dedup_vectors(
     if not texts:
         return {}
     try:
-        vectors = embedding_client.embed(texts)
+        vectors = embed_bounded(
+            embedding_client, texts,
+            identity=lambda: _embedding_identity(embedding_client),
+            expected_model=model, required_dim=dim,
+        )
         stable_model, stable_dim = _embedding_identity(embedding_client)
     except Exception as exc:
         # Provider exception text and tracebacks may contain the full private
@@ -943,6 +948,30 @@ def persist_chunk_results(
                 )
 
     mentioned: set[str] = set()
+    # Reserve exact targets for the entire extraction before any optional
+    # semantic route runs. Otherwise an earlier alias can write a different
+    # interpretation to an edge claimed exactly by a later provider item.
+    reserved_exact_claims: dict[
+        tuple[str, str, str, str, int], tuple[int, str]
+    ] = {}
+    if extraction.source_validated:
+        for t in extraction.triples:
+            claim_source = extraction.claim_sources[t.source_message_id]
+            source_role = claim_source.role
+            claim_weight = role_weights.get(source_role, 1) if source_role else 1
+            reserved_exact_claims[
+                (
+                    canonicalize.resolve(conn, t.subject), t.predicate,
+                    canonicalize.resolve(conn, t.object),
+                    claim_source.session_id, claim_source.message_id,
+                )
+            ] = (
+                t.polarity,
+                _claim_interpretation_key(
+                    t, source_role=source_role, evidence_weight=claim_weight,
+                    cfg=cfg,
+                ),
+            )
     for t in extraction.triples:
         claim_source = (
             extraction.claim_sources.get(t.source_message_id)
@@ -956,9 +985,11 @@ def persist_chunk_results(
             evidence_weight=claim_weight,
             claim_source=claim_source,
             prompt_version=prompt_version,
+            phase1_generation_key=phase1_generation_key,
             cfg=cfg,
             dedup_vectors=dedup_vectors,
             in_cycle_edges=staged_in_cycle_edges,
+            reserved_exact_claims=reserved_exact_claims,
         )
         mentioned.add(subj_canon)
         mentioned.add(obj_canon)
@@ -1475,6 +1506,84 @@ def _find_near_duplicate_in_cycle(
     return None
 
 
+def _claim_interpretation_key(
+    triple: Triple, *, source_role: str | None,
+    evidence_weight: int, cfg: HyMemConfig | None,
+) -> str:
+    return evidence._interpretation_key(
+        polarity=triple.polarity,
+        evidence_weight=evidence_weight,
+        weight_source=(
+            f"configured_role:{source_role or 'unknown'}"
+            if cfg is not None else "default_weight:1"
+        ),
+        source_role=source_role,
+        surface_subject=triple.subject,
+        surface_object=triple.object,
+        value_text=triple.value_text,
+        value_numeric=triple.value_numeric,
+        value_unit=triple.value_unit,
+        temporal_scope=triple.temporal_scope,
+    )
+
+
+def _semantic_dedup_conflicts_with_claim_observation(
+    conn: sqlite3.Connection,
+    *,
+    edge_id: int,
+    triple: Triple,
+    claim_source: CoveredMessage | None,
+    source_role: str | None,
+    evidence_weight: int,
+    cfg: HyMemConfig | None,
+    prompt_version: str | None,
+    phase1_generation_key: str | None,
+    reserved_exact_claims: dict[
+        tuple[str, str, str, str, int], tuple[int, str]
+    ] | None = None,
+) -> bool:
+    """Keep a semantic alias merge from changing one source's claim meaning.
+
+    Exact canonical edges still take the ordinary observation guard. This only
+    screens optional semantic dedup routing before it can supersede evidence.
+    """
+    if (
+        claim_source is None or prompt_version is None
+        or phase1_generation_key is None
+    ):
+        return False
+    interpretation_key = _claim_interpretation_key(
+        triple, source_role=source_role, evidence_weight=evidence_weight,
+        cfg=cfg,
+    )
+    target = conn.execute(
+        "SELECT subject_canonical,predicate,object_canonical "
+        "FROM knowledge_graph WHERE id=?", (edge_id,),
+    ).fetchone()
+    reserved = (reserved_exact_claims or {}).get((
+        target["subject_canonical"], target["predicate"],
+        target["object_canonical"], claim_source.session_id,
+        claim_source.message_id,
+    )) if target is not None else None
+    if reserved is not None and reserved != (triple.polarity, interpretation_key):
+        return True
+    return conn.execute(
+        """
+        SELECT 1 FROM kg_claim_observations
+        WHERE edge_id=? AND source_session_id=? AND source_message_id=?
+          AND evidence_kind='extraction' AND prompt_generation=?
+          AND phase1_generation_key IS ?
+          AND (polarity<>? OR interpretation_key<>?)
+        LIMIT 1
+        """,
+        (
+            edge_id, claim_source.session_id, claim_source.message_id,
+            evidence.prompt_generation(prompt_version), phase1_generation_key,
+            triple.polarity, interpretation_key,
+        ),
+    ).fetchone() is not None
+
+
 def _upsert_triple(
     conn: sqlite3.Connection,
     chunk_id: str,
@@ -1484,9 +1593,13 @@ def _upsert_triple(
     evidence_weight: int = 1,
     claim_source: CoveredMessage | None = None,
     prompt_version: str | None = None,
+    phase1_generation_key: str | None = None,
     cfg: HyMemConfig | None = None,
     dedup_vectors: dict[str, list[float]] | None = None,
     in_cycle_edges: list[_InCycleEdge] | None = None,
+    reserved_exact_claims: dict[
+        tuple[str, str, str, str, int], tuple[int, str]
+    ] | None = None,
 ) -> tuple[str, str, int, int]:
     subj_canon = canonicalize.resolve(conn, triple.subject)
     obj_canon = canonicalize.resolve(conn, triple.object)
@@ -1521,6 +1634,7 @@ def _upsert_triple(
             )
     else:
         edge_id = None
+        rejected_semantic_target = False
         # Semantic dedup: attach to a near-duplicate sibling edge if one exists,
         # rather than spawning yet another canonical variant. The candidate
         # vector was embedded outside this write transaction (see
@@ -1541,6 +1655,17 @@ def _upsert_triple(
                               subj_canon, triple.predicate, obj_canon)
                 edge_id = None
             if edge_id is not None:
+                if _semantic_dedup_conflicts_with_claim_observation(
+                    conn, edge_id=edge_id, triple=triple,
+                    claim_source=claim_source, source_role=source_role,
+                    evidence_weight=evidence_weight, cfg=cfg,
+                    prompt_version=prompt_version,
+                    phase1_generation_key=phase1_generation_key,
+                    reserved_exact_claims=reserved_exact_claims,
+                ):
+                    edge_id = None
+                    rejected_semantic_target = True
+            if edge_id is not None:
                 log.debug(
                     "phase1.triple_deduped candidate=%s %s %s -> edge_id=%d",
                     subj_canon, triple.predicate, obj_canon, edge_id,
@@ -1548,7 +1673,10 @@ def _upsert_triple(
             # Same-wave collapse: no prior-cycle edge matched, so check siblings
             # minted earlier IN THIS cycle (cross-chunk too — the pool is shared
             # by the runner across all chunks). Same gates as cross-cycle dedup.
-            if edge_id is None and in_cycle_edges is not None:
+            if (
+                edge_id is None and not rejected_semantic_target
+                and in_cycle_edges is not None
+            ):
                 try:
                     edge_id = _find_near_duplicate_in_cycle(
                         cfg, candidate_vector, subj_canon, triple.predicate,
@@ -1562,6 +1690,16 @@ def _upsert_triple(
                         subj_canon, triple.predicate, obj_canon,
                     )
                     edge_id = None
+                if edge_id is not None:
+                    if _semantic_dedup_conflicts_with_claim_observation(
+                        conn, edge_id=edge_id, triple=triple,
+                        claim_source=claim_source, source_role=source_role,
+                        evidence_weight=evidence_weight, cfg=cfg,
+                        prompt_version=prompt_version,
+                        phase1_generation_key=phase1_generation_key,
+                        reserved_exact_claims=reserved_exact_claims,
+                    ):
+                        edge_id = None
                 if edge_id is not None:
                     log.debug(
                         "phase1.triple_deduped_samewave candidate=%s %s %s -> edge_id=%d",

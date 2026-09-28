@@ -105,10 +105,10 @@ def resolve(conn: sqlite3.Connection, surface: str) -> str:
 def register_alias(conn: sqlite3.Connection, surface: str, canonical: str) -> None:
     """Map a pure surface form onto an existing canonical id.
 
-    If the normalized surface already owns canonical state, this operation
-    would strand that state behind the new alias because ``resolve`` is
-    intentionally one hop.  Such identity changes must use :func:`merge`,
-    which rewrites and re-hashes every provenance-bearing domain.
+    A new mapping cannot replace an identity that already owns canonical
+    state: ``resolve`` is intentionally one hop, so that change requires
+    :func:`merge`. Re-registering an unchanged mapping is a no-op, including
+    when historical state still names the alias key.
     """
     if not isinstance(surface, str) or not isinstance(canonical, str):
         raise ValueError("entity alias and canonical must be strings")
@@ -130,6 +130,8 @@ def register_alias(conn: sqlite3.Connection, surface: str, canonical: str) -> No
         and str(existing_alias["canonical"]) != canonical
     ):
         raise ValueError("entity alias already maps to another canonical identity")
+    if existing_alias is not None:
+        return
     if alias != canonical:
         owned = False
         scalar_owners = (

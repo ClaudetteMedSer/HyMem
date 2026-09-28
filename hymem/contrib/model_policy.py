@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from hymem.contrib.implementation_identity import import_time_source_sha256
 
-RECOMMENDED_DEEPSEEK_MODEL = "deepseek-v4-flash"
+RECOMMENDED_DEEPSEEK_MODEL = "deepseek-flash"
 DEPRECATED_DEEPSEEK_ALIASES = frozenset({
     "deepseek-chat",
     "deepseek-reasoner",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
 })
 
 
@@ -27,8 +29,9 @@ def deprecated_deepseek_alias(model: object) -> str | None:
     normalization.  The two provider-qualified forms used by this repository
     and common OpenAI-compatible gateways are recognized as well:
     ``deepseek:deepseek-chat`` and ``deepseek/deepseek-chat``.  Versioned model
-    ids such as ``deepseek-chat-v4`` are not aliases and are never rejected by
-    substring inference.
+    ids such as ``deepseek-chat-v4`` are never rejected by substring inference.
+    Version-looking names are not inherently immutable: the retired v4-flash
+    names are explicitly denied because the provider now reroutes them.
     """
 
     if not isinstance(model, str):

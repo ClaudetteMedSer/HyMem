@@ -32,7 +32,7 @@ import pytest
 from hymem import HyMem, HyMemConfig
 from hymem.core import db as core_db
 from hymem.dreaming.aggregate import _anchor_facts, build_aggregation_nodes, load_digest
-from hymem.dreaming import runner as dreaming_runner
+from hymem.dreaming import digest, runner as dreaming_runner
 from hymem.dreaming.user_profile import (
     PROFILE_PROMPT_VERSION,
     ProfileExtraction,
@@ -50,6 +50,7 @@ from hymem.dreaming.user_profile import (
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.extraction.llm import StubLLMClient
 from tests.conftest import seed_edge
+from tests.digest_verification_fixtures import synthetic_fidelity_approval, synthetic_fidelity_result, synthetic_format_approval, synthetic_format_result
 
 # Routing substring unique to USER_PROFILE_SYSTEM (the digest/triple stubs key
 # on their own closers, so the fixtures never collide).
@@ -117,6 +118,9 @@ class _CapturingProfileLLM:
 
     def complete(self, request):
         self.calls.append(request)
+        approval = synthetic_fidelity_approval(request) or synthetic_format_approval(request)
+        if approval is not None:
+            return approval
         if _NEEDLE in request.system:
             match = re.search(
                 r'(?:"""\n|\n)\[msg \d+\] ([\s\S]*?)\n"""',
@@ -513,6 +517,8 @@ def test_old_profile_stamp_re_extracts_despite_current_digest(cfg, stub_llm):
         stub_llm.fixtures["Return the JSON object now"] = json.dumps({
             "episodes": [], "summary": "", "procedures": [],
         })
+        stub_llm.fixtures[digest._DIGEST_FIDELITY_SYSTEM] = json.dumps(synthetic_fidelity_result())
+        stub_llm.fixtures[digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM] = json.dumps(synthetic_format_result())
         hy.dream()
         assert len(_profile_calls(stub_llm)) == 1
 

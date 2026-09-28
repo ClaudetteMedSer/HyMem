@@ -356,16 +356,18 @@ conversation, not per question** (10 stores serve 1986 questions):
 
 Suggested first box run (before any full-1986 spend):
 
-The active defaults use exact `deepseek-v4-flash` identities for answer, judge,
+The active defaults use `deepseek-flash` requested-service identities for answer, judge,
 and memory extraction. The command pins them explicitly; retired
-`deepseek-chat`/`deepseek-reasoner` aliases are rejected.
+`deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash`, and
+`deepseek-v4-flash-vision-exp` names are rejected. The public service does not
+attest immutable provider weights.
 
 ```
 python benchmarks/locomo_adapter.py --data benchmarks/data/locomo10.json \
   --sample 200 --seed 0 --workers 10 --db-dir /tmp/locomo_dbs \
   --checkpoint /tmp/locomo-run.checkpoint.json --results-dir /tmp/locomo-runs \
-  --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash \
-  --hymem-model deepseek-v4-flash --hymem-thinking disabled \
+  --answer-model deepseek-flash --judge-model deepseek-flash \
+  --hymem-model deepseek-flash --hymem-thinking disabled \
   --answer-extra-body '{"thinking":{"type":"disabled"}}' \
   --judge-extra-body  '{"thinking":{"type":"disabled"}}' \
   --out /tmp/locomo_results_v1.json

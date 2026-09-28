@@ -40,10 +40,11 @@ FLIP-DISCUSSABLE iff ALL of:
   4. **>= 90%** session coverage (substantive sessions yielding >= 1 episode)
   5. the correct-answer control shows no systematic over-extraction
      (median <= `dream_max_episodes_per_session`)
-Above a 2% parse-failure rate the run is INCOMPLETE, never FAIL: a truncated
+Above a 2% failed-session-digest rate the run is INCOMPLETE, never FAIL: a truncated
 session yields ZERO episodes, which makes criteria 2/4 harder and criterion 5
 easier — opposite directions, so a truncation-heavy run looks like a sparse,
-clean, honest failure. Same pre-registration as G-F1b's ceiling.
+clean, honest failure. The ceiling remains 2%; verifier calls cannot dilute its
+session denominator, and execution errors count alongside rejected digests.
 
 Criteria 2-4 are MECHANICAL and this probe computes them. Criterion 1 is a
 HAND-READ: the probe dumps the material and reports INCOMPLETE until
@@ -109,6 +110,14 @@ from hymem.config import HyMemConfig  # noqa: E402
 from hymem.core import db as core_db  # noqa: E402
 from hymem.dreaming.digest import (  # noqa: E402
     EPISODE_GRANULAR_PROMPT_VERSION,
+    SESSION_DIGEST_GRANULAR_SYSTEM,
+    SESSION_DIGEST_SYSTEM,
+    SESSION_SUMMARY_MAX_CHARS,
+    _DIGEST_FIDELITY_SYSTEM,
+    _DIGEST_FORMAT_ADJUDICATION_SYSTEM,
+    _DIGEST_SUMMARY_CONTENT_RECOVERY_TEMPLATE,
+    _DIGEST_SUMMARY_DIAGNOSIS_SYSTEM,
+    _DIGEST_SUMMARY_RECOVERY_TEMPLATE,
     extract_session_digest,
 )
 from hymem.dreaming.lossless import materialize_message_coverage  # noqa: E402
@@ -240,6 +249,36 @@ def select_session_sets(
 
 # ── Extraction against the PRODUCTION digest path ───────────────────────────
 
+# v5 separates semantic decisions from optional source-linked diagnosis.
+# Historical v1/v2/v3/v4 rows retain
+# their original requests, metadata and attribution when rescored.
+_RECORD_VERSION = "episode-probe-multicall-v5"
+_RECOVERY_SYSTEM_PATTERN = re.compile(
+    re.escape(_DIGEST_SUMMARY_RECOVERY_TEMPLATE)
+    .replace(re.escape("{returned_chars}"), r"\d+")
+    .replace(re.escape("{max_chars}"), r"\d+")
+)
+
+
+def _request_stage(request: LLMRequest) -> str:
+    """Recognize the exact production tasks, never source-text claim labels."""
+    if request.system in (SESSION_DIGEST_SYSTEM, SESSION_DIGEST_GRANULAR_SYSTEM):
+        return "primary"
+    if request.system == _DIGEST_FIDELITY_SYSTEM:
+        return "fidelity_verification"
+    if request.system == _DIGEST_SUMMARY_DIAGNOSIS_SYSTEM:
+        return "summary_diagnosis"
+    if request.system == _DIGEST_FORMAT_ADJUDICATION_SYSTEM:
+        return "format_adjudication"
+    if request.system == _DIGEST_SUMMARY_CONTENT_RECOVERY_TEMPLATE.format(
+        max_chars=SESSION_SUMMARY_MAX_CHARS,
+    ):
+        return "summary_content_recovery"
+    if _RECOVERY_SYSTEM_PATTERN.fullmatch(request.system):
+        return "summary_compaction"
+    return "unknown"
+
+
 class CapturingLLM:
     """Wraps an extractor and records the EXACT request the digest sent.
 
@@ -254,7 +293,9 @@ class CapturingLLM:
     a canned function under --sim, an OpenAI-compatible client otherwise. There
     is no default backend and no default endpoint: HyMem ships the LLM Protocol
     and StubLLMClient only, and a benchmark that reached for a live model on its
-    own would be shipping one.
+    own would be shipping one. Recorded request parameters are the digest's
+    declared parameters, not proof that an arbitrary two-argument backend honors
+    them; the built-in CLI transport is configured to the same token bound.
     """
 
     def __init__(self, backend, *, max_tokens: int = 3072) -> None:
@@ -266,31 +307,57 @@ class CapturingLLM:
 
     def complete(self, request: LLMRequest) -> str:
         self.calls += 1
-        self.sent.append({
+        self.last_error = None
+        stage = _request_stage(request)
+        if stage == "fidelity_verification":
+            # A new primary marks a separate digest invocation. Distinguish
+            # its one repaired-candidate re-screen from the initial decision.
+            for previous in reversed(self.sent):
+                if previous["stage"] == "primary":
+                    break
+                if previous["stage"] == "fidelity_verification":
+                    stage = "fidelity_reverification"
+                    break
+        sent = {
+            "stage": stage,
             "system": request.system,
             "user": request.user,
             "user_sha256": hashlib.sha256(request.user.encode("utf-8")).hexdigest(),
             "user_chars": len(request.user),
-        })
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "response_format": request.response_format,
+            "reply": None,
+            "reply_sha256": None,
+            "reply_chars": None,
+            "reply_head": None,
+            "backend_error": None,
+        }
+        self.sent.append(sent)
         try:
             reply = self._backend(request.system, request.user)
         except Exception as exc:  # a probe row must never abort the run
             self.last_error = (
                 f"execution_failure:{bounded_exception_type(exc)}"
             )
-            reply = ""
+            sent["backend_error"] = self.last_error
+            # Preserve transport failure as transport failure. extract_one
+            # records the production stage wrapper and all attempted calls.
+            raise
         reply = reply if isinstance(reply, str) else ""
         # What came BACK, recorded next to what went out. The first real run of
         # this probe read 52.5% parse failures and the diagnostic blamed
         # truncation, because the reply was discarded the moment it failed to
-        # parse and the cause had to be INFERRED. It was not truncation: a
-        # reasoning model with no `thinking.disabled` spends the whole output
-        # budget on thinking tokens and returns an EMPTY string, which is
-        # indistinguishable from malformed JSON once thrown away. `reply_head`
+        # parse and the cause had to be INFERRED. Empty model responses, malformed
+        # JSON and valid-but-rejected verifier verdicts need separate evidence;
+        # discarding the reply hides these distinctions. `reply_head`
         # is a bounded SLICE and is diagnostic only -- never hand-score it, and
         # never re-derive a length from it; `reply_chars` is the true full
-        # length, which is the one number that separates the two causes.
-        self.sent[-1].update({
+        # length. It distinguishes empty from non-empty only, not truncation
+        # from a rejected verdict or the underlying cause of an empty response.
+        sent.update({
+            "reply": reply,
+            "reply_sha256": hashlib.sha256(reply.encode("utf-8")).hexdigest(),
             "reply_chars": len(reply),
             "reply_head": reply[:240],
         })
@@ -307,6 +374,32 @@ def sim_backend(system: str, user: str) -> str:
     concreteness numbers are ARTIFACTS of the chunker and must never be read as
     evidence about the prompt.
     """
+    if system == _DIGEST_FORMAT_ADJUDICATION_SYSTEM:
+        # Synthetic schema coverage only: this is not a grammar judgment. The
+        # strict production response schema intentionally has no synthetic flag;
+        # the CLI artifact is instead explicitly labeled with sim=true.
+        payload = json.loads(user)
+        return json.dumps({
+            "summary_format": [{"index": 0, "verdict": "supported"}],
+            "episode_format": [
+                {"index": i, "verdict": "supported"}
+                for i in range(len(payload["items"]))
+            ],
+        })
+    if system == _DIGEST_FIDELITY_SYSTEM:
+        # Explicit synthetic plumbing verdicts, not semantic judgments and not
+        # a production client bypass. Keep this simulation honest in its label.
+        payload = json.loads(user)
+        counts = {
+            "episode_titles": len(payload["items"]),
+            "episode_content": len(payload["items"]),
+            "procedures": len(payload["procedure_items"]),
+            "summary_content": 1,
+        }
+        return json.dumps({
+            family: [{"index": i, "verdict": "supported"} for i in range(count)]
+            for family, count in counts.items()
+        })
     chunk_ids = re.findall(r"\[chunk (msgcov_[0-9a-f]+)\]", user)
     episodes = [
         {
@@ -357,8 +450,9 @@ def extract_one(conn, entry: dict, llm: CapturingLLM, cfg: HyMemConfig,
                 *, granular: bool) -> dict:
     """Run the PRODUCTION digest over one prepared session and record the result.
 
-    Returns a dump row. `parse_failed` is the digest's own flag, so the probe
-    counts exactly what a dream would count into `dream_runs.digest_failures`.
+    `parse_failed` remains the digest's own flag; `digest_failed` also counts
+    execution/no-input errors. Completion attempts and primary source capture
+    survive every ordinary exception, including with a reused client.
     """
     row = {
         "session_id": entry["session_id"],
@@ -370,8 +464,16 @@ def extract_one(conn, entry: dict, llm: CapturingLLM, cfg: HyMemConfig,
             len((m.get("content") or "")) for m in entry["messages"]
             if isinstance(m, dict)),
         "episodes": [],
+        "record_version": _RECORD_VERSION,
+        "digest_attempted": True,
+        "digest_failed": False,
         "parse_failed": False,
         "calls": 0,
+        "completion_records": [],
+        "failure_stage": None,
+        "failure_reason": None,
+        "failure_reply_chars": None,
+        "failure_reply_head": None,
         "extractor_input": None,
         "extractor_input_sha256": None,
         "extractor_input_chars": 0,
@@ -383,6 +485,8 @@ def extract_one(conn, entry: dict, llm: CapturingLLM, cfg: HyMemConfig,
         "error": None,
     }
     before = llm.calls
+    before_sent = len(llm.sent)
+    digest = None
     try:
         digest = extract_session_digest(
             conn, entry["session_id"], llm,
@@ -393,32 +497,77 @@ def extract_one(conn, entry: dict, llm: CapturingLLM, cfg: HyMemConfig,
         )
     except Exception as exc:
         row["error"] = f"execution_failure:{bounded_exception_type(exc)}"
-        return row
-    row["calls"] = llm.calls - before
+        stage = getattr(exc, "failure_stage", None)
+        row["failure_stage"] = stage if stage in {
+            "primary", "summary_compaction", "fidelity_verification", "format_adjudication",
+            "summary_content_recovery", "summary_diagnosis", "fidelity_reverification",
+        } else "unknown"
+        row["failure_reason"] = row["error"]
+    finally:
+        row["calls"] = llm.calls - before
+        row["completion_records"] = [dict(sent) for sent in llm.sent[before_sent:]]
+        primary = next((sent for sent in row["completion_records"]
+                        if sent["stage"] == "primary"), None)
+        if primary is not None:
+            row["extractor_input"] = primary["user"]
+            row["extractor_input_sha256"] = primary["user_sha256"]
+            row["extractor_input_chars"] = primary["user_chars"]
+            # Historical fields continue to describe the primary reply, not
+            # whichever extra completion happened to run last.
+            row["reply_chars"] = primary["reply_chars"]
+            row["reply_head"] = primary["reply_head"]
+        row["backend_error"] = next((sent["backend_error"] for sent in reversed(
+            row["completion_records"]) if sent["backend_error"]), None)
     if digest is None:
-        # No chunks: nothing was sent, so there is no source to hand-score.
-        row["error"] = "no_digest_input"
-        return row
-    row["parse_failed"] = bool(digest.parse_failed)
-    row["episodes"] = [
-        {
-            "title": e.get("title", ""),
-            "summary": e.get("summary", ""),
-            "outcome": e.get("outcome"),
-            "key_entities": e.get("key_entities", []),
-            "chunk_ids": e.get("chunk_ids", []),
+        if row["error"] is None:
+            row["error"] = "no_digest_input"
+            row["failure_reason"] = "no_digest_input"
+    else:
+        row["parse_failed"] = bool(digest.parse_failed)
+        row["failure_stage"] = digest.failure_stage
+        row["failure_reason"] = digest.failure_reason
+        row["episodes"] = [
+            {
+                "title": e.get("title", ""),
+                "summary": e.get("summary", ""),
+                "outcome": e.get("outcome"),
+                "key_entities": e.get("key_entities", []),
+                "chunk_ids": e.get("chunk_ids", []),
+            }
+            for e in digest.episodes.items
+        ]
+    row["digest_failed"] = bool(row["parse_failed"] or row["error"])
+    if row["digest_failed"]:
+        # Some structured failures retain their historical broad fidelity
+        # stage. This instrument can distinguish the
+        # recovery/adjudicator only when the failure is attributed to that broad
+        # stage and its exact final request or reason identifies the task.
+        # Unattributed exceptions remain unknown even after a recorded call.
+        reason = row["failure_reason"]
+        records = row["completion_records"]
+        final_request = records[-1] if records else None
+        pre_dispatch = reason in {
+            "fidelity_input_cap", "format_adjudication_input_cap",
+            "summary_content_recovery_input_cap", "summary_diagnosis_input_cap",
         }
-        for e in digest.episodes.items
-    ]
-    if llm.sent:
-        # The exact string the extractor sent, with the hash taken at send time.
-        sent = llm.sent[-1]
-        row["extractor_input"] = sent["user"]
-        row["extractor_input_sha256"] = sent["user_sha256"]
-        row["extractor_input_chars"] = sent["user_chars"]
-        row["reply_chars"] = sent.get("reply_chars")
-        row["reply_head"] = sent.get("reply_head")
-    row["backend_error"] = llm.last_error
+        if row["failure_stage"] == "fidelity_verification":
+            if isinstance(reason, str) and reason.startswith("format_adjudication_"):
+                row["failure_stage"] = "format_adjudication"
+            elif isinstance(reason, str) and reason.startswith("summary_content_recovery_"):
+                row["failure_stage"] = "summary_content_recovery"
+            elif isinstance(reason, str) and reason.startswith("summary_diagnosis_"):
+                row["failure_stage"] = "summary_diagnosis"
+            elif not pre_dispatch and final_request is not None and final_request["stage"] in {
+                "format_adjudication", "summary_content_recovery", "summary_diagnosis", "fidelity_reverification",
+            }:
+                row["failure_stage"] = final_request["stage"]
+        # A failed second verifier can have a successful first verifier in the
+        # same row. Never borrow that earlier reply for a pre-dispatch failure.
+        if (not pre_dispatch and final_request is not None
+                and row["failure_stage"] not in {None, "unknown"}
+                and final_request["stage"] == row["failure_stage"]):
+            row["failure_reply_chars"] = final_request["reply_chars"]
+            row["failure_reply_head"] = final_request["reply_head"]
     return row
 
 
@@ -432,7 +581,7 @@ def assert_full_source(row: dict) -> None:
     see from the artifact. A probe that cannot prove its dump is complete has no
     business printing a verdict.
     """
-    if row.get("error") or row.get("extractor_input") is None:
+    if row.get("extractor_input") is None:
         return  # nothing was sent; there is nothing to hand-score either
     recorded = row["extractor_input"]
     assert isinstance(recorded, str), "extractor_input must be the literal prompt"
@@ -533,23 +682,47 @@ def summarize(target_rows: list[dict], control_rows: list[dict],
     tgt = arm_stats(target_rows)
     ctl = arm_stats(control_rows)
 
-    calls = sum(r.get("calls", 0) for r in target_rows + control_rows)
+    all_rows = target_rows + control_rows
+    # One row is one attempted session digest, including failures before the
+    # first completion. Old dumps have one row per attempt too; extra calls are
+    # not independent sessions and cannot improve this denominator.
+    attempted_session_digests = len(all_rows)
+    calls = sum(r.get("calls", 0) for r in all_rows)
     parse_failures = sum(
-        1 for r in target_rows + control_rows if r.get("parse_failed"))
-    parse_failure_rate = (parse_failures / calls) if calls else 0.0
-    # Split the failures by CAUSE rather than leaving it to be inferred. An
-    # empty reply and a malformed one both land in `parse_failures` and have
-    # opposite remedies (disable the model's thinking vs raise --max-tokens).
+        1 for r in all_rows if r.get("parse_failed"))
+    failed_rows = [r for r in all_rows if (
+        r.get("parse_failed") or r.get("error") or r.get("digest_failed"))]
+    digest_failures = len(failed_rows)
+    parse_failure_rate = (parse_failures / attempted_session_digests
+                          if attempted_session_digests else 0.0)
+    digest_failure_rate = (digest_failures / attempted_session_digests
+                           if attempted_session_digests else 0.0)
+    # Preserve observed reply shape without inferring a cause or remedy from
+    # length alone: malformed JSON and rejected verifier verdicts can both be
+    # non-empty, and backend errors are not empty model responses.
     # `replies_recorded` exists so a dump written before this was recorded
     # reads as UNKNOWN instead of as "no empty replies" -- a missing field
     # must not answer the question it cannot answer. Both counts are over the
     # FAILING rows only: recording is what makes a failure diagnosable, so a
     # dump where the successes recorded and the failures did not must still
     # read as unknown rather than borrowing the successes' evidence.
-    failed_rows = [r for r in target_rows + control_rows if r.get("parse_failed")]
+    # Legacy reply fields describe the primary reply. Keep them available, but
+    # never relabel old primary evidence as a known verifier/compaction failure.
+    parse_failed_rows = [r for r in all_rows if r.get("parse_failed")]
     replies_recorded = sum(
-        1 for r in failed_rows if r.get("reply_chars") is not None)
-    empty_replies = sum(1 for r in failed_rows if r.get("reply_chars") == 0)
+        1 for r in parse_failed_rows if r.get("reply_chars") is not None)
+    empty_replies = sum(1 for r in parse_failed_rows if r.get("reply_chars") == 0)
+    failure_stage_counts: dict[str, int] = {}
+    failure_reason_counts: dict[str, int] = {}
+    for row in failed_rows:
+        stage = row.get("failure_stage") or "unknown"
+        failure_stage_counts[stage] = failure_stage_counts.get(stage, 0) + 1
+        reason = row.get("failure_reason") or "unknown"
+        failure_reason_counts[reason] = failure_reason_counts.get(reason, 0) + 1
+    failure_replies_recorded = sum(
+        1 for r in failed_rows if r.get("failure_reply_chars") is not None)
+    failure_empty_replies = sum(
+        1 for r in failed_rows if r.get("failure_reply_chars") == 0)
 
     gate = {
         "faithfulness_ok": (faithfulness is not None
@@ -563,7 +736,9 @@ def summarize(target_rows: list[dict], control_rows: list[dict],
         "coverage_ok": (tgt["n_substantive"] > 0
                         and tgt["coverage"] >= _MIN_SESSION_COVERAGE),
         "control_ok": ctl["median_episodes"] <= _MAX_CONTROL_MEDIAN_EPISODES,
-        "parse_failures_ok": parse_failure_rate <= _MAX_PARSE_FAILURE_RATE,
+        # Historical gate name retained; its unchanged ceiling now also sees
+        # execution errors, which must not disappear by being non-parse errors.
+        "parse_failures_ok": digest_failure_rate <= _MAX_PARSE_FAILURE_RATE,
     }
     # Empty arms are the classic vacuous PASS: `median <= cap` and
     # `share >= floor` both hold trivially at n=0, and a probe that extracted
@@ -579,8 +754,9 @@ def summarize(target_rows: list[dict], control_rows: list[dict],
                    "episodes — nothing to read the criteria on)")
     elif not gate["parse_failures_ok"]:
         verdict = (
-            f"INCOMPLETE (parse-failure ceiling: {parse_failures}/{calls} = "
-            f"{parse_failure_rate:.1%} > {_MAX_PARSE_FAILURE_RATE:.0%} — "
+            f"INCOMPLETE (session-digest failure ceiling: "
+            f"{digest_failures}/{attempted_session_digests} = "
+            f"{digest_failure_rate:.1%} > {_MAX_PARSE_FAILURE_RATE:.0%} — "
             f"a failure this size biases the criteria in opposite directions, so "
             f"the run is UNREADABLE; never read as FAIL. See the cause line in "
             f"the report before choosing a remedy)")
@@ -595,10 +771,24 @@ def summarize(target_rows: list[dict], control_rows: list[dict],
         "target": tgt,
         "control": ctl,
         "calls": calls,
+        "attempted_session_digests": attempted_session_digests,
+        "digest_failures": digest_failures,
+        "digest_failure_rate": digest_failure_rate,
+        "metric_units": {
+            "calls": "logical_completion_attempts; provider HTTP retries not measured",
+            "parse_failure_rate": "parse_failed_session_digests / attempted_session_digests",
+            "digest_failure_rate": "failed_session_digests / attempted_session_digests",
+            "gate.parse_failures_ok": "digest_failure_rate <= unchanged 0.02 ceiling",
+            "replies_recorded": "primary replies on parse_failed rows; failure stage not implied",
+        },
         "parse_failures": parse_failures,
         "parse_failure_rate": parse_failure_rate,
         "empty_replies": empty_replies,
         "replies_recorded": replies_recorded,
+        "failure_stage_counts": failure_stage_counts,
+        "failure_reason_counts": failure_reason_counts,
+        "failure_replies_recorded": failure_replies_recorded,
+        "failure_empty_replies": failure_empty_replies,
         "faithfulness": faithfulness,
         "gate": gate,
         "verdict": verdict,
@@ -609,6 +799,7 @@ def summarize(target_rows: list[dict], control_rows: list[dict],
             "coverage": _MIN_SESSION_COVERAGE,
             "control_median": _MAX_CONTROL_MEDIAN_EPISODES,
             "substantive_chars": _MIN_SUBSTANTIVE_CHARS,
+            "session_digest_failure_rate": _MAX_PARSE_FAILURE_RATE,
         },
     }
 
@@ -641,7 +832,9 @@ def report(s: dict, diag: dict, arm_label: str, verbose: bool,
           f"{t['concrete_share']*100:>13.0f}%{c['concrete_share']*100:>17.0f}%")
     print(f"  {'episodes carrying an outcome':<36}"
           f"{t['outcome_share']*100:>13.0f}%{c['outcome_share']*100:>17.0f}%")
-    print(f"\n  extraction calls: {s['calls']}   parse failures: "
+    print(f"\n  logical completion attempts: {s['calls']}   attempted session digests: "
+          f"{s['attempted_session_digests']}   failed digests: {s['digest_failures']}"
+          f"   parse failures: "
           f"{s['parse_failures']}"
           + (f"   row errors: {t['errors'] + c['errors']}"
              if (t["errors"] or c["errors"]) else ""))
@@ -669,28 +862,18 @@ def report(s: dict, diag: dict, arm_label: str, verbose: bool,
                   f"n={t['n_substantive']} — inside this set's resolution. The "
                   f"RATES can still be read against their thresholds, but do NOT "
                   f"read the target-vs-control CONTRAST as evidence of anything.")
-    if s.get("parse_failure_rate", 0.0) > _MAX_PARSE_FAILURE_RATE:
-        print(f"  ⚠ PARSE-FAILURE CEILING EXCEEDED: {s['parse_failures']}/"
-              f"{s['calls']} = {s['parse_failure_rate']:.1%} > "
+    if s.get("digest_failure_rate", 0.0) > _MAX_PARSE_FAILURE_RATE:
+        print(f"  ⚠ SESSION-DIGEST FAILURE CEILING EXCEEDED: {s['digest_failures']}/"
+              f"{s['attempted_session_digests']} = {s['digest_failure_rate']:.1%} > "
               f"{_MAX_PARSE_FAILURE_RATE:.0%}. This biases the criteria in "
               f"opposite directions — the run is UNREADABLE, not a FAIL.")
-        empty, recorded = s.get("empty_replies", 0), s.get("replies_recorded", 0)
-        if empty:
-            print(f"    cause: {empty}/{s['parse_failures']} failures came back "
-                  f"EMPTY (0 chars), which is neither malformed nor truncated "
-                  f"JSON. A reasoning model spends its whole output budget on "
-                  f"thinking tokens and returns nothing unless it is sent "
-                  f"--extra-body '{{\"thinking\":{{\"type\":\"disabled\"}}}}'. "
-                  f"Raising --max-tokens will not fix an empty reply.")
-        elif recorded == s["parse_failures"]:
-            print("    cause: every failing reply came back non-empty, so this "
-                  "is malformed or truncated JSON — raising --max-tokens is the "
-                  "remedy here.")
-        else:
-            print(f"    cause UNKNOWN: only {recorded}/{s['parse_failures']} "
-                  f"failing replies were recorded (a dump predating reply "
-                  f"recording). Re-run to record them rather than guessing at a "
-                  f"remedy.")
+        print(f"    recorded failure stages: {s['failure_stage_counts']}")
+        print(f"    recorded failure reasons: {s['failure_reason_counts']}")
+        print(f"    failing-stage replies recorded: {s['failure_replies_recorded']}/"
+              f"{s['digest_failures']}; empty: {s['failure_empty_replies']}. "
+              "An empty reply, transport error, malformed contract and unsupported "
+              "verdict require different diagnoses; non-empty does not prove "
+              "truncation. Missing historical stage evidence remains UNKNOWN.")
     print("  faithfulness: "
           + (f"{s['faithfulness']:.2f} (hand-scored)"
              if s["faithfulness"] is not None
@@ -754,8 +937,10 @@ def main() -> None:
                     help="question_type to select (default: the MS synthesis bank)")
     ap.add_argument("--seed", type=int, default=0, help="sampling seed")
     ap.add_argument("--sessions-per-arm", type=int, default=20,
-                    help="sessions extracted per arm (THE budget knob: one LLM "
-                         "call per session, both arms)")
+                    help="session digests per arm: normally 3 logical completions "
+                         "each, at most 7 with summary compaction, diagnosis, content "
+                         "recovery, repeated verification and format adjudication; early failures "
+                         "may use fewer, provider HTTP retries are separate")
     ap.add_argument("--prompt-arm", default="granular", choices=("granular", "blob"),
                     help="which digest prompt to score. `granular` is the Plan C "
                          "arm under test; `blob` runs the SHIPPING prompt over the "
@@ -790,7 +975,8 @@ def main() -> None:
                          "mechanical criterion from it. ZERO LLM calls — this is "
                          "how a hand-score is applied after the fact")
     ap.add_argument("--cost", action="store_true",
-                    help="print the call count and exit, spending nothing")
+                    help="print the 3/7 logical-completion budget per session "
+                         "and exit, spending nothing (HTTP retries separate)")
     ap.add_argument("--verbose", action="store_true", help="per-session table")
     args = ap.parse_args()
 
@@ -851,7 +1037,11 @@ def main() -> None:
         sys.exit(2)
 
     print(f"\n[cost] {len(target_entries)} target + {len(control_entries)} "
-          f"control sessions = {len(entries)} digest calls"
+          f"control sessions = {len(entries)} attempted session digests; "
+          f"normally {3 * len(entries)} logical completions (3/session), "
+          f"at most {7 * len(entries)} (7/session with summary compaction, diagnosis, "
+          "content recovery, repeated verification and format adjudication). "
+          "Early failures may use fewer; provider HTTP retries are separate."
           + ("  (--sim: zero LLM calls)" if args.sim else f"  @ {args.model}"),
           flush=True)
     if args.cost:
@@ -890,7 +1080,8 @@ def main() -> None:
                 temperature=0.0, max_tokens=args.max_tokens,
             ) or ""
 
-    cfg = HyMemConfig(root=Path(tempfile.mkdtemp(prefix="episode_probe_")))
+    cfg = HyMemConfig(root=Path(tempfile.mkdtemp(prefix="episode_probe_")),
+                      dream_digest_max_tokens=args.max_tokens)
     conn = build_store(Path(cfg.root) / "probe.sqlite", entries, cfg)
     rows: list[dict] = []
     try:

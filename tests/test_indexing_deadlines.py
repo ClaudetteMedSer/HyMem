@@ -781,6 +781,7 @@ def test_network_clients_cap_each_request_to_exact_remaining_time(
                 llm_calls.append(request)
                 return SimpleNamespace(
                     choices=[SimpleNamespace(
+                        finish_reason="stop",
                         message=SimpleNamespace(content="ok")
                     )],
                     usage=None,
@@ -857,6 +858,7 @@ def test_late_network_responses_are_attempted_but_never_counted_successful(
                 cross_if_late()
                 return SimpleNamespace(
                     choices=[SimpleNamespace(
+                        finish_reason="stop",
                         message=SimpleNamespace(content="ok")
                     )],
                     usage=SimpleNamespace(
@@ -913,7 +915,9 @@ def test_late_network_responses_are_attempted_but_never_counted_successful(
         llm.complete(LLMRequest(system="s", user="late"))
     assert llm.request_attempts == 2
     assert llm.call_count == llm.successful_responses == 1
-    assert llm.token_usage_available is False
+    # A late received reply remains rejected, but its known paid usage is kept.
+    assert llm.token_usage_available is True
+    assert (llm.prompt_tokens, llm.completion_tokens, llm.total_tokens) == (2, 2, 4)
 
     clock.now = 0.0
     with use_deadline(MonotonicDeadline(1.0, clock=clock)), pytest.raises(

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from hymem.api import HyMem
 from hymem.config import HyMemConfig
+from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL
 from hymem.contrib.endpoint_policy import (
     EMBEDDING_INTERNAL_HTTP_ENV,
     EndpointPolicyError,
@@ -32,7 +33,7 @@ log = logging.getLogger("hymem.bootstrap")
 
 DEFAULT_ROOT = Path.home() / ".hermes"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_LLM_MODEL = "deepseek-v4-flash"  # deepseek-chat hard-deprecated 2026-07-24
+DEFAULT_LLM_MODEL = RECOMMENDED_DEEPSEEK_MODEL
 DEFAULT_EMBEDDING_BASE_URL = "local://feature-hash"
 DEFAULT_EMBEDDING_MODEL = "hymem-local-feature-hash-v1"
 DEFAULT_EMBEDDING_DIM = 384
@@ -517,6 +518,13 @@ def build_from_env() -> HyMem:
     from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
     from hymem.contrib.model_policy import require_active_model
 
+    # Reject a retired raw environment selection before resolve_env consults
+    # endpoint credentials. Keep the resolved-config check below for injected
+    # configurations and the constructor check for direct library callers.
+    require_active_model(
+        os.environ.get("HYMEM_LLM_MODEL", DEFAULT_LLM_MODEL),
+        role="HyMem server LLM",
+    )
     cfg = resolve_env()
 
     # Surface a retired deployment override as the primary startup fault,

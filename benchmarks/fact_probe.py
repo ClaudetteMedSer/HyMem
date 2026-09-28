@@ -138,6 +138,7 @@ from longmemeval_adapter import (  # noqa: E402
 from hymem.query.augment import _fts_safe_text, _fold_diacritics  # noqa: E402
 from hymem.contrib.model_policy import (  # noqa: E402
     DeprecatedModelAliasError,
+    RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
 )
 from benchmarks.strictness import bounded_exception_type, content_hash  # noqa: E402
@@ -1048,7 +1049,7 @@ def main() -> None:
                     help="canned extraction, no LLM — plumbing only; its "
                          "containment number is an upper bound, not evidence")
     ap.add_argument("--api-key", default="", help="reader/extractor API key")
-    ap.add_argument("--model", default="deepseek-v4-flash", help="extraction model")
+    ap.add_argument("--model", default=RECOMMENDED_DEEPSEEK_MODEL, help="extraction model")
     ap.add_argument("--base-url", default=DEEPSEEK_BASE_URL,
                     help="OpenAI-compatible endpoint for --model (default: DeepSeek; "
                          "point at OpenRouter etc. when --model is a hosted model)")
@@ -1059,11 +1060,11 @@ def main() -> None:
                          "second failure banks E1 dead")
     ap.add_argument("--extra-body", default="",
                     help='JSON merged into every request, e.g. '
-                         '\'{"thinking":{"type":"disabled"}}\' for v4-flash')
+                         '\'{"thinking":{"type":"disabled"}}\' for Flash')
     ap.add_argument("--workers", type=int, default=1, help="parallel questions")
     ap.add_argument("--max-tokens", type=int, default=1200,
                     help="output cap per extraction call (default 1200, tuned for "
-                         "v4-flash). Reasoning models (e.g. gpt-oss-120b) burn this "
+                         "Flash). Reasoning models (e.g. gpt-oss-120b) burn this "
                          "on chain-of-thought and return content=null when it is too "
                          "small — 4096 was verified to complete on a 12k-char session")
     ap.add_argument("--faithfulness", type=float, default=None,

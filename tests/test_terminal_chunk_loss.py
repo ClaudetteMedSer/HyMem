@@ -20,9 +20,11 @@ from hymem.dreaming.chunks import (
     record_unrecoverable_chunk_losses,
 )
 from hymem.dreaming.lossless import materialize_message_coverage
+from hymem.dreaming.digest import _DIGEST_FIDELITY_SYSTEM, _DIGEST_FORMAT_ADJUDICATION_SYSTEM
 from hymem.dreaming.retention import prune_chunks
 from hymem.extraction.contract import extraction_cache_key
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 
 def _insert_unmanifested_chunk(
@@ -173,6 +175,8 @@ def test_terminal_loss_is_prompt_independent_visible_and_never_fake_success(cfg)
 def test_old_terminal_loss_cannot_hide_new_recoverable_chunk_at_limit_one(cfg):
     llm = StubLLMClient(
         fixtures={
+            _DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            _DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "Return the JSON object now": json.dumps({
                 "episodes": [], "summary": "tail complete", "procedures": [],
             }),
@@ -229,6 +233,8 @@ def test_old_terminal_loss_cannot_hide_new_recoverable_chunk_at_limit_one(cfg):
 def test_targeted_exact_drain_ignores_unrelated_pending_session(cfg):
     llm = StubLLMClient(
         fixtures={
+            _DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            _DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "Return the JSON object now": json.dumps({
                 "episodes": [],
                 "summary": "Targeted session indexing completed.",
@@ -296,6 +302,8 @@ def test_budget_completion_refreshes_and_uses_current_tier(
 ):
     llm = StubLLMClient(
         fixtures={
+            _DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            _DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "Return the JSON object now": json.dumps({
                 "episodes": [],
                 "summary": "Current scheduling tier was checked.",
@@ -355,7 +363,9 @@ def test_chunk_budget_exhaustion_does_not_abort_later_session_tail_work(cfg):
         "episodes": [], "summary": "tail complete", "procedures": [],
     })
     llm = StubLLMClient(
-        fixtures={"Return the JSON object now": digest_payload},
+        fixtures={_DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+                  _DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
+                  "Return the JSON object now": digest_payload},
         default=json.dumps({
             "triples": [], "markers": [], "complete": True,
         }),

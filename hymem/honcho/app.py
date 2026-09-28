@@ -1849,7 +1849,8 @@ def get_context(
         )
 
     session_row = hy.conn.execute(
-        "SELECT summary, auto_summary, summary_source FROM sessions WHERE id = ?",
+        "SELECT summary, auto_summary, summary_source, digest_published_generation "
+        "FROM sessions WHERE id = ?",
         (session_id,),
     ).fetchone()
     from hymem.dreaming.summary import effective_session_summary

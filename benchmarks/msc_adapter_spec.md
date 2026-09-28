@@ -369,8 +369,9 @@ Reused verbatim: `--sample --seed --workers --answer-model --answer-base-url
 --answer-api-key --judge-model --data-dir --keep-db --no-dream --embeddings
 --graph-multihop --rules/--no-rules --rules-extraction --value-supersession`.
 
-Active answer, judge, and memory-pipeline defaults use the exact pinned model ID
-`deepseek-v4-flash`; `deepseek-chat` and `deepseek-reasoner` are rejected rather
+Active answer, judge, and memory-pipeline defaults use the shared model selection
+`deepseek-flash` (requested service, not immutable weights); retired names,
+including `deepseek-v4-flash`, are rejected rather
 than resolved as aliases. Pin all three model flags explicitly in recorded box
 commands even when using those defaults.
 

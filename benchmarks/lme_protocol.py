@@ -23,6 +23,7 @@ from hymem.contrib.endpoint_policy import (
     TRANSPORT_SECURITY_NONE,
     validate_recorded_embedding_endpoint,
     validate_http_endpoint,
+    validate_public_attestation,
     secret_free_endpoint_identity,
 )
 from hymem.dreaming.lossless import (
@@ -1596,7 +1597,7 @@ def _validate_canonical_final_status(value: object) -> Mapping[str, Any]:
 
 
 def _validated_pipeline_aggregation_producer(
-    pipeline: Mapping[str, Any],
+    pipeline: Mapping[str, Any], *, archive_only: bool = False,
 ) -> Mapping[str, Any]:
     """Validate the manifested producer even when no final status exists."""
 
@@ -1607,6 +1608,55 @@ def _validated_pipeline_aggregation_producer(
         expected_declaration = expected_producer.get("declaration")
         if not isinstance(expected_declaration, Mapping):
             raise ValueError("aggregation declaration is absent")
+        if archive_only:
+            # These hashes commit to historical request/retry inputs; their
+            # preimages (including old runtime versions) were not archived.
+            # Validate the commitment and recorded crosslinks, never rebuild
+            # it with today's code or infer current execution eligibility.
+            if (
+                expected_producer["identity_exact"] is not True
+                or expected_producer["reuse_scope"] != "durable"
+                or expected_declaration["client_id"]
+                != "hymem.contrib.openai_client.OpenAICompatibleClient"
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    expected_declaration["implementation"],
+                ) is None
+                or expected_declaration["model"] != pipeline.get("model")
+                or expected_declaration["endpoint_origin"]
+                != pipeline.get("endpoint_origin")
+                or expected_declaration["endpoint_sha256"]
+                != pipeline.get("endpoint_sha256")
+            ):
+                raise ValueError("historical aggregation producer differs")
+            validate_public_attestation(
+                pipeline.get("transport_package_version"),
+                label="recorded OpenAI transport package version", max_bytes=256,
+            )
+            timeout = _finite_number(pipeline.get("request_timeout_seconds"))
+            if timeout is None or timeout <= 0:
+                raise ValueError("recorded OpenAI request timeout is invalid")
+            revision = pipeline.get("deployment_revision_sha256")
+            tenant = pipeline.get("deployment_tenant_sha256")
+            if revision is None and tenant is None:
+                # Known strict-v1 requested-service contracts, kept as data
+                # rather than derived from today's active-model policy. This
+                # is not a claim of fixed or currently available weights.
+                if (
+                    pipeline.get("model") not in {
+                        "deepseek-v4-flash", "deepseek-flash",
+                    }
+                    or pipeline.get("endpoint_origin")
+                    != "https://api.deepseek.com"
+                ):
+                    raise ValueError("historical deployment attestation absent")
+            elif any(
+                not isinstance(item, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None
+                for item in (revision, tenant)
+            ):
+                raise ValueError("historical deployment attestation invalid")
+            return expected_producer
         from hymem.contrib.openai_client import (
             openai_compatible_producer_declaration,
         )
@@ -1663,11 +1713,13 @@ def _validated_pipeline_aggregation_producer(
 
 def _validate_aggregation_pipeline_binding(
     final_status: Mapping[str, Any] | None,
-    pipeline: Mapping[str, Any],
+    pipeline: Mapping[str, Any], *, archive_only: bool = False,
 ) -> None:
     """Cross-check an enabled aggregation producer against the run target."""
 
-    expected_producer = _validated_pipeline_aggregation_producer(pipeline)
+    expected_producer = _validated_pipeline_aggregation_producer(
+        pipeline, archive_only=archive_only,
+    )
     if final_status is None:
         return
     certificate = final_status.get("aggregation_generation")
@@ -1679,6 +1731,73 @@ def _validate_aggregation_pipeline_binding(
     if binding["producer"] != expected_producer:
         raise BenchmarkIntegrityError(
             "LongMemEval aggregation producer differs from memory pipeline target"
+        )
+
+
+def _indexing_snapshot_is_mechanically_complete(
+    final: Mapping[str, Any] | None,
+    reports: list[dict[str, Any]],
+    cycles: int,
+) -> bool:
+    """Mirror convergence's drainage predicate, not its usable-health test.
+
+    Arguments have already passed status/report shape validation. Durable
+    quarantine, source loss and malformed-authority findings are not pending
+    work: they make a drained index unhealthy, and may also coexist with work
+    that is still pending or failed in the last cycle.
+    """
+
+    return bool(
+        final is not None and cycles > 0 and len(reports) == cycles
+        and not any(final["pending"].values())
+        and not final["in_progress"]
+        and not any(reports[-1][key] for key in _INDEXING_REPORT_BOOLEAN_FIELDS)
+        and not any(reports[-1][key] for key in _INDEXING_CYCLE_FAILURE_FIELDS)
+    )
+
+
+def _validate_immediate_durable_indexing_failure(
+    code: str,
+    *,
+    complete: bool,
+    final: Mapping[str, Any] | None,
+    reports: list[dict[str, Any]],
+    cycles: int,
+) -> None:
+    """Accept honest early failure without inventing successful drainage.
+
+    These failures stop convergence immediately, even while another tier is
+    pending. Their completion flag must describe the actual last snapshot.
+    Coverage retry exhaustion and deadline failures have different semantics
+    and deliberately do not use this equality check.
+    """
+
+    if code == "quarantined_extraction":
+        if final is None or not any(final["quarantined"].values()):
+            raise BenchmarkIntegrityError(
+                "LongMemEval quarantine failure lacks durable quarantine evidence"
+            )
+    elif code == "terminal_extraction_source_loss":
+        if final is None or final["terminal_loss"]["chunks"] <= 0:
+            raise BenchmarkIntegrityError(
+                "LongMemEval terminal-loss failure lacks durable loss evidence"
+            )
+    elif code == "malformed_durable_state":
+        if final is None or not any(final["malformed"].values()):
+            raise BenchmarkIntegrityError(
+                "LongMemEval malformed-state failure lacks durable evidence"
+            )
+    else:
+        return
+    if cycles <= 0 or len(reports) != cycles:
+        raise BenchmarkIntegrityError(
+            "LongMemEval durable indexing failure lacks a completed cycle"
+        )
+    if complete is not _indexing_snapshot_is_mechanically_complete(
+        final, reports, cycles,
+    ):
+        raise BenchmarkIntegrityError(
+            "LongMemEval durable failure mechanical completion contradicts its work"
         )
 
 
@@ -1796,44 +1915,15 @@ def _validate_versioned_indexing(
         raise BenchmarkIntegrityError(
             "LongMemEval unavailable producer contradicts its authority evidence"
         )
-    if code == "quarantined_extraction" and (
-        final is None or not any(final["quarantined"].values())
+    _validate_immediate_durable_indexing_failure(
+        code, complete=complete, final=final, reports=reports, cycles=cycles,
+    )
+    if complete and not _indexing_snapshot_is_mechanically_complete(
+        final, reports, cycles,
     ):
         raise BenchmarkIntegrityError(
-            "LongMemEval quarantine failure lacks durable quarantine evidence"
+            "LongMemEval mechanically complete failure has blocking work"
         )
-    if code == "terminal_extraction_source_loss" and (
-        final is None or final["terminal_loss"]["chunks"] <= 0
-    ):
-        raise BenchmarkIntegrityError(
-            "LongMemEval terminal-loss failure lacks durable loss evidence"
-        )
-    if code == "malformed_durable_state" and (
-        final is None or not any(final["malformed"].values())
-    ):
-        raise BenchmarkIntegrityError(
-            "LongMemEval malformed-state failure lacks durable evidence"
-        )
-    if code in {
-        "quarantined_extraction", "terminal_extraction_source_loss",
-        "malformed_durable_state",
-    } and not complete:
-        raise BenchmarkIntegrityError(
-            "LongMemEval extraction-loss failure lacks mechanical completion"
-        )
-    if complete:
-        if (
-            final is None or cycles <= 0 or sum(final["pending"].values()) != 0
-            or final["in_progress"]
-            or any(reports[-1][key] for key in _INDEXING_REPORT_BOOLEAN_FIELDS)
-            or any(
-                reports[-1][key] != 0
-                for key in _INDEXING_CYCLE_FAILURE_FIELDS
-            )
-        ):
-            raise BenchmarkIntegrityError(
-                "LongMemEval mechanically complete failure has blocking work"
-            )
     if code == "max_cycles_exhausted" and cycles != max_cycles:
         raise BenchmarkIntegrityError(
             "LongMemEval max-cycle failure did not exhaust its cycle bound"
@@ -1924,18 +2014,14 @@ def _validate_legacy_indexing(
     )
     if healthy is not computed_healthy:
         raise BenchmarkIntegrityError("LongMemEval indexing health flag is inconsistent")
+    # Preserve legacy missing-field defaults, but never ignore a supplied
+    # digest/fact/profile/aggregation failure or malformed budget flag.
+    canonical_reports = [_canonical_indexing_report(report) for report in reports]
     if healthy:
         if reason is not None or cycles <= 0 or elapsed > timeout:
             raise BenchmarkIntegrityError("LongMemEval successful indexing state is inconsistent")
-        if (
-            reports[-1].get("budget_exhausted")
-            or reports[-1].get("skipped_locked")
-            or _finite_number(
-                reports[-1].get("aggregation_fusion_failures", 0), integer=True
-            ) != 0
-            or _finite_number(
-                reports[-1].get("aggregation_build_exceptions", 0), integer=True
-            ) != 0
+        if not _indexing_snapshot_is_mechanically_complete(
+            canonical_final, canonical_reports, cycles,
         ):
             raise BenchmarkIntegrityError(
                 "LongMemEval successful indexing final cycle is not clean"
@@ -1963,25 +2049,12 @@ def _validate_legacy_indexing(
         raise BenchmarkIntegrityError(
             "LongMemEval coverage failure lacks durable coverage evidence"
         )
-    if failure["code"] in {
-        "quarantined_extraction", "terminal_extraction_source_loss",
-    } and not complete:
-        raise BenchmarkIntegrityError(
-            "LongMemEval extraction-loss failure lacks mechanical completion"
-        )
-    if complete and (
-        canonical_final is None
-        or cycles <= 0 or sum(canonical_final["pending"].values()) != 0
-        or sum(canonical_final["malformed"].values()) != 0
-        or canonical_final["in_progress"]
-        or reports[-1].get("budget_exhausted") is not False
-        or reports[-1].get("skipped_locked") is not False
-        or _finite_number(
-            reports[-1].get("aggregation_fusion_failures", 0), integer=True
-        ) != 0
-        or _finite_number(
-            reports[-1].get("aggregation_build_exceptions", 0), integer=True
-        ) != 0
+    _validate_immediate_durable_indexing_failure(
+        failure["code"], complete=complete, final=canonical_final,
+        reports=canonical_reports, cycles=cycles,
+    )
+    if complete and not _indexing_snapshot_is_mechanically_complete(
+        canonical_final, canonical_reports, cycles,
     ):
         raise BenchmarkIntegrityError(
             "LongMemEval mechanically complete failure has blocking work"
@@ -2178,11 +2251,74 @@ def _router_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def validate_lme_summary_policy_binding(config: Mapping[str, Any]) -> str:
+    """Cross-check explicit treatment without inventing historical disclosure.
+
+    Artifacts predating this lever omit it in both places and can only mean
+    legacy behavior. This interpretation does not add a recorded flag to those
+    artifacts or authorize their reuse under a different current run identity.
+    """
+    from hymem.dreaming.summary_policy import (
+        LEGACY_COMPLETE_V1, validate_summary_policy,
+    )
+
+    if not isinstance(config, Mapping):
+        raise BenchmarkIntegrityError("LongMemEval summary policy config is malformed")
+    effective = config.get("effective_hymem_config")
+    if not isinstance(effective, Mapping):
+        raise BenchmarkIntegrityError("LongMemEval effective HyMem config is absent")
+    field = "digest_summary_policy"
+    recorded = field in config
+    effective_recorded = field in effective
+    if not recorded and not effective_recorded:
+        return LEGACY_COMPLETE_V1
+    if recorded is not effective_recorded:
+        raise BenchmarkIntegrityError("LongMemEval summary policy disclosure is incomplete")
+    try:
+        selected = validate_summary_policy(config[field])
+        actual = validate_summary_policy(effective[field])
+    except ValueError as exc:
+        raise BenchmarkIntegrityError("LongMemEval summary policy is invalid") from exc
+    if selected != actual:
+        raise BenchmarkIntegrityError("LongMemEval effective summary policy differs")
+    return selected
+
+
 def validate_strict_artifact(
     data: object, *, path: Path | None = None,
     require_scored: bool | None = None,
 ) -> dict[str, Any]:
-    """Validate a strict LME evidence envelope and recompute every score."""
+    """Validate strict evidence against the current producer implementation."""
+
+    return _validate_artifact(data, path=path, require_scored=require_scored,
+                              archive_only=False)
+
+
+def validate_archived_artifact(
+    data: object, *, path: Path | None = None,
+    require_scored: bool | None = None,
+) -> dict[str, Any]:
+    """Validate historical commitments, not eligibility for new execution.
+
+    All strict envelope, accounting, score, and checkpoint checks still apply.
+    Old request/retry hash preimages are unavailable, so this explicit reader
+    does not reconstruct them from today's runtime. It is not an admission
+    path for current execution, resume, or official prediction export.
+    """
+
+    result = _validate_artifact(data, path=path, require_scored=require_scored,
+                                archive_only=True)
+    return {
+        **result,
+        "validation_assurance": "historical_commitment_only",
+        "live_execution_eligible": False,
+    }
+
+
+def _validate_artifact(
+    data: object, *, path: Path | None,
+    require_scored: bool | None, archive_only: bool,
+) -> dict[str, Any]:
 
     if not isinstance(data, Mapping):
         raise BenchmarkIntegrityError("LongMemEval artifact root must be an object")
@@ -2596,7 +2732,7 @@ def validate_strict_artifact(
             raise BenchmarkIntegrityError(
                 f"LongMemEval {label} model identity fields differ"
             )
-    _validated_pipeline_aggregation_producer(pipeline)
+    _validated_pipeline_aggregation_producer(pipeline, archive_only=archive_only)
     def expected_provider(endpoint: str) -> str:
         official = validate_http_endpoint(
             endpoint, label="model identity"
@@ -2663,6 +2799,7 @@ def validate_strict_artifact(
     effective = config.get("effective_hymem_config")
     if not isinstance(effective, Mapping) or not effective:
         raise BenchmarkIntegrityError("LongMemEval effective HyMem config is absent")
+    validate_lme_summary_policy_binding(config)
     expected_effective = {
         "message_fts_top_k": 15, "fts_top_k": 10, "graph_top_k": 10,
         "aggregation_nodes_enabled": config.get("aggregation_nodes"),
@@ -2782,6 +2919,7 @@ def validate_strict_artifact(
             )
             _validate_aggregation_pipeline_binding(
                 row_indexing.get("final_status"), pipeline,
+                archive_only=archive_only,
             )
             normalized_row_indexing = dict(row_indexing)
             if normalized_row_indexing.get("schema") != LME_INDEXING_SUMMARY_VERSION:

@@ -63,7 +63,7 @@ def captured(monkeypatch):
 # ── extra_body plumbing ───────────────────────────────────────────────────
 
 def test_extra_body_is_merged_into_the_request(captured):
-    ba.LLMClient("deepseek-v4-flash", "k", extra_body=THINKING)._call([], 0.0, 512)
+    ba.LLMClient("deepseek-flash", "k", extra_body=THINKING)._call([], 0.0, 512)
     assert captured["body"]["thinking"] == {"type": "disabled"}
 
 
@@ -109,7 +109,7 @@ def test_extra_body_cannot_override_manifested_request_identity(captured, key):
 ])
 def test_empty_content_raises_instead_of_scoring_zero(captured, msg):
     captured["reply"] = _message(**msg)
-    client = ba.LLMClient("deepseek-v4-flash", "k")
+    client = ba.LLMClient("deepseek-flash", "k")
     with pytest.raises(ba.LLMEmptyContentError) as raised:
         client._call([], 0.0, 512)
     assert isinstance(raised.value, RuntimeError)  # direct-call compatibility
@@ -127,7 +127,7 @@ def test_chat_surfaces_the_empty_read_as_a_named_error(captured, monkeypatch):
     monkeypatch.setattr(ba.time, "sleep", lambda *_: None)
     private_reasoning = "PRIVATE_REASONING_MUST_NOT_LEAK_93"
     captured["reply"] = _message(content="", reasoning_content=private_reasoning)
-    client = ba.LLMClient("deepseek-v4-flash", "k")
+    client = ba.LLMClient("deepseek-flash", "k")
     out = client.chat([])
     assert ba.LLM_EMPTY_CONTENT_SENTINEL == "[LLM_ERROR:LLMEmptyContentError]"
     assert out == ba.LLM_EMPTY_CONTENT_SENTINEL
@@ -314,7 +314,7 @@ def test_finish_reason_survives_the_empty_content_raise(captured, monkeypatch):
     the field has to outlive the exception the empty content triggers."""
     monkeypatch.setattr(ba.time, "sleep", lambda *_: None)
     captured["reply"] = _reply("", "length")
-    c = ba.LLMClient("deepseek-v4-flash", "k")
+    c = ba.LLMClient("deepseek-flash", "k")
     assert c.chat([]) == ba.LLM_EMPTY_CONTENT_SENTINEL
     assert c.last_finish_reason == "length"
 
@@ -349,7 +349,7 @@ def test_a_truncated_judge_reply_scores_zero_but_says_why(captured):
     truncated = ('{"scores": [1], "total_score": 1.0, "explanation": "The response '
                  'includes numeric error status codes')
     captured["reply"] = _reply(truncated, "length")
-    llm = ba.LLMClient("deepseek-v4-flash", "k")
+    llm = ba.LLMClient("deepseek-flash", "k")
     out = ba.judge_answer(llm, "q", "ideal", ["states the code"], "an answer",
                           return_raw=True)
     assert out["score"] == 0.0 and out["scores"] == []
@@ -359,7 +359,7 @@ def test_a_truncated_judge_reply_scores_zero_but_says_why(captured):
 
 def test_a_complete_judge_reply_is_parsed_and_also_carries_its_finish(captured):
     captured["reply"] = _reply('{"scores": [1, 0], "total_score": 0.5}', "stop")
-    llm = ba.LLMClient("deepseek-v4-flash", "k")
+    llm = ba.LLMClient("deepseek-flash", "k")
     out = ba.judge_answer(llm, "q", "ideal", ["a", "b"], "ans", return_raw=True)
     assert out["score"] == 0.5 and out["scores"] == [1, 0]
     assert out["judge_finish_reason"] == "stop"

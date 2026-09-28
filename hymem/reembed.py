@@ -16,6 +16,7 @@ from pathlib import Path
 import sqlite3
 
 from hymem.core import db
+from hymem.core.embedding_batches import embed_bounded
 from hymem.core.graph import live_edge_predicate
 from hymem.core.vectors import encode_vector
 from hymem.deadline import DeadlineExceeded, MonotonicDeadline, use_deadline
@@ -307,9 +308,21 @@ def repair(conn, embedder, *, apply=False, batch_size=16, max_items=256, timeout
                     if any(_safe_source(conn, index, row) != source for row, source in candidates):
                         raise RuntimeError("source changed")
                     _refresh_lock(conn, holder)
-                    if candidates:
+                    def verify_repair_material():
+                        guard()
+                        if any(_safe_source(conn, index, row) != source for row, source in candidates):
+                            raise RuntimeError("source changed")
+
+                    def count_provider_request():
                         report.provider_batches += 1
-                    vectors = embedder.embed([source[0] for _, source in candidates]) if candidates else []
+
+                    vectors = embed_bounded(
+                        embedder, [source[0] for _, source in candidates],
+                        identity=lambda: _identity(embedder)[1:],
+                        expected_model=model, required_dim=dim,
+                        boundary=verify_repair_material,
+                        on_dispatch=count_provider_request,
+                    ) if candidates else []
                     guard()
                     if len(vectors) != len(candidates) or any(not _valid_vector(encode_vector(vector), dim) for vector in vectors):
                         raise RuntimeError("invalid provider vectors")

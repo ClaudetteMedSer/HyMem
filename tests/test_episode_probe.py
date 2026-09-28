@@ -255,7 +255,7 @@ def test_sim_pipeline_extracts_through_the_production_digest(tmp_path):
         conn.close()
 
     assert all(r["error"] is None for r in rows), [r["error"] for r in rows]
-    assert all(r["calls"] == 1 for r in rows), "one digest call per session"
+    assert all(r["calls"] == 3 for r in rows), "primary plus semantic and format verifiers per session"
     assert all(r["episodes"] for r in rows), "the sim backend must yield episodes"
     # The gated input shape: chunk-tagged, and carrying the granular closer
     # rather than the shipping one.
@@ -278,7 +278,7 @@ def test_blob_arm_sends_the_shipping_prompt(tmp_path):
     finally:
         conn.close()
     assert row["extractor_input"].rstrip().endswith("Return the JSON object now.")
-    assert "granular" not in llm.sent[-1]["system"][:80].lower()
+    assert "granular" not in llm.sent[0]["system"][:80].lower()
 
 
 def test_capturing_llm_records_what_was_sent_not_what_was_asked_for(tmp_path):
@@ -287,6 +287,11 @@ def test_capturing_llm_records_what_was_sent_not_what_was_asked_for(tmp_path):
     seen = {}
 
     def backend(system: str, user: str) -> str:
+        if system in {
+            episode_probe_module._DIGEST_FIDELITY_SYSTEM,
+            episode_probe_module._DIGEST_FORMAT_ADJUDICATION_SYSTEM,
+        }:
+            return sim_backend(system, user)
         seen["user"] = user
         return json.dumps({"episodes": [], "summary": "", "procedures": []})
 
@@ -298,14 +303,15 @@ def test_capturing_llm_records_what_was_sent_not_what_was_asked_for(tmp_path):
         row = extract_one(conn, entries[0], llm, cfg, granular=True)
     finally:
         conn.close()
+    assert not row["digest_failed"]
     assert row["extractor_input"] == seen["user"]
     assert row["extractor_input_sha256"] == hashlib.sha256(
         seen["user"].encode("utf-8")).hexdigest()
 
 
-def test_backend_failure_is_a_parse_failure_not_a_crash(tmp_path):
+def test_backend_failure_is_a_counted_transport_failure_not_a_crash(tmp_path):
     """A probe row must never abort the run — the failure has to surface as a
-    counted parse failure so the pre-registered ceiling can read it."""
+    counted digest failure so the pre-registered ceiling can read it."""
     def backend(system: str, user: str) -> str:
         raise RuntimeError("upstream 500")
 
@@ -317,7 +323,11 @@ def test_backend_failure_is_a_parse_failure_not_a_crash(tmp_path):
         row = extract_one(conn, entries[0], llm, cfg, granular=True)
     finally:
         conn.close()
-    assert row["parse_failed"] is True
+    assert row["parse_failed"] is False
+    assert row["digest_failed"] is True
+    assert row["failure_stage"] == "primary"
+    assert row["calls"] == 1
+    assert row["reply_chars"] is None, "transport failure is not an empty model reply"
     assert row["episodes"] == []
     assert llm.last_error == "execution_failure:RuntimeError"
 

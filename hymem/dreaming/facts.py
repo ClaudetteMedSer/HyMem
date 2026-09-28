@@ -1,6 +1,6 @@
 """Authoritative narrative-fact extraction and lifecycle (schema v46).
 
-The gated ``facts.v2`` prompt still sees ``role: content`` lines. Its input now
+The ``facts.v4`` capacity-aware prompt sees ``role: content`` lines. Its input
 comes from the validated lossless-message stream, can resume inside one large
 turn, and publishes an exact occurrence manifest. Each bounded source slice is
 an authority unit: a later successful replay replaces that unit's current fact
@@ -17,7 +17,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date as calendar_date
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 from hymem.config import HyMemConfig, MAX_FACTS_PER_EXTRACTION_UNIT
 from hymem.core import db as core_db
@@ -36,11 +36,13 @@ from hymem.dreaming.lossless import (
 from hymem.dreaming.message_coverage import LOSSLESS_COVERAGE_VERSION
 from hymem.extraction.jsonio import loads_exact_or_fenced
 from hymem.extraction.llm import LLMClient, LLMRequest
-from hymem.extraction.prompts import FACTS_SYSTEM, FACTS_USER_TEMPLATE
+from hymem.extraction.prompts import (
+    FACTS_CAPACITY_TEMPLATE, FACTS_SYSTEM, FACTS_USER_TEMPLATE,
+)
 
 log = logging.getLogger("hymem.dreaming.facts")
 
-FACTS_PROMPT_VERSION = "facts.v2"
+FACTS_PROMPT_VERSION = "facts.v4"
 FACT_SOURCE_MANIFEST_VERSION = "fact-source-manifest-v1"
 FACT_RESULT_VERSION = "fact-result-v1"
 FACT_SLICE_VERSION = "fact-slice-v1"
@@ -63,6 +65,7 @@ FACT_MAX_ENTITIES_PER_ITEM = 64
 FACT_MAX_ENTITY_CHARS = 200
 
 _MAX_FACT_CHARS = 600
+FactFailureReason = Literal["output_capacity_exceeded", "invalid_output"]
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _FACT_RETRY_RE = re.compile(
     r"^facts-lossless-v1\|prompt=facts\.v\d{1,6}\|chars=\d{1,9}\|"
@@ -100,6 +103,8 @@ class FactsExtraction:
     # the generation it read so concurrent workers cannot append a revision to
     # state they never observed.
     expected_generation: int | None = None
+    # Append diagnostics to preserve every pre-v4 positional constructor slot.
+    failure_reason: FactFailureReason | None = None
 
 
 def _sha256_json(payload: object) -> str:
@@ -829,16 +834,15 @@ def extract_facts(
         source_occurrences=occurrences,
         publication_version=facts_config_version(cfg, client=llm),
     )
-    request = LLMRequest(
-        system=FACTS_SYSTEM,
-        user=FACTS_USER_TEMPLATE.format(text=combined),
-        response_format="json",
-        max_tokens=cfg.dream_digest_max_tokens,
+    raw = llm.complete(build_facts_request(combined, cfg))
+    items, failure_reason = _validate_fact_response(
+        raw, max_items=cfg.dream_max_facts_per_session,
     )
-    raw = llm.complete(request)
-    items = validate_fact_items(raw, max_items=cfg.dream_max_facts_per_session)
     if items is None:
-        return FactsExtraction(parse_failed=True, **common)
+        log.warning("facts.output_rejected reason=%s", failure_reason)
+        return FactsExtraction(
+            parse_failed=True, failure_reason=failure_reason, **common,
+        )
     tail = facts_tail_message_id(conn, session_id)
     return FactsExtraction(
         items=canonical_fact_items(items),
@@ -848,6 +852,57 @@ def extract_facts(
         caught_up=next_partial is None and covered == tail,
         **common,
     )
+
+
+def build_facts_request(rendered: str, cfg: HyMemConfig) -> LLMRequest:
+    """Use one bounded output contract for new and exact historical units.
+
+    A capacity limit is not permission to choose a subset of the input's
+    supported facts. Explicit overflow holds the authority unit for retry;
+    historical units keep their original source boundaries on every replay.
+    """
+    return LLMRequest(
+        system=FACTS_SYSTEM + FACTS_CAPACITY_TEMPLATE.format(
+            max_items=cfg.dream_max_facts_per_session,
+            max_text_chars=_MAX_FACT_CHARS,
+            max_entities=FACT_MAX_ENTITIES_PER_ITEM,
+            max_entity_chars=FACT_MAX_ENTITY_CHARS,
+        ),
+        user=FACTS_USER_TEMPLATE.format(text=rendered),
+        response_format="json",
+        max_tokens=cfg.dream_digest_max_tokens,
+    )
+
+
+def _validate_fact_response(
+    raw: object, *, max_items: int,
+) -> tuple[list[dict] | None, FactFailureReason | None]:
+    """Distinguish a declared capacity failure without salvaging partial data."""
+    parsed = loads_exact_or_fenced(raw) if isinstance(raw, str) else raw
+    if (
+        isinstance(parsed, dict)
+        and set(parsed) == {"facts", "complete"}
+        and isinstance(parsed["facts"], list)
+        and not parsed["facts"]
+        and parsed["complete"] is False
+    ):
+        return None, "output_capacity_exceeded"
+    items = validate_fact_items(parsed, max_items=max_items)
+    if items is not None:
+        return items, None
+    # An over-cap list may still violate the item schema. Diagnose capacity
+    # only when every item is valid, without accepting or publishing that set.
+    # The authority-ledger ceiling bounds this diagnostic validation work.
+    candidate = parsed
+    if isinstance(candidate, dict) and set(candidate) == {"facts"}:
+        candidate = candidate["facts"]
+    if (
+        isinstance(candidate, list)
+        and max_items < len(candidate) <= FACT_MAX_ACTIVE_ITEMS_PER_OUTCOME
+        and validate_fact_items(candidate, max_items=len(candidate)) is not None
+    ):
+        return None, "output_capacity_exceeded"
+    return None, "invalid_output"
 
 
 def validate_fact_items(raw: object, *, max_items: int) -> list[dict] | None:
@@ -974,15 +1029,15 @@ def reextract_fact_outcome(
     )
     if all(not fragment.strip() for fragment in source_fragments):
         return FactsExtraction(items=[], **common)
-    raw = llm.complete(LLMRequest(
-        system=FACTS_SYSTEM,
-        user=FACTS_USER_TEMPLATE.format(text=rendered),
-        response_format="json",
-        max_tokens=cfg.dream_digest_max_tokens,
-    ))
-    items = validate_fact_items(raw, max_items=cfg.dream_max_facts_per_session)
+    raw = llm.complete(build_facts_request(rendered, cfg))
+    items, failure_reason = _validate_fact_response(
+        raw, max_items=cfg.dream_max_facts_per_session,
+    )
     if items is None:
-        return FactsExtraction(parse_failed=True, **common)
+        log.warning("facts.output_rejected reason=%s", failure_reason)
+        return FactsExtraction(
+            parse_failed=True, failure_reason=failure_reason, **common,
+        )
     return FactsExtraction(items=canonical_fact_items(items), **common)
 
 

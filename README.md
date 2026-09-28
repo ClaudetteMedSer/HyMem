@@ -338,7 +338,7 @@ hymem/
 │   ├── dates.py        Stdlib-only date extraction primitives for the TR path
 │   ├── embeddings.py   Batch embedding of chunks + knowledge-graph edges (JSON + sqlite-vec)
 │   ├── phase1.py       Extraction persist + dedup (lock-free embed, same-wave collapse)
-│   ├── digest.py       Batched per-session episodes+summary+procedures (one LLM call)
+│   ├── digest.py       Batched episodes+summary+procedures, semantic + format checks
 │   ├── phase2.py       Consolidation: markers→profile, graph→MEMORY.md
 │   ├── phase3.py       Co-occurrence-aware decay + retraction
 │   ├── inference.py    Transitive closure over depends_on edges
@@ -563,9 +563,65 @@ does not masquerade as an extraction-cache event.
 
 ### Inter-Phase Steps (`dreaming/runner.py`)
 
-After chunk extraction per session, one batched digest call produces episodes,
-an automatic summary, and procedures from the independent coverage stream. A
-persistent message/character cursor makes each bounded window retryable and
+After chunk extraction per session, one batched digest generation call produces
+episodes, an automatic summary, and procedures from the independent coverage stream.
+An initial batched verification call screens the candidate before any
+cursor or publication advances: titles, episode content and procedure claims use
+each item's own cited new spans; the rolling summary also uses the prior automatic
+summary as derived continuity. Boundary context is interpretation-only, never a
+source of independent new facts. Each exact source record is sent once in a
+shared catalog, with explicit per-item citation references; appearing in that
+catalog does not authorize another item's uncited claims. Summary outcomes, conditions and material sequence
+are checked separately from the one-sentence/no-wrapper formatting contract;
+episode narratives retain their separate one-to-two-sentence allowance.
+
+Malformed or missing verdicts and unsupported or uncertain episode/procedure
+claims hold the whole digest. If all those item claims are supported but summary
+content is rejected or uncertain, a separate `summary_diagnosis` call may supply
+source-linked hints for one targeted summary repair. The semantic decision reply
+contains only complete indexed verdicts, never inline diagnostics. The diagnosis
+returns only bounded issues: it cannot approve, rewrite or publish a candidate.
+Repair is permitted only with validated source-linked diagnostics. Fixed issue codes identify such defects
+as lost temporal order, negation, attribution, conditions or outcomes; bounded
+exact quotations must bind to the candidate and its cited visible sources, or
+explicitly typed prior-summary continuity. Boundary context cannot authorize a
+diagnostic source. Missing diagnostics preserve the rejection without a generic
+reroll; malformed or fabricated references fail closed.
+
+The repair receives the unchanged original input alongside the rejected summary
+and diagnostic hints. Generated text and hints are untrusted, never evidence or
+instructions; their structural validation does not prove the alleged defect.
+Items and citations stay fixed; empty, malformed, oversized or effectively
+unchanged replacements remain held.
+A changed replacement must pass complete structural validation and a new full
+verification, including every item claim; no previous favorable verdict substitutes
+for that check, and a second content rejection cannot trigger another rewrite.
+
+The source-aware verifier returns only semantic verdicts. After complete final
+semantic acceptance, exactly one separate candidate-only format verification
+is mandatory (the internal stage name remains `format_adjudication`). It receives
+only the exact effective summary and episode narrative strings, with no source
+catalog, prior verdict, titles, entities or procedure metadata. It cannot rewrite
+text or overrule a factual veto. Every candidate format must be supported;
+rejected, uncertain or malformed adjudication still holds the whole digest.
+No recovery path salvages individual items or reduces the input window. Empty summary
+no-ops also need verification, and cannot silently truncate overlong prior history.
+Ordinary successful slices use three logical completions: generation, semantic
+verification and candidate-only format verification. Summary-only compaction
+can add one; separate diagnosis, targeted content repair and full reverification
+can add three, giving a maximum of seven logical completions per slice
+(at most twenty-one HTTP attempts with the shipped three-attempt client). There is
+no repeated content-recovery or adjudication loop. Calls use the existing client,
+token limits and remaining invocation deadline, without resetting that deadline.
+This is probabilistic screening, not proof of entailment:
+false rejections and missed errors remain possible and require provider-level
+evaluation. Digest policy/code identity changes replay retained source without
+changing Phase-1, fact, profile or standalone-summary contracts.
+The separated-decision candidate is an architecture experiment,
+not yet a demonstrated live reliability improvement or canonical LME clearance;
+see the [reliability program](docs/plans/2026-09-16-digest-reliability-program.md).
+
+A persistent message/character cursor makes each bounded window retryable and
 idempotent: an oversized message resumes at the exact next character, and the
 message-level watermark advances only after its final slice commits. Short and
 assistant-only tails therefore reopen the digest even when they create no
@@ -983,7 +1039,7 @@ dimension).
 | `HYMEM_ROOT` | `~/.hermes` | Directory for sqlite + markdown files |
 | `HYMEM_LLM_API_KEY` | provider key for an exact official origin | Purpose-bound LLM key for the configured endpoint; `DEEPSEEK_API_KEY`/`OPENAI_API_KEY` never cross to a custom host |
 | `HYMEM_LLM_BASE_URL` | `https://api.deepseek.com` | LLM endpoint |
-| `HYMEM_LLM_MODEL` | `deepseek-v4-flash` | Extraction model; retired mutable aliases `deepseek-chat` and `deepseek-reasoner` are rejected before client construction |
+| `HYMEM_LLM_MODEL` | `deepseek-flash` | Requested extraction service, not an immutable weights pin; retired `deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash`, and `deepseek-v4-flash-vision-exp` are rejected before client construction |
 | `HYMEM_LLM_THINKING` | `auto` | DeepSeek thinking-body policy; `auto` safely disables thinking on identified DeepSeek endpoints/models, while unrelated providers receive no vendor-specific body |
 | `HYMEM_EMBEDDING_API_KEY` | none | Purpose-bound key for an explicit embedding endpoint; `OPENAI_API_KEY` is inherited only for the exact official HTTPS `api.openai.com` origin, while loopback uses `local` |
 | `HYMEM_EMBEDDING_BASE_URL` | `local://feature-hash` | Actual OpenAI-compatible API base, including its route prefix (for example `/v1` when served there); no automatic `/v1` suffix. Remote URLs require HTTPS by default; omission selects the deterministic no-network fallback |
@@ -1126,13 +1182,26 @@ cannot leak through the registry, status, portable export, or store receipt.
 Older or relabelled nested evidence fails closed rather than becoming a scored
 cache hit.
 
+Pending work may coexist with a quarantine, terminal source loss or malformed
+durable record. Such indexing failures retain their canonical failure evidence
+and truthful incomplete state; they do not become successes or lose their
+diagnosis merely because the store has not drained. The episode probe separately
+records primary, compaction, targeted repair, semantic verification and mandatory
+candidate-only format requests/replies. New v4 records reflect the three-call
+normal path and six-call ceiling; rescoring preserves older record versions and
+their original attribution. Its unchanged 2%
+failure ceiling uses attempted session digests, including execution failures,
+not completion calls: extra verification calls cannot dilute the failure rate.
+Simulation verdicts are explicitly synthetic and measure plumbing, not fidelity.
+
 **Cost-aware screening is exploratory.** A lower-tier model may screen a fixed,
 stratified subset only when baseline and candidate use the same exact pinned
 model ID, seed/config, and fixed judge. Write-side/extraction changes additionally
 need an early screened-model × target-model interaction check because model
 quality changes the stored substrate. Promote on paired uncertainty and health,
 retrieval, and answer metrics—not a single score—then rerun the full definitive
-protocol under exact `deepseek-v4-flash`. See
+protocol under the explicitly recorded `deepseek-flash` service and request. This
+freezes requested identity, not provider weights. See
 [the model-migration note](references/deepseek-model-migration.md#cost-aware-lower-tier-screening).
 
 Reader packing has two explicitly different capacity policies. A locally supplied `tokenizer.json` is hashed, bound to the answer model, and fails closed if counting fails. Without one, the default is a 60,000-byte UTF-8 budget—not a token claim—checked together with 1,024 output tokens and a 256-token chat-framing reserve against the declared provider context ceiling. Raw retrieval receives a 60% selection reserve before summaries or distilled aids, although those aids still lead the rendered prompt. Official judge prompts/model/parser can match upstream scoring semantics, but the local safety-bounded three-attempt transport differs from upstream's unbounded retry policy; artifacts therefore record scoring-semantics alignment separately and do not claim full protocol/transport equivalence.
@@ -1188,18 +1257,18 @@ The biggest lifts land where cross-session consolidation matters most: **MS +9pp
 # exploratory full-set development run; produces no official-comparable claim
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
     --workers 4 --permissive-default --no-prereg \
-    --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash \
-    --hymem-model deepseek-v4-flash --hymem-thinking disabled
+    --answer-model deepseek-flash --judge-model deepseek-flash \
+    --hymem-model deepseek-flash --hymem-thinking disabled
 # fast exploratory no-dream A/B
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 --auto-ability \
     --workers 4 --no-dream --permissive-default --no-prereg \
-    --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash \
-    --hymem-model deepseek-v4-flash --hymem-thinking disabled
+    --answer-model deepseek-flash --judge-model deepseek-flash \
+    --hymem-model deepseek-flash --hymem-thinking disabled
 # oracle-label diagnostic (explicitly exploratory)
 python benchmarks/longmemeval_adapter.py --sample 0 --seed 0 \
     --no-auto-ability --workers 8 --no-prereg \
-    --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash \
-    --hymem-model deepseek-v4-flash --hymem-thinking disabled
+    --answer-model deepseek-flash --judge-model deepseek-flash \
+    --hymem-model deepseek-flash --hymem-thinking disabled
 ```
 
 **Methodology.** Every diagnostic behind these numbers is run against a control

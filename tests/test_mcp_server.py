@@ -9,6 +9,7 @@ pytest.importorskip("mcp")
 
 import hymem.server as srv
 from hymem import HyMem
+from hymem.dreaming import digest
 from hymem.dreaming.lossless import COVERAGE_INTEGRITY_CONFIG_VERSION
 from hymem.dreaming.runner import (
     DREAM_REPORT_BOOLEAN_GATE_FIELDS,
@@ -22,6 +23,7 @@ from hymem.dreaming.runner import (
 from hymem.dreaming.status import DREAM_STATUS_SCHEMA_VERSION
 from hymem.extraction.llm import StubLLMClient
 from tests.conftest import make_routed_llm
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 _TEST_AGGREGATION_CONFIG_VERSION = "aggregation-build-config-v1:" + ("0" * 64)
 _TEST_OLD_AGGREGATION_CONFIG_VERSION = (
@@ -827,6 +829,8 @@ def test_dream_tool_clean_snapshot_describes_new_completions_without_ratio(
 def _authoritative_empty_pipeline_llm() -> StubLLMClient:
     return StubLLMClient(
         fixtures={
+            digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "You analyze one conversation session": json.dumps({
                 "episodes": [], "summary": "", "procedures": [],
             }),
@@ -879,6 +883,8 @@ def test_authoritative_empty_counts_as_new_completion_then_cache_is_noop(cfg):
 def test_invalid_extraction_json_stays_pending_and_mcp_reports_incomplete(cfg):
     llm = StubLLMClient(
         fixtures={
+            digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "You analyze one conversation session": json.dumps({
                 "episodes": [], "summary": "", "procedures": [],
             }),

@@ -12,6 +12,8 @@ from benchmarks.strictness import (
     BenchmarkIntegrityError, IndexingConvergenceError, sanitize_for_artifact,
 )
 from tests.archive_evidence_fixtures import scoped_indexing, skipped_indexing
+from hymem.dreaming import digest
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 
 def _offline_adapter(tmp_path):
@@ -19,6 +21,8 @@ def _offline_adapter(tmp_path):
     adapter = msc.MSCAdapter(HyMemConfig(root=tmp_path).db_path, sim=True)
     adapter.open()
     adapter.pipeline_llm.fixtures.update({
+        digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+        digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
         "typed user-profile facts": '{"items":[]}',
         "You analyze one conversation session": '{"episodes":[],"summary":"","procedures":[]}',
         "single pass": '{"triples":[],"markers":[],"complete":true}',

@@ -48,6 +48,7 @@ from hymem.dreaming.episodes import (
     validate_episode_items,
 )
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import VerificationStubLLM
 
 _BLOB_CLOSER = "Return the JSON object now"
 _GRANULAR_CLOSER = "Return the granular digest JSON object now"
@@ -65,7 +66,7 @@ def _digest_llm(episodes: list[dict] | None = None, summary: str = "") -> StubLL
         "summary": summary,
         "procedures": [],
     })
-    return StubLLMClient(
+    return VerificationStubLLM(
         fixtures={_BLOB_CLOSER: payload, _GRANULAR_CLOSER: payload},
         default="[]",
     )

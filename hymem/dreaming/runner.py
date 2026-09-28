@@ -24,6 +24,9 @@ from hymem.deadline import (
     use_deadline,
 )
 from hymem.core import db as core_db
+from hymem.core.embedding_batches import (
+    EmbeddingInputTooLarge, EmbeddingResponseInvalid, embed_bounded,
+)
 from hymem.dreaming import bitemporal, phase1, phase2, phase3
 from hymem.dreaming.aggregate import (
     aggregation_config_version,
@@ -57,6 +60,7 @@ from hymem.dreaming.embeddings import (
     ChunkEmbedRequest,
     _embedding_identity,
     assemble_chunk_pending,
+    chunk_embedding_id_batches,
     fetch_chunk_embeddings,
     fetch_edge_embeddings,
     fetch_episode_embeddings,
@@ -78,6 +82,8 @@ from hymem.dreaming.digest import (
     digest_staging_cursor_is_valid,
     digest_retry_policy_version,
     digest_retry_is_quarantined,
+    digest_retry_counts_for_policy,
+    digest_failure_requires_input_shrink,
     extract_session_digest,
     load_completed_digest_slices,
     load_digest_staged_summary,
@@ -576,6 +582,12 @@ def _persist_message_batch_with_failure_isolation(
                 with core_db.transaction(conn):
                     persisted += persist_message_embeddings(conn, pending)
                 cache_hits += pending.cache_hits
+        except EmbeddingInputTooLarge:
+            log.error("embedding.message_input_too_large batch_size=%d", len(batch))
+            return True, None
+        except EmbeddingResponseInvalid:
+            log.error("embedding.message_response_invalid batch_size=%d", len(batch))
+            return True, None
         except Exception as exc:
             log.error(
                 "embedding.message_fetch_failure batch_size=%d error=%s",
@@ -733,6 +745,7 @@ def _run_dreaming(
                 max_tokens=cfg.dream_digest_max_tokens,
                 max_episodes=(cfg.dream_max_episodes_per_session
                               if cfg.episode_granularity_enabled else None),
+                summary_policy=cfg.digest_summary_policy,
                 client=phase1_identity_client,
             )
         if tier == "profile":
@@ -1041,7 +1054,12 @@ def _run_dreaming(
             client = embedding_client
             miss_texts = request.miss_texts
             future: Future = embed_executor.submit(
-                lambda: client.embed(miss_texts) if miss_texts else []
+                lambda client=client, miss_texts=miss_texts, request_model=request.model: embed_bounded(
+                    client, miss_texts,
+                    identity=lambda: _embedding_identity(client),
+                    expected_model=request_model,
+                    boundary=_check_deadline,
+                ) if miss_texts else []
             )
             embed_inflight.append((request, future))
 
@@ -1585,19 +1603,27 @@ def _run_dreaming(
                     else None
                 ),
             )
-            digest_retry_count = (
-                int(digested["digest_retry_count"] or 0)
-                if digested
-                and digested["digest_retry_config_version"] == digest_retry_key
-                else 0
-            )
+            digest_retry_malformed = False
+            try:
+                digest_retry_count, digest_input_retry_count = digest_retry_counts_for_policy(
+                    digested["digest_retry_count"] if digested else 0,
+                    digested["digest_retry_config_version"] if digested else None,
+                    retry_key=digest_retry_key,
+                )
+            except ValueError:
+                # A corrupt count/key is not a policy change. Hold it for
+                # diagnosis instead of resetting attempts or spending calls.
+                # A damaged redundant flag alone remains safely recoverable.
+                digest_retry_count = digest_input_retry_count = 0
+                digest_retry_malformed = True
             digest_quarantined = digest_retry_is_quarantined(
                 digest_retry_count,
                 digested["digest_retry_config_version"] if digested else None,
                 retry_key=digest_retry_key,
                 max_attempts=cfg.digest_extraction_max_attempts,
             )
-            if coverage_tail is not None and not caught_up and not digest_quarantined:
+            if (coverage_tail is not None and not caught_up
+                    and not digest_quarantined and not digest_retry_malformed):
                 _check_deadline()
                 # A new full walk gets a distinct generation even when its
                 # prompt/config is unchanged.  Successful partial slices store
@@ -1633,10 +1659,10 @@ def _run_dreaming(
                     f"after={cursor_message_id if cursor_message_id is not None else 'start'};"
                     f"partial={partial_message_id if partial_message_id is not None else 'none'};"
                     f"offset={cursor_offset};cap="
-                    f"{digest_attempt_max_chars(cfg.dream_digest_max_chars, digest_retry_count)}"
+                    f"{digest_attempt_max_chars(cfg.dream_digest_max_chars, digest_input_retry_count)}"
                 )
                 digest_attempt_chars = digest_attempt_max_chars(
-                    cfg.dream_digest_max_chars, digest_retry_count
+                    cfg.dream_digest_max_chars, digest_input_retry_count
                 )
                 try:
                     with _semantic_boundary("digest"):
@@ -1650,8 +1676,9 @@ def _run_dreaming(
                             prior_summary=prior_auto_summary,
                             granular=cfg.episode_granularity_enabled,
                             max_episodes=cfg.dream_max_episodes_per_session,
+                            summary_policy=cfg.digest_summary_policy,
                         )
-                except Exception:
+                except Exception as exc:
                     report.digest_failures += 1
                     log.exception("digest.extraction_failure session_id=%s", session_id)
                     with core_db.transaction(conn):
@@ -1660,6 +1687,9 @@ def _run_dreaming(
                             session_id,
                             max_attempts=cfg.digest_extraction_max_attempts,
                             retry_config_version=digest_retry_key,
+                            input_failure=digest_failure_requires_input_shrink(
+                                "completion_failure", getattr(exc, "failure_stage", "primary"),
+                            ),
                         )
                     if newly_quarantined:
                         report.digest_quarantined += 1
@@ -1674,6 +1704,9 @@ def _run_dreaming(
                                 session_id,
                                 max_attempts=cfg.digest_extraction_max_attempts,
                                 retry_config_version=digest_retry_key,
+                                input_failure=digest_failure_requires_input_shrink(
+                                    digest.failure_reason, digest.failure_stage,
+                                ),
                             )
                         if newly_quarantined:
                             report.digest_quarantined += 1
@@ -1836,6 +1869,13 @@ def _run_dreaming(
                                 # A bounded digest slice is unfinished work even
                                 # when the Phase-1 chunk budget remains.
                                 report.budget_exhausted = True
+            elif digest_retry_malformed and coverage_tail is not None and not caught_up:
+                report.digest_failures += 1
+                report.budget_exhausted = True
+                log.warning(
+                    "digest.retry_state_malformed session_id=%s action=held_without_call",
+                    session_id,
+                )
             elif digest_quarantined and coverage_tail is not None and not caught_up:
                 report.digest_quarantined += 1
                 log.warning(
@@ -2565,7 +2605,7 @@ def _run_dreaming(
             # Drain background-embedded batches before opening any write
             # transaction. A
             # per-batch future failure is logged and skipped — the post-loop
-            # fetch_chunk_embeddings call below catches anything missed
+            # bounded catch-all scan below catches anything missed
             # (skipped sessions, future raises, miss_texts size mismatch).
             persisted_ids: set[str] = set()
             if embed_inflight:
@@ -2605,15 +2645,19 @@ def _run_dreaming(
                     persisted_ids.update(pending.ids)
                 embed_inflight.clear()
 
-            pending_chunks = fetch_chunk_embeddings(
-                conn,
-                embedding_client,
-                exclude_ids=deferred_baseline_embedding_ids,
-            )
-            if pending_chunks is not None:
-                with core_db.transaction(conn):
-                    report.chunks_embedded += persist_chunk_embeddings(conn, pending_chunks)
-                report.chunks_embedded_from_cache += pending_chunks.cache_hits
+            for chunk_batch in chunk_embedding_id_batches(
+                conn, exclude_ids=deferred_baseline_embedding_ids
+            ):
+                _check_deadline()
+                pending_chunks = fetch_chunk_embeddings(
+                    conn, embedding_client, chunk_ids=chunk_batch
+                )
+                if pending_chunks is not None:
+                    with core_db.transaction(conn):
+                        report.chunks_embedded += persist_chunk_embeddings(
+                            conn, pending_chunks
+                        )
+                    report.chunks_embedded_from_cache += pending_chunks.cache_hits
 
             # Exact message occurrences have their own durable semantic tier.
             # Fetch/embedding is deliberately outside the write transaction;

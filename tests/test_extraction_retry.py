@@ -2585,8 +2585,10 @@ def test_soft_newline_inside_padded_claim_is_held_without_provider_spend():
     assert llm.calls == []
 
 
-def test_source_less_unbreakable_claim_cannot_become_authoritative_empty():
+def test_source_less_bounded_unbreakable_unit_gets_whole_unit_empty_verification():
     text = "Application uses " + ("x" * 374) + " PostgreSQL."
+    assert len(text) <= chunk_extraction._MAX_LEAF_INPUT_CHARS
+    assert chunk_extraction._semantic_split_point(text) is None
     legacy_midpoint = len(text) // 2
     for fragment in (text[:legacy_midpoint + 64], text[legacy_midpoint - 64:]):
         assert not (
@@ -2596,14 +2598,17 @@ def test_source_less_unbreakable_claim_cannot_become_authoritative_empty():
 
     result = extract_chunk(llm, text)
 
-    assert result.failed is True
-    assert result.failure_reason == "resource_limit"
-    assert "split:no_admissible_semantic_boundary" in result.failure_details
+    assert result.failed is False
+    assert result.failure_reason is None
+    assert result.failure_details == ()
     assert result.triples == [] and result.markers == []
-    # Split safety cannot be established, but the terminal primary empty still
-    # receives exactly one genuine second look before the unit is held.
+    # Unsafe arbitrary cuts remain forbidden. Both calls see the entire
+    # admissible unit, just as for a short claim-bearing source: a cue alone is
+    # not evidence of resource exhaustion or an invalid completion. Correlated
+    # model misses remain possible and are tested separately by the canary.
     assert result.completion_calls == result.provider_attempts == 2
     assert len(llm.calls) == 2
+    assert all(call.user.split('\"\"\"', 2)[1].strip() == text for call in llm.calls)
     assert "VERIFICATION PASS" not in llm.calls[0].system
     assert "EMPTY VERIFICATION PASS" in llm.calls[1].system
 

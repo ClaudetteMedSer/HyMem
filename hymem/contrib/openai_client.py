@@ -22,7 +22,7 @@ from hymem.contrib.openai_embedding_client import (
     OPENAI_TRANSPORT_RUNTIME_EXACT,
     OPENAI_TRANSPORT_RUNTIME_VERSIONS,
 )
-from hymem.contrib.model_policy import require_active_model
+from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL, require_active_model
 from hymem.deadline import DeadlineExceeded, current_deadline
 
 from hymem.extraction.llm import (
@@ -69,7 +69,7 @@ _OPENAI_LLM_EXECUTION_CONFIGS: weakref.WeakKeyDictionary[
 ] = weakref.WeakKeyDictionary()
 _OPENAI_LLM_EXECUTION_CONFIGS_LOCK = threading.Lock()
 _OFFICIAL_DEEPSEEK_DEPLOYMENT_CONTRACT = (
-    "official-deepseek-v4-flash-at-api.deepseek.com-v1"
+    "official-deepseek-flash-request-service-at-api.deepseek.com-v1"
 )
 _FROZEN_CURRENT_DEADLINE = current_deadline
 _FROZEN_WITH_RETRY = with_retry
@@ -112,12 +112,13 @@ class OpenAICompatibleClient:
     environment keys are origin-bound: ``DEEPSEEK_API_KEY`` and
     ``OPENAI_API_KEY`` are never sent to a custom host.  Use the purpose-bound
     ``HYMEM_LLM_API_KEY`` (or an explicit constructor key) for a custom HTTPS
-    endpoint.
+    endpoint. The official DeepSeek producer identifies the requested service
+    and local request implementation; it does not attest immutable model weights.
 
     Environment variables (all optional if arguments are passed directly):
         HYMEM_LLM_API_KEY   — purpose-bound API key for the configured endpoint
         HYMEM_LLM_BASE_URL  — base URL (default: https://api.deepseek.com)
-        HYMEM_LLM_MODEL     — model name (default: deepseek-v4-flash)
+        HYMEM_LLM_MODEL     — requested model service (default: deepseek-flash)
         HYMEM_LLM_THINKING  — whether to send DeepSeek's `thinking` body key:
                               "auto" (default, send only on DeepSeek endpoints),
                               "disabled" (always send it, i.e. force reasoning
@@ -144,7 +145,7 @@ class OpenAICompatibleClient:
         # object exists.  Environment fallback is part of the effective model
         # identity and must not bypass the same constructor-level policy.
         resolved_model = (
-            model or os.environ.get("HYMEM_LLM_MODEL") or "deepseek-v4-flash"
+            model or os.environ.get("HYMEM_LLM_MODEL") or RECOMMENDED_DEEPSEEK_MODEL
         )
         if type(resolved_model) is str:
             resolved_model = resolved_model.strip()
@@ -200,13 +201,13 @@ class OpenAICompatibleClient:
                 revision_sha256 is None
                 and tenant_sha256 is None
                 and endpoint.official_provider == "deepseek"
-                and resolved_model == "deepseek-v4-flash"
+                and resolved_model == RECOMMENDED_DEEPSEEK_MODEL
             )
             else None
         )
 
-        # `thinking` is a DeepSeek-specific body key: deepseek-v4-flash otherwise
-        # spends its whole token budget reasoning and returns empty content. But
+        # `thinking` is a DeepSeek-specific body key. Reasoning can consume a
+        # bounded completion budget before producing usable content. But
         # the OpenAI API rejects unknown body params with a 400, and vLLM's
         # tolerance varies by version — and because every call goes through
         # with_retry(), an unconditional send turns "wrong vendor" into three
@@ -250,9 +251,9 @@ class OpenAICompatibleClient:
         self._official_deployment_contract = official_deployment_contract
 
         # Provider accounting is cumulative and thread-safe because benchmark
-        # workers can share this client. Any failed attempt or response without
-        # a complete usage block makes token totals unavailable rather than
-        # falsely exact.
+        # workers can share this client. Any unaccounted attempt or response
+        # without a complete usage block makes token totals unavailable rather
+        # than falsely exact, even if later responses are admitted.
         self.call_count = 0
         self.request_attempts = 0
         self.successful_responses = 0
@@ -263,6 +264,7 @@ class OpenAICompatibleClient:
         self.cost_usd = None
         self.token_usage_available = False
         self._usage_complete = True
+        self._accounted_response_attempts = 0
         self._usage_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._close_condition = threading.Condition(self._close_lock)
@@ -655,8 +657,11 @@ class OpenAICompatibleClient:
         if request.response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
+        # Keep the caller's absolute deadline for every attempt and admission;
+        # provider callbacks must not replace it by changing ambient context.
+        deadline = _FROZEN_CURRENT_DEADLINE()
+
         def _attempt():
-            deadline = _FROZEN_CURRENT_DEADLINE()
             request_kwargs = dict(kwargs)
             if deadline is not None:
                 request_kwargs["timeout"] = deadline.cap_timeout(
@@ -666,15 +671,10 @@ class OpenAICompatibleClient:
                 tracker._record()
             with self._usage_lock:
                 self.request_attempts += 1
+                self.token_usage_available = False
             started = time.monotonic()
             try:
-                response = config.completion_create(**request_kwargs)
-                # A custom/OpenAI-compatible transport may ignore its timeout.
-                # Reject a late response before parsing or publication once it
-                # eventually hands control back to us.
-                if deadline is not None:
-                    deadline.check()
-                return response
+                return config.completion_create(**request_kwargs)
             except (Exception, DeadlineExceeded):
                 with self._usage_lock:
                     self._usage_complete = False
@@ -691,26 +691,29 @@ class OpenAICompatibleClient:
             max_delay=DEFAULT_RETRY_MAX_DELAY_SECONDS,
             label=f"LLM completion ({config.model})",
         )
-        self._verify_transport_integrity()
-        content = resp.choices[0].message.content
-        if type(content) is not str:
-            raise RuntimeError("LLM response content is not a string")
+        # A received reply can be paid even when its finish/content is rejected.
+        # Account it outside the transport retry loop, before any admission or
+        # post-return deadline/integrity check. Never reroll a received failure.
         usage = getattr(resp, "usage", None)
         values = {
             "prompt_tokens": getattr(usage, "prompt_tokens", None),
             "completion_tokens": getattr(usage, "completion_tokens", None),
             "total_tokens": getattr(usage, "total_tokens", None),
         }
-        valid = all(
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(float(value))
-            and value >= 0
-            for value in values.values()
-        )
+        try:
+            valid = all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and value >= 0 and value == int(value)
+                for value in values.values()
+            ) and values["total_tokens"] == (
+                values["prompt_tokens"] + values["completion_tokens"]
+            )
+        except (OverflowError, ValueError):
+            valid = False
         with self._usage_lock:
-            self.call_count += 1
-            self.successful_responses += 1
+            self._accounted_response_attempts += 1
             if valid:
                 self.prompt_tokens += values["prompt_tokens"]
                 self.completion_tokens += values["completion_tokens"]
@@ -718,8 +721,28 @@ class OpenAICompatibleClient:
             else:
                 self._usage_complete = False
             self.token_usage_available = (
-                self.successful_responses > 0 and self._usage_complete
+                self._usage_complete
+                and self._accounted_response_attempts == self.request_attempts
             )
+        # A transport may ignore its timeout. Keep its observed usage but never
+        # admit a late response, even if its content and finish look usable.
+        if deadline is not None:
+            deadline.check()
+        self._verify_transport_integrity()
+        choices = getattr(resp, "choices", None)
+        if type(choices) is not list or len(choices) != 1:
+            raise RuntimeError("LLM response must contain exactly one choice")
+        choice = choices[0]
+        finish = getattr(choice, "finish_reason", None)
+        if type(finish) is not str or finish != "stop":
+            raise RuntimeError("LLM response did not finish with stop")
+        content = getattr(getattr(choice, "message", None), "content", None)
+        if type(content) is not str:
+            raise RuntimeError("LLM response content is not a string")
+        # These counters describe admitted text completions, not paid replies.
+        with self._usage_lock:
+            self.call_count += 1
+            self.successful_responses += 1
         return content
 
     def close(self) -> None:
@@ -785,15 +808,22 @@ def openai_compatible_producer_declaration(
     official_deployment_contract: str | None = None,
     require_consistent_thinking: bool = True,
 ):
-    """Derive the same safe producer declaration without constructing I/O."""
+    """Derive the same safe producer declaration without constructing I/O.
+
+    The official DeepSeek exception identifies the exact request implementation
+    and requested service, not immutable provider weights. A provider-side
+    backend change is not observable from this declaration alone.
+    """
 
     from hymem.contrib.endpoint_policy import ENDPOINT_POLICY_VERSION
     from hymem.extraction.producer import Phase1ProducerDeclaration
 
+    if type(model) is str:
+        model = model.strip()
+    _FROZEN_REQUIRE_ACTIVE_MODEL(model, role="HyMem LLM")
     model = validate_public_attestation(
         model, label="OpenAI LLM model", max_bytes=4096,
     )
-    _FROZEN_REQUIRE_ACTIVE_MODEL(model, role="HyMem LLM")
     if thinking_mode not in _THINKING_MODES:
         raise ValueError("OpenAI thinking mode is invalid")
     from urllib.parse import urlsplit
@@ -834,7 +864,7 @@ def openai_compatible_producer_declaration(
         and deployment_revision_sha256 is None
         and deployment_tenant_sha256 is None
         and endpoint_meta.official_provider == "deepseek"
-        and model == "deepseek-v4-flash"
+        and model == RECOMMENDED_DEEPSEEK_MODEL
     ):
         official_deployment_contract = _OFFICIAL_DEEPSEEK_DEPLOYMENT_CONTRACT
     exact_official_contract = bool(
@@ -842,7 +872,7 @@ def openai_compatible_producer_declaration(
         and deployment_revision_sha256 is None
         and deployment_tenant_sha256 is None
         and endpoint_meta.official_provider == "deepseek"
-        and model == "deepseek-v4-flash"
+        and model == RECOMMENDED_DEEPSEEK_MODEL
     )
     if not (exact_operator_attestation or exact_official_contract):
         raise ValueError(

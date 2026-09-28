@@ -27,7 +27,7 @@ always_on to keep the store seed-free.
 Usage (box):
   export HYMEM_LLM_API_KEY=...        # or DEEPSEEK_API_KEY / OPENAI_API_KEY
   python benchmarks/rules_compliance.py \
-      --answer-model deepseek-v4-flash --judge-model deepseek-v4-flash --verbose
+      --answer-model deepseek-flash --judge-model deepseek-flash --verbose
   # add --json for one machine-readable line; --answer-base-url / --judge-base-url
   # to point at gpt-oss / a local vLLM; --answer-model stub for a plumbing dry-run.
 """
@@ -46,6 +46,7 @@ from pathlib import Path
 from hymem import HyMem, HyMemConfig
 from hymem.contrib.model_policy import (
     DeprecatedModelAliasError,
+    RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
 )
 from hymem.extraction.llm import LLMRequest
@@ -234,11 +235,11 @@ def _report(res: dict, s: dict, verbose: bool) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Idea B rules-adherence box gate.")
-    ap.add_argument("--answer-model", default="deepseek-v4-flash",
+    ap.add_argument("--answer-model", default=RECOMMENDED_DEEPSEEK_MODEL,
                     help="answerer model; 'stub' for a no-API plumbing run")
     ap.add_argument("--answer-base-url", default=None)
     ap.add_argument("--answer-api-key", default=None)
-    ap.add_argument("--judge-model", default="deepseek-v4-flash",
+    ap.add_argument("--judge-model", default=RECOMMENDED_DEEPSEEK_MODEL,
                     help="judge model; 'stub' for a plumbing run")
     ap.add_argument("--judge-base-url", default=None)
     ap.add_argument("--judge-api-key", default=None)

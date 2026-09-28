@@ -26,7 +26,7 @@ hymem/contrib/openai_client.py for the full list).
 Key variables:
     HYMEM_LLM_API_KEY        API key for the extraction LLM (or DEEPSEEK_API_KEY)
     HYMEM_LLM_BASE_URL       Base URL (default: https://api.deepseek.com)
-    HYMEM_LLM_MODEL          Model name (default: deepseek-v4-flash)
+    HYMEM_LLM_MODEL          Requested model service (default: deepseek-flash)
                              Retired deepseek-chat/deepseek-reasoner aliases
                              are rejected before the server opens its store.
     HYMEM_LLM_THINKING       Thinking-body policy (default: auto)

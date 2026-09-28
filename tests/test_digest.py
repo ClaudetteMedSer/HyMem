@@ -1,7 +1,7 @@
 """Tests for the batched per-session digest (the dream cycle's tail).
 
-  * One LLM call produces episodes + summary + procedures together, replacing
-    the three separate per-session calls.
+  * One generation call produces episodes + summary + procedures together;
+    one subsequent batched verification call gates publication.
   * The skip-guard (``sessions.digested_prompt_version``) suppresses the digest
     call entirely on a re-dream of an unchanged session — the cost win for
     steady-state dreaming over many already-processed sessions.
@@ -19,6 +19,7 @@ from hymem.core import db as core_db
 from hymem.dreaming.digest import extract_session_digest
 from hymem.dreaming.lossless import coverage_chunk_id, materialize_message_coverage
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import VerificationStubLLM
 
 
 # --- helpers ---------------------------------------------------------------
@@ -38,7 +39,7 @@ def _digest_llm(
         "summary": summary,
         "procedures": procedures or [],
     }
-    return StubLLMClient(
+    return VerificationStubLLM(
         fixtures={"Return the JSON object now": json.dumps(payload)},
         default="[]",
     )
@@ -79,8 +80,8 @@ _TURNS = [
 
 
 def test_single_digest_call_persists_episodes_summary_procedures(cfg):
-    """A single batched call writes episodes, the session summary, and
-    procedures — and the digest prompt is hit exactly once."""
+    """One generation plus verification writes all three surfaces;
+    the batched generation prompt is hit exactly once."""
     episode = {
         "title": "Staging deploy",
         "summary": "Walked through shipping a build to staging.",
@@ -540,7 +541,7 @@ def test_digest_parses_fenced_reply(cfg):
         payload["episodes"][0]["chunk_ids"] = [coverage_chunk_id(sid, last_mid)]
         payload["procedures"][0]["chunk_ids"] = [coverage_chunk_id(sid, last_mid)]
         fenced = "```json\n" + json.dumps(payload) + "\n```"
-        hy.set_llm(StubLLMClient(
+        hy.set_llm(VerificationStubLLM(
             fixtures={"Return the JSON object now": fenced}, default="[]",
         ))
         digest = extract_session_digest(
@@ -681,8 +682,14 @@ def test_digest_stays_quiet_on_the_stub_empty_array(cfg, caplog):
 
 def _extract_digest_payload(hy, sid: str, payload: object, **kwargs):
     encoded = json.dumps(payload)
-    hy.set_llm(StubLLMClient(
-        fixtures={"Return the JSON object now": encoded},
+    fixtures = {"Return the JSON object now": encoded}
+    if isinstance(payload, dict) and "summary" in payload:
+        fixtures = {
+            "You compact one rolling conversation summary": json.dumps({"summary": payload["summary"]}),
+            **fixtures,
+        }
+    hy.set_llm(VerificationStubLLM(
+        fixtures=fixtures,
         default=encoded,
     ))
     return extract_session_digest(

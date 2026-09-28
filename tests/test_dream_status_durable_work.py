@@ -9,6 +9,7 @@ from benchmarks import strictness
 from hymem import HyMem, HyMemConfig
 from hymem.core import db as core_db
 from hymem.dreaming import facts, runner
+from hymem.dreaming.digest import _DIGEST_FIDELITY_SYSTEM, _DIGEST_FORMAT_ADJUDICATION_SYSTEM
 from hymem.dreaming.chunks import source_materialization_config_version
 from hymem.dreaming.facts import (
     fact_cursor_retry_unit_key,
@@ -16,6 +17,7 @@ from hymem.dreaming.facts import (
 )
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 
 def _cfg(cfg: HyMemConfig, **changes) -> HyMemConfig:
@@ -36,13 +38,15 @@ def _pipeline_llm(
 ) -> StubLLMClient:
     return StubLLMClient(
         fixtures={
+            _DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            _DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "structured technical relationships": json.dumps({
                 "triples": [], "markers": [], "complete": True,
             }),
             "typed user-profile facts": (
                 profile if profile is not None else json.dumps({"items": []})
             ),
-            "Return the JSON array of narrative facts now.": (
+            "Return the JSON object of narrative facts now.": (
                 fact_items if fact_items is not None else "[]"
             ),
             "Return the JSON object now.": (

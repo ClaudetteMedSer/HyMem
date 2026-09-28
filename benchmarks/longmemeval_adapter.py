@@ -57,7 +57,13 @@ from hymem.contrib.endpoint_policy import (  # noqa: E402
 )
 from hymem.contrib.model_policy import (  # noqa: E402
     DeprecatedModelAliasError,
+    RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
+)
+from hymem.dreaming.summary_policy import (  # noqa: E402
+    LEGACY_COMPLETE_V1 as DEFAULT_SUMMARY_POLICY,
+    SUMMARY_POLICIES,
+    validate_summary_policy,
 )
 
 from benchmarks.strictness import (
@@ -126,6 +132,7 @@ from benchmarks.lme_protocol import (
     official_judge_match,
     parse_official_verdict,
     validate_lme_dataset,
+    validate_lme_summary_policy_binding,
     validate_safe_endpoint,
 )
 from benchmarks.extraction_canary import (
@@ -366,13 +373,19 @@ DEFAULT_INDEXING_TIMEOUT_S = 3600.0
 # DeepSeek API
 DEEPSEEK_API_KEY = ""
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-PINNED_DEEPSEEK_MODEL = "deepseek-v4-flash"
+# Public name retained for callers; this pins the requested service, not weights.
+PINNED_DEEPSEEK_MODEL = RECOMMENDED_DEEPSEEK_MODEL
 ANSWER_MODEL = PINNED_DEEPSEEK_MODEL
 JUDGE_MODEL = PINNED_DEEPSEEK_MODEL
 
 # Local embedding server (lever L1) — the FastEmbed ONNX server Hermes runs in
-# production. These are the OUT-OF-THE-BOX defaults for --embeddings so the flag
-# works with no env setup; every field is still overridable via HYMEM_EMBEDDING_*.
+# production. These endpoint/model/dimension defaults do not start that service
+# or supply its required deployment revision and tenant attestations. Set those
+# with --embedding-deployment-revision / --embedding-deployment-tenant or
+# HYMEM_EMBEDDING_DEPLOYMENT_REVISION / HYMEM_EMBEDDING_DEPLOYMENT_TENANT.
+# The adapter pins the dimension automatically. A service outside the container
+# needs a reachable --embedding-base-url (including /v1 for this FastEmbed service)
+# and HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP=1 for trusted internal HTTP.
 # DeepSeek has no embeddings API, so this benchmark deliberately points at its
 # own local FastEmbed service. api_key="local" because that service ignores it.
 LOCAL_EMBED_BASE_URL = "http://localhost:8766/v1"
@@ -714,12 +727,11 @@ def resolve_model_extra_body(
 ) -> tuple[dict, bool]:
     """Return a safe, effective raw request body extension.
 
-    DeepSeek v4-flash writes its usable answer to the ordinary ``content``
-    field only when thinking is disabled.  An omitted body therefore gets the
-    required vendor extension automatically on the actual DeepSeek endpoint.
-    A caller-provided body remains authoritative, but a DeepSeek v4-flash body
-    that would leave thinking enabled is rejected instead of producing a
-    capability score from empty completions.
+    The bounded raw benchmark paths use non-reasoning Flash requests so that
+    reasoning cannot consume the answer budget. An omitted body gets that
+    vendor extension on the actual DeepSeek endpoint. An explicit incompatible
+    body is rejected. This pure transformation also retains the old v4-flash
+    handling for historical artifact validation; it is not live admission.
 
     The endpoint check is deliberately exact-host.  A custom OpenAI-compatible
     gateway never receives a DeepSeek-only key merely because its model name
@@ -734,21 +746,28 @@ def resolve_model_extra_body(
     was_absent = extra_body is None
     host = (urlsplit(normalized_base).hostname or "").casefold()
     is_deepseek_endpoint = host == "api.deepseek.com"
-    is_v4_flash = "v4-flash" in model.casefold()
+    is_flash = (
+        model.casefold() == "deepseek-flash"
+        or "v4-flash" in model.casefold()
+    )
 
-    if was_absent and is_deepseek_endpoint and is_v4_flash:
+    if was_absent and is_deepseek_endpoint and is_flash:
         return copy.deepcopy(THINKING_DISABLED), True
-    if is_deepseek_endpoint and is_v4_flash:
+    if is_deepseek_endpoint and is_flash:
         thinking = body.get("thinking")
         if not isinstance(thinking, dict) or thinking.get("type") != "disabled":
             raise BenchmarkIntegrityError(
-                "DeepSeek v4-flash requires thinking.type='disabled'; omit "
+                "DeepSeek Flash requires thinking.type='disabled'; omit "
                 "the extra-body option to use the safe default"
             )
     return body, False
 
 
 # ── LLM Client ──────────────────────────────────────────────────────
+
+class LLMResponseError(RuntimeError):
+    """A received response failed admission; resubmitting is not a retry."""
+
 
 class LLMClient:
     def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
@@ -775,7 +794,7 @@ class LLMClient:
         # Extra top-level request-body fields merged into every call — the raw-HTTP
         # equivalent of the OpenAI SDK's `extra_body`. Needed post-2026-07-24:
         # the retired deepseek-chat alias had moved reader/judge to
-        # deepseek-v4-flash, whose thinking mode can consume the response budget
+        # DeepSeek Flash, whose thinking mode can consume the response budget
         # (and corrupt the yes/no judge parse) unless thinking is disabled.
         # ``None`` means no operator body was supplied and activates the safe
         # DeepSeek-only default; an explicit object is validated as-is.
@@ -796,8 +815,9 @@ class LLMClient:
         self.total_latency_s = 0.0
         self.token_usage_available = False
         self._usage_complete = True
+        self._accounted_response_attempts = 0
         self.last_error: str | None = None
-        # Guards the two counters so they aggregate correctly when many worker
+        # Guards accounting so it aggregates correctly when many worker
         # threads share this client (--workers > 1).
         self._lock = threading.Lock()
         self._closed = False
@@ -807,25 +827,13 @@ class LLMClient:
         last_exception_type = "Exception"
         for attempt in range(3):
             try:
-                content, usage = self._call(messages, temperature, max_tokens)
-                with self._lock:
-                    required = ("prompt_tokens", "completion_tokens", "total_tokens")
-                    valid = all(
-                        isinstance(usage.get(key), (int, float))
-                        and not isinstance(usage.get(key), bool)
-                        and usage[key] >= 0
-                        for key in required
-                    )
-                    if valid:
-                        self.prompt_tokens += usage["prompt_tokens"]
-                        self.completion_tokens += usage["completion_tokens"]
-                        self.total_tokens += usage["total_tokens"]
-                    else:
-                        self._usage_complete = False
-                    self.token_usage_available = (
-                        self.successful_responses > 0 and self._usage_complete
-                    )
+                content, _usage = self._call(messages, temperature, max_tokens)
                 return content
+            except LLMResponseError as e:
+                # Usage was accounted before response admission. A received
+                # non-stop/schema failure must not become another paid request.
+                last_exception_type = _bounded_exception_type(e)
+                break
             except Exception as e:
                 last_error = str(e)
                 last_exception_type = _bounded_exception_type(e)
@@ -837,12 +845,6 @@ class LLMClient:
                     self.token_usage_available = False
                 if "429" in last_error or "rate" in last_error.lower():
                     time.sleep(15 * (attempt + 1))
-                elif "null content" in last_error and "finish=length" in last_error:
-                    # Deterministic truncation: the reasoning model burned the
-                    # output budget and emitted no answer. Retrying with the SAME
-                    # cap re-spends the call for the same result — fail fast and
-                    # let the caller's parse-failure ceiling catch the aggregate.
-                    break
                 elif attempt < 2:
                     time.sleep(3)
                 else:
@@ -865,6 +867,7 @@ class LLMClient:
         started = time.monotonic()
         with self._lock:
             self.request_attempts += 1
+            self.token_usage_available = False
         try:
             resp = http.post(
                 f"{self.base_url}/chat/completions",
@@ -873,31 +876,64 @@ class LLMClient:
                 timeout=120,
             )
             resp.raise_for_status()
-            data = resp.json()
+        except Exception:
+            with self._lock:
+                self._usage_complete = False
+                self.token_usage_available = False
+            raise
         finally:
             with self._lock:
                 self.total_latency_s += time.monotonic() - started
-        content = data["choices"][0]["message"].get("content")
-        if content is None:
-            # A 200 with content=null. Transient provider behavior should be
-            # retried like a 429; a null from finish_reason=length is
-            # deterministic truncation (chat() fails that one fast). Either
-            # way, returning None used to crash callers (`None.startswith`) —
-            # raising makes the failure explicit and countable.
-            raise RuntimeError(
-                f"null content (finish={data['choices'][0].get('finish_reason')})")
-        if not isinstance(content, str):
-            raise RuntimeError(
-                "non-string content "
-                f"(finish={data['choices'][0].get('finish_reason')})"
+        try:
+            data = resp.json()
+        except Exception as exc:
+            with self._lock:
+                self._usage_complete = False
+                self.token_usage_available = False
+            raise LLMResponseError("LLM response is not JSON") from exc
+        usage = data.get("usage") if type(data) is dict else None
+        required = ("prompt_tokens", "completion_tokens", "total_tokens")
+        try:
+            valid = type(usage) is dict and all(
+                isinstance(usage.get(key), (int, float))
+                and not isinstance(usage[key], bool)
+                and math.isfinite(float(usage[key]))
+                and usage[key] >= 0 and usage[key] == int(usage[key])
+                for key in required
+            ) and usage["total_tokens"] == (
+                usage["prompt_tokens"] + usage["completion_tokens"]
             )
+        except (OverflowError, ValueError):
+            valid = False
+        with self._lock:
+            self._accounted_response_attempts += 1
+            if valid:
+                self.prompt_tokens += usage["prompt_tokens"]
+                self.completion_tokens += usage["completion_tokens"]
+                self.total_tokens += usage["total_tokens"]
+            else:
+                self._usage_complete = False
+            self.token_usage_available = (
+                self._usage_complete
+                and self._accounted_response_attempts == self.request_attempts
+            )
+        choices = data.get("choices") if type(data) is dict else None
+        if type(choices) is not list or not choices or type(choices[0]) is not dict:
+            raise LLMResponseError("LLM response has no valid first choice")
+        # Preserve the existing first-choice policy, including an explicitly
+        # requested n>1. Other choices cannot rescue a rejected first choice.
+        choice = choices[0]
+        finish = choice.get("finish_reason")
+        if type(finish) is not str or finish != "stop":
+            raise LLMResponseError("LLM response did not finish with stop")
+        message = choice.get("message")
+        content = message.get("content") if type(message) is dict else None
+        if type(content) is not str:
+            raise LLMResponseError("LLM response content is not a string")
         with self._lock:
             self.call_count += 1
             self.successful_responses += 1
-        return (
-            content,
-            data.get("usage", {}),
-        )
+        return content, usage if type(usage) is dict else {}
 
     def close(self) -> None:
         """End this wrapper's lifecycle exactly once.
@@ -1034,7 +1070,8 @@ class HyMemAdapter:
                  embedding_dim: int | None = None,
                  embedding_api_key: str | None = None,
                  embedding_deployment_revision: str | None = None,
-                 embedding_deployment_tenant: str | None = None):
+                 embedding_deployment_tenant: str | None = None,
+                 digest_summary_policy: str = DEFAULT_SUMMARY_POLICY):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -1044,6 +1081,7 @@ class HyMemAdapter:
         self.aggregation_nodes = aggregation_nodes
         self.aggregation_broad = aggregation_broad
         self.episode_granularity = episode_granularity
+        self.digest_summary_policy = validate_summary_policy(digest_summary_policy)
         self.value_supersession = value_supersession
         self.graph_multihop = graph_multihop
         self.graph_multihop_max_hops = graph_multihop_max_hops
@@ -1089,6 +1127,7 @@ class HyMemAdapter:
         if self.aggregation_broad:
             overrides["aggregation_inject_abilities"] = ()
         overrides["episode_granularity_enabled"] = self.episode_granularity
+        overrides["digest_summary_policy"] = validate_summary_policy(self.digest_summary_policy)
         overrides["value_supersession_enabled"] = self.value_supersession
         if self.graph_multihop:
             overrides["graph_multihop_enabled"] = True
@@ -1160,6 +1199,9 @@ class HyMemAdapter:
         # consideration, and the day it lands this adapter must not move with
         # it silently.
         overrides["episode_granularity_enabled"] = self.episode_granularity
+        # Pin the write-side summary treatment independently of future library
+        # defaults. Reusing another treatment's store is not the same experiment.
+        overrides["digest_summary_policy"] = validate_summary_policy(self.digest_summary_policy)
         # Bi-temporal KU lever: dream-cycle single-assertion value supersession.
         # Pinned explicitly BOTH ways so a run is reproducible whatever the
         # library default: ON since 2026-07-02 (guard cleared — score-neutral,
@@ -1212,12 +1254,12 @@ class HyMemAdapter:
             self.pipeline_llm = self._owned_resources.own(
                 llm, label="memory pipeline client"
             )
-            # Optional semantic-recall A/B (lever L1). Drives the SAME local FastEmbed
-            # server Hermes uses in production. Pass this benchmark's local FastEmbed
-            # defaults explicitly so --embeddings works with ZERO env setup. DeepSeek
-            # has no embeddings API; HYMEM_EMBEDDING_* can instead select a real
-            # embedding endpoint. Off by default: the headline baseline is lexical-only
-            # (a paired comparison).
+            # Optional semantic-recall A/B (lever L1); lexical-only by default.
+            # --embeddings requires a running, reachable embedding service and explicit
+            # deployment revision/tenant; the adapter pins the dimension automatically.
+            # HYMEM_EMBEDDING_* can override local FastEmbed defaults. Include /v1 in
+            # the base URL when required by the service. Non-loopback internal HTTP
+            # requires HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP=1.
             embedding_client = None
             if self.embeddings:
                 from hymem.contrib.openai_embedding_client import (
@@ -3290,6 +3332,7 @@ def _adapter_for_args(db_path: Path, args, api_key: str) -> HyMemAdapter:
         aggregation_nodes=args.aggregation_nodes,
         aggregation_broad=args.aggregation_broad,
         episode_granularity=args.episode_granularity,
+        digest_summary_policy=getattr(args, "digest_summary_policy", DEFAULT_SUMMARY_POLICY),
         value_supersession=args.value_supersession,
         graph_multihop=args.graph_multihop,
         graph_multihop_max_hops=args.graph_multihop_max_hops,
@@ -4005,6 +4048,8 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                           aggregation_broad=args.aggregation_broad,
                           episode_granularity=getattr(
                               args, "episode_granularity", False),
+                          digest_summary_policy=getattr(
+                              args, "digest_summary_policy", DEFAULT_SUMMARY_POLICY),
                           value_supersession=args.value_supersession,
                           facts_enabled=getattr(args, "facts", None),
                           facts_extraction=getattr(args, "facts_extraction", None),
@@ -4482,11 +4527,11 @@ def _run_main(
     parser.add_argument("--answer-extra-body", default=None, metavar="JSON",
                         help="JSON object merged into the ANSWER request body (raw-HTTP "
                              "`extra_body`). When omitted, the pinned DeepSeek "
-                             "v4-flash default gets thinking disabled automatically; "
+                             "Flash default gets thinking disabled automatically; "
                              "custom endpoints are never given a vendor body implicitly.")
     parser.add_argument("--judge-extra-body", default=None, metavar="JSON",
                         help="JSON object merged into the JUDGE request body. When "
-                             "omitted, the pinned DeepSeek v4-flash default gets "
+                             "omitted, the DeepSeek Flash requested service gets "
                              "thinking disabled automatically.")
     parser.add_argument("--rejudge", default=None, metavar="RUN.json",
                         help="Re-judge a stored results JSON under the current "
@@ -4604,12 +4649,23 @@ def _run_main(
                              "it (skip L2b). If it doesn't recover MS, the loss is downstream "
                              "(packing/budget, → L3), not the reranker. Default None = config.")
     parser.add_argument("--embeddings", action="store_true",
-                        help="LEVER L1: enable semantic vector recall. Works with NO env "
-                             f"setup — defaults to the local FastEmbed server "
+                        help="LEVER L1: enable semantic vector recall. Requires a running "
+                             f"embedding server; endpoint/model/dimension defaults are "
                              f"({LOCAL_EMBED_MODEL} @ {LOCAL_EMBED_BASE_URL}, dim "
-                             f"{LOCAL_EMBED_DIM}, api_key='local') that Hermes runs in "
-                             "production. Override any field with HYMEM_EMBEDDING_API_KEY/"
-                             "_BASE_URL/_MODEL/_DIM to point at a different server. DEFAULT "
+                             f"{LOCAL_EMBED_DIM}). Also set --embedding-deployment-revision "
+                             "and --embedding-deployment-tenant, or "
+                             "HYMEM_EMBEDDING_DEPLOYMENT_REVISION and "
+                             "HYMEM_EMBEDDING_DEPLOYMENT_TENANT. The adapter pins the "
+                             "dimension automatically; HYMEM_EMBEDDING_PIN_DIMENSION is "
+                             "not required here. For a server outside the container, use "
+                             "a reachable --embedding-base-url (including /v1 for this "
+                             "FastEmbed service); trusted internal HTTP additionally "
+                             "requires HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP=1. "
+                             "Endpoint and identity checks remain strict. Override the "
+                             "server settings with --embedding-base-url, --embedding-model, "
+                             "--embedding-dim, --embedding-api-key or "
+                             "HYMEM_EMBEDDING_BASE_URL, HYMEM_EMBEDDING_MODEL, "
+                             "HYMEM_EMBEDDING_DIM, HYMEM_EMBEDDING_API_KEY. DEFAULT "
                              "OFF (lexical-only baseline); run paired on --seed to measure "
                              "the recall the FTS-only path leaves behind.")
     parser.add_argument("--embedding-base-url", default=None)
@@ -4655,6 +4711,14 @@ def _run_main(
                              "G-EP1 PASSED 2026-08-31 (benchmarks/episode_probe.py); this "
                              "flag exists to run the LME non-regression guard the flip "
                              "still owes.")
+    parser.add_argument(
+        "--digest-summary-policy", choices=tuple(SUMMARY_POLICIES),
+        default=DEFAULT_SUMMARY_POLICY,
+        help="Versioned write-side rolling-summary treatment: legacy_complete_v1 "
+             "(default) or opt-in bounded_highlights_v1. Recorded in effective "
+             "config and checkpoint/calibration identity; compare explicitly "
+             "disclosed treatments, not stores built under another policy.",
+    )
     parser.add_argument("--graph-multihop", action="store_true",
                         help="Track A / Idea A lever (cfg.graph_multihop_enabled): enable "
                              "query-time multi-hop graph traversal (Source 4 of _graph_lookup) "
@@ -5001,6 +5065,9 @@ def _run_main(
     ).build_config()
     effective_hymem_config = effective_hymem_config_identity(config_probe)
     strict_config.update({
+        "digest_summary_policy": validate_summary_policy(getattr(
+            args, "digest_summary_policy", DEFAULT_SUMMARY_POLICY,
+        )),
         "label_free_answer_path": bool(args.auto_ability),
         "scored_run": not args.retrieval_only,
         "exploratory_label_steering": not args.auto_ability,
@@ -5053,6 +5120,7 @@ def _run_main(
         ),
         "effective_hymem_config": effective_hymem_config,
     })
+    validate_lme_summary_policy_binding(strict_config)
     runtime_extraction_binding = validate_extraction_canary_config_binding(
         strict_config["extraction_canary"], effective_hymem_config
     )

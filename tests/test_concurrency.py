@@ -17,6 +17,7 @@ import pytest
 
 from hymem import HyMem, HyMemConfig, StubEmbeddingClient
 from hymem.extraction.llm import LLMRequest, StubLLMClient
+from tests.digest_verification_fixtures import synthetic_fidelity_approval, synthetic_format_approval
 from hymem.extraction.prompts import (
     SESSION_DIGEST_SYSTEM,
     build_chunk_empty_verification_system,
@@ -128,6 +129,9 @@ class _ParkedLLM:
     def complete(self, request: LLMRequest) -> str:
         assert self.conn is not None
         self.entry_transactions.append(self.conn.in_transaction)
+        approval = synthetic_fidelity_approval(request) or synthetic_format_approval(request)
+        if approval is not None:
+            return approval
         if request.system == SESSION_DIGEST_SYSTEM:
             scope = "digest"
             result = (

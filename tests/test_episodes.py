@@ -19,6 +19,7 @@ from hymem.dreaming.episodes import (
     persist_episodes,
 )
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import VerificationStubLLM
 
 
 # --- shared helpers --------------------------------------------------------
@@ -30,7 +31,7 @@ def _episode_llm_response(items: list[dict]) -> StubLLMClient:
     everything else (so triples/markers no-op). Keyed on the unique digest
     user-prompt closer ``Return the JSON object now``."""
     digest = {"episodes": items, "summary": "", "procedures": []}
-    return StubLLMClient(
+    return VerificationStubLLM(
         fixtures={"Return the JSON object now": json.dumps(digest)},
         default="[]",
     )
@@ -76,7 +77,7 @@ def test_persist_episodes_populates_message_range_and_participants(cfg):
     def llm_factory():
         # Return one episode covering every emitted chunk, as the episodes
         # section of the batched session-digest response.
-        return StubLLMClient(
+        return VerificationStubLLM(
             fixtures={"Return the JSON object now": json.dumps({
                 "episodes": [
                     {

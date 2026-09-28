@@ -9,7 +9,8 @@ answer, and which would have surfaced the 2026-08-26 aggregation-default
 flip had it existed.
 
 Usage:
-  lme_registry.py ingest [FILE ...]      Add runs from JSON files (default: all archives)
+  lme_registry.py ingest [FILE ...] [--historical-commitments]
+                                       Add runs (default: all archives)
   lme_registry.py list [--limit N] [--flag COL]   Print table
   lme_registry.py query "SQL"            Raw query against the DB
   lme_registry.py audit [--strict]       Date-check the aggregation label
@@ -20,12 +21,19 @@ If a key is absent (e.g. older format, or a lever that was not recorded),
 the value is stored as NULL — this registry does not guess; the
 date-check / provenance analysis is done on top of NULLs, not inside
 them.
+
+Strict ingestion defaults to current producer reconstruction. Use the explicit
+--historical-commitments reader after runtime/model-policy drift: it checks
+historical commitments and all score/accounting evidence, records the weaker
+assurance separately, and does not establish current execution eligibility.
+It is never selected automatically after a validation failure.
 """
 import json
 import math
 import os
 import sqlite3
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 try:  # package import (tests): benchmarks.run_registry
@@ -33,11 +41,17 @@ try:  # package import (tests): benchmarks.run_registry
     from .strictness import (
         BenchmarkIntegrityError, content_hash, read_artifact_or_pointer,
     )
-    from .lme_protocol import strict_intent, validate_strict_artifact
+    from .lme_protocol import (
+        strict_intent, validate_archived_artifact, validate_strict_artifact,
+        validate_lme_summary_policy_binding,
+    )
 except (ImportError, ValueError):  # direct CLI: python benchmarks/lme_registry.py
     import run_registry as rr
     from strictness import BenchmarkIntegrityError, content_hash, read_artifact_or_pointer
-    from lme_protocol import strict_intent, validate_strict_artifact
+    from lme_protocol import (
+        strict_intent, validate_archived_artifact, validate_strict_artifact,
+        validate_lme_summary_policy_binding,
+    )
 
 DB = Path(os.environ.get("LME_REGISTRY_DB", "/home/node/.hermes/benchmarks/lme_runs.db"))
 BENCH_DIR = Path(os.environ.get("LME_BENCH_DIR", "/home/node/.hermes/benchmarks"))
@@ -63,6 +77,7 @@ FLAG_COLUMNS = [
     "aggregation_nodes_enabled",   # NULL where never recorded (pre-pin formats)
     "episode_granularity_enabled", # NULL where never recorded (pre-2247074)
     "value_supersession_enabled",  # NULL where never recorded
+    "digest_summary_policy",      # NULL when historical treatment was unrecorded
 ]
 # Config keys known to be *absent* in run JSONs even though they were
 # active: pre-6543ee6 runs never carried these in the config block; the guard
@@ -112,6 +127,7 @@ CREATE TABLE IF NOT EXISTS runs (
     aggregation_nodes_enabled  INTEGER,
     episode_granularity_enabled INTEGER,
     value_supersession_enabled INTEGER,
+    digest_summary_policy      TEXT,
     -- scores
     overall                    REAL,
     multi_session              REAL,
@@ -134,6 +150,9 @@ CREATE TABLE IF NOT EXISTS runs (
     protocol_split             TEXT,
     calibration_receipt_hash   TEXT,
     strict_validated           INTEGER,
+    archive_validated          INTEGER,
+    validation_assurance       TEXT,
+    live_execution_eligible    INTEGER,
     official_comparable        INTEGER,
     development_only           INTEGER,
     official_denominator_validated INTEGER,
@@ -180,7 +199,10 @@ CREATE INDEX IF NOT EXISTS idx_runs_aggr ON runs(aggregation_nodes_enabled);
 """
 
 ADDITIVE_COLUMNS = {
+    "digest_summary_policy": "TEXT",
     "run_id": "TEXT", "protocol": "TEXT", "strict_validated": "INTEGER",
+    "archive_validated": "INTEGER", "validation_assurance": "TEXT",
+    "live_execution_eligible": "INTEGER",
     "protocol_split": "TEXT", "calibration_receipt_hash": "TEXT",
     "official_comparable": "INTEGER", "development_only": "INTEGER",
     "official_denominator_validated": "INTEGER",
@@ -461,8 +483,14 @@ def _load_registry_artifact(path: Path) -> tuple[dict, str, str, str]:
     return data, archive, digest, compatibility
 
 
-def ingest_file(con, path: Path, overrides: dict | None = None):
+def ingest_file(
+    con, path: Path, overrides: dict | None = None, *,
+    validation_scope: str = "current",
+):
     """Insert one run JSON. Returns 'inserted' | 'skipped' | 'error'."""
+    if validation_scope not in {"current", "historical"}:
+        return "error: unknown LongMemEval validation scope"
+    historical = validation_scope == "historical"
     overrides = overrides or {}
     try:
         data, archive, artifact_digest, pointer_compatibility = (
@@ -476,7 +504,10 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         if overrides:
             return "error: strict LongMemEval artifacts reject analyst overrides"
         try:
-            validated = validate_strict_artifact(data, path=path)
+            validator = (
+                validate_archived_artifact if historical else validate_strict_artifact
+            )
+            validated = validator(data, path=path)
         except (BenchmarkIntegrityError, ValueError, TypeError) as exc:
             # Strict intent is fail-closed: malformed evidence never falls back
             # to permissive legacy parsing.
@@ -574,8 +605,14 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         "scores": scores,
         "models": data.get("models") if strict else None,
         "execution": data.get("execution") if strict else None,
-        "strict_validation": (
+        "strict_validation" if historical else "archive_validation": None,
+        "archive_validation" if historical else "strict_validation": (
             {
+                "validation_assurance": (
+                    "historical_commitment_only" if historical
+                    else "current_producer_reconstructed"
+                ),
+                "live_execution_eligible": False if historical else None,
                 "run_id": validated["run_id"],
                 "official_protocol_aligned": validated["official_protocol_aligned"],
                 "official_scoring_semantics_aligned": validated[
@@ -618,6 +655,8 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         "aggregation_nodes_enabled": cfg.get("aggregation_nodes_enabled"),
         "episode_granularity_enabled": cfg.get("episode_granularity_enabled"),
         "value_supersession_enabled": cfg.get("value_supersession_enabled"),
+        # Never turn historical absence into recorded legacy (or bounded) proof.
+        "digest_summary_policy": cfg.get("digest_summary_policy"),
         "overall": overall_acc, "multi_session": cat("multi-session"),
         "single_session_assistant": cat("single-session-assistant"),
         "single_session_preference": cat("single-session-preference"),
@@ -641,7 +680,8 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         ),
         "total_tokens": total_tokens, "elapsed_s": elapsed_s,
         "flags_provenance": (
-            "strict-v1 validated durable evidence" if strict else prov
+            ("strict-v1 historical commitment only" if historical
+             else "strict-v1 validated durable evidence") if strict else prov
         ),
         "extras": json.dumps(extras, default=str),
         "run_id": validated.get("run_id") if validated else None,
@@ -650,7 +690,15 @@ def ingest_file(con, path: Path, overrides: dict | None = None):
         "calibration_receipt_hash": (
             manifest.get("calibration_receipt_hash") if strict else None
         ),
-        "strict_validated": int(strict),
+        "strict_validated": int(strict and not historical),
+        "archive_validated": int(strict and historical),
+        "validation_assurance": (
+            ("historical_commitment_only" if historical
+             else "current_producer_reconstructed") if validated else None
+        ),
+        "live_execution_eligible": (
+            0 if validated and historical else None
+        ),
         "official_comparable": _to_int(
             validated.get("official_comparable") if validated else None
         ),
@@ -765,7 +813,7 @@ OVERRIDE_COLUMNS = {
 }
 
 
-def cmd_ingest(files, overrides=None):
+def cmd_ingest(files, overrides=None, *, validation_scope="current"):
     con = connect()
     if not files:
         files = sorted(BENCH_DIR.glob("longmemeval-v2-hymem*.json"))
@@ -774,7 +822,7 @@ def cmd_ingest(files, overrides=None):
         files = [f for f in files if f.name != "longmemeval-v2-hymem.json"]
     stats = {}
     for f in files:
-        r = ingest_file(con, Path(f), overrides)
+        r = ingest_file(con, Path(f), overrides, validation_scope=validation_scope)
         stats[r] = stats.get(r, 0) + 1
     con.commit()
     total = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
@@ -791,7 +839,8 @@ def cmd_list(limit=30, flag=None):
     con = connect()
     cols = ["id", "run_date", "archive", "overall", "multi_session",
             "auto_ability", "no_dream", "permissive_default",
-            "aggregation_nodes_enabled", "episode_granularity_enabled", "answer_model"]
+            "aggregation_nodes_enabled", "episode_granularity_enabled",
+            "digest_summary_policy", "answer_model"]
     if flag:
         cols.append(flag)
     q = f"SELECT {', '.join(cols)} FROM runs ORDER BY run_date DESC LIMIT ?"
@@ -1027,6 +1076,61 @@ def cmd_audit(strict=False):
 
 
 
+def lme_arm_evidence(cfg_a, cfg_b, lever):
+    """Compare the recorded summary treatment without double-counting it.
+
+    This is contrast evidence, not artifact admission or score validation.
+    Only the validated nested duplicate of this one lever is discounted.
+    Historical absence stays absent; other levers retain the shared behavior.
+    """
+    field = "digest_summary_policy"
+    if lever != field:
+        return rr.arm_evidence(cfg_a, cfg_b, lever)
+
+    configs = [cfg if cfg is not None else {} for cfg in (cfg_a, cfg_b)]
+    prepared = []
+    for label, config in zip(("A", "B"), configs):
+        if not isinstance(config, Mapping):
+            return rr.ARM_UNEVIDENCED, f"arm {label} has a malformed config block", []
+        effective = config.get("effective_hymem_config")
+        nested_recorded = isinstance(effective, Mapping) and field in effective
+        copied = dict(config)
+        if field in config or nested_recorded:
+            try:
+                validate_lme_summary_policy_binding(config)
+            except BenchmarkIntegrityError:
+                return rr.ARM_UNEVIDENCED, (
+                    f"arm {label} has invalid, incomplete or inconsistent recorded "
+                    "summary policy disclosure"
+                ), []
+            # Validation requires both declarations and exact equality. Never
+            # drop another effective field or fill an absent historical flag.
+            copied["effective_hymem_config"] = {
+                key: value for key, value in effective.items() if key != field
+            }
+        prepared.append(copied)
+
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False,
+                          allow_nan=False, separators=(",", ":"))
+
+    a, b = prepared
+    try:
+        # Establish finite JSON even for unchanged values or excluded timing
+        # fields. Python equality alone would conflate True, 1 and 1.0.
+        canonical(a)
+        canonical(b)
+        confounds = sorted(
+            key for key in set(a) | set(b)
+            if key not in {field, "elapsed_s", "total_tokens"}
+            and (key not in a or key not in b or canonical(a[key]) != canonical(b[key]))
+        )
+    except (TypeError, ValueError, RecursionError):
+        return rr.ARM_UNEVIDENCED, "summary policy comparison requires finite JSON configs", []
+    verdict, note, _ = rr.arm_evidence(a, b, lever)
+    return verdict, note, confounds
+
+
 def cmd_arms(path_a, path_b, lever):
     """Ask whether a claimed A/B pair can evidence its own contrast.
 
@@ -1035,7 +1139,7 @@ def cmd_arms(path_a, path_b, lever):
     a result rather than as a question."""
     a = json.loads(Path(path_a).read_text(encoding="utf-8"))
     b = json.loads(Path(path_b).read_text(encoding="utf-8"))
-    verdict, note, confounds = rr.arm_evidence(
+    verdict, note, confounds = lme_arm_evidence(
         a.get("config"), b.get("config"), lever)
     print(f"\n=== arm evidence — {lever} ===")
     print(f"  A  {Path(path_a).name}")
@@ -1063,16 +1167,20 @@ def main():
     if cmd == "ingest":
         ov = {}
         args = sys.argv[2:]
+        validation_scope = "current"
         i = 0
         while i < len(args):
-            if args[i] == "--set" and i + 1 < len(args):
+            if args[i] == "--historical-commitments":
+                validation_scope = "historical"
+                args.pop(i)
+            elif args[i] == "--set" and i + 1 < len(args):
                 k, v = args[i + 1].split("=", 1)
                 ov[k] = v
                 args.pop(i)
                 args.pop(i)
             else:
                 i += 1
-        cmd_ingest(args or None, ov)  # noqa: E1123
+        cmd_ingest(args or None, ov, validation_scope=validation_scope)
     elif cmd == "backfill":
         if cmd_backfill():
             sys.exit(1)   # §6.5: unreachable rows were not migrated

@@ -346,6 +346,7 @@ def _digest_status(
             cfg.dream_max_episodes_per_session
             if cfg.episode_granularity_enabled else None
         ),
+        summary_policy=cfg.digest_summary_policy,
         client=client,
     )
     pending = 0

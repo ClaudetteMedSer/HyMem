@@ -12,15 +12,18 @@ from hymem.dreaming.retention import prune_messages
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.dreaming.semantic_generation import semantic_generation_suffix
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 
 def _client(label="Alpha"):
     return StubLLMClient(fixtures={
+        digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+        digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
         "typed user-profile facts": json.dumps({"items": [{
             "slot": "role", "value": label + " engineer",
             "evidence_message_id": 1, "confidence": 0.9,
         }]}),
-        "Return the JSON array of narrative facts now": json.dumps([{
+        "Return the JSON object of narrative facts now": json.dumps([{
             "text": label + " attended the engineering meeting.",
             "date": None, "entities": [label],
         }]),
@@ -139,7 +142,7 @@ class _ChangingClient:
         needles = {
             "digest": "You analyze one conversation session",
             "profile": "typed user-profile facts",
-            "facts": "Return the JSON array of narrative facts now",
+            "facts": "Return the JSON object of narrative facts now",
         }
         if not self.changed and needles[self.tier] in request.system + request.user:
             self.changed = True

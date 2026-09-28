@@ -34,8 +34,8 @@ DISABLED = {"thinking": {"type": "disabled"}}
 
 def test_the_defaults_are_now_the_pin():
     """§6's headline. Step 1 passed, so an unflagged run means the pin."""
-    assert ba.ANSWER_MODEL == "deepseek-v4-flash"
-    assert ba.JUDGE_MODEL == "deepseek-v4-flash"
+    assert ba.ANSWER_MODEL == "deepseek-flash"
+    assert ba.JUDGE_MODEL == "deepseek-flash"
 
 
 def test_absent_flag_on_v4_flash_defaults_to_thinking_disabled():

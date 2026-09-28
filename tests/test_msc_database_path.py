@@ -12,7 +12,9 @@ from benchmarks import locomo_adapter as locomo, msc_adapter as msc
 from benchmarks.archive_evidence import validate_scoped_indexing
 from benchmarks.strictness import BenchmarkIntegrityError
 from hymem import HyMemConfig
+from hymem.dreaming import digest
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 from tests.test_locomo_checkpoint_resume import _conversation
 from tests.test_msc_checkpoint_resume import _example
 
@@ -45,6 +47,8 @@ def offline_providers(monkeypatch):
 
     def memory_provider(**_kwargs):
         client = StubLLMClient(fixtures={
+            digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "typed user-profile facts": '{"items":[]}',
             "You analyze one conversation session": (
                 '{"episodes":[],"summary":"","procedures":[]}'

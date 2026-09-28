@@ -483,10 +483,14 @@ def test_beam_embedding_backlog_uses_scalar_queries_not_fetchall():
 
 
 def _empty_indexing_llm():
+    from hymem.dreaming import digest
     from hymem.extraction.llm import StubLLMClient
+    from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
     return StubLLMClient(
         fixtures={
+            digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+            digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
             "Return the JSON object now": json.dumps({
                 "episodes": [], "summary": "", "procedures": [],
             }),

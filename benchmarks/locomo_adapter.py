@@ -157,12 +157,13 @@ from benchmarks.extraction_canary import (
 from hymem.contrib.endpoint_policy import validate_http_endpoint
 from hymem.contrib.model_policy import (
     DeprecatedModelAliasError,
+    RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
 )
 
-_ANSWER_MODEL = "deepseek-v4-flash"
-_JUDGE_MODEL = "deepseek-v4-flash"
-_HYMEM_MODEL = "deepseek-v4-flash"
+_ANSWER_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+_JUDGE_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+_HYMEM_MODEL = RECOMMENDED_DEEPSEEK_MODEL
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 _MAX_CONVERSATION_ID_LENGTH = 128
@@ -1734,7 +1735,7 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
     ap.add_argument("--answer-base-url", default=_DEEPSEEK_BASE_URL)
     ap.add_argument("--answer-api-key", default=None)
     ap.add_argument("--answer-extra-body", default=None, metavar="JSON",
-                    help="optional provider body; omitted DeepSeek v4-flash "
+                    help="optional provider body; omitted DeepSeek Flash "
                          "requests disable thinking automatically")
     ap.add_argument("--judge-model", default=_JUDGE_MODEL)
     ap.add_argument(
@@ -1746,7 +1747,7 @@ def _run_main(owned_clients: OwnedResourceScope) -> None:
         help="judge-specific API key (never inherited from --answer-api-key)",
     )
     ap.add_argument("--judge-extra-body", default=None, metavar="JSON",
-                    help="optional provider body; omitted DeepSeek v4-flash "
+                    help="optional provider body; omitted DeepSeek Flash "
                          "requests disable thinking automatically")
     ap.add_argument("--hymem-model", default=_HYMEM_MODEL, help="HyMem's dream LLM")
     ap.add_argument("--hymem-base-url", default=_DEEPSEEK_BASE_URL)

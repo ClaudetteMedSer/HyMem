@@ -1,14 +1,16 @@
 """Markdown compatibility sidecars never publish rolled-back DB state."""
 from dataclasses import replace
+import json
 import sqlite3
 
 import pytest
 
 from hymem import HyMem
 from hymem.core import db, markdown_io
-from hymem.dreaming import phase2
+from hymem.dreaming import digest, phase2
 from hymem.deadline import DeadlineExceeded, MonotonicDeadline, use_deadline
 from tests.conftest import make_routed_llm
+from tests.digest_verification_fixtures import synthetic_fidelity_result, synthetic_format_result
 
 
 def _hy(cfg):
@@ -16,6 +18,8 @@ def _hy(cfg):
                      profile_extraction_enabled=False, facts_extraction_enabled=False)
     llm = make_routed_llm([], [{"kind": "preference", "statement": "user prefers uv"}])
     llm = type(llm)(fixtures={
+        digest._DIGEST_FIDELITY_SYSTEM: json.dumps(synthetic_fidelity_result()),
+        digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM: json.dumps(synthetic_format_result()),
         "You analyze one conversation session": '{"episodes":[],"summary":"","procedures":[]}',
         **llm.fixtures,
     }, default="[]")

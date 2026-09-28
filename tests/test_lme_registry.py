@@ -388,6 +388,9 @@ def test_strict_lme_archive_discovery_and_nested_metadata(tmp_db):
     assert row["aggregation_nodes_enabled"] == 0
     assert row["episode_granularity_enabled"] == 1
     assert row["strict_validated"] == 1
+    assert row["archive_validated"] == 0
+    assert row["validation_assurance"] == "current_producer_reconstructed"
+    assert row["live_execution_eligible"] is None
     assert row["official_comparable"] == 0
     assert row["development_only"] == 1
     assert row["usage_exact"] == 1
@@ -420,6 +423,7 @@ def test_strict_lme_archive_discovery_and_nested_metadata(tmp_db):
     assert row["embedding_quality"] == "none"
     assert row["embedding_network_free"] == 1
     extras = json.loads(row["extras"])
+    assert extras["archive_validation"] is None
     assert extras["strict_validation"]["usage_exact"] is True
 
 

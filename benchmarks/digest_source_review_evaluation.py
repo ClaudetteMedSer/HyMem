@@ -1,0 +1,199 @@
+"""Pure scoring of independently labelled source-review checks.
+
+Labels are supplied and reviewed before outputs are observed; this module does
+not infer semantic truth. Views may overlap, so their denominators are never
+pooled. Grounding conjunctions and single-source retention facets are distinct
+domains, including when both appear in one reporting view. No provider, file,
+network, retry, repair or publication machinery is invoked.
+"""
+from __future__ import annotations
+
+from collections import Counter
+
+from benchmarks import digest_source_review as review
+
+
+VERSION = "digest-source-review-evaluation-v1"
+VIEWS = frozenset({"primary", "auxiliary", "retention", "legacy", "witness", "grounding"})
+GROUNDING_VERDICTS = frozenset({"supported", "unsupported", "uncertain"})
+RETENTION_GOLD = frozenset({"retained", "omitted", "altered", "not_applicable"})
+_GROUNDING_KINDS = frozenset({"assertion", "relations", "outcome"})
+_RETENTION_ACCEPTS = frozenset({"retained", "not_applicable"})
+_RETENTION_DEFECTS = frozenset({"omitted", "altered"})
+
+
+def _require(condition: bool, code: str) -> None:
+    if not condition:
+        raise ValueError(code)
+
+
+def _resolve(scope: review.SourceReviewScope, selector: dict) -> str:
+    _require(type(selector) is dict, "invalid_selector")
+    kind = selector.get("kind")
+    _require(type(kind) is str and kind in _GROUNDING_KINDS | {"retention"},
+             "invalid_check_kind")
+    coordinate = "chunk_id" if kind == "retention" else "field_path"
+    keys = {"kind", coordinate, "facet"} if kind == "retention" else {"kind", coordinate}
+    _require(set(selector) == keys and type(selector[coordinate]) is str
+             and 0 < len(selector[coordinate]) <= review.MAX_INPUT_CHARS,
+             "invalid_selector_shape")
+    if kind == "retention":
+        _require(type(selector["facet"]) is str and selector["facet"] in review.RETENTION_FACETS,
+                 "invalid_retention_facet")
+        sources = {source.source_id for source in scope.canonical_sources
+                   if source.chunk_id == selector[coordinate]}
+        matches = [check.check_id for check in scope.checks
+                   if check.kind == "retention" and check.source_id in sources
+                   and check.facet == selector["facet"]]
+    else:
+        fields = {field.field_id for field in scope.fields if field.path == selector[coordinate]}
+        matches = [check.check_id for check in scope.checks
+                   if check.kind == kind and len(check.field_ids) == 1
+                   and check.field_ids[0] in fields]
+    _require(len(matches) == 1, "selector_must_resolve_exactly_once")
+    return matches[0]
+
+
+def resolve_selector(scope: review.SourceReviewScope, selector: dict) -> str:
+    """Bind exact semantic coordinates, never guessed positional check IDs."""
+    return _resolve(review._validate_scope(scope), selector)
+
+
+def bind_labels(scope: review.SourceReviewScope, labels: list[dict]) -> tuple[dict, ...]:
+    """Validate explicit gold before any output, with no semantic inference.
+
+    Grounding selectors form a reviewed conjunction. Retention selectors bind
+    exactly one canonical source and one facet; aggregating facets or mixing
+    domains is forbidden. Duplicate or overlapping checks within one view do
+    not create extra denominators. Across views, consistent overlap is allowed.
+    """
+    scope = review._validate_scope(scope)
+    _require(type(labels) is list and 0 < len(labels) <= review.MAX_CHECKS,
+             "invalid_label_count")
+    seen_ids, used_by_view, singleton_gold, result = set(), {}, {}, []
+    for label in labels:
+        _require(type(label) is dict and set(label) == {
+            "id", "view", "selectors", "expected", "rationale"}, "invalid_label_shape")
+        _require(type(label["id"]) is str and bool(label["id"].strip())
+                 and len(label["id"]) <= 256, "invalid_label_id")
+        _require(label["id"] not in seen_ids, "duplicate_label_id")
+        seen_ids.add(label["id"])
+        _require(type(label["view"]) is str and label["view"] in VIEWS, "invalid_label_view")
+        _require(type(label["rationale"]) is str and bool(label["rationale"].strip())
+                 and len(label["rationale"]) <= 8192, "missing_gold_rationale")
+        selectors = label["selectors"]
+        _require(type(selectors) is list and 0 < len(selectors) <= len(scope.checks),
+                 "invalid_selector_count")
+        checks = tuple(_resolve(scope, selector) for selector in selectors)
+        _require(len(set(checks)) == len(checks), "duplicate_target_check")
+        domains = {"retention" if selector["kind"] == "retention" else "grounding"
+                   for selector in selectors}
+        _require(len(domains) == 1, "mixed_target_domains")
+        domain = next(iter(domains))
+        _require(domain != "retention" or len(checks) == 1,
+                 "retention_target_requires_one_facet")
+        allowed_gold = RETENTION_GOLD if domain == "retention" else {"supported", "unsupported"}
+        _require(type(label["expected"]) is str and label["expected"] in allowed_gold,
+                 "invalid_gold_verdict")
+        _require(label["view"] != "retention" or domain == "retention",
+                 "retention_view_requires_retention_checks")
+        _require(label["view"] != "grounding" or domain == "grounding",
+                 "grounding_view_requires_grounding_checks")
+        used = used_by_view.setdefault(label["view"], set())
+        _require(not used.intersection(checks), "overlapping_targets_in_view")
+        used.update(checks)
+        if len(checks) == 1:
+            previous = singleton_gold.setdefault(checks[0], label["expected"])
+            _require(previous == label["expected"], "conflicting_single_check_gold")
+        result.append({"id": label["id"], "view": label["view"], "domain": domain,
+                       "check_ids": checks, "expected": label["expected"]})
+    # Every positive conjunction entails all its members. The union of these
+    # positive memberships cannot cover an explicitly negative conjunction.
+    positive = {check for row in result
+                if row["domain"] == "grounding" and row["expected"] == "supported"
+                for check in row["check_ids"]}
+    _require(not any(row["domain"] == "grounding" and row["expected"] == "unsupported"
+                     and set(row["check_ids"]) <= positive for row in result),
+             "contradictory_gold_conjunctions")
+    return tuple(result)
+
+
+def aggregate_grounding(verdicts: list[str]) -> str:
+    """Conjoin grounding verdicts, preserving abstention and never vacuous support."""
+    _require(type(verdicts) is list and len(verdicts) <= review.MAX_CHECKS
+             and all(type(value) is str and value in GROUNDING_VERDICTS for value in verdicts),
+             "invalid_verdicts")
+    if "unsupported" in verdicts:
+        return "unsupported"
+    return "uncertain" if not verdicts or "uncertain" in verdicts else "supported"
+
+
+def _counts(rows: list[dict]) -> dict:
+    confusion = {}
+    for expected in sorted({row["expected"] for row in rows}):
+        confusion[expected] = dict(sorted(Counter(
+            row["observed"] for row in rows if row["expected"] == expected).items()))
+    return {
+        "targets": len(rows),
+        "matches": sum(row["match"] for row in rows),
+        "false_accepts": sum(row["false_accept"] for row in rows),
+        "false_rejects": sum(row["false_reject"] for row in rows),
+        "false_not_applicable": sum(row["false_not_applicable"] for row in rows),
+        "false_applicable": sum(row["false_applicable"] for row in rows),
+        "defect_kind_confusions": sum(row["defect_kind_confusion"] for row in rows),
+        "false_accepts_masked_by_other_veto": sum(
+            row["false_accept_masked_by_other_veto"] for row in rows),
+        "expected": dict(sorted(Counter(row["expected"] for row in rows).items())),
+        "observed": dict(sorted(Counter(row["observed"] for row in rows).items())),
+        "confusion": confusion,
+    }
+
+
+def score_scope(raw: object, scope: review.SourceReviewScope, labels: list[dict], *,
+                max_output_chars: int = review.MAX_OUTPUT_CHARS) -> dict:
+    """Score the complete unmodified response with no partial-scope salvage.
+
+    A malformed scope makes every labelled target malformed, never a correctly
+    detected defect. Uncertain likewise earns no exact-match or false-accept /
+    false-reject credit. Untargeted vetoes are reported but cannot rescue a
+    selected target. Provider accounting and execution audits are separate.
+    """
+    bound = bind_labels(scope, labels)  # Bad output never excuses invalid gold.
+    outcome = review.parse_source_review(raw, scope, max_output_chars=max_output_chars)
+    observed = {item.check_id: item.verdict for item in outcome.judgments}
+    vetoes = {item.check_id for item in outcome.judgments
+              if (item.verdict not in _RETENTION_ACCEPTS if item.kind == "retention"
+                  else item.verdict != "supported")}
+    malformed = outcome.status == "malformed_review"
+    rows = []
+    for target in bound:
+        domain, expected = target["domain"], target["expected"]
+        value = ("malformed" if malformed else observed[target["check_ids"][0]]
+                 if domain == "retention" else
+                 aggregate_grounding([observed[check] for check in target["check_ids"]]))
+        if domain == "retention":
+            false_accept = expected in _RETENTION_DEFECTS and value in _RETENTION_ACCEPTS
+            false_reject = expected in _RETENTION_ACCEPTS and value in _RETENTION_DEFECTS
+        else:
+            false_accept = expected == "unsupported" and value == "supported"
+            false_reject = expected == "supported" and value == "unsupported"
+        other_vetoes = sorted(vetoes.difference(target["check_ids"]))
+        rows.append({**target, "observed": value, "match": value == expected,
+            "false_accept": false_accept, "false_reject": false_reject,
+            "false_not_applicable": domain == "retention" and expected != "not_applicable"
+                and value == "not_applicable",
+            "false_applicable": domain == "retention" and expected == "not_applicable"
+                and value in {"retained", "omitted", "altered"},
+            "defect_kind_confusion": domain == "retention" and expected in _RETENTION_DEFECTS
+                and value in _RETENTION_DEFECTS and value != expected,
+            "off_target_vetoes": other_vetoes,
+            "false_accept_masked_by_other_veto": false_accept and bool(other_vetoes)})
+    views = {}
+    for view in sorted({row["view"] for row in rows}):
+        views[view] = {}
+        for domain in sorted({row["domain"] for row in rows if row["view"] == view}):
+            views[view][domain] = _counts(
+                [row for row in rows if row["view"] == view and row["domain"] == domain])
+    return {"version": VERSION, "scope_binding_sha256": scope.binding_sha256,
+            "status": outcome.status, "targets": rows, "views": views,
+            "semantic_verified": False, "publication_authorized": False}

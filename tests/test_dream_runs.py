@@ -9,6 +9,7 @@ from hymem.dreaming.lossless import coverage_chunk_id
 from hymem.extraction.contract import extraction_cache_key
 from hymem.extraction.llm import LLMRequest, StubLLMClient
 from tests.conftest import make_routed_llm
+from tests.digest_verification_fixtures import VerificationStubLLM
 
 
 def _seed_session(hy) -> str:
@@ -82,7 +83,7 @@ def test_dream_persists_digest_counters(hy):
         "key_entities": ["uv", "docker"],
         "chunk_ids": [coverage_chunk_id(sid, last_mid)],
     }
-    hy.set_llm(StubLLMClient(
+    hy.set_llm(VerificationStubLLM(
         fixtures={"Return the JSON object now": json.dumps(
             {"episodes": [episode], "summary": "", "procedures": []}
         )},
@@ -467,7 +468,7 @@ def test_corrupt_quarantine_flags_cannot_starve_digest_or_profile(tmp_path):
         facts_extraction_enabled=False,
         profile_extraction_enabled=True,
     )
-    llm = StubLLMClient(
+    llm = VerificationStubLLM(
         fixtures={
             "typed user-profile facts": '{"items":[]}',
             "New, not-yet-digested session material": (

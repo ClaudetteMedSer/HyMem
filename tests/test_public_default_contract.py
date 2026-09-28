@@ -86,7 +86,7 @@ def test_unset_env_defers_to_dataclass_and_server_help_matches(
     assert "HyMemConfig dataclass as the authoritative default" in bootstrap_source
 
     master_word = "on" if code_config.aggregation_nodes_enabled else "off"
-    assert f"Model name (default: {DEFAULT_LLM_MODEL})" in server_source
+    assert f"Requested model service (default: {DEFAULT_LLM_MODEL})" in server_source
     assert f"time (default: {master_word}). Set false to opt out." in server_source
     assert "aggregation layer enabled via env" not in bootstrap_source
 

@@ -893,7 +893,7 @@ def test_lme_v3_rejects_prior_summary_and_nested_status_schema():
 
 
 @pytest.mark.parametrize(
-    "field_name", protocol._INDEXING_CYCLE_FAILURE_FIELDS,
+    "field_name", sorted(protocol._INDEXING_CYCLE_FAILURE_FIELDS),
 )
 def test_lme_v3_success_rejects_every_positive_final_cycle_error(field_name):
     summary = _canonical_indexing_summary(failed=False)
@@ -2429,20 +2429,33 @@ def test_mechanically_complete_failure_has_exact_nonblocking_state(mutate):
         protocol._validate_indexing(summary, allow_incomplete=True)
 
 
-def test_extraction_loss_failures_require_mechanical_completion():
-    for code in ("quarantined_extraction", "terminal_extraction_source_loss"):
-        summary = _canonical_indexing_summary(failed=True)
-        summary.update({"complete": False})
-        summary["failure"] = {"code": code, "exception_type": None}
-        if code == "quarantined_extraction":
-            summary["final_status"]["quarantined"]["quarantined_chunks"] = 1
-        else:
-            summary["final_status"]["terminal_loss"] = {
-                "chunks": 1,
-                "reasons": {"source_manifest_unrecoverable": 1},
-            }
-        with pytest.raises(BenchmarkIntegrityError, match="mechanical completion"):
-            protocol._validate_indexing(summary, allow_incomplete=True)
+@pytest.mark.parametrize(
+    "code", ["quarantined_extraction", "terminal_extraction_source_loss"],
+)
+def test_extraction_loss_failure_completion_describes_its_actual_work(code):
+    summary = _canonical_indexing_summary(failed=False)
+    summary.update({
+        "outcome": "failure", "complete": False, "healthy": False,
+        "failure": {"code": code, "exception_type": None},
+    })
+    if code == "quarantined_extraction":
+        summary["final_status"]["quarantined"]["quarantined_chunks"] = 1
+    else:
+        summary["final_status"]["terminal_loss"] = {
+            "chunks": 1,
+            "reasons": {"source_manifest_unrecoverable": 1},
+        }
+    summary["final_status"]["pending"]["pending_digests"] = 1
+    assert protocol._validate_indexing(summary, allow_incomplete=True) is False
+
+    summary["complete"] = True
+    with pytest.raises(BenchmarkIntegrityError, match="mechanical completion"):
+        protocol._validate_indexing(summary, allow_incomplete=True)
+    summary["final_status"]["pending"]["pending_digests"] = 0
+    assert protocol._validate_indexing(summary, allow_incomplete=True) is False
+    summary["complete"] = False
+    with pytest.raises(BenchmarkIntegrityError, match="mechanical completion"):
+        protocol._validate_indexing(summary, allow_incomplete=True)
 
 
 @pytest.mark.parametrize(

@@ -36,9 +36,9 @@ only needed while running an **older** HyMem server.
    The v25 `dream_runs.digest_failures` / `episodes_created` columns are the
    place to check this (a run of `episodes_created = 0` against a rising
    `chunks_seen` is the signature).
-   Current HyMem rejects the retired `deepseek-chat` and
-   `deepseek-reasoner` aliases at client construction. Set
-   `HYMEM_LLM_MODEL=deepseek-v4-flash` and `HYMEM_LLM_THINKING=auto` (or
+   Current HyMem rejects retired `deepseek-chat`, `deepseek-reasoner`,
+   `deepseek-v4-flash`, and `deepseek-v4-flash-vision-exp` at client construction.
+   Set `HYMEM_LLM_MODEL=deepseek-flash` and `HYMEM_LLM_THINKING=auto` (or
    `disabled`) in the actual service environment before restarting.
 4. Verify — server first with `curl`, then the harness **in a fresh session**; an existing session's cached base context serves a stale block (§Verification).
 

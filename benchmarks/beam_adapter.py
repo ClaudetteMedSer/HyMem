@@ -91,7 +91,7 @@ from benchmarks.extraction_canary import (
     validate_extraction_canary_config_binding,
     validate_extraction_canary_report,
 )
-from longmemeval_adapter import (
+from benchmarks.longmemeval_adapter import (
     PINNED_DEEPSEEK_MODEL,
     THINKING_DISABLED,
     _detect_ability,
@@ -766,21 +766,22 @@ def select_judge_ideal(judge_gold: bool, gold_text: str | None,
 
 def apply_thinking_default(role: str, model: str, provider: str,
                            absent: bool, obj: dict) -> tuple[dict, bool]:
-    """Model-pin pre-reg §6: default v4-flash to thinking-disabled when the
+    """Default the current Flash service to thinking-disabled when the
     operator passed no flag at all.
 
-    The match term is `"v4-flash" in model`, NOT `"deepseek" in model`. The
-    latter is the library client's gate (`hymem/contrib/openai_client.py`)
-    and it would also fire on the retired `deepseek-chat` alias. Historical
-    comparator artifacts used that alias without this body, so reproducing
-    those request bytes requires an explicit model override. The live default
-    is the pinned v4-flash path below.
+    Keep the old `"v4-flash" in model` transform as well: historical comparator
+    validation must reproduce its original request body without granting live
+    admission to retired names. Do not generalize to every DeepSeek model.
 
     ABSENT is not EMPTY. `--{role}-extra-body ''` or `'{}'` is the operator
     explicitly asking for no extra body, and a convenience must never override
     an explicit statement -- so those keep `{}` and the guard then refuses the
     run, which is the correct outcome for a request that cannot work."""
-    if not absent or provider != "deepseek" or "v4-flash" not in model:
+    is_flash = (
+        model.casefold() == "deepseek-flash"
+        or "v4-flash" in model
+    )
+    if not absent or provider != "deepseek" or not is_flash:
         return obj, False
     # Deep, not `dict(...)`: a shallow copy shares the nested dict, so one
     # run mutating its own extra_body would edit every later run's default.
@@ -790,12 +791,9 @@ def apply_thinking_default(role: str, model: str, provider: str,
 def check_model_pin(role: str, model: str, provider: str, extra_body: dict) -> None:
     """Refuse the two ways a model pin turns into silent empty completions.
 
-    (1) A v4-flash DeepSeek model WITHOUT thinking disabled answers in
-        `reasoning_content` and leaves `content` empty. `_rejudge_run` has
-        aborted on this since the gold-delta pre-registration, but the normal
-        answer/judge path had no guard at all -- a bare
-        `--answer-model deepseek-v4-flash` ran straight into it and the run
-        looked like a capability result.
+    (1) Flash reasoning can consume the bounded answer budget before ordinary
+        content is produced. This benchmark requires its non-reasoning body;
+        historical v4-flash transformations retain the same guard.
     (2) DeepSeek's `thinking` key sent to OpenAI/Gemini is a 400. The ANSWERER
         is provider-swappable (ANSWER_PROVIDERS), so this is reachable by flag
         combination; the judge is DeepSeek-only and cannot hit it.
@@ -805,12 +803,15 @@ def check_model_pin(role: str, model: str, provider: str, extra_body: dict) -> N
         print(f"ERROR: {role} provider {provider!r} rejects DeepSeek's `thinking` key "
               f"(HTTP 400). Drop it from --{role}-extra-body.")
         sys.exit(2)
-    if provider == "deepseek" and "v4-flash" in model and \
+    is_flash = (
+        model.casefold() == "deepseek-flash"
+        or "v4-flash" in model
+    )
+    if provider == "deepseek" and is_flash and \
             (thinking or {}).get("type") != "disabled":
         print(f"ERROR: {role} model {model!r} requires "
               f"--{role}-extra-body '{{\"thinking\": {{\"type\": \"disabled\"}}}}'. "
-              "Without it the model writes to reasoning_content, this client reads "
-              "content, and every empty read scores 0.")
+              "Reasoning can exhaust this benchmark's bounded content budget.")
         sys.exit(2)
 
 
@@ -3210,7 +3211,7 @@ def _rejudge_run_impl(
 
     # Was an unconditional ABORT while beam had no extra_body plumbing (the
     # gold-delta phase explicitly deferred it). The plumbing exists now, so the
-    # same trap is a GUARD: v4-flash is allowed here once thinking is disabled,
+    # same trap is a GUARD: the Flash service requires thinking disabled,
     # and still refused when it is not. The judge is DeepSeek-only.
     judge_extra = getattr(args, "judge_extra_body_obj", None) or {}
     check_model_pin("judge", args.judge_model, "deepseek", judge_extra)
@@ -3638,7 +3639,7 @@ def _run_main(
         "--judge-model", default=None,
         help=(
             "Judge provider:model. Defaults to openai:gpt-4.1-mini for the "
-            "official protocol and pinned DeepSeek v4-flash for legacy-custom."
+            "official protocol and the DeepSeek Flash service for legacy-custom."
         ),
     )
     parser.add_argument("--hymem-model", default=HYMEM_MODEL,
@@ -3687,7 +3688,7 @@ def _run_main(
     )
     parser.add_argument("--answer-extra-body", default=None,
                         help="JSON merged into every ANSWER request body. When "
-                             "omitted, DeepSeek v4-flash gets thinking disabled "
+                             "omitted, DeepSeek Flash gets thinking disabled "
                              "automatically; the vendor key is rejected for "
                              "non-DeepSeek providers.")
     parser.add_argument("--judge-extra-body", default=None,
@@ -3818,7 +3819,7 @@ def _run_main(
     if _judge_defaulted:
         args.extra_body_defaulted.append("judge")
         print(f"judge extra_body DEFAULTED to {args.judge_extra_body_obj} "
-              f"(v4-flash, no --judge-extra-body passed)")
+              f"(Flash, no --judge-extra-body passed)")
 
     # Pin the spec before the money. Requiring one of the two flags is the
     # point: a default would let a canonical run be produced by forgetting.
@@ -3898,7 +3899,7 @@ def _run_main(
     if _answer_defaulted:
         args.extra_body_defaulted.append("answer")
         print(f"answer extra_body DEFAULTED to {args.answer_extra_body_obj} "
-              f"(v4-flash, no --answer-extra-body passed)")
+              f"(Flash, no --answer-extra-body passed)")
     check_model_pin("answer", ans_model, ans_provider, args.answer_extra_body_obj)
     check_model_pin(
         "judge", judge_model, judge_provider, args.judge_extra_body_obj

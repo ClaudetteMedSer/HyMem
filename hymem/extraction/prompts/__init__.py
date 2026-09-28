@@ -545,13 +545,102 @@ PROCEDURE_USER_TEMPLATE = """Conversation:
 Return the JSON array now."""
 
 
+# One bound for the producer instruction, strict digest validation and the
+# legacy summary cleaner. Digest generations hash the loaded system prompts,
+# so changing this contract replays prior walks without changing Phase-1.
+SESSION_SUMMARY_MAX_CHARS = 500
+_SESSION_DIGEST_SUMMARY_LIMIT = (
+    f" The summary string must be at most {SESSION_SUMMARY_MAX_CHARS} characters "
+    "after trimming leading and trailing whitespace (count Unicode code points, "
+    "including spaces and punctuation; JSON escaping does not add characters). "
+    "Rephrase concisely to fit; do not simply append the new material to the "
+    "prior summary. "
+)
+# Shared by primary extraction and summary-only repair so compression keeps
+# the same typed relations, rather than preserving names but changing meaning.
+SESSION_DIGEST_CATEGORY_RELATIONS = (
+    "When compressing, group related examples within their stated categories "
+    "and retain who recommended, requested, preferred, owned or did what. "
+    "Omit incidental example names before category labels; do not merge "
+    "unlike categories into one similarity or recommendation relation. "
+    "For example, artists/songs, podcasts and documentaries remain distinct "
+    "even when all were recommended. Keep the important relations, not every "
+    "named example. Advice or a question does not establish the recipient's "
+    "preference, ownership or completed action. In the rolling summary, "
+    "prior-only topics and their stated relations may remain as derived "
+    "continuity, not as newly established events or evidence. "
+)
+# Compression must preserve a claim's limits in primary output and repair;
+# keeping the subject and predicate is insufficient if their scope changes.
+SESSION_DIGEST_CLAIM_SCOPE = (
+    "Preserve each claim's stated uncertainty, conditions, negation, time "
+    "and scope. Preserve explicit corrections and their direction without "
+    "restating the superseded claim as current. Do not infer broader "
+    "exclusivity, universality or certainty from a narrower claim. For "
+    "example, 'available at one provider, not at another' does not mean "
+    "'available only at that provider'; 'may work if enabled' does not mean "
+    "'always works'. Retain stronger wording when explicitly supported; do "
+    "not weaken an explicit exclusive or universal claim merely to avoid "
+    "such wording. Apply these limits to prior-summary continuity as well "
+    "as new material. "
+)
+_SESSION_DIGEST_SEMANTIC_GUIDANCE = (
+    "Explicitly stated personal experiences, decisions and preferences are "
+    "episode material even when no task was solved or decision changed. "
+    "Retain the stated event or preference itself, not just the request or "
+    "assistant advice that follows it; a real event must not disappear into "
+    "generic recommendations. Distinguish completed actions from intentions, "
+    "interests and recommendations. "
+    + SESSION_DIGEST_CATEGORY_RELATIONS
+    + SESSION_DIGEST_CLAIM_SCOPE
+    + "The prior automatic summary is derived continuity "
+    "context, not independently verified source evidence; it cannot by itself "
+    "authorize a new episode or procedure. Cite only exact visible new "
+    "material and never complete an unseen cut-off phrase.\n\n"
+)
+# Shared by both primary modes and summary-only compaction: the same scarce
+# summary space must not be allocated differently merely because repair ran.
+SESSION_DIGEST_SUMMARY_ALLOCATION = (
+    "Allocate the limited rolling-summary space in this order: first capture "
+    "newly stated durable personal experiences, preferences, decisions, "
+    "material outcomes and corrections; then retain distinct earlier topics "
+    "and their still-relevant state; only then keep incidental recommendation "
+    "or example names if space remains. Compress redundant prior example "
+    "lists into their topic categories before dropping a newly stated "
+    "durable experience. Preserve earlier topics without copying every "
+    "prior name, and do not discard all older history to focus only on the "
+    "latest turn. Keep the event's participants, temporal or sequential "
+    "relations, and completed versus intended status when stated and material "
+    "to its meaning; do not turn a missed activity into a completed one. "
+)
+# This is a rolling-summary format policy, not a restriction on episode
+# narratives; repair must not weaken the primary producer's sentence contract.
+SESSION_DIGEST_SUMMARY_SENTENCE = (
+    "For a nonempty rolling summary, write exactly one sentence. Join concise "
+    "clauses with conjunctions or semicolons while preserving category "
+    "boundaries, qualifiers, negation and scope. Rephrase rather than truncate "
+    "a sentence or remove a meaningful qualifier just to fit. "
+)
+_SESSION_DIGEST_SUMMARY_CONTRACT = (
+    '"summary": a single string — an UPDATED one-sentence summary covering '
+    "BOTH the prior automatic summary and the new material. Preserve earlier "
+    "accomplishments, decisions, problems solved, and topics at topic level "
+    "unless the new material explicitly supersedes them. "
+    + _SESSION_DIGEST_SUMMARY_LIMIT
+    + SESSION_DIGEST_SUMMARY_ALLOCATION
+    + SESSION_DIGEST_SUMMARY_SENTENCE
+    + 'Do NOT add "The user" or "The assistant"; use passive voice or implicit '
+    'subject. No markdown, no quotes. Empty string "" is valid only when both '
+    "inputs contain nothing to summarize."
+)
+
 SESSION_DIGEST_SYSTEM = """You analyze one conversation session and produce three things in a single pass: its episodes, a one-sentence summary, and any step-by-step procedures.
 
 Each input segment is tagged like `[chunk msgcov_abc123]` — copy the exact chunk id shown in square brackets when citing it.
 
 Text labeled `previous context` is boundary-only context that was already digested. It may help complete a phrase, but it must never independently authorize an episode or procedure. Every emitted episode and procedure must cite at least one chunk from the new material, not solely previous context.
 
-Output a strict JSON OBJECT (not an array) with exactly these three keys:
+""" + _SESSION_DIGEST_SEMANTIC_GUIDANCE + """Output a strict JSON OBJECT (not an array) with exactly these three keys:
 
 "episodes": a JSON array of episodes. An episode is a coherent segment focused on one topic, problem, or task; a session may have several. Each item:
 - title (string): Short descriptive name, max 8 words
@@ -561,7 +650,7 @@ Output a strict JSON OBJECT (not an array) with exactly these three keys:
 - chunk_ids (list of strings): The exact `msgcov_...` ids you grouped, in conversation order. Must be non-empty and contain only ids that appear in the input.
 Empty array [] is valid if there are no clear episodes.
 
-"summary": a single string — an UPDATED one-sentence summary covering BOTH the prior automatic summary and the new material. Preserve earlier accomplishments, decisions, problems solved, and topics unless the new material explicitly supersedes them; add the new concrete outcome. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid only when both inputs contain nothing to summarize.
+""" + _SESSION_DIGEST_SUMMARY_CONTRACT + """
 
 "procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
 - name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
@@ -573,7 +662,7 @@ Empty array [] is valid if there are no clear episodes.
 - triggers (list of strings): Words/phrases someone might use to ask about this procedure
 - entities_involved (list of strings): Named tools, services, platforms, files involved
 - chunk_ids (list of strings): The exact `msgcov_...` ids from NEW material that support this procedure. Must be non-empty; boundary-only previous context does not count.
-Only extract procedures that are EXPLICITLY described; do not invent them. Empty array [] is valid.
+Only extract procedures that are EXPLICITLY described for a technical task; do not invent them. Travel directions, activity preparation, lifestyle advice and recommendations are not technical procedures, even when presented as numbered steps. Road names and destinations are not tools/commands/CLIs. Use empty array [] when no explicit technical procedure is present.
 
 Always return all three keys. Example shape:
 {"episodes": [], "summary": "", "procedures": []}
@@ -593,9 +682,9 @@ Return the JSON object now."""
 
 
 # --- Plan C: decision-grained session digest (default OFF) ------------------
-# A SECOND digest prompt, not an edit of the one above. The shipping prompt
-# stays byte-identical because it is what every existing episode in every store
-# was extracted under, and because Plan C is unmeasured: the granularity claim
+# A SECOND digest prompt rather than an episode rewrite of the one above.
+# Both arms share the strict summary contract; only the episode wording
+# differs because Plan C is unmeasured: the granularity claim
 # has no faithfulness number on EPISODE REWRITES yet (G-F1's 1.00 was measured
 # on the narrative-facts extractor — a different generative task on the same
 # turns, and reusing another gate's driver is the trap that has cost this
@@ -605,7 +694,9 @@ Return the JSON object now."""
 # wording before any default moves.
 #
 # What changes vs SESSION_DIGEST_SYSTEM, and why:
-#   1. The unit is a DECISION/CHANGE/OUTCOME, not a "coherent segment". The BEAM
+#   1. The unit is a specific EVENT/PREFERENCE/DECISION/CHANGE/OUTCOME, not a
+#      "coherent segment". Stated personal experiences and preferences are
+#      eligible even without a decision or completed technical task. The BEAM
 #      EO/SUM post-mortem traced the floor to episodes so abstract ("developed
 #      budget tracker with Flask, added auth") that the rubric's event sequence
 #      could not be recovered from them — one blob per session is a summary of a
@@ -633,19 +724,19 @@ Each input segment is tagged like `[chunk msgcov_abc123]` — copy the exact chu
 
 Text labeled `previous context` is boundary-only context that was already digested. It may help complete a phrase, but it must never independently authorize an episode or procedure. Every emitted episode and procedure must cite at least one chunk from the new material, not solely previous context.
 
-THE ONLY RULE THAT MATTERS: every name, number, date, version, price and claim you write must ALREADY BE PRESENT in the chunks below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal episode is correct; a rich episode containing one invented detail is a failure. Never record an outcome that was not reached.
+""" + _SESSION_DIGEST_SEMANTIC_GUIDANCE + """NEW-ITEM EVIDENCE RULE: every name, number, date, version, price and claim in an episode or procedure must come from the exact visible source supporting that item. Each new item must be supported by new material and cite its supporting new chunk ids. Bounded previous context may only interpret or complete an explicit phrase that continues into the visible new material; it must never independently authorize a claim. A prior automatic summary is not new-item evidence. Do not infer unstated details, invent an unseen suffix or make a detail plausible. A short, dull, literal episode is correct; a rich episode containing one invented detail is a failure. Never record an outcome that was not reached. This new-item rule does not forbid retaining prior-only topics in the rolling summary under its derived-continuity contract.
 
 Output a strict JSON OBJECT (not an array) with exactly these three keys:
 
-"episodes": a JSON array of episodes. ONE EPISODE PER DECISION, CHANGE OR OUTCOME — not one per session and not one per topic. If the session settled on a library, hit an error, fixed it, and then agreed a deadline, that is four episodes, not one. Each item:
-- title (string): Short descriptive name, max 8 words, naming the specific thing decided or changed
-- summary (string): 1-2 sentences saying what was decided, changed or established — and CARRYING THE CONCRETE VALUES: the names, numbers, dates, versions, file paths and error messages exactly as the chunks state them. "Pinned pandas to 2.1.4 after the 2.2 groupby regression" — not "resolved a dependency issue".
+"episodes": a JSON array of episodes. ONE EPISODE PER DISTINCT STATED EVENT, PREFERENCE, DECISION, CHANGE OR OUTCOME — not one per session and not one per broad topic. A personal experience or preference does not need a decision, change or resolution to qualify. Do not replace an account of what happened with the recommendations requested afterward; retain the account itself. If the session settled on a library, hit an error, fixed it, and then agreed a deadline, that is four episodes, not one. Keep connected details of one event together rather than making a separate episode per value. Each item:
+- title (string): Short descriptive name, max 8 words, naming the specific event, preference, decision, change or outcome
+- summary (string): 1-2 sentences saying what happened, was preferred, decided, changed or established — and CARRYING THE CONCRETE VALUES: the names, numbers, dates, versions, file paths and error messages exactly as the chunks state them. Preserve a stated event's sequence and any explicit activity that did not happen; do not infer missing chronology. "Pinned pandas to 2.1.4 after the 2.2 groupby regression" — not "resolved a dependency issue".
 - outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear. REQUIRED (non-null) when the session actually reached one; null is for genuinely open ends, never a hedge.
 - key_entities (list of strings): Named tools, services, files, or concepts involved, exactly as written
 - chunk_ids (list of strings): The exact `msgcov_...` ids that support THIS episode, in conversation order. Must be non-empty and contain only ids that appear in the input. Cite the narrowest set that supports it — do not attach every chunk to every episode.
 NO QUOTA. A substantive working session usually yields 3 to 8 episodes; a session that decided one thing yields one; small talk yields []. Those numbers describe what such sessions contain, they are not a target to fill, and [] is always available to you.
 
-"summary": a single string — an UPDATED one-sentence summary covering BOTH the prior automatic summary and the new material. Preserve earlier accomplishments, decisions, problems solved, and topics unless the new material explicitly supersedes them; add the new concrete outcome. Be specific about tools, technologies, and concrete outcomes. Do NOT add "The user" or "The assistant"; use passive voice or implicit subject. No markdown, no quotes. Empty string "" is valid only when both inputs contain nothing to summarize.
+""" + _SESSION_DIGEST_SUMMARY_CONTRACT + """
 
 "procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
 - name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
@@ -657,7 +748,7 @@ NO QUOTA. A substantive working session usually yields 3 to 8 episodes; a sessio
 - triggers (list of strings): Words/phrases someone might use to ask about this procedure
 - entities_involved (list of strings): Named tools, services, platforms, files involved
 - chunk_ids (list of strings): The exact `msgcov_...` ids from NEW material that support this procedure. Must be non-empty; boundary-only previous context does not count.
-Only extract procedures that are EXPLICITLY described; do not invent them. Empty array [] is valid.
+Only extract procedures that are EXPLICITLY described for a technical task; do not invent them. Travel directions, activity preparation, lifestyle advice and recommendations are not technical procedures, even when presented as numbered steps. Road names and destinations are not tools/commands/CLIs. Use empty array [] when no explicit technical procedure is present.
 
 Before writing each episode, check: can I point at the exact words in the chunks that state every value in it? If not, drop the value — or the episode.
 
@@ -737,15 +828,16 @@ Return the profile JSON object now."""
 
 
 # Narrative-facts extraction (E1; authoritative source/lifecycle schema v46).
-# This text is the VERBATIM
-# `FACTS_PROMPT_V2` that cleared the G-F1b extraction-faithfulness gate
-# (2026-08-02, 123/123 strict on the healed full-source sample) — moving it
-# unchanged is what carries the gate's verdict over to production, so any
-# rewording, however small, re-enters the gate: bump FACTS_PROMPT_VERSION in
-# hymem/dreaming/facts.py, flip facts_extraction_enabled off, re-clear
-# benchmarks/fact_probe.py at ≥0.90, then re-enable. The draft arms and the
-# v1→v2 defect analysis stay in fact_probe.py (the instrument), not here.
-# The user-template closer ("Return the JSON array of narrative facts now.")
+# facts.v4 retains v3's factual instructions and object success envelope,
+# adding the configured output bounds and a fail-closed overflow response in
+# the shared fresh/historical request builder. Never select a subset to fit.
+# The historical v2 G-F1b verdict (2026-08-02, 123/123 strict) does NOT attest
+# this revised prompt. A candidate wording change must bump FACTS_PROMPT_VERSION
+# in hymem/dreaming/facts.py and re-clear extraction faithfulness at >=0.90 on
+# the actual production request before release; do not inherit a verdict from
+# the independent v1/v2 prompt arms in benchmarks/fact_probe.py. Default feature
+# settings remain unchanged while the candidate is validated privately.
+# The user-template closer ("Return the JSON object of narrative facts now.")
 # is unique so test stubs keyed on the digest/triple/profile closers never
 # route here.
 
@@ -755,14 +847,14 @@ A narrative fact is a single, self-contained statement of something that happene
 
 THE ONLY RULE THAT MATTERS: every name, number, date, price, quantity and claim you write must ALREADY BE PRESENT in the turns below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal fact is correct; a rich fact containing one invented detail is a failure.
 
-Output a strict JSON array. Each item has exactly:
+Output a strict JSON object with exactly one key, "facts", whose value is an array: {"facts": [...]}. Do not add other top-level keys, prose, markdown, or code fences. Each item in "facts" has exactly:
 - text (string): the fact, one sentence, self-contained. Name the people, things and values explicitly instead of using "he", "it", "that", "the project" — but only names that appear in the turns.
 - date (string or null): use YYYY-MM-DD ONLY when the conversation itself writes that date. If the turns say "recently", "last week", "a few days ago", or say nothing about when — use null. Never derive a date from the session date. Never guess.
 - entities (array of strings): the concrete people, products, places, tools or organizations the fact is about, exactly as written in the turns.
 
 Rules:
 - VERBATIM VALUES. Names, numbers, dates, versions, prices and quantities exactly as the turns state them. Never round, convert, or normalize.
-- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields [] — that is a GOOD answer, not a failure, and [] is always available to you.
+- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields {"facts": []} — that is a GOOD answer, not a failure, and {"facts": []} is always available to you.
 - Never extract the assistant's suggestions, recommendations, or hypotheticals as facts about the user. "You could try X" is not "the user uses X".
 - One fact per exchange, decision, event or outcome — not one per turn. Combine a question and its answer into the single fact they establish.
 - Self-contained means resolvable alone: "Atta moved the MedFlow deploy to fly.io" — not "he moved it there".
@@ -779,7 +871,18 @@ FACTS_USER_TEMPLATE = """Conversation:
 {text}
 \"\"\"
 
-Return the JSON array of narrative facts now."""
+Return the JSON object of narrative facts now."""
+
+
+FACTS_CAPACITY_TEMPLATE = """
+Output capacity for this exact conversation excerpt:
+- A complete result may contain at most {max_items} facts. This is a maximum, NOT a target or a quota.
+- Each fact's text must be at most {max_text_chars} characters after trimming outer whitespace. Count Unicode code points, including spaces and punctuation; JSON escaping does not add characters.
+- Each fact may have at most {max_entities} entities, each at most {max_entity_chars} characters after trimming outer whitespace. Do not shorten or alter a source name to fit.
+- Extract the complete set of supported narrative facts under the rules above. Never choose only the first, best, or most important facts to fit a limit. Never omit a supported fact, truncate a value, or merge unrelated facts merely to fit.
+- If that complete set cannot fit any of these limits, do NOT return a partial result or a successful empty result. Instead return exactly {{"facts": [], "complete": false}}. This is the only exception to the one-key success envelope: it signals incomplete extraction and requests retry without claiming any source coverage. Do not include partial facts or extra keys.
+- Otherwise return the complete result as exactly {{"facts": [...]}} without a "complete" key. Use {{"facts": []}} only when this excerpt genuinely establishes no supported narrative facts, never to hide overflow.
+"""
 
 
 RERANK_SYSTEM = """You evaluate the relevance of conversation excerpts to a user query.

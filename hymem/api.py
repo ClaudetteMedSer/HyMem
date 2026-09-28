@@ -21,6 +21,7 @@ from hymem import session as session_log
 from hymem.config import HyMemConfig
 from hymem.deadline import MonotonicDeadline
 from hymem.core import db as core_db
+from hymem.core.embedding_batches import EmbeddingInputTooLarge, EmbeddingResponseInvalid
 from hymem.core.graph import graph_clock_order_sql, live_edge_predicate
 from hymem.dreaming import canonicalize as canon
 from hymem.dreaming import evidence as evidence_ledger
@@ -440,6 +441,16 @@ class HyMem:
                 if pending is not None:
                     with core_db.transaction(self.conn):
                         persist_message_embeddings(self.conn, pending)
+            except EmbeddingInputTooLarge:
+                log.error(
+                    "embedding.message_input_too_large batch_size=%d", len(batch)
+                )
+                continue
+            except EmbeddingResponseInvalid:
+                log.error(
+                    "embedding.message_response_invalid batch_size=%d", len(batch)
+                )
+                continue
             except Exception as exc:  # provider failure leaves retryable rows
                 consecutive_failures += 1
                 log.error(

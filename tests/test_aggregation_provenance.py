@@ -853,6 +853,10 @@ class _DigestEpisodeLLM:
         self.chunk_ids = [chunk_ids] if isinstance(chunk_ids, str) else chunk_ids
 
     def complete(self, request: LLMRequest) -> str:
+        from tests.digest_verification_fixtures import synthetic_fidelity_approval, synthetic_format_approval
+        approval = synthetic_fidelity_approval(request) or synthetic_format_approval(request)
+        if approval is not None:
+            return approval
         if request.system.startswith((
             "You analyze one conversation session",
             "You re-read one conversation session",

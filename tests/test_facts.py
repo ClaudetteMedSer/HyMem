@@ -36,7 +36,7 @@ from hymem.rules import Rule
 
 # The unique closer of FACTS_USER_TEMPLATE — routes stubs and counts calls
 # without colliding with the digest/triple/profile prompts.
-_FACTS_CLOSER = "Return the JSON array of narrative facts now"
+_FACTS_CLOSER = "Return the JSON object of narrative facts now"
 
 
 # --- helpers ---------------------------------------------------------------
@@ -244,7 +244,8 @@ def test_prompt_version_bump_replays_then_extracts_new_tail(cfg, monkeypatch):
         before = _rows(hy)
         calls = len(_fact_calls(llm))
 
-        monkeypatch.setattr(facts_mod, "FACTS_PROMPT_VERSION", "facts.v3")
+        next_version = f"facts.v{int(facts_mod.FACTS_PROMPT_VERSION.rsplit('v', 1)[1]) + 1}"
+        monkeypatch.setattr(facts_mod, "FACTS_PROMPT_VERSION", next_version)
 
         hy.dream()
         assert len(_fact_calls(llm)) == calls + 1
@@ -394,7 +395,9 @@ def test_tier_surfaces_matches_skips_non_matches_and_hides_superseded(cfg):
         replay = facts_mod.reextract_fact_outcome(
             hy.conn, slice_key, _facts_llm("[]"), hy.config
         )
-        replay.publication_version = "facts.v3"
+        replay.publication_version = (
+            f"facts.v{int(facts_mod.FACTS_PROMPT_VERSION.rsplit('v', 1)[1]) + 1}"
+        )
         with core_db.transaction(hy.conn):
             facts_mod.persist_facts(hy.conn, sid, replay)
 
@@ -772,12 +775,9 @@ _ONE_FACT = '{"text": "Atta shipped it.", "entities": []}'
     ("I could not extract any facts.", None),                 # refusal
 ])
 def test_validator_shape_table(raw, expected):
-    # The envelope rows are the point: this call sets response_format="json"
-    # (-> json_object) while FACTS_SYSTEM asks for a bare array, so
-    # {"facts": [...]} is a shape the provider will genuinely emit. Rejecting
-    # it returns None -> parse_failed -> the watermark holds -> the SAME slice
-    # is re-extracted on every subsequent dream: an unbounded paid-for loop
-    # that stores nothing. Bare and fenced must also agree exactly.
+    # The production prompt and json_object transport require the exact facts
+    # envelope. Older providers' bare/fenced arrays remain readable without
+    # weakening the rejection of ambiguous or malformed envelopes.
     items = facts_mod.validate_fact_items(raw, max_items=8)
     assert (None if items is None else len(items)) == expected
 

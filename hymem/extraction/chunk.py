@@ -134,9 +134,10 @@ _MAX_CONVERSATION_CONTEXT_APPLICABILITY_CHARS = 320
 # A terminal primary-empty result is never authoritative until that exact
 # source unit has received one direct empty-verification call.  Keeping this
 # identity separate from prompt wording lets benchmark artifacts reject the
-# former cue-split policy, which suppressed verification on child leaves.
+# former cue-split policy, which suppressed verification on child leaves, and
+# the cue/length veto on otherwise complete bounded whole-unit empty pairs.
 CLEAN_EMPTY_RECOVERY_POLICY_VERSION = (
-    "hymem-terminal-clean-empty-verification-v2"
+    "hymem-terminal-clean-empty-verification-v3"
 )
 _NEAR_BALANCED_BOUNDARY_CHARS = 512
 _MAX_TRIPLES_PER_RESPONSE = 24
@@ -2364,20 +2365,6 @@ def _unit_has_explicit_cue(unit: _ExtractionUnit) -> bool:
     return False
 
 
-def _unit_semantic_content_chars(unit: _ExtractionUnit) -> int:
-    """Underlying content length, excluding source-record JSON metadata."""
-
-    if unit.source_records is None:
-        return len(unit.text)
-    total = 0
-    for record in unit.source_records:
-        payload = _source_payload(record)
-        if payload is None:  # validated at the public boundary
-            return len(unit.text)
-        total += len(payload["content"])
-    return total
-
-
 def _consistent_unique_triples(
     items: list[dict],
     allowed_source_message_ids: frozenset[int] | None = None,
@@ -2844,7 +2831,6 @@ def extract_chunk(
         result, _raw = attempt(current)
         if not result.failed:
             if not result.triples and not result.markers:
-                unresolved_cue_detail: str | None = None
                 if _unit_has_explicit_cue(current):
                     split = (
                         _split_unit(current)
@@ -2861,30 +2847,18 @@ def extract_chunk(
                             return _failed_split_after_left(left)
                         right = recover(split[1], depth + 1)
                         return _merge_results(left, right)
-                    if (
-                        _unit_semantic_content_chars(current)
-                        >= 2 * _MIN_FRAGMENT_CONTENT_CHARS
-                    ):
-                        unresolved_cue_detail = (
-                            "split:max_depth_reached"
-                            if depth >= _MAX_SPLIT_DEPTH
-                            else "split:no_admissible_semantic_boundary"
-                        )
                 # This is a direct, one-shot call rather than a recursive
                 # ``recover`` invocation.  Its output can receive the standard
                 # omission pass when non-empty, but can never trigger an
-                # EMPTY-of-EMPTY loop.  Even an unsplittable suspicious unit
-                # gets this genuine second look before being held fail-closed.
+                # EMPTY-of-EMPTY loop. This exact whole unit already fits the
+                # hard input ceiling. If safe subdivision is unavailable, a
+                # cue match cannot turn two complete empty responses into an
+                # invented resource failure. Actual response/budget failures
+                # remain failures, including the terminal-retry path below.
                 result, _verified_raw = attempt(current, verification="empty")
                 if result.failed:
-                    if unresolved_cue_detail is not None:
-                        result.failure_details = _bounded_details(
-                            result.failure_details, [unresolved_cue_detail]
-                        )
                     return result
                 if not result.triples and not result.markers:
-                    if unresolved_cue_detail is not None:
-                        return _failure("resource_limit", unresolved_cue_detail)
                     return result
             if result.triples or result.markers:
                 # A non-empty complete=true response is not, by itself, a

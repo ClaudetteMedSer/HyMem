@@ -4,8 +4,9 @@
     and rejects suspiciously short LLM outputs.
   * `persist_session_summary` writes to `sessions.summary` so the
     Honcho context endpoint can prefer it over the MEMORY.md dump.
-  * Quote-wrapped LLM output is stripped; over-cap output is held for retry
-  without advancing the durable digest cursor.
+  * Digest quote wrappers are held by the format gate; meaningful quotations
+    remain unchanged. Over-cap output holds the durable digest cursor.
+    Standalone legacy cleaning is a separate compatibility contract.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from hymem.dreaming.summary import (
     persist_session_summary,
 )
 from hymem.extraction.llm import StubLLMClient
+from tests.digest_verification_fixtures import VerificationStubLLM, synthetic_fidelity_approval, synthetic_format_approval
 
 
 # --- helpers ---------------------------------------------------------------
@@ -31,7 +33,7 @@ def _summary_llm(summary: str) -> StubLLMClient:
     import json
 
     digest = {"episodes": [], "summary": summary, "procedures": []}
-    return StubLLMClient(
+    return VerificationStubLLM(
         fixtures={"Return the JSON object now": json.dumps(digest)},
         default="[]",
     )
@@ -46,9 +48,14 @@ class _SequencedSummaryLLM:
         import json
 
         self.calls.append(request)
+        approval = synthetic_fidelity_approval(request) or synthetic_format_approval(request)
+        if approval is not None:
+            return approval
         if "Return the JSON object now" not in request.user:
             return "[]"
         assert self.summaries, "unexpected extra digest retry"
+        if request.system.startswith("You compact one rolling conversation summary"):
+            return json.dumps({"summary": self.summaries.pop(0)})
         return json.dumps({
             "episodes": [],
             "summary": self.summaries.pop(0),
@@ -149,35 +156,53 @@ def test_short_llm_output_rejected(cfg, raw):
         hy.close()
 
 
-def test_quoted_summary_is_unwrapped(cfg):
-    """LLMs sometimes return summaries wrapped in quotes despite the prompt
-    forbidding them; the summarizer strips leading and trailing quotes
-    before persisting."""
+def test_digest_quoted_summary_is_held_not_silently_unwrapped(cfg, caplog):
+    """A scripted format rejection holds a digest's forbidden quote wrapper."""
+    import json
+    from hymem.dreaming import digest
+
+    class FormatRejectingStub(VerificationStubLLM):
+        def complete(self, request):
+            if request.system == digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM:
+                self.calls.append(request)
+                assert json.loads(request.user)["summary_item"]["candidate_summary"] == quoted
+                verdict = json.loads(synthetic_format_approval(request))
+                verdict["summary_format"][0]["verdict"] = "unsupported"
+                return json.dumps(verdict)
+            return super().complete(request)
+
     quoted = '"User reviewed the deployment runbook and renamed the staging step."'
-    hy = HyMem(cfg, llm=_summary_llm(quoted))
+    client = FormatRejectingStub(fixtures={"Return the JSON object now": json.dumps({
+        "episodes": [], "summary": quoted, "procedures": [],
+    })}, default="[]")
+    hy = HyMem(cfg, llm=client)
     try:
         sid = "s_quoted"
         _seed_session(hy, sid, [
             ("assistant", "what did we touch in the runbook?"),
             ("user", "We renamed the staging step in the deployment runbook to be more explicit."),
         ])
-        hy.dream()
+        report = hy.dream()
         row = hy.conn.execute(
-            "SELECT summary FROM sessions WHERE id = ?", (sid,),
+            "SELECT summary,auto_summary,digest_cursor_message_id FROM sessions WHERE id = ?", (sid,),
         ).fetchone()
-        assert row["summary"] is not None
-        assert not row["summary"].startswith('"')
-        assert not row["summary"].endswith('"')
-        assert "deployment runbook" in row["summary"]
+        assert tuple(row) == (None, None, None)
+        assert report.digest_failures == 1
+        assert sum(call.system == digest._DIGEST_FIDELITY_SYSTEM for call in client.calls) == 1
+        assert sum(call.system == digest._DIGEST_FORMAT_ADJUDICATION_SYSTEM for call in client.calls) == 1
+        assert "reason=summary_format_unsupported" in caplog.text
+        assert hy.conn.execute("SELECT COUNT(*) FROM digest_staging").fetchone()[0] == 0
     finally:
         hy.close()
 
 
 def test_long_summary_holds_cursor_and_heals_on_retry(cfg):
-    """An over-cap response is a failed outcome, never silent truncation."""
+    """Two over-cap responses hold the slice, never silently truncating it."""
     long = "a" * 1200
     healed = "Reviewed the deployment runbook and recorded the exact outcome."
-    llm = _SequencedSummaryLLM([long, healed])
+    # The one allowed in-call correction must fail as well before the runner
+    # records a held outcome and retries the source slice on its next dream.
+    llm = _SequencedSummaryLLM([long, long, healed])
     hy = HyMem(cfg, llm=llm)
     try:
         sid = "s_long"
@@ -196,6 +221,9 @@ def test_long_summary_holds_cursor_and_heals_on_retry(cfg):
         assert row["digest_quarantined"] == 0
         assert failed.digest_failures == 1
         assert failed.budget_exhausted is True
+        digest_calls = [call for call in llm.calls if "Return the JSON object now" in call.user]
+        assert len(digest_calls) == 2
+        assert digest_calls[0].user == digest_calls[1].user
 
         succeeded = hy.dream()
         healed_row = hy.conn.execute(
@@ -209,6 +237,7 @@ def test_long_summary_holds_cursor_and_heals_on_retry(cfg):
         assert healed_row["digest_retry_config_version"] is None
         assert healed_row["digest_quarantined"] == 0
         assert succeeded.digest_failures == 0
+        assert len([call for call in llm.calls if "Return the JSON object now" in call.user]) == 3
     finally:
         hy.close()
 
