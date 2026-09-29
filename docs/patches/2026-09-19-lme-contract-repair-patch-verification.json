@@ -1,0 +1,16 @@
+{
+  "base_commit": "af6a615fa7fd1cf14c4c0a27b9fb236ae264f122",
+  "patch_sha256": {
+    "2026-09-18-lme-00-stopped-run-baseline.patch": "cd34d28ab7c32067fe815b6cea90388710180716f08ff3e31bbfbc7634ddd79f",
+    "2026-09-18-lme-01-facts.patch": "c4bace6c56a8070b4817f744c6e02d946a99db7a48cbed15ec9ef7269fa7fc7e",
+    "2026-09-18-lme-02-digest.patch": "1e9c77f9d056e4bd2bf7ff99636d435d9aea812980d340e74dcff7e1366e6bff",
+    "2026-09-18-lme-03-chunks.patch": "1d2936389cfb0daa29f2bed4b2005e3d6aea5bbbe1049084318c1c951fc46265",
+    "2026-09-19-lme-04-facts-capacity-recovery.patch": "3cd9e6c3e8f17f9f36b4f72b2ccd37027cbcd83b65e9d504b7b315a6f27a0a6e",
+    "2026-09-19-lme-05-targeted-summary-revision.patch": "d40e95a30a04218154443d3f2e5588c6b53b33dbb8aa6a61d4344ea0d2327cc0",
+    "2026-09-19-lme-06-episode-title-alias.patch": "27bd5294684b690bc16ad87ac053c53e0cff253aebc5c2c524f7881d883e7fdd"
+  },
+  "reconstructed_patch_files": 36,
+  "source_files_verified": 225,
+  "status": "patch_chain_verified",
+  "test_files_verified": 204
+}

@@ -1,0 +1,29 @@
+{
+  "schema": "r8-headless-continuation-v2",
+  "root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/claim-conflict-20260925-zqkdtxky/lme-r8-headless-continuation-v2",
+  "target": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/claim-conflict-20260925-zqkdtxky/lme-r8-sample8-headless-v3",
+  "target_pin": "f7b25cf0d903ac320380d5ec083667d5686f5559ceedc38baf9b8691862b4b0d",
+  "controller_pin": "5c0b6a1663a0686b50ff70dc4bcf47212e93d98e4546cbaa71d5aede59876b52",
+  "source_pin": "52c8a4938e4420a936f9c507710414ea846c9232ddf6a461c66366958e8ec7cb",
+  "source_files": 505,
+  "expected_collected": 7890,
+  "suite_cid": "ce93099d6603e24ce167407871922a7ec15ee00a35aeb2235a9ab032656079a0",
+  "preflight_cid": "8306af0c69342db7434d369e89d7b2dfbd25fd51da5a3b72cfc25c623da8614b",
+  "summary_control_review_passed": true,
+  "repair_control_review_passed": true,
+  "retained_capture_inventory_sha256": "3abd9e76a3f35bf98072171844a98904c46add45c25c181a3b771b238261969a",
+  "evidence": {
+    "suite": {
+      "root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/claim-conflict-20260925-zqkdtxky/lme-r8-full-suite-v6",
+      "manifest_sha256": "d0cd9a91e25f96ed281539fe7f7920d469125d406d49e712d7faf91ed491a1cd"
+    },
+    "summary": {
+      "root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/claim-conflict-20260925-zqkdtxky/lme-r8-summary-v4",
+      "manifest_sha256": "710197f2f6ed0078ab195a9e150dcde1070c68421dec25fcd0c2cd8c11ce2656"
+    },
+    "retained_extraction": {
+      "root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/claim-conflict-20260925-zqkdtxky/lme-r8-final-chunk-v4",
+      "manifest_sha256": "7af332d0058cdf0dc075f390839700e7b94ace70964726f4de64146b937f9b11"
+    }
+  }
+}

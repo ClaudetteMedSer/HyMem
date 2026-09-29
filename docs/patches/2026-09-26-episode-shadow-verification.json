@@ -1,0 +1,53 @@
+{
+  "status": "root_verified_targeted_tests_and_private_offline_replay_not_deployed",
+  "candidate_directory": "/private/tmp/hymem-episode-shadow-fix.RjDDmJ",
+  "parent_manifest_sha256": "ed889d8970c6d7827315de34342996ad55182773c238922fbbdf8510d73c43a4",
+  "candidate_manifest_sha256": "5550a6e1d29692fbda28560b87120dc90eec4d6ddb01bcbc18eaea100307b576",
+  "candidate_file_count": 481,
+  "application_files": {
+    "hymem/core/db.py": "ceab71516bb72424eaf1d49eed50b821fa95b37843f233959e0e051c5c469fc3",
+    "hymem/dreaming/runner.py": "25387efe4ef6cf5ca6d6178f96a0c7872748cdb3758bbf68836c222027691f5a"
+  },
+  "app_patch_sha256": "956cde5d4ac1f7303976c457ab6257e04501a962f71171bc3d686d43c6c60048",
+  "tests_patch_sha256": "74a9ce626a517c76b9126ddef51da68a2e393ac553924634d6a6d0fcf39b7cef",
+  "patches_dry_run_apply_to_parent": true,
+  "regression_fails_before_passes_after": true,
+  "root_focused_tests_passed": 43,
+  "root_broad_tests_passed": 339,
+  "diagnostic_worker_tests_passed": 5,
+  "new_candidate_full_suite_run": false,
+  "new_candidate_paid_dream_run": false,
+  "private_replay": {
+    "stage": "cold-replay-dream-v1/episode-shadow-replay-v1",
+    "worker_sha256": "faa28387ab543f24e5370aedf31ff3168ae59e897ec9594ccb1d1b121f4bfd66",
+    "result_sha256": "9a05dfe4b6383b263e3d510a77e3550aab7f140036d538d0cdebf650a75ac823",
+    "source_sha256": "f4f9cb8ec8247d27ab2981af58ec0c044fb76cc71356f2e6a757540d4eae59ae",
+    "container_id": "4eacb7bb10f9813ae6a003b75ab48945adc15f8aacf01bb0bb1754944104f6e2",
+    "network": "none",
+    "credentials_mounted": false,
+    "production_database_mounted": false,
+    "source_unchanged": true,
+    "exit_code": 0,
+    "pid": 0,
+    "oom_killed": false,
+    "before_episode_vectors": 44,
+    "after_episode_vectors": 36,
+    "removed_orphan_keys": 8,
+    "exact_valid_vectors_preserved": true,
+    "all_other_table_rows_unchanged": true,
+    "schema_unchanged": true,
+    "repeat_noop": true,
+    "reopen_aligned": true,
+    "integrity_fk_canonical_ledger_conflicts_clean": true,
+    "root_independently_revalidated": true
+  },
+  "production_application_deployed": false,
+  "production_dream_started": false,
+  "full_lme_certified": false,
+  "new_paid_calls_for_this_repair": 0,
+  "remaining_gates": [
+    "fresh_end_to_end_candidate_validation",
+    "controlled_production_application_rollout",
+    "production_dream_and_LME_validation"
+  ]
+}

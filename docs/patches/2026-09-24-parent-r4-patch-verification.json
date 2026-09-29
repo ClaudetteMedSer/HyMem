@@ -1,0 +1,14 @@
+{
+  "schema": "parent-exact-r4-patch-verification-v1",
+  "manifest_sha256": "16cf214451f90ee9c7d2a73151a0b26c5bd9fe04404cc40b7370f03777c916d0",
+  "patch_sha256": "cb9d0c1b74c111d24ae0c8bf78eae8199afc62bf742fdb05ba2b8b14f49d4857",
+  "verified_files": 462,
+  "changed_source_and_test_files": 31,
+  "changed_test_only_auxiliary": ["README.md"],
+  "all_hashes_match_reconstruction_and_frozen_tree": true,
+  "no_fuzzy_patching": true,
+  "application_checkout_modified": false,
+  "api_calls": 0,
+  "deployment_performed": false,
+  "scope": "Parent independently reapplied patch14 and the separate README patch to its own exact R3 reconstruction, then checked all462 hashes against the new manifest and frozen R4 tree. Test passing is not asserted by this receipt."
+}

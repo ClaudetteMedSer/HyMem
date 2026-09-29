@@ -1,0 +1,33 @@
+{
+  "status": "passed",
+  "role": "paid_postflight",
+  "candidate_manifest_sha256": "5550a6e1d29692fbda28560b87120dc90eec4d6ddb01bcbc18eaea100307b576",
+  "root_reviewed": true,
+  "checks": {
+    "claims": true,
+    "ledger": true,
+    "canonical": true,
+    "same_generation": true,
+    "integrity": true,
+    "foreign_keys": true,
+    "episode_vectors": true
+  },
+  "aggregation_passed": true,
+  "paid_calls": 59,
+  "llm_http_attempts": 59,
+  "embedding_http_attempts": 159,
+  "total_http_attempts": 218,
+  "total_tokens": 193661,
+  "cleanup_verified": true,
+  "accounting_verified": true,
+  "production_modified": false,
+  "session_convergence_verified": false,
+  "bounded_work_remaining": true,
+  "pending_domains": 3,
+  "new_epoch_progress_domains": 2,
+  "paid_result_sha256": "7abc29a7c4e4f0676963177f942d1994d5e12cb12b813ea3518ebc06d0e6f8d5",
+  "postflight_sha256": "68da9fa22a404aa14d3507622d6f7f437ac84b79188379ee057a1e23b2089699",
+  "postflight_checker_sha256": "715b498b3a9c4d4b5bcf164eee78e6e60d901aa1527318b6932c43c3bcde6bc1",
+  "postflight_container_id": "b7a4559793591573aee17e126d9f8c430872810760d004722cec575acc24a988",
+  "closed_store_sha256": "b67056e9f9b13067ecfd9c50ee0d19989600f8fa6e0b8cc9553c5c6396aa0ce4"
+}

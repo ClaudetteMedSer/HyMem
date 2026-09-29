@@ -1,0 +1,12 @@
+{
+  "configuration_verified": true,
+  "container_id": "421c0acb36950d1e5fd6f47afc3d6ac3f5c89f8ecda90832c84a848472528d91",
+  "credential_mount": false,
+  "exit_code": 0,
+  "manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc",
+  "network": "none",
+  "oom_killed": false,
+  "pid": 2812967,
+  "selected": 1044,
+  "status": "running"
+}

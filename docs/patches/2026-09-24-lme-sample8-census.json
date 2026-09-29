@@ -1,0 +1,21 @@
+{
+  "schema": "lme-fixed-sample8-census-v1",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "source_question_count": 500,
+  "sample": 8,
+  "seed": 0,
+  "source_indices": [213, 262, 329, 339, 370, 372, 392, 400],
+  "questions": [
+    {"source_index": 213, "question_id": "c18a7dc8", "question_type": "multi-session", "sessions": 49, "messages": 509},
+    {"source_index": 262, "question_id": "gpt4_e061b84f", "question_type": "temporal-reasoning", "sessions": 46, "messages": 467},
+    {"source_index": 329, "question_id": "gpt4_483dd43c", "question_type": "temporal-reasoning", "sessions": 52, "messages": 532},
+    {"source_index": 339, "question_id": "gpt4_7de946e7", "question_type": "temporal-reasoning", "sessions": 49, "messages": 533},
+    {"source_index": 370, "question_id": "945e3d21", "question_type": "knowledge-update", "sessions": 48, "messages": 489},
+    {"source_index": 372, "question_id": "71315a70", "question_type": "knowledge-update", "sessions": 53, "messages": 514},
+    {"source_index": 392, "question_id": "72e3ee87", "question_type": "knowledge-update", "sessions": 51, "messages": 496},
+    {"source_index": 400, "question_id": "e61a7584", "question_type": "knowledge-update", "sessions": 50, "messages": 496}
+  ],
+  "provider_calls": 0,
+  "selection_predeclared": true,
+  "raw_content_exported": false
+}

@@ -1,0 +1,25 @@
+{
+  "api_calls": 0,
+  "application_source_modified": false,
+  "cause": "The auxiliary README was copied from the newer uncommitted main working tree, whose model-policy and semantic-verifier documentation differs from the frozen independent-summary candidate. This was an auxiliary/source-generation mismatch, not a failing executable default.",
+  "changes": [
+    "Replaced only the HYMEM_LLM_MODEL table row with the frozen candidate's actual default and rejection policy.",
+    "Added an explicit nine-line test-only snapshot caveat distinguishing executable defaults from provider availability and the separate approved deepseek-flash, thinking-disabled live diagnostic."
+  ],
+  "corrected_readme_sha256": "a0dd78dd778e17c85f9b95f4c13903311ba202e6031a372b680ee80c338d7565",
+  "deployment_authorized": false,
+  "deployment_performed": false,
+  "deployment_requirement": "Integrate and verify the currently approved model policy and explicit request settings before deployment; this documentation correction does not change application defaults or make the older default a recommended live route.",
+  "exact_reconstruction_verified": true,
+  "generator_sha256": "ee3bc8190e84bf69be4cfb65967d243c60f06e18ee5306b34ffe09d9383e9c14",
+  "included_in_deployment_patch_chain": false,
+  "main_readme_modified": false,
+  "original_r2_manifest_sha256": "df94fc65708e43703faba0f3dc60dd4ec4b56de956a2b501b03f7b9ff35df885",
+  "original_r2_modified": false,
+  "original_readme_sha256": "eff9e7358d3519b424d015c801bb80894c6d30a5b856f1452fe26e670be0553b",
+  "patch": "2026-09-19-lme-independent-summary-auxiliary-readme.patch",
+  "patch_sha256": "7fa4306bac1960edb0dc5c968e44aec8ee930aadbdb3ba56931b39a10c7a4630",
+  "role": "test_auxiliary_documentation_only",
+  "schema": "independent-summary-test-auxiliary-readme-correction-v1",
+  "tests_modified": false
+}

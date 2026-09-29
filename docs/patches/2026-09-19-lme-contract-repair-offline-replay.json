@@ -1,0 +1,41 @@
+{
+  "cases": [
+    {
+      "case_sequence": 4,
+      "kind": "facts",
+      "new_http_attempts": 0,
+      "primary_request_exact": true,
+      "primary_user_chars": 4389,
+      "recovery_request_sha256": "9428540f48083c547a100221d31d8ca0fbf2f8a25f32560b55a20fb0bd51a27d",
+      "recovery_user_chars": 2041,
+      "status": "requires_fresh_completion"
+    },
+    {
+      "case_sequence": 5,
+      "kind": "digest",
+      "new_http_attempts": 0,
+      "primary_request_exact": true,
+      "primary_user_chars": 1588,
+      "recovery_request_sha256": "bfc2e93506cc41d204bbeda221ba35a68c15c5c31327bd000af3b8f32cf59f4d",
+      "recovery_user_chars": 2325,
+      "status": "requires_fresh_completion"
+    },
+    {
+      "case_sequence": 13,
+      "episodes": 3,
+      "kind": "digest",
+      "new_http_attempts": 0,
+      "primary_request_exact": true,
+      "status": "saved_primary_now_accepted",
+      "summary_chars": 389
+    }
+  ],
+  "chunk_source_inventories_unchanged": 3,
+  "fact_digest_primary_requests_unchanged": 17,
+  "lme_readiness_verified": false,
+  "new_http_attempts": 0,
+  "semantic_correctness_verified": false,
+  "source_hashes_verified": 225,
+  "status": "offline_repairs_verified",
+  "store_hashes_verified": 10
+}

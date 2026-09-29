@@ -1,0 +1,3467 @@
+diff --git a/benchmarks/extraction_canary.py b/benchmarks/extraction_canary.py
+index b6a44cb..57b6073 100644
+--- a/benchmarks/extraction_canary.py
++++ b/benchmarks/extraction_canary.py
+@@ -44,7 +44,7 @@ from hymem.extraction.contract import (
+     validate_effective_config_extraction_contract,
+ )
+ from hymem.extraction.jsonio import loads_exact_or_fenced
+-from hymem.extraction.llm import LLMClient
++from hymem.extraction.llm import LLMClient, LLMOutputTruncatedError
+ from hymem.extraction.retry import DEFAULT_RETRY_ATTEMPTS
+ from hymem.extraction.triples import normalize_combined_triple_item
+ 
+@@ -53,7 +53,7 @@ from hymem.extraction.triples import normalize_combined_triple_item
+ # pass now proves that provider requests carried the exact table-header/prelude
+ # and adjacent-prose contexts needed by two deliberately non-self-contained
+ # claims, while list and fence controls remained atomic.
+-EXTRACTION_CANARY_VERSION = "hymem-phase1-extraction-canary-v17"
++EXTRACTION_CANARY_VERSION = "hymem-phase1-extraction-canary-v18"
+ EXTRACTION_CANARY_TABLE_SOURCE_MESSAGE_ID = 9_271_604_311
+ EXTRACTION_CANARY_PROSE_SOURCE_MESSAGE_ID = 9_271_604_312
+ EXTRACTION_CANARY_SOURCE_MESSAGE_IDS = (
+@@ -253,6 +253,7 @@ _CANARY_EXPECTED_CLAIMS = (
+     ),
+ )
+ _NORMAL_EXECUTION_PATH = {
++    "provider_output_truncations": 0,
+     "primary_requests": 4,
+     "empty_verification_requests": 2,
+     "omission_verification_requests": 2,
+@@ -316,6 +317,7 @@ _EVIDENCE_KEYS = frozenset({
+     "object_properties",
+ })
+ _EXECUTION_PATH_KEYS = frozenset({
++    "provider_output_truncations",
+     "primary_requests",
+     "empty_verification_requests",
+     "omission_verification_requests",
+@@ -598,7 +600,7 @@ def _nonnegative_number(value: object, *, integer: bool = False):
+ 
+ def _validate_usage(
+     value: object, *, completion_calls: int, provider_attempts: int,
+-    passed: bool,
++    passed: bool, provider_output_truncations: int,
+ ) -> None:
+     if not isinstance(value, Mapping) or set(value) != _USAGE_KEYS:
+         raise _integrity("usage shape is invalid")
+@@ -632,9 +634,9 @@ def _validate_usage(
+     if (
+         calls != successes
+         or attempts != provider_attempts
+-        or calls > completion_calls
++        or calls + provider_output_truncations > completion_calls
+         or attempts < completion_calls
+-        or (passed and calls != completion_calls)
++        or (passed and calls + provider_output_truncations != completion_calls)
+     ):
+         raise _integrity("usage counters do not reconcile")
+ 
+@@ -662,10 +664,11 @@ def _validate_execution_path(
+     completion_calls: int,
+     initial_leaves: int,
+     passed: bool,
+-) -> None:
++    policy: Mapping[str, Any],
++) -> int:
+     """Validate bounded evidence derived from the actual provider requests."""
+ 
+-    if not isinstance(value, Mapping) or set(value) != _EXECUTION_PATH_KEYS:
++    if not isinstance(value, Mapping) or set(value) != set(policy["normal_execution_path"]):
+         raise _integrity("execution path shape is invalid")
+     path = dict(value)
+     source_ids = path.pop("source_message_ids_seen")
+@@ -677,7 +680,7 @@ def _validate_execution_path(
+         raise _integrity("execution path structural probes are invalid")
+     if (
+         not isinstance(source_ids, list)
+-        or len(source_ids) > len(EXTRACTION_CANARY_SOURCE_MESSAGE_IDS)
++        or len(source_ids) > len(policy["source_message_ids"])
+         or any(
+             isinstance(item, bool) or not isinstance(item, int) or item < 1
+             for item in source_ids
+@@ -690,6 +693,9 @@ def _validate_execution_path(
+         for item in path.values()
+     ):
+         raise _integrity("execution path counters are invalid")
++    truncations = path.get("provider_output_truncations", 0)
++    if truncations > completion_calls:
++        raise _integrity("truncation count exceeds requests")
+ 
+     primary = path["primary_requests"]
+     empty = path["empty_verification_requests"]
+@@ -739,7 +745,7 @@ def _validate_execution_path(
+         or omission < 2
+         or path["parsed_source_records"] != completion_calls
+         or path["source_record_parse_failures"] != 0
+-        or source_ids != list(EXTRACTION_CANARY_SOURCE_MESSAGE_IDS)
++        or source_ids != policy["source_message_ids"]
+         or path["table_claim_requests"] < 2
+         or path["table_claim_exact_context_requests"]
+         != path["table_claim_requests"]
+@@ -761,10 +767,11 @@ def _validate_execution_path(
+         raise _integrity("passed report did not exercise exact context paths")
+     if (
+         passed
+-        and completion_calls == EXTRACTION_CANARY_NORMAL_PASS_COMPLETION_CALLS
+-        and not _strict_equal(value, _NORMAL_EXECUTION_PATH)
++        and completion_calls == policy["normal_pass_completion_calls"]
++        and not _strict_equal(value, policy["normal_execution_path"])
+     ):
+         raise _integrity("normal execution path differs from exact policy")
++    return truncations
+ 
+ 
+ class _RecordingClient:
+@@ -774,13 +781,18 @@ class _RecordingClient:
+         self.delegate = delegate
+         self.requests: list[Any] = []
+         self.responses: list[tuple[Any, Any]] = []
++        self.provider_output_truncations = 0
+ 
+     def __getattr__(self, name: str) -> Any:
+         return getattr(self.delegate, name)
+ 
+     def complete(self, request: Any) -> str:
+         self.requests.append(request)
+-        response = self.delegate.complete(request)
++        try:
++            response = self.delegate.complete(request)
++        except LLMOutputTruncatedError:
++            self.provider_output_truncations += 1
++            raise
+         self.responses.append((request, response))
+         return response
+ 
+@@ -879,7 +891,8 @@ def _response_expected_claim_indexes(response: object) -> list[int]:
+                 key in normalized and _strict_equal(normalized[key], value)
+                 for key, value in expected.items()
+             ):
+-                indexes.append(index)
++                if index not in indexes:
++                    indexes.append(index)
+     return indexes
+ 
+ 
+@@ -1093,8 +1106,8 @@ def _validate_client(
+             raise _integrity("client differs from memory pipeline")
+ 
+ 
+-def _validate_claim_evidence(value: object) -> list[int]:
+-    if not isinstance(value, list) or len(value) > len(_CANARY_EXPECTED_CLAIMS):
++def _validate_claim_evidence(value: object, expected_claims: list[dict]) -> list[int]:
++    if not isinstance(value, list) or len(value) > len(expected_claims):
+         raise _integrity("claim evidence shape is invalid")
+     indexes: list[int] = []
+     for evidence in value:
+@@ -1103,13 +1116,13 @@ def _validate_claim_evidence(value: object) -> list[int]:
+         index = evidence.get("expected_claim_index")
+         if (
+             isinstance(index, bool) or not isinstance(index, int)
+-            or index < 0 or index >= len(_CANARY_EXPECTED_CLAIMS)
++            or index < 0 or index >= len(expected_claims)
+             or index in indexes
+         ):
+             raise _integrity("claim evidence indexes are invalid")
+         expected = {
+             "expected_claim_index": index,
+-            **extraction_canary_policy()["expected_claims"][index],
++            **expected_claims[index],
+         }
+         if not _strict_equal(dict(evidence), expected):
+             raise _integrity("claim evidence does not match the canary contract")
+@@ -1134,15 +1147,32 @@ def validate_extraction_canary_report(
+     The function intentionally emits structural errors only.
+     """
+ 
++    policy = extraction_canary_policy(prompt_version=expected_prompt_version)
++    return _validate_report_with_policy(
++        value, policy=policy, expected_mode=expected_mode,
++        expected_client=expected_client, require_client_closed=require_client_closed,
++    )
++
++
++def _validate_report_with_policy(
++    value: object, *, policy: Mapping[str, Any], expected_mode: str,
++    expected_client: Mapping[str, Any] | None = None,
++    require_client_closed: bool = False,
++) -> dict[str, Any]:
++    """Private core: policy must come from a strict current/archive validator.
++
++    Historical callers supply a frozen known-version policy with a structurally
++    validated recorded contract, never a reconstructed current producer.
++    """
+     if expected_mode not in _EXPECTED_MODES:
+         raise _integrity("validation mode is unsupported")
+     if not isinstance(value, Mapping):
+         raise _integrity("report is absent")
+     report = dict(value)
+-    validate_extraction_canary_policy(
+-        {key: report[key] for key in _POLICY_KEYS if key in report},
+-        expected_prompt_version=expected_prompt_version,
+-    )
++    if not _strict_equal(
++        {key: report[key] for key in _POLICY_KEYS if key in report}, dict(policy),
++    ):
++        raise _integrity("policy identity is unsupported")
+ 
+     if expected_mode == "pending":
+         if set(report) != _POLICY_KEYS | {"status"} or report.get("status") != "pending":
+@@ -1183,30 +1213,54 @@ def validate_extraction_canary_report(
+     if (
+         type(completion_calls) is not int
+         or completion_calls < (0 if failed else 1)
+-        or completion_calls > EXTRACTION_CANARY_MAX_COMPLETION_CALLS
++        or completion_calls > policy["max_completion_calls"]
+         or type(provider_attempts) is not int
+         or provider_attempts < completion_calls
+-        or provider_attempts > EXTRACTION_CANARY_MAX_PROVIDER_ATTEMPTS
++        or provider_attempts > policy["max_provider_attempts"]
+         or type(initial_leaves) is not int
+         or initial_leaves < 0
+-        or initial_leaves > EXTRACTION_CANARY_EXPECTED_PREPARTITION_LEAVES
++        or initial_leaves > policy["expected_prepartition_leaves"]
+     ):
+         raise _integrity("attempt counters are invalid")
+     if (
+         not failed
+-        and completion_calls < EXTRACTION_CANARY_MIN_PASS_COMPLETION_CALLS
++        and completion_calls < policy["minimum_pass_completion_calls"]
+     ):
+         raise _integrity("passed report lacks omission verification")
+-    _validate_usage(
+-        report.get("usage"), completion_calls=completion_calls,
+-        provider_attempts=provider_attempts, passed=not failed,
+-    )
+-    _validate_execution_path(
++    truncations = _validate_execution_path(
+         report.get("execution_path"),
+         completion_calls=completion_calls,
+         initial_leaves=initial_leaves,
+         passed=not failed,
++        policy=policy,
+     )
++    _validate_usage(
++        report.get("usage"), completion_calls=completion_calls,
++        provider_attempts=provider_attempts, passed=not failed,
++        provider_output_truncations=truncations,
++    )
++    # Emissions require admitted text. A typed truncation contains no response
++    # payload and cannot substantiate a claim, even when its request was valid.
++    admitted = report["usage"]["calls"]
++    path = report["execution_path"]
++    if not failed and admitted < policy["minimum_pass_completion_calls"]:
++        raise _integrity("passed report lacks admitted verification responses")
++    if "provider_output_truncations" in path and (
++        any(path[f"{claim}_claim_exact_context_emissions"]
++            + path[f"{claim}_claim_wrong_context_emissions"] > admitted
++            for claim in ("table", "prose"))
++        or (not failed and (
++            path["table_claim_exact_context_emissions"]
++            + path["prose_claim_exact_context_emissions"] > admitted
++        ))
++    ):
++        raise _integrity("claim emissions exceed admitted responses")
++    if "provider_output_truncations" in path and any(
++        path[f"{claim}_claim_exact_context_emissions"]
++        > path[f"{claim}_claim_exact_context_requests"]
++        for claim in ("table", "prose")
++    ):
++        raise _integrity("claim emissions exceed exact-context requests")
+     _validate_client(report.get("client"), expected_client=expected_client)
+     closed = report.get("client_closed")
+     if closed is not None and not isinstance(closed, bool):
+@@ -1214,14 +1268,15 @@ def validate_extraction_canary_report(
+     if require_client_closed and closed is not True:
+         raise _integrity("configured client was not closed successfully")
+ 
+-    evidence_indexes = _validate_claim_evidence(report.get("claim_evidence"))
++    expected_claims = policy["expected_claims"]
++    evidence_indexes = _validate_claim_evidence(report.get("claim_evidence"), expected_claims)
+     matched = report.get("matched_supported_claims")
+     missing = report.get("missing_expected_claim_indexes")
+     triple_count = report.get("valid_triples_returned")
+     marker_count = report.get("valid_markers_returned")
+     duplicate_count = report.get("duplicate_triples_collapsed")
+     expected_missing = [
+-        index for index in range(len(_CANARY_EXPECTED_CLAIMS))
++        index for index in range(len(expected_claims))
+         if index not in evidence_indexes
+     ]
+     if (
+@@ -1233,12 +1288,12 @@ def validate_extraction_canary_report(
+     ):
+         raise _integrity("claim evidence counts do not reconcile")
+     if not failed and (
+-        evidence_indexes != list(range(len(_CANARY_EXPECTED_CLAIMS)))
+-        or matched != len(_CANARY_EXPECTED_CLAIMS) or missing
+-        or triple_count != len(_CANARY_EXPECTED_CLAIMS)
++        evidence_indexes != list(range(len(expected_claims)))
++        or matched != len(expected_claims) or missing
++        or triple_count != len(expected_claims)
+         or marker_count != 0
+         or duplicate_count != 0
+-        or initial_leaves != EXTRACTION_CANARY_EXPECTED_PREPARTITION_LEAVES
++        or initial_leaves != policy["expected_prepartition_leaves"]
+     ):
+         raise _integrity("passed report is not the exact behavioral canary result")
+     if failed:
+@@ -1346,6 +1401,12 @@ def run_extraction_canary(
+             recording_client.requests, recording_client.responses,
+         ),
+     }
++    base["execution_path"]["provider_output_truncations"] = (
++        recording_client.provider_output_truncations
++    )
++    if (result.completion_calls != len(recording_client.requests)
++            or base["usage"]["calls"] != len(recording_client.responses)):
++        raise _integrity("recorded completion outcomes do not reconcile")
+     if result.failed:
+         report = {
+             **base,
+diff --git a/benchmarks/extraction_canary_archive.py b/benchmarks/extraction_canary_archive.py
+new file mode 100644
+index 0000000..af3a51d
+--- /dev/null
++++ b/benchmarks/extraction_canary_archive.py
+@@ -0,0 +1,143 @@
++"""Archive-only canary commitment validation, never live execution admission.
++
++The v17 template was captured from the genuine synthetic reconstructed-R3
++fixture d9fd6ededba452c29ef039f785c3fb377c6400e18ea3023ebf4f8a328779e6aa.
++Do not reconstruct its extraction hash from current code or relabel its version.
++"""
++from __future__ import annotations
++
++from collections.abc import Mapping
++from copy import deepcopy
++import json
++import re
++
++try:
++    from .extraction_canary import _integrity, _strict_equal, _validate_report_with_policy
++except ImportError:  # direct benchmark scripts
++    from extraction_canary import _integrity, _strict_equal, _validate_report_with_policy
++
++# Literal non-runtime policy; independent of today's fixture builders/hashes.
++_V17_POLICY = json.loads(r'''{
++  "clean_empty_recovery_policy_version": "hymem-terminal-clean-empty-verification-v3",
++  "expected_claims": [
++    {
++      "object": "Fly.io",
++      "object_properties": {},
++      "object_type": "platform",
++      "polarity": 1,
++      "predicate": "deploys_to",
++      "source_message_id": 9271604311,
++      "subject": "HyMem Canary Relay",
++      "subject_properties": {},
++      "subject_type": "service",
++      "temporal_scope": null,
++      "value_numeric": null,
++      "value_text": null,
++      "value_unit": null
++    },
++    {
++      "object": "PostgreSQL",
++      "object_properties": {},
++      "object_type": "database",
++      "polarity": 1,
++      "predicate": "prefers",
++      "source_message_id": 9271604312,
++      "subject": "Avery Boundary Canary",
++      "subject_properties": {},
++      "subject_type": "person",
++      "temporal_scope": null,
++      "value_numeric": null,
++      "value_text": null,
++      "value_unit": null
++    }
++  ],
++  "expected_prepartition_leaves": 4,
++  "fenced_code_control_sha256": "c11d7b0dbbb2492184ec94c43894ca2fc9ee3d2991b2878f296fb834da6db274",
++  "fixture_sha256": "3fedadfbcdf35a013f8f61c5ea3f6ccc3e150aca0d025d8597327704551e94de",
++  "fixture_version": "hymem-phase1-context-paths-four-leaf-v7",
++  "list_control_sha256": "e8f93e21ed6b8ea2df448e4ea2b3c7b09122838a2da3999f7c117ff3257a53e5",
++  "max_completion_calls": 24,
++  "max_provider_attempts": 72,
++  "minimum_pass_completion_calls": 8,
++  "normal_execution_path": {
++    "empty_verification_requests": 2,
++    "fenced_code_control_atomic_requests": 2,
++    "fenced_code_control_probe_atomic": true,
++    "list_control_atomic_requests": 2,
++    "list_control_probe_atomic": true,
++    "omission_verification_requests": 2,
++    "parsed_source_records": 8,
++    "primary_requests": 4,
++    "prose_claim_exact_context_emissions": 1,
++    "prose_claim_exact_context_requests": 2,
++    "prose_claim_requests": 2,
++    "prose_claim_self_contained_requests": 0,
++    "prose_claim_wrong_context_emissions": 0,
++    "protected_control_split_boundaries": 0,
++    "source_message_ids_seen": [
++      9271604311,
++      9271604312
++    ],
++    "source_record_parse_failures": 0,
++    "table_claim_exact_context_emissions": 1,
++    "table_claim_exact_context_requests": 2,
++    "table_claim_requests": 2,
++    "table_claim_self_contained_requests": 0,
++    "table_claim_wrong_context_emissions": 0
++  },
++  "normal_pass_completion_calls": 8,
++  "prose_boundary_claim_sha256": "aeebb66034c889372c5f7a81cabd8891fc0126f9ad286825663ac3a047c4d17a",
++  "required_before_indexing": true,
++  "scope": "once_per_pending_run_configuration",
++  "source_content_chars": 10349,
++  "source_message_ids": [
++    9271604311,
++    9271604312
++  ],
++  "source_split_policy_version": "hymem-source-semantic-split-v10",
++  "store_writes": 0,
++  "structural_control_probe_version": "hymem-phase1-markdown-atom-split-probe-v1",
++  "table_continuation_claim_sha256": "b0101bc38d69ab81541575a131a2d202037f0b8f489b9e07bfa22baf943cc13d",
++  "usage_accounting": "excluded_from_scored_usage_dedicated_memory_pipeline_client",
++  "version": "hymem-phase1-extraction-canary-v17"
++}''')
++_V17 = "hymem-phase1-extraction-canary-v17"
++_V18 = "hymem-phase1-extraction-canary-v18"
++_SCHEMA = "hymem-extraction-contract-sha256-v1"
++
++
++def validate_archived_canary_config(policy: object, effective_config: object) -> dict:
++    """Validate recorded commitments and their cross-links, not their preimages."""
++    if not isinstance(policy, Mapping) or not isinstance(effective_config, Mapping):
++        raise _integrity("archived policy/config is absent")
++    version = policy.get("version")
++    if version not in {_V17, _V18}:
++        raise _integrity("archived policy version is unsupported")
++    prompt = policy.get("prompt_version")
++    binding = policy.get("extraction_contract")
++    if (type(prompt) is not str or not prompt or prompt != prompt.strip()
++            or len(prompt) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in prompt)
++            or not isinstance(binding, Mapping)
++            or set(binding) != {"schema", "prompt_version", "identity"}
++            or binding.get("schema") != _SCHEMA
++            or binding.get("prompt_version") != prompt
++            or type(binding.get("identity")) is not str
++            or re.fullmatch(_SCHEMA + r":[0-9a-f]{64}", binding["identity"]) is None):
++        raise _integrity("archived extraction commitment is malformed")
++    if (effective_config.get("prompt_version") != prompt
++            or not _strict_equal(effective_config.get("extraction_contract"), dict(binding))):
++        raise _integrity("archived extraction commitment cross-link differs")
++    expected = deepcopy(_V17_POLICY)
++    if version == _V18:
++        expected["version"] = _V18
++        expected["normal_execution_path"]["provider_output_truncations"] = 0
++    expected.update(prompt_version=prompt, extraction_contract=dict(binding))
++    if not _strict_equal(dict(policy), expected):
++        raise _integrity("archived policy differs from known version")
++    return expected
++
++
++def validate_archived_canary_report(value: object, *, policy: object,
++                                   effective_config: object, **context) -> dict:
++    expected = validate_archived_canary_config(policy, effective_config)
++    return _validate_report_with_policy(value, policy=expected, **context)
+diff --git a/benchmarks/lme_protocol.py b/benchmarks/lme_protocol.py
+index b7ae496..981d0fe 100644
+--- a/benchmarks/lme_protocol.py
++++ b/benchmarks/lme_protocol.py
+@@ -782,9 +782,25 @@ def _validate_model(
+     return value
+ 
+ 
++def _archived_canary_validators():
++    # Archive-only dependency: live admission and its semantic code identity
++    # neither import nor execute this historical commitment reader. Full source
++    # manifests still pin its bytes for archive review and packaging.
++    if __package__:
++        from .extraction_canary_archive import (
++            validate_archived_canary_config, validate_archived_canary_report,
++        )
++    else:
++        from extraction_canary_archive import (
++            validate_archived_canary_config, validate_archived_canary_report,
++        )
++    return validate_archived_canary_config, validate_archived_canary_report
++
++
+ def _validate_segment_extraction_canary(
+     segment: Mapping[str, Any], *, pipeline: Mapping[str, Any], no_dream: bool,
+-    prompt_version: str,
++    prompt_version: str, archive_policy: Mapping[str, Any] | None = None,
++    archive_effective_config: Mapping[str, Any] | None = None,
+ ) -> None:
+     """Bind every segment probe to its actual work and pipeline posture."""
+ 
+@@ -826,15 +842,22 @@ def _validate_segment_extraction_canary(
+                 "LongMemEval extraction canary endpoint identity is not secret-free"
+             )
+     try:
+-        validate_extraction_canary_report(
+-            report,
++        context = dict(
+             expected_mode=mode,
+             expected_client=(
+                 pipeline if mode in {"required", "failed"} else None
+             ),
+             require_client_closed=mode in {"required", "failed"},
+-            expected_prompt_version=prompt_version,
+         )
++        if archive_policy is not None:
++            _archived_canary_validators()[1](
++                report, policy=archive_policy,
++                effective_config=archive_effective_config, **context,
++            )
++        else:
++            validate_extraction_canary_report(
++                report, expected_prompt_version=prompt_version, **context,
++            )
+     except BenchmarkIntegrityError as exc:
+         raise BenchmarkIntegrityError(
+             "LongMemEval extraction canary evidence is invalid"
+@@ -2698,7 +2721,11 @@ def _validate_artifact(
+         secret_free_endpoint=True,
+     )
+     try:
+-        validate_extraction_canary_config_binding(
++        canary_validator = (
++            _archived_canary_validators()[0] if archive_only
++            else validate_extraction_canary_config_binding
++        )
++        canary_validator(
+             config.get("extraction_canary"),
+             config.get("effective_hymem_config"),
+         )
+@@ -3170,6 +3197,8 @@ def _validate_artifact(
+         _validate_segment_extraction_canary(
+             segment, pipeline=pipeline, no_dream=config["no_dream"],
+             prompt_version=config["effective_hymem_config"]["prompt_version"],
++            archive_policy=config["extraction_canary"] if archive_only else None,
++            archive_effective_config=config["effective_hymem_config"] if archive_only else None,
+         )
+         if segment.get("model_identities") != models:
+             raise BenchmarkIntegrityError(
+diff --git a/benchmarks/longmemeval_adapter.py b/benchmarks/longmemeval_adapter.py
+index e80f6ef..a826a01 100644
+--- a/benchmarks/longmemeval_adapter.py
++++ b/benchmarks/longmemeval_adapter.py
+@@ -754,6 +754,10 @@ def resolve_model_extra_body(
+ 
+ # ── LLM Client ──────────────────────────────────────────────────────
+ 
++class LLMResponseError(RuntimeError):
++    """A received response failed admission; resubmitting is not a retry."""
++
++
+ class LLMClient:
+     def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
+                  extra_body: dict | None = None, *, n: int | None = None):
+@@ -800,6 +804,7 @@ class LLMClient:
+         self.total_latency_s = 0.0
+         self.token_usage_available = False
+         self._usage_complete = True
++        self._accounted_response_attempts = 0
+         self.last_error: str | None = None
+         # Guards the two counters so they aggregate correctly when many worker
+         # threads share this client (--workers > 1).
+@@ -811,25 +816,13 @@ class LLMClient:
+         last_exception_type = "Exception"
+         for attempt in range(3):
+             try:
+-                content, usage = self._call(messages, temperature, max_tokens)
+-                with self._lock:
+-                    required = ("prompt_tokens", "completion_tokens", "total_tokens")
+-                    valid = all(
+-                        isinstance(usage.get(key), (int, float))
+-                        and not isinstance(usage.get(key), bool)
+-                        and usage[key] >= 0
+-                        for key in required
+-                    )
+-                    if valid:
+-                        self.prompt_tokens += usage["prompt_tokens"]
+-                        self.completion_tokens += usage["completion_tokens"]
+-                        self.total_tokens += usage["total_tokens"]
+-                    else:
+-                        self._usage_complete = False
+-                    self.token_usage_available = (
+-                        self.successful_responses > 0 and self._usage_complete
+-                    )
++                content, _usage = self._call(messages, temperature, max_tokens)
+                 return content
++            except LLMResponseError as e:
++                # A received response is accounted, then rejected once. A
++                # second paid response cannot be called a transport retry.
++                last_exception_type = _bounded_exception_type(e)
++                break
+             except Exception as e:
+                 last_error = str(e)
+                 last_exception_type = _bounded_exception_type(e)
+@@ -841,12 +834,6 @@ class LLMClient:
+                     self.token_usage_available = False
+                 if "429" in last_error or "rate" in last_error.lower():
+                     time.sleep(15 * (attempt + 1))
+-                elif "null content" in last_error and "finish=length" in last_error:
+-                    # Deterministic truncation: the reasoning model burned the
+-                    # output budget and emitted no answer. Retrying with the SAME
+-                    # cap re-spends the call for the same result — fail fast and
+-                    # let the caller's parse-failure ceiling catch the aggregate.
+-                    break
+                 elif attempt < 2:
+                     time.sleep(3)
+                 else:
+@@ -869,6 +856,7 @@ class LLMClient:
+         started = time.monotonic()
+         with self._lock:
+             self.request_attempts += 1
++            self.token_usage_available = False
+         try:
+             resp = http.post(
+                 f"{self.base_url}/chat/completions",
+@@ -877,31 +865,64 @@ class LLMClient:
+                 timeout=120,
+             )
+             resp.raise_for_status()
+-            data = resp.json()
++        except Exception:
++            with self._lock:
++                self._usage_complete = False
++                self.token_usage_available = False
++            raise
+         finally:
+             with self._lock:
+                 self.total_latency_s += time.monotonic() - started
+-        content = data["choices"][0]["message"].get("content")
+-        if content is None:
+-            # A 200 with content=null. Transient provider behavior should be
+-            # retried like a 429; a null from finish_reason=length is
+-            # deterministic truncation (chat() fails that one fast). Either
+-            # way, returning None used to crash callers (`None.startswith`) —
+-            # raising makes the failure explicit and countable.
+-            raise RuntimeError(
+-                f"null content (finish={data['choices'][0].get('finish_reason')})")
+-        if not isinstance(content, str):
+-            raise RuntimeError(
+-                "non-string content "
+-                f"(finish={data['choices'][0].get('finish_reason')})"
++        try:
++            data = resp.json()
++        except Exception as exc:
++            with self._lock:
++                self._usage_complete = False
++                self.token_usage_available = False
++            raise LLMResponseError("LLM response is not JSON") from exc
++        usage = data.get("usage") if type(data) is dict else None
++        required = ("prompt_tokens", "completion_tokens", "total_tokens")
++        try:
++            valid = type(usage) is dict and all(
++                isinstance(usage.get(key), (int, float))
++                and not isinstance(usage[key], bool)
++                and math.isfinite(float(usage[key]))
++                and usage[key] >= 0 and usage[key] == int(usage[key])
++                for key in required
++            ) and usage["total_tokens"] == (
++                usage["prompt_tokens"] + usage["completion_tokens"]
+             )
++        except (OverflowError, ValueError):
++            valid = False
++        with self._lock:
++            self._accounted_response_attempts += 1
++            if valid:
++                self.prompt_tokens += int(usage["prompt_tokens"])
++                self.completion_tokens += int(usage["completion_tokens"])
++                self.total_tokens += int(usage["total_tokens"])
++            else:
++                self._usage_complete = False
++            self.token_usage_available = (
++                self._usage_complete
++                and self._accounted_response_attempts == self.request_attempts
++            )
++        choices = data.get("choices") if type(data) is dict else None
++        if type(choices) is not list or not choices or type(choices[0]) is not dict:
++            raise LLMResponseError("LLM response has no valid first choice")
++        # Retain the requested n>1 first-choice policy; a later choice cannot
++        # rescue a rejected first one.
++        choice = choices[0]
++        finish = choice.get("finish_reason")
++        if type(finish) is not str or finish != "stop":
++            raise LLMResponseError("LLM response did not finish with stop")
++        message = choice.get("message")
++        content = message.get("content") if type(message) is dict else None
++        if type(content) is not str:
++            raise LLMResponseError("LLM response content is not a string")
+         with self._lock:
+             self.call_count += 1
+             self.successful_responses += 1
+-        return (
+-            content,
+-            data.get("usage", {}),
+-        )
++        return content, usage if type(usage) is dict else {}
+ 
+     def close(self) -> None:
+         """End this wrapper's lifecycle exactly once.
+diff --git a/hymem/contrib/openai_client.py b/hymem/contrib/openai_client.py
+index ef642c9..9b94ae7 100644
+--- a/hymem/contrib/openai_client.py
++++ b/hymem/contrib/openai_client.py
+@@ -28,8 +28,11 @@ from hymem.deadline import DeadlineExceeded, current_deadline
+ from hymem.extraction.llm import (
+     LLMClient,
+     LLMRequest,
++    LLMResponseError,
++    LLMOutputTruncatedError,
+     ProviderAttemptTracker,
+ )
++from hymem.extraction import llm as llm_module
+ from hymem.extraction.retry import (
+     DEFAULT_RETRY_ATTEMPTS,
+     DEFAULT_RETRY_BASE_DELAY_SECONDS,
+@@ -263,6 +266,7 @@ class OpenAICompatibleClient:
+         self.cost_usd = None
+         self.token_usage_available = False
+         self._usage_complete = True
++        self._accounted_response_attempts = 0
+         self._usage_lock = threading.Lock()
+         self._close_lock = threading.Lock()
+         self._close_condition = threading.Condition(self._close_lock)
+@@ -476,6 +480,7 @@ class OpenAICompatibleClient:
+                 and self._helper_guard == (
+                     current_deadline, with_retry, require_active_model,
+                     resolve_llm_api_key, retry_module.retry_support_integrity,
++                    LLMResponseError, LLMOutputTruncatedError,
+                 )
+                 and retry_module.retry_support_integrity()
+                 and tuple(
+@@ -670,8 +675,11 @@ class OpenAICompatibleClient:
+         if request.response_format == "json":
+             kwargs["response_format"] = {"type": "json_object"}
+ 
++        # The caller's absolute deadline owns every attempt and admission,
++        # even if provider code changes ambient context while returning.
++        deadline = _FROZEN_CURRENT_DEADLINE()
++
+         def _attempt():
+-            deadline = _FROZEN_CURRENT_DEADLINE()
+             request_kwargs = dict(kwargs)
+             if deadline is not None:
+                 request_kwargs["timeout"] = deadline.cap_timeout(
+@@ -681,15 +689,10 @@ class OpenAICompatibleClient:
+                 tracker._record()
+             with self._usage_lock:
+                 self.request_attempts += 1
++                self.token_usage_available = False
+             started = time.monotonic()
+             try:
+-                response = config.completion_create(**request_kwargs)
+-                # A custom/OpenAI-compatible transport may ignore its timeout.
+-                # Reject a late response before parsing or publication once it
+-                # eventually hands control back to us.
+-                if deadline is not None:
+-                    deadline.check()
+-                return response
++                return config.completion_create(**request_kwargs)
+             except (Exception, DeadlineExceeded):
+                 with self._usage_lock:
+                     self._usage_complete = False
+@@ -706,35 +709,62 @@ class OpenAICompatibleClient:
+             max_delay=DEFAULT_RETRY_MAX_DELAY_SECONDS,
+             label=f"LLM completion ({config.model})",
+         )
+-        self._verify_transport_integrity()
+-        content = resp.choices[0].message.content
+-        if type(content) is not str:
+-            raise RuntimeError("LLM response content is not a string")
++        # Account received paid replies outside transport retry, before any
++        # deadline, identity or content rejection. Never reroll their admission.
+         usage = getattr(resp, "usage", None)
+         values = {
+             "prompt_tokens": getattr(usage, "prompt_tokens", None),
+             "completion_tokens": getattr(usage, "completion_tokens", None),
+             "total_tokens": getattr(usage, "total_tokens", None),
+         }
+-        valid = all(
+-            isinstance(value, (int, float))
+-            and not isinstance(value, bool)
+-            and math.isfinite(float(value))
+-            and value >= 0
+-            for value in values.values()
+-        )
++        try:
++            valid = all(
++                isinstance(value, (int, float))
++                and not isinstance(value, bool)
++                and math.isfinite(float(value))
++                and value >= 0 and value == int(value)
++                for value in values.values()
++            ) and values["total_tokens"] == (
++                values["prompt_tokens"] + values["completion_tokens"]
++            )
++        except (OverflowError, ValueError):
++            valid = False
+         with self._usage_lock:
+-            self.call_count += 1
+-            self.successful_responses += 1
++            self._accounted_response_attempts += 1
+             if valid:
+-                self.prompt_tokens += values["prompt_tokens"]
+-                self.completion_tokens += values["completion_tokens"]
+-                self.total_tokens += values["total_tokens"]
++                self.prompt_tokens += int(values["prompt_tokens"])
++                self.completion_tokens += int(values["completion_tokens"])
++                self.total_tokens += int(values["total_tokens"])
+             else:
+                 self._usage_complete = False
+             self.token_usage_available = (
+-                self.successful_responses > 0 and self._usage_complete
++                self._usage_complete
++                and self._accounted_response_attempts == self.request_attempts
+             )
++        if deadline is not None:
++            deadline.check()
++        self._verify_transport_integrity()
++        choices = getattr(resp, "choices", None)
++        if type(choices) is not list or len(choices) != 1:
++            raise LLMResponseError("LLM response must contain exactly one choice")
++        choice = choices[0]
++        finish = getattr(choice, "finish_reason", None)
++        message = getattr(choice, "message", None)
++        if message is None or not hasattr(message, "content"):
++            raise LLMResponseError("LLM response message is malformed")
++        content = message.content
++        if type(finish) is str and finish == "length":
++            if content is not None and type(content) is not str:
++                raise LLMResponseError("LLM response content is malformed")
++            raise LLMOutputTruncatedError()
++        if type(finish) is not str or finish != "stop":
++            raise LLMResponseError("LLM response did not finish with stop")
++        if type(content) is not str:
++            raise LLMResponseError("LLM response content is not a string")
++        # These counters represent admitted text, not paid provider replies.
++        with self._usage_lock:
++            self.call_count += 1
++            self.successful_responses += 1
+         return content
+ 
+     def close(self) -> None:
+@@ -765,6 +795,7 @@ _OPENAI_LLM_ORIGINAL_IMPLEMENTATION_GUARD = tuple(
+ _OPENAI_LLM_ORIGINAL_HELPER_GUARD = (
+     current_deadline, with_retry, require_active_model, resolve_llm_api_key,
+     retry_module.retry_support_integrity,
++    LLMResponseError, LLMOutputTruncatedError,
+ )
+ 
+ 
+@@ -932,5 +963,6 @@ OPENAI_LLM_IMPLEMENTATION_SHA256 = compose_import_time_sha256(
+     ENDPOINT_POLICY_IMPLEMENTATION_SHA256,
+     MODEL_POLICY_IMPLEMENTATION_SHA256,
+     retry_module.EXTRACTION_IMPLEMENTATION_SHA256,
++    llm_module.EXTRACTION_IMPLEMENTATION_SHA256,
+     DEADLINE_IMPLEMENTATION_SHA256,
+ )
+diff --git a/hymem/dreaming/digest.py b/hymem/dreaming/digest.py
+index 89e1d5f..d48383c 100644
+--- a/hymem/dreaming/digest.py
++++ b/hymem/dreaming/digest.py
+@@ -18,7 +18,7 @@ from hymem.dreaming.procedures import ProceduresExtraction, validate_procedure_i
+ from hymem.dreaming.summary import clean_summary
+ from hymem.dreaming.summary_state import SUMMARY_FAILURE_REASONS
+ from hymem.extraction.jsonio import is_ceiling_cut, loads_exact_or_fenced
+-from hymem.extraction.llm import LLMClient, LLMRequest
++from hymem.extraction.llm import LLMClient, LLMRequest, LLMOutputTruncatedError
+ from hymem.extraction.prompts import (
+     SESSION_DIGEST_GRANULAR_SYSTEM,
+     SESSION_DIGEST_GRANULAR_USER_TEMPLATE,
+@@ -808,12 +808,14 @@ def extract_session_digest(
+             # only the rejected summary's length informs source-only recovery.
+             with _digest_failure_stage("summary_compaction"):
+                 repair_request = _build_digest_summary_repair_request(request, data["summary"])
+-                # The client interface has no typed provider-error boundary:
+-                # even RuntimeError can signal identity/accounting corruption.
+-                # All completion exceptions therefore remain fatal; only a
+-                # returned provider reply can be a summary-only degradation.
+-                repair_raw = llm.complete(repair_request)
+-                repaired_summary, failure = _validate_digest_summary_repair(repair_raw)
++                try:
++                    repair_raw = llm.complete(repair_request)
++                except LLMOutputTruncatedError:
++                    # Only this bounded provider rejection is summary-local.
++                    # Identity, transport and deadline failures remain fatal.
++                    repaired_summary, failure = None, "output_truncated"
++                else:
++                    repaired_summary, failure = _validate_digest_summary_repair(repair_raw)
+                 if failure is not None:
+                     result = _empty(reason=failure, stage="summary_compaction")
+                 else:
+diff --git a/hymem/dreaming/summary_recovery.py b/hymem/dreaming/summary_recovery.py
+index 8dcb647..b0668b9 100644
+--- a/hymem/dreaming/summary_recovery.py
++++ b/hymem/dreaming/summary_recovery.py
+@@ -27,7 +27,7 @@ from hymem.dreaming.lossless import covered_messages_after, lossless_cursor_is_v
+ from hymem.dreaming.summary import clean_summary
+ from hymem.dreaming.summary_state import classify_summary_state, mark_summary_current
+ from hymem.extraction.jsonio import is_ceiling_cut, loads_exact_or_fenced
+-from hymem.extraction.llm import LLMRequest, measure_provider_attempts
++from hymem.extraction.llm import LLMRequest, LLMOutputTruncatedError, measure_provider_attempts
+ from hymem.extraction.producer import (
+     canonical_callable_sha256, canonical_module_sha256, canonical_module_slice_sha256,
+     producer_binding_for_declaration,
+@@ -88,6 +88,7 @@ def _config(llm, max_chars, max_tokens, max_attempts):
+             _build_message_window, covered_messages_after, lossless_cursor_is_valid,
+             classify_summary_state, mark_summary_current, loads_exact_or_fenced, is_ceiling_cut,
+             _digest_summary_clause_assembly_is_meaningful, clean_summary,
++            LLMOutputTruncatedError,
+         ),
+         "producer": producer_binding_for_declaration(llm, declaration_hook="memory_producer_declaration"),
+         "chars": max_chars, "tokens": max_tokens, "attempts": max_attempts,
+@@ -354,15 +355,20 @@ def run_summary_recovery(
+                     _refresh_lock(conn, holder)
+                     report["calls"] += 1
+                     measurement = None
++                    truncated = False
+                     try:
+                         with measure_provider_attempts(client) as measurement:
+                             raw = client.complete(request)
++                    except LLMOutputTruncatedError:
++                        truncated = True
+                     finally:
+                         if measurement is not None:
+                             report["provider_attempts"] += measurement.attempts
+                             report["provider_attempts_exact"] &= measurement.exact
+                     guard()
+-                    summary, failure = _parse_summary(raw)
++                    summary, failure = (
++                        (None, "output_truncated") if truncated else _parse_summary(raw)
++                    )
+                     with db.transaction(conn):
+                         guard()
+                         _fence_context(conn, job)
+diff --git a/hymem/extraction/chunk.py b/hymem/extraction/chunk.py
+index 5848b37..41e83ae 100644
+--- a/hymem/extraction/chunk.py
++++ b/hymem/extraction/chunk.py
+@@ -24,6 +24,7 @@ from hymem.extraction.jsonio import (
+ from hymem.extraction.llm import (
+     LLMClient,
+     LLMRequest,
++    LLMOutputTruncatedError,
+     measure_provider_attempts,
+ )
+ from hymem.extraction.markers import (
+@@ -2633,6 +2634,10 @@ def extract_chunk(
+         try:
+             with measure_provider_attempts(client) as attempt_measurement:
+                 raw = client.complete(request)
++        except LLMOutputTruncatedError:
++            # Provider-confirmed length exhaustion may subdivide only the
++            # original source. Rejected partial text has no item authority.
++            return _failure("incomplete_response", "provider:finish_length"), None
+         except Exception as exc:
+             log.warning(
+                 "chunk_extraction.call_failure error_type=%s", type(exc).__name__
+diff --git a/hymem/extraction/contract.py b/hymem/extraction/contract.py
+index bba5f32..50b717a 100644
+--- a/hymem/extraction/contract.py
++++ b/hymem/extraction/contract.py
+@@ -355,7 +355,8 @@ def _contract_components(prompt_version: str) -> dict[str, Any]:
+                 "loads_strict_json",
+             ),
+             "llm": _module_source_digest(
+-                llm_module, "LLMRequest", "measure_provider_attempts"
++                llm_module, "LLMRequest", "measure_provider_attempts",
++                "LLMResponseError", "LLMOutputTruncatedError",
+             ),
+             "markers": _module_source_digest(
+                 markers_module,
+diff --git a/hymem/extraction/llm.py b/hymem/extraction/llm.py
+index 2746322..904f6e7 100644
+--- a/hymem/extraction/llm.py
++++ b/hymem/extraction/llm.py
+@@ -29,6 +29,17 @@ class LLMClient(Protocol):
+     def complete(self, request: LLMRequest) -> str: ...
+ 
+ 
++class LLMResponseError(RuntimeError):
++    """A received reply failed admission; resubmitting is not a transport retry."""
++
++
++class LLMOutputTruncatedError(LLMResponseError):
++    """Trusted finish=length evidence with no partial payload or item authority."""
++
++    def __init__(self) -> None:
++        super().__init__("LLM response exceeded its output budget")
++
++
+ class ProviderAttemptTracker:
+     """Exact request-attempt count for one caller-owned completion scope.
+ 
+diff --git a/tests/data/synthetic_r3_v17_indexing_failure.json b/tests/data/synthetic_r3_v17_indexing_failure.json
+new file mode 100644
+index 0000000..ed08ac7
+--- /dev/null
++++ b/tests/data/synthetic_r3_v17_indexing_failure.json
+@@ -0,0 +1,1587 @@
++{
++  "abstention_diagnostics": {
++    "abstention": {
++      "accuracy": null,
++      "benchmark_failures": 0,
++      "conditional_valid_accuracy": null,
++      "conditional_valid_count": 0,
++      "count": 0
++    },
++    "answerable": {
++      "accuracy": 0.0,
++      "benchmark_failures": 1,
++      "conditional_valid_accuracy": null,
++      "conditional_valid_count": 0,
++      "count": 1
++    },
++    "by_category": {
++      "multi-session": {
++        "abstention": {
++          "accuracy": null,
++          "benchmark_failures": 0,
++          "conditional_valid_accuracy": null,
++          "conditional_valid_count": 0,
++          "count": 0
++        },
++        "answerable": {
++          "accuracy": 0.0,
++          "benchmark_failures": 1,
++          "conditional_valid_accuracy": null,
++          "conditional_valid_count": 0,
++          "count": 1
++        }
++      }
++    }
++  },
++  "benchmark": "LongMemEval",
++  "conditional_judged_only": {
++    "accuracy": null,
++    "count": 0
++  },
++  "config": {
++    "aggregation_broad": false,
++    "aggregation_nodes": false,
++    "answer_endpoint_origin": "https://reader.example",
++    "answer_endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
++    "answer_extra_body_obj": {},
++    "answer_model": "reader",
++    "auto_ability": true,
++    "context_policy": {
++      "budget_unit": "utf8_bytes",
++      "gold_access": false,
++      "max_input_bytes": 60000,
++      "max_input_tokens": null,
++      "min_semantic_excerpt_alnum": 8,
++      "min_semantic_excerpt_chars": 12,
++      "name": "conservative-utf8-byte-query-head-tail-v2",
++      "provider_context_window_tokens": 65536,
++      "raw_evidence_reserve_fraction": 0.6,
++      "reserved_output_tokens": 1024,
++      "reserved_transport_overhead_tokens": 256,
++      "source_boundaries": [
++        "head",
++        "query-window",
++        "tail"
++      ],
++      "tokenizer": null,
++      "tokenizer_failure_policy": "not-applicable"
++    },
++    "dataset_expected_count": 1,
++    "dataset_revision": "fixture",
++    "dataset_sha256": "sha256:4b42b0f05718d6f739ab7bf97ec8a5c3d8d675a3a436ee56063ed9310a228fae",
++    "distill": false,
++    "distill_prompt_version": "v2",
++    "effective_hymem_config": {
++      "aggregation_inject_abilities": [
++        "TR"
++      ],
++      "aggregation_nodes_enabled": false,
++      "episode_granularity_enabled": false,
++      "extraction_contract": {
++        "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
++        "prompt_version": "v20",
++        "schema": "hymem-extraction-contract-sha256-v1"
++      },
++      "facts_enabled": true,
++      "facts_extraction_enabled": true,
++      "fts_top_k": 10,
++      "graph_multihop_decay": 0.5,
++      "graph_multihop_enabled": false,
++      "graph_multihop_max_hops": 2,
++      "graph_multihop_min_score": 0.05,
++      "graph_top_k": 10,
++      "message_fts_top_k": 15,
++      "prompt_version": "v20",
++      "rerank_message_hits": true,
++      "rerank_model": "llm",
++      "rerank_top_k": 20,
++      "rules_enabled": true,
++      "rules_extraction_enabled": false,
++      "value_supersession_enabled": true
++    },
++    "embedding_runtime": {
++      "backend": "none",
++      "configured": false,
++      "dimension": null,
++      "fallback_policy": "none",
++      "fallback_reason": null,
++      "identity_exact": true,
++      "network_free": true,
++      "producer_binding": {
++        "declaration": {
++          "kind": "disabled"
++        },
++        "identity_exact": true,
++        "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
++        "reuse_scope": "durable",
++        "schema": "hymem-embedding-producer-binding-v1"
++      },
++      "quality": "none",
++      "reuse_scope": "durable",
++      "schema": "hymem-public-embedding-identity-v1",
++      "transport_security": "none",
++      "vector_space_key": null
++    },
++    "embeddings": false,
++    "episode_granularity": false,
++    "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
++    "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
++    "evaluator_url": "https://github.com/xiaowu0162/LongMemEval/blob/9e0b455f4ef0e2ab8f2e582289761153549043fc/src/evaluation/evaluate_qa.py",
++    "exploratory_label_steering": false,
++    "exploratory_non_comparable": true,
++    "extraction_canary": {
++      "clean_empty_recovery_policy_version": "hymem-terminal-clean-empty-verification-v3",
++      "expected_claims": [
++        {
++          "object": "Fly.io",
++          "object_properties": {},
++          "object_type": "platform",
++          "polarity": 1,
++          "predicate": "deploys_to",
++          "source_message_id": 9271604311,
++          "subject": "HyMem Canary Relay",
++          "subject_properties": {},
++          "subject_type": "service",
++          "temporal_scope": null,
++          "value_numeric": null,
++          "value_text": null,
++          "value_unit": null
++        },
++        {
++          "object": "PostgreSQL",
++          "object_properties": {},
++          "object_type": "database",
++          "polarity": 1,
++          "predicate": "prefers",
++          "source_message_id": 9271604312,
++          "subject": "Avery Boundary Canary",
++          "subject_properties": {},
++          "subject_type": "person",
++          "temporal_scope": null,
++          "value_numeric": null,
++          "value_text": null,
++          "value_unit": null
++        }
++      ],
++      "expected_prepartition_leaves": 4,
++      "extraction_contract": {
++        "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
++        "prompt_version": "v20",
++        "schema": "hymem-extraction-contract-sha256-v1"
++      },
++      "fenced_code_control_sha256": "c11d7b0dbbb2492184ec94c43894ca2fc9ee3d2991b2878f296fb834da6db274",
++      "fixture_sha256": "3fedadfbcdf35a013f8f61c5ea3f6ccc3e150aca0d025d8597327704551e94de",
++      "fixture_version": "hymem-phase1-context-paths-four-leaf-v7",
++      "list_control_sha256": "e8f93e21ed6b8ea2df448e4ea2b3c7b09122838a2da3999f7c117ff3257a53e5",
++      "max_completion_calls": 24,
++      "max_provider_attempts": 72,
++      "minimum_pass_completion_calls": 8,
++      "normal_execution_path": {
++        "empty_verification_requests": 2,
++        "fenced_code_control_atomic_requests": 2,
++        "fenced_code_control_probe_atomic": true,
++        "list_control_atomic_requests": 2,
++        "list_control_probe_atomic": true,
++        "omission_verification_requests": 2,
++        "parsed_source_records": 8,
++        "primary_requests": 4,
++        "prose_claim_exact_context_emissions": 1,
++        "prose_claim_exact_context_requests": 2,
++        "prose_claim_requests": 2,
++        "prose_claim_self_contained_requests": 0,
++        "prose_claim_wrong_context_emissions": 0,
++        "protected_control_split_boundaries": 0,
++        "source_message_ids_seen": [
++          9271604311,
++          9271604312
++        ],
++        "source_record_parse_failures": 0,
++        "table_claim_exact_context_emissions": 1,
++        "table_claim_exact_context_requests": 2,
++        "table_claim_requests": 2,
++        "table_claim_self_contained_requests": 0,
++        "table_claim_wrong_context_emissions": 0
++      },
++      "normal_pass_completion_calls": 8,
++      "prompt_version": "v20",
++      "prose_boundary_claim_sha256": "aeebb66034c889372c5f7a81cabd8891fc0126f9ad286825663ac3a047c4d17a",
++      "required_before_indexing": true,
++      "scope": "once_per_pending_run_configuration",
++      "source_content_chars": 10349,
++      "source_message_ids": [
++        9271604311,
++        9271604312
++      ],
++      "source_split_policy_version": "hymem-source-semantic-split-v10",
++      "store_writes": 0,
++      "structural_control_probe_version": "hymem-phase1-markdown-atom-split-probe-v1",
++      "table_continuation_claim_sha256": "b0101bc38d69ab81541575a131a2d202037f0b8f489b9e07bfa22baf943cc13d",
++      "usage_accounting": "excluded_from_scored_usage_dedicated_memory_pipeline_client",
++      "version": "hymem-phase1-extraction-canary-v17"
++    },
++    "facts": null,
++    "facts_extraction": null,
++    "graph_facts_first": false,
++    "graph_multihop": false,
++    "graph_multihop_decay": null,
++    "graph_multihop_max_hops": null,
++    "graph_multihop_min_score": null,
++    "historical_local_judge_prompts_exact_official": false,
++    "hymem_endpoint_origin": "https://pipeline.example",
++    "hymem_endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++    "hymem_model": "pipeline",
++    "hymem_thinking": "off",
++    "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1",
++    "indexing_max_cycles": 4,
++    "indexing_require_healthy": true,
++    "indexing_timeout_s": 900.0,
++    "judge_endpoint_origin": "https://judge.example",
++    "judge_endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
++    "judge_extra_body_obj": {},
++    "judge_model": "judge",
++    "judge_protocol": "legacy-custom",
++    "judge_transport_retry_policy": "bounded-three-attempt-backoff-v1",
++    "label_free_answer_path": true,
++    "max_input_bytes": 60000,
++    "max_input_tokens": null,
++    "no_dream": false,
++    "official_denominator_validated": false,
++    "official_judge_endpoint_origin": "https://api.openai.com",
++    "official_judge_endpoint_sha256": "sha256:d9617135d6fdd0a2cde722d637a1dfcc3da37515708b3ea5d66ae607c8ac785e",
++    "official_judge_match": false,
++    "official_transport_exact": false,
++    "official_transport_retry_policy": "unbounded-openai-backoff-v1",
++    "permissive_default": false,
++    "prereg": null,
++    "provider_context_tokens": 65536,
++    "rerank_message_hits": null,
++    "rerank_model": null,
++    "rerank_top_k": null,
++    "retrieval_only": false,
++    "retrieval_usage_owner": "none",
++    "rules": null,
++    "rules_extraction": null,
++    "sample": 1,
++    "sample_strategy": "sha256-seed-source-index-preserve-order-v1",
++    "scales": "S",
++    "scored_run": true,
++    "seed": 7,
++    "source_ids_hash": "sha256:190602be17c532f8704d8cf4cae55a8d11dee659b00d167b26b4c0c41eae1411",
++    "source_order_validated": false,
++    "source_qtype_counts": {
++      "multi-session": 1
++    },
++    "subset_run": true,
++    "top_k": 15,
++    "value_supersession": true,
++    "workers": 1
++  },
++  "date": "2026-09-04T12:00:00+00:00",
++  "execution": {
++    "checkpoint": {
++      "schema": "hymem-benchmark-checkpoint-attestation-v1",
++      "state": {
++        "checkpoint_schema": "hymem-benchmark-checkpoint-v1",
++        "counts": {
++          "attempted": 1,
++          "completed": 0,
++          "expected": 1,
++          "failed": 1,
++          "missing": 0,
++          "total_attempts": 1,
++          "unique_attempted": 1
++        },
++        "entries": [
++          {
++            "attempts": 1,
++            "question_id": "qid",
++            "row_sha256": "sha256:fc877bdf629607499d873c4f6c3950bfaab02546fa2db35e1c05672896cb05aa",
++            "status": "failed"
++          }
++        ],
++        "expected_ids": [
++          "qid"
++        ],
++        "failure_ids": [
++          "qid"
++        ],
++        "manifest_sha256": "sha256:f2cbd290be8932ac0bd80c857a72bc2b94754b7fd09b959bb266a229928cb54b",
++        "rows_sha256": "sha256:edd6248addeab5bcd962e4fd0bf1117ee77bb3cfc23fffd981aa11451e0a837a",
++        "run_id": "sha256:08c4b07aa4525aab02a1d9efd502c7431ea3674467da3b7177705acf621f615e",
++        "scored": true,
++        "segments_sha256": "sha256:57c6cd8e583010b40741e5dc0e02fec8548ef94cd4c21a9b5f73df536962db17",
++        "status": "complete",
++        "verdict_key": "correct"
++      },
++      "state_sha256": "sha256:28adb0c963bf29648f20d61b67c9b79d031b62984952eb09ddd957ea7a0b1273"
++    },
++    "counts": {
++      "attempted": 1,
++      "completed": 0,
++      "expected": 1,
++      "failed": 1,
++      "missing": 0,
++      "total_attempts": 1,
++      "unique_attempted": 1
++    },
++    "segments": [
++      {
++        "attempted_attempts": 1,
++        "elapsed_s": 1.0,
++        "embedding_usage": {
++          "backend": "none",
++          "calls": 0,
++          "calls_available": true,
++          "configured": false,
++          "cost_available": false,
++          "cost_usd": null,
++          "dimension": null,
++          "identity_available": true,
++          "identity_exact": true,
++          "input_characters": 0,
++          "input_characters_available": true,
++          "input_count": 0,
++          "input_count_available": true,
++          "latency_available": true,
++          "latency_s": 0.0,
++          "model": null,
++          "network_free": true,
++          "prompt_tokens": null,
++          "provider_token_usage_available": false,
++          "quality": "none",
++          "request_attempts": 0,
++          "request_attempts_available": true,
++          "reuse_scope": "durable",
++          "successful_responses": 0,
++          "successful_responses_available": true,
++          "total_tokens": null
++        },
++        "extraction_canary": {
++          "claim_evidence": [
++            {
++              "expected_claim_index": 0,
++              "object": "Fly.io",
++              "object_properties": {},
++              "object_type": "platform",
++              "polarity": 1,
++              "predicate": "deploys_to",
++              "source_message_id": 9271604311,
++              "subject": "HyMem Canary Relay",
++              "subject_properties": {},
++              "subject_type": "service",
++              "temporal_scope": null,
++              "value_numeric": null,
++              "value_text": null,
++              "value_unit": null
++            },
++            {
++              "expected_claim_index": 1,
++              "object": "PostgreSQL",
++              "object_properties": {},
++              "object_type": "database",
++              "polarity": 1,
++              "predicate": "prefers",
++              "source_message_id": 9271604312,
++              "subject": "Avery Boundary Canary",
++              "subject_properties": {},
++              "subject_type": "person",
++              "temporal_scope": null,
++              "value_numeric": null,
++              "value_text": null,
++              "value_unit": null
++            }
++          ],
++          "clean_empty_recovery_policy_version": "hymem-terminal-clean-empty-verification-v3",
++          "client": {
++            "client_class": "fixture.CanaryClient",
++            "effective_extra_body": {},
++            "endpoint_origin": "https://pipeline.example",
++            "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++            "model": "pipeline",
++            "thinking_mode": "off"
++          },
++          "client_closed": true,
++          "completion_calls": 8,
++          "duplicate_triples_collapsed": 0,
++          "execution_path": {
++            "empty_verification_requests": 2,
++            "fenced_code_control_atomic_requests": 2,
++            "fenced_code_control_probe_atomic": true,
++            "list_control_atomic_requests": 2,
++            "list_control_probe_atomic": true,
++            "omission_verification_requests": 2,
++            "parsed_source_records": 8,
++            "primary_requests": 4,
++            "prose_claim_exact_context_emissions": 1,
++            "prose_claim_exact_context_requests": 2,
++            "prose_claim_requests": 2,
++            "prose_claim_self_contained_requests": 0,
++            "prose_claim_wrong_context_emissions": 0,
++            "protected_control_split_boundaries": 0,
++            "source_message_ids_seen": [
++              9271604311,
++              9271604312
++            ],
++            "source_record_parse_failures": 0,
++            "table_claim_exact_context_emissions": 1,
++            "table_claim_exact_context_requests": 2,
++            "table_claim_requests": 2,
++            "table_claim_self_contained_requests": 0,
++            "table_claim_wrong_context_emissions": 0
++          },
++          "expected_claims": [
++            {
++              "object": "Fly.io",
++              "object_properties": {},
++              "object_type": "platform",
++              "polarity": 1,
++              "predicate": "deploys_to",
++              "source_message_id": 9271604311,
++              "subject": "HyMem Canary Relay",
++              "subject_properties": {},
++              "subject_type": "service",
++              "temporal_scope": null,
++              "value_numeric": null,
++              "value_text": null,
++              "value_unit": null
++            },
++            {
++              "object": "PostgreSQL",
++              "object_properties": {},
++              "object_type": "database",
++              "polarity": 1,
++              "predicate": "prefers",
++              "source_message_id": 9271604312,
++              "subject": "Avery Boundary Canary",
++              "subject_properties": {},
++              "subject_type": "person",
++              "temporal_scope": null,
++              "value_numeric": null,
++              "value_text": null,
++              "value_unit": null
++            }
++          ],
++          "expected_prepartition_leaves": 4,
++          "extraction_contract": {
++            "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
++            "prompt_version": "v20",
++            "schema": "hymem-extraction-contract-sha256-v1"
++          },
++          "fenced_code_control_sha256": "c11d7b0dbbb2492184ec94c43894ca2fc9ee3d2991b2878f296fb834da6db274",
++          "fixture_sha256": "3fedadfbcdf35a013f8f61c5ea3f6ccc3e150aca0d025d8597327704551e94de",
++          "fixture_version": "hymem-phase1-context-paths-four-leaf-v7",
++          "initial_prepartition_leaves": 4,
++          "list_control_sha256": "e8f93e21ed6b8ea2df448e4ea2b3c7b09122838a2da3999f7c117ff3257a53e5",
++          "matched_supported_claims": 2,
++          "max_completion_calls": 24,
++          "max_provider_attempts": 72,
++          "minimum_pass_completion_calls": 8,
++          "missing_expected_claim_indexes": [],
++          "normal_execution_path": {
++            "empty_verification_requests": 2,
++            "fenced_code_control_atomic_requests": 2,
++            "fenced_code_control_probe_atomic": true,
++            "list_control_atomic_requests": 2,
++            "list_control_probe_atomic": true,
++            "omission_verification_requests": 2,
++            "parsed_source_records": 8,
++            "primary_requests": 4,
++            "prose_claim_exact_context_emissions": 1,
++            "prose_claim_exact_context_requests": 2,
++            "prose_claim_requests": 2,
++            "prose_claim_self_contained_requests": 0,
++            "prose_claim_wrong_context_emissions": 0,
++            "protected_control_split_boundaries": 0,
++            "source_message_ids_seen": [
++              9271604311,
++              9271604312
++            ],
++            "source_record_parse_failures": 0,
++            "table_claim_exact_context_emissions": 1,
++            "table_claim_exact_context_requests": 2,
++            "table_claim_requests": 2,
++            "table_claim_self_contained_requests": 0,
++            "table_claim_wrong_context_emissions": 0
++          },
++          "normal_pass_completion_calls": 8,
++          "prompt_version": "v20",
++          "prose_boundary_claim_sha256": "aeebb66034c889372c5f7a81cabd8891fc0126f9ad286825663ac3a047c4d17a",
++          "provider_attempts": 8,
++          "required_before_indexing": true,
++          "scope": "once_per_pending_run_configuration",
++          "source_content_chars": 10349,
++          "source_message_ids": [
++            9271604311,
++            9271604312
++          ],
++          "source_split_policy_version": "hymem-source-semantic-split-v10",
++          "status": "passed",
++          "store_writes": 0,
++          "structural_control_probe_version": "hymem-phase1-markdown-atom-split-probe-v1",
++          "table_continuation_claim_sha256": "b0101bc38d69ab81541575a131a2d202037f0b8f489b9e07bfa22baf943cc13d",
++          "usage": {
++            "calls": 8,
++            "calls_available": true,
++            "completion_tokens": 0,
++            "cost_available": true,
++            "cost_usd": 0.0,
++            "latency_available": true,
++            "latency_s": 0.0,
++            "prompt_tokens": 20,
++            "request_attempts": 8,
++            "request_attempts_available": true,
++            "successful_responses": 8,
++            "successful_responses_available": true,
++            "token_usage_available": true,
++            "total_tokens": 20
++          },
++          "usage_accounting": "excluded_from_scored_usage_dedicated_memory_pipeline_client",
++          "valid_markers_returned": 0,
++          "valid_triples_returned": 2,
++          "version": "hymem-phase1-extraction-canary-v17"
++        },
++        "indexing_runs": [
++          {
++            "question_id": "qid",
++            "summary": {
++              "cleanup_errors": [],
++              "complete": false,
++              "cycles": 1,
++              "elapsed_s": 1.0,
++              "failure": {
++                "code": "coverage_integrity_failure",
++                "exception_type": null
++              },
++              "final_status": {
++                "aggregation_generation": {
++                  "enabled": false,
++                  "generation_binding": null,
++                  "generation_key": null,
++                  "identity_exact": null,
++                  "producer_identity_sha256": null
++                },
++                "aggregation_material": {
++                  "enabled": false,
++                  "identity_exact": null,
++                  "material_binding": null,
++                  "material_epoch_key": null,
++                  "material_revision": null
++                },
++                "benchmark_indexing_status_schema": "hymem-benchmark-indexing-status-v4",
++                "coverage_integrity": {
++                  "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
++                  "details": [
++                    {
++                      "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
++                      "failure_reason": "source_stream_invalid",
++                      "first_detected_at": "2026-09-05 10:00:00",
++                      "last_detected_at": "2026-09-05 10:01:00",
++                      "occurrences": 2,
++                      "session_id_hash": "sha256:bfa06a6cba57128c60796a31732064556b6a977a6325114dd768c6c79dab01b7"
++                    }
++                  ],
++                  "details_truncated": false,
++                  "failures": 1,
++                  "reasons": {
++                    "source_stream_invalid": 1
++                  }
++                },
++                "dream_status_schema": "hymem-dream-status-v8",
++                "in_progress": false,
++                "malformed": {
++                  "malformed_digests": 0,
++                  "malformed_facts": 0,
++                  "malformed_profiles": 0,
++                  "malformed_source_materialization": 0,
++                  "malformed_summaries": 0
++                },
++                "pending": {
++                  "pending_aggregation": 0,
++                  "pending_chunk_embeddings": 0,
++                  "pending_chunks": 0,
++                  "pending_digests": 0,
++                  "pending_edge_embeddings": 0,
++                  "pending_episode_embeddings": 0,
++                  "pending_fact_embeddings": 0,
++                  "pending_facts": 0,
++                  "pending_message_embeddings": 0,
++                  "pending_profiles": 0,
++                  "pending_source_materialization": 0
++                },
++                "pending_chunks_authoritative": true,
++                "phase1_backlog_status": "current_producer",
++                "phase1_generation_key": "hymem-phase1-generation-v1:1111111111111111111111111111111111111111111111111111111111111111",
++                "quarantined": {
++                  "quarantined_chunks": 0,
++                  "quarantined_digests": 0,
++                  "quarantined_facts": 0,
++                  "quarantined_facts_malformed": 0,
++                  "quarantined_profiles": 0
++                },
++                "summary_health": {
++                  "malformed_summaries": 0,
++                  "summary_degraded_sessions": 0,
++                  "summary_healthy": true,
++                  "summary_missing_sessions": 0
++                },
++                "terminal_loss": {
++                  "chunks": 0,
++                  "reasons": {}
++                }
++              },
++              "healthy": false,
++              "max_cycles": 2,
++              "outcome": "failure",
++              "reports": [
++                {
++                  "aggregation_blocking": "",
++                  "aggregation_build_exceptions": 0,
++                  "aggregation_facts_rekey": null,
++                  "aggregation_fusion_failures": 0,
++                  "aggregation_input_episodes": 0,
++                  "aggregation_keying_residual": null,
++                  "aggregation_leaf_added": null,
++                  "aggregation_leaf_changed": null,
++                  "aggregation_leaf_removed": null,
++                  "aggregation_level0_missed": null,
++                  "aggregation_nodes_built": 0,
++                  "aggregation_nodes_reused": 0,
++                  "aggregation_predicted_rebuild": null,
++                  "aggregation_rebuilt_level0": null,
++                  "aggregation_rebuilt_rollup": null,
++                  "aggregation_rebuilt_root": null,
++                  "budget_exhausted": false,
++                  "chunk_extraction_completion_calls": 0,
++                  "chunk_extraction_failures": 0,
++                  "chunk_extraction_provider_attempts": 0,
++                  "chunks_embedded": 0,
++                  "chunks_embedded_from_cache": 0,
++                  "chunks_processed": 0,
++                  "chunks_seen": 0,
++                  "coverage_integrity_failures": 1,
++                  "digest_failures": 0,
++                  "digest_quarantined": 0,
++                  "edges_embedded": 0,
++                  "edges_embedded_from_cache": 0,
++                  "episodes_created": 0,
++                  "episodes_embedded": 0,
++                  "episodes_embedded_from_cache": 0,
++                  "extraction_provider_attempt_budget_exhausted": false,
++                  "fact_failures": 0,
++                  "facts_embedded": 0,
++                  "facts_embedded_from_cache": 0,
++                  "facts_extracted": 0,
++                  "markers_extracted": 0,
++                  "messages_embedded": 0,
++                  "messages_embedded_from_cache": 0,
++                  "profile_failures": 0,
++                  "profile_items_extracted": 0,
++                  "rules_extracted": 0,
++                  "sessions_processed": 0,
++                  "skipped_locked": false,
++                  "triples_extracted": 0
++                }
++              ],
++              "schema": "hymem-lme-indexing-summary-v6",
++              "summary_healthy": true,
++              "timeout_s": 10.0
++            }
++          }
++        ],
++        "judge_usage": {
++          "calls": 0,
++          "calls_available": true,
++          "completion_tokens": 0,
++          "cost_available": true,
++          "cost_usd": 0.0,
++          "latency_available": true,
++          "latency_s": 0.0,
++          "prompt_tokens": 0,
++          "request_attempts": 0,
++          "request_attempts_available": true,
++          "successful_responses": 0,
++          "successful_responses_available": true,
++          "token_usage_available": true,
++          "total_tokens": 0
++        },
++        "latest_indexing": {
++          "question_id": "qid",
++          "summary": {
++            "cleanup_errors": [],
++            "complete": false,
++            "cycles": 1,
++            "elapsed_s": 1.0,
++            "failure": {
++              "code": "coverage_integrity_failure",
++              "exception_type": null
++            },
++            "final_status": {
++              "aggregation_generation": {
++                "enabled": false,
++                "generation_binding": null,
++                "generation_key": null,
++                "identity_exact": null,
++                "producer_identity_sha256": null
++              },
++              "aggregation_material": {
++                "enabled": false,
++                "identity_exact": null,
++                "material_binding": null,
++                "material_epoch_key": null,
++                "material_revision": null
++              },
++              "benchmark_indexing_status_schema": "hymem-benchmark-indexing-status-v4",
++              "coverage_integrity": {
++                "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
++                "details": [
++                  {
++                    "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
++                    "failure_reason": "source_stream_invalid",
++                    "first_detected_at": "2026-09-05 10:00:00",
++                    "last_detected_at": "2026-09-05 10:01:00",
++                    "occurrences": 2,
++                    "session_id_hash": "sha256:bfa06a6cba57128c60796a31732064556b6a977a6325114dd768c6c79dab01b7"
++                  }
++                ],
++                "details_truncated": false,
++                "failures": 1,
++                "reasons": {
++                  "source_stream_invalid": 1
++                }
++              },
++              "dream_status_schema": "hymem-dream-status-v8",
++              "in_progress": false,
++              "malformed": {
++                "malformed_digests": 0,
++                "malformed_facts": 0,
++                "malformed_profiles": 0,
++                "malformed_source_materialization": 0,
++                "malformed_summaries": 0
++              },
++              "pending": {
++                "pending_aggregation": 0,
++                "pending_chunk_embeddings": 0,
++                "pending_chunks": 0,
++                "pending_digests": 0,
++                "pending_edge_embeddings": 0,
++                "pending_episode_embeddings": 0,
++                "pending_fact_embeddings": 0,
++                "pending_facts": 0,
++                "pending_message_embeddings": 0,
++                "pending_profiles": 0,
++                "pending_source_materialization": 0
++              },
++              "pending_chunks_authoritative": true,
++              "phase1_backlog_status": "current_producer",
++              "phase1_generation_key": "hymem-phase1-generation-v1:1111111111111111111111111111111111111111111111111111111111111111",
++              "quarantined": {
++                "quarantined_chunks": 0,
++                "quarantined_digests": 0,
++                "quarantined_facts": 0,
++                "quarantined_facts_malformed": 0,
++                "quarantined_profiles": 0
++              },
++              "summary_health": {
++                "malformed_summaries": 0,
++                "summary_degraded_sessions": 0,
++                "summary_healthy": true,
++                "summary_missing_sessions": 0
++              },
++              "terminal_loss": {
++                "chunks": 0,
++                "reasons": {}
++              }
++            },
++            "healthy": false,
++            "max_cycles": 2,
++            "outcome": "failure",
++            "reports": [
++              {
++                "aggregation_blocking": "",
++                "aggregation_build_exceptions": 0,
++                "aggregation_facts_rekey": null,
++                "aggregation_fusion_failures": 0,
++                "aggregation_input_episodes": 0,
++                "aggregation_keying_residual": null,
++                "aggregation_leaf_added": null,
++                "aggregation_leaf_changed": null,
++                "aggregation_leaf_removed": null,
++                "aggregation_level0_missed": null,
++                "aggregation_nodes_built": 0,
++                "aggregation_nodes_reused": 0,
++                "aggregation_predicted_rebuild": null,
++                "aggregation_rebuilt_level0": null,
++                "aggregation_rebuilt_rollup": null,
++                "aggregation_rebuilt_root": null,
++                "budget_exhausted": false,
++                "chunk_extraction_completion_calls": 0,
++                "chunk_extraction_failures": 0,
++                "chunk_extraction_provider_attempts": 0,
++                "chunks_embedded": 0,
++                "chunks_embedded_from_cache": 0,
++                "chunks_processed": 0,
++                "chunks_seen": 0,
++                "coverage_integrity_failures": 1,
++                "digest_failures": 0,
++                "digest_quarantined": 0,
++                "edges_embedded": 0,
++                "edges_embedded_from_cache": 0,
++                "episodes_created": 0,
++                "episodes_embedded": 0,
++                "episodes_embedded_from_cache": 0,
++                "extraction_provider_attempt_budget_exhausted": false,
++                "fact_failures": 0,
++                "facts_embedded": 0,
++                "facts_embedded_from_cache": 0,
++                "facts_extracted": 0,
++                "markers_extracted": 0,
++                "messages_embedded": 0,
++                "messages_embedded_from_cache": 0,
++                "profile_failures": 0,
++                "profile_items_extracted": 0,
++                "rules_extracted": 0,
++                "sessions_processed": 0,
++                "skipped_locked": false,
++                "triples_extracted": 0
++              }
++            ],
++            "schema": "hymem-lme-indexing-summary-v6",
++            "summary_healthy": true,
++            "timeout_s": 10.0
++          }
++        },
++        "memory_pipeline_usage": {
++          "calls": 0,
++          "calls_available": true,
++          "completion_tokens": 0,
++          "cost_available": true,
++          "cost_usd": 0.0,
++          "latency_available": true,
++          "latency_s": 0.0,
++          "prompt_tokens": 0,
++          "request_attempts": 0,
++          "request_attempts_available": true,
++          "successful_responses": 0,
++          "successful_responses_available": true,
++          "token_usage_available": true,
++          "total_tokens": 0
++        },
++        "model_identities": {
++          "embedding": {
++            "backend": "none",
++            "configured": false,
++            "dimension": null,
++            "fallback_policy": "none",
++            "fallback_reason": null,
++            "identity_exact": true,
++            "network_free": true,
++            "producer_binding": {
++              "declaration": {
++                "kind": "disabled"
++              },
++              "identity_exact": true,
++              "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
++              "reuse_scope": "durable",
++              "schema": "hymem-embedding-producer-binding-v1"
++            },
++            "quality": "none",
++            "reuse_scope": "durable",
++            "schema": "hymem-public-embedding-identity-v1",
++            "transport_security": "none",
++            "vector_space_key": null
++          },
++          "judge": {
++            "endpoint_origin": "https://judge.example",
++            "endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
++            "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
++            "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
++            "extra_body": {},
++            "max_tokens": 10,
++            "model": "judge",
++            "n": null,
++            "prompt_exact_official": false,
++            "protocol": "legacy-custom",
++            "provider": "openai-compatible",
++            "retry_policy": "bounded-three-attempt-backoff-v1",
++            "temperature": 0.0,
++            "verdict_parser": "anchored-exclusive-yes-no-local-v1"
++          },
++          "memory_pipeline": {
++            "aggregation_producer": {
++              "declaration": {
++                "client_id": "hymem.contrib.openai_client.OpenAICompatibleClient",
++                "effective_request": {
++                  "schema": "hymem-phase1-nested-identity-sha256-v1",
++                  "sha256": "sha256:62732fda9c5ed4272f7a2e0af03da9a280ab6347322be3b4b5ecb87e43da7734"
++                },
++                "endpoint_origin": "https://pipeline.example",
++                "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++                "implementation": "sha256:369e75a84adf10ca25b037439f2f61b982433ad851bbe51a80b7c1a601c5e830",
++                "model": "pipeline",
++                "retry_policy": {
++                  "schema": "hymem-phase1-nested-identity-sha256-v1",
++                  "sha256": "sha256:ca0dd0cb7ac4c1c0c4c088e3f494a42460c166533c80ea9e6143206721bc864e"
++                },
++                "schema": "hymem-aggregation-producer-declaration-v1"
++              },
++              "identity_exact": true,
++              "identity_sha256": "sha256:82140a507a09f1d8468a76c26fbd22db33bbb90125a05151f0cd05a89f3d9e66",
++              "reuse_scope": "durable",
++              "schema": "hymem-phase1-producer-binding-v1"
++            },
++            "deployment_revision_sha256": "sha256:bb5e3948036d1e0ec84a33b16b02d8730709c6586fca6433c55c10bcfd682497",
++            "deployment_tenant_sha256": "sha256:3373a114fe3468218a3db97972b38c3f82f9fd098df5d4438e6de6c36b07c937",
++            "effective_extra_body": {},
++            "endpoint_origin": "https://pipeline.example",
++            "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++            "model": "pipeline",
++            "provider": "openai-compatible",
++            "request_timeout_seconds": 120.0,
++            "thinking_mode": "off",
++            "transport_package_version": "test-openai-1"
++          },
++          "reader": {
++            "endpoint_origin": "https://reader.example",
++            "endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
++            "extra_body": {},
++            "max_tokens": 1024,
++            "model": "reader",
++            "provider": "openai-compatible",
++            "temperature": 0.0
++          }
++        },
++        "reader_usage": {
++          "calls": 0,
++          "calls_available": true,
++          "completion_tokens": 0,
++          "cost_available": true,
++          "cost_usd": 0.0,
++          "latency_available": true,
++          "latency_s": 0.0,
++          "prompt_tokens": 0,
++          "request_attempts": 0,
++          "request_attempts_available": true,
++          "successful_responses": 0,
++          "successful_responses_available": true,
++          "token_usage_available": true,
++          "total_tokens": 0
++        },
++        "retrieval_usage": {
++          "calls": 0,
++          "calls_available": true,
++          "completion_tokens": 0,
++          "cost_available": true,
++          "cost_usd": 0.0,
++          "latency_available": true,
++          "latency_s": 0.0,
++          "prompt_tokens": 0,
++          "request_attempts": 0,
++          "request_attempts_available": true,
++          "successful_responses": 0,
++          "successful_responses_available": true,
++          "token_usage_available": true,
++          "total_tokens": 0
++        },
++        "segment_id": "segment-a",
++        "status": "complete"
++      }
++    ]
++  },
++  "manifest": {
++    "benchmark": "LongMemEval",
++    "calibration_receipt_hash": null,
++    "code_hash": "sha256:4a1933b06cf695fcff4acaba1fdbaa7f10ce109d3c7f57bbf62f6bb572658de8",
++    "config": {
++      "aggregation_broad": false,
++      "aggregation_nodes": false,
++      "answer_endpoint_origin": "https://reader.example",
++      "answer_endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
++      "answer_extra_body_obj": {},
++      "answer_model": "reader",
++      "auto_ability": true,
++      "context_policy": {
++        "budget_unit": "utf8_bytes",
++        "gold_access": false,
++        "max_input_bytes": 60000,
++        "max_input_tokens": null,
++        "min_semantic_excerpt_alnum": 8,
++        "min_semantic_excerpt_chars": 12,
++        "name": "conservative-utf8-byte-query-head-tail-v2",
++        "provider_context_window_tokens": 65536,
++        "raw_evidence_reserve_fraction": 0.6,
++        "reserved_output_tokens": 1024,
++        "reserved_transport_overhead_tokens": 256,
++        "source_boundaries": [
++          "head",
++          "query-window",
++          "tail"
++        ],
++        "tokenizer": null,
++        "tokenizer_failure_policy": "not-applicable"
++      },
++      "dataset_expected_count": 1,
++      "dataset_revision": "fixture",
++      "dataset_sha256": "sha256:4b42b0f05718d6f739ab7bf97ec8a5c3d8d675a3a436ee56063ed9310a228fae",
++      "distill": false,
++      "distill_prompt_version": "v2",
++      "effective_hymem_config": {
++        "aggregation_inject_abilities": [
++          "TR"
++        ],
++        "aggregation_nodes_enabled": false,
++        "episode_granularity_enabled": false,
++        "extraction_contract": {
++          "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
++          "prompt_version": "v20",
++          "schema": "hymem-extraction-contract-sha256-v1"
++        },
++        "facts_enabled": true,
++        "facts_extraction_enabled": true,
++        "fts_top_k": 10,
++        "graph_multihop_decay": 0.5,
++        "graph_multihop_enabled": false,
++        "graph_multihop_max_hops": 2,
++        "graph_multihop_min_score": 0.05,
++        "graph_top_k": 10,
++        "message_fts_top_k": 15,
++        "prompt_version": "v20",
++        "rerank_message_hits": true,
++        "rerank_model": "llm",
++        "rerank_top_k": 20,
++        "rules_enabled": true,
++        "rules_extraction_enabled": false,
++        "value_supersession_enabled": true
++      },
++      "embedding_runtime": {
++        "backend": "none",
++        "configured": false,
++        "dimension": null,
++        "fallback_policy": "none",
++        "fallback_reason": null,
++        "identity_exact": true,
++        "network_free": true,
++        "producer_binding": {
++          "declaration": {
++            "kind": "disabled"
++          },
++          "identity_exact": true,
++          "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
++          "reuse_scope": "durable",
++          "schema": "hymem-embedding-producer-binding-v1"
++        },
++        "quality": "none",
++        "reuse_scope": "durable",
++        "schema": "hymem-public-embedding-identity-v1",
++        "transport_security": "none",
++        "vector_space_key": null
++      },
++      "embeddings": false,
++      "episode_granularity": false,
++      "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
++      "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
++      "evaluator_url": "https://github.com/xiaowu0162/LongMemEval/blob/9e0b455f4ef0e2ab8f2e582289761153549043fc/src/evaluation/evaluate_qa.py",
++      "exploratory_label_steering": false,
++      "exploratory_non_comparable": true,
++      "extraction_canary": {
++        "clean_empty_recovery_policy_version": "hymem-terminal-clean-empty-verification-v3",
++        "expected_claims": [
++          {
++            "object": "Fly.io",
++            "object_properties": {},
++            "object_type": "platform",
++            "polarity": 1,
++            "predicate": "deploys_to",
++            "source_message_id": 9271604311,
++            "subject": "HyMem Canary Relay",
++            "subject_properties": {},
++            "subject_type": "service",
++            "temporal_scope": null,
++            "value_numeric": null,
++            "value_text": null,
++            "value_unit": null
++          },
++          {
++            "object": "PostgreSQL",
++            "object_properties": {},
++            "object_type": "database",
++            "polarity": 1,
++            "predicate": "prefers",
++            "source_message_id": 9271604312,
++            "subject": "Avery Boundary Canary",
++            "subject_properties": {},
++            "subject_type": "person",
++            "temporal_scope": null,
++            "value_numeric": null,
++            "value_text": null,
++            "value_unit": null
++          }
++        ],
++        "expected_prepartition_leaves": 4,
++        "extraction_contract": {
++          "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
++          "prompt_version": "v20",
++          "schema": "hymem-extraction-contract-sha256-v1"
++        },
++        "fenced_code_control_sha256": "c11d7b0dbbb2492184ec94c43894ca2fc9ee3d2991b2878f296fb834da6db274",
++        "fixture_sha256": "3fedadfbcdf35a013f8f61c5ea3f6ccc3e150aca0d025d8597327704551e94de",
++        "fixture_version": "hymem-phase1-context-paths-four-leaf-v7",
++        "list_control_sha256": "e8f93e21ed6b8ea2df448e4ea2b3c7b09122838a2da3999f7c117ff3257a53e5",
++        "max_completion_calls": 24,
++        "max_provider_attempts": 72,
++        "minimum_pass_completion_calls": 8,
++        "normal_execution_path": {
++          "empty_verification_requests": 2,
++          "fenced_code_control_atomic_requests": 2,
++          "fenced_code_control_probe_atomic": true,
++          "list_control_atomic_requests": 2,
++          "list_control_probe_atomic": true,
++          "omission_verification_requests": 2,
++          "parsed_source_records": 8,
++          "primary_requests": 4,
++          "prose_claim_exact_context_emissions": 1,
++          "prose_claim_exact_context_requests": 2,
++          "prose_claim_requests": 2,
++          "prose_claim_self_contained_requests": 0,
++          "prose_claim_wrong_context_emissions": 0,
++          "protected_control_split_boundaries": 0,
++          "source_message_ids_seen": [
++            9271604311,
++            9271604312
++          ],
++          "source_record_parse_failures": 0,
++          "table_claim_exact_context_emissions": 1,
++          "table_claim_exact_context_requests": 2,
++          "table_claim_requests": 2,
++          "table_claim_self_contained_requests": 0,
++          "table_claim_wrong_context_emissions": 0
++        },
++        "normal_pass_completion_calls": 8,
++        "prompt_version": "v20",
++        "prose_boundary_claim_sha256": "aeebb66034c889372c5f7a81cabd8891fc0126f9ad286825663ac3a047c4d17a",
++        "required_before_indexing": true,
++        "scope": "once_per_pending_run_configuration",
++        "source_content_chars": 10349,
++        "source_message_ids": [
++          9271604311,
++          9271604312
++        ],
++        "source_split_policy_version": "hymem-source-semantic-split-v10",
++        "store_writes": 0,
++        "structural_control_probe_version": "hymem-phase1-markdown-atom-split-probe-v1",
++        "table_continuation_claim_sha256": "b0101bc38d69ab81541575a131a2d202037f0b8f489b9e07bfa22baf943cc13d",
++        "usage_accounting": "excluded_from_scored_usage_dedicated_memory_pipeline_client",
++        "version": "hymem-phase1-extraction-canary-v17"
++      },
++      "facts": null,
++      "facts_extraction": null,
++      "graph_facts_first": false,
++      "graph_multihop": false,
++      "graph_multihop_decay": null,
++      "graph_multihop_max_hops": null,
++      "graph_multihop_min_score": null,
++      "historical_local_judge_prompts_exact_official": false,
++      "hymem_endpoint_origin": "https://pipeline.example",
++      "hymem_endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++      "hymem_model": "pipeline",
++      "hymem_thinking": "off",
++      "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1",
++      "indexing_max_cycles": 4,
++      "indexing_require_healthy": true,
++      "indexing_timeout_s": 900.0,
++      "judge_endpoint_origin": "https://judge.example",
++      "judge_endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
++      "judge_extra_body_obj": {},
++      "judge_model": "judge",
++      "judge_protocol": "legacy-custom",
++      "judge_transport_retry_policy": "bounded-three-attempt-backoff-v1",
++      "label_free_answer_path": true,
++      "max_input_bytes": 60000,
++      "max_input_tokens": null,
++      "no_dream": false,
++      "official_denominator_validated": false,
++      "official_judge_endpoint_origin": "https://api.openai.com",
++      "official_judge_endpoint_sha256": "sha256:d9617135d6fdd0a2cde722d637a1dfcc3da37515708b3ea5d66ae607c8ac785e",
++      "official_judge_match": false,
++      "official_transport_exact": false,
++      "official_transport_retry_policy": "unbounded-openai-backoff-v1",
++      "permissive_default": false,
++      "prereg": null,
++      "provider_context_tokens": 65536,
++      "rerank_message_hits": null,
++      "rerank_model": null,
++      "rerank_top_k": null,
++      "retrieval_only": false,
++      "retrieval_usage_owner": "none",
++      "rules": null,
++      "rules_extraction": null,
++      "sample": 1,
++      "sample_strategy": "sha256-seed-source-index-preserve-order-v1",
++      "scales": "S",
++      "scored_run": true,
++      "seed": 7,
++      "source_ids_hash": "sha256:190602be17c532f8704d8cf4cae55a8d11dee659b00d167b26b4c0c41eae1411",
++      "source_order_validated": false,
++      "source_qtype_counts": {
++        "multi-session": 1
++      },
++      "subset_run": true,
++      "top_k": 15,
++      "value_supersession": true,
++      "workers": 1
++    },
++    "config_hash": "sha256:34062fe46b90899827a7ef9fc91f0460048c594b82d761054145fe7c3de9b9f2",
++    "data_hash": "sha256:4b42b0f05718d6f739ab7bf97ec8a5c3d8d675a3a436ee56063ed9310a228fae",
++    "development_only": true,
++    "expected_count": 1,
++    "expected_ids_hash": "sha256:190602be17c532f8704d8cf4cae55a8d11dee659b00d167b26b4c0c41eae1411",
++    "exploratory_label_steering": false,
++    "exploratory_non_comparable": true,
++    "label_free_answer_path": true,
++    "model_hash": "sha256:c615cce042b1658bde43c3576c9c86a1ad497344600563f21455b50b7932d956",
++    "models": {
++      "embedding": {
++        "backend": "none",
++        "configured": false,
++        "dimension": null,
++        "fallback_policy": "none",
++        "fallback_reason": null,
++        "identity_exact": true,
++        "network_free": true,
++        "producer_binding": {
++          "declaration": {
++            "kind": "disabled"
++          },
++          "identity_exact": true,
++          "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
++          "reuse_scope": "durable",
++          "schema": "hymem-embedding-producer-binding-v1"
++        },
++        "quality": "none",
++        "reuse_scope": "durable",
++        "schema": "hymem-public-embedding-identity-v1",
++        "transport_security": "none",
++        "vector_space_key": null
++      },
++      "judge": {
++        "endpoint_origin": "https://judge.example",
++        "endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
++        "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
++        "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
++        "extra_body": {},
++        "max_tokens": 10,
++        "model": "judge",
++        "n": null,
++        "prompt_exact_official": false,
++        "protocol": "legacy-custom",
++        "provider": "openai-compatible",
++        "retry_policy": "bounded-three-attempt-backoff-v1",
++        "temperature": 0.0,
++        "verdict_parser": "anchored-exclusive-yes-no-local-v1"
++      },
++      "memory_pipeline": {
++        "aggregation_producer": {
++          "declaration": {
++            "client_id": "hymem.contrib.openai_client.OpenAICompatibleClient",
++            "effective_request": {
++              "schema": "hymem-phase1-nested-identity-sha256-v1",
++              "sha256": "sha256:62732fda9c5ed4272f7a2e0af03da9a280ab6347322be3b4b5ecb87e43da7734"
++            },
++            "endpoint_origin": "https://pipeline.example",
++            "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++            "implementation": "sha256:369e75a84adf10ca25b037439f2f61b982433ad851bbe51a80b7c1a601c5e830",
++            "model": "pipeline",
++            "retry_policy": {
++              "schema": "hymem-phase1-nested-identity-sha256-v1",
++              "sha256": "sha256:ca0dd0cb7ac4c1c0c4c088e3f494a42460c166533c80ea9e6143206721bc864e"
++            },
++            "schema": "hymem-aggregation-producer-declaration-v1"
++          },
++          "identity_exact": true,
++          "identity_sha256": "sha256:82140a507a09f1d8468a76c26fbd22db33bbb90125a05151f0cd05a89f3d9e66",
++          "reuse_scope": "durable",
++          "schema": "hymem-phase1-producer-binding-v1"
++        },
++        "deployment_revision_sha256": "sha256:bb5e3948036d1e0ec84a33b16b02d8730709c6586fca6433c55c10bcfd682497",
++        "deployment_tenant_sha256": "sha256:3373a114fe3468218a3db97972b38c3f82f9fd098df5d4438e6de6c36b07c937",
++        "effective_extra_body": {},
++        "endpoint_origin": "https://pipeline.example",
++        "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++        "model": "pipeline",
++        "provider": "openai-compatible",
++        "request_timeout_seconds": 120.0,
++        "thinking_mode": "off",
++        "transport_package_version": "test-openai-1"
++      },
++      "reader": {
++        "endpoint_origin": "https://reader.example",
++        "endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
++        "extra_body": {},
++        "max_tokens": 1024,
++        "model": "reader",
++        "provider": "openai-compatible",
++        "temperature": 0.0
++      }
++    },
++    "official_comparable": false,
++    "official_split": false,
++    "protocol_limitation": "full-set development evidence; may be test-contaminated",
++    "protocol_split": "full",
++    "run_id": "sha256:08c4b07aa4525aab02a1d9efd502c7431ea3674467da3b7177705acf621f615e",
++    "schema": "hymem-benchmark-strict-v1",
++    "scored_run": true,
++    "seed": 7
++  },
++  "models": {
++    "embedding": {
++      "backend": "none",
++      "configured": false,
++      "dimension": null,
++      "fallback_policy": "none",
++      "fallback_reason": null,
++      "identity_exact": true,
++      "network_free": true,
++      "producer_binding": {
++        "declaration": {
++          "kind": "disabled"
++        },
++        "identity_exact": true,
++        "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
++        "reuse_scope": "durable",
++        "schema": "hymem-embedding-producer-binding-v1"
++      },
++      "quality": "none",
++      "reuse_scope": "durable",
++      "schema": "hymem-public-embedding-identity-v1",
++      "transport_security": "none",
++      "vector_space_key": null
++    },
++    "judge": {
++      "endpoint_origin": "https://judge.example",
++      "endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
++      "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
++      "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
++      "extra_body": {},
++      "max_tokens": 10,
++      "model": "judge",
++      "n": null,
++      "prompt_exact_official": false,
++      "protocol": "legacy-custom",
++      "provider": "openai-compatible",
++      "retry_policy": "bounded-three-attempt-backoff-v1",
++      "temperature": 0.0,
++      "verdict_parser": "anchored-exclusive-yes-no-local-v1"
++    },
++    "memory_pipeline": {
++      "aggregation_producer": {
++        "declaration": {
++          "client_id": "hymem.contrib.openai_client.OpenAICompatibleClient",
++          "effective_request": {
++            "schema": "hymem-phase1-nested-identity-sha256-v1",
++            "sha256": "sha256:62732fda9c5ed4272f7a2e0af03da9a280ab6347322be3b4b5ecb87e43da7734"
++          },
++          "endpoint_origin": "https://pipeline.example",
++          "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++          "implementation": "sha256:369e75a84adf10ca25b037439f2f61b982433ad851bbe51a80b7c1a601c5e830",
++          "model": "pipeline",
++          "retry_policy": {
++            "schema": "hymem-phase1-nested-identity-sha256-v1",
++            "sha256": "sha256:ca0dd0cb7ac4c1c0c4c088e3f494a42460c166533c80ea9e6143206721bc864e"
++          },
++          "schema": "hymem-aggregation-producer-declaration-v1"
++        },
++        "identity_exact": true,
++        "identity_sha256": "sha256:82140a507a09f1d8468a76c26fbd22db33bbb90125a05151f0cd05a89f3d9e66",
++        "reuse_scope": "durable",
++        "schema": "hymem-phase1-producer-binding-v1"
++      },
++      "deployment_revision_sha256": "sha256:bb5e3948036d1e0ec84a33b16b02d8730709c6586fca6433c55c10bcfd682497",
++      "deployment_tenant_sha256": "sha256:3373a114fe3468218a3db97972b38c3f82f9fd098df5d4438e6de6c36b07c937",
++      "effective_extra_body": {},
++      "endpoint_origin": "https://pipeline.example",
++      "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
++      "model": "pipeline",
++      "provider": "openai-compatible",
++      "request_timeout_seconds": 120.0,
++      "thinking_mode": "off",
++      "transport_package_version": "test-openai-1"
++    },
++    "reader": {
++      "endpoint_origin": "https://reader.example",
++      "endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
++      "extra_body": {},
++      "max_tokens": 1024,
++      "model": "reader",
++      "provider": "openai-compatible",
++      "temperature": 0.0
++    }
++  },
++  "per_question": [
++    {
++      "ability_used": null,
++      "benchmark_failure": "indexing_failure:coverage_integrity_failure",
++      "correct": false,
++      "detected_ability": null,
++      "distill_calls": 0,
++      "distill_fired": false,
++      "indexing": {
++        "cleanup_errors": [],
++        "complete": false,
++        "cycles": 1,
++        "elapsed_s": 1.0,
++        "failure": {
++          "code": "coverage_integrity_failure",
++          "exception_type": null
++        },
++        "final_status": {
++          "aggregation_generation": {
++            "enabled": false,
++            "generation_binding": null,
++            "generation_key": null,
++            "identity_exact": null,
++            "producer_identity_sha256": null
++          },
++          "aggregation_material": {
++            "enabled": false,
++            "identity_exact": null,
++            "material_binding": null,
++            "material_epoch_key": null,
++            "material_revision": null
++          },
++          "benchmark_indexing_status_schema": "hymem-benchmark-indexing-status-v4",
++          "coverage_integrity": {
++            "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
++            "details": [
++              {
++                "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
++                "failure_reason": "source_stream_invalid",
++                "first_detected_at": "2026-09-05 10:00:00",
++                "last_detected_at": "2026-09-05 10:01:00",
++                "occurrences": 2,
++                "session_id_hash": "sha256:bfa06a6cba57128c60796a31732064556b6a977a6325114dd768c6c79dab01b7"
++              }
++            ],
++            "details_truncated": false,
++            "failures": 1,
++            "reasons": {
++              "source_stream_invalid": 1
++            }
++          },
++          "dream_status_schema": "hymem-dream-status-v8",
++          "in_progress": false,
++          "malformed": {
++            "malformed_digests": 0,
++            "malformed_facts": 0,
++            "malformed_profiles": 0,
++            "malformed_source_materialization": 0,
++            "malformed_summaries": 0
++          },
++          "pending": {
++            "pending_aggregation": 0,
++            "pending_chunk_embeddings": 0,
++            "pending_chunks": 0,
++            "pending_digests": 0,
++            "pending_edge_embeddings": 0,
++            "pending_episode_embeddings": 0,
++            "pending_fact_embeddings": 0,
++            "pending_facts": 0,
++            "pending_message_embeddings": 0,
++            "pending_profiles": 0,
++            "pending_source_materialization": 0
++          },
++          "pending_chunks_authoritative": true,
++          "phase1_backlog_status": "current_producer",
++          "phase1_generation_key": "hymem-phase1-generation-v1:1111111111111111111111111111111111111111111111111111111111111111",
++          "quarantined": {
++            "quarantined_chunks": 0,
++            "quarantined_digests": 0,
++            "quarantined_facts": 0,
++            "quarantined_facts_malformed": 0,
++            "quarantined_profiles": 0
++          },
++          "summary_health": {
++            "malformed_summaries": 0,
++            "summary_degraded_sessions": 0,
++            "summary_healthy": true,
++            "summary_missing_sessions": 0
++          },
++          "terminal_loss": {
++            "chunks": 0,
++            "reasons": {}
++          }
++        },
++        "healthy": false,
++        "max_cycles": 2,
++        "outcome": "failure",
++        "reports": [
++          {
++            "aggregation_blocking": "",
++            "aggregation_build_exceptions": 0,
++            "aggregation_facts_rekey": null,
++            "aggregation_fusion_failures": 0,
++            "aggregation_input_episodes": 0,
++            "aggregation_keying_residual": null,
++            "aggregation_leaf_added": null,
++            "aggregation_leaf_changed": null,
++            "aggregation_leaf_removed": null,
++            "aggregation_level0_missed": null,
++            "aggregation_nodes_built": 0,
++            "aggregation_nodes_reused": 0,
++            "aggregation_predicted_rebuild": null,
++            "aggregation_rebuilt_level0": null,
++            "aggregation_rebuilt_rollup": null,
++            "aggregation_rebuilt_root": null,
++            "budget_exhausted": false,
++            "chunk_extraction_completion_calls": 0,
++            "chunk_extraction_failures": 0,
++            "chunk_extraction_provider_attempts": 0,
++            "chunks_embedded": 0,
++            "chunks_embedded_from_cache": 0,
++            "chunks_processed": 0,
++            "chunks_seen": 0,
++            "coverage_integrity_failures": 1,
++            "digest_failures": 0,
++            "digest_quarantined": 0,
++            "edges_embedded": 0,
++            "edges_embedded_from_cache": 0,
++            "episodes_created": 0,
++            "episodes_embedded": 0,
++            "episodes_embedded_from_cache": 0,
++            "extraction_provider_attempt_budget_exhausted": false,
++            "fact_failures": 0,
++            "facts_embedded": 0,
++            "facts_embedded_from_cache": 0,
++            "facts_extracted": 0,
++            "markers_extracted": 0,
++            "messages_embedded": 0,
++            "messages_embedded_from_cache": 0,
++            "profile_failures": 0,
++            "profile_items_extracted": 0,
++            "rules_extracted": 0,
++            "sessions_processed": 0,
++            "skipped_locked": false,
++            "triples_extracted": 0
++          }
++        ],
++        "schema": "hymem-lme-indexing-summary-v6",
++        "summary_healthy": true,
++        "timeout_s": 10.0
++      },
++      "oracle_ability": "MR",
++      "question_id": "qid",
++      "question_type": "multi-session",
++      "retrieval_only": false
++    }
++  ],
++  "result_digest": "sha256:edd6248addeab5bcd962e4fd0bf1117ee77bb3cfc23fffd981aa11451e0a837a",
++  "scores": {
++    "OVERALL": {
++      "accuracy": 0.0,
++      "count": 1
++    },
++    "multi-session": {
++      "accuracy": 0.0,
++      "count": 1
++    }
++  },
++  "version": "strict-v1"
++}
+diff --git a/tests/test_benchmark_extraction_canary.py b/tests/test_benchmark_extraction_canary.py
+index 0d171dd..766cfa0 100644
+--- a/tests/test_benchmark_extraction_canary.py
++++ b/tests/test_benchmark_extraction_canary.py
+@@ -301,6 +301,7 @@ def test_canary_uses_real_phase1_contract_and_requires_exact_claim_fields():
+     assert extraction_canary_module._LIST_CONTROL in controls_payload["content"]
+     assert extraction_canary_module._FENCED_CODE_CONTROL in controls_payload["content"]
+     assert report["execution_path"] == {
++        "provider_output_truncations": 0,
+         "primary_requests": 4,
+         "empty_verification_requests": 2,
+         "omission_verification_requests": 2,
+@@ -929,7 +930,7 @@ def test_canary_does_not_touch_an_existing_store(tmp_path: Path):
+ 
+ 
+ def test_canary_prompt_provenance_tracks_benchmark_hymem_default(tmp_path: Path):
+-    assert EXTRACTION_CANARY_VERSION == "hymem-phase1-extraction-canary-v17"
++    assert EXTRACTION_CANARY_VERSION == "hymem-phase1-extraction-canary-v18"
+     assert EXTRACTION_CANARY_PROMPT_VERSION == "v20"
+     assert EXTRACTION_CANARY_FIXTURE_VERSION == (
+         "hymem-phase1-context-paths-four-leaf-v7"
+diff --git a/tests/test_canary_response_history.py b/tests/test_canary_response_history.py
+new file mode 100644
+index 0000000..95a8f18
+--- /dev/null
++++ b/tests/test_canary_response_history.py
+@@ -0,0 +1,225 @@
++"""Current response accounting and genuine cross-version archived evidence."""
++from copy import deepcopy
++import hashlib
++import json
++from pathlib import Path
++
++import pytest
++
++from benchmarks import extraction_canary as canary, lme_protocol as protocol, lme_registry
++from benchmarks.extraction_canary_archive import validate_archived_canary_config, validate_archived_canary_report
++from benchmarks.strictness import AtomicCheckpoint, BenchmarkIntegrityError
++from hymem.extraction.contract import extraction_contract_binding
++from tests.test_benchmark_extraction_canary import _passed_report
++from tests.test_lme_protocol_hardening import _indexing_failure_artifact, _refresh_manifest
++
++
++FIXTURE = Path(__file__).parent / "data/synthetic_r3_v17_indexing_failure.json"
++PIN = "d9fd6ededba452c29ef039f785c3fb377c6400e18ea3023ebf4f8a328779e6aa"
++
++
++def old_artifact():
++    raw = FIXTURE.read_bytes()
++    assert hashlib.sha256(raw).hexdigest() == PIN
++    return json.loads(raw)
++
++
++def archive_report(artifact):
++    return validate_archived_canary_report(
++        artifact["execution"]["segments"][0]["extraction_canary"],
++        policy=artifact["config"]["extraction_canary"],
++        effective_config=artifact["config"]["effective_hymem_config"],
++        expected_mode="required", expected_client=artifact["models"]["memory_pipeline"],
++        require_client_closed=True,
++    )
++
++
++def test_genuine_r3_v17_survives_contract_change_only_as_unchanged_history(tmp_path):
++    artifact = old_artifact()
++    before = deepcopy(artifact)
++    old_binding = artifact["config"]["extraction_canary"]["extraction_contract"]
++    assert old_binding != extraction_contract_binding(old_binding["prompt_version"])
++    result = protocol.validate_archived_artifact(artifact)
++    assert result["validation_assurance"] == "historical_commitment_only"
++    assert result["live_execution_eligible"] is False
++    assert archive_report(artifact)["version"] == "hymem-phase1-extraction-canary-v17"
++    with pytest.raises(BenchmarkIntegrityError):
++        protocol.validate_strict_artifact(artifact)
++    with pytest.raises(BenchmarkIntegrityError):
++        canary.validate_extraction_canary_report(
++            artifact["execution"]["segments"][0]["extraction_canary"], expected_mode="required")
++    output = tmp_path / "predictions.jsonl"
++    with pytest.raises(BenchmarkIntegrityError):
++        protocol.export_official_predictions(artifact, output)
++    assert not output.exists() and artifact == before
++    assert hashlib.sha256(FIXTURE.read_bytes()).hexdigest() == PIN
++
++
++def test_genuine_old_manifest_cannot_resume_current_execution(tmp_path):
++    artifact = old_artifact()
++    path = tmp_path / "old-checkpoint.json"
++    with AtomicCheckpoint(path, manifest=artifact["manifest"], expected_ids=["qid"]):
++        pass
++    before = path.read_bytes()
++    current = _indexing_failure_artifact()
++    with pytest.raises(BenchmarkIntegrityError):
++        AtomicCheckpoint(path, manifest=current["manifest"], expected_ids=["qid"], resume=True)
++    assert path.read_bytes() == before
++
++
++def test_registry_requires_explicit_history_for_genuine_old_artifact(tmp_path, monkeypatch):
++    artifact = old_artifact()
++    path = tmp_path / "longmemeval-v2-hymem-20260904T120000Z-seed0-strict.json"
++    path.write_bytes(FIXTURE.read_bytes())
++    monkeypatch.setattr(lme_registry, "DB", tmp_path / "registry.sqlite")
++    conn = lme_registry.connect()
++    try:
++        assert lme_registry.ingest_file(conn, path).startswith("error: strict")
++        assert lme_registry.ingest_file(conn, path, validation_scope="historical") == "inserted"
++        assert conn.execute("SELECT strict_validated,archive_validated,live_execution_eligible FROM runs").fetchone() == (0, 1, 0)
++    finally:
++        conn.close()
++    assert hashlib.sha256(path.read_bytes()).hexdigest() == PIN
++
++
++@pytest.mark.parametrize("version", ["v16", "v19", "unknown"])
++def test_archive_rejects_unknown_versions_even_when_report_and_policy_agree(version):
++    artifact = old_artifact()
++    for policy in (artifact["config"]["extraction_canary"], artifact["execution"]["segments"][0]["extraction_canary"]):
++        policy["version"] = "hymem-phase1-extraction-canary-" + version
++    _refresh_manifest(artifact)
++    with pytest.raises(BenchmarkIntegrityError):
++        protocol.validate_archived_artifact(artifact)
++
++
++@pytest.mark.parametrize("site", ["policy", "report"])
++def test_archive_rejects_mixed_v17_v18_and_one_sided_contract_changes(site):
++    artifact = old_artifact()
++    obj = artifact["config"]["extraction_canary"] if site == "policy" else artifact["execution"]["segments"][0]["extraction_canary"]
++    obj.update(canary.extraction_canary_policy())
++    _refresh_manifest(artifact)
++    with pytest.raises(BenchmarkIntegrityError):
++        protocol.validate_archived_artifact(artifact)
++
++
++@pytest.mark.parametrize("fault", ["extra_truncation", "normal_path", "cap", "fixture_hash", "claim", "context", "contract", "call_deficit"])
++def test_archive_rejects_resealed_v17_canary_forgery(fault):
++    artifact = old_artifact()
++    report = artifact["execution"]["segments"][0]["extraction_canary"]
++    policy = artifact["config"]["extraction_canary"]
++    if fault == "extra_truncation":
++        report["execution_path"]["provider_output_truncations"] = 0
++    elif fault == "normal_path":
++        for item in (report, policy):
++            item["normal_execution_path"]["primary_requests"] += 1
++    elif fault == "cap":
++        report["max_provider_attempts"] = policy["max_provider_attempts"] = 73
++    elif fault == "fixture_hash":
++        report["fixture_sha256"] = policy["fixture_sha256"] = "sha256:" + "0" * 64
++    elif fault == "claim":
++        report["claim_evidence"][0]["object"] = "Invented"
++    elif fault == "context":
++        report["execution_path"]["table_claim_exact_context_requests"] = 0
++    elif fault == "contract":
++        report["extraction_contract"]["identity"] = "hymem-extraction-contract-sha256-v1:" + "0" * 64
++    else:
++        report["usage"]["calls"] = report["usage"]["successful_responses"] = 7
++    _refresh_manifest(artifact)
++    with pytest.raises(BenchmarkIntegrityError):
++        protocol.validate_archived_artifact(artifact)
++
++
++def test_archive_hash_without_preimage_is_only_a_commitment_not_current_proof(monkeypatch):
++    artifact = old_artifact()
++    old = artifact["config"]["extraction_canary"]["extraction_contract"]["identity"]
++    missing = "hymem-extraction-contract-sha256-v1:" + "e" * 64
++    artifact = json.loads(json.dumps(artifact).replace(old, missing))
++    _refresh_manifest(artifact)
++    def forbidden(*_args, **_kwargs):
++        raise AssertionError("historical validation reconstructed live contract")
++    monkeypatch.setattr(canary, "extraction_contract_binding", forbidden)
++    result = protocol.validate_archived_artifact(artifact)
++    assert result["validation_assurance"] == "historical_commitment_only"
++    assert result["live_execution_eligible"] is False
++    assert artifact["config"]["extraction_canary"]["extraction_contract"]["identity"] == missing
++
++
++@pytest.mark.parametrize("prompt", ["", " v20", "v20\n", "x" * 129])
++def test_archive_prompt_retains_historical_bound(prompt):
++    artifact = old_artifact()
++    policy = artifact["config"]["extraction_canary"]
++    config = artifact["config"]["effective_hymem_config"]
++    policy["prompt_version"] = config["prompt_version"] = prompt
++    policy["extraction_contract"]["prompt_version"] = prompt
++    config["extraction_contract"]["prompt_version"] = prompt
++    with pytest.raises(BenchmarkIntegrityError):
++        validate_archived_canary_config(policy, config)
++
++
++@pytest.mark.parametrize("count", [None, True, -1, 25, "1"])
++def test_v18_rejects_invalid_or_missing_typed_count(count):
++    report = _passed_report()
++    if count is None:
++        del report["execution_path"]["provider_output_truncations"]
++    else:
++        report["execution_path"]["provider_output_truncations"] = count
++    with pytest.raises(BenchmarkIntegrityError):
++        canary.validate_extraction_canary_report(report, expected_mode="required")
++
++
++@pytest.mark.parametrize("admitted", [0, 1, 2, 7, 9])
++def test_v18_rejects_typed_deficits_without_sufficient_admitted_verifications(admitted):
++    report = _passed_report()
++    report["completion_calls"] = report["provider_attempts"] = 9
++    report["usage"].update(calls=admitted, successful_responses=admitted, request_attempts=9)
++    report["execution_path"].update(primary_requests=5, parsed_source_records=9,
++                                    provider_output_truncations=9 - admitted)
++    if admitted == 9:
++        # A nonzero count must not be added when all calls were admitted.
++        report["execution_path"]["provider_output_truncations"] = 1
++    with pytest.raises(BenchmarkIntegrityError):
++        canary.validate_extraction_canary_report(report, expected_mode="required")
++
++
++def test_v18_normal_eight_call_path_cannot_claim_a_typed_rejection():
++    report = _passed_report()
++    report["execution_path"]["provider_output_truncations"] = 1
++    report["usage"]["calls"] = report["usage"]["successful_responses"] = 7
++    with pytest.raises(BenchmarkIntegrityError):
++        canary.validate_extraction_canary_report(report, expected_mode="required")
++
++
++def test_v18_emission_counts_cannot_exceed_admitted_texts():
++    report = _passed_report()
++    report["completion_calls"] = report["provider_attempts"] = 9
++    report["usage"]["request_attempts"] = 9
++    report["execution_path"].update(primary_requests=5, parsed_source_records=9,
++                                    provider_output_truncations=1,
++                                    table_claim_exact_context_emissions=8,
++                                    prose_claim_exact_context_emissions=1)
++    with pytest.raises(BenchmarkIntegrityError, match="emissions"):
++        canary.validate_extraction_canary_report(report, expected_mode="required")
++
++
++def test_v18_failed_report_cannot_count_one_claim_more_than_admitted_texts():
++    report = _passed_report()
++    report.update(status="failed", completion_calls=9, provider_attempts=9,
++                  failure_reason="parse_failure", failure_details=[])
++    report["usage"].update(calls=2, successful_responses=2, request_attempts=9)
++    report["execution_path"].update(primary_requests=5, parsed_source_records=9,
++                                    provider_output_truncations=7,
++                                    table_claim_exact_context_emissions=2,
++                                    table_claim_wrong_context_emissions=1)
++    with pytest.raises(BenchmarkIntegrityError, match="emissions exceed admitted"):
++        canary.validate_extraction_canary_report(report, expected_mode="failed")
++
++
++@pytest.mark.parametrize("claim", ["table", "prose"])
++def test_v18_exact_emissions_cannot_exceed_matching_requests(claim):
++    report = _passed_report()
++    report["completion_calls"] = report["provider_attempts"] = 9
++    report["usage"].update(calls=9, successful_responses=9, request_attempts=9)
++    report["execution_path"].update(primary_requests=5, parsed_source_records=9)
++    report["execution_path"][f"{claim}_claim_exact_context_emissions"] = 3
++    with pytest.raises(BenchmarkIntegrityError, match="emissions exceed exact-context"):
++        canary.validate_extraction_canary_report(report, expected_mode="required")
+diff --git a/tests/test_completion_response_admission.py b/tests/test_completion_response_admission.py
+new file mode 100644
+index 0000000..4aaa792
+--- /dev/null
++++ b/tests/test_completion_response_admission.py
+@@ -0,0 +1,300 @@
++"""Received non-stop replies are failures, not retryable HTTP attempts.
++
++All provider responses are synthetic; these tests make no network requests.
++"""
++from concurrent.futures import ThreadPoolExecutor
++from copy import deepcopy
++from types import SimpleNamespace
++import threading
++
++import pytest
++
++from benchmarks import longmemeval_adapter as lme
++from benchmarks.lme_protocol import _usage
++from benchmarks.strictness import usage_snapshot
++from hymem.contrib.openai_client import OpenAICompatibleClient
++from hymem.extraction.llm import LLMRequest
++
++
++USAGE = {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
++
++
++def response(*, finish="stop", content="ok", usage=USAGE):
++    return {"choices": [{"finish_reason": finish, "message": {"content": content}}],
++            "usage": deepcopy(usage)}
++
++
++def sdk_response(value):
++    if not isinstance(value, dict):
++        return value
++    result = SimpleNamespace(**value)
++    if "usage" in value and isinstance(value["usage"], dict):
++        result.usage = SimpleNamespace(**value["usage"])
++    if isinstance(value.get("choices"), list):
++        result.choices = []
++        for choice in value["choices"]:
++            if isinstance(choice, dict):
++                converted = SimpleNamespace(**choice)
++                if isinstance(choice.get("message"), dict):
++                    converted.message = SimpleNamespace(**choice["message"])
++                result.choices.append(converted)
++            else:
++                result.choices.append(choice)
++    return result
++
++
++@pytest.fixture(params=["sdk", "raw"])
++def client_factory(request, monkeypatch):
++    clients = []
++    backend = request.param
++    monkeypatch.setattr("hymem.extraction.retry.time.sleep", lambda _delay: None)
++    monkeypatch.setattr(lme.time, "sleep", lambda _delay: None)
++
++    def build(responses, **kwargs):
++        calls = []
++        def reply(wire):
++            calls.append(wire)
++            value = responses(wire) if callable(responses) else responses.pop(0)
++            if isinstance(value, Exception):
++                raise value
++            return value
++
++        if backend == "sdk":
++            import openai
++            class Resource:
++                def create(self, **wire):
++                    return sdk_response(reply(wire))
++            class SDK:
++                def __init__(self, **options):
++                    self._client = options.get("http_client")
++                    self.chat = SimpleNamespace(completions=Resource())
++                def close(self):
++                    self._client.close()
++            monkeypatch.setattr(openai, "OpenAI", SDK)
++            client = OpenAICompatibleClient(api_key="test-key", model="deepseek-flash")
++        else:
++            class HTTPResponse:
++                def __init__(self, value):
++                    self.value = value
++                def raise_for_status(self):
++                    pass
++                def json(self):
++                    return self.value
++            def post(_url, **options):
++                return HTTPResponse(reply(options["json"]))
++            monkeypatch.setattr(lme.http, "post", post)
++            client = lme.LLMClient("deepseek-flash", "test-key", **kwargs)
++        clients.append(client)
++        return backend, client, calls
++
++    yield build
++    for client in clients:
++        client.close()
++
++
++def invoke(backend, client, *, rejected=False):
++    if backend == "sdk":
++        if rejected:
++            with pytest.raises(RuntimeError):
++                client.complete(LLMRequest("system", "user"))
++            return
++        return client.complete(LLMRequest("system", "user"))
++    result = client.chat([{"role": "user", "content": "user"}])
++    if rejected:
++        assert result.startswith("[LLM_ERROR:")
++    else:
++        return result
++
++
++@pytest.mark.parametrize("finish", ["length", "content_filter", "tool_calls", "function_call", None, "STOP", "unknown"])
++@pytest.mark.parametrize("content", ["yes", '{"accepted":true}', ""])
++def test_nonstop_string_rejected_without_retry_and_paid_usage_retained(client_factory, finish, content):
++    backend, client, calls = client_factory([response(finish=finish, content=content)])
++    invoke(backend, client, rejected=True)
++    assert len(calls) == client.request_attempts == 1
++    assert client.call_count == client.successful_responses == 0
++    assert (client.prompt_tokens, client.completion_tokens, client.total_tokens) == (3, 5, 8)
++    snapshot = usage_snapshot(client)
++    assert snapshot["token_usage_available"] is True and snapshot["total_tokens"] == 8
++    normalized = _usage(snapshot, label="rejected fixture")
++    assert (normalized["calls"], normalized["attempts"], normalized["successes"],
++            normalized["total_tokens"]) == (0, 1, 0, 8)
++
++
++@pytest.mark.parametrize("mutation", ["missing_finish", "no_choices", "empty_choices", "bad_choices", "bad_choice", "no_message", "null_content", "number_content"])
++def test_received_schema_failure_does_not_retry_or_lose_usage(client_factory, mutation):
++    value = response()
++    if mutation == "missing_finish":
++        del value["choices"][0]["finish_reason"]
++    elif mutation == "no_choices":
++        del value["choices"]
++    elif mutation == "empty_choices":
++        value["choices"] = []
++    elif mutation == "bad_choices":
++        value["choices"] = "not a list"
++    elif mutation == "bad_choice":
++        value["choices"] = [None]
++    elif mutation == "no_message":
++        del value["choices"][0]["message"]
++    else:
++        value["choices"][0]["message"]["content"] = None if mutation == "null_content" else 3
++    backend, client, calls = client_factory([value])
++    invoke(backend, client, rejected=True)
++    assert len(calls) == client.request_attempts == 1
++    assert client.call_count == client.successful_responses == 0
++    assert usage_snapshot(client)["total_tokens"] == 8
++
++
++@pytest.mark.parametrize("content", ["", "ok", "not JSON"])
++def test_exact_stop_admits_strings_without_new_content_or_json_policy(client_factory, content):
++    backend, client, calls = client_factory([response(content=content)])
++    assert invoke(backend, client) == content
++    assert len(calls) == client.call_count == client.successful_responses == 1
++    assert usage_snapshot(client)["total_tokens"] == 8
++
++
++@pytest.mark.parametrize("invalid", [None, {}, {**USAGE, "total_tokens": True},
++    {**USAGE, "total_tokens": float("inf")}, {**USAGE, "total_tokens": float("nan")},
++    {**USAGE, "total_tokens": -1}, {**USAGE, "total_tokens": 10**400},
++    {**USAGE, "total_tokens": 9}, {**USAGE, "prompt_tokens": 3.5, "total_tokens": 8.5}])
++def test_unknown_usage_stays_unknown_after_later_good_reply(client_factory, invalid):
++    backend, client, calls = client_factory([response(finish="length", usage=invalid), response()])
++    invoke(backend, client, rejected=True)
++    assert invoke(backend, client) == "ok"
++    assert len(calls) == 2 and client.successful_responses == 1
++    assert client.total_tokens == 8  # known subtotal, never invented missing cost
++    assert usage_snapshot(client)["token_usage_available"] is False
++    assert _usage(usage_snapshot(client), label="unknown fixture")["total_tokens"] is None
++
++
++def test_transport_retry_preserves_unknown_cost_even_after_known_rejected_reply(client_factory):
++    backend, client, calls = client_factory([TimeoutError("synthetic"), response(finish="length")])
++    invoke(backend, client, rejected=True)
++    assert len(calls) == client.request_attempts == 2
++    assert client.successful_responses == 0 and client.total_tokens == 8
++    assert usage_snapshot(client)["token_usage_available"] is False
++
++
++def test_accounting_cannot_be_complete_while_another_attempt_is_in_flight(client_factory):
++    started, release = threading.Event(), threading.Event()
++    serial_lock = threading.Lock()
++    serial = 0
++    def reply(_wire):
++        nonlocal serial
++        with serial_lock:
++            serial += 1
++            first = serial == 1
++        if first:
++            started.set()
++            assert release.wait(5)
++        return response()
++    backend, client, calls = client_factory(reply)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        pending = pool.submit(invoke, backend, client)
++        assert started.wait(5)
++        try:
++            assert invoke(backend, client) == "ok"
++            assert client.successful_responses == 1 and client.request_attempts == 2
++            assert usage_snapshot(client)["token_usage_available"] is False
++        finally:
++            release.set()
++        assert pending.result(5) == "ok"
++    assert client.total_tokens == 16 and client.successful_responses == 2
++    assert usage_snapshot(client)["token_usage_available"] is True
++
++
++def test_raw_requested_multiple_choices_preserves_first_choice_policy(client_factory):
++    value = response(content="first")
++    value["choices"].append(response(finish="length", content="second")["choices"][0])
++    backend, client, calls = client_factory([value], n=2)
++    if backend == "sdk":
++        invoke(backend, client, rejected=True)  # SDK did not request n>1.
++    else:
++        assert invoke(backend, client) == "first"
++        assert calls[0]["n"] == 2
++    assert len(calls) == 1 and client.total_tokens == 8
++
++
++def test_multiple_choices_cannot_rescue_nonstop_first_choice(client_factory):
++    value = response(finish="length", content="bad first")
++    value["choices"].append(response(content="good second")["choices"][0])
++    backend, client, calls = client_factory([value], n=2)
++    invoke(backend, client, rejected=True)
++    assert len(calls) == 1 and client.successful_responses == 0 and client.total_tokens == 8
++
++
++def test_received_late_sdk_reply_retains_usage_without_admission_or_retry(client_factory):
++    from hymem.deadline import DeadlineExceeded, MonotonicDeadline, use_deadline
++    clock = [0.0]
++    def late(_wire):
++        clock[0] = 2.0
++        return response()
++    backend, client, calls = client_factory(late)
++    if backend != "sdk":
++        pytest.skip("raw benchmark deadline ownership is outside this client")
++    with use_deadline(MonotonicDeadline(1.0, clock=lambda: clock[0])):
++        with pytest.raises(DeadlineExceeded):
++            invoke(backend, client)
++    assert len(calls) == 1 and client.call_count == client.successful_responses == 0
++    assert calls[0]["timeout"] == 1.0
++    assert _usage(usage_snapshot(client), label="late fixture")["total_tokens"] == 8
++
++
++def test_post_response_sdk_integrity_failure_keeps_known_usage(client_factory):
++    owner = []
++    def drift(_wire):
++        owner[0]._client = object()
++        return response()
++    backend, client, calls = client_factory(drift)
++    if backend != "sdk":
++        pytest.skip("maintained SDK transport seal only")
++    owner.append(client)
++    invoke(backend, client, rejected=True)
++    assert len(calls) == 1 and client.successful_responses == 0
++    assert _usage(usage_snapshot(client), label="integrity fixture")["total_tokens"] == 8
++
++
++@pytest.mark.parametrize("replacement", ["cleared", "extended"])
++def test_late_sdk_reply_cannot_replace_owning_deadline(client_factory, replacement):
++    from hymem import deadline as deadline_module
++    clock = [0.0]
++    def replace_context(_wire):
++        clock[0] = 2.0
++        deadline_module._CURRENT_DEADLINE.set(
++            None if replacement == "cleared" else deadline_module.MonotonicDeadline(
++                100.0, clock=lambda: clock[0]
++            )
++        )
++        return response()
++    backend, client, calls = client_factory(replace_context)
++    if backend != "sdk":
++        pytest.skip("raw benchmark deadline ownership is outside this client")
++    owner = deadline_module.MonotonicDeadline(1.0, clock=lambda: clock[0])
++    with deadline_module.use_deadline(owner):
++        with pytest.raises(deadline_module.DeadlineExceeded):
++            invoke(backend, client)
++    assert len(calls) == 1 and calls[0]["timeout"] == 1.0
++    assert client.call_count == client.successful_responses == 0
++    assert _usage(usage_snapshot(client), label="replaced deadline")["total_tokens"] == 8
++
++
++def test_raw_invalid_json_response_is_nonretryable_and_usage_unknown(monkeypatch):
++    calls = []
++    class InvalidJSON:
++        def raise_for_status(self):
++            pass
++        def json(self):
++            raise ValueError("private response details")
++    def post(*_args, **_kwargs):
++        calls.append(1)
++        return InvalidJSON()
++    monkeypatch.setattr(lme.http, "post", post)
++    monkeypatch.setattr(lme.time, "sleep", lambda _: pytest.fail("received reply retried"))
++    client = lme.LLMClient("deepseek-flash", "test-key")
++    try:
++        assert client.chat([]) == "[LLM_ERROR:LLMResponseError]"
++        assert len(calls) == client.request_attempts == 1
++        assert client.call_count == 0
++        assert _usage(usage_snapshot(client), label="invalid JSON")["total_tokens"] is None
++    finally:
++        client.close()
+diff --git a/tests/test_indexing_deadlines.py b/tests/test_indexing_deadlines.py
+index 08b8896..e6287c7 100644
+--- a/tests/test_indexing_deadlines.py
++++ b/tests/test_indexing_deadlines.py
+@@ -781,7 +781,8 @@ def test_network_clients_cap_each_request_to_exact_remaining_time(
+                 llm_calls.append(request)
+                 return SimpleNamespace(
+                     choices=[SimpleNamespace(
+-                        message=SimpleNamespace(content="ok")
++                        message=SimpleNamespace(content="ok"),
++                        finish_reason="stop",
+                     )],
+                     usage=None,
+                 )
+@@ -857,7 +858,8 @@ def test_late_network_responses_are_attempted_but_never_counted_successful(
+                 cross_if_late()
+                 return SimpleNamespace(
+                     choices=[SimpleNamespace(
+-                        message=SimpleNamespace(content="ok")
++                        message=SimpleNamespace(content="ok"),
++                        finish_reason="stop",
+                     )],
+                     usage=SimpleNamespace(
+                         prompt_tokens=1, completion_tokens=1, total_tokens=2,
+@@ -913,7 +915,8 @@ def test_late_network_responses_are_attempted_but_never_counted_successful(
+         llm.complete(LLMRequest(system="s", user="late"))
+     assert llm.request_attempts == 2
+     assert llm.call_count == llm.successful_responses == 1
+-    assert llm.token_usage_available is False
++    assert llm.token_usage_available is True
++    assert llm.total_tokens == 4
+ 
+     clock.now = 0.0
+     with use_deadline(MonotonicDeadline(1.0, clock=clock)), pytest.raises(
+diff --git a/tests/test_openai_client.py b/tests/test_openai_client.py
+index 686f954..38187b0 100644
+--- a/tests/test_openai_client.py
++++ b/tests/test_openai_client.py
+@@ -47,6 +47,7 @@ class _RecordingCompletions:
+ 
+         class _Choice:
+             message = _Message()
++            finish_reason = "stop"
+ 
+         class _Response:
+             choices = [_Choice()]
+@@ -390,6 +391,7 @@ def _provider_response(content: str) -> Any:
+     message.content = content
+     choice = _Choice()
+     choice.message = message
++    choice.finish_reason = "stop"
+     response = _Response()
+     response.choices = [choice]
+     return response
+diff --git a/tests/test_typed_response_recovery.py b/tests/test_typed_response_recovery.py
+new file mode 100644
+index 0000000..e8b6cca
+--- /dev/null
++++ b/tests/test_typed_response_recovery.py
+@@ -0,0 +1,253 @@
++"""Real maintained SDK dispatch into extraction; all provider replies synthetic."""
++from copy import deepcopy
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from benchmarks import extraction_canary as canary
++from hymem.contrib.openai_client import OpenAICompatibleClient
++from hymem.deadline import DeadlineExceeded, MonotonicDeadline, use_deadline
++from hymem.dreaming import digest, summary_recovery
++from hymem.extraction import chunk
++from hymem.extraction.llm import LLMRequest, LLMOutputTruncatedError, LLMResponseError
++from tests.test_completion_response_admission import response, sdk_response
++from tests.test_digest_bounded_summary_repair import source, payload, extract, SequenceLLM
++from tests.test_summary_recovery_v63 import conn, _seed, _public, _items, _no_lease
++from tests.test_benchmark_extraction_canary import _representative_response
++
++
++@pytest.fixture
++def sdk_factory(monkeypatch):
++    import openai
++    clients = []
++    monkeypatch.delenv("HYMEM_LLM_EXTRA_BODY", raising=False)
++    monkeypatch.setattr("hymem.extraction.retry.time.sleep", lambda _: None)
++
++    def build(values):
++        calls = []
++        class Resource:
++            def create(self, **wire):
++                calls.append(wire)
++                value = values(wire) if callable(values) else values.pop(0)
++                if isinstance(value, BaseException):
++                    raise value
++                return sdk_response(value)
++        class SDK:
++            def __init__(self, **options):
++                self._client = options["http_client"]
++                self.chat = SimpleNamespace(completions=Resource())
++            def close(self):
++                self._client.close()
++        monkeypatch.setattr(openai, "OpenAI", SDK)
++        client = OpenAICompatibleClient(api_key="synthetic-not-a-key", model="deepseek-flash")
++        clients.append(client)
++        return client, calls
++
++    yield build
++    for client in clients:
++        client.close()
++
++
++def request(wire):
++    return LLMRequest(system=wire["messages"][0]["content"],
++                      user=wire["messages"][1]["content"])
++
++
++def test_sdk_length_has_only_typed_bounded_evidence_and_paid_usage(sdk_factory):
++    client, calls = sdk_factory([response(finish="length", content="PRIVATE_PARTIAL")])
++    with client.track_provider_attempts() as tracker:
++        with pytest.raises(LLMOutputTruncatedError) as caught:
++            client.complete(LLMRequest("system", "user"))
++    assert caught.value.args == ("LLM response exceeded its output budget",)
++    assert not vars(caught.value)
++    assert len(calls) == tracker.attempts == client.request_attempts == 1
++    assert client.call_count == client.successful_responses == 0
++    assert client.token_usage_available and client.total_tokens == 8
++
++
++@pytest.mark.parametrize("mutation", ["two_choices", "no_message", "no_content", "bad_content"])
++def test_malformed_length_reply_never_gets_recoverable_authority(sdk_factory, mutation):
++    value = response(finish="length")
++    if mutation == "two_choices":
++        value["choices"].append(deepcopy(value["choices"][0]))
++    elif mutation == "no_message":
++        del value["choices"][0]["message"]
++    elif mutation == "no_content":
++        del value["choices"][0]["message"]["content"]
++    else:
++        value["choices"][0]["message"]["content"] = 3
++    client, calls = sdk_factory([value])
++    with pytest.raises(LLMResponseError) as caught:
++        client.complete(LLMRequest("system", "user"))
++    assert not isinstance(caught.value, LLMOutputTruncatedError)
++    assert len(calls) == 1 and client.total_tokens == 8
++
++
++@pytest.mark.parametrize("when", ["primary", "omission"])
++def test_real_sdk_length_recovers_real_chunk_with_omission_and_exact_accounting(sdk_factory, when):
++    rejected = []
++    def reply(wire):
++        req = request(wire)
++        if not rejected and ((when == "primary") or "OMISSION VERIFICATION PASS" in req.system):
++            rejected.append(req)
++            return response(finish="length", content="PRIVATE_PARTIAL")
++        return response(content=_representative_response(req))
++    client, calls = sdk_factory(reply)
++    result = chunk.extract_chunk(client, canary._CANARY_CONTENT,
++                                 source_records=canary._source_records(), completion_call_limit=24)
++    assert rejected and not result.failed
++    assert len(result.triples) == 2 and not result.markers
++    assert result.completion_calls == result.provider_attempts == len(calls) <= 24
++    assert client.call_count == client.successful_responses == len(calls) - 1
++    assert client.total_tokens == 8 * len(calls) and client.token_usage_available
++    assert any("OMISSION VERIFICATION PASS" in request(wire).system for wire in calls)
++    # The failed source unit is actually replaced by smaller source requests.
++    assert any(len(request(wire).user) < len(rejected[0].user) for wire in calls[1:])
++
++
++@pytest.mark.parametrize("finish", ["content_filter", "tool_calls", None, "unknown"])
++def test_other_sdk_rejections_do_not_split_or_masquerade_as_length(sdk_factory, finish):
++    client, calls = sdk_factory([response(finish=finish, content="PRIVATE_PARTIAL")])
++    result = chunk.extract_chunk(client, canary._CANARY_CONTENT,
++                                 source_records=canary._source_records(), completion_call_limit=24)
++    assert result.failed and not result.triples
++    assert len(calls) == result.completion_calls == result.provider_attempts == 1
++
++
++@pytest.mark.parametrize("separated", [False, True])
++def test_real_sdk_truncated_digest_repair_preserves_only_proven_items(source, sdk_factory, separated):
++    client, calls = sdk_factory([
++        response(content=json.dumps(payload(source, "x" * 644))),
++        response(finish="length", content='{"summary":"PRIVATE_PARTIAL'),
++    ])
++    before = source[0].conn.total_changes
++    result = extract(source, client, separate_summary=separated)
++    assert len(calls) == 2 and client.request_attempts == 2
++    assert client.call_count == 1 and client.total_tokens == 16 and client.token_usage_available
++    assert result.summary is None and source[0].conn.total_changes == before
++    if separated:
++        reference = extract(source, SequenceLLM(payload(source)))
++        assert not result.parse_failed and result.summary_failure_reason == "output_truncated"
++        assert result.episodes == reference.episodes and result.procedures == reference.procedures
++        assert result.source_sha256 == reference.source_sha256
++        assert result.covered_message_id == reference.covered_message_id
++    else:
++        assert result.parse_failed and result.failure_reason == "output_truncated"
++        assert result.failure_stage == "summary_compaction"
++        assert result.source_sha256 is None and result.covered_message_id is None
++        assert not result.episodes.items and not result.procedures.items
++
++
++def test_real_sdk_truncated_primary_digest_never_salvages_partial_items(source, sdk_factory):
++    client, calls = sdk_factory([response(finish="length", content=json.dumps(payload(source)))])
++    with pytest.raises(digest.DigestCompletionError) as caught:
++        extract(source, client, separate_summary=True)
++    assert caught.value.failure_stage == "primary"
++    assert isinstance(caught.value.__cause__, LLMOutputTruncatedError)
++    assert len(calls) == 1 and client.call_count == 0 and client.total_tokens == 8
++
++
++@pytest.mark.parametrize("finish", ["content_filter", "unknown"])
++def test_real_sdk_nonlength_summary_repair_is_fatal(source, sdk_factory, finish):
++    client, calls = sdk_factory([response(content=json.dumps(payload(source, "x" * 644))),
++                                 response(finish=finish)])
++    with pytest.raises(digest.DigestCompletionError) as caught:
++        extract(source, client, separate_summary=True)
++    assert caught.value.failure_stage == "summary_compaction"
++    assert type(caught.value.__cause__) is LLMResponseError and len(calls) == 2
++
++
++def test_owning_deadline_precedes_length_downgrade_in_summary_repair(source, sdk_factory):
++    clock, seen = [0.0], []
++    def reply(wire):
++        seen.append(wire)
++        if len(seen) == 1:
++            return response(content=json.dumps(payload(source, "x" * 644)))
++        clock[0] = 2.0
++        return response(finish="length")
++    client, calls = sdk_factory(reply)
++    with use_deadline(MonotonicDeadline(1.0, clock=lambda: clock[0])):
++        with pytest.raises(DeadlineExceeded):
++            extract(source, client, separate_summary=True)
++    assert len(calls) == 2 and client.total_tokens == 16
++
++
++def test_real_sdk_length_holds_private_summary_job_without_advancing(conn, sdk_factory):
++    _seed(conn, long=True)
++    old = _public(conn), _items(conn)
++    client, calls = sdk_factory([response(finish="length", content="PRIVATE_PARTIAL")])
++    report = summary_recovery.run_summary_recovery(conn, client, max_calls=4)
++    assert report["calls"] == report["provider_attempts"] == report["held"] == 1
++    assert report["provider_attempts_exact"] is True
++    assert report["advanced"] == report["published"] == 0
++    assert (_public(conn), _items(conn)) == old
++    job = conn.execute("SELECT * FROM summary_recovery").fetchone()
++    assert (job["cursor_message_id"], job["cursor_partial_message_id"], job["cursor_offset"], job["draft"]) == (None, None, 0, "")
++    assert job["failure_reason"] == "output_truncated" and job["attempts"] == 1
++    assert len(calls) == 1 and client.total_tokens == 8
++    _no_lease(conn)
++
++
++def test_real_configured_canary_accounts_recovered_sdk_length_and_closes(sdk_factory):
++    seen = []
++    def reply(wire):
++        seen.append(wire)
++        if len(seen) == 1:
++            return response(finish="length", content="PRIVATE_PARTIAL")
++        return response(content=_representative_response(request(wire)))
++    # Installing the synthetic SDK leaves the configured canary's real
++    # constructor, response admission, extraction and close path intact.
++    unused, _ = sdk_factory(reply)
++    unused.close()
++    report = canary.run_configured_extraction_canary(api_key="synthetic-not-a-key",
++        base_url="https://api.deepseek.com", model="deepseek-flash", thinking="disabled")
++    assert report["status"] == "passed" and report["client_closed"] is True
++    assert report["version"] == "hymem-phase1-extraction-canary-v18"
++    assert report["execution_path"]["provider_output_truncations"] == 1
++    assert report["usage"]["calls"] + 1 == report["completion_calls"] == len(seen)
++    assert report["provider_attempts"] == len(seen) <= 24
++    assert report["usage"]["total_tokens"] == len(seen) * 8
++
++
++def test_operator_extra_body_remains_an_unmodified_extension(sdk_factory, monkeypatch):
++    client, calls = sdk_factory([response()])
++    monkeypatch.setenv("HYMEM_LLM_EXTRA_BODY", '{"diagnostic_extension":true}')
++    assert client.complete(LLMRequest("system", "user")) == "ok"
++    assert calls[0]["extra_body"] == {"thinking": {"type": "disabled"}, "diagnostic_extension": True}
++
++
++@pytest.mark.parametrize("failure", ["content_filter", "unknown", "deadline"])
++def test_private_summary_worker_does_not_downgrade_other_failures(conn, sdk_factory, failure):
++    _seed(conn, long=True)
++    old = _public(conn), _items(conn)
++    reply = DeadlineExceeded("synthetic deadline") if failure == "deadline" else response(finish=failure)
++    client, calls = sdk_factory([reply])
++    expected = DeadlineExceeded if failure == "deadline" else LLMResponseError
++    with pytest.raises(expected):
++        summary_recovery.run_summary_recovery(conn, client, max_calls=4)
++    assert (_public(conn), _items(conn)) == old and len(calls) == 1
++    job = conn.execute("SELECT * FROM summary_recovery").fetchone()
++    assert job["attempts"] == 1 and job["failure_reason"] is None
++    assert job["cursor_message_id"] is None and job["draft"] == ""
++    _no_lease(conn)
++
++
++def test_persistent_sdk_length_cannot_escape_chunk_resource_cap(sdk_factory):
++    client, calls = sdk_factory(lambda _: response(finish="length", content="PRIVATE_PARTIAL"))
++    result = chunk.extract_chunk(client, canary._CANARY_CONTENT,
++                                 source_records=canary._source_records(), completion_call_limit=24)
++    assert result.failed and not result.triples and not result.markers
++    assert result.completion_calls == result.provider_attempts == len(calls) <= 24
++    assert client.call_count == 0 and client.total_tokens == len(calls) * 8
++
++
++def test_sdk_response_error_alias_is_part_of_live_integrity_guard(sdk_factory, monkeypatch):
++    from hymem.contrib import openai_client as sdk
++    client, calls = sdk_factory([response()])
++    class AlteredLengthError(LLMOutputTruncatedError):
++        pass
++    monkeypatch.setattr(sdk, "LLMOutputTruncatedError", AlteredLengthError)
++    with pytest.raises(RuntimeError, match="identity changed"):
++        client.complete(LLMRequest("system", "user"))
++    assert not calls
+

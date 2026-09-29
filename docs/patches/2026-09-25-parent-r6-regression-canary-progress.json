@@ -1,0 +1,19 @@
+{
+  "schema": "r6-parent-regression-canary-observation-v1",
+  "package_manifest_sha256": "3e227d959ec6e5d55f65d2343787dbe66cfb5ac63de0d033d04fd0641969e484",
+  "source_manifest_sha256": "bd8d0f3a8fb40bd6b77e7ca6579c8e5e8ee78733bea2bb22df71bc4b2c12eaa2",
+  "progress_only": true,
+  "benchmark_pass_claimed": false,
+  "canaries": [
+    {
+      "client_closed": true,
+      "completion_calls": 8,
+      "provider_attempts": 8,
+      "source_split_policy_version": "hymem-source-semantic-split-v11",
+      "status": "passed",
+      "version": "hymem-phase1-extraction-canary-v19"
+    }
+  ],
+  "new_provider_calls": 0,
+  "segments": 1
+}

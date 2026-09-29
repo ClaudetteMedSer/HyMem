@@ -1,0 +1,29 @@
+{
+  "schema": "stock-q1-approved-package-recovery-v1",
+  "recovered_on": "2026-09-24",
+  "status": "historical_bytes_recovered_only",
+  "source_host": "afrodite",
+  "source_directory": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-independent-summary-20260919-9fl8JQ/q1-stock-v3/bundle",
+  "files_sha256": {
+    "manifest.json": "e6be83fee57c238c88d989bc7d8f49fc2016e62e7642636dc4cfd240f5f1868d",
+    "RUNBOOK.md": "4fc9cbd48a79641513f1f266f64ade83a51b93d39c46d1b2a5905af4f725dc7f",
+    "q1_stock_host.py": "13700ac3212c2d60dcdf360862bd582623ddfac7767695686968928848500472",
+    "q1_stock_run.py": "259d5b975adac1d0b4366f85427a06f0382af9e2a3ad78351845b336c0a4826e",
+    "q1_stock_validate.py": "189afbbe83760efc89b9a956ae914a607dcc5cd63358748f538ee59e5b8ca942",
+    "supervised_invocation.py": "9bab7fc77e68cbea050b774791aee94893c7eb54d3cbb87f8b3e7bee33ef85bc",
+    "transport_common.py": "1c98c73cfb1b607113c726616058862fd6bb16a57901a57c8962ee4a0a2807a0"
+  },
+  "local_directory": "tools/diagnostics/lme_stock_q1/previous-v3",
+  "verification": "Local shasum -a 256 matches the historical manifest and each of its six helper/RUNBOOK pins.",
+  "remote_reads_limited_to_listed_files": true,
+  "remote_results_logs_controls_credentials_or_production_memory_read": false,
+  "remote_mutations": 0,
+  "remote_benchmark_or_helper_execution": false,
+  "provider_calls": 0,
+  "successor_directory": "tools/diagnostics/lme_stock_q1/pending",
+  "successor_sealed": false,
+  "successor_manifest_present": false,
+  "source_pin_status": "awaiting_final_reviewed_R5",
+  "historical_execution_result_not_reverified": true,
+  "current_readiness_claim": false
+}

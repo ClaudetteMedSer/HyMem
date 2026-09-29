@@ -1,0 +1,9 @@
+{
+  "archive_sha256": "bdb74fad3775e01f78c8ce9d880092e24fe9ce5fd05486b8a4fed85a17d3e5f6",
+  "manifest_sha256": "3e227d959ec6e5d55f65d2343787dbe66cfb5ac63de0d033d04fd0641969e484",
+  "production_changes": false,
+  "provider_calls": 0,
+  "source_files": 231,
+  "source_manifest_sha256": "bd8d0f3a8fb40bd6b77e7ca6579c8e5e8ee78733bea2bb22df71bc4b2c12eaa2",
+  "status": "installed_not_started"
+}

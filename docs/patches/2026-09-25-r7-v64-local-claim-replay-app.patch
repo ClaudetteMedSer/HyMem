@@ -1,0 +1,689 @@
+diff --git a/hymem/core/db.py b/hymem/core/db.py
+index fe2a91a..0d6dac4 100644
+--- a/hymem/core/db.py
++++ b/hymem/core/db.py
+@@ -35,7 +35,7 @@ from hymem.core.vectors import decode_vector
+ 
+ log = logging.getLogger("hymem.core.db")
+ 
+-EXPECTED_SCHEMA_VERSION = 63
++EXPECTED_SCHEMA_VERSION = 64
+ _EVIDENCE_MUTATION_KEYS: contextvars.ContextVar[
+     frozenset[tuple[int, int, int]]
+ ] = contextvars.ContextVar("hymem_evidence_mutation_keys", default=frozenset())
+@@ -3870,9 +3870,20 @@ def _install_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
+         # replace the durable publication guards unconditionally: this heals a
+         # process that created an earlier same-named trigger definition before
+         # the final migration contract was installed.
++        proof_guard = (
++            "OR (new.local_replay_proof IS NOT NULL AND ("
++            "length(new.local_replay_proof) <> 71 OR "
++            "substr(new.local_replay_proof, 1, 7) <> 'sha256:' OR "
++            "substr(new.local_replay_proof, 8) GLOB '*[^0-9a-f]*'))"
++            if "local_replay_proof" in {
++                row["name"] for row in conn.execute(
++                    "PRAGMA table_info(kg_claim_extraction_outcomes)"
++                ).fetchall()
++            } else ""
++        )
+         _execute_startup_sql(
+             conn,
+-            """
++            f"""
+             DROP TRIGGER IF EXISTS kg_claim_extraction_outcomes_insert_guard;
+             DROP TRIGGER IF EXISTS kg_claim_extraction_outcomes_update_guard;
+             DROP TRIGGER IF EXISTS kg_claim_extraction_outcomes_delete_guard;
+@@ -3885,6 +3896,7 @@ def _install_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
+               OR substr(new.result_hash, 1, 7) <> 'sha256:'
+               OR length(new.result_hash) <> 71
+               OR substr(new.result_hash, 8) GLOB '*[^0-9a-f]*'
++              {proof_guard}
+             BEGIN
+                 SELECT RAISE(ABORT, 'claim extraction outcomes are internally managed');
+             END;
+@@ -3896,6 +3908,7 @@ def _install_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
+               OR substr(new.result_hash, 1, 7) <> 'sha256:'
+               OR length(new.result_hash) <> 71
+               OR substr(new.result_hash, 8) GLOB '*[^0-9a-f]*'
++              {proof_guard}
+             BEGIN
+                 SELECT RAISE(ABORT, 'claim extraction outcomes are internally managed');
+             END;
+@@ -5009,6 +5022,31 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
+                 )
+             log.info("migrated schema to v%d (%s)", version, entry.name)
+             continue
++        if version == 64:
++            with transaction(conn):
++                if _table_exists(conn, "kg_claim_extraction_outcomes"):
++                    columns = {
++                        row["name"] for row in conn.execute(
++                            "PRAGMA table_info(kg_claim_extraction_outcomes)"
++                        ).fetchall()
++                    }
++                    if "local_replay_proof" not in columns:
++                        _apply_migration_sql(
++                            conn, entry.read_text(encoding="utf-8")
++                        )
++                    _validate_v64_local_claim_replay_shape(conn)
++                elif _v40_domain_present(conn):
++                    raise RuntimeError(
++                        "schema v64 claim outcome domain is missing"
++                    )
++                # Sparse historical fixtures without the graph domain carry
++                # only the version stamp, as older optional migrations do.
++                conn.execute(
++                    "INSERT OR REPLACE INTO schema_meta(key,value) VALUES "
++                    "('schema_version',?)", (str(version),),
++                )
++            log.info("migrated schema to v%d (%s)", version, entry.name)
++            continue
+         if version == 40 and apply_v40 and not _v40_sql_is_complete(conn):
+             _prepare_v40_legacy_shape(conn)
+         if version == 46 and apply_version and _v46_sql_is_complete(conn):
+@@ -5237,6 +5275,8 @@ def _repair_post_migration_schema(conn: sqlite3.Connection) -> None:
+     ):
+         _ensure_v41_claim_extraction_outcome_shape(conn)
+         _refresh_v41_claim_extraction_outcomes(conn)
++        if schema_version(conn) >= 64:
++            _validate_v64_local_claim_replay_shape(conn)
+     if schema_version(conn) >= 57 and _v57_domain_present(conn):
+         # A dropped v57 view leaves its dependent triggers present but
+         # unexecutable.  Restore owned support objects before profile/evidence
+@@ -5621,6 +5661,37 @@ def _backfill_v41_claim_extraction_outcomes(conn: sqlite3.Connection) -> None:
+             )
+ 
+ 
++def _validate_v64_local_claim_replay_shape(conn: sqlite3.Connection) -> None:
++    """Reject a stamped or precreated lookalike without the local proof CHECK."""
++    columns = {
++        str(row["name"]): row
++        for row in conn.execute(
++            "PRAGMA table_info(kg_claim_extraction_outcomes)"
++        ).fetchall()
++    }
++    column = columns.get("local_replay_proof")
++    table = conn.execute(
++        "SELECT sql FROM sqlite_master WHERE type='table' "
++        "AND name='kg_claim_extraction_outcomes'"
++    ).fetchone()
++    ddl = str(table["sql"] or "") if table else ""
++    ddl = re.sub(r"/\*.*?\*/|--[^\n]*", "", ddl, flags=re.DOTALL)
++    sql = re.sub(r"\s+", "", ddl).lower()
++    expected_clause = (
++        "local_replay_prooftextcheck(local_replay_proofisnullor("
++        "length(local_replay_proof)=71and"
++        "substr(local_replay_proof,1,7)='sha256:'and"
++        "substr(local_replay_proof,8)notglob'*[^0-9a-f]*'))"
++    )
++    if (
++        column is None or str(column["type"]).upper() != "TEXT"
++        or int(column["notnull"]) != 0
++        or column["dflt_value"] is not None
++        or expected_clause not in sql
++    ):
++        raise RuntimeError("schema v64 local claim replay proof shape is malformed")
++
++
+ def _ensure_v41_claim_extraction_outcome_shape(conn: sqlite3.Connection) -> None:
+     """Heal an early stamped-v41 outcome FK from CASCADE to RESTRICT.
+ 
+@@ -5651,11 +5722,16 @@ def _ensure_v41_claim_extraction_outcome_shape(conn: sqlite3.Connection) -> None
+         ).fetchall()
+     }
+     allowed_columns = {frozenset(base_columns)}
++    allowed_columns.add(frozenset({*base_columns, "local_replay_proof"}))
+     if _table_exists(conn, "phase1_generations"):
+         allowed_columns.add(frozenset({*base_columns, "phase1_generation_key"}))
++        allowed_columns.add(frozenset({
++            *base_columns, "phase1_generation_key", "local_replay_proof",
++        }))
+     if frozenset(actual_columns) not in allowed_columns:
+         raise RuntimeError("unsupported claim extraction outcome table shape")
+     source_has_phase1_generation = "phase1_generation_key" in actual_columns
++    source_has_local_replay_proof = "local_replay_proof" in actual_columns
+     # A stamped v53 store can still carry the released early-v41 CASCADE
+     # shape after a partial/manual historical reconstruction.  When the v53
+     # registry exists, this repair must converge the rebuilt table to the full
+@@ -5664,6 +5740,20 @@ def _ensure_v41_claim_extraction_outcome_shape(conn: sqlite3.Connection) -> None
+         source_has_phase1_generation
+         or _table_exists(conn, "phase1_generations")
+     )
++    target_has_local_replay_proof = (
++        source_has_local_replay_proof or schema_version(conn) >= 64
++    )
++    if target_has_local_replay_proof and not source_has_local_replay_proof:
++        # A historical/reconstructed outcome table can safely regain only
++        # this nullable local field. No old publication earns an input proof.
++        conn.execute(
++            "ALTER TABLE kg_claim_extraction_outcomes ADD COLUMN "
++            "local_replay_proof TEXT CHECK (local_replay_proof IS NULL OR "
++            "(length(local_replay_proof)=71 AND "
++            "substr(local_replay_proof,1,7)='sha256:' AND "
++            "substr(local_replay_proof,8) NOT GLOB '*[^0-9a-f]*'))"
++        )
++        source_has_local_replay_proof = True
+     phase1_fk_is_restrict = any(
+         row["from"] == "phase1_generation_key"
+         and row["table"] == "phase1_generations"
+@@ -5735,16 +5825,28 @@ def _ensure_v41_claim_extraction_outcome_shape(conn: sqlite3.Connection) -> None
+                 "phase1_generations(generation_key) ON DELETE RESTRICT"
+                 if target_has_phase1_generation else ""
+             )
++            + (
++                ",local_replay_proof TEXT CHECK (local_replay_proof IS NULL "
++                "OR (length(local_replay_proof)=71 AND "
++                "substr(local_replay_proof,1,7)='sha256:' AND "
++                "substr(local_replay_proof,8) NOT GLOB '*[^0-9a-f]*'))"
++                if target_has_local_replay_proof else ""
++            )
+             + ")"
+         )
+         generation_column = (
+             ",phase1_generation_key" if source_has_phase1_generation else ""
+         )
++        proof_column = (
++            ",local_replay_proof" if source_has_local_replay_proof else ""
++        )
+         conn.execute(
+             "INSERT INTO kg_claim_extraction_outcomes("
+             "chunk_id,prompt_version,prompt_generation,result_hash,succeeded_at"
+-            + generation_column + ") SELECT chunk_id,prompt_version,"
+-            "prompt_generation,result_hash,succeeded_at" + generation_column
++            + generation_column + proof_column
++            + ") SELECT chunk_id,prompt_version,"
++            "prompt_generation,result_hash,succeeded_at"
++            + generation_column + proof_column
+             + " FROM kg_claim_extraction_outcomes_v41_old"
+         )
+         conn.execute("DROP TABLE kg_claim_extraction_outcomes_v41_old")
+@@ -5768,7 +5870,8 @@ def _refresh_v41_claim_extraction_outcomes(conn: sqlite3.Connection) -> None:
+         "SELECT chunk_id FROM kg_claim_extraction_outcomes ORDER BY chunk_id"
+     ).fetchall()
+     refresh_claim_extraction_outcomes(
+-        conn, [str(row["chunk_id"]) for row in rows]
++        conn, [str(row["chunk_id"]) for row in rows],
++        preserve_unchanged_local_proof=True,
+     )
+ 
+ 
+diff --git a/hymem/core/schema.sql b/hymem/core/schema.sql
+index 5cfd285..bcf873c 100644
+--- a/hymem/core/schema.sql
++++ b/hymem/core/schema.sql
+@@ -522,7 +522,14 @@ CREATE TABLE IF NOT EXISTS kg_claim_extraction_outcomes (
+     result_hash TEXT NOT NULL,
+     succeeded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+     phase1_generation_key TEXT
+-        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT
++        REFERENCES phase1_generations(generation_key) ON DELETE RESTRICT,
++    local_replay_proof TEXT CHECK (
++        local_replay_proof IS NULL OR (
++            length(local_replay_proof) = 71
++            AND substr(local_replay_proof, 1, 7) = 'sha256:'
++            AND substr(local_replay_proof, 8) NOT GLOB '*[^0-9a-f]*'
++        )
++    )
+ );
+ CREATE TRIGGER IF NOT EXISTS kg_claim_extraction_outcomes_insert_guard
+ BEFORE INSERT ON kg_claim_extraction_outcomes
+diff --git a/hymem/core/migrations/064_local_claim_replay_proof.sql b/hymem/core/migrations/064_local_claim_replay_proof.sql
+new file mode 100644
+index 0000000..f707d16
+--- /dev/null
++++ b/hymem/core/migrations/064_local_claim_replay_proof.sql
+@@ -0,0 +1,10 @@
++-- v64: local ordered-input proof for exact claim replay. Historical rows stay
++-- NULL; the proof is earned only by a fresh successful local publication.
++ALTER TABLE kg_claim_extraction_outcomes ADD COLUMN local_replay_proof TEXT
++CHECK (
++    local_replay_proof IS NULL OR (
++        length(local_replay_proof) = 71
++        AND substr(local_replay_proof, 1, 7) = 'sha256:'
++        AND substr(local_replay_proof, 8) NOT GLOB '*[^0-9a-f]*'
++    )
++);
+diff --git a/hymem/dreaming/phase1.py b/hymem/dreaming/phase1.py
+index e5e0714..4e1519f 100644
+--- a/hymem/dreaming/phase1.py
++++ b/hymem/dreaming/phase1.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import json
++import hashlib
+ import logging
+ import math
+ import sqlite3
+@@ -99,6 +100,53 @@ class ChunkExtraction:
+     phase1_generation: dict[str, object] | None = None
+ 
+ 
++def _local_replay_proof(
++    chunk: Chunk,
++    extraction: ChunkExtraction,
++    *,
++    prompt_version: str,
++    phase1_generation_key: str,
++    result_hash: str,
++    cfg: HyMemConfig | None,
++) -> str:
++    """Bind an exact ordered input to its locally published observation set."""
++    role_weights = cfg.evidence_role_weights if cfg is not None else {}
++    sources = []
++    for message_id, source in sorted(extraction.claim_sources.items()):
++        sources.append([
++            message_id, source.message_id, source.session_id, source.role,
++            source.chunk_id, source.source_created_at, source.source_peer_id,
++            source.source_workspace_id,
++            hashlib.sha256(source.content.encode("utf-8")).hexdigest(),
++        ])
++    triples = []
++    for triple in extraction.triples:
++        source = extraction.claim_sources[triple.source_message_id]
++        weight = role_weights.get(source.role, 1) if cfg is not None else 1
++        triples.append([
++            triple.subject, triple.predicate, triple.object, triple.polarity,
++            triple.value_text, triple.value_numeric, triple.value_unit,
++            triple.temporal_scope, triple.source_message_id,
++            source.session_id, source.role, weight,
++            f"configured_role:{source.role}" if cfg is not None
++            else "default_weight:1",
++        ])
++    payload = [
++        "hymem-local-claim-replay-v1", LOSSLESS_COVERAGE_VERSION,
++        prompt_version,
++        phase1_generation_key, result_hash,
++        [chunk.id, chunk.session_id, chunk.start_message_id,
++         chunk.end_message_id, chunk.salience_reason,
++         hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
++         list(chunk.source_message_ids)],
++        sources, triples,
++    ]
++    encoded = json.dumps(
++        payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
++    ).encode("utf-8")
++    return "sha256:" + hashlib.sha256(encoded).hexdigest()
++
++
+ def _is_exact_published_replay(
+     conn: sqlite3.Connection,
+     chunk: Chunk,
+@@ -125,7 +173,8 @@ def _is_exact_published_replay(
+     outcome = conn.execute(
+         "SELECT outcome.prompt_version,outcome.prompt_generation,"
+         "outcome.phase1_generation_key,"
+-        "outcome.result_hash,outcome.succeeded_at,chunk.created_at "
++        "outcome.result_hash,outcome.local_replay_proof,"
++        "outcome.succeeded_at,chunk.created_at "
+         "FROM kg_claim_extraction_outcomes outcome "
+         "JOIN chunks chunk ON chunk.id=outcome.chunk_id "
+         "WHERE outcome.chunk_id=?",
+@@ -217,6 +266,37 @@ def _is_exact_published_replay(
+     ).fetchone()
+     if int(authority["total"] or 0) != int(authority["healthy"] or 0):
+         return False
++    if outcome["local_replay_proof"] is not None:
++        # The input binding is useful only while the cited source manifest
++        # still reproduces the exact source objects supplied to this replay.
++        try:
++            stored_chunk = conn.execute(
++                "SELECT session_id,start_message_id,end_message_id,"
++                "salience_reason,text FROM chunks WHERE id=?", (chunk.id,),
++            ).fetchone()
++            chunk_matches = stored_chunk is not None and tuple(stored_chunk) == (
++                chunk.session_id, chunk.start_message_id,
++                chunk.end_message_id, chunk.salience_reason, chunk.text,
++            )
++            durable_sources = {
++                source.message_id: source
++                for source in _claim_sources_for_chunk(conn, chunk)
++            }
++            source_matches = durable_sources == extraction.claim_sources
++            expected_proof = _local_replay_proof(
++                chunk, extraction, prompt_version=prompt_version,
++                phase1_generation_key=phase1_generation_key,
++                result_hash=str(outcome["result_hash"]), cfg=cfg,
++            )
++        except (KeyError, TypeError, ValueError):
++            chunk_matches = False
++            source_matches = False
++            expected_proof = None
++        if (
++            chunk_matches and source_matches
++            and expected_proof == outcome["local_replay_proof"]
++        ):
++            return True
+     role_weights = cfg.evidence_role_weights if cfg is not None else {}
+     semantic_rows: list[tuple[object, ...]] = []
+     for triple in extraction.triples:
+@@ -948,6 +1028,30 @@ def persist_chunk_results(
+                 )
+ 
+     mentioned: set[str] = set()
++    # Reserve exact targets for the entire extraction before any optional
++    # semantic route runs. Otherwise an earlier alias can write a different
++    # interpretation to an edge claimed exactly by a later provider item.
++    reserved_exact_claims: dict[
++        tuple[str, str, str, str, int], tuple[int, str]
++    ] = {}
++    if extraction.source_validated:
++        for t in extraction.triples:
++            claim_source = extraction.claim_sources[t.source_message_id]
++            source_role = claim_source.role
++            claim_weight = role_weights.get(source_role, 1) if source_role else 1
++            reserved_exact_claims[
++                (
++                    canonicalize.resolve(conn, t.subject), t.predicate,
++                    canonicalize.resolve(conn, t.object),
++                    claim_source.session_id, claim_source.message_id,
++                )
++            ] = (
++                t.polarity,
++                _claim_interpretation_key(
++                    t, source_role=source_role, evidence_weight=claim_weight,
++                    cfg=cfg,
++                ),
++            )
+     for t in extraction.triples:
+         claim_source = (
+             extraction.claim_sources.get(t.source_message_id)
+@@ -965,6 +1069,7 @@ def persist_chunk_results(
+             cfg=cfg,
+             dedup_vectors=dedup_vectors,
+             in_cycle_edges=staged_in_cycle_edges,
++            reserved_exact_claims=reserved_exact_claims,
+         )
+         mentioned.add(subj_canon)
+         mentioned.add(obj_canon)
+@@ -1008,11 +1113,18 @@ def persist_chunk_results(
+         )
+ 
+     if extraction.source_validated:
++        local_replay_proof = _local_replay_proof(
++            chunk, extraction, prompt_version=prompt_version,
++            phase1_generation_key=phase1_generation_key,
++            result_hash=evidence.claim_observation_result_hash(conn, chunk.id),
++            cfg=cfg,
++        )
+         evidence.record_claim_extraction_outcome(
+             conn,
+             chunk_id=chunk.id,
+             prompt_version=prompt_version,
+             phase1_generation_key=phase1_generation_key,
++            local_replay_proof=local_replay_proof,
+         )
+         if phase1_generation_key is None:
+             raise ValueError("source-validated extraction has no generation")
+@@ -1481,6 +1593,27 @@ def _find_near_duplicate_in_cycle(
+     return None
+ 
+ 
++def _claim_interpretation_key(
++    triple: Triple, *, source_role: str | None,
++    evidence_weight: int, cfg: HyMemConfig | None,
++) -> str:
++    return evidence._interpretation_key(
++        polarity=triple.polarity,
++        evidence_weight=evidence_weight,
++        weight_source=(
++            f"configured_role:{source_role or 'unknown'}"
++            if cfg is not None else "default_weight:1"
++        ),
++        source_role=source_role,
++        surface_subject=triple.subject,
++        surface_object=triple.object,
++        value_text=triple.value_text,
++        value_numeric=triple.value_numeric,
++        value_unit=triple.value_unit,
++        temporal_scope=triple.temporal_scope,
++    )
++
++
+ def _semantic_dedup_conflicts_with_claim_observation(
+     conn: sqlite3.Connection,
+     *,
+@@ -1492,6 +1625,9 @@ def _semantic_dedup_conflicts_with_claim_observation(
+     cfg: HyMemConfig | None,
+     prompt_version: str | None,
+     phase1_generation_key: str | None,
++    reserved_exact_claims: dict[
++        tuple[str, str, str, str, int], tuple[int, str]
++    ] | None = None,
+ ) -> bool:
+     """Keep a semantic alias merge from changing one source's claim meaning.
+ 
+@@ -1503,21 +1639,21 @@ def _semantic_dedup_conflicts_with_claim_observation(
+         or phase1_generation_key is None
+     ):
+         return False
+-    interpretation_key = evidence._interpretation_key(
+-        polarity=triple.polarity,
+-        evidence_weight=evidence_weight,
+-        weight_source=(
+-            f"configured_role:{source_role or 'unknown'}"
+-            if cfg is not None else "default_weight:1"
+-        ),
+-        source_role=source_role,
+-        surface_subject=triple.subject,
+-        surface_object=triple.object,
+-        value_text=triple.value_text,
+-        value_numeric=triple.value_numeric,
+-        value_unit=triple.value_unit,
+-        temporal_scope=triple.temporal_scope,
++    interpretation_key = _claim_interpretation_key(
++        triple, source_role=source_role, evidence_weight=evidence_weight,
++        cfg=cfg,
+     )
++    target = conn.execute(
++        "SELECT subject_canonical,predicate,object_canonical "
++        "FROM knowledge_graph WHERE id=?", (edge_id,),
++    ).fetchone()
++    reserved = (reserved_exact_claims or {}).get((
++        target["subject_canonical"], target["predicate"],
++        target["object_canonical"], claim_source.session_id,
++        claim_source.message_id,
++    )) if target is not None else None
++    if reserved is not None and reserved != (triple.polarity, interpretation_key):
++        return True
+     return conn.execute(
+         """
+         SELECT 1 FROM kg_claim_observations
+@@ -1548,6 +1684,9 @@ def _upsert_triple(
+     cfg: HyMemConfig | None = None,
+     dedup_vectors: dict[str, list[float]] | None = None,
+     in_cycle_edges: list[_InCycleEdge] | None = None,
++    reserved_exact_claims: dict[
++        tuple[str, str, str, str, int], tuple[int, str]
++    ] | None = None,
+ ) -> tuple[str, str, int, int]:
+     subj_canon = canonicalize.resolve(conn, triple.subject)
+     obj_canon = canonicalize.resolve(conn, triple.object)
+@@ -1609,6 +1748,7 @@ def _upsert_triple(
+                     evidence_weight=evidence_weight, cfg=cfg,
+                     prompt_version=prompt_version,
+                     phase1_generation_key=phase1_generation_key,
++                    reserved_exact_claims=reserved_exact_claims,
+                 ):
+                     edge_id = None
+                     rejected_semantic_target = True
+@@ -1644,6 +1784,7 @@ def _upsert_triple(
+                         evidence_weight=evidence_weight, cfg=cfg,
+                         prompt_version=prompt_version,
+                         phase1_generation_key=phase1_generation_key,
++                        reserved_exact_claims=reserved_exact_claims,
+                     ):
+                         edge_id = None
+                 if edge_id is not None:
+diff --git a/hymem/dreaming/evidence.py b/hymem/dreaming/evidence.py
+index 134a06b..f7d5fef 100644
+--- a/hymem/dreaming/evidence.py
++++ b/hymem/dreaming/evidence.py
+@@ -229,6 +229,7 @@ def record_claim_extraction_outcome(
+     chunk_id: str,
+     prompt_version: str,
+     phase1_generation_key: str | None = None,
++    local_replay_proof: str | None = None,
+ ) -> bool:
+     """Publish the latest successful, source-validated result for a chunk.
+ 
+@@ -396,21 +397,21 @@ def record_claim_extraction_outcome(
+             conn.execute(
+                 "INSERT INTO kg_claim_extraction_outcomes(" 
+                 "chunk_id,prompt_version,prompt_generation,result_hash,"
+-                "phase1_generation_key) VALUES (?,?,?,?,?)",
++                "phase1_generation_key,local_replay_proof) VALUES (?,?,?,?,?,?)",
+                 (
+                     chunk_id, prompt_version, generation, result_hash,
+-                    phase1_generation_key,
++                    phase1_generation_key, local_replay_proof,
+                 ),
+             )
+         else:
+             conn.execute(
+                 "UPDATE kg_claim_extraction_outcomes SET prompt_version=?,"
+                 "prompt_generation=?,result_hash=?,phase1_generation_key=?,"
+-                "succeeded_at=CURRENT_TIMESTAMP "
++                "local_replay_proof=?,succeeded_at=CURRENT_TIMESTAMP "
+                 "WHERE chunk_id=?",
+                 (
+                     prompt_version, generation, result_hash,
+-                    phase1_generation_key, chunk_id,
++                    phase1_generation_key, local_replay_proof, chunk_id,
+                 ),
+             )
+     _publish_chunk_evidence(conn, chunk_id)
+@@ -418,21 +419,42 @@ def record_claim_extraction_outcome(
+ 
+ 
+ def refresh_claim_extraction_outcomes(
+-    conn: sqlite3.Connection, chunk_ids: Iterable[str]
++    conn: sqlite3.Connection, chunk_ids: Iterable[str], *,
++    preserve_unchanged_local_proof: bool = False,
+ ) -> None:
+     """Refresh hashes after an authorized edge-natural/provenance merge."""
+     ids = sorted({str(chunk_id) for chunk_id in chunk_ids if chunk_id})
+     if not ids:
+         return
+     from hymem.core.db import evidence_mutation
++    has_local_proof = any(
++        row["name"] == "local_replay_proof"
++        for row in conn.execute(
++            "PRAGMA table_info(kg_claim_extraction_outcomes)"
++        ).fetchall()
++    )
+ 
+     with evidence_mutation(conn):
+         for chunk_id in ids:
+-            conn.execute(
+-                "UPDATE kg_claim_extraction_outcomes SET result_hash=? "
+-                "WHERE chunk_id=?",
+-                (claim_observation_result_hash(conn, chunk_id), chunk_id),
+-            )
++            result_hash = claim_observation_result_hash(conn, chunk_id)
++            if not has_local_proof:
++                conn.execute(
++                    "UPDATE kg_claim_extraction_outcomes SET result_hash=? "
++                    "WHERE chunk_id=?", (result_hash, chunk_id),
++                )
++            elif preserve_unchanged_local_proof:
++                conn.execute(
++                    "UPDATE kg_claim_extraction_outcomes SET result_hash=?,"
++                    "local_replay_proof=CASE WHEN result_hash=? "
++                    "THEN local_replay_proof ELSE NULL END WHERE chunk_id=?",
++                    (result_hash, result_hash, chunk_id),
++                )
++            else:
++                conn.execute(
++                    "UPDATE kg_claim_extraction_outcomes SET result_hash=?,"
++                    "local_replay_proof=NULL WHERE chunk_id=?",
++                    (result_hash, chunk_id),
++                )
+ 
+ 
+ def claim_retirement_authority(
+@@ -2285,6 +2307,13 @@ def move_edge_provenance(
+         observation_chunk_ids = {
+             str(observation["chunk_id"]) for observation in observations
+         }
++        observation_chunk_ids.update(
++            str(row["chunk_id"])
++            for row in conn.execute(
++                "SELECT DISTINCT chunk_id FROM kg_claim_observations "
++                "WHERE edge_id=?", (survivor_id,),
++            ).fetchall()
++        )
+         for observation in observations:
+             mapped_evidence = id_map.get(
+                 int(observation["evidence_id"]), int(observation["evidence_id"])
+diff --git a/hymem/dreaming/canonicalize.py b/hymem/dreaming/canonicalize.py
+index e43621f..01cd54b 100644
+--- a/hymem/dreaming/canonicalize.py
++++ b/hymem/dreaming/canonicalize.py
+@@ -105,10 +105,10 @@ def resolve(conn: sqlite3.Connection, surface: str) -> str:
+ def register_alias(conn: sqlite3.Connection, surface: str, canonical: str) -> None:
+     """Map a pure surface form onto an existing canonical id.
+ 
+-    If the normalized surface already owns canonical state, this operation
+-    would strand that state behind the new alias because ``resolve`` is
+-    intentionally one hop.  Such identity changes must use :func:`merge`,
+-    which rewrites and re-hashes every provenance-bearing domain.
++    A new mapping cannot replace an identity that already owns canonical
++    state: ``resolve`` is intentionally one hop, so that change requires
++    :func:`merge`. Re-registering an unchanged mapping is a no-op, including
++    when historical state still names the alias key.
+     """
+     if not isinstance(surface, str) or not isinstance(canonical, str):
+         raise ValueError("entity alias and canonical must be strings")
+@@ -130,6 +130,8 @@ def register_alias(conn: sqlite3.Connection, surface: str, canonical: str) -> No
+         and str(existing_alias["canonical"]) != canonical
+     ):
+         raise ValueError("entity alias already maps to another canonical identity")
++    if existing_alias is not None:
++        return
+     if alias != canonical:
+         owned = False
+         scalar_owners = (
+@@ -678,3 +680,22 @@ def merge(
+         )
+ 
+         refresh_phase1_auxiliary_outcomes(conn, auxiliary_identities)
++        # A merge can change only auxiliary identity rows while every claim
++        # remains on an existing edge. Those chunks still lose their local
++        # ordered-input replay proof; no historical proof is reconstructed.
++        if "local_replay_proof" in {
++            str(row["name"])
++            for row in conn.execute(
++                "PRAGMA table_info(kg_claim_extraction_outcomes)"
++            ).fetchall()
++        }:
++            from hymem.core.db import evidence_mutation
++
++            with evidence_mutation(conn):
++                conn.executemany(
++                    "UPDATE kg_claim_extraction_outcomes SET "
++                    "local_replay_proof=NULL WHERE chunk_id=?",
++                    [(chunk_id,) for chunk_id in sorted({
++                        chunk_id for chunk_id, _ in auxiliary_identities
++                    })],
++                )
+diff --git a/hymem/portability.py b/hymem/portability.py
+index 3ceee1e..ad470f4 100644
+--- a/hymem/portability.py
++++ b/hymem/portability.py
+@@ -6192,6 +6192,15 @@ def _import_v7_claim_state(
+                 "WHERE outcome.chunk_id=?",
+                 (chunk_id,),
+             ).fetchone()
++            # Ordered-input replay proof is earned only by this local writer.
++            # Even an identical imported outcome cannot authenticate the
++            # source response that produced the destination's current graph.
++            if existing is not None:
++                conn.execute(
++                    "UPDATE kg_claim_extraction_outcomes SET "
++                    "local_replay_proof=NULL WHERE chunk_id=?",
++                    (chunk_id,),
++                )
+             incoming_generation = int(record["prompt_generation"])
+             incoming_key = record.get("phase1_generation_key")
+             invalidate_processed = False

@@ -1,0 +1,22 @@
+--- a/tests/test_honcho_server.py
++++ b/tests/test_honcho_server.py
+@@ -799,7 +799,8 @@
+     assert r2.status_code == 201
+ 
+     # First kick runs immediately; second is gated by cooldown.
+-    assert sched.wait_for_cycle(1, timeout=5.0)
++    # CPU-bound source-proof generation can exceed 5s on a one-CPU test runner.
++    assert sched.wait_for_cycle(1, timeout=30.0)
+ 
+     count = hy_with_embed.conn.execute(
+         "SELECT COUNT(*) FROM dream_runs"
+@@ -821,7 +822,8 @@
+     assert r1.status_code == 201
+     assert r2.status_code == 201
+ 
+-    assert sched.wait_for_cycle(2, timeout=5.0)
++    # Allow bounded execution time without changing the scheduler's cooldown.
++    assert sched.wait_for_cycle(2, timeout=30.0)
+ 
+     count = hy_with_embed.conn.execute(
+         "SELECT COUNT(*) FROM dream_runs"

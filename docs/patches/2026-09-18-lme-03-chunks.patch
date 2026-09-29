@@ -1,0 +1,537 @@
+--- a/hymem/extraction/chunk.py
++++ b/hymem/extraction/chunk.py
+@@ -75,6 +75,11 @@
+ # predictable 8192-token failure. These limits fail the whole chunk rather than
+ # silently dropping input.
+ _MAX_LEAF_INPUT_CHARS = 4000
++# The ordinary partition target is not a proof that a larger semantic atom is
++# invalid. If the safe splitter cannot divide a unit, permit one intact input
++# under a separate hard ceiling; never discard its source or context to fit.
++INPUT_ADMISSION_POLICY_VERSION = "hymem-bounded-whole-unit-input-v1"
++_MAX_UNSPLITTABLE_INPUT_CHARS = 8000
+ _MAX_PREPARTITION_LEAVES = 32
+ _MAX_SPLIT_DEPTH = 8
+ # Recursive subdivision is hard-bounded in logical ``LLMClient.complete`` calls.
+@@ -2323,24 +2328,43 @@
+     )
+ 
+ 
++def _bounded_whole_unit_allowed(unit: _ExtractionUnit, depth: int) -> bool:
++    """Whether an unsplittable oversized unit fits the intact-input envelope.
++
++    Call only after the existing safe splitter returned None. This is input
++    admission, not recovery from failed children or a waiver of tree limits.
++    Count encoded context and owned records together, exactly as transmitted.
++    """
++    return (
++        depth < _MAX_SPLIT_DEPTH
++        and _MAX_LEAF_INPUT_CHARS < len(unit.text)
++        <= _MAX_UNSPLITTABLE_INPUT_CHARS
++    )
++
++
+ def _prepartition(
+     unit: _ExtractionUnit,
+ ) -> tuple[list[tuple[_ExtractionUnit, int]] | None, ChunkResult | None]:
+     leaves: list[tuple[_ExtractionUnit, int]] = []
+     failure_details: list[str] = []
+ 
++    def add_leaf(current: _ExtractionUnit, depth: int) -> bool:
++        leaves.append((current, depth))
++        if len(leaves) <= _MAX_PREPARTITION_LEAVES:
++            return True
++        failure_details.append("input:prepartition_limit_exceeded")
++        return False
++
+     def visit(current: _ExtractionUnit, depth: int) -> bool:
+         if len(current.text) <= _MAX_LEAF_INPUT_CHARS:
+-            leaves.append((current, depth))
+-            if len(leaves) <= _MAX_PREPARTITION_LEAVES:
+-                return True
+-            failure_details.append("input:prepartition_limit_exceeded")
+-            return False
++            return add_leaf(current, depth)
+         if depth >= _MAX_SPLIT_DEPTH:
+             failure_details.append("split:max_depth_reached")
+             return False
+         split = _split_unit(current)
+         if split is None:
++            if _bounded_whole_unit_allowed(current, depth):
++                return add_leaf(current, depth)
+             failure_details.append("split:no_admissible_semantic_boundary")
+             return False
+         return visit(split[0], depth + 1) and visit(split[1], depth + 1)
+@@ -2817,15 +2841,19 @@
+ 
+     def recover(current: _ExtractionUnit, depth: int) -> ChunkResult:
+         # A recovery split can add context metadata to its children. Apply the
+-        # same hard input ceiling as initial prepartitioning before any call.
++        # same split-first/intact-input envelope as initial prepartitioning.
+         if len(current.text) > _MAX_LEAF_INPUT_CHARS:
+             split = _split_unit(current) if depth < _MAX_SPLIT_DEPTH else None
+             if split is None:
+-                return _failure("resource_limit", "input:context_leaf_limit_exceeded")
+-            left = recover(split[0], depth + 1)
+-            if left.failed:
+-                return _failed_split_after_left(left)
+-            return _merge_results(left, recover(split[1], depth + 1))
++                if not _bounded_whole_unit_allowed(current, depth):
++                    return _failure("resource_limit", "input:context_leaf_limit_exceeded")
++                # Continue into the existing primary/verification ladder with
++                # this exact unit. Do not recursively retry the same input.
++            else:
++                left = recover(split[0], depth + 1)
++                if left.failed:
++                    return _failed_split_after_left(left)
++                return _merge_results(left, recover(split[1], depth + 1))
+         verifier_failed = False
+         verifier_split_recoverable = False
+         result, _raw = attempt(current)
+--- a/hymem/extraction/contract.py
++++ b/hymem/extraction/contract.py
+@@ -315,6 +315,10 @@
+             "max_conversation_context_encoded_chars": chunk_module._MAX_CONVERSATION_CONTEXT_ENCODED_CHARS,
+             "max_conversation_context_applicability_chars": chunk_module._MAX_CONVERSATION_CONTEXT_APPLICABILITY_CHARS,
+             "clean_empty": chunk_module.CLEAN_EMPTY_RECOVERY_POLICY_VERSION,
++            "input_admission": chunk_module.INPUT_ADMISSION_POLICY_VERSION,
++            "max_unsplittable_input_chars": (
++                chunk_module._MAX_UNSPLITTABLE_INPUT_CHARS
++            ),
+             "retry_attempts": retry_module.DEFAULT_RETRY_ATTEMPTS,
+             "max_completion_calls": (
+                 chunk_module.MAX_EXTRACTION_COMPLETION_CALLS_PER_CHUNK
+--- /dev/null
++++ b/tests/test_extraction_whole_unit_input.py
+@@ -0,0 +1,245 @@
++"""Intact bounded input is not the same as discarding an unsafe boundary."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from benchmarks.extraction_canary import extraction_canary_policy
++from hymem.extraction import chunk, contract, prompts
++
++
++EMPTY = '{"triples":[],"markers":[],"complete":true}'
++
++
++def _record(content, mid=17, role="user"):
++    return mid, json.dumps({
++        "content": content, "source_created_at": "2026-09-01T00:00:00.000Z",
++        "source_message_id": mid, "source_peer_id": None,
++        "source_record_version": "hymem-claim-source-v2",
++        "source_role": role, "source_session_id": "whole-unit-control",
++        "source_workspace_id": None,
++    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
++
++
++def _sized_record(size, *, prefix="", suffix=""):
++    overhead = len(_record(prefix + suffix)[1])
++    record = _record(prefix + "x" * (size - overhead) + suffix)
++    assert len(record[1]) == size
++    return record
++
++
++def _claim(mid=17):
++    return {"subject": "user", "predicate": "uses", "object": "PostgreSQL",
++            "polarity": -1, "source_message_id": mid}
++
++
++def _response(*claims, complete=True):
++    return json.dumps({"triples": list(claims), "markers": [], "complete": complete})
++
++
++class _Client:
++    def __init__(self, *responses):
++        self.responses = list(responses)
++        self.requests = []
++
++    def complete(self, request):
++        self.requests.append(request)
++        if not self.responses:
++            raise AssertionError("unexpected extra provider call")
++        return self.responses.pop(0)
++
++
++def _excerpt(request):
++    return request.user.split('"""', 2)[1].strip()
++
++
++@pytest.mark.parametrize("size", [4000, 4001, 7999, 8000, 8001])
++@pytest.mark.parametrize("source_backed", [False, True])
++def test_encoded_input_boundaries_preserve_whole_input(size, source_backed):
++    records = (_sized_record(size),) if source_backed else None
++    expected = records[0][1] if records else "x" * size
++    client = _Client(EMPTY, EMPTY)
++    result = chunk.extract_chunk(client, expected, source_records=records)
++    if size > chunk._MAX_UNSPLITTABLE_INPUT_CHARS:
++        assert result.failed and result.failure_reason == "resource_limit"
++        assert result.completion_calls == result.provider_attempts == 0
++        assert client.requests == []
++    else:
++        assert not result.failed
++        assert result.initial_prepartition_leaves == 1
++        assert result.completion_calls == result.provider_attempts == 2
++        assert [_excerpt(request) for request in client.requests] == [expected] * 2
++        assert all(request.max_tokens == 4096 for request in client.requests)
++
++
++@pytest.mark.parametrize("size", [8000, 8001])
++def test_json_escaping_and_metadata_count_toward_whole_input_bound(size):
++    record = _sized_record(size, prefix='"\\\n' * 120)
++    assert len(json.loads(record[1])["content"]) < size
++    client = _Client(EMPTY, EMPTY)
++    result = chunk.extract_chunk(client, "ignored", source_records=(record,))
++    assert result.failed is (size == 8001)
++    assert result.completion_calls == (0 if size == 8001 else 2)
++    assert all(_excerpt(request) == record[1] for request in client.requests)
++
++
++def test_normal_splittable_input_still_uses_four_thousand_target():
++    record = _record("Routine background. " * 250)
++    assert 4000 < len(record[1]) < 8000
++    client = _Client(*([EMPTY] * 8))
++    result = chunk.extract_chunk(client, "ignored", source_records=(record,))
++    assert not result.failed and result.initial_prepartition_leaves > 1
++    assert all(len(_excerpt(request)) <= 4000 for request in client.requests)
++
++
++def test_fenced_code_is_transmitted_whole_without_cutting_or_relabelling():
++    record = _sized_record(4180, prefix="```text\nDo NOT use PostgreSQL ", suffix="\n```")
++    unit = chunk._source_unit((record,))
++    assert chunk._split_unit(unit) is None
++    client = _Client(_response(_claim()), EMPTY)
++    result = chunk.extract_chunk(client, "ignored", source_records=(record,))
++    assert not result.failed and result.triples[0].polarity == -1
++    assert result.completion_calls == 2
++    assert [_excerpt(request) for request in client.requests] == [record[1]] * 2
++    assert "OMISSION VERIFICATION PASS" in client.requests[1].system
++
++
++def test_unsliceable_conversational_antecedent_and_negation_stay_intact():
++    records = (
++        _record("Do NOT " + "very " * 600 + "often use PostgreSQL?", role="assistant"),
++        _record("No, I do not. " + "y" * 1200, mid=18),
++    )
++    unit = chunk._source_unit(records)
++    assert 4000 < len(unit.text) < 8000
++    assert chunk._split_unit(unit) is None
++    client = _Client(_response(_claim(18)), EMPTY)
++    result = chunk.extract_chunk(client, "ignored", source_records=records)
++    assert not result.failed
++    assert result.triples[0].source_message_id == 18
++    assert result.triples[0].polarity == -1
++    assert [_excerpt(request) for request in client.requests] == [unit.text] * 2
++
++
++def test_real_recovery_context_expansion_keeps_negation_and_owned_citation():
++    for padding in range(3000, 3700):
++        records = (
++            _record("Do you NOT use PostgreSQL?", role="assistant"),
++            _record("No " + "x" * padding, mid=18),
++        )
++        parent = chunk._source_unit(records)
++        split = chunk._split_unit(parent)
++        if (
++            split is not None
++            and len(parent.text) <= 4000 < len(split[1].text) <= 8000
++            and chunk._split_unit(split[1]) is None
++        ):
++            break
++    else:
++        pytest.fail("fixture must exercise unsplittable recovery context expansion")
++    left, right = split
++    client = _Client(_response(complete=False), EMPTY, EMPTY, _response(_claim(18)), EMPTY)
++    result = chunk.extract_chunk(client, "ignored", source_records=records)
++    assert not result.failed and result.completion_calls == 5
++    assert result.initial_prepartition_leaves == 1
++    assert result.triples[0].source_message_id == 18
++    assert result.triples[0].polarity == -1
++    assert [_excerpt(request) for request in client.requests] == [
++        parent.text, left.text, left.text, right.text, right.text,
++    ]
++    context = json.loads(right.context_records[0][1])
++    assert context["content"] == "Do you NOT use PostgreSQL?"
++    assert right.allowed_ids == frozenset({18})
++
++
++@pytest.mark.parametrize("bad,reason", [
++    (_response(complete=False), "incomplete_response"),
++    ('{"triples":[', "parse_failure"),
++    ('{"triples":[BROKEN', "parse_failure"),
++    (_response({"subject": "incomplete"}), "item_validation_failure"),
++    (_response(_claim(999)), "response_conflict"),
++    (_response(*[_claim() for _ in range(24)]), "output_limit_exceeded"),
++])
++def test_oversize_admission_cannot_heal_invalid_primary_with_empty(bad, reason):
++    record = _sized_record(4500)
++    client = _Client(bad, EMPTY)
++    result = chunk.extract_chunk(client, "ignored", source_records=(record,))
++    assert result.failed and result.failure_reason == reason
++    assert result.triples == [] and result.markers == []
++    assert 1 <= result.completion_calls <= 2
++    assert all(_excerpt(request) == record[1] for request in client.requests)
++
++
++@pytest.mark.parametrize("bad", [_response(complete=False), '{"triples":[BROKEN'])
++def test_failed_oversize_omission_verification_stays_atomic_and_finite(bad):
++    record = _sized_record(4500)
++    client = _Client(_response(_claim()), bad)
++    result = chunk.extract_chunk(client, "ignored", source_records=(record,))
++    assert result.failed and result.triples == [] and result.markers == []
++    assert result.completion_calls == len(client.requests) == 2
++
++
++def test_whole_unit_verification_still_requires_call_budget():
++    client = _Client(EMPTY)
++    result = chunk.extract_chunk(client, "x" * 4500, completion_call_limit=1)
++    assert result.failed and result.failure_reason == "resource_limit"
++    assert "calls:max_exceeded" in result.failure_details
++    assert result.completion_calls == 1
++
++
++def test_prepartition_fallback_does_not_bypass_depth_or_leaf_count(monkeypatch):
++    client = _Client()
++    monkeypatch.setattr(chunk, "_MAX_SPLIT_DEPTH", 0)
++    result = chunk.extract_chunk(client, "x" * 4500)
++    assert result.failed and result.failure_details == ("split:max_depth_reached",)
++    assert not client.requests
++    monkeypatch.setattr(chunk, "_MAX_SPLIT_DEPTH", 8)
++    monkeypatch.setattr(chunk, "_MAX_PREPARTITION_LEAVES", 1)
++    text = "x" * 4500 + ".\n\n" + "Y" * 4500
++    result = chunk.extract_chunk(client, text)
++    assert result.failed
++    assert result.failure_details == ("input:prepartition_limit_exceeded",)
++    assert not client.requests
++
++
++@pytest.mark.parametrize("child_size,depth,accepted", [(4500, 0, True), (8001, 0, False), (4500, 7, False)])
++def test_recovery_created_child_uses_same_whole_unit_and_depth_bounds(
++    monkeypatch, child_size, depth, accepted,
++):
++    # Model a recovery-only context expansion. All extractor input/call guards
++    # are real; the splitter seam isolates this otherwise rare branch.
++    parent = chunk._ExtractionUnit("P" * 500)
++    child = chunk._ExtractionUnit("x" * child_size)
++    right = chunk._ExtractionUnit("R" * 200)
++    monkeypatch.setattr(chunk, "_prepartition", lambda unit: ([(unit, depth)], None))
++    monkeypatch.setattr(chunk, "_split_unit", lambda unit: (child, right) if unit.text == parent.text else None)
++    client = _Client(_response(complete=False), EMPTY, EMPTY, EMPTY, EMPTY)
++    result = chunk.extract_chunk(client, parent.text)
++    assert result.failed is not accepted
++    if accepted:
++        assert result.completion_calls == 5
++        assert [_excerpt(request) for request in client.requests][1:3] == [child.text] * 2
++    else:
++        assert result.completion_calls == 1
++        assert result.triples == [] and result.markers == []
++        assert any("context_leaf_limit_exceeded" in detail for detail in result.failure_details)
++
++
++def test_whole_input_policy_and_limit_bind_cache_and_canary_identity(monkeypatch):
++    old_cache = contract.extraction_cache_key("v20")
++    old_canary = extraction_canary_policy(prompt_version="v20")
++    components = contract._contract_components("v20")["recovery_policy"]
++    assert components["input_admission"] == "hymem-bounded-whole-unit-input-v1"
++    assert components["max_unsplittable_input_chars"] == 8000
++    assert chunk._MAX_LEAF_INPUT_CHARS == 4000
++    assert chunk._MAX_SPLIT_DEPTH == 8 and chunk._MAX_PREPARTITION_LEAVES == 32
++    assert chunk.MAX_EXTRACTION_COMPLETION_CALLS_PER_CHUNK == 96
++    assert chunk.SOURCE_RECORD_SPLIT_POLICY_VERSION == "hymem-source-semantic-split-v10"
++    assert chunk.CLEAN_EMPTY_RECOVERY_POLICY_VERSION.endswith("-v3")
++    original_prompt = prompts.build_chunk_extraction_system()
++    for name, value in [("INPUT_ADMISSION_POLICY_VERSION", "different-policy"), ("_MAX_UNSPLITTABLE_INPUT_CHARS", 8001)]:
++        with monkeypatch.context() as patch:
++            patch.setattr(chunk, name, value)
++            assert contract.extraction_cache_key("v20") != old_cache
++            assert extraction_canary_policy(prompt_version="v20") != old_canary
++            assert prompts.build_chunk_extraction_system() == original_prompt
+--- a/tests/test_extraction_retry.py
++++ b/tests/test_extraction_retry.py
+@@ -995,9 +995,9 @@
+ 
+     content = (
+         "The Amsterdam deployment record "
+-        + ("x" * 2050)
++        + ("x" * 4050)
+         + internal_punctuation
+-        + ("y" * 2050)
++        + ("y" * 4050)
+         + " remains authoritative in Amsterdam."
+     )
+     llm = StubLLMClient(default=_complete({"triples": [], "markers": []}))
+@@ -1098,8 +1098,8 @@
+ ):
+     """Even record-shaped rows need a header to prove their semantics."""
+ 
+-    content = _dense_headerless_table(newline=newline)
+-    assert len(content) > chunk_extraction._MAX_LEAF_INPUT_CHARS
++    content = _dense_headerless_table(240, newline=newline)
++    assert len(content) > chunk_extraction._MAX_UNSPLITTABLE_INPUT_CHARS
+     assert chunk_extraction._markdown_table_boundary_points(content) == []
+     assert chunk_extraction._semantic_split_point(content) is None
+ 
+@@ -1254,7 +1254,7 @@
+ ):
+     content = newline.join([
+         "   ````python",
+-        *(("inside. Another sentence." + newline + newline) for _ in range(180)),
++        *(("inside. Another sentence." + newline + newline) for _ in range(360)),
+         "```",  # shorter than the opener, so it is source text, not a close
+         "| a | b |",
+         "| --- | --- |",
+@@ -1502,9 +1502,9 @@
+     content = newline.join([
+         "Important claims:",
+         "",
+-        "- first clause " + ("x" * 2100) + ". Another sentence.",
++        "- first clause " + ("x" * 4100) + ". Another sentence.",
+         "",
+-        "  continuation clause " + ("y" * 2100) + ".",
++        "  continuation clause " + ("y" * 4100) + ".",
+         "    - nested-looking clause " + ("z" * 300) + ".",
+     ])
+     assert len(content) > chunk_extraction._MAX_LEAF_INPUT_CHARS
+@@ -2078,7 +2078,7 @@
+     content = "\n".join([
+         "| person | preferred database |",
+         "| --- | --- |",
+-        *(f"| person_{index} | database_{index} |" for index in range(260)),
++        *(f"| person_{index} | database_{index} |" for index in range(320)),
+     ])
+     assert chunk_extraction._semantic_split_point(content) in (
+         chunk_extraction._markdown_table_boundary_points(content)
+@@ -2489,7 +2489,9 @@
+     ],
+ )
+ def test_malformed_pipe_prose_does_not_enable_soft_newline_splits(content: str):
+-    assert len(content) > chunk_extraction._MAX_LEAF_INPUT_CHARS
++    # Keep the original malformed boundary cases, beyond intact admission too.
++    content = content + "\n" + content
++    assert len(content) > chunk_extraction._MAX_UNSPLITTABLE_INPUT_CHARS
+     assert chunk_extraction._markdown_table_boundary_points(content) == []
+     assert chunk_extraction._semantic_split_point(content) is None
+ 
+@@ -2541,7 +2543,7 @@
+ def test_literal_unseparated_midpoint_claim_is_held_without_provider_spend():
+     """A terminal followed by token data is not a safe sentence boundary."""
+ 
+-    content = ("x" * 2100) + _MIDPOINT_CROSSING_CLAIM + ("y" * 2100)
++    content = ("x" * 4100) + _MIDPOINT_CROSSING_CLAIM + ("y" * 4100)
+     legacy_midpoint = len(content) // 2
+     assert _MIDPOINT_CROSSING_CLAIM not in content[:legacy_midpoint + 64]
+     assert _MIDPOINT_CROSSING_CLAIM not in content[legacy_midpoint - 64:]
+@@ -2565,7 +2567,7 @@
+     """A display wrap cannot authorize two independently empty fragments."""
+ 
+     claim = "The deployment depends\non PostgreSQL."
+-    content = ("x" * 2100) + claim + ("y" * 2100)
++    content = ("x" * 4100) + claim + ("y" * 4100)
+     soft_cut = content.index("\n") + 1
+     assert "deployment depends" in content[:soft_cut]
+     assert "on PostgreSQL" in content[soft_cut:]
+@@ -2585,8 +2587,10 @@
+     assert llm.calls == []
+ 
+ 
+-def test_source_less_unbreakable_claim_cannot_become_authoritative_empty():
++def test_source_less_bounded_unbreakable_unit_gets_whole_unit_empty_verification():
+     text = "Application uses " + ("x" * 374) + " PostgreSQL."
++    assert len(text) <= chunk_extraction._MAX_LEAF_INPUT_CHARS
++    assert chunk_extraction._semantic_split_point(text) is None
+     legacy_midpoint = len(text) // 2
+     for fragment in (text[:legacy_midpoint + 64], text[legacy_midpoint - 64:]):
+         assert not (
+@@ -2596,14 +2600,15 @@
+ 
+     result = extract_chunk(llm, text)
+ 
+-    assert result.failed is True
+-    assert result.failure_reason == "resource_limit"
+-    assert "split:no_admissible_semantic_boundary" in result.failure_details
++    assert result.failed is False
++    assert result.failure_reason is None
++    assert result.failure_details == ()
+     assert result.triples == [] and result.markers == []
+-    # Split safety cannot be established, but the terminal primary empty still
+-    # receives exactly one genuine second look before the unit is held.
++    # Inherited v3 contract: cue/length alone cannot reject two valid replies.
++    # Neither call may silently split or truncate the indivisible claim.
+     assert result.completion_calls == result.provider_attempts == 2
+     assert len(llm.calls) == 2
++    assert all(call.user.split('"""', 2)[1].strip() == text for call in llm.calls)
+     assert "VERIFICATION PASS" not in llm.calls[0].system
+     assert "EMPTY VERIFICATION PASS" in llm.calls[1].system
+ 
+@@ -2765,7 +2770,7 @@
+     result = extract_chunk(
+         llm,
+         "ignored legacy rendering",
+-        source_records=(_source_record(17, "x" * 5000),),
++        source_records=(_source_record(17, "x" * 9000),),
+     )
+     assert result.failed is True
+     assert result.failure_reason == "resource_limit"
+@@ -3482,7 +3487,7 @@
+         aggregation_nodes_enabled=False,
+     ), llm=llm)
+     try:
+-        unsafe = ("x" * 2100) + _MIDPOINT_CROSSING_CLAIM + ("y" * 2100)
++        unsafe = ("x" * 4100) + _MIDPOINT_CROSSING_CLAIM + ("y" * 4100)
+         chunk = _seed_chunk(hy, "unsafe-semantic-unit", content=unsafe)
+ 
+         report = hy.dream(session_ids=[chunk.session_id])
+--- a/tests/test_extraction_conversation_context.py
++++ b/tests/test_extraction_conversation_context.py
+@@ -216,7 +216,7 @@
+ def test_unrepresentable_empty_context_metadata_terminates_without_calls():
+     record = _record(1, "assistant", "")
+     payload = json.loads(record[1])
+-    payload["source_peer_id"] = "x" * 5000
++    payload["source_peer_id"] = "x" * 9000
+     oracle = _ConversationOracle()
+     result = chunk.extract_chunk(oracle, "ignored", source_records=((1, json.dumps(payload)), _record(2, "user", "Yes.")))
+     assert result.failed
+@@ -248,7 +248,7 @@
+ 
+ 
+ def test_unsafe_context_truncation_holds_instead_of_dropping_negation():
+-    first = "Do you NOT " + "very " * 800 + "often use PostgreSQL?"
++    first = "Do you NOT " + "very " * 1700 + "often use PostgreSQL?"
+     oracle = _ConversationOracle()
+     result = chunk.extract_chunk(oracle, "ignored", source_records=(_record(1, "assistant", first), _record(2, "user", "Yes.")))
+     assert result.failed and result.failure_reason == "resource_limit"
+--- a/tests/test_benchmark_extraction_canary.py
++++ b/tests/test_benchmark_extraction_canary.py
+@@ -492,9 +492,12 @@
+     with pytest.raises(ExtractionCanaryError) as caught:
+         run_extraction_canary(_representative_client())
+ 
+-    assert caught.value.report["failure_reason"] == "resource_limit"
+-    assert caught.value.report["completion_calls"] == 0
+-    assert caught.value.report["execution_path"]["table_claim_requests"] == 0
++    # Intact admission can preserve the parent, but cannot forge the canary's
++    # required contextual extraction path or supported-claim evidence.
++    assert caught.value.report["failure_reason"] == "supported_claim_evidence_missing"
++    assert caught.value.report["completion_calls"] > 0
++    assert caught.value.report["execution_path"]["table_claim_exact_context_requests"] == 0
++    assert 0 in caught.value.report["missing_expected_claim_indexes"]
+ 
+ 
+ @pytest.mark.parametrize("forged_field", ["header", "prelude"])
+@@ -548,9 +551,10 @@
+     with pytest.raises(ExtractionCanaryError) as caught:
+         run_extraction_canary(_representative_client())
+ 
+-    assert caught.value.report["failure_reason"] == "resource_limit"
+-    assert caught.value.report["completion_calls"] == 0
+-    assert caught.value.report["execution_path"]["prose_claim_requests"] == 0
++    assert caught.value.report["failure_reason"] == "supported_claim_evidence_missing"
++    assert caught.value.report["completion_calls"] > 0
++    assert caught.value.report["execution_path"]["prose_claim_exact_context_requests"] == 0
++    assert 1 in caught.value.report["missing_expected_claim_indexes"]
+ 
+ 
+ def test_representative_canary_fails_if_prose_context_is_forged(monkeypatch):

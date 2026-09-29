@@ -1,0 +1,30 @@
+{
+  "schema": "r6-parent-fix2-first-gate-v1",
+  "gate_accepted": false,
+  "paid_calls": 0,
+  "parent_tests": {"tests": 837, "passed": 834, "failed": 3, "errors": 0, "skipped": 0},
+  "failure_cause": "Current canary version v18 emits new splitter v11 while historical canary v18 correctly pins splitter v10; version advancement and compatibility tests required",
+  "test_receipt": "2026-09-25-parent-r6-fix2-final.xml",
+  "old_code_new_dense_regressions_failed_expected": 3,
+  "source_revision_retained": "r6-fix2-replay-v1",
+  "manifest_sha256": "3bf4c73b2ea95c667adfa5974b14c830ee10ee5d12653ed9dc3dc1cd6aea49a7",
+  "archive_sha256": "aea666d047c50fd41c9aaa293f34da72ad03d9f6669542f68c170d6a47975f24",
+  "offline_container_id": "ecd36ba002d74fc4b43af619d17beea00bd5f9c390e41f9b2a9a1ee8be901ba8",
+  "offline_terminal": {"status": "exited", "exit_code": 0, "pid": 0, "oom_killed": false, "network": "none", "credentials_mounted": false},
+  "offline_result": {
+    "status": "offline_passed",
+    "canonical_sources_verified": true,
+    "exact_partition_verified": true,
+    "reference_unchanged": true,
+    "source_unchanged": true,
+    "client_closed": true,
+    "threads_clean": true,
+    "completion_calls": 0,
+    "http_attempts": 0,
+    "source_content_ranges": [[0, 2791], [2791, 4557], [4557, 6521], [6521, 9786], [9786, 13059]],
+    "encoded_leaf_chars": [3108, 2629, 2908, 3980, 3979],
+    "contract_identity": "hymem-extraction-contract-sha256-v1:eea23e49777ca43d74f1d7e4da9f5a5910a84d578f38cb4ac080b14e6ab9cd74"
+  },
+  "setup_note": "An early offline host check ran before package transfer completed and returned FileNotFoundError; read-only checks confirmed no invocation/output directory had been created. Preflight was launched once after completed copy/pin verification.",
+  "next_step": "Same Fix2 Sol agent corrects version compatibility, parent rechecks before paid replay or Fix3"
+}

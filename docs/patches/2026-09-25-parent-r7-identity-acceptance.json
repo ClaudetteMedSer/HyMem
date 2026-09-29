@@ -1,0 +1,46 @@
+{
+  "schema": "r7-parent-identity-preservation-v1",
+  "accepted": true,
+  "release": "/private/tmp/hymem-r7-integration-20260925.vDa9yP/release",
+  "source_sha256": "2b4fa362c8a101cfd8dd28a842ce52052839f2c7ecc6cf0859befb123a68070c",
+  "test_sha256": "3b43fe5428e5f608fd5408bae9aacef143a6863f450925011d9171c672ff2eee",
+  "parent_tests": {
+    "passed": 186,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "elapsed_seconds": 31.84,
+    "junit": "docs/patches/2026-09-25-parent-r7-identity-v2.xml"
+  },
+  "independent_probe": [
+    {
+      "name": "r6",
+      "result": {
+        "digests_count": 100,
+        "digests_sha256": "6d11a4f7bbb28467d0a24735743de255e7a5c2c1142c51f13b168c25ebe23ee6",
+        "module_controls": 2,
+        "mutable_graphs": 48,
+        "provider_calls": 0,
+        "schema": "r7-parent-identity-parity-probe-v1",
+        "seed": 20260925
+      }
+    },
+    {
+      "name": "release",
+      "result": {
+        "digests_count": 100,
+        "digests_sha256": "6d11a4f7bbb28467d0a24735743de255e7a5c2c1142c51f13b168c25ebe23ee6",
+        "module_controls": 2,
+        "mutable_graphs": 48,
+        "provider_calls": 0,
+        "schema": "r7-parent-identity-parity-probe-v1",
+        "seed": 20260925
+      }
+    }
+  ],
+  "probe": "tools/diagnostics/lme_r7_identity_probe.py",
+  "provider_calls": 0,
+  "main_application_changes": false,
+  "production_changes": false,
+  "note": "First parent pytest invocation named nonexistent test_performance.py and collected zero tests; corrected filename test_loaded_identity_performance.py passed. This was an invocation error, not a source failure."
+}

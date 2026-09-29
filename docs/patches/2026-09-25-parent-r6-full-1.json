@@ -1,0 +1,26 @@
+{
+  "allowed_selected_skip_nodeids": [],
+  "benchmark_completion_claimed": false,
+  "candidate_verified_after": true,
+  "candidate_verified_before": true,
+  "deployment_performed": false,
+  "elapsed_seconds": 1322.767,
+  "focus_files": [],
+  "gate_passed": false,
+  "junit_selection_reconciled": true,
+  "junit_sha256": "02d2acebef82cfa0e88c46819f7f95c0ad3559c87d646093ba83843e33a6b2bc",
+  "junit_totals": {
+    "errors": 6,
+    "failures": 1,
+    "skipped": 0,
+    "tests": 2436
+  },
+  "manifest_sha256": "c1f9dc072f408ee0a64d7ac6d688d96de0828a700309fdbde30a66dccb2a98bb",
+  "network_guard_scope": "pytest process; literal loopback only",
+  "observed_skip_nodeids": [],
+  "provider_credentials_present": false,
+  "pytest_exit_code": 1,
+  "selected": 2436,
+  "shard": 1,
+  "shards": 3
+}

@@ -1,0 +1,70 @@
+{
+  "schema": "lme-r5-response-boundary-handoff-v1",
+  "candidate": "/private/tmp/hymem-response-boundary-r5-20260924.zhFFxb/candidate",
+  "candidate_read_only": true,
+  "manifest": "2026-09-24-lme-independent-summary-indexing-r5-manifest.json",
+  "manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc",
+  "patch": "2026-09-24-lme-15-response-boundary.patch",
+  "patch_sha256": "4ba27727009ab6aae65e249f0f5896d3ea6570ccac7afaf48a588a56c4228256",
+  "combined_files": 467,
+  "source_files": 231,
+  "test_files": 227,
+  "auxiliary_files": 9,
+  "fresh_collected_nodeids": 7247,
+  "reconstruction": {
+    "method": "git apply --check followed by git apply onto a fresh isolated copy of accepted R4; full identity map verification",
+    "directory": "/private/tmp/hymem-r5-reconstruction-check-20260924.rX8gBO",
+    "exact_files_verified": 467,
+    "source_candidate_verified_again": true
+  },
+  "broad_gate": {
+    "test_files": 12,
+    "collected": 839,
+    "passed": 835,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 4,
+    "seconds": 178.003,
+    "receipt": "2026-09-24-r5-response-broad.xml",
+    "receipt_sha256": "a002fb78c9767a9e5795f0a9d8118a6ae9a57557b3e7bc233d52fcf8bb8ee8fa",
+    "original_receipt_sha256": "b4baa94410a16269ec1005d09f1583ab53f81734b73cd306b006fa9011c5c3a8",
+    "durable_copy_normalization": "Terminal newline only; parsed XML and all test cases unchanged",
+    "candidate_inventory_verified_before_after": true,
+    "ambient_environment_cleared": true,
+    "network_guard_scope": "Python test process permits literal loopback only; no provider credentials, API calls or remote execution",
+    "new_regressions": {
+      "test_completion_response_admission.py": {"passed": 95, "skipped": 4},
+      "test_typed_response_recovery.py": {"passed": 25, "skipped": 0},
+      "test_canary_response_history.py": {"passed": 36, "skipped": 0}
+    }
+  },
+  "intentional_skips": {
+    "reason": "Four unchanged parameterized controls concern SDK-only owning-deadline or post-response identity behavior; the separate raw client has no matching interface",
+    "exact_nodeids": [
+      "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-cleared]",
+      "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-extended]",
+      "tests/test_completion_response_admission.py::test_post_response_sdk_integrity_failure_keeps_known_usage[raw]",
+      "tests/test_completion_response_admission.py::test_received_late_sdk_reply_retains_usage_without_admission_or_retry[raw]"
+    ]
+  },
+  "preserved": [
+    "R4 application and all prior patches/receipts",
+    "HYMEM_LLM_EXTRA_BODY extension",
+    "summary/item-index separation and canonical source authority",
+    "24-completion/72-provider-attempt canary bounds and eight admitted verification minimum",
+    "historical v17 commitment-only identity without relabeling or live admission",
+    "exact unchanged 99-case response-admission regression source"
+  ],
+  "remaining_verification": [
+    "parent final review and independent exact reconstruction",
+    "complete 7247-case candidate suite",
+    "target-runtime network-isolated gate",
+    "approved bounded live stock Q1 and subsequent readiness decision"
+  ],
+  "main_application_edited": false,
+  "api_calls": 0,
+  "remote_execution": false,
+  "deployment_performed": false,
+  "full_suite_pass_claimed": false,
+  "lme_ready_claimed": false
+}

@@ -1,0 +1,52 @@
+{
+  "collected": 7577,
+  "declared_skips": [
+    "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-cleared]",
+    "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-extended]",
+    "tests/test_completion_response_admission.py::test_post_response_sdk_integrity_failure_keeps_known_usage[raw]",
+    "tests/test_completion_response_admission.py::test_received_late_sdk_reply_retains_usage_without_admission_or_retry[raw]"
+  ],
+  "errors": 0,
+  "failures": 0,
+  "frozen_and_release_files_verified": 479,
+  "full_500_run": false,
+  "junit_exact_node_union_reconciled": true,
+  "main_preservation_files_verified": 541,
+  "manifest_sha256": "1d8917ca87dbd1b64bf3af3ee699d54b1352a3f51c3da280fd3ddd3ffc9e0ec8",
+  "new_paid_calls": 0,
+  "passed": 7573,
+  "production_changed": false,
+  "schema": "r7-parent-full-suite-acceptance-v1",
+  "shards": [
+    {
+      "elapsed_seconds": 583.528,
+      "junit_sha256": "94366795de6efc563c1acd82f534accc574e51ee88f07d446acf1592d08501f9",
+      "receipt_sha256": "3b34d7f9d93250d3f2e71cda5a0ba011e781c459f8ef10576207dad2c0a97e4d",
+      "selected": 1895,
+      "shard": 1
+    },
+    {
+      "elapsed_seconds": 577.987,
+      "junit_sha256": "e978d2c75b9575447571bef21332d24ebb21ce0878e20c628f03a239482c3927",
+      "receipt_sha256": "ef0c1f6f876ccbeeef4c272ff6a900283c22f6b56e7c39b2f90f24a33a077ac4",
+      "selected": 1894,
+      "shard": 2
+    },
+    {
+      "elapsed_seconds": 576.542,
+      "junit_sha256": "5727c9ee577826f9aa9a11218bb9fa998b9d2b5f99a43ddb64021f108a565671",
+      "receipt_sha256": "666b2f2f4e0bfd023b2742f07b4082639a314bdba157493e90072d43bc981d6e",
+      "selected": 1894,
+      "shard": 3
+    },
+    {
+      "elapsed_seconds": 661.07,
+      "junit_sha256": "9aac66260d21cc37a3d87a2c22a696588d03a44f2852971cd594daf546e501bc",
+      "receipt_sha256": "638030702894f4e9ed8bcb33304e9dddf1504cdc953119be82be1aeb068db6bb",
+      "selected": 1894,
+      "shard": 4
+    }
+  ],
+  "status": "passed",
+  "target_runtime_gate": "running_separately"
+}

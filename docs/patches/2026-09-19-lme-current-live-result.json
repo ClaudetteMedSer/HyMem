@@ -1,0 +1,689 @@
+{
+  "kind": "completed-bounded-current-model-replay",
+  "date": "2026-09-19",
+  "remote_root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-repair-current-20260919-AKZh09",
+  "authority": "Approved fresh20case current-model one-pass diagnostic; no rerolls or resume",
+  "limits": {
+    "completions": 72,
+    "http_attempts": 72,
+    "invocation_seconds": 120,
+    "campaign_seconds": 1800
+  },
+  "paid_completions": 30,
+  "http_attempts": 30,
+  "previous_spent_paid_completions": 1,
+  "combined_paid_completions": 31,
+  "accounting": {
+    "audit": {
+      "accepted_empty": {
+        "chunk": 3,
+        "digest": 0,
+        "facts": 2
+      },
+      "case_covered_stores": 9,
+      "cases": 20,
+      "completions": 30,
+      "finish_reasons": {
+        "stop": 30
+      },
+      "http_attempts": 30,
+      "inventory_sha256": "ea7c7c1cc44b614224f4482ecd5410067cd8eeefe37db629f165c67fa40bab08",
+      "lme_readiness_verified": false,
+      "manifest_sha256": "8d6f7e89c9e70b910813fe63a3b4fe2500249857fe6e4a838854d7cb6010bbcb",
+      "mode": "live",
+      "nonstop_gate_failed": false,
+      "outcomes": {
+        "chunk": {
+          "accepted": 3
+        },
+        "digest": {
+          "accepted": 5,
+          "rejected": 2
+        },
+        "facts": {
+          "accepted": 9,
+          "rejected": 1
+        }
+      },
+      "planned_completion_cap": 72,
+      "semantic_verified": false,
+      "source_files_hash_verified": 225,
+      "status": "accounting_verified",
+      "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+      "stores_hash_verified": 10,
+      "usage": {
+        "completion_tokens": 8285,
+        "prompt_tokens": 72488,
+        "total_tokens": 80773
+      }
+    },
+    "container": {
+      "ExitCode": 0,
+      "FinishedAt": "2026-09-18T23:05:06.094623571Z",
+      "OOMKilled": false,
+      "Pid": 0,
+      "StartedAt": "2026-09-18T23:02:29.869581868Z",
+      "Status": "exited"
+    },
+    "returncode": 0,
+    "stderr_bytes": 0
+  },
+  "case_results": [
+    {
+      "case_sha256": "3c8e256b70b97f89746696e55600d42ae5c3eb6e0832ae92941b395da30cfdcf",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": false,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-01cdb2511bb9adb7cd1a1fbe1839a072ef1bebc08782da94a4b3618794542301",
+        "item_counts": {
+          "facts": 5
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "da1b6e870f11fa27e2781f53155b4fd72d7bfd3c05bd4224a66ff61fda844b69",
+        "status": "accepted"
+      },
+      "sequence": 1
+    },
+    {
+      "case_sha256": "3def3afd5de1aa6a7249ff56416d705c5d60fc48e32e3a7f2dccad64f76d274b",
+      "completions": 2,
+      "http_attempts": 2,
+      "kind": "digest",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 2,
+        "empty": false,
+        "episode_rejected_items": 0,
+        "failed": false,
+        "failure_reason": null,
+        "failure_stage": null,
+        "id": "digest-02df4cab9f4f2ca85a715432889b37dddc2577045d505fa1a85bb2f28f952e0c",
+        "item_counts": {
+          "episodes": 2,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "parse_failed": false,
+        "persisted": false,
+        "procedure_rejected_items": 0,
+        "production_default_completion_limit": null,
+        "source_sha256": "4c41cc3486c555545b235ae9bcbc5c92716f17ea5415a460163a29b0fa1e8b99",
+        "status": "accepted",
+        "summary_chars": 452,
+        "summary_present": true
+      },
+      "sequence": 2
+    },
+    {
+      "case_sha256": "c205910ae8e58cd8c973c9552f98e554ebefc9c32b2436e650f4da3ace281fc4",
+      "completions": 2,
+      "http_attempts": 2,
+      "kind": "chunk",
+      "outcome": {
+        "accepted_empty": true,
+        "completion_calls": 2,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 16,
+        "empty": true,
+        "failed": false,
+        "failure_details": [],
+        "failure_reason": null,
+        "id": "chunk-47bd27bfd11c7c73c1cdf848bec95302fb9b4f6d6758aa9760247a83b50f40ff",
+        "initial_prepartition_leaves": 1,
+        "item_counts": {
+          "markers": 0,
+          "triples": 0
+        },
+        "kind": "chunk",
+        "parse_failed": null,
+        "persisted": false,
+        "production_default_completion_limit": 96,
+        "provider_attempts": 2,
+        "source_sha256": "583440be053ee3fb3416af1e8f23774476125d37157d8729facb101d7d836c40",
+        "status": "accepted"
+      },
+      "sequence": 3
+    },
+    {
+      "case_sha256": "d73fc9fb780908865c4aeac9fb4692a2349c3fb1d0eb3c46a9bd2dbfcd115ca1",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": true,
+        "failed": true,
+        "failure_reason": "output_capacity_exceeded",
+        "id": "facts-0f9b3a7ebc174cf5f1e9e4720a8902977d05ecd8c4d5b279e6ee320fd0806cf8",
+        "item_counts": {
+          "facts": 0
+        },
+        "kind": "facts",
+        "parse_failed": true,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "38b1a68e11dc96a61adec3c716c2e5233cab759653bef0327a47b344189f186f",
+        "status": "rejected"
+      },
+      "sequence": 4
+    },
+    {
+      "case_sha256": "2e1850d877dd34d6a699297f2d25e2b5f10c109f2b95b9e74c39db569dd6324f",
+      "completions": 2,
+      "http_attempts": 2,
+      "kind": "digest",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 2,
+        "empty": true,
+        "episode_rejected_items": 0,
+        "failed": true,
+        "failure_reason": "summary_output_cap",
+        "failure_stage": "summary_compaction",
+        "id": "digest-23b1c169504bdda8450db3c3bcbbb1ca8a3adad4993e36914b351a43887d107f",
+        "item_counts": {
+          "episodes": 0,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "parse_failed": true,
+        "persisted": false,
+        "procedure_rejected_items": 0,
+        "production_default_completion_limit": null,
+        "source_sha256": "e80f76cdd1804811836174715e29fa290d8fbe8e0c5c9cf73e6c923fe910b227",
+        "status": "rejected",
+        "summary_chars": 0,
+        "summary_present": false
+      },
+      "sequence": 5
+    },
+    {
+      "case_sha256": "7d280a2b4c96b79736e48e21abb0ed3de315c6b1de4d0da2874aae0730483f87",
+      "completions": 6,
+      "http_attempts": 6,
+      "kind": "chunk",
+      "outcome": {
+        "accepted_empty": true,
+        "completion_calls": 6,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 16,
+        "empty": true,
+        "failed": false,
+        "failure_details": [],
+        "failure_reason": null,
+        "id": "chunk-5c9b7a42bb192cba0630a6b5599f9d035d18e17ab52e128de08249d21a48e754",
+        "initial_prepartition_leaves": 3,
+        "item_counts": {
+          "markers": 0,
+          "triples": 0
+        },
+        "kind": "chunk",
+        "parse_failed": null,
+        "persisted": false,
+        "production_default_completion_limit": 96,
+        "provider_attempts": 6,
+        "source_sha256": "7af413dbdfb04898f79bf3223a675f98be727fe07cfad88d0f8609f3a64ebe51",
+        "status": "accepted"
+      },
+      "sequence": 6
+    },
+    {
+      "case_sha256": "f7cd7b58a9ff62df55fbf6807f478289f85084e34b034e69be51b1996fce77a4",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": true,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": true,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-16d70d6ef916631a33b196e2ef163fc803717ce6ac7eced5f4efc8778f16b8f7",
+        "item_counts": {
+          "facts": 0
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "d7b78ad8d6e581e6bcce7ce6fe89019a4b61780cf0510ee92726e36e21a7c3a0",
+        "status": "accepted"
+      },
+      "sequence": 7
+    },
+    {
+      "case_sha256": "7c8f0bfd1e8cf4467afc879e7f0330342ecd8d7c43abd7985a5a38226cd32963",
+      "completions": 2,
+      "http_attempts": 2,
+      "kind": "digest",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 2,
+        "empty": false,
+        "episode_rejected_items": 0,
+        "failed": false,
+        "failure_reason": null,
+        "failure_stage": null,
+        "id": "digest-4ec030135dd934b2547b28dd5481b77f57104ef2ff5ba82333d7adeae90a0ded",
+        "item_counts": {
+          "episodes": 1,
+          "procedures": 1
+        },
+        "kind": "digest",
+        "parse_failed": false,
+        "persisted": false,
+        "procedure_rejected_items": 0,
+        "production_default_completion_limit": null,
+        "source_sha256": "22b84f1d172e7341a67df7511237ad2b6bb5acae55b28d50506ff7c7f82534c4",
+        "status": "accepted",
+        "summary_chars": 392,
+        "summary_present": true
+      },
+      "sequence": 8
+    },
+    {
+      "case_sha256": "cf9b794f816922e30de95f55dd9c169eb5f7ef078347e63fb6f472f248ade909",
+      "completions": 2,
+      "http_attempts": 2,
+      "kind": "chunk",
+      "outcome": {
+        "accepted_empty": true,
+        "completion_calls": 2,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 16,
+        "empty": true,
+        "failed": false,
+        "failure_details": [],
+        "failure_reason": null,
+        "id": "chunk-ffc28c04d2262a22e297fa86fafca12026b299868fadb658f7550fc474ecc939",
+        "initial_prepartition_leaves": 1,
+        "item_counts": {
+          "markers": 0,
+          "triples": 0
+        },
+        "kind": "chunk",
+        "parse_failed": null,
+        "persisted": false,
+        "production_default_completion_limit": 96,
+        "provider_attempts": 2,
+        "source_sha256": "47af79a04ab0ed94323dcda7de06e9b774da3007777b98bcf4f95f4270b7e60b",
+        "status": "accepted"
+      },
+      "sequence": 9
+    },
+    {
+      "case_sha256": "89056ba33253eeb7d1a43559ccd4892b41cacde6e07464c8297c64afeeffdb3d",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": false,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-1aa2c37d9c6333a7fcf5ee7343346f982c30fe663e0514f2fa0159227af7060e",
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "1de251ef241b7267f5698faa9b27c380a9e15758e130e06b62e2884c3a9d0a65",
+        "status": "accepted"
+      },
+      "sequence": 10
+    },
+    {
+      "case_sha256": "ec2d942fa0408926fb807de9e8ab0bf616e227164a2a500162443e9500ab9710",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "digest",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 2,
+        "empty": false,
+        "episode_rejected_items": 0,
+        "failed": false,
+        "failure_reason": null,
+        "failure_stage": null,
+        "id": "digest-81994a41f11675ea176c247a5c8c38eb8c26392dd3762d306ae3217e83881a02",
+        "item_counts": {
+          "episodes": 2,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "parse_failed": false,
+        "persisted": false,
+        "procedure_rejected_items": 0,
+        "production_default_completion_limit": null,
+        "source_sha256": "89508ea8037902123e08c6eb36872afeceffc2c8f315f02166f342b21f93de13",
+        "status": "accepted",
+        "summary_chars": 389,
+        "summary_present": true
+      },
+      "sequence": 11
+    },
+    {
+      "case_sha256": "814f089233f97d4f7ef8cfc07e0cbf75e8bfd35310b581b6bdbba3895ff9402b",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": false,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-619aa5934bd32b3a55601af5084f16247d8b2981a1200d4f80d0905233c7404a",
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "095e10535bcb13cddda3990b80a13b1d95dc05c7a8486b2515f73d612267f9a2",
+        "status": "accepted"
+      },
+      "sequence": 12
+    },
+    {
+      "case_sha256": "cde4d8b91afebb78405cb9448eecd124b605883f74d7be04e8e7f6bb835eab08",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "digest",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 2,
+        "empty": true,
+        "episode_rejected_items": 1,
+        "failed": true,
+        "failure_reason": "episode_validation_failure",
+        "failure_stage": "primary",
+        "id": "digest-9a652ed4cbb3980c1d5de00c0a8e0af7dd653508958a3157121c697ddbbe45ce",
+        "item_counts": {
+          "episodes": 0,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "parse_failed": true,
+        "persisted": false,
+        "procedure_rejected_items": 0,
+        "production_default_completion_limit": null,
+        "source_sha256": "74d2efc166b7ca7d36ba2386436a3b3f1f4f348b250cd49a42ca68f89ec3aba4",
+        "status": "rejected",
+        "summary_chars": 0,
+        "summary_present": false
+      },
+      "sequence": 13
+    },
+    {
+      "case_sha256": "ff8f32e231d7af04f8f77a658d0afbc884e5c4f781f7286c421763f062e1b776",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": false,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-6cc87e5035157ab5213508a4a53d5e5651e30d52eda3aef1218168bf976a26c0",
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "a09454a88680728b4bca29f2a7077be68430398bef2f2582e20e4742b832df3d",
+        "status": "accepted"
+      },
+      "sequence": 14
+    },
+    {
+      "case_sha256": "6c61173429a35a30735e525b53910648533d07aa1a0c5103e8be4a92a5169b4b",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "digest",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 2,
+        "empty": false,
+        "episode_rejected_items": 0,
+        "failed": false,
+        "failure_reason": null,
+        "failure_stage": null,
+        "id": "digest-a7781c7246ff44cf1c0ad202a5da4a335c73dd9c53fb1f94a1bb844f09b35c3c",
+        "item_counts": {
+          "episodes": 2,
+          "procedures": 1
+        },
+        "kind": "digest",
+        "parse_failed": false,
+        "persisted": false,
+        "procedure_rejected_items": 0,
+        "production_default_completion_limit": null,
+        "source_sha256": "2b813682bd097f7f965e5bc66649d5b8a4643d0ca58db24dd63ce56960bbc6fd",
+        "status": "accepted",
+        "summary_chars": 367,
+        "summary_present": true
+      },
+      "sequence": 15
+    },
+    {
+      "case_sha256": "46d326b1510fc237e4a72baf689ff59bd4170f8a41d96020a4f9141a7929c664",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": true,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": true,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-7112c9bd8236969f95f5dfddcb62168cc3152c736e19896c23d13cd628bfb8a5",
+        "item_counts": {
+          "facts": 0
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "6dae9c2223083a24bd7746e13a15e3a46cc91cdb06d8abcd80839812adac4986",
+        "status": "accepted"
+      },
+      "sequence": 16
+    },
+    {
+      "case_sha256": "9a0e3e1ec46a1e093f007f4da260724443b8750cff5fd0f56ab93915a138088b",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "digest",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 2,
+        "empty": false,
+        "episode_rejected_items": 0,
+        "failed": false,
+        "failure_reason": null,
+        "failure_stage": null,
+        "id": "digest-db88b72a25f3fe2276c737aaff2720e9bbd6c7e5343f02927399703f3ba27f3d",
+        "item_counts": {
+          "episodes": 1,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "parse_failed": false,
+        "persisted": false,
+        "procedure_rejected_items": 0,
+        "production_default_completion_limit": null,
+        "source_sha256": "8e8f3a3b8206a404077aa12baa274807b697f5fb194199bbd8eea72d44f557c0",
+        "status": "accepted",
+        "summary_chars": 450,
+        "summary_present": true
+      },
+      "sequence": 17
+    },
+    {
+      "case_sha256": "b7b06221fadad1437e384339e66b4d050f70b1692ccd351e2c449e95ea93ed79",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": false,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-8e89cdc01569c3f927fa01ee2736dee982d5849e88dc36de3c123422569ba4ea",
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "8c335f44273ee9d116db4a308fac580bbabda5c7c5958a1069a1faf45fae8c2b",
+        "status": "accepted"
+      },
+      "sequence": 18
+    },
+    {
+      "case_sha256": "33a35585bf6e9b789e93840d4319cdb6d0cc3863ac42a8581a1616fd3dc06a4b",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": false,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-a5d8aa1370188363f6ce3035d02e084859d6462f8321312f38f7bbbaa22b7b1d",
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "6a45e381eb7cf54a3b4f50c653e9138b53bda916fb149a7ba90f7bcbcb5ec199",
+        "status": "accepted"
+      },
+      "sequence": 19
+    },
+    {
+      "case_sha256": "7237f737e4a3f6156c3d21a069c9b83602f929b65a209fc9dc3f7da0f33d848a",
+      "completions": 1,
+      "http_attempts": 1,
+      "kind": "facts",
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": false,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-b65060e0d878882aacb5e348bbb618e9a73c3fcde378b7ea72cd93961a5335c4",
+        "item_counts": {
+          "facts": 7
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "06c64df17a08feea01d6ce3c9fa6b12e8bb79cc6f535a1a133adc86223c48854",
+        "status": "accepted"
+      },
+      "sequence": 20
+    }
+  ],
+  "model_counts": [
+    {
+      "count": 30,
+      "requested": "deepseek-flash",
+      "response": "deepseek-flash"
+    }
+  ],
+  "system_fingerprints": [
+    {
+      "count": 30,
+      "fingerprint": {
+        "state": "known",
+        "value": "aeb56401ca74e127821c4f9126dcb669"
+      }
+    }
+  ],
+  "reasoning_metadata_states": {
+    "missing": 30
+  },
+  "root_tests": {
+    "runner": {
+      "tests": 46,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "auditor": {
+      "tests": 43,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "retry_integration": {
+      "tests": 10,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "interpretation": {
+    "accepted": 17,
+    "rejected": 3,
+    "accepted_empty": 5,
+    "accepted_nonempty": 12,
+    "failure_reasons": [
+      "output_capacity_exceeded",
+      "summary_output_cap",
+      "episode_validation_failure"
+    ],
+    "all_chunk_outputs_empty": true,
+    "semantic_correctness_verified": false,
+    "scheduler_convergence_tested": false,
+    "lme_readiness_verified": false,
+    "read_only_replay_only": true
+  },
+  "production_deployment": false,
+  "service_restarts": false,
+  "full_lme_run": false,
+  "resume_allowed": false
+}

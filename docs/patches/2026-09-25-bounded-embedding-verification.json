@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "stage": "embedding-batches-v1",
+  "scope": "private Afrodite clone, embedding-only; no production deployment or dream",
+  "result": "passed",
+  "application_embeddings_sha256": "53713f956efdabdd880dfda7c926db34c37e7e4def6833b7b8866a1af4f74978",
+  "reference_sha256": "803efa98c90d154bd3b27c7aa504c25369dd59d88364aa75939c6fddd36f15aa",
+  "final_clone_sha256": "a9380b76d4e414b252db493bd246f21cf808648ac12d63f85577ffe68efa8f42",
+  "limits": {"texts_per_request": 16, "characters_per_request": 128000, "utf8_text_bytes_per_request": 512000, "http_requests": 128},
+  "usage": {"llm_completions": 0, "llm_http": 0, "embedding_http": 89, "remote_texts": 993, "remote_characters": 2438859, "remote_utf8_text_bytes": 2486809},
+  "coverage": {"extraction_chunks": 1411, "pending_before": 1125, "persisted": 1125, "cache_hits": 132, "pending_after": 0, "dimension": 384},
+  "verification": {"integrity": "ok", "foreign_key_violations": 0, "canonical_drift": 0, "evidence_ledger_failures": 0, "graph_unchanged": true, "non_embedding_logical_data_unchanged": true, "producer_unchanged": true, "source_unchanged": true, "accounting_reconciled": true, "diagnostic_containers_stopped": true, "parent_local_tests_passed": 114},
+  "post_test_services": {"honcho_health": 200, "embedding_health": 200, "hermes1_started_at": "2026-09-25T16:49:57.970571701Z", "hermes1_restart_count": 0, "embedding_started_at": "2026-09-25T17:53:46.656672883Z", "embedding_restart_count": 1},
+  "limitations": ["Not a complete dream or LME verification", "Other embedding paths require shared request bounds", "Original production dream 1407 ValueError remains unidentified", "No new application fix deployed", "Earlier embedding-server restart cause not proven"]
+}

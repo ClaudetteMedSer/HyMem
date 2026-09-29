@@ -1,0 +1,1137 @@
+diff --git a/tests/test_alias_registration_idempotence.py b/tests/test_alias_registration_idempotence.py
+new file mode 100644
+index 0000000..f21f25f
+--- /dev/null
++++ b/tests/test_alias_registration_idempotence.py
+@@ -0,0 +1,125 @@
++"""An existing alias remains usable when old canonical rows still name its key."""
++
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hymem.dreaming import canonicalize, phase1
++from hymem.extraction.triples import Triple
++from tests.test_bitemporal import _seed_chunk, _seed_message, _seed_session
++
++
++SCALAR_OWNERS = (
++    ("entity_aliases", "canonical"),
++    ("entity_types", "entity_canonical"),
++    ("entity_properties", "entity_canonical"),
++    ("entity_type_observations", "entity_canonical"),
++    ("entity_property_observations", "entity_canonical"),
++    ("entity_mention_observations", "entity_canonical"),
++    ("entity_mentions", "entity_canonical"),
++    ("knowledge_graph", "subject_canonical"),
++    ("knowledge_graph", "object_canonical"),
++)
++
++
++def _minimal_store() -> sqlite3.Connection:
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.execute("CREATE TABLE entity_aliases(alias TEXT PRIMARY KEY, canonical TEXT)")
++    conn.execute(
++        "CREATE TABLE knowledge_graph("
++        "subject_canonical TEXT, object_canonical TEXT)"
++    )
++    for table, column in SCALAR_OWNERS:
++        if table in {"entity_aliases", "knowledge_graph"}:
++            continue
++        conn.execute(f"CREATE TABLE {table}({column} TEXT)")
++    conn.execute("CREATE TABLE rules(scope TEXT, trigger_entities TEXT)")
++    return conn
++
++
++@pytest.mark.parametrize("table,column", SCALAR_OWNERS + (("rules", "trigger_entities"),))
++def test_exact_registration_preserves_historical_owner_rows(table: str, column: str):
++    conn = _minimal_store()
++    try:
++        conn.execute(
++            "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
++            ("redis_cache", "redis"),
++        )
++        if table == "entity_aliases":
++            conn.execute(
++                "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
++                ("legacy_name", "redis_cache"),
++            )
++        elif table == "rules":
++            conn.execute(
++                "INSERT INTO rules(scope, trigger_entities) VALUES (?, ?)",
++                ("contextual", '["redis_cache"]'),
++            )
++        else:
++            conn.execute(f"INSERT INTO {table}({column}) VALUES (?)", ("redis_cache",))
++
++        before = "\n".join(conn.iterdump())
++        assert canonicalize.resolve(conn, "Redis Cache") == "redis"
++        canonicalize.register_alias(conn, "Redis Cache", "redis")
++        assert "\n".join(conn.iterdump()) == before
++        assert canonicalize.resolve(conn, "Redis Cache") == "redis"
++    finally:
++        conn.close()
++
++
++def test_exact_registration_still_validates_target_and_new_writes():
++    conn = _minimal_store()
++    try:
++        conn.execute(
++            "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
++            ("redis_cache", "redis"),
++        )
++        conn.execute(
++            "INSERT INTO entity_types(entity_canonical) VALUES (?)", ("redis_cache",),
++        )
++        conn.execute(
++            "INSERT INTO entity_types(entity_canonical) VALUES (?)", ("legacy_owner",),
++        )
++        before = "\n".join(conn.iterdump())
++        for surface, target, message in (
++            ("Redis Cache", "other", "already maps"),
++            ("Redis Cache", "Not Normal", "normalized canonical"),
++            ("Another Cache", "redis_cache", "must not itself be an alias"),
++        ):
++            with pytest.raises(ValueError, match=message):
++                canonicalize.register_alias(conn, surface, target)
++        assert "\n".join(conn.iterdump()) == before
++
++        # A new mapping of a historical owner is still rejected.
++        with pytest.raises(ValueError, match="already owns state"):
++            canonicalize.register_alias(conn, "Legacy Owner", "redis")
++    finally:
++        conn.close()
++
++
++def test_phase1_triple_persists_through_existing_alias_with_old_owner(hy):
++    conn = hy.conn
++    _seed_session(conn)
++    _seed_message(conn, 10, "2024-03-15 09:00:00")
++    _seed_chunk(conn, "c1", 10)
++    hy.set_entity_type("Redis Cache", "database")
++    conn.execute(
++        "INSERT INTO entity_aliases(alias, canonical) VALUES (?, ?)",
++        ("redis_cache", "redis"),
++    )
++    before_type = conn.execute(
++        "SELECT * FROM entity_types WHERE entity_canonical=?", ("redis_cache",)
++    ).fetchall()
++
++    phase1._upsert_triple(conn, "c1", Triple("app", "uses", "Redis Cache", 1))
++
++    assert conn.execute(
++        "SELECT COUNT(*) FROM knowledge_graph WHERE "
++        "subject_canonical='app' AND predicate='uses' AND object_canonical='redis'"
++    ).fetchone()[0] == 1
++    assert conn.execute(
++        "SELECT * FROM entity_types WHERE entity_canonical=?", ("redis_cache",)
++    ).fetchall() == before_type
+diff --git a/tests/test_alias_registration_root_controls.py b/tests/test_alias_registration_root_controls.py
+new file mode 100644
+index 0000000..9baa8a8
+--- /dev/null
++++ b/tests/test_alias_registration_root_controls.py
+@@ -0,0 +1,159 @@
++"""Independent source-valid Phase 1 controls for an existing alias no-op.
++
++Historical alias ownership is deliberately retained, not repaired or merged.
++All providers are absent; no extraction or embedding network calls occur.
++"""
++
++from dataclasses import replace
++
++import pytest
++
++from hymem.config import HyMemConfig
++from hymem.core import db
++from hymem.dreaming import canonicalize, phase1
++from hymem.dreaming.chunks import Chunk, persist_chunks
++from hymem.dreaming.lossless import materialize_message_coverage
++from hymem.extraction.triples import Triple
++
++
++@pytest.fixture
++def alias_state(tmp_path):
++    conn = db.connect(tmp_path / "alias-root-control.sqlite")
++    db.initialize(conn)
++    content = "Service uses Legacy Store. Legacy Store uses Redis."
++    with db.transaction(conn):
++        conn.execute("INSERT INTO sessions(id) VALUES ('alias-fixture')")
++        mid = int(conn.execute(
++            "INSERT INTO messages(session_id,role,content,created_at) "
++            "VALUES ('alias-fixture','user',?,'2026-06-01T12:00:00Z')",
++            (content,),
++        ).lastrowid)
++        materialize_message_coverage(conn, "alias-fixture")
++        chunks = [Chunk(
++            name, "alias-fixture", mid, mid, "test", "user: " + content,
++            source_message_ids=(mid,),
++        ) for name in ("alias-history", "alias-current")]
++        persist_chunks(conn, chunks)
++        canonicalize.register_alias(conn, "Legacy Store", "canonical_store")
++        # These are normalized, schema-valid historical owners. Registering
++        # this mapping again cannot be the action that strands them.
++        conn.executemany(
++            "INSERT INTO knowledge_graph(subject_canonical,predicate,"
++            "object_canonical,pos_evidence,neg_evidence,status) "
++            "VALUES (?,'uses',?,1,0,'active')",
++            [("service", "legacy_store"), ("legacy_store", "redis")],
++        )
++        conn.execute(
++            "INSERT INTO entity_types(entity_canonical,type,confidence,source_chunk_id) "
++            "VALUES ('legacy_store','tool',1.0,'alias-history')"
++        )
++        conn.execute(
++            "INSERT INTO entity_mentions(chunk_id,entity_canonical) "
++            "VALUES ('alias-history','legacy_store')"
++        )
++    try:
++        yield conn, mid, chunks[1], replace(
++            HyMemConfig(root=tmp_path), triple_dedup_enabled=False,
++        )
++    finally:
++        conn.close()
++
++
++def _owners(conn):
++    return {
++        "aliases": [tuple(row) for row in conn.execute(
++            "SELECT * FROM entity_aliases WHERE alias='legacy_store' OR canonical='legacy_store' ORDER BY alias"
++        )],
++        "edges": [tuple(row) for row in conn.execute(
++            "SELECT * FROM knowledge_graph WHERE subject_canonical='legacy_store' "
++            "OR object_canonical='legacy_store' ORDER BY id"
++        )],
++        "types": [tuple(row) for row in conn.execute(
++            "SELECT * FROM entity_types WHERE entity_canonical='legacy_store' ORDER BY type"
++        )],
++        "mentions": [tuple(row) for row in conn.execute(
++            "SELECT * FROM entity_mentions WHERE entity_canonical='legacy_store' ORDER BY chunk_id"
++        )],
++    }
++
++
++def _persist(conn, chunk, triple, cfg):
++    sources = phase1._claim_sources_for_chunk(conn, chunk)
++    assert sources and all(source.message_id == triple.source_message_id for source in sources)
++    extraction = phase1.ChunkExtraction(
++        triples=[triple], markers=[], source_validated=True,
++        claim_sources={source.message_id: source for source in sources},
++    )
++    with db.transaction(conn):
++        phase1.persist_chunk_results(
++            conn, chunk, extraction, prompt_version="v14", cfg=cfg,
++        )
++
++
++def test_exact_existing_mapping_is_no_dml_even_with_historical_owners(alias_state):
++    conn, _mid, _chunk, _cfg = alias_state
++    before, changes = tuple(conn.iterdump()), conn.total_changes
++    assert canonicalize.resolve(conn, "Legacy Store") == "canonical_store"
++    canonicalize.register_alias(conn, "Legacy Store", "canonical_store")
++    canonicalize.register_alias(conn, "legacy_store", "canonical_store")
++    assert tuple(conn.iterdump()) == before
++    assert conn.total_changes == changes
++
++
++@pytest.mark.parametrize("position", ["subject", "object"])
++def test_real_phase1_existing_alias_does_not_rewrite_historical_owners(alias_state, position):
++    conn, mid, chunk, cfg = alias_state
++    before = _owners(conn)
++    triple = (
++        Triple("Legacy Store", "uses", "redis", 1, source_message_id=mid)
++        if position == "subject" else
++        Triple("service", "uses", "Legacy Store", 1, source_message_id=mid)
++    )
++    _persist(conn, chunk, triple, cfg)
++    assert _owners(conn) == before
++    selected = conn.execute(
++        "SELECT kg.subject_canonical,kg.predicate,kg.object_canonical,"
++        "observation.source_message_id,observation.polarity "
++        "FROM kg_claim_observations observation "
++        "JOIN knowledge_graph kg ON kg.id=observation.edge_id "
++        "WHERE observation.chunk_id=?", (chunk.id,),
++    ).fetchall()
++    expected_edge = (("canonical_store", "uses", "redis") if position == "subject"
++                     else ("service", "uses", "canonical_store"))
++    assert [tuple(row) for row in selected] == [(*expected_edge, mid, 1)]
++    assert conn.execute(
++        "SELECT count(*) FROM current_phase1_publications WHERE chunk_id=?", (chunk.id,),
++    ).fetchone()[0] == 1
++    published = tuple(conn.iterdump())
++    _persist(conn, chunk, triple, cfg)
++    assert tuple(conn.iterdump()) == published
++    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++
++
++@pytest.mark.parametrize("surface,target,reason", [
++    ("service", "new_service", "already owns state"),
++    ("Legacy Store", "other_store", "already maps"),
++    ("new surface", "legacy_store", "must not itself be an alias"),
++    ("Legacy Store", "Not Normalized", "normalized canonical"),
++    ("!!!", "canonical_store", "must not be empty"),
++])
++def test_non_noop_guards_still_reject_without_any_mutation(alias_state, surface, target, reason):
++    conn, _mid, _chunk, _cfg = alias_state
++    before, changes = tuple(conn.iterdump()), conn.total_changes
++    with pytest.raises(ValueError, match=reason):
++        canonicalize.register_alias(conn, surface, target)
++    assert tuple(conn.iterdump()) == before
++    assert conn.total_changes == changes
++
++
++def test_existing_same_mapping_cannot_bypass_target_chain_validation(alias_state):
++    conn, _mid, _chunk, _cfg = alias_state
++    conn.execute(
++        "INSERT INTO entity_aliases(alias,canonical) VALUES ('older_surface','legacy_store')"
++    )
++    before, changes = tuple(conn.iterdump()), conn.total_changes
++    with pytest.raises(ValueError, match="must not itself be an alias"):
++        canonicalize.register_alias(conn, "Older Surface", "legacy_store")
++    assert tuple(conn.iterdump()) == before
++    assert conn.total_changes == changes
++
+diff --git a/tests/test_claim_replay_binding_regressions.py b/tests/test_claim_replay_binding_regressions.py
+new file mode 100644
+index 0000000..9744f33
+--- /dev/null
++++ b/tests/test_claim_replay_binding_regressions.py
+@@ -0,0 +1,174 @@
++"""Exact claim replay must stay bound to its published routing decision."""
++
++from __future__ import annotations
++
++import json
++from dataclasses import replace
++
++from hymem import HyMemConfig
++from hymem.core import db
++from hymem.dreaming import evidence, phase1
++from hymem.dreaming.chunks import Chunk, persist_chunks
++from hymem.dreaming.lossless import materialize_message_coverage
++from hymem.extraction.triples import Triple
++from tests.test_claim_semantic_dedup_guard import _chunk, _persist, _source, _vectors
++
++
++def _second_source(conn) -> int:
++    message_id = int(conn.execute(
++        "INSERT INTO messages(session_id,role,content,created_at) "
++        "VALUES ('s','user','Service uses Redis cache', "
++        "'2026-06-02T12:00:00Z')"
++    ).lastrowid)
++    with db.transaction(conn):
++        materialize_message_coverage(conn, "s")
++    return message_id
++
++
++def _config(tmp_path) -> HyMemConfig:
++    return replace(
++        HyMemConfig(root=tmp_path),
++        triple_dedup_enabled=True,
++        triple_dedup_cosine_threshold=0.9,
++    )
++
++
++def _claim_state(conn, chunk_id: str) -> tuple[list[str], list[tuple]]:
++    return (
++        list(conn.iterdump()),
++        [tuple(row) for row in conn.execute(
++            "SELECT edge_id,source_message_id,polarity,interpretation_key "
++            "FROM kg_claim_observations WHERE chunk_id=? "
++            "ORDER BY source_message_id,edge_id", (chunk_id,),
++        )],
++    )
++
++
++def _assert_published(conn, chunk_id: str, expected_observations: int) -> None:
++    row = conn.execute(
++        "SELECT outcome.result_hash,outcome.phase1_generation_key,"
++        "chunk.source_manifest_count,"
++        "hymem_phase1_generation_is_authorized("
++        "generation.generation_key,generation.identity_exact) AS authorized "
++        "FROM kg_claim_extraction_outcomes outcome "
++        "JOIN chunks chunk ON chunk.id=outcome.chunk_id "
++        "JOIN phase1_generations generation "
++        "ON generation.generation_key=outcome.phase1_generation_key "
++        "WHERE outcome.chunk_id=?", (chunk_id,),
++    ).fetchone()
++    assert row is not None and row["authorized"] == 1
++    assert row["source_manifest_count"] > 0
++    assert row["result_hash"] == evidence.claim_observation_result_hash(
++        conn, chunk_id,
++    )
++    assert conn.execute(
++        "SELECT COUNT(*) FROM kg_claim_observations WHERE chunk_id=?",
++        (chunk_id,),
++    ).fetchone()[0] == expected_observations
++
++
++def test_cached_alias_replay_survives_vector_cache_change(tmp_path):
++    conn = db.connect(tmp_path / "cached-alias.sqlite")
++    db.initialize(conn)
++    try:
++        first_source = _source(conn)
++        second_source = _second_source(conn)
++        cfg = _config(tmp_path)
++        vectors = _vectors()
++        exact = Triple(
++            "service", "uses", "redis", 1, source_message_id=first_source,
++        )
++        alias = Triple(
++            "service", "uses", "redis_cache", 1,
++            source_message_id=second_source,
++        )
++        _persist(conn, _chunk(conn, first_source, "seed"), [exact], cfg)
++        with db.embedding_mutation(conn):
++            conn.execute(
++                "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) "
++                "VALUES (?,?,?,?)",
++                ("service uses redis", json.dumps([1.0, 0.0]), vectors.model, 2),
++            )
++
++        chunk = _chunk(conn, second_source, "cached-alias")
++        _persist(conn, chunk, [alias], cfg, vectors=vectors)
++        assert conn.execute("SELECT COUNT(*) FROM knowledge_graph").fetchone()[0] == 1
++        _assert_published(conn, chunk.id, 1)
++        first = _claim_state(conn, chunk.id)
++        _persist(conn, chunk, [alias], cfg, vectors=vectors)
++        assert _claim_state(conn, chunk.id) == first
++
++        # The published claim is the same even when the optional vector cache
++        # no longer offers its earlier semantic route.
++        with db.embedding_mutation(conn):
++            conn.execute("DELETE FROM edge_embeddings WHERE edge_text=?", (
++                "service uses redis",
++            ))
++        before = _claim_state(conn, chunk.id)
++        _persist(conn, chunk, [alias], cfg, vectors=vectors)
++        assert _claim_state(conn, chunk.id) == before
++        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++    finally:
++        conn.close()
++
++
++def test_same_wave_alias_then_two_exact_claims_replay_with_empty_pool(tmp_path):
++    conn = db.connect(tmp_path / "batch-order.sqlite")
++    db.initialize(conn)
++    try:
++        first_source = _source(conn)
++        second_source = _second_source(conn)
++        chunk = Chunk(
++            "ordered-batch", "s", first_source, second_source, "test",
++            "user: Service uses Redis and Redis cache",
++            source_message_ids=(first_source, second_source),
++        )
++        with db.transaction(conn):
++            persist_chunks(conn, [chunk])
++        cfg = _config(tmp_path)
++        vectors = _vectors()
++        triples = [
++            Triple(
++                "service", "uses", "redis_cache", 1,
++                source_message_id=second_source, value_numeric=66.0,
++                value_unit="percent",
++            ),
++            Triple(
++                "service", "uses", "redis", 1,
++                source_message_id=first_source, value_numeric=65.0,
++                value_unit="percent",
++            ),
++            Triple(
++                "service", "uses", "redis", 1,
++                source_message_id=second_source, value_numeric=65.0,
++                value_unit="percent",
++            ),
++        ]
++        pool = phase1.new_in_cycle_pool()
++        pool[:] = _persist(conn, chunk, triples, cfg, vectors=vectors, pool=pool)
++        rows = conn.execute(
++            "SELECT kg.object_canonical,observation.source_message_id "
++            "FROM kg_claim_observations observation "
++            "JOIN knowledge_graph kg ON kg.id=observation.edge_id "
++            "WHERE observation.chunk_id=? "
++            "ORDER BY observation.source_message_id,kg.object_canonical",
++            (chunk.id,),
++        ).fetchall()
++        assert [tuple(row) for row in rows] == [
++            ("redis_cache", first_source),
++            ("redis", second_source),
++            ("redis_cache", second_source),
++        ]
++        _assert_published(conn, chunk.id, 3)
++
++        # A later dream starts with no in-cycle pool. It must still recognize
++        # the exact same published input and preserve the earlier route.
++        before = _claim_state(conn, chunk.id)
++        _persist(
++            conn, chunk, triples, cfg, vectors=vectors,
++            pool=phase1.new_in_cycle_pool(),
++        )
++        assert _claim_state(conn, chunk.id) == before
++        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++    finally:
++        conn.close()
+diff --git a/tests/test_claim_replay_local_proof_root.py b/tests/test_claim_replay_local_proof_root.py
+new file mode 100644
+index 0000000..2bd4a6a
+--- /dev/null
++++ b/tests/test_claim_replay_local_proof_root.py
+@@ -0,0 +1,357 @@
++"""Independent network-free checks for a local-only exact replay proof."""
++
++from dataclasses import replace
++import hashlib
++import json
++import re
++import sqlite3
++
++import pytest
++
++from hymem import HyMemConfig, portability
++from hymem.core import db
++from hymem.dreaming import canonicalize, phase1
++from hymem.dreaming.lossless import materialize_message_coverage
++from hymem.extraction.producer import phase1_generation_binding
++from hymem.extraction.triples import Triple
++from tests.test_claim_semantic_dedup_guard import _chunk, _vectors
++from tests.test_phase1_producer_identity import _DeclaredLLM
++
++
++def _proof(conn, chunk_id):
++    return conn.execute(
++        "SELECT local_replay_proof FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
++        (chunk_id,),
++    ).fetchone()[0]
++
++
++def _publish(conn, chunk, triples, cfg, generation, *, vectors=None):
++    sources = phase1._claim_sources_for_chunk(conn, chunk)
++    extraction = phase1.ChunkExtraction(
++        triples=list(triples), markers=[], source_validated=True,
++        claim_sources={source.message_id: source for source in sources},
++        phase1_generation=generation,
++    )
++    with db.transaction(conn):
++        phase1.persist_chunk_results(
++            conn, chunk, extraction, prompt_version="v14", cfg=cfg,
++            dedup_vectors=vectors,
++        )
++    return extraction
++
++
++@pytest.fixture
++def published(tmp_path):
++    path = tmp_path / "local-proof.sqlite"
++    conn = db.connect(path)
++    db.initialize(conn)
++    conn.execute("INSERT INTO sessions(id) VALUES ('s')")
++    mid = int(conn.execute(
++        "INSERT INTO messages(session_id,role,content,created_at) "
++        "VALUES ('s','user','Service uses Redis','2026-06-01T12:00:00.000Z')"
++    ).lastrowid)
++    with db.transaction(conn):
++        materialize_message_coverage(conn, "s")
++    chunk = _chunk(conn, mid, "root-proof")
++    cfg = replace(HyMemConfig(root=tmp_path), triple_dedup_enabled=False)
++    client = _DeclaredLLM("root-proof-model", "redis")
++    generation = phase1_generation_binding("v14", client)
++    triples = [Triple("service", "uses", "redis", 1, source_message_id=mid)]
++    extraction = _publish(conn, chunk, triples, cfg, generation)
++    state = dict(conn=conn, path=path, mid=mid, chunk=chunk, cfg=cfg,
++                 generation=generation, triples=triples, extraction=extraction)
++    try:
++        yield state
++        assert client.calls == []
++    finally:
++        state["conn"].close()
++
++
++def test_live_proof_is_local_and_never_appears_on_wire(published, tmp_path):
++    state = published
++    proof = _proof(state["conn"], state["chunk"].id)
++    assert isinstance(proof, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", proof)
++    path = tmp_path / "wire.jsonl"
++    portability.export_jsonl(state["conn"], path)
++    records = [json.loads(line) for line in path.read_text().splitlines()]
++    outcomes = [row["record"] for row in records if row["type"] == "claim_extraction_outcome"]
++    assert len(outcomes) == 1
++    assert outcomes[0]["phase1_generation_key"] == state["generation"]["generation_key"]
++    assert "local_replay_proof" not in outcomes[0]
++    assert proof not in path.read_text()
++
++
++def test_reopen_preserves_local_proof_and_replay_avoids_claim_writes(published, monkeypatch):
++    state = published
++    proof = _proof(state["conn"], state["chunk"].id)
++    assert proof is not None
++    db.initialize(state["conn"])
++    assert _proof(state["conn"], state["chunk"].id) == proof
++    state["conn"].close()
++    state["conn"] = db.connect(state["path"])
++    db.initialize(state["conn"])
++    assert _proof(state["conn"], state["chunk"].id) == proof
++    before = list(state["conn"].iterdump())
++
++    def must_not_write(*_args, **_kwargs):
++        raise AssertionError("exact local proof unexpectedly rerouted the claim")
++
++    monkeypatch.setattr(phase1, "_upsert_triple", must_not_write)
++    _publish(state["conn"], state["chunk"], state["triples"],
++             state["cfg"], state["generation"])
++    assert list(state["conn"].iterdump()) == before
++
++
++def test_stamped_v64_missing_proof_cannot_invent_authority(published):
++    conn, chunk = published["conn"], published["chunk"]
++    original = tuple(conn.execute(
++        "SELECT chunk_id,prompt_version,prompt_generation,result_hash,succeeded_at,"
++        "phase1_generation_key FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
++        (chunk.id,),
++    ).fetchone())
++    # Model a historical/manual table reconstruction without changing its
++    # authoritative rows or safe FKs. No input proof can be inferred afterward.
++    conn.execute("DROP TRIGGER kg_claim_extraction_outcomes_insert_guard")
++    conn.execute("DROP TRIGGER kg_claim_extraction_outcomes_update_guard")
++    conn.execute("ALTER TABLE kg_claim_extraction_outcomes DROP COLUMN local_replay_proof")
++    assert db.schema_version(conn) == 64
++    try:
++        db.initialize(conn)
++    except RuntimeError as exc:
++        assert str(exc) == "schema v64 local claim replay proof shape is malformed"
++        assert "local_replay_proof" not in {
++            row["name"] for row in conn.execute("PRAGMA table_info(kg_claim_extraction_outcomes)")
++        }
++    else:
++        # A nullable-only repair is safe too; neither strategy may derive a
++        # proof from the pre-existing published observation set.
++        assert _proof(conn, chunk.id) is None
++    assert tuple(conn.execute(
++        "SELECT chunk_id,prompt_version,prompt_generation,result_hash,succeeded_at,"
++        "phase1_generation_key FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
++        (chunk.id,),
++    ).fetchone()) == original
++    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++
++
++@pytest.mark.parametrize("old_version", [46, 63])
++def test_pre_v64_outcome_shape_and_absent_guards_upgrade_without_invented_proof(published, old_version):
++    state, conn, chunk = published, published["conn"], published["chunk"]
++    original = tuple(conn.execute(
++        "SELECT chunk_id,prompt_version,prompt_generation,result_hash,succeeded_at,"
++        "phase1_generation_key FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
++        (chunk.id,),
++    ).fetchone())
++    conn.execute("DROP TRIGGER kg_claim_extraction_outcomes_insert_guard")
++    conn.execute("DROP TRIGGER kg_claim_extraction_outcomes_update_guard")
++    conn.execute("ALTER TABLE kg_claim_extraction_outcomes DROP COLUMN local_replay_proof")
++    conn.execute("UPDATE schema_meta SET value=? WHERE key='schema_version'", (str(old_version),))
++    conn.close()
++    state["conn"] = conn = db.connect(state["path"])
++    db.initialize(conn)
++    assert db.schema_version(conn) == 64
++    assert _proof(conn, chunk.id) is None
++    assert tuple(conn.execute(
++        "SELECT chunk_id,prompt_version,prompt_generation,result_hash,succeeded_at,"
++        "phase1_generation_key FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
++        (chunk.id,),
++    ).fetchone()) == original
++    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++    with pytest.raises(sqlite3.IntegrityError):
++        conn.execute("UPDATE kg_claim_extraction_outcomes SET local_replay_proof=? WHERE chunk_id=?",
++                     ("sha256:" + "0" * 64, chunk.id))
++
++
++def test_cold_import_does_not_invent_local_proof(published, tmp_path):
++    path = tmp_path / "wire.jsonl"
++    portability.export_jsonl(published["conn"], path)
++    conn = db.connect(tmp_path / "cold.sqlite")
++    db.initialize(conn)
++    try:
++        portability.import_jsonl(conn, path)
++        assert _proof(conn, published["chunk"].id) is None
++        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++    finally:
++        conn.close()
++
++
++def test_import_rejects_injected_well_formed_origin_proof_even_with_valid_wire_checksum(published, tmp_path):
++    origin_proof = _proof(published["conn"], published["chunk"].id)
++    assert re.fullmatch(r"sha256:[0-9a-f]{64}", origin_proof)
++    path = tmp_path / "forged-local-proof.jsonl"
++    portability.export_jsonl(published["conn"], path)
++    records = [json.loads(line) for line in path.read_text().splitlines()]
++    outcomes = [row["record"] for row in records if row["type"] == "claim_extraction_outcome"]
++    assert len(outcomes) == 1
++    outcomes[0]["local_replay_proof"] = origin_proof
++    assert records[-1]["type"] == "_end"
++    body = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in records[:-1])
++    records[-1]["sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
++    path.write_text(body + json.dumps(records[-1], ensure_ascii=False) + "\n", encoding="utf-8")
++    conn = db.connect(tmp_path / "forged-proof-target.sqlite")
++    db.initialize(conn)
++    try:
++        before = list(conn.iterdump())
++        with pytest.raises(ValueError, match="portable claim_extraction_outcome record does not match"):
++            portability.import_jsonl(conn, path)
++        assert conn.execute(
++            "SELECT COUNT(*) FROM kg_claim_extraction_outcomes WHERE local_replay_proof IS NOT NULL"
++        ).fetchone()[0] == 0
++        assert list(conn.iterdump()) == before
++        assert _proof(published["conn"], published["chunk"].id) == origin_proof
++    finally:
++        conn.close()
++
++
++def test_same_identity_import_clears_touched_local_proof(published, tmp_path):
++    conn, chunk = published["conn"], published["chunk"]
++    assert _proof(conn, chunk.id) is not None
++    original = conn.execute(
++        "SELECT result_hash,phase1_generation_key FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
++        (chunk.id,),
++    ).fetchone()
++    path = tmp_path / "same.jsonl"
++    portability.export_jsonl(conn, path)
++    portability.import_jsonl(conn, path)
++    assert _proof(conn, chunk.id) is None
++    assert tuple(conn.execute(
++        "SELECT result_hash,phase1_generation_key FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
++        (chunk.id,),
++    ).fetchone()) == tuple(original)
++
++
++def test_import_failure_rolls_back_proof_invalidation(published, tmp_path, monkeypatch):
++    conn, chunk = published["conn"], published["chunk"]
++    proof = _proof(conn, chunk.id)
++    assert proof is not None
++    path = tmp_path / "rollback.jsonl"
++    portability.export_jsonl(conn, path)
++    before = list(conn.iterdump())
++
++    def fail_after_claim_import(*_args, **_kwargs):
++        assert _proof(conn, chunk.id) is None
++        raise ValueError("synthetic auxiliary import failure")
++
++    monkeypatch.setattr(portability, "_import_v14_auxiliary_state", fail_after_claim_import)
++    with pytest.raises(ValueError, match="synthetic auxiliary import failure"):
++        portability.import_jsonl(conn, path)
++    assert _proof(conn, chunk.id) == proof
++    assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("coalescing", [False, True])
++def test_authorized_merge_clears_only_affected_local_proof(published, coalescing):
++    state, conn = published, published["conn"]
++    unaffected = _chunk(conn, state["mid"], "root-unaffected")
++    _publish(conn, unaffected,
++             [Triple("unrelated", "uses", "postgres", 1, source_message_id=state["mid"])],
++             state["cfg"], state["generation"])
++    unaffected_proof = _proof(conn, unaffected.id)
++    if coalescing:
++        extra = _chunk(conn, state["mid"], "root-merge-target")
++        _publish(conn, extra,
++                 [Triple("service", "uses", "memcache", 1, source_message_id=state["mid"])],
++                 state["cfg"], state["generation"])
++    assert _proof(conn, state["chunk"].id) is not None
++    with db.transaction(conn):
++        canonicalize.merge(conn, "memcache", "redis")
++    assert _proof(conn, state["chunk"].id) is None
++    assert _proof(conn, unaffected.id) == unaffected_proof
++    if coalescing:
++        assert _proof(conn, extra.id) is None
++    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++
++
++def test_alias_only_merge_without_graph_owner_clears_affected_proof(published):
++    state, conn = published, published["conn"]
++    chunk = _chunk(conn, state["mid"], "root-alias-only-merge")
++    vectors = _vectors()
++    with db.embedding_mutation(conn):
++        conn.execute(
++            "INSERT INTO edge_embeddings(edge_text,vector_json,model,dim) VALUES (?,?,?,?)",
++            ("service uses redis", json.dumps([1.0, 0.0]), vectors.model, 2),
++        )
++    cfg = replace(state["cfg"], triple_dedup_enabled=True, triple_dedup_cosine_threshold=0.9)
++    _publish(conn, chunk, [
++        Triple("service", "uses", "redis", 1, source_message_id=state["mid"]),
++        Triple("service", "uses", "redis_cache", 1, source_message_id=state["mid"]),
++    ], cfg, state["generation"], vectors=vectors)
++    assert _proof(conn, chunk.id) is not None
++    assert conn.execute(
++        "SELECT COUNT(*) FROM knowledge_graph WHERE object_canonical='redis_cache'"
++    ).fetchone()[0] == 0
++    assert conn.execute(
++        "SELECT COUNT(*) FROM entity_mention_observations "
++        "WHERE chunk_id=? AND entity_canonical='redis_cache'", (chunk.id,),
++    ).fetchone()[0] == 1
++    with db.transaction(conn):
++        canonicalize.merge(conn, "redis", "redis_cache")
++    assert _proof(conn, chunk.id) is None
++    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++
++
++def test_ordinary_sql_cannot_replace_local_proof(published):
++    conn, chunk = published["conn"], published["chunk"]
++    proof = _proof(conn, chunk.id)
++    with pytest.raises(sqlite3.IntegrityError):
++        conn.execute(
++            "UPDATE kg_claim_extraction_outcomes SET local_replay_proof=? WHERE chunk_id=?",
++            ("sha256:" + "0" * 64, chunk.id),
++        )
++    assert _proof(conn, chunk.id) == proof
++
++
++@pytest.mark.parametrize("bad", ["", "sha256:bad", "sha256:" + "G" * 64, 123])
++def test_even_authorized_mutation_rejects_malformed_proof(published, bad):
++    conn, chunk = published["conn"], published["chunk"]
++    proof = _proof(conn, chunk.id)
++    with pytest.raises(sqlite3.IntegrityError), db.evidence_mutation(conn):
++        conn.execute(
++            "UPDATE kg_claim_extraction_outcomes SET local_replay_proof=? WHERE chunk_id=?",
++            (bad, chunk.id),
++        )
++    assert _proof(conn, chunk.id) == proof
++
++
++_PROOF_CHECK_EXPRESSION = (
++    "local_replay_proof IS NULL OR (length(local_replay_proof)=71 AND "
++    "substr(local_replay_proof,1,7)='sha256:' AND "
++    "substr(local_replay_proof,8) NOT GLOB '*[^0-9a-f]*')"
++)
++_PROOF_COLUMN = "local_replay_proof TEXT CHECK (" + _PROOF_CHECK_EXPRESSION + ")"
++
++
++def test_local_proof_shape_validator_accepts_real_constraint():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    try:
++        conn.execute("CREATE TABLE kg_claim_extraction_outcomes (" + _PROOF_COLUMN + ")")
++        db._validate_v64_local_claim_replay_shape(conn)
++        with pytest.raises(sqlite3.IntegrityError):
++            conn.execute("INSERT INTO kg_claim_extraction_outcomes VALUES ('not-a-proof')")
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("spoof", ["or_one", "block_comment", "line_comment", "or_one_and_comment"])
++def test_local_proof_shape_validator_rejects_weak_check_and_comment_spoofs(spoof):
++    if spoof == "or_one":
++        column = "local_replay_proof TEXT CHECK (" + _PROOF_CHECK_EXPRESSION + " OR 1)"
++    elif spoof == "block_comment":
++        column = "local_replay_proof TEXT CHECK (1) /* " + _PROOF_COLUMN + " */"
++    elif spoof == "line_comment":
++        column = "local_replay_proof TEXT CHECK (1) -- " + _PROOF_COLUMN + "\n"
++    else:
++        column = ("local_replay_proof TEXT CHECK (" + _PROOF_CHECK_EXPRESSION
++                  + " OR 1) /* " + _PROOF_COLUMN + " */")
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    try:
++        conn.execute("CREATE TABLE kg_claim_extraction_outcomes (" + column + ")")
++        # Establish that this is an actually weakened SQLite constraint, not
++        # merely a differently spelled equivalent definition.
++        conn.execute("INSERT INTO kg_claim_extraction_outcomes VALUES ('not-a-proof')")
++        with pytest.raises(RuntimeError, match="schema v64 local claim replay proof shape is malformed"):
++            db._validate_v64_local_claim_replay_shape(conn)
++    finally:
++        conn.close()
+diff --git a/tests/test_claim_replay_proof_root.py b/tests/test_claim_replay_proof_root.py
+new file mode 100644
+index 0000000..96feb2c
+--- /dev/null
++++ b/tests/test_claim_replay_proof_root.py
+@@ -0,0 +1,114 @@
++"""Independent byte/input binding controls for the local-only replay receipt."""
++
++from dataclasses import replace
++import re
++
++import pytest
++
++from hymem.config import HyMemConfig
++from hymem.dreaming import phase1
++from hymem.dreaming.chunks import Chunk
++from hymem.dreaming.lossless import CoveredMessage
++from hymem.extraction.triples import Triple
++
++
++@pytest.fixture
++def proof_input(tmp_path):
++    chunk = Chunk("proof-chunk", "proof-session", 41, 41, "test", "synthetic text",
++                  source_message_ids=(41,))
++    source = CoveredMessage(
++        41, "proof-session", "user", "Synthetic source bytes.\n", "coverage-chunk",
++        source_created_at="2026-01-01T12:00:00Z", source_peer_id="peer-a",
++        source_workspace_id="workspace-a",
++    )
++    triple = Triple("alpha", "uses", "beta", 1, source_message_id=41,
++                    value_text="ten", value_numeric=10.0, value_unit="seconds",
++                    temporal_scope="today")
++    extraction = phase1.ChunkExtraction(
++        triples=[triple], markers=[], claim_sources={41: source}, source_validated=True,
++    )
++    options = dict(prompt_version="derived-test-key-v1",
++                   phase1_generation_key="test-generation",
++                   result_hash="sha256:" + "a" * 64,
++                   cfg=HyMemConfig(root=tmp_path))
++    return chunk, extraction, options
++
++
++def _proof(case):
++    chunk, extraction, options = case
++    return phase1._local_replay_proof(chunk, extraction, **options)
++
++
++def test_proof_is_deterministic_and_contains_no_source_text(proof_input):
++    first = _proof(proof_input)
++    assert _proof(proof_input) == first
++    assert re.fullmatch(r"(?:[A-Za-z0-9_-]+:)*[0-9a-f]{64}", first)
++    assert "Synthetic" not in first and "alpha" not in first
++
++
++@pytest.mark.parametrize("field,value", [
++    ("subject", "alpha_variant"), ("object", "beta_variant"),
++    ("predicate", "prefers"), ("polarity", -1),
++    ("value_text", "eleven"), ("value_numeric", 11.0),
++    ("value_unit", "minutes"), ("temporal_scope", "yesterday"),
++])
++def test_every_claim_field_changes_receipt(proof_input, field, value):
++    chunk, extraction, options = proof_input
++    changed = replace(extraction, triples=[replace(extraction.triples[0], **{field: value})])
++    assert _proof((chunk, changed, options)) != _proof(proof_input)
++
++
++@pytest.mark.parametrize("field,value", [
++    ("session_id", "other-session"), ("role", "assistant"),
++    ("content", "Synthetic source bytes.\n "), ("chunk_id", "other-coverage"),
++    ("source_created_at", "2026-01-02T12:00:00Z"),
++    ("source_peer_id", "peer-b"), ("source_workspace_id", "workspace-b"),
++])
++def test_full_source_binding_changes_receipt(proof_input, field, value):
++    chunk, extraction, options = proof_input
++    changed_source = replace(extraction.claim_sources[41], **{field: value})
++    changed = replace(extraction, claim_sources={41: changed_source})
++    assert _proof((chunk, changed, options)) != _proof(proof_input)
++
++
++@pytest.mark.parametrize("field,value", [
++    ("prompt_version", "other-derived-key-v1"),
++    ("phase1_generation_key", "other-generation"),
++    ("result_hash", "sha256:" + "b" * 64),
++])
++def test_publication_binding_changes_receipt(proof_input, field, value):
++    chunk, extraction, options = proof_input
++    assert _proof((chunk, extraction, {**options, field: value})) != _proof(proof_input)
++
++
++def test_order_cardinality_and_weights_are_not_discarded(proof_input):
++    chunk, extraction, options = proof_input
++    first = extraction.triples[0]
++    second = replace(first, object="gamma")
++    ordered = replace(extraction, triples=[first, second])
++    reversed_ = replace(extraction, triples=[second, first])
++    duplicated = replace(extraction, triples=[first, second, second])
++    values = {_proof((chunk, candidate, options)) for candidate in
++              (extraction, ordered, reversed_, duplicated)}
++    assert len(values) == 4
++    cfg = replace(options["cfg"], evidence_role_weights={"user": 3})
++    assert _proof((chunk, extraction, {**options, "cfg": cfg})) != _proof(proof_input)
++
++
++def test_cited_message_identity_changes_receipt(proof_input):
++    chunk, extraction, options = proof_input
++    changed = replace(
++        extraction,
++        triples=[replace(extraction.triples[0], source_message_id=42)],
++        claim_sources={42: replace(extraction.claim_sources[41], message_id=42)},
++    )
++    assert _proof((chunk, changed, options)) != _proof(proof_input)
++
++
++@pytest.mark.parametrize("field,value", [
++    ("id", "other-chunk"), ("session_id", "other-session"),
++    ("text", "synthetic text "), ("source_message_ids", (41, 42)),
++])
++def test_chunk_binding_changes_receipt(proof_input, field, value):
++    chunk, extraction, options = proof_input
++    assert _proof((replace(chunk, **{field: value}), extraction, options)) != _proof(proof_input)
+diff --git a/tests/test_claim_replay_r7_upgrade_root.py b/tests/test_claim_replay_r7_upgrade_root.py
+new file mode 100644
+index 0000000..2b82768
+--- /dev/null
++++ b/tests/test_claim_replay_r7_upgrade_root.py
+@@ -0,0 +1,99 @@
++"""Independent release-lineage controls for the R7 v63 -> v64 replay fix.
++
++Run against the rebased R7 candidate, not the stale pre-R7 workspace.
++All model responses below are invented and supplied in process.
++"""
++import sqlite3
++from importlib.resources import files
++
++import pytest
++
++from hymem.core import db
++from hymem.dreaming import summary_recovery
++from tests.test_summary_recovery_v63 import Replies, _seed
++
++
++def _summary_rows(conn):
++    return {
++        table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
++        for table in ("sessions", "digest_staging", "summary_recovery")
++    }
++
++
++@pytest.fixture
++def source63(tmp_path):
++    conn = db.connect(tmp_path / "r7-upgrade.sqlite")
++    db.initialize(conn)
++    assert db.schema_version(conn) == 64
++    _seed(conn, long=True)
++    report = summary_recovery.run_summary_recovery(
++        conn, Replies(), max_calls=1, max_chars=300,
++    )
++    assert report["advanced"] == 1 and report["published"] == 0
++    assert conn.execute("SELECT COUNT(*) FROM summary_recovery").fetchone()[0] == 1
++    # Undo only the new additive migration; keep R7's real summary state and
++    # table constraints. The separate retained-store rehearsal covers genuine
++    # historical DDL and nonempty historical claim outcomes.
++    conn.execute("DROP TRIGGER kg_claim_extraction_outcomes_insert_guard")
++    conn.execute("DROP TRIGGER kg_claim_extraction_outcomes_update_guard")
++    conn.execute("ALTER TABLE kg_claim_extraction_outcomes DROP COLUMN local_replay_proof")
++    conn.execute("UPDATE schema_meta SET value='63' WHERE key='schema_version'")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def test_migration_numbers_extend_existing_summary_history():
++    entries = [entry.name for entry in files("hymem.core.migrations").iterdir()
++               if entry.name.endswith(".sql")]
++    numbers = [int(name.split("_", 1)[0]) for name in entries]
++    assert len(numbers) == len(set(numbers))
++    assert "062_independent_summary_frontier.sql" in entries
++    assert "063_private_summary_recovery.sql" in entries
++    assert "064_local_claim_replay_proof.sql" in entries
++    assert "062_local_claim_replay_proof.sql" not in entries
++    assert max(numbers) == db.EXPECTED_SCHEMA_VERSION == 64
++
++
++def test_upgrade_preserves_nonempty_private_summary_walk_and_guards(source63):
++    conn = source63
++    before = _summary_rows(conn)
++    guards = list(conn.execute(
++        "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
++        "AND name IN ('summary_state_workspace_guard','summary_recovery_workspace_guard') "
++        "ORDER BY name"
++    ))
++    assert len(guards) == 2
++    db.initialize(conn)
++    assert db.schema_version(conn) == 64
++    assert _summary_rows(conn) == before
++    assert list(conn.execute(
++        "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
++        "AND name IN ('summary_state_workspace_guard','summary_recovery_workspace_guard') "
++        "ORDER BY name"
++    )) == guards
++    db.initialize(conn)
++    assert _summary_rows(conn) == before
++    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++    with pytest.raises(sqlite3.IntegrityError):
++        conn.execute("UPDATE sessions SET source_workspace_id='other-workspace' WHERE id='x'")
++    assert _summary_rows(conn) == before
++
++
++def test_rejected_v64_migration_does_not_stamp_or_partially_add_column(source63, monkeypatch):
++    conn = source63
++    before = _summary_rows(conn)
++
++    def reject_shape(_conn):
++        raise RuntimeError("synthetic proof schema rejection")
++
++    monkeypatch.setattr(db, "_validate_v64_local_claim_replay_shape", reject_shape)
++    with pytest.raises(RuntimeError, match="synthetic proof schema rejection"):
++        db._run_migrations(conn)
++    assert db.schema_version(conn) == 63
++    assert "local_replay_proof" not in {
++        row["name"] for row in conn.execute("PRAGMA table_info(kg_claim_extraction_outcomes)")
++    }
++    assert _summary_rows(conn) == before
++    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+diff --git a/tests/test_r7_v64_summary_preservation.py b/tests/test_r7_v64_summary_preservation.py
+new file mode 100644
+index 0000000..942ea24
+--- /dev/null
++++ b/tests/test_r7_v64_summary_preservation.py
+@@ -0,0 +1,47 @@
++"""The local replay proof migration leaves R7 summary recovery state intact."""
++
++from hymem.core import db
++
++
++def test_v63_summary_recovery_row_survives_v64_upgrade(tmp_path):
++    path = tmp_path / "r7-v63.sqlite"
++    conn = db.connect(path)
++    db.initialize(conn)
++    conn.execute("INSERT INTO sessions(id) VALUES ('s')")
++    conn.execute(
++        "INSERT INTO summary_recovery("
++        "session_id,config_version,walk_id,target_generation,"
++        "target_message_id,base_sha256,target_source_sha256,draft,"
++        "source_sha256,attempt_limit,state_sha256) "
++        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
++        (
++            "s", "r7-test-v1", "a" * 32, "generation", 1,
++            "b" * 64, "c" * 64, "private draft", "d" * 64, 2,
++            "e" * 64,
++        ),
++    )
++    before = tuple(conn.execute("SELECT * FROM summary_recovery").fetchone())
++    summary_markers = [tuple(row) for row in conn.execute(
++        "SELECT key,value FROM schema_meta WHERE key IN "
++        "('summary_frontier_schema','summary_recovery_schema') ORDER BY key"
++    )]
++    conn.execute("DROP TRIGGER kg_claim_extraction_outcomes_insert_guard")
++    conn.execute("DROP TRIGGER kg_claim_extraction_outcomes_update_guard")
++    conn.execute(
++        "ALTER TABLE kg_claim_extraction_outcomes DROP COLUMN local_replay_proof"
++    )
++    conn.execute("UPDATE schema_meta SET value='63' WHERE key='schema_version'")
++    conn.close()
++
++    conn = db.connect(path)
++    try:
++        db.initialize(conn)
++        assert db.schema_version(conn) == 64
++        assert tuple(conn.execute("SELECT * FROM summary_recovery").fetchone()) == before
++        assert [tuple(row) for row in conn.execute(
++            "SELECT key,value FROM schema_meta WHERE key IN "
++            "('summary_frontier_schema','summary_recovery_schema') ORDER BY key"
++        )] == summary_markers
++        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
++    finally:
++        conn.close()
+diff --git a/tests/test_summary_recovery_v63.py b/tests/test_summary_recovery_v63.py
+index 6f05d9f..166b18e 100644
+--- a/tests/test_summary_recovery_v63.py
++++ b/tests/test_summary_recovery_v63.py
+@@ -571,7 +571,7 @@ def test_invalid_limits_never_call_provider_or_create_private_state(conn, key, v
+ 
+ 
+ def test_v63_private_storage_is_fail_closed_and_guard_heals(conn):
+-    assert db.schema_version(conn) == 63
++    assert db.schema_version(conn) == db.EXPECTED_SCHEMA_VERSION
+     conn.execute("DROP TRIGGER summary_recovery_workspace_guard")
+     db.initialize(conn)
+     assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='summary_recovery_workspace_guard'").fetchone()
+@@ -747,5 +747,5 @@ def test_v63_forward_migration_failure_rolls_back_private_table_guard_and_stamp(
+     assert (_public(conn), _items(conn)) == (old_public, old_items)
+     monkeypatch.setattr(db, "_install_summary_recovery_guards", original)
+     db._run_migrations(conn)
+-    assert db.schema_version(conn) == 63
++    assert db.schema_version(conn) == db.EXPECTED_SCHEMA_VERSION
+     assert (_public(conn), _items(conn)) == (old_public, old_items)

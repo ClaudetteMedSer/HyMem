@@ -1,0 +1,1630 @@
+--- a/benchmarks/beam_adapter.py
++++ b/benchmarks/beam_adapter.py
+@@ -92,7 +92,7 @@
+     validate_extraction_canary_config_binding,
+     validate_extraction_canary_report,
+ )
+-from longmemeval_adapter import (
++from benchmarks.longmemeval_adapter import (
+     PINNED_DEEPSEEK_MODEL,
+     THINKING_DISABLED,
+     _detect_ability,
+@@ -768,21 +768,22 @@
+ 
+ def apply_thinking_default(role: str, model: str, provider: str,
+                            absent: bool, obj: dict) -> tuple[dict, bool]:
+-    """Model-pin pre-reg §6: default v4-flash to thinking-disabled when the
++    """Default the current Flash service to thinking-disabled when the
+     operator passed no flag at all.
+ 
+-    The match term is `"v4-flash" in model`, NOT `"deepseek" in model`. The
+-    latter is the library client's gate (`hymem/contrib/openai_client.py`)
+-    and it would also fire on the retired `deepseek-chat` alias. Historical
+-    comparator artifacts used that alias without this body, so reproducing
+-    those request bytes requires an explicit model override. The live default
+-    is the pinned v4-flash path below.
++    Keep the old `"v4-flash" in model` transform as well: historical comparator
++    validation must reproduce its original request body without granting live
++    admission to retired names. Do not generalize to every DeepSeek model.
+ 
+     ABSENT is not EMPTY. `--{role}-extra-body ''` or `'{}'` is the operator
+     explicitly asking for no extra body, and a convenience must never override
+     an explicit statement -- so those keep `{}` and the guard then refuses the
+     run, which is the correct outcome for a request that cannot work."""
+-    if not absent or provider != "deepseek" or "v4-flash" not in model:
++    is_flash = (
++        model.casefold() == "deepseek-flash"
++        or "v4-flash" in model
++    )
++    if not absent or provider != "deepseek" or not is_flash:
+         return obj, False
+     # Deep, not `dict(...)`: a shallow copy shares the nested dict, so one
+     # run mutating its own extra_body would edit every later run's default.
+@@ -792,12 +793,9 @@
+ def check_model_pin(role: str, model: str, provider: str, extra_body: dict) -> None:
+     """Refuse the two ways a model pin turns into silent empty completions.
+ 
+-    (1) A v4-flash DeepSeek model WITHOUT thinking disabled answers in
+-        `reasoning_content` and leaves `content` empty. `_rejudge_run` has
+-        aborted on this since the gold-delta pre-registration, but the normal
+-        answer/judge path had no guard at all -- a bare
+-        `--answer-model deepseek-v4-flash` ran straight into it and the run
+-        looked like a capability result.
++    (1) Flash reasoning can consume the bounded answer budget before ordinary
++        content is produced. This benchmark requires its non-reasoning body;
++        historical v4-flash transformations retain the same guard.
+     (2) DeepSeek's `thinking` key sent to OpenAI/Gemini is a 400. The ANSWERER
+         is provider-swappable (ANSWER_PROVIDERS), so this is reachable by flag
+         combination; the judge is DeepSeek-only and cannot hit it.
+@@ -807,12 +805,15 @@
+         print(f"ERROR: {role} provider {provider!r} rejects DeepSeek's `thinking` key "
+               f"(HTTP 400). Drop it from --{role}-extra-body.")
+         sys.exit(2)
+-    if provider in ("deepseek", "deepinfra") and "v4-flash" in model and \
++    is_flash = (
++        model.casefold() == "deepseek-flash"
++        or "v4-flash" in model
++    )
++    if provider in ("deepseek", "deepinfra") and is_flash and \
+             (thinking or {}).get("type") != "disabled":
+         print(f"ERROR: {role} model {model!r} requires "
+               f"--{role}-extra-body '{{\"thinking\": {{\"type\": \"disabled\"}}}}'. "
+-              "Without it the model writes to reasoning_content, this client reads "
+-              "content, and every empty read scores 0.")
++              "Reasoning can exhaust this benchmark's bounded content budget.")
+         sys.exit(2)
+ 
+ 
+--- a/benchmarks/coref_eval.py
++++ b/benchmarks/coref_eval.py
+@@ -44,6 +44,7 @@
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+ from hymem.query.coref import QueryRewrite, rewrite_query  # noqa: E402
+ from hymem.session import Message  # noqa: E402
++from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL  # noqa: E402
+ 
+ _INSERT_EDGE = """
+     INSERT INTO knowledge_graph
+@@ -256,7 +257,7 @@
+             over["coref_llm_enabled"] = True
+             llm = OpenAICompatibleClient(
+                 api_key=args.api_key, base_url="https://api.deepseek.com",
+-                model="deepseek-v4-flash",
++                model=RECOMMENDED_DEEPSEEK_MODEL,
+             )
+         cfg = dataclasses.replace(base, **over)
+         print(f"[cfg] max_turns={cfg.coref_max_turns} "
+--- a/benchmarks/fact_probe.py
++++ b/benchmarks/fact_probe.py
+@@ -137,6 +137,7 @@
+ # will actually use (Latin accent folding + Unicode-safe literal query terms).
+ from hymem.query.augment import _fts_safe_text, _fold_diacritics  # noqa: E402
+ from hymem.contrib.model_policy import (  # noqa: E402
++    RECOMMENDED_DEEPSEEK_MODEL,
+     DeprecatedModelAliasError,
+     require_active_model,
+ )
+@@ -1048,7 +1049,7 @@
+                     help="canned extraction, no LLM — plumbing only; its "
+                          "containment number is an upper bound, not evidence")
+     ap.add_argument("--api-key", default="", help="reader/extractor API key")
+-    ap.add_argument("--model", default="deepseek-v4-flash", help="extraction model")
++    ap.add_argument("--model", default=RECOMMENDED_DEEPSEEK_MODEL, help="extraction model")
+     ap.add_argument("--base-url", default=DEEPSEEK_BASE_URL,
+                     help="OpenAI-compatible endpoint for --model (default: DeepSeek; "
+                          "point at OpenRouter etc. when --model is a hosted model)")
+--- a/benchmarks/lme_canary_watch.py
++++ b/benchmarks/lme_canary_watch.py
+@@ -19,6 +19,7 @@
+ import time
+ 
+ sys.path.insert(0, "/home/node/HyMem")
++from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL
+ os.chdir("/home/node/HyMem")
+ 
+ from benchmarks.extraction_canary import (
+@@ -53,7 +54,7 @@
+         run_configured_extraction_canary(
+             api_key=key,
+             base_url="https://api.deepseek.com",
+-            model="deepseek-v4-flash",
++            model=RECOMMENDED_DEEPSEEK_MODEL,
+             thinking="auto",
+         )
+         verdict = "PASS"
+--- a/benchmarks/lme_protocol.py
++++ b/benchmarks/lme_protocol.py
+@@ -23,6 +23,7 @@
+     TRANSPORT_SECURITY_NONE,
+     validate_recorded_embedding_endpoint,
+     validate_http_endpoint,
++    validate_public_attestation,
+     secret_free_endpoint_identity,
+ )
+ from hymem.dreaming.lossless import (
+@@ -1619,7 +1620,7 @@
+ 
+ 
+ def _validated_pipeline_aggregation_producer(
+-    pipeline: Mapping[str, Any],
++    pipeline: Mapping[str, Any], *, archive_only: bool = False,
+ ) -> Mapping[str, Any]:
+     """Validate the manifested producer even when no final status exists."""
+ 
+@@ -1630,6 +1631,55 @@
+         expected_declaration = expected_producer.get("declaration")
+         if not isinstance(expected_declaration, Mapping):
+             raise ValueError("aggregation declaration is absent")
++        if archive_only:
++            # These hashes commit to historical request/retry inputs; their
++            # preimages (including old runtime versions) were not archived.
++            # Validate the commitment and recorded crosslinks, never rebuild
++            # it with today's code or infer current execution eligibility.
++            if (
++                expected_producer["identity_exact"] is not True
++                or expected_producer["reuse_scope"] != "durable"
++                or expected_declaration["client_id"]
++                != "hymem.contrib.openai_client.OpenAICompatibleClient"
++                or re.fullmatch(
++                    r"sha256:[0-9a-f]{64}",
++                    expected_declaration["implementation"],
++                ) is None
++                or expected_declaration["model"] != pipeline.get("model")
++                or expected_declaration["endpoint_origin"]
++                != pipeline.get("endpoint_origin")
++                or expected_declaration["endpoint_sha256"]
++                != pipeline.get("endpoint_sha256")
++            ):
++                raise ValueError("historical aggregation producer differs")
++            validate_public_attestation(
++                pipeline.get("transport_package_version"),
++                label="recorded OpenAI transport package version", max_bytes=256,
++            )
++            timeout = _finite_number(pipeline.get("request_timeout_seconds"))
++            if timeout is None or timeout <= 0:
++                raise ValueError("recorded OpenAI request timeout is invalid")
++            revision = pipeline.get("deployment_revision_sha256")
++            tenant = pipeline.get("deployment_tenant_sha256")
++            if revision is None and tenant is None:
++                # Known strict-v1 requested-service contracts, kept as data
++                # rather than derived from today's active-model policy. This
++                # is not a claim of fixed or currently available weights.
++                if (
++                    pipeline.get("model") not in {
++                        "deepseek-v4-flash", "deepseek-flash",
++                    }
++                    or pipeline.get("endpoint_origin")
++                    != "https://api.deepseek.com"
++                ):
++                    raise ValueError("historical deployment attestation absent")
++            elif any(
++                not isinstance(item, str)
++                or re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None
++                for item in (revision, tenant)
++            ):
++                raise ValueError("historical deployment attestation invalid")
++            return expected_producer
+         from hymem.contrib.openai_client import (
+             openai_compatible_producer_declaration,
+         )
+@@ -1686,11 +1736,13 @@
+ 
+ def _validate_aggregation_pipeline_binding(
+     final_status: Mapping[str, Any] | None,
+-    pipeline: Mapping[str, Any],
++    pipeline: Mapping[str, Any], *, archive_only: bool = False,
+ ) -> None:
+     """Cross-check an enabled aggregation producer against the run target."""
+ 
+-    expected_producer = _validated_pipeline_aggregation_producer(pipeline)
++    expected_producer = _validated_pipeline_aggregation_producer(
++        pipeline, archive_only=archive_only,
++    )
+     if final_status is None:
+         return
+     certificate = final_status.get("aggregation_generation")
+@@ -2238,7 +2290,33 @@
+     data: object, *, path: Path | None = None,
+     require_scored: bool | None = None,
+ ) -> dict[str, Any]:
+-    """Validate a strict LME evidence envelope and recompute every score."""
++    """Validate strict evidence against the current producer implementation."""
++
++    return _validate_artifact(data, path=path, require_scored=require_scored,
++                              archive_only=False)
++
++
++def validate_archived_artifact(
++    data: object, *, path: Path | None = None,
++    require_scored: bool | None = None,
++) -> dict[str, Any]:
++    """Validate historical commitments, not eligibility for new execution.
++
++    Envelope, accounting, score, source and checkpoint checks still apply.
++    Historical request/retry preimages are unavailable. This explicit reader
++    does not reconstruct them from today's runtime or admit execution, resume,
++    or official prediction export.
++    """
++    result = _validate_artifact(data, path=path, require_scored=require_scored,
++                                archive_only=True)
++    return {**result, "validation_assurance": "historical_commitment_only",
++            "live_execution_eligible": False}
++
++
++def _validate_artifact(
++    data: object, *, path: Path | None,
++    require_scored: bool | None, archive_only: bool,
++) -> dict[str, Any]:
+ 
+     if not isinstance(data, Mapping):
+         raise BenchmarkIntegrityError("LongMemEval artifact root must be an object")
+@@ -2654,7 +2732,7 @@
+             raise BenchmarkIntegrityError(
+                 f"LongMemEval {label} model identity fields differ"
+             )
+-    _validated_pipeline_aggregation_producer(pipeline)
++    _validated_pipeline_aggregation_producer(pipeline, archive_only=archive_only)
+     def expected_provider(endpoint: str) -> str:
+         official = validate_http_endpoint(
+             endpoint, label="model identity"
+@@ -2840,6 +2918,7 @@
+             )
+             _validate_aggregation_pipeline_binding(
+                 row_indexing.get("final_status"), pipeline,
++                archive_only=archive_only,
+             )
+             normalized_row_indexing = dict(row_indexing)
+             if normalized_row_indexing.get("schema") != LME_INDEXING_SUMMARY_VERSION:
+--- a/benchmarks/lme_registry.py
++++ b/benchmarks/lme_registry.py
+@@ -9,7 +9,8 @@
+ flip had it existed.
+ 
+ Usage:
+-  lme_registry.py ingest [FILE ...]      Add runs from JSON files (default: all archives)
++  lme_registry.py ingest [FILE ...] [--historical-commitments]
++                                       Add runs (default: all archives)
+   lme_registry.py list [--limit N] [--flag COL]   Print table
+   lme_registry.py query "SQL"            Raw query against the DB
+   lme_registry.py audit [--strict]       Date-check the aggregation label
+@@ -20,6 +21,11 @@
+ the value is stored as NULL — this registry does not guess; the
+ date-check / provenance analysis is done on top of NULLs, not inside
+ them.
++
++Strict ingestion reconstructs current producer identity. The explicit
++--historical-commitments reader validates preserved historical commitments
++and score/accounting evidence, records its weaker assurance, and never
++authorizes current execution. It is not a fallback after validation failure.
+ """
+ import json
+ import math
+@@ -39,7 +45,7 @@
+ from .strictness import (
+     BenchmarkIntegrityError, content_hash, read_artifact_or_pointer,
+ )
+-from .lme_protocol import strict_intent, validate_strict_artifact
++from .lme_protocol import strict_intent, validate_archived_artifact, validate_strict_artifact
+ 
+ DB = Path(os.environ.get("LME_REGISTRY_DB", "/home/node/.hermes/benchmarks/lme_runs.db"))
+ BENCH_DIR = Path(os.environ.get("LME_BENCH_DIR", "/home/node/.hermes/benchmarks"))
+@@ -136,6 +142,9 @@
+     protocol_split             TEXT,
+     calibration_receipt_hash   TEXT,
+     strict_validated           INTEGER,
++    archive_validated          INTEGER,
++    validation_assurance       TEXT,
++    live_execution_eligible    INTEGER,
+     official_comparable        INTEGER,
+     development_only           INTEGER,
+     official_denominator_validated INTEGER,
+@@ -183,6 +192,8 @@
+ 
+ ADDITIVE_COLUMNS = {
+     "run_id": "TEXT", "protocol": "TEXT", "strict_validated": "INTEGER",
++    "archive_validated": "INTEGER", "validation_assurance": "TEXT",
++    "live_execution_eligible": "INTEGER",
+     "protocol_split": "TEXT", "calibration_receipt_hash": "TEXT",
+     "official_comparable": "INTEGER", "development_only": "INTEGER",
+     "official_denominator_validated": "INTEGER",
+@@ -463,8 +474,12 @@
+     return data, archive, digest, compatibility
+ 
+ 
+-def ingest_file(con, path: Path, overrides: dict | None = None):
++def ingest_file(con, path: Path, overrides: dict | None = None, *,
++                validation_scope: str = "current"):
+     """Insert one run JSON. Returns 'inserted' | 'skipped' | 'error'."""
++    if validation_scope not in {"current", "historical"}:
++        return "error: unknown LongMemEval validation scope"
++    historical = validation_scope == "historical"
+     overrides = overrides or {}
+     try:
+         data, archive, artifact_digest, pointer_compatibility = (
+@@ -478,7 +493,8 @@
+         if overrides:
+             return "error: strict LongMemEval artifacts reject analyst overrides"
+         try:
+-            validated = validate_strict_artifact(data, path=path)
++            validator = validate_archived_artifact if historical else validate_strict_artifact
++            validated = validator(data, path=path)
+         except (BenchmarkIntegrityError, ValueError, TypeError) as exc:
+             # Strict intent is fail-closed: malformed evidence never falls back
+             # to permissive legacy parsing.
+@@ -576,8 +592,14 @@
+         "scores": scores,
+         "models": data.get("models") if strict else None,
+         "execution": data.get("execution") if strict else None,
+-        "strict_validation": (
++        "strict_validation" if historical else "archive_validation": None,
++        "archive_validation" if historical else "strict_validation": (
+             {
++                "validation_assurance": (
++                    "historical_commitment_only" if historical
++                    else "current_producer_reconstructed"
++                ),
++                "live_execution_eligible": False if historical else None,
+                 "run_id": validated["run_id"],
+                 "summary_degraded_questions": validated["summary_degraded_questions"],
+                 "summary_degraded_sessions": validated["summary_degraded_sessions"],
+@@ -645,7 +667,8 @@
+         ),
+         "total_tokens": total_tokens, "elapsed_s": elapsed_s,
+         "flags_provenance": (
+-            "strict-v1 validated durable evidence" if strict else prov
++            ("strict-v1 historical commitment only" if historical
++             else "strict-v1 validated durable evidence") if strict else prov
+         ),
+         "extras": json.dumps(extras, default=str),
+         "run_id": validated.get("run_id") if validated else None,
+@@ -654,7 +677,13 @@
+         "calibration_receipt_hash": (
+             manifest.get("calibration_receipt_hash") if strict else None
+         ),
+-        "strict_validated": int(strict),
++        "strict_validated": int(strict and not historical),
++        "archive_validated": int(strict and historical),
++        "validation_assurance": (
++            ("historical_commitment_only" if historical
++             else "current_producer_reconstructed") if validated else None
++        ),
++        "live_execution_eligible": 0 if validated and historical else None,
+         "official_comparable": _to_int(
+             validated.get("official_comparable") if validated else None
+         ),
+@@ -769,7 +798,7 @@
+ }
+ 
+ 
+-def cmd_ingest(files, overrides=None):
++def cmd_ingest(files, overrides=None, *, validation_scope="current"):
+     con = connect()
+     if not files:
+         files = sorted(BENCH_DIR.glob("longmemeval-v2-hymem*.json"))
+@@ -778,7 +807,7 @@
+         files = [f for f in files if f.name != "longmemeval-v2-hymem.json"]
+     stats = {}
+     for f in files:
+-        r = ingest_file(con, Path(f), overrides)
++        r = ingest_file(con, Path(f), overrides, validation_scope=validation_scope)
+         stats[r] = stats.get(r, 0) + 1
+     con.commit()
+     total = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+@@ -1066,17 +1095,21 @@
+     cmd = sys.argv[1]
+     if cmd == "ingest":
+         ov = {}
++        validation_scope = "current"
+         args = sys.argv[2:]
+         i = 0
+         while i < len(args):
+-            if args[i] == "--set" and i + 1 < len(args):
++            if args[i] == "--historical-commitments":
++                validation_scope = "historical"
++                args.pop(i)
++            elif args[i] == "--set" and i + 1 < len(args):
+                 k, v = args[i + 1].split("=", 1)
+                 ov[k] = v
+                 args.pop(i)
+                 args.pop(i)
+             else:
+                 i += 1
+-        cmd_ingest(args or None, ov)  # noqa: E1123
++        cmd_ingest(args or None, ov, validation_scope=validation_scope)
+     elif cmd == "backfill":
+         if cmd_backfill():
+             sys.exit(1)   # §6.5: unreachable rows were not migrated
+--- a/benchmarks/locomo_adapter.py
++++ b/benchmarks/locomo_adapter.py
+@@ -158,12 +158,13 @@
+ from hymem.contrib.endpoint_policy import validate_http_endpoint
+ from hymem.contrib.model_policy import (
+     DeprecatedModelAliasError,
++    RECOMMENDED_DEEPSEEK_MODEL,
+     require_active_model,
+ )
+ 
+-_ANSWER_MODEL = "deepseek-v4-flash"
+-_JUDGE_MODEL = "deepseek-v4-flash"
+-_HYMEM_MODEL = "deepseek-v4-flash"
++_ANSWER_MODEL = RECOMMENDED_DEEPSEEK_MODEL
++_JUDGE_MODEL = RECOMMENDED_DEEPSEEK_MODEL
++_HYMEM_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+ _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+ 
+ _MAX_CONVERSATION_ID_LENGTH = 128
+--- a/benchmarks/longmemeval_adapter.py
++++ b/benchmarks/longmemeval_adapter.py
+@@ -57,6 +57,7 @@
+ )
+ from hymem.contrib.model_policy import (  # noqa: E402
+     DeprecatedModelAliasError,
++    RECOMMENDED_DEEPSEEK_MODEL,
+     require_active_model,
+ )
+ 
+@@ -367,7 +368,7 @@
+ # DeepSeek API
+ DEEPSEEK_API_KEY = ""
+ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+-PINNED_DEEPSEEK_MODEL = "deepseek-v4-flash"
++PINNED_DEEPSEEK_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+ ANSWER_MODEL = PINNED_DEEPSEEK_MODEL
+ JUDGE_MODEL = PINNED_DEEPSEEK_MODEL
+ 
+@@ -715,12 +716,11 @@
+ ) -> tuple[dict, bool]:
+     """Return a safe, effective raw request body extension.
+ 
+-    DeepSeek v4-flash writes its usable answer to the ordinary ``content``
+-    field only when thinking is disabled.  An omitted body therefore gets the
+-    required vendor extension automatically on the actual DeepSeek endpoint.
+-    A caller-provided body remains authoritative, but a DeepSeek v4-flash body
+-    that would leave thinking enabled is rejected instead of producing a
+-    capability score from empty completions.
++    The bounded raw benchmark paths use non-reasoning Flash requests so that
++    reasoning cannot consume the answer budget. An omitted body gets that
++    vendor extension on the actual DeepSeek endpoint. An explicit incompatible
++    body is rejected. This pure transformation also retains the old v4-flash
++    handling for historical artifact validation; it is not live admission.
+ 
+     The endpoint check is deliberately exact-host.  A custom OpenAI-compatible
+     gateway never receives a DeepSeek-only key merely because its model name
+@@ -735,15 +735,18 @@
+     was_absent = extra_body is None
+     host = (urlsplit(normalized_base).hostname or "").casefold()
+     is_deepseek_endpoint = host == "api.deepseek.com"
+-    is_v4_flash = "v4-flash" in model.casefold()
+-
+-    if was_absent and is_deepseek_endpoint and is_v4_flash:
++    is_flash = (
++        model.casefold() == "deepseek-flash"
++        or "v4-flash" in model.casefold()
++    )
++
++    if was_absent and is_deepseek_endpoint and is_flash:
+         return copy.deepcopy(THINKING_DISABLED), True
+-    if is_deepseek_endpoint and is_v4_flash:
++    if is_deepseek_endpoint and is_flash:
+         thinking = body.get("thinking")
+         if not isinstance(thinking, dict) or thinking.get("type") != "disabled":
+             raise BenchmarkIntegrityError(
+-                "DeepSeek v4-flash requires thinking.type='disabled'; omit "
++                "DeepSeek Flash requires thinking.type='disabled'; omit "
+                 "the extra-body option to use the safe default"
+             )
+     return body, False
+--- a/benchmarks/msc_adapter.py
++++ b/benchmarks/msc_adapter.py
+@@ -136,6 +136,7 @@
+ from hymem.contrib.endpoint_policy import validate_http_endpoint
+ from hymem.contrib.model_policy import (
+     DeprecatedModelAliasError,
++    RECOMMENDED_DEEPSEEK_MODEL,
+     require_active_model,
+ )
+ from hymem.core.vectors import decode_vector
+@@ -153,9 +154,9 @@
+ # Reuse the LME machinery unchanged — same answer/judge clients and scoring keep
+ # MSC and LME numbers in ONE comparability frame (frozen posture). Imported
+ # lazily inside functions to keep --sim import-light and API-free.
+-_ANSWER_MODEL = "deepseek-v4-flash"
+-_JUDGE_MODEL = "deepseek-v4-flash"
+-_HYMEM_MODEL = "deepseek-v4-flash"   # NOT the deprecated deepseek-chat (2026-07-24)
++_ANSWER_MODEL = RECOMMENDED_DEEPSEEK_MODEL
++_JUDGE_MODEL = RECOMMENDED_DEEPSEEK_MODEL
++_HYMEM_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+ _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+ _MSC_APERTURE = {
+     "message_fts_top_k": 15,
+--- a/benchmarks/multihop_miner.py
++++ b/benchmarks/multihop_miner.py
+@@ -82,6 +82,7 @@
+ from hymem.query.augment import _multihop_edges  # noqa: E402
+ from hymem.query.entities import match_known_entities  # noqa: E402
+ from hymem.contrib.model_policy import (  # noqa: E402
++    RECOMMENDED_DEEPSEEK_MODEL,
+     DeprecatedModelAliasError,
+     require_active_model,
+ )
+@@ -401,7 +402,7 @@
+     ap.add_argument("--types", default=",".join(sorted(_MINE_TYPES)),
+                     help="comma-separated question_types to mine (default MR+TR)")
+     # per-question dreaming
+-    ap.add_argument("--dream-model", default="deepseek-v4-flash",
++    ap.add_argument("--dream-model", default=RECOMMENDED_DEEPSEEK_MODEL,
+                     help="per-question mode: extraction LLM. Thinking MUST be disabled for "
+                          "v4-flash (the box's patched openai_client). 'stub' = no-op plumbing test.")
+     ap.add_argument("--dream-base-url", default=None,
+--- a/benchmarks/rerank_ab.py
++++ b/benchmarks/rerank_ab.py
+@@ -72,6 +72,7 @@
+ )
+ 
+ from hymem.query.augment import MessageHit, _message_fts_search  # noqa: E402
++from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL  # noqa: E402
+ from hymem.query.rerank import (  # noqa: E402
+     _get_cross_encoder,
+     cross_encoder_rerank,
+@@ -374,7 +375,7 @@
+     ap.add_argument("--ce-model", default=MXBAI, help="M1's cross-encoder model")
+     ap.add_argument("--bge-model", default=BGE_M3, help="M2's challenger model")
+     ap.add_argument("--api-key", default="", help="LLM arm (M1 only)")
+-    ap.add_argument("--model", default="deepseek-v4-flash", help="LLM arm model")
++    ap.add_argument("--model", default=RECOMMENDED_DEEPSEEK_MODEL, help="LLM arm model")
+     ap.add_argument("--sim", action="store_true",
+                     help="fake rerankers — plumbing only, numbers are meaningless")
+     ap.add_argument("--out", type=Path, default=None, help="write the summary JSON")
+--- a/benchmarks/rules_compliance.py
++++ b/benchmarks/rules_compliance.py
+@@ -45,6 +45,7 @@
+ 
+ from hymem import HyMem, HyMemConfig
+ from hymem.contrib.model_policy import (
++    RECOMMENDED_DEEPSEEK_MODEL,
+     DeprecatedModelAliasError,
+     require_active_model,
+ )
+@@ -234,11 +235,11 @@
+ 
+ def main() -> None:
+     ap = argparse.ArgumentParser(description="Idea B rules-adherence box gate.")
+-    ap.add_argument("--answer-model", default="deepseek-v4-flash",
++    ap.add_argument("--answer-model", default=RECOMMENDED_DEEPSEEK_MODEL,
+                     help="answerer model; 'stub' for a no-API plumbing run")
+     ap.add_argument("--answer-base-url", default=None)
+     ap.add_argument("--answer-api-key", default=None)
+-    ap.add_argument("--judge-model", default="deepseek-v4-flash",
++    ap.add_argument("--judge-model", default=RECOMMENDED_DEEPSEEK_MODEL,
+                     help="judge model; 'stub' for a plumbing run")
+     ap.add_argument("--judge-base-url", default=None)
+     ap.add_argument("--judge-api-key", default=None)
+--- a/hymem/bootstrap.py
++++ b/hymem/bootstrap.py
+@@ -18,6 +18,7 @@
+ 
+ from hymem.api import HyMem
+ from hymem.config import HyMemConfig
++from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL
+ from hymem.contrib.endpoint_policy import (
+     EMBEDDING_INTERNAL_HTTP_ENV,
+     EndpointPolicyError,
+@@ -32,7 +33,7 @@
+ 
+ DEFAULT_ROOT = Path.home() / ".hermes"
+ DEFAULT_BASE_URL = "https://api.deepseek.com"
+-DEFAULT_LLM_MODEL = "deepseek-v4-flash"  # deepseek-chat hard-deprecated 2026-07-24
++DEFAULT_LLM_MODEL = RECOMMENDED_DEEPSEEK_MODEL
+ DEFAULT_EMBEDDING_BASE_URL = "local://feature-hash"
+ DEFAULT_EMBEDDING_MODEL = "hymem-local-feature-hash-v1"
+ DEFAULT_EMBEDDING_DIM = 384
+@@ -517,6 +518,10 @@
+     from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
+     from hymem.contrib.model_policy import require_active_model
+ 
++    require_active_model(
++        os.environ.get("HYMEM_LLM_MODEL", DEFAULT_LLM_MODEL),
++        role="HyMem server LLM",
++    )
+     cfg = resolve_env()
+ 
+     # Surface a retired deployment override as the primary startup fault,
+--- a/hymem/contrib/model_policy.py
++++ b/hymem/contrib/model_policy.py
+@@ -9,10 +9,12 @@
+ 
+ from hymem.contrib.implementation_identity import import_time_source_sha256
+ 
+-RECOMMENDED_DEEPSEEK_MODEL = "deepseek-v4-flash"
++RECOMMENDED_DEEPSEEK_MODEL = "deepseek-flash"
+ DEPRECATED_DEEPSEEK_ALIASES = frozenset({
+     "deepseek-chat",
+     "deepseek-reasoner",
++    "deepseek-v4-flash",
++    "deepseek-v4-flash-vision-exp",
+ })
+ 
+ 
+--- a/hymem/contrib/openai_client.py
++++ b/hymem/contrib/openai_client.py
+@@ -22,7 +22,7 @@
+     OPENAI_TRANSPORT_RUNTIME_EXACT,
+     OPENAI_TRANSPORT_RUNTIME_VERSIONS,
+ )
+-from hymem.contrib.model_policy import require_active_model
++from hymem.contrib.model_policy import RECOMMENDED_DEEPSEEK_MODEL, require_active_model
+ from hymem.deadline import DeadlineExceeded, current_deadline
+ 
+ from hymem.extraction.llm import (
+@@ -69,7 +69,7 @@
+ ] = weakref.WeakKeyDictionary()
+ _OPENAI_LLM_EXECUTION_CONFIGS_LOCK = threading.Lock()
+ _OFFICIAL_DEEPSEEK_DEPLOYMENT_CONTRACT = (
+-    "official-deepseek-v4-flash-at-api.deepseek.com-v1"
++    "official-deepseek-flash-request-service-at-api.deepseek.com-v1"
+ )
+ _FROZEN_CURRENT_DEADLINE = current_deadline
+ _FROZEN_WITH_RETRY = with_retry
+@@ -117,7 +117,7 @@
+     Environment variables (all optional if arguments are passed directly):
+         HYMEM_LLM_API_KEY   — purpose-bound API key for the configured endpoint
+         HYMEM_LLM_BASE_URL  — base URL (default: https://api.deepseek.com)
+-        HYMEM_LLM_MODEL     — model name (default: deepseek-v4-flash)
++        HYMEM_LLM_MODEL     — requested model service (default: deepseek-flash)
+         HYMEM_LLM_THINKING  — whether to send DeepSeek's `thinking` body key:
+                               "auto" (default, send only on DeepSeek endpoints),
+                               "disabled" (always send it, i.e. force reasoning
+@@ -144,7 +144,7 @@
+         # object exists.  Environment fallback is part of the effective model
+         # identity and must not bypass the same constructor-level policy.
+         resolved_model = (
+-            model or os.environ.get("HYMEM_LLM_MODEL") or "deepseek-v4-flash"
++            model or os.environ.get("HYMEM_LLM_MODEL") or RECOMMENDED_DEEPSEEK_MODEL
+         )
+         if type(resolved_model) is str:
+             resolved_model = resolved_model.strip()
+@@ -200,7 +200,7 @@
+                 revision_sha256 is None
+                 and tenant_sha256 is None
+                 and endpoint.official_provider == "deepseek"
+-                and resolved_model == "deepseek-v4-flash"
++                and resolved_model == RECOMMENDED_DEEPSEEK_MODEL
+             )
+             else None
+         )
+@@ -800,15 +800,22 @@
+     official_deployment_contract: str | None = None,
+     require_consistent_thinking: bool = True,
+ ):
+-    """Derive the same safe producer declaration without constructing I/O."""
++    """Derive the same safe producer declaration without constructing I/O.
++
++    The official contract identifies a requested service and local request
++    implementation, not immutable provider weights. Provider backend changes
++    are not observable from this declaration alone.
++    """
+ 
+     from hymem.contrib.endpoint_policy import ENDPOINT_POLICY_VERSION
+     from hymem.extraction.producer import Phase1ProducerDeclaration
+ 
++    if type(model) is str:
++        model = model.strip()
++    _FROZEN_REQUIRE_ACTIVE_MODEL(model, role="HyMem LLM")
+     model = validate_public_attestation(
+         model, label="OpenAI LLM model", max_bytes=4096,
+     )
+-    _FROZEN_REQUIRE_ACTIVE_MODEL(model, role="HyMem LLM")
+     if thinking_mode not in _THINKING_MODES:
+         raise ValueError("OpenAI thinking mode is invalid")
+     from urllib.parse import urlsplit
+@@ -849,7 +856,7 @@
+         and deployment_revision_sha256 is None
+         and deployment_tenant_sha256 is None
+         and endpoint_meta.official_provider == "deepseek"
+-        and model == "deepseek-v4-flash"
++        and model == RECOMMENDED_DEEPSEEK_MODEL
+     ):
+         official_deployment_contract = _OFFICIAL_DEEPSEEK_DEPLOYMENT_CONTRACT
+     exact_official_contract = bool(
+@@ -857,7 +864,7 @@
+         and deployment_revision_sha256 is None
+         and deployment_tenant_sha256 is None
+         and endpoint_meta.official_provider == "deepseek"
+-        and model == "deepseek-v4-flash"
++        and model == RECOMMENDED_DEEPSEEK_MODEL
+     )
+     if not (exact_operator_attestation or exact_official_contract):
+         raise ValueError(
+--- a/hymem/server.py
++++ b/hymem/server.py
+@@ -26,7 +26,7 @@
+ Key variables:
+     HYMEM_LLM_API_KEY        API key for the extraction LLM (or DEEPSEEK_API_KEY)
+     HYMEM_LLM_BASE_URL       Base URL (default: https://api.deepseek.com)
+-    HYMEM_LLM_MODEL          Model name (default: deepseek-v4-flash)
++    HYMEM_LLM_MODEL          Model name (default: deepseek-flash)
+                              Retired deepseek-chat/deepseek-reasoner aliases
+                              are rejected before the server opens its store.
+     HYMEM_LLM_THINKING       Thinking-body policy (default: auto)
+--- a/tests/test_beam_default_flip.py
++++ b/tests/test_beam_default_flip.py
+@@ -34,8 +34,8 @@
+ 
+ def test_the_defaults_are_now_the_pin():
+     """§6's headline. Step 1 passed, so an unflagged run means the pin."""
+-    assert ba.ANSWER_MODEL == "deepseek-v4-flash"
+-    assert ba.JUDGE_MODEL == "deepseek-v4-flash"
++    assert ba.ANSWER_MODEL == "deepseek-flash"
++    assert ba.JUDGE_MODEL == "deepseek-flash"
+ 
+ 
+ def test_absent_flag_on_v4_flash_defaults_to_thinking_disabled():
+--- a/tests/test_beam_model_pin.py
++++ b/tests/test_beam_model_pin.py
+@@ -63,7 +63,7 @@
+ # ── extra_body plumbing ───────────────────────────────────────────────────
+ 
+ def test_extra_body_is_merged_into_the_request(captured):
+-    ba.LLMClient("deepseek-v4-flash", "k", extra_body=THINKING)._call([], 0.0, 512)
++    ba.LLMClient("deepseek-flash", "k", extra_body=THINKING)._call([], 0.0, 512)
+     assert captured["body"]["thinking"] == {"type": "disabled"}
+ 
+ 
+@@ -109,7 +109,7 @@
+ ])
+ def test_empty_content_raises_instead_of_scoring_zero(captured, msg):
+     captured["reply"] = _message(**msg)
+-    client = ba.LLMClient("deepseek-v4-flash", "k")
++    client = ba.LLMClient("deepseek-flash", "k")
+     with pytest.raises(ba.LLMEmptyContentError) as raised:
+         client._call([], 0.0, 512)
+     assert isinstance(raised.value, RuntimeError)  # direct-call compatibility
+@@ -127,7 +127,7 @@
+     monkeypatch.setattr(ba.time, "sleep", lambda *_: None)
+     private_reasoning = "PRIVATE_REASONING_MUST_NOT_LEAK_93"
+     captured["reply"] = _message(content="", reasoning_content=private_reasoning)
+-    client = ba.LLMClient("deepseek-v4-flash", "k")
++    client = ba.LLMClient("deepseek-flash", "k")
+     out = client.chat([])
+     assert ba.LLM_EMPTY_CONTENT_SENTINEL == "[LLM_ERROR:LLMEmptyContentError]"
+     assert out == ba.LLM_EMPTY_CONTENT_SENTINEL
+@@ -314,7 +314,7 @@
+     the field has to outlive the exception the empty content triggers."""
+     monkeypatch.setattr(ba.time, "sleep", lambda *_: None)
+     captured["reply"] = _reply("", "length")
+-    c = ba.LLMClient("deepseek-v4-flash", "k")
++    c = ba.LLMClient("deepseek-flash", "k")
+     assert c.chat([]) == ba.LLM_EMPTY_CONTENT_SENTINEL
+     assert c.last_finish_reason == "length"
+ 
+@@ -349,7 +349,7 @@
+     truncated = ('{"scores": [1], "total_score": 1.0, "explanation": "The response '
+                  'includes numeric error status codes')
+     captured["reply"] = _reply(truncated, "length")
+-    llm = ba.LLMClient("deepseek-v4-flash", "k")
++    llm = ba.LLMClient("deepseek-flash", "k")
+     out = ba.judge_answer(llm, "q", "ideal", ["states the code"], "an answer",
+                           return_raw=True)
+     assert out["score"] == 0.0 and out["scores"] == []
+@@ -359,7 +359,7 @@
+ 
+ def test_a_complete_judge_reply_is_parsed_and_also_carries_its_finish(captured):
+     captured["reply"] = _reply('{"scores": [1, 0], "total_score": 0.5}', "stop")
+-    llm = ba.LLMClient("deepseek-v4-flash", "k")
++    llm = ba.LLMClient("deepseek-flash", "k")
+     out = ba.judge_answer(llm, "q", "ideal", ["a", "b"], "ans", return_raw=True)
+     assert out["score"] == 0.5 and out["scores"] == [1, 0]
+     assert out["judge_finish_reason"] == "stop"
+--- a/tests/test_beam_truncation_gate.py
++++ b/tests/test_beam_truncation_gate.py
+@@ -70,7 +70,7 @@
+     truncated reply; nothing downstream may treat it as the judge's verdict."""
+     captured["reply"] = {"choices": [{"message": {"content": TRUNCATED},
+                                       "finish_reason": "length"}]}
+-    llm = ba.LLMClient("deepseek-v4-flash", "k")
++    llm = ba.LLMClient("deepseek-flash", "k")
+     out = ba.judge_answer(llm, "q", "ideal", ["r"], "a", return_raw=True)
+     assert out["score"] == 0.0 and out["scores"] == []       # the fabrication
+     assert '"scores": [1]' in out["judge_raw"]               # what was really said
+--- a/tests/test_benchmark_client_cleanup.py
++++ b/tests/test_benchmark_client_cleanup.py
+@@ -52,7 +52,7 @@
+ def _doctor_llm_config():
+     return SimpleNamespace(
+         llm_base_url="https://api.deepseek.com/v1",
+-        llm_model="deepseek-v4-flash",
++        llm_model="deepseek-flash",
+         has_llm_key=True,
+         llm_api_key="provider-key-must-not-leak",
+     )
+--- a/tests/test_benchmark_model_defaults.py
++++ b/tests/test_benchmark_model_defaults.py
+@@ -27,7 +27,7 @@
+ import msc_adapter as msc  # noqa: E402
+ 
+ 
+-PIN = "deepseek-v4-flash"
++PIN = "deepseek-flash"
+ DISABLED = {"thinking": {"type": "disabled"}}
+ 
+ 
+--- a/tests/test_bootstrap_lifecycle.py
++++ b/tests/test_bootstrap_lifecycle.py
+@@ -67,7 +67,7 @@
+         root=tmp_path,
+         llm_api_key="purpose-key",
+         llm_base_url="https://api.deepseek.com",
+-        llm_model="deepseek-v4-flash",
++        llm_model="deepseek-flash",
+         embedding_api_key="embedding-key" if remote_embedding else None,
+         embedding_base_url=(
+             "https://api.openai.com/v1"
+--- a/tests/test_coverage_health.py
++++ b/tests/test_coverage_health.py
+@@ -30,7 +30,7 @@
+ def _cfg(path):
+     return EnvConfig(
+         root=path.parent, llm_api_key=None, llm_base_url="https://api.deepseek.com",
+-        llm_model="deepseek-v4-flash", embedding_api_key=None,
++        llm_model="deepseek-flash", embedding_api_key=None,
+         embedding_base_url="local://feature-hash", embedding_model="health-test",
+         embedding_dim=3, embedding_backend="local_feature_hash",
+         embedding_fallback_reason=None, aggregation_nodes_enabled=False,
+--- /dev/null
++++ b/tests/test_current_deepseek_service.py
+@@ -0,0 +1,165 @@
++"""Current requested-service admission is distinct from historical identity."""
++
++from copy import deepcopy
++
++import pytest
++
++from benchmarks import beam_adapter as beam, lme_protocol, longmemeval_adapter as lme
++from hymem import bootstrap
++from hymem.contrib import model_policy, openai_client
++from hymem.contrib.endpoint_policy import secret_free_endpoint_identity
++from hymem.extraction.producer import producer_binding_from_typed_declaration
++from tests.test_lme_protocol_hardening import make_artifact, _refresh_manifest
++
++
++CURRENT = "deepseek-flash"
++DISABLED = {"thinking": {"type": "disabled"}}
++CONTRACT = "official-deepseek-flash-request-service-at-api.deepseek.com-v1"
++RETIRED = ("deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash",
++           "deepseek-v4-flash-vision-exp")
++
++
++@pytest.fixture(autouse=True)
++def no_ambient_llm_config(monkeypatch):
++    for name in (
++        "HYMEM_LLM_MODEL", "HYMEM_LLM_BASE_URL", "HYMEM_LLM_THINKING",
++        "HYMEM_LLM_DEPLOYMENT_REVISION", "HYMEM_LLM_DEPLOYMENT_TENANT",
++        "HYMEM_LLM_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY",
++    ):
++        monkeypatch.delenv(name, raising=False)
++
++
++def declaration(**overrides):
++    kwargs = dict(
++        model=CURRENT, endpoint="https://api.deepseek.com", thinking_mode="auto",
++        effective_extra_body=DISABLED, transport_package_version="fixture-sdk",
++        request_timeout_seconds=120.0,
++    )
++    kwargs.update(overrides)
++    return openai_client.openai_compatible_producer_declaration(**kwargs)
++
++
++@pytest.mark.parametrize("model", RETIRED)
++@pytest.mark.parametrize("form", ("{}", "  {}  ", "openai:{}", "openrouter:deepseek/{}"))
++def test_retired_requests_fail_before_any_credential_or_bootstrap_resolution(
++    monkeypatch, model, form,
++):
++    selected = form.format(model.upper())
++
++    def forbidden(*_args, **_kwargs):
++        raise AssertionError("retired selection reached setup")
++
++    monkeypatch.setattr(openai_client, "resolve_llm_api_key", forbidden)
++    monkeypatch.setattr(bootstrap, "resolve_env", forbidden)
++    with pytest.raises(model_policy.DeprecatedModelAliasError):
++        openai_client.OpenAICompatibleClient(model=selected)
++    # Constructor and standalone producer admit the identical selected model.
++    with pytest.raises(model_policy.DeprecatedModelAliasError):
++        declaration(model=selected)
++    monkeypatch.setenv("HYMEM_LLM_MODEL", selected)
++    with pytest.raises(model_policy.DeprecatedModelAliasError):
++        openai_client.OpenAICompatibleClient()
++    with pytest.raises(model_policy.DeprecatedModelAliasError):
++        bootstrap.build_from_env()
++
++
++@pytest.mark.parametrize("thinking,body", (("auto", DISABLED), ("disabled", DISABLED),
++                                           ("off", {}), ("enabled", {})))
++def test_current_client_and_standalone_declarations_are_identical(thinking, body):
++    client = openai_client.OpenAICompatibleClient(
++        api_key="synthetic-fixture-key", model=f"  {CURRENT}  ", thinking=thinking,
++    )
++    try:
++        actual = client.phase1_producer_declaration()
++        expected = declaration(
++            model=f"  {CURRENT}  ", thinking_mode=thinking,
++            effective_extra_body=body,
++            transport_package_version=client.transport_package_version,
++        )
++        assert actual == expected == client.aggregation_producer_declaration()
++        assert actual.model == client.model == CURRENT
++        assert actual.effective_request["official_deployment_contract"] == CONTRACT
++        assert client.effective_extra_body == body
++        binding = producer_binding_from_typed_declaration(
++            actual, declaration_hook="phase1_producer_declaration",
++        )
++        assert binding["identity_exact"] is True
++        assert binding["reuse_scope"] == "durable"
++    finally:
++        client.close()
++
++
++@pytest.mark.parametrize("endpoint", (
++    "https://api.deepseek.com", "https://api.deepseek.com/v1",
++    "https://gateway.example/v1",
++))
++@pytest.mark.parametrize("missing", ("revision", "tenant"))
++def test_partial_attestation_never_uses_official_exception(endpoint, missing):
++    fields = dict(deployment_revision_sha256="sha256:" + "a" * 64,
++                  deployment_tenant_sha256="sha256:" + "b" * 64)
++    fields[f"deployment_{missing}_sha256"] = None
++    with pytest.raises(ValueError, match="revision and tenant"):
++        declaration(endpoint=endpoint, **fields)
++
++
++def test_custom_endpoint_still_needs_both_attestations():
++    with pytest.raises(ValueError, match="revision and tenant"):
++        declaration(endpoint="https://gateway.example/v1")
++    result = declaration(
++        endpoint="https://gateway.example/v1",
++        deployment_revision_sha256="sha256:" + "a" * 64,
++        deployment_tenant_sha256="sha256:" + "b" * 64,
++    )
++    assert result.effective_request["official_deployment_contract"] is None
++
++
++def test_old_official_contract_cannot_be_asserted_for_current_service():
++    with pytest.raises(ValueError, match="revision and tenant"):
++        declaration(official_deployment_contract=
++                    "official-deepseek-v4-flash-at-api.deepseek.com-v1")
++
++
++@pytest.mark.parametrize("model", (CURRENT, "deepseek-v4-flash",
++                                   "deepseek-v4-flash-vision-exp"))
++def test_pure_historical_body_transforms_retain_old_and_current_flash(model):
++    body, defaulted = lme.resolve_model_extra_body(model, "https://api.deepseek.com", None)
++    assert (body, defaulted) == (DISABLED, True)
++    body["thinking"]["type"] = "mutated"
++    assert lme.resolve_model_extra_body(model, "https://api.deepseek.com", None) == (DISABLED, True)
++    assert lme.resolve_model_extra_body(model, "https://gateway.example/v1", None) == ({}, False)
++    for incompatible in ({}, {"thinking": {"type": "enabled"}}):
++        with pytest.raises(lme.BenchmarkIntegrityError):
++            lme.resolve_model_extra_body(model, "https://api.deepseek.com", incompatible)
++        assert beam.apply_thinking_default("answer", model, "deepseek", False, incompatible) == (incompatible, False)
++        with pytest.raises(SystemExit):
++            beam.check_model_pin("answer", model, "deepseek", incompatible)
++    assert beam.apply_thinking_default("answer", model, "deepseek", True, {}) == (DISABLED, True)
++    beam.check_model_pin("answer", model, "deepseek", DISABLED)
++
++
++def test_current_official_service_artifact_remains_archivable_after_retirement(monkeypatch):
++    artifact = make_artifact()
++    config, pipeline = artifact["config"], artifact["models"]["memory_pipeline"]
++    identity = secret_free_endpoint_identity("https://api.deepseek.com", label="fixture")
++    config.update(hymem_model=CURRENT, hymem_thinking="auto")
++    config.update({f"hymem_{key}": value for key, value in identity.items()})
++    pipeline.update(provider="deepseek", model=CURRENT, thinking_mode="auto", effective_extra_body=deepcopy(DISABLED),
++                    deployment_revision_sha256=None, deployment_tenant_sha256=None, **identity)
++    pipeline["aggregation_producer"] = producer_binding_from_typed_declaration(
++        declaration(transport_package_version=pipeline["transport_package_version"]),
++        declaration_hook="aggregation_producer_declaration",
++    )
++    _refresh_manifest(artifact)
++    lme_protocol.validate_strict_artifact(artifact)
++    original = deepcopy(artifact)
++    monkeypatch.setattr(model_policy, "DEPRECATED_DEEPSEEK_ALIASES",
++                        model_policy.DEPRECATED_DEEPSEEK_ALIASES | {CURRENT})
++    with pytest.raises(lme.BenchmarkIntegrityError, match="aggregation identity"):
++        lme_protocol.validate_strict_artifact(artifact)
++    assert lme_protocol.validate_archived_artifact(artifact)["live_execution_eligible"] is False
++    assert artifact == original
++
++
++def test_current_defaults_are_one_shared_selection():
++    assert model_policy.RECOMMENDED_DEEPSEEK_MODEL == bootstrap.DEFAULT_LLM_MODEL == CURRENT
++    assert lme.PINNED_DEEPSEEK_MODEL == beam.HYMEM_MODEL == CURRENT
+--- a/tests/test_dream_lease.py
++++ b/tests/test_dream_lease.py
+@@ -39,7 +39,7 @@
+         root=tmp_path,
+         llm_api_key="test-purpose-key",
+         llm_base_url="https://api.deepseek.com",
+-        llm_model="deepseek-v4-flash",
++        llm_model="deepseek-flash",
+         embedding_api_key=None,
+         embedding_base_url=bootstrap.DEFAULT_EMBEDDING_BASE_URL,
+         embedding_model=bootstrap.DEFAULT_EMBEDDING_MODEL,
+--- a/tests/test_embedding_recovery_health.py
++++ b/tests/test_embedding_recovery_health.py
+@@ -20,7 +20,7 @@
+ def partial_switch(tmp_path):
+     cfg = EnvConfig(
+         root=tmp_path, llm_api_key=None, llm_base_url="https://api.deepseek.com",
+-        llm_model="deepseek-v4-flash", embedding_api_key=None,
++        llm_model="deepseek-flash", embedding_api_key=None,
+         embedding_base_url="local://feature-hash", embedding_model="new-producer",
+         embedding_dim=3, embedding_backend="local_feature_hash",
+         embedding_fallback_reason=None, aggregation_nodes_enabled=False,
+--- a/tests/test_facts_object_contract.py
++++ b/tests/test_facts_object_contract.py
+@@ -115,7 +115,7 @@
+         monkeypatch.setattr(openai, "OpenAI", sdk)
+         client = OpenAICompatibleClient(
+             api_key="synthetic-test-key", base_url="https://api.deepseek.com",
+-            model="deepseek-v4-flash", thinking="disabled",
++            model="deepseek-flash", thinking="disabled",
+         )
+         clients.append(client)
+         return client, calls
+--- /dev/null
++++ b/tests/test_lme_current_model_startup.py
+@@ -0,0 +1,86 @@
++"""Exercise actual CLI checkpoint setup without a provider call."""
++import json
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++STARTUP = r'''
++import json, os, pathlib, runpy, sys
++source, work = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
++explicit = sys.argv[3] == 'yes'
++os.environ.clear()
++os.environ.update(HOME=str(work), TMPDIR=str(work), PATH='/usr/bin:/bin',
++                  PYTHONDONTWRITEBYTECODE='1', DEEPSEEK_API_KEY='synthetic-no-network-key')
++connections = []
++def audit(event, args):
++    if event in {'socket.connect', 'socket.getaddrinfo', 'socket.sendto'}:
++        connections.append(event)
++        raise AssertionError('startup attempted network I/O')
++sys.addaudithook(audit)
++sys.path.insert(0, str(source))
++class ClientBoundary(BaseException):
++    pass
++adapter = source / 'benchmarks' / 'longmemeval_adapter.py'
++def boundary(frame, event, _arg):
++    if event == 'call' and frame.f_code.co_filename == str(adapter):
++        client = frame.f_globals.get('LLMClient')
++        if client is not None and frame.f_code is client.__init__.__code__:
++            raise ClientBoundary()
++    return boundary
++sys.argv = [str(adapter), '--scales', 'S', '--sample', '1', '--seed', '53',
++            '--workers', '1', '--top-k', '15', '--auto-ability', '--permissive-default',
++            '--no-prereg', '--protocol-split', 'full', '--indexing-max-cycles', '100',
++            '--indexing-timeout-s', '3600', '--indexing-require-healthy', '--keep-db',
++            '--judge-protocol', 'legacy-custom', '--data-dir', str(work),
++            '--results-dir', str(work / 'results'),
++            '--checkpoint', str(work / 'results' / 'checkpoint.json')]
++if explicit:
++    for role in ('hymem', 'answer', 'judge'):
++        sys.argv.extend(['--' + role + '-model', 'deepseek-flash',
++                         '--' + role + '-base-url', 'https://api.deepseek.com'])
++    sys.argv.extend(['--hymem-thinking', 'disabled', '--answer-extra-body',
++                     '{"thinking":{"type":"disabled"}}', '--judge-extra-body',
++                     '{"thinking":{"type":"disabled"}}'])
++sys.settrace(boundary)
++try:
++    runpy.run_path(str(adapter), run_name='__main__')
++except ClientBoundary:
++    sys.settrace(None)
++else:
++    raise AssertionError('actual CLI did not reach its reader client boundary')
++assert not connections
++checkpoint = json.loads((work / 'results' / 'checkpoint.json').read_text())
++manifest = checkpoint['manifest']
++assert checkpoint['expected_ids'] == ['startup-qid']
++assert manifest['config']['indexing_completion_policy'] == 'source-backed-index-with-explicit-summary-degradation-v1'
++for role in ('reader', 'judge', 'memory_pipeline'):
++    assert manifest['models'][role]['model'] == 'deepseek-flash'
++pipeline = manifest['models']['memory_pipeline']
++assert pipeline['aggregation_producer']['identity_exact'] is True
++assert pipeline['deployment_revision_sha256'] is pipeline['deployment_tenant_sha256'] is None
++assert pipeline['effective_extra_body'] == {'thinking': {'type': 'disabled'}}
++assert manifest['models']['reader']['extra_body'] == {'thinking': {'type': 'disabled'}}
++assert manifest['models']['judge']['extra_body'] == {'thinking': {'type': 'disabled'}}
++print('ACTUAL_CLI_CHECKPOINT_CLIENT_BOUNDARY_NO_PROVIDER_CALLS')
++'''
++
++@pytest.mark.parametrize('explicit', [False, True])
++def test_actual_cli_reaches_checkpoint_and_client_boundary_without_provider_calls(tmp_path, explicit):
++    rows = [{
++        'question_id': 'startup-qid', 'question_type': 'multi-session',
++        'question': 'Which city?', 'answer': 'Utrecht', 'question_date': '2025-01-03',
++        'answer_session_ids': ['session-0'], 'haystack_session_ids': ['session-0'],
++        'haystack_dates': ['2025-01-01'],
++        'haystack_sessions': [[{'role': 'user', 'content': 'I live in Utrecht.',
++                               'has_answer': True}]],
++    }]
++    (tmp_path / 'longmemeval_s_cleaned.json').write_text(json.dumps(rows))
++    result = subprocess.run(
++        [sys.executable, '-I', '-B', '-c', STARTUP, str(Path(__file__).resolve().parents[1]),
++         str(tmp_path), 'yes' if explicit else 'no'], cwd=tmp_path, env={},
++        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert 'ACTUAL_CLI_CHECKPOINT_CLIENT_BOUNDARY_NO_PROVIDER_CALLS' in result.stdout
+--- /dev/null
++++ b/tests/test_lme_historical_admission.py
+@@ -0,0 +1,345 @@
++"""Explicit historical LME admission cannot authorize current execution."""
++
++from copy import deepcopy
++import json
++import sqlite3
++import sys
++
++import pytest
++
++from benchmarks import lme_protocol as protocol, lme_registry as registry
++from benchmarks.strictness import BenchmarkIntegrityError, content_hash
++from hymem.contrib import model_policy, openai_client
++from hymem.extraction.producer import producer_binding_from_typed_declaration
++from tests.archive_evidence_fixtures import bind_checkpoint
++from tests.test_lme_protocol_hardening import (
++    _current_exact_aggregation_status,
++    _indexing_failure_artifact,
++    _refresh_manifest,
++    make_artifact,
++)
++
++
++def _drift(monkeypatch, kind):
++    if kind == "policy":
++        monkeypatch.setattr(
++            model_policy, "DEPRECATED_DEEPSEEK_ALIASES",
++            model_policy.DEPRECATED_DEEPSEEK_ALIASES | {"pipeline"},
++        )
++    elif kind == "runtime":
++        monkeypatch.setattr(
++            openai_client, "OPENAI_TRANSPORT_RUNTIME_VERSIONS",
++            {"python": "different-from-fixture-runtime"},
++        )
++    elif kind == "implementation":
++        monkeypatch.setattr(
++            openai_client, "OPENAI_LLM_IMPLEMENTATION_SHA256", "sha256:" + "f" * 64,
++        )
++    else:
++        raise AssertionError(kind)
++
++
++def _reseal_producer(artifact):
++    producer = artifact["models"]["memory_pipeline"]["aggregation_producer"]
++    producer["identity_sha256"] = content_hash({
++        key: value for key, value in producer["declaration"].items()
++        if key != "schema"
++    })
++    _refresh_manifest(artifact)
++
++
++@pytest.mark.parametrize("kind", ["policy", "runtime", "implementation"])
++@pytest.mark.parametrize("indexed", [False, True])
++def test_explicit_historical_reader_survives_drift_without_changing_evidence(
++    monkeypatch, kind, indexed,
++):
++    artifact = _indexing_failure_artifact() if indexed else make_artifact()
++    strict = protocol.validate_strict_artifact(artifact)
++    before = deepcopy(artifact)
++    _drift(monkeypatch, kind)
++    with pytest.raises(BenchmarkIntegrityError, match="aggregation identity"):
++        protocol.validate_strict_artifact(artifact)
++    historical = protocol.validate_archived_artifact(artifact)
++    assert historical == {
++        **strict, "validation_assurance": "historical_commitment_only",
++        "live_execution_eligible": False,
++    }
++    assert artifact == before
++
++
++@pytest.mark.parametrize("kind", ["policy", "runtime", "implementation"])
++def test_registry_historical_scope_is_explicit_persisted_and_still_listed(
++    monkeypatch, tmp_path, capsys, kind,
++):
++    artifact = _indexing_failure_artifact()
++    path = tmp_path / "longmemeval-v2-hymem-20260904T120000Z-seed0-strict.json"
++    path.write_text(json.dumps(artifact))
++    original = path.read_bytes()
++    monkeypatch.setattr(registry, "DB", tmp_path / "registry.sqlite")
++    _drift(monkeypatch, kind)
++    conn = registry.connect()
++    assert registry.ingest_file(conn, path).startswith("error: strict")
++    assert conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
++    assert registry.ingest_file(conn, path, validation_scope="historical") == "inserted"
++    conn.commit()
++    conn.row_factory = sqlite3.Row
++    row = conn.execute("SELECT * FROM runs").fetchone()
++    assert row["strict_validated"] == 0
++    assert row["archive_validated"] == 1
++    assert row["validation_assurance"] == "historical_commitment_only"
++    assert row["live_execution_eligible"] == 0
++    assert row["pipeline_model"] == "pipeline"
++    extras = json.loads(row["extras"])
++    assert extras["strict_validation"] is None
++    assert extras["archive_validation"]["live_execution_eligible"] is False
++    assert extras["archive_validation"]["validation_assurance"] == "historical_commitment_only"
++    assert extras["models"] == artifact["models"]
++    assert registry.ingest_file(conn, path, validation_scope="historical") == "skipped"
++    registry.cmd_list()
++    assert path.name in capsys.readouterr().out
++    assert path.read_bytes() == original
++    conn.close()
++
++
++def test_current_registry_default_and_cli_historical_selection(monkeypatch, tmp_path, capsys):
++    artifact = make_artifact()
++    path = tmp_path / "longmemeval-v2-hymem-20260904T120000Z-seed0-strict.json"
++    path.write_text(json.dumps(artifact))
++    monkeypatch.setattr(registry, "DB", tmp_path / "current.sqlite")
++    conn = registry.connect()
++    assert registry.ingest_file(conn, path) == "inserted"
++    assert conn.execute(
++        "SELECT strict_validated, archive_validated, validation_assurance, "
++        "live_execution_eligible FROM runs"
++    ).fetchone() == (1, 0, "current_producer_reconstructed", None)
++    conn.commit()
++    registry.cmd_list()
++    assert path.name in capsys.readouterr().out
++    conn.close()
++    monkeypatch.setattr(registry, "DB", tmp_path / "historical.sqlite")
++    _drift(monkeypatch, "runtime")
++    monkeypatch.setattr(sys, "argv", [
++        "lme_registry.py", "ingest", str(path), "--historical-commitments",
++    ])
++    registry.main()
++    with sqlite3.connect(registry.DB) as con:
++        assert con.execute("SELECT archive_validated FROM runs").fetchone() == (1,)
++
++
++def test_archive_validation_never_calls_current_producer_builder(monkeypatch):
++    artifact = make_artifact()
++
++    def forbidden(**_kwargs):
++        raise AssertionError("archive reader reached current producer builder")
++
++    monkeypatch.setattr(openai_client, "openai_compatible_producer_declaration", forbidden)
++    protocol.validate_archived_artifact(artifact)
++    with pytest.raises(AssertionError, match="current producer"):
++        protocol.validate_strict_artifact(artifact)
++
++
++@pytest.mark.parametrize("model", ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"])
++def test_recorded_retired_model_is_not_rewritten_or_authorized(monkeypatch, model):
++    artifact = make_artifact()
++    pipeline = artifact["models"]["memory_pipeline"]
++    artifact["config"]["hymem_model"] = pipeline["model"] = model
++    with monkeypatch.context() as before_retirement:
++        before_retirement.setattr(model_policy, "DEPRECATED_DEEPSEEK_ALIASES", frozenset())
++        pipeline["aggregation_producer"] = producer_binding_from_typed_declaration(
++            openai_client.openai_compatible_producer_declaration(
++                model=model, endpoint="https://pipeline.example/v1",
++                thinking_mode=pipeline["thinking_mode"],
++                effective_extra_body=pipeline["effective_extra_body"],
++                transport_package_version=pipeline["transport_package_version"],
++                request_timeout_seconds=pipeline["request_timeout_seconds"],
++                deployment_revision_sha256=pipeline["deployment_revision_sha256"],
++                deployment_tenant_sha256=pipeline["deployment_tenant_sha256"],
++            ), declaration_hook="aggregation_producer_declaration",
++        )
++        _refresh_manifest(artifact)
++        protocol.validate_strict_artifact(artifact)
++    original = json.dumps(artifact, sort_keys=True)
++    monkeypatch.setattr(
++        model_policy, "DEPRECATED_DEEPSEEK_ALIASES",
++        model_policy.DEPRECATED_DEEPSEEK_ALIASES | {model},
++    )
++    assert protocol.validate_archived_artifact(artifact)["live_execution_eligible"] is False
++    with pytest.raises(BenchmarkIntegrityError, match="aggregation identity"):
++        protocol.validate_strict_artifact(artifact)
++    with pytest.raises(model_policy.DeprecatedModelAliasError):
++        model_policy.require_active_model(model)
++    assert json.dumps(artifact, sort_keys=True) == original
++
++
++@pytest.mark.parametrize("kind", ["policy", "runtime", "implementation"])
++def test_historical_acceptance_does_not_enable_official_export(monkeypatch, tmp_path, kind):
++    artifact = make_artifact()
++    _drift(monkeypatch, kind)
++    protocol.validate_archived_artifact(artifact)
++    destination = tmp_path / "predictions.jsonl"
++    with pytest.raises(BenchmarkIntegrityError, match="aggregation identity"):
++        protocol.export_official_predictions(artifact, destination)
++    assert not destination.exists()
++
++
++@pytest.mark.parametrize("validator", [
++    protocol.validate_strict_artifact, protocol.validate_archived_artifact,
++])
++@pytest.mark.parametrize(("field", "value"), [
++    ("client_id", "other.Client"),
++    ("implementation", "not-a-digest"),
++    ("model", "other-model"),
++    ("endpoint_origin", "https://other.example"),
++    ("endpoint_sha256", "sha256:" + "1" * 64),
++    ("effective_request", {"sha256": "invalid"}),
++    ("retry_policy", {"sha256": "invalid"}),
++])
++def test_resealed_producer_tampering_is_rejected_in_both_modes(validator, field, value):
++    artifact = make_artifact()
++    artifact["models"]["memory_pipeline"]["aggregation_producer"]["declaration"][field] = value
++    _reseal_producer(artifact)
++    with pytest.raises(BenchmarkIntegrityError, match="aggregation identity"):
++        validator(artifact)
++
++
++@pytest.mark.parametrize("validator", [
++    protocol.validate_strict_artifact, protocol.validate_archived_artifact,
++])
++@pytest.mark.parametrize(("field", "value"), [
++    ("transport_package_version", ""),
++    ("transport_package_version", []),
++    ("request_timeout_seconds", True),
++    ("request_timeout_seconds", 0),
++    ("request_timeout_seconds", float("inf")),
++    ("deployment_revision_sha256", None),
++    ("deployment_tenant_sha256", "invalid"),
++    ("thinking_mode", "invented"),
++    ("effective_extra_body", {"model": "override"}),
++])
++def test_recorded_pipeline_shapes_remain_required(validator, field, value):
++    artifact = make_artifact()
++    artifact["models"]["memory_pipeline"][field] = value
++    if field == "request_timeout_seconds" and value == float("inf"):
++        # Non-finite JSON is invalid before any identity reconstruction.
++        with pytest.raises(ValueError):
++            _refresh_manifest(artifact)
++        return
++    _refresh_manifest(artifact)
++    with pytest.raises((BenchmarkIntegrityError, ValueError)):
++        validator(artifact)
++
++
++@pytest.mark.parametrize("validator", [
++    protocol.validate_strict_artifact, protocol.validate_archived_artifact,
++])
++@pytest.mark.parametrize("kind", ["score", "count", "usage", "checkpoint", "result", "producer"])
++def test_historical_scope_keeps_non_model_integrity_checks(validator, kind):
++    artifact = make_artifact()
++    if kind == "score":
++        artifact["scores"]["OVERALL"]["accuracy"] = 99.0
++    elif kind == "count":
++        artifact["execution"]["counts"]["expected"] += 1
++        bind_checkpoint(artifact)
++    elif kind == "usage":
++        artifact["execution"]["segments"][0]["reader_usage"]["total_tokens"] += 1
++        bind_checkpoint(artifact)
++    elif kind == "checkpoint":
++        artifact["execution"].pop("checkpoint")
++    elif kind == "result":
++        artifact["result_digest"] = "sha256:" + "e" * 64
++    else:
++        artifact["models"]["memory_pipeline"]["aggregation_producer"]["identity_sha256"] = "sha256:" + "e" * 64
++        _refresh_manifest(artifact)
++    with pytest.raises((BenchmarkIntegrityError, ValueError)):
++        validator(artifact)
++
++
++@pytest.mark.parametrize("archive_only", [False, True])
++def test_aggregation_certificate_must_match_same_recorded_producer(cfg, archive_only):
++    artifact = make_artifact()
++    pipeline = artifact["models"]["memory_pipeline"]
++    matching = protocol._canonical_final_indexing_status(_current_exact_aggregation_status(cfg))
++    protocol._validate_aggregation_pipeline_binding(matching, pipeline, archive_only=archive_only)
++    different = protocol._canonical_final_indexing_status(
++        _current_exact_aggregation_status(cfg, model="different-pipeline")
++    )
++    with pytest.raises(BenchmarkIntegrityError, match="differs from memory pipeline"):
++        protocol._validate_aggregation_pipeline_binding(different, pipeline, archive_only=archive_only)
++
++
++@pytest.mark.parametrize("different", [False, True])
++def test_full_indexed_archive_preserves_aggregation_certificate_crosslink(
++    cfg, monkeypatch, tmp_path, different,
++):
++    artifact = _indexing_failure_artifact()
++    artifact["config"]["aggregation_nodes"] = True
++    artifact["config"]["effective_hymem_config"]["aggregation_nodes_enabled"] = True
++    status = protocol._canonical_final_indexing_status(
++        _current_exact_aggregation_status(
++            cfg, model="other-pipeline" if different else "pipeline",
++        )
++    )
++    summary = artifact["per_question"][0]["indexing"]
++    for field in ("aggregation_generation", "aggregation_material"):
++        summary["final_status"][field] = status[field]
++    segment = artifact["execution"]["segments"][0]
++    record = {"question_id": "qid", "summary": deepcopy(summary)}
++    segment["indexing_runs"] = [record]
++    segment["latest_indexing"] = deepcopy(record)
++    artifact["result_digest"] = content_hash(artifact["per_question"])
++    _refresh_manifest(artifact)
++    if not different:
++        protocol.validate_strict_artifact(artifact)
++    _drift(monkeypatch, "runtime")
++    path = tmp_path / "longmemeval-v2-hymem-20260904T120000Z-seed0-strict.json"
++    path.write_text(json.dumps(artifact))
++    monkeypatch.setattr(registry, "DB", tmp_path / "registry.sqlite")
++    with registry.connect() as conn:
++        result = registry.ingest_file(conn, path, validation_scope="historical")
++        if different:
++            assert result.startswith("error: strict")
++            assert "differs from memory pipeline" in result
++            assert conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
++        else:
++            assert result == "inserted"
++
++
++def test_opaque_historical_hashes_are_not_misrepresented_as_reconstructed():
++    artifact = make_artifact()
++    declaration = artifact["models"]["memory_pipeline"]["aggregation_producer"]["declaration"]
++    declaration["implementation"] = "sha256:" + "7" * 64
++    for field in ("effective_request", "retry_policy"):
++        declaration[field]["sha256"] = "sha256:" + "8" * 64
++    _reseal_producer(artifact)
++    with pytest.raises(BenchmarkIntegrityError, match="aggregation identity"):
++        protocol.validate_strict_artifact(artifact)
++    result = protocol.validate_archived_artifact(artifact)
++    assert result["validation_assurance"] == "historical_commitment_only"
++    assert result["live_execution_eligible"] is False
++
++
++@pytest.mark.parametrize("kind", ["outcome", "summary_bool", "missing_counter", "canary"])
++def test_archive_scope_keeps_summary_degradation_and_canary_contracts(kind):
++    from tests.test_benchmark_summary_degradation import artifact
++    from tests.test_lme_protocol_hardening import _refresh_result_digest
++
++    data = artifact()
++    result = protocol.validate_archived_artifact(data)
++    assert result["summary_degraded_questions"] == 1
++    assert result["summary_degraded_sessions"] == 1
++    summary = data["per_question"][0]["indexing"]
++    segment = data["execution"]["segments"][0]
++    if kind == "outcome":
++        summary["outcome"] = "success"
++    elif kind == "summary_bool":
++        summary["summary_healthy"] = True
++    elif kind == "missing_counter":
++        del summary["final_status"]["summary_health"]["summary_missing_sessions"]
++    else:
++        segment["extraction_canary"]["provider_attempts"] = 0
++    segment["indexing_runs"] = [{"question_id": "qid", "summary": deepcopy(summary)}]
++    segment["latest_indexing"] = deepcopy(segment["indexing_runs"][-1])
++    _refresh_manifest(data)
++    _refresh_result_digest(data)
++    with pytest.raises(BenchmarkIntegrityError):
++        protocol.validate_archived_artifact(data)
+--- a/tests/test_model_policy.py
++++ b/tests/test_model_policy.py
+@@ -36,6 +36,12 @@
+         ("openai:deepseek-chat", "deepseek-chat"),
+         ("deepseek/deepseek-chat", "deepseek-chat"),
+         ("openrouter: DeepSeek / DeepSeek-Chat", "deepseek-chat"),
++        ("deepseek-v4-flash", "deepseek-v4-flash"),
++        (" DEEPSEEK-V4-FLASH ", "deepseek-v4-flash"),
++        ("openai:DeepSeek-V4-Flash", "deepseek-v4-flash"),
++        ("deepseek/deepseek-v4-flash", "deepseek-v4-flash"),
++        ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"),
++        ("openrouter: DeepSeek / DEEPSEEK-V4-FLASH-VISION-EXP", "deepseek-v4-flash-vision-exp"),
+     ],
+ )
+ def test_policy_recognizes_only_exact_normalized_alias_slots(model, alias):
+@@ -44,7 +50,7 @@
+         require_active_model(model, role="test role")
+     message = str(caught.value)
+     assert alias in message
+-    assert "deepseek-v4-flash" in message
++    assert "deepseek-flash" in message
+     assert "auto" in message and "disabled" in message
+ 
+ 
+@@ -55,7 +61,8 @@
+         "deepseek-reasoner-v2",
+         "my-deepseek-chat-model",
+         "org/deepseek-chat",
+-        "deepseek-v4-flash",
++        "deepseek-flash",
++        "deepseek-v4-flash-custom",
+         "openai:gpt-4.1-mini",
+         None,
+     ],
+@@ -65,7 +72,10 @@
+     require_active_model(model)
+ 
+ 
+-@pytest.mark.parametrize("model", ["deepseek-chat", "deepseek-reasoner"])
++@pytest.mark.parametrize("model", [
++    "deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash",
++    " DEEPSEEK-V4-FLASH-VISION-EXP ", "openrouter:deepseek/deepseek-v4-flash",
++])
+ def test_library_constructor_rejects_explicit_alias_before_secret_resolution(
+     monkeypatch, model,
+ ):
+@@ -77,7 +87,7 @@
+         "resolve_llm_api_key",
+         lambda *_args, **_kwargs: resolved.append(True),
+     )
+-    with pytest.raises(DeprecatedModelAliasError, match="deepseek-v4-flash"):
++    with pytest.raises(DeprecatedModelAliasError, match="deepseek-flash"):
+         client_module.OpenAICompatibleClient(model=model)
+     assert resolved == []
+ 
+@@ -122,7 +132,7 @@
+     monkeypatch.delenv("HYMEM_LLM_API_KEY", raising=False)
+     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+-    with pytest.raises(DeprecatedModelAliasError, match="deepseek-v4-flash"):
++    with pytest.raises(DeprecatedModelAliasError, match="deepseek-flash"):
+         build_from_env()
+ 
+ 
+@@ -142,7 +152,7 @@
+     result = _check_llm(cfg)
+     assert result.status == FAIL
+     assert "deepseek-chat" in result.detail
+-    assert "deepseek-v4-flash" in result.detail
++    assert "deepseek-flash" in result.detail
+     assert constructed == []
+ 
+ 
+@@ -193,7 +203,7 @@
+         lambda *_args, **_kwargs: constructed.append(True),
+     )
+     kwargs = {"stub_reply": "stub"} if builder is rules_compliance._build_llm else {}
+-    with pytest.raises(DeprecatedModelAliasError, match="deepseek-v4-flash"):
++    with pytest.raises(DeprecatedModelAliasError, match="deepseek-flash"):
+         builder(*args, **kwargs)
+     assert constructed == []
+ 
+@@ -241,7 +251,7 @@
+         fact_probe.main()
+     assert caught.value.code == 2
+     assert touched == []
+-    assert "deepseek-v4-flash" in capsys.readouterr().err
++    assert "deepseek-flash" in capsys.readouterr().err
+ 
+ 
+ def test_fact_probe_cost_only_keeps_historical_model_label_readable(
+--- a/tests/test_openai_client.py
++++ b/tests/test_openai_client.py
+@@ -101,7 +101,7 @@
+ 
+ 
+ def test_default_construction_sends_thinking_disabled(calls) -> None:
+-    # Defaults resolve to the DeepSeek base URL + deepseek-v4-flash, which is
++    # Defaults resolve to the DeepSeek base URL + deepseek-flash, which is
+     # exactly the configuration the body key exists for.
+     _complete(OpenAICompatibleClient())
+     assert calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+@@ -120,7 +120,7 @@
+             setattr(client, field, value)
+     assert client.aggregation_producer_declaration() == baseline
+     _complete(client)
+-    assert calls[0]["model"] == "deepseek-v4-flash"
++    assert calls[0]["model"] == "deepseek-flash"
+ 
+ 
+ def test_retry_default_change_rotates_aggregation_producer_identity(
+@@ -532,7 +532,7 @@
+ def test_deepseek_model_behind_a_gateway_still_sends_it(calls) -> None:
+     _complete(
+         OpenAICompatibleClient(
+-            base_url="https://gateway.internal/v1", model="deepseek-v4-flash"
++            base_url="https://gateway.internal/v1", model="deepseek-flash"
+         )
+     )
+     assert calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}

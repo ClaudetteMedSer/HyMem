@@ -1,0 +1,41 @@
+{
+  "admission": {
+    "configuration_verified": true,
+    "live_container_id": "56729d5659b7f8807956ff8a7552d548afaf9471449bf6e5c33c03baa6b42a87",
+    "live_state": {
+      "configuration_verified": true,
+      "container_id": "56729d5659b7f8807956ff8a7552d548afaf9471449bf6e5c33c03baa6b42a87",
+      "credential_mount": true,
+      "exit_code": 0,
+      "manifest_sha256": "fa471c38440dd70e8527b75171b1af8fc9b48ee98081df9738b45093f41efffc",
+      "network": "bridge",
+      "oom_killed": false,
+      "pid": 2893102,
+      "status": "running"
+    },
+    "manifest_sha256": "fa471c38440dd70e8527b75171b1af8fc9b48ee98081df9738b45093f41efffc",
+    "maximum_wait_seconds": 32400,
+    "new_provider_calls": 0,
+    "schema": "sample8-dependent-validation-wait-v1",
+    "source_and_package_verified": true
+  },
+  "helper_process_identity_verified": true,
+  "launch": {
+    "files": {
+      "finish_validation.py": "9784c2cb824dd86739c1f4f103f73cbb5e8924b42acf08cab3f3e7970ef81571",
+      "host_control.py": "424fcfe119c0662ceecc4dff49a753e1b96500b1d0e030117415eee389efa28e"
+    },
+    "new_provider_calls": 0,
+    "notification_automation": false,
+    "paid_run_restart": false,
+    "pid": 2933214,
+    "recurring": false,
+    "start_ticks": 174649281,
+    "started_utc": "2026-09-24T22:02:38.842415+00:00",
+    "status": "launched_admission_pending"
+  },
+  "notification_automation_created": false,
+  "schema": "sample8-dependent-validator-launch-proof-v1",
+  "status": "waiting_for_existing_paid_run",
+  "validation_not_started_yet": true
+}

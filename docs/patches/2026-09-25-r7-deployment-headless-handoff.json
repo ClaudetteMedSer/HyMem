@@ -1,0 +1,100 @@
+{
+  "date": "2026-09-25",
+  "status": "deployment_verified_benchmark_running",
+  "scope": "Hermes1 only; one fresh sample-eight LME; no full500, reroll or resume",
+  "release_manifest_sha256": "1d8917ca87dbd1b64bf3af3ee699d54b1352a3f51c3da280fd3ddd3ffc9e0ec8",
+  "production": {
+    "schema": 63,
+    "integrity_ok": true,
+    "foreign_keys_ok": true,
+    "canonical_drift": "OK",
+    "lossless_coverage_integrity": "OK",
+    "health": "ok",
+    "mcp": {
+      "handshake": true,
+      "profile_ok": true,
+      "retrieval_ok": true
+    },
+    "doctor": {
+      "exit_code": 0,
+      "passed": 9,
+      "failed": 0,
+      "warnings": [
+        "stored embedding compatibility",
+        "summary context health"
+      ]
+    },
+    "source_files_verified": 479,
+    "diagnostic_only_override": {
+      "path": "hymem/doctor.py",
+      "sha256": "2ac786c6590aa7fbece726e6380981906d514fefe9f664a3ca4f7b1d1de7c15b"
+    },
+    "model": "deepseek-flash",
+    "embedding_dimension": 384,
+    "unchanged_application_dependencies": 86,
+    "entrypoints_verified": 5,
+    "wrapper_sha256": "685b198a87e22c877d562e126b0f13780e500e30383b7a3f43ae2b6b73930402",
+    "hook_sha256": "4bd4cc0011f2bfa298cf073d823bce7aaf3a3a1fd3b4f801c010c89a8dcaef68",
+    "credential_file_unchanged": true
+  },
+  "backups": {
+    "remote_stage": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/r7-deploy-20260925",
+    "database_sha256": "ef47b37763ad46b288ce0fdff1b36500aa330985b7cb368f13cf964e9802b406",
+    "source_and_entrypoints_retained": true,
+    "config_backups_retained": true
+  },
+  "benchmark": {
+    "container_id": "e73124b8ee6816275b5779052c094abb3fdb1722281f17a7a84069f7aed7f9bb",
+    "started_at": "2026-09-25T13:12:41.079401883Z",
+    "status_at_handoff": "running",
+    "sample": 8,
+    "seed": 0,
+    "source_indices": [
+      213,
+      262,
+      329,
+      339,
+      370,
+      372,
+      392,
+      400
+    ],
+    "sessions": 398,
+    "messages": 4036,
+    "run_root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-independent-summary-20260919-9fl8JQ/r7-sample8-headless-v1",
+    "supervisor_limit_seconds": 32400,
+    "automatic_paid_reruns": 0,
+    "completed_questions_at_snapshot": 0,
+    "observed_progress": {
+      "processed_chunks": 50,
+      "episodes": 96,
+      "quarantined_chunk_rows": 0,
+      "quarantined_digest_sessions": 0,
+      "quarantined_fact_sessions": 0,
+      "quarantined_profile_sessions": 0,
+      "summary_failure_marker_sessions": 2,
+      "instrumentation_errors": 0
+    },
+    "score_verified": false
+  },
+  "finalizer": {
+    "pid": 3676344,
+    "parent_pid": 1,
+    "session_id": 3676344,
+    "identity_verified": true,
+    "offline_validation_automatic": true,
+    "new_paid_runs_allowed": 0,
+    "result_file": "finalizer-result.json"
+  },
+  "untouched_instances": [
+    "hermes-2",
+    "hermes-3",
+    "embedding-server"
+  ],
+  "limitations": [
+    "The eight-question benchmark is running, not passed or scored yet.",
+    "Historical/summary warnings are retained honestly.",
+    "The production doctor-only fix is separate from the benchmark's frozen R7 source.",
+    "Server and Docker must remain running; automatic reruns are disabled."
+  ]
+}

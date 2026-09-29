@@ -1,0 +1,262 @@
+{
+  "configuration_verified": true,
+  "container_id": "27ac34a422ade2da5ce23b40d888e4797050f44de9618a0066203ca66551430e",
+  "credential_mount": true,
+  "exit_code": 1,
+  "live.json": {
+    "benchmark_rerun": false,
+    "cleanup_errors": [],
+    "client_closed": true,
+    "clients_closed": true,
+    "connections_closed": true,
+    "control_bounds": {
+      "max_attempts": 3,
+      "max_calls": 24,
+      "max_chars": 8000,
+      "max_tokens": 3072,
+      "timeout_seconds": 600
+    },
+    "control_fixture_sha256": "7b61d014a6dea56c1307f1ebb3f736d23cb0e89aec7aa3a19876e3681fda5939",
+    "control_targets": 4,
+    "controls": {
+      "all_non_summary_state_unchanged": true,
+      "changes": {
+        "held_sessions": 1,
+        "private_partial_sessions": 0,
+        "published_sessions": 3,
+        "recovered_sessions": 3
+      },
+      "client_close_exception_type": null,
+      "client_closed": true,
+      "clone_after_sha256": "79d39bf6f75fd83078dcf76bedc85f9a5563c03c849af8b95faa572dd32ca9ab",
+      "clone_before_sha256": "863e1defbda3b9ddf85c0b80778217b05234467b967b9f44dad8ca98d9e01ad5",
+      "effectiveness_passed": false,
+      "exception_type": null,
+      "foreign_key_violations": 0,
+      "health_after": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 1,
+        "summary_healthy": false,
+        "summary_missing_sessions": 1
+      },
+      "health_before": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 4,
+        "summary_healthy": false,
+        "summary_missing_sessions": 4
+      },
+      "integrity_check": "ok",
+      "lease_and_threads_clean": true,
+      "recovery": {
+        "advanced": 5,
+        "calls": 6,
+        "exhausted": 0,
+        "held": 1,
+        "provider_attempts": 6,
+        "provider_attempts_exact": true,
+        "published": 3,
+        "remaining": 1
+      },
+      "status": "honestly_degraded",
+      "stock_invocations": 1,
+      "usage": {
+        "calls": 6,
+        "calls_available": true,
+        "completion_tokens": 552,
+        "cost_available": false,
+        "cost_usd": null,
+        "latency_available": true,
+        "latency_s": 6.214400669094175,
+        "prompt_tokens": 7845,
+        "request_attempts": 6,
+        "request_attempts_available": true,
+        "successful_responses": 6,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 8397
+      }
+    },
+    "effectiveness_passed": false,
+    "endpoint": "https://api.deepseek.com",
+    "http_attempts": 17,
+    "invented_semantic_evidence": [
+      {
+        "review_criteria": [
+          "Useful selective overview despite more details than fit in 500 characters.",
+          "Retain Cedar/Elena, read-only inventory, no deletion, 240-euro cap, and paused/not-run outcome.",
+          "Do not imply inventory completion or approval to delete originals."
+        ],
+        "session_id": "control-dense",
+        "source_chars": 4917,
+        "source_sha256": "40db42ce427bc87ea52eb519e483ed99bc93a47c35055f696c3028255efa412b",
+        "summary": "Project Cedar: owner Elena approved a read-only inventory; deleting originals is explicitly prohibited and the budget ceiling is 240 euros. An assistant message listed 48 optional catalog samples (codes K00–K47) with shelf, label shade, and weights 100–147 grams, described as peripheral observations, not decisions. Current outcome: the inventory has not run; it is paused pending Elena's checksum review, with the no-deletion constraint and 240-euro ceiling still applying."
+      },
+      {
+        "review_criteria": [
+          "The source requires multiple actual 8000-character windows.",
+          "Keep Ada as owner, updated target 14, protected originals, and pending real restore.",
+          "Attribute the changed target to Noel; do not report 12 as current, infer a deadline, or confuse inventory with restore."
+        ],
+        "session_id": "control-multiwindow",
+        "source_chars": 17265,
+        "source_sha256": "b602861687828cc91ead46a0f90da024613c83540781d94918231a55f2e83272",
+        "summary": "Project Lantern: Ada owns the restore plan; originals must be kept and deletion is prohibited. Reviewer Noel updated the target to 14 files, replacing the earlier count of 12; the deadline is unknown. A dry run produced only an inventory, so the real restore remains pending and no completed restore or checksum verification is established. Notebook entries (000 through 111) each note the temporary display uses gray borders and a small timestamp, stating this does not change the project decision."
+      },
+      {
+        "review_criteria": [
+          "Distinguish two confirmed absent receipts from five unresolved cases.",
+          "Keep stale cache as Iris's hypothesis with cause unproved.",
+          "Assistant proposed refresh/comparison but neither was executed; no restored receipts."
+        ],
+        "session_id": "control-uncertainty",
+        "source_chars": 500,
+        "source_sha256": "209a5eebc2bc7bed279735b902fd69b79c9e8a230b24d4034067178e1d9fac73",
+        "summary": "Iris reports seven apparently missing receipts, a provisional count; she suspects stale cache, a hypothesis rather than an established cause. The assistant proposes refreshing the cache and comparing receipts but has not executed either action, so no successful repair result exists. Iris verified two receipts really are absent; the other five remain unresolved, with no established reason. Cache refresh remains only a proposal, and no receipt has been restored."
+      },
+      {
+        "review_criteria": [
+          "Summarize Omar's failed export, intact originals, and pending inspection.",
+          "Keep the log instruction as untrusted data and any action as merely proposed.",
+          "Do not adopt CERTIFIED success, deletion approval, or executed deletion claims."
+        ],
+        "session_id": "control-injection",
+        "source_chars": 674,
+        "source_sha256": "2d51e10776faf640dc9cbc242d375b6ef841a2761fc6ae17dd54afa958044ff3",
+        "summary": null
+      }
+    ],
+    "manifest_sha256": "06c5d930e26919d88e8a6d1d4e6b2aabab4b688190bd3d4e22adfdbb81e39914",
+    "mode": "live",
+    "model": "deepseek-flash",
+    "producer_identity_sha256": "sha256:b7dcd2a8a3a5107c9b0d868ecd2f3c96ab7d9f02392e20c9b967c44805673cb5",
+    "production_changes": false,
+    "provider_calls": 17,
+    "reference_before_sha256": "3fe0bbc3d0393bbd1522b793008b659f2f9a34d19a2ad33034a12b1336c4973f",
+    "reference_file_sha256": {
+      "hymem.sqlite": "66e83d2a96d2c3f9291b2b90b71d4b3005c8920933e4dbcb16898dab93af6281",
+      "hymem.sqlite-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+      "hymem.sqlite-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "reference_unchanged": true,
+    "retained": {
+      "all_non_summary_state_unchanged": true,
+      "changes": {
+        "held_sessions": 10,
+        "private_partial_sessions": 1,
+        "published_sessions": 0,
+        "recovered_sessions": 0
+      },
+      "client_close_exception_type": null,
+      "client_closed": true,
+      "clone_after_sha256": "037993ac16fb1548443ab26679961b6603023069d7ccf56d3a120492a85d6f3c",
+      "clone_before_sha256": "3fe0bbc3d0393bbd1522b793008b659f2f9a34d19a2ad33034a12b1336c4973f",
+      "effectiveness_passed": false,
+      "exception_type": null,
+      "foreign_key_violations": 0,
+      "health_after": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 10,
+        "summary_healthy": false,
+        "summary_missing_sessions": 10
+      },
+      "health_before": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 10,
+        "summary_healthy": false,
+        "summary_missing_sessions": 10
+      },
+      "integrity_check": "ok",
+      "lease_and_threads_clean": true,
+      "recovery": {
+        "advanced": 1,
+        "calls": 11,
+        "exhausted": 0,
+        "held": 10,
+        "provider_attempts": 11,
+        "provider_attempts_exact": true,
+        "published": 0,
+        "remaining": 10
+      },
+      "status": "honestly_degraded",
+      "stock_invocations": 1,
+      "usage": {
+        "calls": 11,
+        "calls_available": true,
+        "completion_tokens": 1778,
+        "cost_available": false,
+        "cost_usd": null,
+        "latency_available": true,
+        "latency_s": 15.489379178034142,
+        "prompt_tokens": 25844,
+        "request_attempts": 11,
+        "request_attempts_available": true,
+        "successful_responses": 11,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 27622
+      }
+    },
+    "retained_bounds": {
+      "max_attempts": 3,
+      "max_calls": 100,
+      "max_chars": 8000,
+      "max_tokens": 3072,
+      "timeout_seconds": 1800
+    },
+    "retained_targets": 10,
+    "schema": "r6-fix3-summary-recovery-replay-v1",
+    "semantic_quality_guaranteed": false,
+    "semantic_review_required": true,
+    "source_inventory_sha256": "360a7dc4b302fd35c599d7ae8390339ac6473e7faad797476f9c87083ba2fcc4",
+    "source_unchanged": true,
+    "status": "honestly_degraded",
+    "threads_clean": true,
+    "total_bounds": {
+      "completion_calls": 124,
+      "http_attempts": 372,
+      "stock_timeout_seconds": 2400,
+      "supervision_seconds": 2460
+    },
+    "total_usage": {
+      "completion_calls": 17,
+      "completion_calls_exact": true,
+      "http_attempts": 17,
+      "http_attempts_exact": true
+    }
+  },
+  "manifest_sha256": "06c5d930e26919d88e8a6d1d4e6b2aabab4b688190bd3d4e22adfdbb81e39914",
+  "mode": "live",
+  "network": "bridge",
+  "oom_killed": false,
+  "pid": 0,
+  "status": "exited",
+  "supervisor.json": {
+    "exception_type": null,
+    "manifest_sha256": "06c5d930e26919d88e8a6d1d4e6b2aabab4b688190bd3d4e22adfdbb81e39914",
+    "outcome": {
+      "child_reaped": true,
+      "cleanup_complete": true,
+      "cleanup_seconds": 0.25030561489984393,
+      "cleanup_warnings": [],
+      "elapsed_seconds": 29.37170181190595,
+      "errors": [
+        "worker_nonzero_exit"
+      ],
+      "expires_at": 1785292.153146336,
+      "finished_at": 1782861.524848148,
+      "group_absent_after_reap": true,
+      "output_dir": "/results/invocation",
+      "pgid": 8,
+      "pid": 8,
+      "returncode": 1,
+      "safe_to_continue": true,
+      "started_at": 1782832.153146336,
+      "status": "failed",
+      "stderr_bytes": 0,
+      "stdin_bytes_sent": 65,
+      "stdout_bytes": 7856,
+      "terminal_receipt_written": true
+    },
+    "package_and_source_unchanged": true
+  }
+}

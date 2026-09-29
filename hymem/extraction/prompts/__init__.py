@@ -179,6 +179,8 @@ Return the JSON array now."""
 # distinctive substrings "structured technical relationships" and "EXPLICIT
 # behavioral signals" are preserved for prompt routing in tests.
 
+PREDICATE_GROUNDING_VERSION = "hymem-predicate-grounding-v1"
+
 _CHUNK_EXTRACTION_SYSTEM_TEMPLATE = """You extract structured technical relationships, personal-life facts, and EXPLICIT behavioral signals from a conversation excerpt in a single pass.
 
 Work source record by source record, sentence by sentence:
@@ -238,6 +240,13 @@ source_message_id (integer).
     located_in: A lives in, is located in, or is based in place B
     participates_in: A does, plays, practices, attends, or is enrolled in activity/event B (put frequency or schedule in temporal_scope)
     has_attribute: A has the personal attribute or measurement B (age, height, weight, salary, a rate); state the value as the object (e.g. 60_bpm) and also in value_numeric/value_unit when numeric
+- Predicate grounding ({predicate_grounding_version}): support each predicate
+  independently from the cited source record. A preference does not establish
+  use, ownership, or deployment; use does not establish preference. Intent,
+  recommendations, and hypotheses do not establish actual adoption. Preserve
+  both predicates when each is supported, including implicit language that
+  clearly entails the relationship. Preserve exact positive and negative
+  claims from their respective sources.
 - polarity is -1 only when the speaker negates or retracts the relationship
   ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
   Mapping for negations: "no longer uses" -> uses with polarity -1.
@@ -349,6 +358,7 @@ def build_chunk_extraction_system() -> str:
     """Build the deterministic combined triples+markers system prompt."""
     return _CHUNK_EXTRACTION_SYSTEM_TEMPLATE.format(
         predicates=", ".join(ALLOWED_PREDICATES),
+        predicate_grounding_version=PREDICATE_GROUNDING_VERSION,
     )
 
 

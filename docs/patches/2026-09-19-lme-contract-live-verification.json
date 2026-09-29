@@ -1,0 +1,438 @@
+{
+  "schema": "lme-contract-live-verification-v1",
+  "approved_campaign_complete": true,
+  "campaign_spent": true,
+  "resume_allowed": false,
+  "remote_root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-contract-live-20260919-MJTviH",
+  "container": {
+    "name": "hymem-contract-live-MJTviH",
+    "id": "fb034528e16ea7209b86c608e8a899ef900b3e64c295f53d9aaf8da0fd76fd51",
+    "exit_code": 0,
+    "pid": 0,
+    "oom_killed": false,
+    "start_utc": "2026-09-19T07:40:04.155796406Z",
+    "end_utc": "2026-09-19T07:41:29.986047477Z",
+    "user": "1000:1000",
+    "read_only_root": true,
+    "source_runtime_helpers_stores_credentials_readonly": true,
+    "network": "bridge",
+    "cap_drop": [
+      "ALL"
+    ],
+    "no_new_privileges": true
+  },
+  "audit": {
+    "accepted_empty": {
+      "digest": 0,
+      "facts": 2
+    },
+    "accepted_partial": {
+      "digest": 0,
+      "facts": 1
+    },
+    "case_covered_stores": 9,
+    "cases": 17,
+    "completions": 18,
+    "finish_reasons": {
+      "stop": 18
+    },
+    "http_attempts": 18,
+    "inventory_sha256": "1dc9992776da0d3b2641edbfb07c4746cd41f5736f57446e1adbe85f1f5a6bac",
+    "lme_readiness_verified": false,
+    "manifest_sha256": "906309c48b13c15c59ad7fefcf5058ae049a195205f8d21e5a84acc2d7ff27a9",
+    "mode": "live",
+    "nonstop_gate_failed": false,
+    "outcomes": {
+      "digest": {
+        "accepted": 6,
+        "rejected": 1
+      },
+      "facts": {
+        "accepted": 10
+      }
+    },
+    "planned_completion_cap": 34,
+    "semantic_verified": false,
+    "source_files_hash_verified": 225,
+    "status": "accounting_verified",
+    "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+    "stores_hash_verified": 10,
+    "usage": {
+      "completion_tokens": 7926,
+      "prompt_tokens": 35505,
+      "total_tokens": 43431
+    }
+  },
+  "saved_replay": {
+    "accepted": 16,
+    "accepted_empty": 2,
+    "accepted_tail_pending": 1,
+    "all_outcomes_match": true,
+    "cases": 17,
+    "failures": [
+      {
+        "case_sequence": 4,
+        "failure_reason": "summary_output_cap",
+        "failure_stage": "summary_compaction",
+        "kind": "digest",
+        "response_shapes": [
+          {
+            "episode_count": 1,
+            "exact_summary_only_object": false,
+            "json_decoded": true,
+            "object": true,
+            "procedure_count": 0,
+            "summary_is_string": true,
+            "summary_trimmed_codepoints": 674
+          },
+          {
+            "episode_count": null,
+            "exact_summary_only_object": true,
+            "json_decoded": true,
+            "object": true,
+            "procedure_count": null,
+            "summary_is_string": true,
+            "summary_trimmed_codepoints": 594
+          }
+        ]
+      }
+    ],
+    "lme_readiness_verified": false,
+    "new_http_attempts": 0,
+    "rejected": 1,
+    "saved_responses": 18,
+    "semantic_verified": false,
+    "status": "exact_saved_replay_verified",
+    "two_call_cases": 1
+  },
+  "metadata": {
+    "cases": [
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 5
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 1,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "episodes": 2,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "partial_message": false,
+        "sequence": 2,
+        "status": "accepted",
+        "summary_chars": 493,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 3,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": null,
+        "completions": 2,
+        "failure_reason": "summary_output_cap",
+        "failure_stage": "summary_compaction",
+        "http_attempts": 2,
+        "item_counts": {
+          "episodes": 0,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "partial_message": null,
+        "sequence": 4,
+        "status": "rejected",
+        "summary_chars": 0,
+        "tail_pending": null
+      },
+      {
+        "accepted_empty": true,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 0
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 5,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "episodes": 1,
+          "procedures": 1
+        },
+        "kind": "digest",
+        "partial_message": false,
+        "sequence": 6,
+        "status": "accepted",
+        "summary_chars": 461,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 7,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "episodes": 2,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "partial_message": false,
+        "sequence": 8,
+        "status": "accepted",
+        "summary_chars": 389,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 9,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "episodes": 3,
+          "procedures": 1
+        },
+        "kind": "digest",
+        "partial_message": false,
+        "sequence": 10,
+        "status": "accepted",
+        "summary_chars": 429,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": false,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 11,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": true
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "episodes": 2,
+          "procedures": 1
+        },
+        "kind": "digest",
+        "partial_message": false,
+        "sequence": 12,
+        "status": "accepted",
+        "summary_chars": 472,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": true,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 0
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 13,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "episodes": 1,
+          "procedures": 0
+        },
+        "kind": "digest",
+        "partial_message": false,
+        "sequence": 14,
+        "status": "accepted",
+        "summary_chars": 422,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 15,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 8
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 16,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      },
+      {
+        "accepted_empty": false,
+        "caught_up": true,
+        "completions": 1,
+        "failure_reason": null,
+        "failure_stage": null,
+        "http_attempts": 1,
+        "item_counts": {
+          "facts": 6
+        },
+        "kind": "facts",
+        "partial_message": false,
+        "sequence": 17,
+        "status": "accepted",
+        "summary_chars": null,
+        "tail_pending": false
+      }
+    ],
+    "fingerprint_metadata": [
+      {
+        "responses": 18,
+        "state": "known",
+        "value_sha256": "09af7682e7d983b1290cce4ece4f2ab063ea0b17e69d3954b6043ca20b0c4602"
+      }
+    ],
+    "model_version_pinned": false,
+    "response_models": {
+      "deepseek-flash": 18
+    }
+  },
+  "helper_pins": {
+    "runner": "b8277624b74473e9aa8af644c892383a162e798afa2a4d8e58cd95a062c2fe04",
+    "adapter": "c4535498a63be9a3035710c748ebf0e1ef044253f1337ad6e4549a5acdb15d97",
+    "auditor": "6ea118a34a9cc7668a26eaa1bda7ef70755f2ad4206c093c88e3e9dfd8e6c29d",
+    "saved_replayer": "5e277b0103d700a3fbf507ccdab45add61ad038a8282f3da5a129e7986554f74"
+  },
+  "interpretation": {
+    "summary_repair_sufficient": false,
+    "remaining_failure": "Same retained digest summary cap: primary674codepoints, repair594, hardcap500.",
+    "new_facts_recovery_live_exercised": false,
+    "previous_fact_failure_primary_accepted_items": 8,
+    "accepted_partial_case_sequence": 11,
+    "accepted_partial_was_recovery": false,
+    "causal_quality_improvement_proved": false,
+    "full_lme_run": false,
+    "production_deployment": false,
+    "production_memory_modified": false,
+    "raw_text_exported": false
+  }
+}

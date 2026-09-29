@@ -1,0 +1,30 @@
+{
+  "schema": "q1-postvalidation-rejection-diagnosis-v1",
+  "manifest_sha256": "5cdb8db3213229aed6f140da6747ff2a1048433e75437b3a7feda6521f0b73a3",
+  "live_container_id": "d859dca64f8284e13363a2cc68de499c8d010c84fcfb243b6782ff8ce33d81fb",
+  "live_exit_code": 0,
+  "live_oom_killed": false,
+  "live_pid": 0,
+  "validation_container_id": "89f3be6d010ab45c88c1b3eb7c84e765afa6801de2088783641efcaf4e7780bd",
+  "validation_exit_code": 1,
+  "validation_oom_killed": false,
+  "validation_pid": 0,
+  "rejected_check": "postvalidation_physical_checkpoint",
+  "exception_type": "RuntimeError",
+  "diagnostic_container_id": "cc1e333abad186913115de859022084b46575875d1c64465f00e34f216522197",
+  "archive_sha256": "85c7e13f5eb259fbcfc668b348f212141af2e1ec09363cd5faeb5dfc61145c25",
+  "checkpoint_sha256": "e64b32876078b0a82a004af28fec86fda28f49bcf67b8965a57ff12f7c8dece5",
+  "physical_comparison": {
+    "expected_ids_match": true,
+    "status_complete": true,
+    "archive_row_id_match": true,
+    "archive_only_strict_failure": true,
+    "checkpoint_extra_keys_absent": true,
+    "all_shared_values_equal": true,
+    "archive_strict_failure_is_false": true
+  },
+  "diagnosis": "The raw checkpoint row omits the strict_failure=False field added by stock reconcile_results. The diagnostic verifier incorrectly required raw and reconciled rows to be identical before applying that legitimate projection.",
+  "application_or_artifact_changes": false,
+  "additional_paid_calls_for_diagnosis": 0,
+  "full_postvalidation_completed": false
+}

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="2" skipped="0" tests="2" time="1.302" timestamp="2026-09-25T09:53:33.903895+02:00" hostname="MacBook-Pro-2.local"><testcase classname="tests.test_summary_recovery_v63" name="test_selective_overview_contract_and_dense_source_publication" time="0.710"><failure message="assert ('selective overview' in 'You regenerate one rolling conversation summary from exact source material. Return one strict JSON object with exactl...e cap. If a faithful complete summary cannot fit, return {&quot;summary&quot;:&quot;&quot;}; this is an explicit held result, not success.')">conn = &lt;sqlite3.Connection object at 0x10783fa60&gt;
+
+    def test_selective_overview_contract_and_dense_source_publication(conn):
+        _seed(conn)
+        dense = (
+            "Mira proposed a September launch, but nobody approved it. The team decided "
+            "to delay deployment until the audit closes. The estimate is perhaps 18 days, "
+            "not a commitment. Forty lower-priority log entries list interface colors, "
+            "meeting rooms, and repeated calendar details. " * 8
+        )
+        append_message(conn, "x", "user", dense)
+        with db.transaction(conn):
+            materialize_message_coverage(conn, "x")
+        last = conn.execute("SELECT MAX(id) FROM messages WHERE session_id='x'").fetchone()[0]
+        conn.execute("UPDATE sessions SET digest_published_message_id=?,digest_cursor_message_id=?,"
+                     "digested_message_id=? WHERE id='x'", (last, last, last))
+        before_items = _items(conn)
+        overview = ("Mira proposed a September launch; it was not approved. The team decided "
+                    "to delay deployment until the audit closes. The 18-day estimate remains uncertain.")
+        llm = Replies({"summary": overview})
+        report = recovery.run_summary_recovery(conn, llm, max_chars=20000)
+        assert report["published"] == report["calls"] == 1
+        assert conn.execute("SELECT auto_summary FROM sessions WHERE id='x'").fetchone()[0] == overview
+        assert _items(conn) == before_items
+        system = llm.calls[0].system
+&gt;       assert "selective overview" in system and "omit lower-priority details" in system
+E       assert ('selective overview' in 'You regenerate one rolling conversation summary from exact source material. Return one strict JSON object with exactl...e cap. If a faithful complete summary cannot fit, return {"summary":""}; this is an explicit held result, not success.')
+
+../../hymem-r6-sequential-20260925.6dSIIq/candidate/tests/test_summary_recovery_v63.py:140: AssertionError</failure></testcase><testcase classname="tests.test_summary_recovery_v63" name="test_valid_v1_partial_replay_restarts_under_v2_without_mixing_drafts" time="0.500"><failure message="AssertionError: assert False&#10; +  where False = &lt;built-in method startswith of str object at 0x1121150b0&gt;('summary-recovery-v2:')&#10; +    where &lt;built-in method startswith of str object at 0x1121150b0&gt; = 'summary-recovery-v1:56f7eef77d04dad325fa38fb714acd78a4b7679a4488bac3406fa8a928125ed1'.startswith">conn = &lt;sqlite3.Connection object at 0x111d33790&gt;
+
+    def test_valid_v1_partial_replay_restarts_under_v2_without_mixing_drafts(conn):
+        _seed(conn, long=True)
+        llm = Replies()
+        recovery.run_summary_recovery(conn, llm, max_chars=300)
+        old = _as_v1_job(conn)
+        assert old["draft"] and old["cursor_partial_message_id"] is not None
+        public, items = _public(conn), _items(conn)
+        report = recovery.run_summary_recovery(conn, llm, max_chars=300)
+        new = recovery._read_job(conn, "x")
+        assert report["advanced"] == 1 and report["published"] == 0
+&gt;       assert new["config_version"].startswith("summary-recovery-v2:")
+E       AssertionError: assert False
+E        +  where False = &lt;built-in method startswith of str object at 0x1121150b0&gt;('summary-recovery-v2:')
+E        +    where &lt;built-in method startswith of str object at 0x1121150b0&gt; = 'summary-recovery-v1:56f7eef77d04dad325fa38fb714acd78a4b7679a4488bac3406fa8a928125ed1'.startswith
+
+../../hymem-r6-sequential-20260925.6dSIIq/candidate/tests/test_summary_recovery_v63.py:299: AssertionError</failure></testcase></testsuite></testsuites>

@@ -1,0 +1,22 @@
+{
+  "stage": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/hymem-v64-rollout-20260926-r1",
+  "candidate": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/claim-conflict-20260925-zqkdtxky/cold-replay-dream-v1/episode-shadow-replay-v1/candidate",
+  "candidate_manifest": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/hymem-v64-tools-20260926-v1/candidate-manifest.json",
+  "candidate_manifest_sha256": "5550a6e1d29692fbda28560b87120dc90eec4d6ddb01bcbc18eaea100307b576",
+  "baseline_manifest": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-independent-summary-20260919-9fl8JQ/offline-r7/diag/manifest.json",
+  "image": "sha256:8e0221ce80304b093d8a86a4285c29c2f2d8936ba3bc768a0339f1e92fbedce5",
+  "gates": {
+    "fullsuite": {
+      "path": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/hymem-v64-tools-20260926-v1/fullsuite-gate.json",
+      "sha256": null
+    },
+    "paid_postflight": {
+      "path": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/hymem-v64-tools-20260926-v1/paid-postflight-gate.json",
+      "sha256": null
+    }
+  },
+  "census": {
+    "path": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/hymem-v64-tools-20260926-v1/census-reviewed.json",
+    "sha256": null
+  }
+}

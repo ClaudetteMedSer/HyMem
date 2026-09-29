@@ -1,0 +1,57 @@
+{
+  "audit_passed": true,
+  "changes": {
+    "held_sessions": 10,
+    "private_partial_sessions": 0,
+    "published_sessions": 0,
+    "recovered_sessions": 0
+  },
+  "health_after": {
+    "malformed_summaries": 0,
+    "summary_degraded_sessions": 10,
+    "summary_healthy": false,
+    "summary_missing_sessions": 10
+  },
+  "health_before": {
+    "malformed_summaries": 0,
+    "summary_degraded_sessions": 10,
+    "summary_healthy": false,
+    "summary_missing_sessions": 10
+  },
+  "manifest_sha256": "6113dd9f513521f789392df934cb6735f0cd5b05f0432b4bad9d641e6b73d6e9",
+  "new_provider_calls": 0,
+  "non_summary_state_unchanged": true,
+  "original_unchanged": true,
+  "process_cleanup_verified": true,
+  "recovery": {
+    "advanced": 0,
+    "calls": 10,
+    "exhausted": 0,
+    "held": 10,
+    "provider_attempts": 10,
+    "provider_attempts_exact": true,
+    "published": 0,
+    "remaining": 10
+  },
+  "result_sha256": "eee67b193bcad5a4dd6ba9c9399668c6ae6f9279e834efbe271cacb3aa2866ec",
+  "schema": "summary-recovery-readonly-audit-v1",
+  "semantic_quality_guaranteed": false,
+  "status": "honestly_degraded",
+  "supervisor_sha256": "931c257cab25d0b08ab31e730ac2c572a64387037432e05f95a8c0db0b491216",
+  "usage": {
+    "calls": 10,
+    "calls_available": true,
+    "completion_tokens": 3285,
+    "cost_available": false,
+    "cost_usd": null,
+    "latency_available": true,
+    "latency_s": 20.61303841136396,
+    "prompt_tokens": 22879,
+    "request_attempts": 10,
+    "request_attempts_available": true,
+    "successful_responses": 10,
+    "successful_responses_available": true,
+    "token_usage_available": true,
+    "total_tokens": 26164
+  }
+}

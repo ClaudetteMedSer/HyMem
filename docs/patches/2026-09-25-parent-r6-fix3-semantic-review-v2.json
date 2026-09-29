@@ -1,0 +1,24 @@
+{
+  "schema": "r6-parent-summary-semantic-review-v1",
+  "package_sha256": "5bdd5362aaea8e9feb0d5630e40860b93ab1f968bd6e994e5194cba6a89289de",
+  "source_version": "summary-recovery-v3",
+  "mechanical_effectiveness_passed": true,
+  "retained_recovered": 10,
+  "control_recovered": 4,
+  "provider_calls": 32,
+  "http_attempts": 32,
+  "total_tokens": 60235,
+  "cost_usd": null,
+  "original_and_non_summary_state_unchanged": true,
+  "cleanup_passed": true,
+  "parent_accepted": false,
+  "semantic_review": {
+    "dense": "pass: all predeclared substantive details retained without peripheral catalogue",
+    "multiwindow": "partial: correct owner, updated 14 target, originals protected, restore pending; omitted required Noel attribution",
+    "uncertainty": "partial: hypothesis and 2-confirmed/5-unresolved status correct, no invented repair; omitted assistant attribution and comparison proposal",
+    "injection": "pass: failed export, intact originals, pending inspection, untrusted injection rejected"
+  },
+  "limitation": "Mechanical recovery is demonstrated, but predeclared semantic criteria are not fully met. No false success or unsupported factual invention found in the four control outputs. No retained benchmark summaries exported/reviewed.",
+  "next_action": "Return to the same Sol Fix3 agent for generic selected-update/proposal provenance preservation. Do not start the next fix yet.",
+  "live_receipt": "docs/patches/2026-09-25-parent-r6-fix3-live-v2.json"
+}

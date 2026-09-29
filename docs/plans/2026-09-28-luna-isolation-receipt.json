@@ -1,0 +1,33 @@
+{
+  "schema": "hymem-luna-subscription-isolation-v1",
+  "status": "passed_bounded_isolation",
+  "host": "afrodite",
+  "model": "gpt-6-luna",
+  "codex_version": "0.158.0",
+  "transport_sha256": "387cf65be4cd7e6dabd6ba8a9ee90d9f23d0c7669702979b87926d5b71e81491",
+  "probe_sha256": "86f5a684eb87df6fe325b2c15f0871f0e48a323f7e754cda3e7457a6fd129a2f",
+  "offline_tests_passed": 129,
+  "successful_probe": {
+    "checks": ["configuration_admission", "json_nonce_echo", "fresh_context", "local_file_access_unavailable"],
+    "observed_turns": 3,
+    "known_tokens": 12851,
+    "usage_complete": true,
+    "elapsed_seconds": 17.259,
+    "owned_processes_and_groups_cleaned": true,
+    "fresh_unique_process_and_thread_per_completion": true,
+    "tool_items_observed": 0,
+    "internal_http_attempts": null
+  },
+  "prior_diagnostics": {
+    "interrupted_turns": 4,
+    "token_usage": null,
+    "usage_complete": false,
+    "note": "Three verification attempts stopped on runtime notices; one separate single-turn diagnostic retained the second notice privately. These are not successful completions and their usage must not be treated as zero."
+  },
+  "limitations": [
+    "Effective tool inventory is not directly observable; assurance rests on version-pinned effective controls, empty environments, event checks and bounded runtime probes.",
+    "Temperature, max-output-token and API JSON-mode controls are not supported by this App Server interface and are not claimed as enforced.",
+    "Codex harness context is not equivalent to the canonical API prompt protocol.",
+    "This does not validate an extraction canary, LME question, full benchmark or production deployment."
+  ]
+}

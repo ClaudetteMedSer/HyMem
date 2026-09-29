@@ -1,0 +1,10 @@
+{
+  "archive_sha256": "042c8aeb9ffa67d5e1e827d6300ebaac677753a3714119afeff52bb2431e9b30",
+  "candidate_created": false,
+  "diag_files": 2,
+  "gate_sha256": "d53ac383414f077a2af29b506ed883acbcd64cb933da149df3ca5da8cfe6e01a",
+  "manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc",
+  "provider_calls": 0,
+  "status": "installed_not_started",
+  "verification_files": 467
+}

@@ -1,0 +1,32 @@
+{
+  "allowed_selected_skip_nodeids": [
+    "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-extended]",
+    "tests/test_completion_response_admission.py::test_post_response_sdk_integrity_failure_keeps_known_usage[raw]"
+  ],
+  "benchmark_completion_claimed": false,
+  "candidate_verified_after": true,
+  "candidate_verified_before": true,
+  "deployment_performed": false,
+  "elapsed_seconds": 583.528,
+  "focus_files": [],
+  "gate_passed": true,
+  "junit_selection_reconciled": true,
+  "junit_sha256": "94366795de6efc563c1acd82f534accc574e51ee88f07d446acf1592d08501f9",
+  "junit_totals": {
+    "errors": 0,
+    "failures": 0,
+    "skipped": 2,
+    "tests": 1895
+  },
+  "manifest_sha256": "1d8917ca87dbd1b64bf3af3ee699d54b1352a3f51c3da280fd3ddd3ffc9e0ec8",
+  "network_guard_scope": "pytest process; literal loopback only",
+  "observed_skip_nodeids": [
+    "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-extended]",
+    "tests/test_completion_response_admission.py::test_post_response_sdk_integrity_failure_keeps_known_usage[raw]"
+  ],
+  "provider_credentials_present": false,
+  "pytest_exit_code": 0,
+  "selected": 1895,
+  "shard": 1,
+  "shards": 4
+}

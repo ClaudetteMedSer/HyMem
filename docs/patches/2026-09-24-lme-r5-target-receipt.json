@@ -1,0 +1,59 @@
+{
+  "allowed_selected_skip_nodeids": [
+    "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-cleared]",
+    "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-extended]",
+    "tests/test_completion_response_admission.py::test_post_response_sdk_integrity_failure_keeps_known_usage[raw]",
+    "tests/test_completion_response_admission.py::test_received_late_sdk_reply_retains_usage_without_admission_or_retry[raw]"
+  ],
+  "benchmark_completion_claimed": false,
+  "candidate_verified_after": true,
+  "candidate_verified_before": true,
+  "deployment_performed": false,
+  "elapsed_seconds": 1575.522,
+  "focus_files": [
+    "tests/test_completion_response_admission.py",
+    "tests/test_typed_response_recovery.py",
+    "tests/test_canary_response_history.py",
+    "tests/test_openai_client.py",
+    "tests/test_provider_attempt_accounting.py",
+    "tests/test_indexing_deadlines.py",
+    "tests/test_benchmark_client_cleanup.py",
+    "tests/test_benchmark_extraction_canary.py",
+    "tests/test_digest_summary_index_separation.py",
+    "tests/test_digest_summary_separate_publication.py",
+    "tests/test_digest_publication.py",
+    "tests/test_summary_frontier_v62.py",
+    "tests/test_summary_recovery_v63.py",
+    "tests/test_summary_recovery_integration_root.py",
+    "tests/test_summary_recovery_command_root.py",
+    "tests/test_lme_protocol_hardening.py",
+    "tests/test_lme_historical_admission.py",
+    "tests/test_lme_registry_cli_bootstrap.py",
+    "tests/test_lme_current_model_startup.py",
+    "tests/test_startup_schema_atomicity.py",
+    "tests/test_summary_portability_v18.py",
+    "tests/test_benchmark_summary_degradation.py"
+  ],
+  "gate_passed": true,
+  "junit_selection_reconciled": true,
+  "junit_sha256": "62edb5220df5e478ea4fb8148067155072fb7c5238a20725dc9598c9ea2db379",
+  "junit_totals": {
+    "errors": 0,
+    "failures": 0,
+    "skipped": 4,
+    "tests": 1044
+  },
+  "manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc",
+  "network_guard_scope": "pytest process; literal loopback only",
+  "observed_skip_nodeids": [
+    "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-cleared]",
+    "tests/test_completion_response_admission.py::test_late_sdk_reply_cannot_replace_owning_deadline[raw-extended]",
+    "tests/test_completion_response_admission.py::test_post_response_sdk_integrity_failure_keeps_known_usage[raw]",
+    "tests/test_completion_response_admission.py::test_received_late_sdk_reply_retains_usage_without_admission_or_retry[raw]"
+  ],
+  "provider_credentials_present": false,
+  "pytest_exit_code": 0,
+  "selected": 1044,
+  "shard": 1,
+  "shards": 1
+}

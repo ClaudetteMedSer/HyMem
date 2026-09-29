@@ -1,0 +1,96 @@
+--- a/hymem/core/db.py
++++ b/hymem/core/db.py
+@@ -6608,6 +6608,64 @@
+         ValueError, OverflowError,
+     ):
+         return False
++    return True
++
++
++def prune_extra_episode_vectors(conn: sqlite3.Connection) -> bool:
++    """Atomically remove only surplus derived episode keys, or refuse repair.
++
++    Every expected vector must already match the authoritative clusterable
++    mirror. Missing/different vectors require the existing broader repair;
++    an eligible but non-finite vector also conservatively refuses repair.
++    this operation never rebuilds unrelated shadows or changes evidence.
++    The transaction supplies the caller's lexical deadline and lease fences.
++    """
++    with transaction(conn):
++        if not _load_vec_extension(conn) or not has_vec_table(conn, table="vec_episodes"):
++            return False
++        dim_row = conn.execute(
++            "SELECT value FROM schema_meta WHERE key='vec_dim'"
++        ).fetchone()
++        model_row = conn.execute(
++            "SELECT value FROM schema_meta WHERE key='vec_model'"
++        ).fetchone()
++        try:
++            dim = int(dim_row["value"]) if dim_row is not None else 0
++        except (TypeError, ValueError, OverflowError):
++            return False
++        model = model_row["value"] if model_row is not None else None
++        if dim <= 0 or not isinstance(model, str) or re.fullmatch(
++            r"hymem-embedding-producer-v1:[0-9a-f]{64}", model
++        ) is None:
++            return False
++        from hymem.dreaming.aggregate import load_clusterable_episodes
++
++        expected: dict[int, bytes] = {}
++        for episode in load_clusterable_episodes(
++            conn, max_rowid=None, embedding_model=model, embedding_dim=dim,
++        ):
++            vec = _finite_vec(episode["vector"], dim)
++            if vec is None:
++                return False
++            expected[int(episode["rowid"])] = _pack_vector(vec)
++        actual = {
++            int(row["rowid"]): bytes(row["embedding"])
++            for row in conn.execute("SELECT rowid,embedding FROM vec_episodes")
++        }
++        if any(actual.get(key) != vector for key, vector in expected.items()):
++            return False
++        extras = actual.keys() - expected.keys()
++        if not extras:
++            return False
++        for key in sorted(extras):
++            check_current_deadline()
++            conn.execute("DELETE FROM vec_episodes WHERE rowid=?", (key,))
++        remaining = {
++            int(row["rowid"]): bytes(row["embedding"])
++            for row in conn.execute("SELECT rowid,embedding FROM vec_episodes")
++        }
++        if remaining != expected or not vec_episodes_aligned(conn):
++            raise RuntimeError("episode vector surplus repair verification failed")
+     return True
+ 
+ 
+--- a/hymem/dreaming/runner.py
++++ b/hymem/dreaming/runner.py
+@@ -2880,19 +2880,16 @@
+                     if shadows_healed:
+                         log.info("aggregate.pre_build_shadow_heal")
+                 else:
+-                    # Resync is optional maintenance composed of several FTS
+-                    # and vector-table writes.  Do not start it in a bounded
+-                    # dream: unlike normal semantic transactions it cannot be
+-                    # made safe if the deadline lands between those writes.
+-                    # A clean read-only probe licenses aggregation; a proven
+-                    # mismatch remains pending for an unbounded repair rather
+-                    # than building a tree from corrupt rowid shadows.
++                    # Full shadow resync remains unbounded maintenance. A
++                    # surplus-only episode repair is one atomic fenced write;
++                    # missing or changed authoritative vectors still fail closed.
+                     shadows_aligned = core_db.vec_episodes_aligned(conn)
+                     _check_deadline()
+                     if not shadows_aligned:
+-                        raise RuntimeError(
+-                            "rowid shadow repair requires an unbounded dream"
+-                        )
++                        if not core_db.prune_extra_episode_vectors(conn):
++                            raise RuntimeError(
++                                "rowid shadow repair requires an unbounded dream"
++                            )
+                 _check_deadline()
+                 agg = build_aggregation_nodes(
+                     conn, cfg, llm, embedding_client,

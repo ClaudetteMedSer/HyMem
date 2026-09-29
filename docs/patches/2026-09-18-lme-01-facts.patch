@@ -1,0 +1,1091 @@
+--- a/hymem/dreaming/facts.py
++++ b/hymem/dreaming/facts.py
+@@ -1,6 +1,6 @@
+ """Authoritative narrative-fact extraction and lifecycle (schema v46).
+ 
+-The gated ``facts.v2`` prompt still sees ``role: content`` lines. Its input now
++The ``facts.v4`` capacity-aware prompt sees ``role: content`` lines. Its input
+ comes from the validated lossless-message stream, can resume inside one large
+ turn, and publishes an exact occurrence manifest. Each bounded source slice is
+ an authority unit: a later successful replay replaces that unit's current fact
+@@ -17,7 +17,7 @@
+ import sqlite3
+ from dataclasses import dataclass, field
+ from datetime import date as calendar_date
+-from typing import Iterable, Sequence
++from typing import Iterable, Literal, Sequence
+ 
+ from hymem.config import HyMemConfig, MAX_FACTS_PER_EXTRACTION_UNIT
+ from hymem.core import db as core_db
+@@ -36,11 +36,13 @@
+ from hymem.dreaming.message_coverage import LOSSLESS_COVERAGE_VERSION
+ from hymem.extraction.jsonio import loads_exact_or_fenced
+ from hymem.extraction.llm import LLMClient, LLMRequest
+-from hymem.extraction.prompts import FACTS_SYSTEM, FACTS_USER_TEMPLATE
++from hymem.extraction.prompts import (
++    FACTS_CAPACITY_TEMPLATE, FACTS_SYSTEM, FACTS_USER_TEMPLATE,
++)
+ 
+ log = logging.getLogger("hymem.dreaming.facts")
+ 
+-FACTS_PROMPT_VERSION = "facts.v2"
++FACTS_PROMPT_VERSION = "facts.v4"
+ FACT_SOURCE_MANIFEST_VERSION = "fact-source-manifest-v1"
+ FACT_RESULT_VERSION = "fact-result-v1"
+ FACT_SLICE_VERSION = "fact-slice-v1"
+@@ -63,6 +65,9 @@
+ FACT_MAX_ENTITY_CHARS = 200
+ 
+ _MAX_FACT_CHARS = 600
++FactFailureReason = Literal[
++    "invalid_json", "invalid_envelope", "invalid_items", "output_capacity_exceeded",
++]
+ _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ _FACT_RETRY_RE = re.compile(
+     r"^facts-lossless-v1\|prompt=facts\.v\d{1,6}\|chars=\d{1,9}\|"
+@@ -100,6 +105,8 @@
+     # the generation it read so concurrent workers cannot append a revision to
+     # state they never observed.
+     expected_generation: int | None = None
++    # Append diagnostics without changing any pre-v4 positional constructor slot.
++    failure_reason: FactFailureReason | None = None
+ 
+ 
+ def _sha256_json(payload: object) -> str:
+@@ -829,16 +836,17 @@
+         source_occurrences=occurrences,
+         publication_version=facts_config_version(cfg, client=llm),
+     )
+-    request = LLMRequest(
+-        system=FACTS_SYSTEM,
+-        user=FACTS_USER_TEMPLATE.format(text=combined),
+-        response_format="json",
+-        max_tokens=cfg.dream_digest_max_tokens,
+-    )
+-    raw = llm.complete(request)
+-    items = validate_fact_items(raw, max_items=cfg.dream_max_facts_per_session)
++    raw = llm.complete(build_facts_request(combined, cfg))
++    items, failure_reason = _validate_fact_response(
++        raw, max_items=cfg.dream_max_facts_per_session,
++    )
+     if items is None:
+-        return FactsExtraction(parse_failed=True, **common)
++        _log_fact_rejection(
++            session_id, slice_key, "fresh", failure_reason,
++        )
++        return FactsExtraction(
++            parse_failed=True, failure_reason=failure_reason, **common,
++        )
+     tail = facts_tail_message_id(conn, session_id)
+     return FactsExtraction(
+         items=canonical_fact_items(items),
+@@ -847,6 +855,85 @@
+         next_message_offset=next_offset,
+         caught_up=next_partial is None and covered == tail,
+         **common,
++    )
++
++
++def build_facts_request(rendered: str, cfg: HyMemConfig) -> LLMRequest:
++    """Use one bounded output contract for new and exact historical units.
++
++    Output limits never authorize selecting a subset of supported facts.
++    Explicit overflow holds the unit for retry; a historical unit retains its
++    original source boundaries throughout that retry.
++    """
++    return LLMRequest(
++        system=FACTS_SYSTEM + FACTS_CAPACITY_TEMPLATE.format(
++            max_items=cfg.dream_max_facts_per_session,
++            max_text_chars=_MAX_FACT_CHARS,
++            max_entities=FACT_MAX_ENTITIES_PER_ITEM,
++            max_entity_chars=FACT_MAX_ENTITY_CHARS,
++        ),
++        user=FACTS_USER_TEMPLATE.format(text=rendered),
++        response_format="json",
++        max_tokens=cfg.dream_digest_max_tokens,
++    )
++
++
++def _validate_fact_response(
++    raw: object, *, max_items: int,
++) -> tuple[list[dict] | None, FactFailureReason | None]:
++    """Classify rejection without accepting or salvaging any partial result."""
++    parsed = loads_exact_or_fenced(raw) if isinstance(raw, str) else raw
++    if parsed is None and isinstance(raw, str):
++        # The shared parser uses None for both rejection and JSON null. Null
++        # is syntactically valid but cannot be a facts envelope, fenced or bare.
++        text = raw.strip()
++        if text != "null" and re.fullmatch(
++            r"```(?i:json)?\s*null\s*```", text,
++        ) is None:
++            return None, "invalid_json"
++    if (
++        isinstance(parsed, dict)
++        and set(parsed) == {"facts", "complete"}
++        and isinstance(parsed["facts"], list)
++        and not parsed["facts"]
++        and parsed["complete"] is False
++    ):
++        return None, "output_capacity_exceeded"
++    items = validate_fact_items(parsed, max_items=max_items)
++    if items is not None:
++        return items, None
++    candidate = parsed
++    if isinstance(candidate, dict) and set(candidate) == {"facts"}:
++        candidate = candidate["facts"]
++    if not isinstance(candidate, list):
++        return None, "invalid_envelope"
++    # Only individually valid over-cap sets are classified as capacity.
++    # Bound this secondary diagnostic work by the authority-ledger ceiling;
++    # malformed or larger unchecked sets remain invalid_items and never pass.
++    if (
++        max_items < len(candidate) <= FACT_MAX_ACTIVE_ITEMS_PER_OUTCOME
++        and validate_fact_items(candidate, max_items=len(candidate)) is not None
++    ):
++        return None, "output_capacity_exceeded"
++    return None, "invalid_items"
++
++
++def fact_diagnostic_session_key(session_id: str) -> str:
++    """Stable store-to-log attribution without emitting arbitrary session IDs."""
++    return _sha256_json({
++        "version": "fact-diagnostic-session-v1", "session_id": session_id,
++    })
++
++
++def _log_fact_rejection(
++    session_id: str, slice_key: str, mode: Literal["fresh", "replay"],
++    reason: FactFailureReason | None,
++) -> None:
++    # Benchmark supervisors retain ordinary warning logs. Never record reply
++    # text, envelope keys, fact/entity values, or untrusted identifier spelling.
++    log.warning(
++        "facts.output_rejected reason=%s mode=%s session_key=%s slice_key=%s",
++        reason, mode, fact_diagnostic_session_key(session_id), slice_key,
+     )
+ 
+ 
+@@ -974,15 +1061,17 @@
+     )
+     if all(not fragment.strip() for fragment in source_fragments):
+         return FactsExtraction(items=[], **common)
+-    raw = llm.complete(LLMRequest(
+-        system=FACTS_SYSTEM,
+-        user=FACTS_USER_TEMPLATE.format(text=rendered),
+-        response_format="json",
+-        max_tokens=cfg.dream_digest_max_tokens,
+-    ))
+-    items = validate_fact_items(raw, max_items=cfg.dream_max_facts_per_session)
++    raw = llm.complete(build_facts_request(rendered, cfg))
++    items, failure_reason = _validate_fact_response(
++        raw, max_items=cfg.dream_max_facts_per_session,
++    )
+     if items is None:
+-        return FactsExtraction(parse_failed=True, **common)
++        _log_fact_rejection(
++            outcome["session_id"], slice_key, "replay", failure_reason,
++        )
++        return FactsExtraction(
++            parse_failed=True, failure_reason=failure_reason, **common,
++        )
+     return FactsExtraction(items=canonical_fact_items(items), **common)
+ 
+ 
+--- a/hymem/extraction/prompts/__init__.py
++++ b/hymem/extraction/prompts/__init__.py
+@@ -737,15 +737,12 @@
+ 
+ 
+ # Narrative-facts extraction (E1; authoritative source/lifecycle schema v46).
+-# This text is the VERBATIM
+-# `FACTS_PROMPT_V2` that cleared the G-F1b extraction-faithfulness gate
+-# (2026-08-02, 123/123 strict on the healed full-source sample) — moving it
+-# unchanged is what carries the gate's verdict over to production, so any
+-# rewording, however small, re-enters the gate: bump FACTS_PROMPT_VERSION in
+-# hymem/dreaming/facts.py, flip facts_extraction_enabled off, re-clear
+-# benchmarks/fact_probe.py at ≥0.90, then re-enable. The draft arms and the
+-# v1→v2 defect analysis stay in fact_probe.py (the instrument), not here.
+-# The user-template closer ("Return the JSON array of narrative facts now.")
++# facts.v4 keeps the v2 factual instructions, aligns the success envelope with
++# JSON-object transport, and advertises the configured output bounds through
++# the shared fresh/historical request builder. Never select a subset to fit.
++# The historical v2 G-F1b verdict does not attest this revised prompt; the
++# production request requires its own extraction-faithfulness validation.
++# The user-template closer ("Return the JSON object of narrative facts now.")
+ # is unique so test stubs keyed on the digest/triple/profile closers never
+ # route here.
+ 
+@@ -755,14 +752,14 @@
+ 
+ THE ONLY RULE THAT MATTERS: every name, number, date, price, quantity and claim you write must ALREADY BE PRESENT in the turns below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal fact is correct; a rich fact containing one invented detail is a failure.
+ 
+-Output a strict JSON array. Each item has exactly:
++Output a strict JSON object with exactly one key, "facts", whose value is an array: {"facts": [...]}. Do not add other top-level keys, prose, markdown, or code fences. Each item in "facts" has exactly:
+ - text (string): the fact, one sentence, self-contained. Name the people, things and values explicitly instead of using "he", "it", "that", "the project" — but only names that appear in the turns.
+ - date (string or null): use YYYY-MM-DD ONLY when the conversation itself writes that date. If the turns say "recently", "last week", "a few days ago", or say nothing about when — use null. Never derive a date from the session date. Never guess.
+ - entities (array of strings): the concrete people, products, places, tools or organizations the fact is about, exactly as written in the turns.
+ 
+ Rules:
+ - VERBATIM VALUES. Names, numbers, dates, versions, prices and quantities exactly as the turns state them. Never round, convert, or normalize.
+-- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields [] — that is a GOOD answer, not a failure, and [] is always available to you.
++- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields {"facts": []} — that is a GOOD answer, not a failure, and {"facts": []} is always available to you.
+ - Never extract the assistant's suggestions, recommendations, or hypotheticals as facts about the user. "You could try X" is not "the user uses X".
+ - One fact per exchange, decision, event or outcome — not one per turn. Combine a question and its answer into the single fact they establish.
+ - Self-contained means resolvable alone: "Atta moved the MedFlow deploy to fly.io" — not "he moved it there".
+@@ -779,7 +776,18 @@
+ {text}
+ \"\"\"
+ 
+-Return the JSON array of narrative facts now."""
++Return the JSON object of narrative facts now."""
++
++
++FACTS_CAPACITY_TEMPLATE = """
++Output capacity for this exact conversation excerpt:
++- A complete result may contain at most {max_items} facts. This is a maximum, NOT a target or a quota.
++- Each fact's text must be at most {max_text_chars} characters after trimming outer whitespace. Count Unicode code points, including spaces and punctuation; JSON escaping does not add characters.
++- Each fact may have at most {max_entities} entities, each at most {max_entity_chars} characters after trimming outer whitespace. Do not shorten or alter a source name to fit.
++- Extract the complete set of supported narrative facts under the rules above. Never choose only the first, best, or most important facts to fit a limit. Never omit a supported fact, truncate a value, or merge unrelated facts merely to fit.
++- If that complete set cannot fit any of these limits, do NOT return a partial result or a successful empty result. Instead return exactly {{"facts": [], "complete": false}}. This is the only exception to the one-key success envelope: it signals incomplete extraction and requests retry without claiming any source coverage. Do not include partial facts or extra keys.
++- Otherwise return the complete result as exactly {{"facts": [...]}} without a "complete" key. Use {{"facts": []}} only when this excerpt genuinely establishes no supported narrative facts, never to hide overflow.
++"""
+ 
+ 
+ RERANK_SYSTEM = """You evaluate the relevance of conversation excerpts to a user query.
+--- a/tests/test_dream_status_durable_work.py
++++ b/tests/test_dream_status_durable_work.py
+@@ -42,7 +42,7 @@
+             "typed user-profile facts": (
+                 profile if profile is not None else json.dumps({"items": []})
+             ),
+-            "Return the JSON array of narrative facts now.": (
++            "Return the JSON object of narrative facts now.": (
+                 fact_items if fact_items is not None else "[]"
+             ),
+             "Return the JSON object now.": (
+--- a/tests/test_fact_authority.py
++++ b/tests/test_fact_authority.py
+@@ -34,7 +34,7 @@
+ from hymem.query.augment import _fact_search
+ 
+ 
+-_CLOSER = "Return the JSON array of narrative facts now"
++_CLOSER = "Return the JSON object of narrative facts now"
+ 
+ 
+ def _quiet_config(cfg: HyMemConfig, **changes) -> HyMemConfig:
+--- a/tests/test_fact_fts_authority.py
++++ b/tests/test_fact_fts_authority.py
+@@ -9,7 +9,7 @@
+ from hymem.extraction.llm import StubLLMClient
+ 
+ 
+-_FACTS_CLOSER = "Return the JSON array of narrative facts now"
++_FACTS_CLOSER = "Return the JSON object of narrative facts now"
+ _TOKEN = "quasarneedle"
+ 
+ 
+--- a/tests/test_facts.py
++++ b/tests/test_facts.py
+@@ -36,7 +36,7 @@
+ 
+ # The unique closer of FACTS_USER_TEMPLATE — routes stubs and counts calls
+ # without colliding with the digest/triple/profile prompts.
+-_FACTS_CLOSER = "Return the JSON array of narrative facts now"
++_FACTS_CLOSER = "Return the JSON object of narrative facts now"
+ 
+ 
+ # --- helpers ---------------------------------------------------------------
+--- /dev/null
++++ b/tests/test_facts_capacity_contract.py
+@@ -0,0 +1,307 @@
++"""Output limits never authorize skipping supported facts or source bytes.
++
++Synthetic protocol tests only: these do not attest live model faithfulness.
++"""
++
++from contextlib import closing
++from dataclasses import replace
++import json
++
++import pytest
++
++from hymem import HyMem
++from hymem.core import db
++from hymem.dreaming import facts
++from hymem.dreaming.lossless import materialize_message_coverage
++from hymem.dreaming.semantic_generation import semantic_generation_suffix
++from hymem.extraction.llm import StubLLMClient
++
++
++_TEXT = "Nora shipped the Cedar package."
++_ITEM = {"text": _TEXT, "date": None, "entities": ["Nora", "Cedar"]}
++_OVERFLOW = {"facts": [], "complete": False}
++
++
++def _config(cfg, **overrides):
++    return replace(cfg, aggregation_nodes_enabled=False,
++                   profile_extraction_enabled=False, **overrides)
++
++
++def _seed(hy, text=_TEXT):
++    message_id = hy.log_message("capacity", "user", text)
++    with db.transaction(hy.conn):
++        materialize_message_coverage(hy.conn, "capacity")
++    return message_id
++
++
++def _state(hy):
++    tables = (
++        "sessions", "messages", "chunks", "chunk_message_sources",
++        "fact_extraction_outcomes", "fact_extraction_revisions",
++        "fact_extraction_source_occurrences", "narrative_facts",
++        "narrative_fact_lifecycle",
++    )
++    return tuple(tuple(tuple(row) for row in hy.conn.execute(
++        f"SELECT * FROM {table} ORDER BY rowid"
++    )) for table in tables)
++
++
++def _old_outcome(hy, llm, monkeypatch, *, max_chars=None):
++    with monkeypatch.context() as old:
++        old.setattr(facts, "FACTS_PROMPT_VERSION", "facts.v3")
++        result = facts.extract_facts(
++            hy.conn, "capacity", llm, hy.config, max_chars=max_chars,
++        )
++        assert result is not None and not result.parse_failed
++        with db.transaction(hy.conn):
++            facts.persist_facts(hy.conn, "capacity", result)
++        return result
++
++
++@pytest.mark.parametrize("path", ["fresh", "historical"])
++@pytest.mark.parametrize("cap", [1, 2, 8, 32, 256])
++def test_actual_paths_share_configured_capacity_contract(cfg, monkeypatch, path, cap):
++    config = _config(cfg, dream_max_facts_per_session=cap)
++    llm = StubLLMClient(default=json.dumps({"facts": [_ITEM]}))
++    with closing(HyMem(config, llm=llm)) as hy:
++        _seed(hy)
++        prior = _old_outcome(hy, llm, monkeypatch) if path == "historical" else None
++        before = _state(hy)
++        result = (
++            facts.extract_facts(hy.conn, "capacity", llm, config)
++            if prior is None else facts.reextract_fact_outcome(
++                hy.conn, prior.slice_key, llm, config,
++            )
++        )
++        assert not result.parse_failed
++        assert _state(hy) == before
++        request = llm.calls[-1]
++        assert f"at most {cap} facts" in request.system
++        assert request == facts.build_facts_request("user: " + _TEXT, config)
++        assert result.failure_reason is None
++        assert f"at most {facts._MAX_FACT_CHARS} characters" in request.system
++        assert f"at most {facts.FACT_MAX_ENTITIES_PER_ITEM} entities" in request.system
++        assert f"at most {facts.FACT_MAX_ENTITY_CHARS} characters" in request.system
++        assert "Never omit a supported fact" in request.system
++        assert json.dumps(_OVERFLOW) in request.system
++        assert request.response_format == "json" and request.temperature == 0.0
++        assert request.max_tokens == config.dream_digest_max_tokens
++
++
++@pytest.mark.parametrize("cap", [0, -1, False, 257])
++def test_disabled_or_out_of_range_item_cap_is_not_a_supported_configuration(cfg, cap):
++    with pytest.raises(ValueError, match="between 1 and 256"):
++        replace(cfg, dream_max_facts_per_session=cap)
++
++
++@pytest.mark.parametrize("path", ["fresh", "historical"])
++@pytest.mark.parametrize("payload,reason", [
++    (_OVERFLOW, "output_capacity_exceeded"),
++    ({"facts": [_ITEM] * 9}, "output_capacity_exceeded"),
++    ([_ITEM] * 9, "output_capacity_exceeded"),
++    ({"facts": [_ITEM] * 9 + [{"text": "bad", "date": "never"}]}, "invalid_items"),
++    ({"facts": [], "complete": 0}, "invalid_envelope"),
++    ({"facts": [], "complete": "false"}, "invalid_envelope"),
++    ({"facts": [], "complete": None}, "invalid_envelope"),
++    ({"facts": [], "complete": True}, "invalid_envelope"),
++    ({"facts": {}, "complete": False}, "invalid_envelope"),
++    ({"facts": [_ITEM], "complete": False}, "invalid_envelope"),
++    ({"facts": [], "complete": False, "reason": "capacity"}, "invalid_envelope"),
++    ({"complete": False}, "invalid_envelope"),
++    ({"facts": [_ITEM, dict(_ITEM, text="x" * 601)]}, "invalid_items"),
++    ('{"facts": [], "complete": fal', "invalid_json"),
++])
++def test_capacity_or_invalid_output_holds_all_authority_atomically(
++    cfg, monkeypatch, caplog, path, payload, reason,
++):
++    llm = StubLLMClient(default=json.dumps({"facts": [_ITEM]}))
++    with closing(HyMem(_config(cfg), llm=llm)) as hy:
++        _seed(hy)
++        prior = _old_outcome(hy, llm, monkeypatch) if path == "historical" else None
++        bad = StubLLMClient(default=payload if isinstance(payload, str) else json.dumps(payload))
++        before = _state(hy)
++        result = (
++            facts.extract_facts(hy.conn, "capacity", bad, hy.config)
++            if prior is None else facts.reextract_fact_outcome(
++                hy.conn, prior.slice_key, bad, hy.config,
++            )
++        )
++        assert result.parse_failed and result.items == []
++        assert result.failure_reason == reason
++        assert f"facts.output_rejected reason={reason}" in caplog.text
++        assert _state(hy) == before
++        with pytest.raises(ValueError, match="cannot persist a failed"):
++            with db.transaction(hy.conn):
++                facts.persist_facts(hy.conn, "capacity", result)
++        assert _state(hy) == before
++        if prior:
++            for key in (
++                "slice_key", "input_hash", "source_occurrences", "covered_message_id",
++                "partial_message_id", "next_message_offset", "expected_generation",
++            ):
++                expected = 1 if key == "expected_generation" else getattr(prior, key)
++                assert getattr(result, key) == expected
++
++
++@pytest.mark.parametrize("payload", [[], {"facts": []}, [_ITEM], {"facts": [_ITEM]}])
++@pytest.mark.parametrize("fenced", [False, True])
++def test_legacy_complete_empty_and_nonempty_success_remain_exact(payload, fenced):
++    raw = json.dumps(payload)
++    if fenced:
++        raw = "```json\n" + raw + "\n```"
++    expected = facts.validate_fact_items(payload, max_items=8)
++    items, reason = facts._validate_fact_response(raw, max_items=8)
++    assert items == expected and reason is None
++
++
++def test_overflow_sentinel_cannot_pass_the_persistence_item_validator():
++    assert facts.validate_fact_items(_OVERFLOW, max_items=8) is None
++
++
++def test_diagnostic_field_preserves_all_legacy_positional_constructor_slots():
++    from dataclasses import fields
++
++    legacy_names = [
++        "items", "start_message_id", "covered_message_id", "parse_failed",
++        "cursor_before_message_id", "cursor_before_partial_message_id",
++        "cursor_before_offset", "partial_message_id", "next_message_offset",
++        "slice_key", "input_hash", "source_occurrences", "caught_up",
++        "publication_version", "expected_generation",
++    ]
++    assert [field.name for field in fields(facts.FactsExtraction)] == (
++        legacy_names + ["failure_reason"]
++    )
++    sentinels = [object() for _ in legacy_names]
++    result = facts.FactsExtraction(*sentinels)
++    assert all(getattr(result, name) is value for name, value in zip(legacy_names, sentinels))
++    assert result.failure_reason is None
++
++
++class _CompleteSetClient:
++    """Deterministic complete-set producer, never chooses a subset to fit."""
++
++    def __init__(self, texts):
++        self.texts = texts
++        self.fact_calls = []
++        self.delegate = StubLLMClient(default="[]")
++
++    def phase1_producer_declaration(self):
++        return self.delegate.phase1_producer_declaration()
++
++    def memory_producer_declaration(self):
++        return self.delegate.memory_producer_declaration()
++
++    def complete(self, request):
++        if "Return the JSON object of narrative facts now" not in request.user:
++            return self.delegate.complete(request)
++        self.fact_calls.append(request)
++        assert "at most 2 facts" in request.system
++        supported = [text for text in self.texts if text in request.user]
++        if len(supported) > 2:
++            return json.dumps(_OVERFLOW)
++        return json.dumps({"facts": [
++            {"text": text, "date": None, "entities": ["Nora"]}
++            for text in supported
++        ]})
++
++
++def test_next_dream_retries_smaller_complete_units_without_skipping_any_tail(cfg):
++    texts = [f"Nora shipped package {letter}{'x' * 115}." for letter in "ABCD"]
++    llm = _CompleteSetClient(texts)
++    config = _config(cfg, dream_digest_max_chars=700, dream_max_facts_per_session=2)
++    with closing(HyMem(config, llm=llm)) as hy:
++        ids = [_seed(hy, text) for text in texts]
++        source_before = tuple(tuple(row) for row in hy.conn.execute("SELECT * FROM messages"))
++        first = hy.dream()
++        assert first.fact_failures == 1 and first.facts_extracted == 0
++        state = hy.conn.execute(
++            "SELECT facts_cursor_message_id,facts_cursor_partial_message_id,"
++            "facts_cursor_offset,facts_retry_count,facts_quarantined FROM sessions "
++            "WHERE id='capacity'"
++        ).fetchone()
++        assert tuple(state) == (None, None, 0, 1, 0)
++        assert hy.conn.execute("SELECT COUNT(*) FROM fact_extraction_outcomes").fetchone()[0] == 0
++        second = hy.dream()
++        assert second.fact_failures == 0 and second.facts_extracted == 2
++        assert hy.conn.execute(
++            "SELECT facts_cursor_message_id,facts_retry_count FROM sessions WHERE id='capacity'"
++        ).fetchone()[:] == (ids[1], 0)
++        third = hy.dream()
++        assert third.fact_failures == 0 and third.facts_extracted == 2
++        assert len(llm.fact_calls) == 3
++        excerpts = [call.user.split('"""')[1].strip("\n") for call in llm.fact_calls]
++        assert excerpts[0] == "\n".join("user: " + text for text in texts)
++        assert excerpts[1] == "\n".join("user: " + text for text in texts[:2])
++        assert excerpts[2] == "\n".join("user: " + text for text in texts[2:])
++        assert "\n".join(excerpts[1:]) == excerpts[0]
++        assert hy.conn.execute(
++            "SELECT facts_cursor_message_id,facts_cursor_partial_message_id,"
++            "facts_cursor_offset,facts_retry_count,facts_quarantined FROM sessions "
++            "WHERE id='capacity'"
++        ).fetchone()[:] == (ids[-1], None, 0, 0, 0)
++        assert {row[0] for row in hy.conn.execute(
++            "SELECT text FROM narrative_facts WHERE lifecycle_status='active'"
++        )} == set(texts)
++        assert facts.fact_session_authority_is_valid(hy.conn, "capacity")
++        assert tuple(tuple(row) for row in hy.conn.execute("SELECT * FROM messages")) == source_before
++        assert hy.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
++        assert hy.conn.execute("PRAGMA foreign_key_check").fetchall() == []
++
++
++def test_historical_overflow_then_recovery_keeps_exact_partial_unit(cfg, monkeypatch):
++    llm = StubLLMClient(default=json.dumps({"facts": [_ITEM]}))
++    with closing(HyMem(_config(cfg), llm=llm)) as hy:
++        _seed(hy, _TEXT + " More source words." * 30)
++        prior = _old_outcome(hy, llm, monkeypatch, max_chars=75)
++        assert prior.partial_message_id is not None
++        before = _state(hy)
++        failed_client = StubLLMClient(default=json.dumps(_OVERFLOW))
++        for _ in range(3):
++            failed = facts.reextract_fact_outcome(
++                hy.conn, prior.slice_key, failed_client, hy.config,
++            )
++            assert failed.parse_failed and failed.failure_reason == "output_capacity_exceeded"
++            assert _state(hy) == before
++        recovered = facts.reextract_fact_outcome(hy.conn, prior.slice_key, llm, hy.config)
++        assert not recovered.parse_failed
++        for name in (
++            "slice_key", "input_hash", "source_occurrences", "covered_message_id",
++            "partial_message_id", "next_message_offset", "cursor_before_offset",
++        ):
++            assert getattr(recovered, name) == getattr(prior, name)
++        expected_excerpt = llm.calls[0].user
++        assert all(call.user == expected_excerpt for call in failed_client.calls)
++        assert llm.calls[-1].user == expected_excerpt
++        assert _state(hy) == before
++        with db.transaction(hy.conn):
++            facts.persist_facts(hy.conn, "capacity", recovered)
++        assert facts.fact_session_authority_is_valid(hy.conn, "capacity")
++
++
++def test_capacity_contract_version_and_loaded_builder_change_semantic_identity(cfg, monkeypatch):
++    assert facts.FACTS_PROMPT_VERSION == "facts.v4"
++    llm = StubLLMClient(default="[]")
++    current = facts.facts_config_version(cfg, client=llm)
++    current_retry = facts.facts_retry_policy_version(cfg, client=llm)
++    with monkeypatch.context() as old:
++        old.setattr(facts, "FACTS_PROMPT_VERSION", "facts.v3")
++        assert facts.facts_config_version(cfg, client=llm) != current
++        assert facts.facts_retry_policy_version(cfg, client=llm) != current_retry
++    for name, change in (
++        ("FACTS_CAPACITY_TEMPLATE", facts.FACTS_CAPACITY_TEMPLATE + " Changed."),
++        ("_MAX_FACT_CHARS", facts._MAX_FACT_CHARS - 1),
++        ("FACT_MAX_ENTITIES_PER_ITEM", facts.FACT_MAX_ENTITIES_PER_ITEM - 1),
++        ("FACT_MAX_ENTITY_CHARS", facts.FACT_MAX_ENTITY_CHARS - 1),
++    ):
++        before = semantic_generation_suffix("facts", llm)
++        with monkeypatch.context() as changed:
++            changed.setattr(facts, name, change)
++            assert semantic_generation_suffix("facts", llm) != before
++    original = facts.build_facts_request
++
++    def changed_builder(*args, **kwargs):
++        return original(*args, **kwargs)
++
++    before = semantic_generation_suffix("facts", llm)
++    monkeypatch.setattr(facts, "build_facts_request", changed_builder)
++    assert semantic_generation_suffix("facts", llm) != before
+--- /dev/null
++++ b/tests/test_facts_object_contract.py
+@@ -0,0 +1,291 @@
++"""The real facts producers must agree with their JSON-object transport.
++
++These tests use synthetic source turns and an SDK recorder, never a network or
++paid model. They check the envelope contract, not model extraction faithfulness.
++"""
++
++from contextlib import closing
++from dataclasses import replace
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from benchmarks.fact_probe import FACTS_PROMPT_V2, FACTS_USER_TEMPLATE_V2
++from hymem import HyMem
++from hymem.contrib.openai_client import OpenAICompatibleClient
++from hymem.core import db
++from hymem.dreaming import facts
++from hymem.dreaming.lossless import materialize_message_coverage
++from hymem.dreaming.semantic_generation import semantic_generation_suffix
++from hymem.extraction.llm import StubLLMClient
++
++
++_TEXT = "Nora chose Cedar on 2024-05-06."
++_ITEM = {"text": _TEXT, "date": "2024-05-06", "entities": ["Nora", "Cedar"]}
++_CANONICAL_ITEM = dict(_ITEM, entities=["nora", "cedar"])
++_OBJECT_INSTRUCTION = (
++    'Output a strict JSON object with exactly one key, "facts", whose value is '
++    'an array: {"facts": [...]}. Do not add other top-level keys, prose, markdown, '
++    'or code fences. Each item in "facts" has exactly:'
++)
++
++
++def _config(cfg):
++    return replace(cfg, aggregation_nodes_enabled=False,
++                   profile_extraction_enabled=False)
++
++
++def _seed(hy, text=_TEXT):
++    message_id = hy.log_message(
++        "facts-object", "user", text, created_at="2025-07-08T09:10:11Z",
++    )
++    with db.transaction(hy.conn):
++        materialize_message_coverage(hy.conn, "facts-object")
++    return message_id
++
++
++def _state(hy):
++    """Publication, cursor and exact source bytes stay untouched by extraction."""
++    tables = (
++        "sessions", "messages", "chunks", "chunk_message_sources",
++        "fact_extraction_outcomes", "fact_extraction_revisions",
++        "fact_extraction_source_occurrences", "narrative_facts",
++        "narrative_fact_lifecycle",
++    )
++    return tuple(tuple(tuple(row) for row in hy.conn.execute(
++        f"SELECT * FROM {table} ORDER BY rowid"
++    )) for table in tables)
++
++
++def _seed_old_outcome(hy, monkeypatch):
++    with monkeypatch.context() as old:
++        old.setattr(facts, "FACTS_PROMPT_VERSION", "facts.v2")
++        old.setattr(facts, "FACTS_SYSTEM", FACTS_PROMPT_V2)
++        old.setattr(facts, "FACTS_USER_TEMPLATE", FACTS_USER_TEMPLATE_V2)
++        extraction = facts.extract_facts(
++            hy.conn, "facts-object", StubLLMClient(default=json.dumps([_ITEM])),
++            hy.config,
++        )
++        assert extraction is not None and not extraction.parse_failed
++        with db.transaction(hy.conn):
++            facts.persist_facts(hy.conn, "facts-object", extraction)
++        return extraction
++
++
++def _extract_path(hy, llm, path, prior):
++    if path == "fresh":
++        return facts.extract_facts(hy.conn, "facts-object", llm, hy.config)
++    return facts.reextract_fact_outcome(hy.conn, prior.slice_key, llm, hy.config)
++
++
++@pytest.fixture
++def wire_client(monkeypatch):
++    """Exercise OpenAICompatibleClient.complete without constructing a network SDK."""
++    import openai
++
++    for name in (
++        "HYMEM_LLM_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY",
++        "HYMEM_LLM_BASE_URL", "HYMEM_LLM_MODEL", "HYMEM_LLM_THINKING",
++        "HYMEM_LLM_DEPLOYMENT_REVISION", "HYMEM_LLM_DEPLOYMENT_TENANT",
++    ):
++        monkeypatch.delenv(name, raising=False)
++
++    clients = []
++
++    def build(raw):
++        calls = []
++
++        class Completions:
++            def create(self, **kwargs):
++                calls.append(kwargs)
++                return SimpleNamespace(choices=[SimpleNamespace(
++                    finish_reason="stop",
++                    message=SimpleNamespace(content=raw),
++                )])
++
++        def sdk(**kwargs):
++            http_client = kwargs.get("http_client")
++            return SimpleNamespace(
++                _client=http_client,
++                chat=SimpleNamespace(completions=Completions()),
++                close=lambda: http_client.close() if http_client else None,
++            )
++
++        monkeypatch.setattr(openai, "OpenAI", sdk)
++        client = OpenAICompatibleClient(
++            api_key="synthetic-test-key", base_url="https://api.deepseek.com",
++            model="deepseek-v4-flash", thinking="disabled",
++        )
++        clients.append(client)
++        return client, calls
++
++    yield build
++    for client in clients:
++        client.close()
++
++
++@pytest.mark.parametrize("path", ["fresh", "historical"])
++@pytest.mark.parametrize("items", [[_ITEM], []], ids=["nonempty", "empty"])
++def test_real_fact_paths_match_json_object_transport(
++    cfg, monkeypatch, wire_client, path, items,
++):
++    with closing(HyMem(_config(cfg), llm=StubLLMClient(default="[]"))) as hy:
++        message_id = _seed(hy)
++        prior = _seed_old_outcome(hy, monkeypatch) if path == "historical" else None
++        llm, calls = wire_client(json.dumps({"facts": items}))
++        before = _state(hy)
++        result = _extract_path(hy, llm, path, prior)
++        assert result is not None and not result.parse_failed
++        assert result.items == ([_CANONICAL_ITEM] if items else [])
++        assert _state(hy) == before
++        assert result.covered_message_id == message_id
++        assert [source.message_id for source in result.source_occurrences] == [message_id]
++        assert len(calls) == 1
++        call = calls[0]
++        assert call["response_format"] == {"type": "json_object"}
++        assert call["temperature"] == 0.0
++        assert call["max_tokens"] == hy.config.dream_digest_max_tokens
++        assert call["messages"] == [
++            {"role": "system", "content": facts.build_facts_request(
++                "user: " + _TEXT, hy.config,
++            ).system},
++            {"role": "user", "content": facts.FACTS_USER_TEMPLATE.format(
++                text="user: " + _TEXT,
++            )},
++        ]
++        assert _OBJECT_INSTRUCTION in call["messages"][0]["content"]
++        assert '{"facts": []}' in call["messages"][0]["content"]
++        assert call["messages"][1]["content"].endswith(
++            "Return the JSON object of narrative facts now."
++        )
++        assert "2025-07-08" not in str(call["messages"])
++        if prior:
++            assert result.slice_key == prior.slice_key
++            assert result.input_hash == prior.input_hash
++            assert result.source_occurrences == prior.source_occurrences
++            assert result.publication_version != prior.publication_version
++
++
++def test_envelope_change_preserves_every_v2_factual_instruction():
++    """Byte-equivalence after undoing envelope edits is not a new G-F1 verdict."""
++    assert _OBJECT_INSTRUCTION in facts.FACTS_SYSTEM
++    restored = facts.FACTS_SYSTEM.replace(
++        _OBJECT_INSTRUCTION, "Output a strict JSON array. Each item has exactly:",
++    ).replace('{"facts": []}', "[]")
++    assert restored == FACTS_PROMPT_V2
++    assert facts.FACTS_USER_TEMPLATE.replace(
++        "JSON object of narrative facts", "JSON array of narrative facts",
++    ) == FACTS_USER_TEMPLATE_V2
++
++
++@pytest.mark.parametrize("path", ["fresh", "historical"])
++@pytest.mark.parametrize("raw", [
++    json.dumps({"facts": [_ITEM], "type": "json_object"}),
++    json.dumps({"facts": [_ITEM, dict(_ITEM, date="2024-02-30")]}),
++    '{"facts": [{"text": "Nora chose Cedar',
++], ids=["extra-wrapper-key", "mixed-invalid-item", "incomplete"])
++def test_invalid_object_never_drops_content_or_advances_authority(
++    cfg, monkeypatch, path, raw,
++):
++    with closing(HyMem(_config(cfg), llm=StubLLMClient(default="[]"))) as hy:
++        _seed(hy)
++        prior = _seed_old_outcome(hy, monkeypatch) if path == "historical" else None
++        before = _state(hy)
++        result = _extract_path(hy, StubLLMClient(default=raw), path, prior)
++        assert result is not None and result.parse_failed and result.items == []
++        assert _state(hy) == before
++        if prior:
++            assert result.slice_key == prior.slice_key
++            assert result.input_hash == prior.input_hash
++            assert result.source_occurrences == prior.source_occurrences
++
++
++@pytest.mark.parametrize("payload", [
++    [_ITEM], {"facts": [_ITEM]}, [], {"facts": []},
++])
++@pytest.mark.parametrize("fenced", [False, True])
++def test_exact_objects_and_legacy_arrays_remain_compatible(payload, fenced):
++    raw = json.dumps(payload)
++    if fenced:
++        raw = "```json\n" + raw + "\n```"
++    assert facts.validate_fact_items(raw, max_items=8) == (
++        [_CANONICAL_ITEM] if payload in ([_ITEM], {"facts": [_ITEM]}) else []
++    )
++
++
++@pytest.mark.parametrize("payload", [
++    {"facts": [_ITEM], "type": "json_object"},
++    {"facts": [], "notes": []},
++    {"items": [_ITEM]}, {"facts": {}},
++    {"facts": [_ITEM, dict(_ITEM, text=" ")]},
++    {"facts": [_ITEM, dict(_ITEM, text="x" * 601)]},
++    {"facts": [_ITEM, dict(_ITEM, date="2024-02-30")]},
++    {"facts": [_ITEM, dict(_ITEM, extra="metadata")]},
++    {"facts": [_ITEM, dict(_ITEM, entities="Nora")]},
++    {"facts": [_ITEM] * 9},
++])
++def test_object_validator_stays_atomic_and_strict(payload):
++    assert facts.validate_fact_items(json.dumps(payload), max_items=8) is None
++
++
++def test_current_prompt_replays_exact_old_partial_units_and_resets_only_old_retry_generation(
++    cfg, monkeypatch,
++):
++    assert facts.FACTS_PROMPT_VERSION == "facts.v4"
++    config = _config(cfg)
++    llm = StubLLMClient(default=json.dumps({"facts": [_ITEM]}))
++    with closing(HyMem(config, llm=llm)) as hy:
++        message_id = _seed(hy, _TEXT + " " + "More source words. " * 20)
++        with monkeypatch.context() as old:
++            old.setattr(facts, "FACTS_PROMPT_VERSION", "facts.v2")
++            old.setattr(facts, "FACTS_SYSTEM", FACTS_PROMPT_V2)
++            old.setattr(facts, "FACTS_USER_TEMPLATE", FACTS_USER_TEMPLATE_V2)
++            old_semantic = semantic_generation_suffix("facts", llm)
++            old_version = facts.facts_config_version(config, client=llm)
++            old_retry = facts.facts_retry_policy_version(config, client=llm)
++            first = facts.extract_facts(
++                hy.conn, "facts-object", llm, config, max_chars=60,
++            )
++            assert first is not None and first.partial_message_id == message_id
++            assert first.next_message_offset > 0
++            with db.transaction(hy.conn):
++                facts.persist_facts(hy.conn, "facts-object", first)
++                for _ in range(config.facts_extraction_max_attempts):
++                    facts.record_fact_failure(
++                        hy.conn, "facts-object",
++                        max_attempts=config.facts_extraction_max_attempts,
++                        retry_config_version=old_retry,
++                    )
++
++        new_version = facts.facts_config_version(config, client=llm)
++        new_retry = facts.facts_retry_policy_version(config, client=llm)
++        assert new_version != old_version and new_retry != old_retry
++        assert semantic_generation_suffix("facts", llm) != old_semantic
++        assert facts.next_fact_outcome_for_replay(
++            hy.conn, "facts-object", new_version,
++        ) == first.slice_key
++        assert facts.fact_quarantine_status(hy.conn, config, client=llm) == {
++            "quarantined_facts": 0, "quarantined_facts_malformed": 0,
++        }
++        before = _state(hy)
++        replay = facts.reextract_fact_outcome(hy.conn, first.slice_key, llm, config)
++        assert not replay.parse_failed and _state(hy) == before
++        for name in (
++            "slice_key", "input_hash", "source_occurrences", "partial_message_id",
++            "next_message_offset", "covered_message_id", "cursor_before_offset",
++        ):
++            assert getattr(replay, name) == getattr(first, name)
++        assert replay.publication_version == new_version
++        # Framing changes, source bytes do not; no full-turn historical re-cut.
++        assert llm.calls[-1].user.split('"""')[1] == llm.calls[0].user.split('"""')[1]
++        with db.transaction(hy.conn):
++            assert not facts.record_fact_failure(
++                hy.conn, "facts-object", max_attempts=config.facts_extraction_max_attempts,
++                retry_config_version=new_retry,
++            )
++        row = hy.conn.execute(
++            "SELECT facts_retry_count,facts_retry_config_version,facts_quarantined "
++            "FROM sessions WHERE id='facts-object'",
++        ).fetchone()
++        assert tuple(row) == (1, new_retry, 0)
+--- /dev/null
++++ b/tests/test_facts_rejection_diagnostics.py
+@@ -0,0 +1,165 @@
++"""Bounded, attributable fact failures without logging source or model text."""
++
++from contextlib import closing
++from dataclasses import replace
++import hashlib
++import json
++import logging
++
++import pytest
++
++from hymem import HyMem
++from hymem.core import db
++from hymem.dreaming import facts
++from hymem.dreaming.lossless import materialize_message_coverage
++from hymem.dreaming.semantic_generation import semantic_generation_suffix
++from hymem.extraction.llm import StubLLMClient
++
++
++_ITEM = {"text": "Nora shipped Cedar.", "date": None, "entities": ["Nora"]}
++
++
++@pytest.mark.parametrize("raw,reason", [
++    ("null", "invalid_envelope"),
++    (" NULL ", "invalid_json"),
++    ("Null", "invalid_json"),
++    ("```json\nnull\n```", "invalid_envelope"),
++    ("```JSON\nnull\n```", "invalid_envelope"),
++    ("```jsonnull```", "invalid_envelope"),
++    ("```null```", "invalid_envelope"),
++    ("```json\nNULL\n```", "invalid_json"),
++    ("```json\nNull\n```", "invalid_json"),
++    ("```jsonNULL```", "invalid_json"),
++    ("```json\nnull", "invalid_json"),
++    ("```python\nnull\n```", "invalid_json"),
++    ("Before ```json\nnull\n```", "invalid_json"),
++    ("```json\nnull\n``` after", "invalid_json"),
++    ("", "invalid_json"),
++    ('{"facts":[', "invalid_json"),
++    ('{"facts":[],"facts":[]}', "invalid_json"),
++    ('{"facts":NaN}', "invalid_json"),
++    ('{"facts":[],"type":"json_object"}', "invalid_envelope"),
++    ('{"facts":{}}', "invalid_envelope"),
++    ('{"items":[]}', "invalid_envelope"),
++    ('"plain text"', "invalid_envelope"),
++    ('false', "invalid_envelope"),
++    ('4', "invalid_envelope"),
++    ('[null]', "invalid_items"),
++    ('[{"text":""}]', "invalid_items"),
++    ('[{"text":"Nora shipped Cedar.","date":"2024-02-30"}]', "invalid_items"),
++])
++def test_closed_reasons_distinguish_parse_envelope_and_items(raw, reason):
++    assert facts._validate_fact_response(raw, max_items=8) == (None, reason)
++    assert facts.validate_fact_items(raw, max_items=8) is None
++
++
++def test_capacity_diagnostics_do_not_validate_unbounded_rejected_lists(monkeypatch):
++    original = facts.validate_fact_items
++    calls = []
++
++    def recorder(raw, *, max_items):
++        calls.append(max_items)
++        return original(raw, max_items=max_items)
++
++    monkeypatch.setattr(facts, "validate_fact_items", recorder)
++    payload = {"facts": [_ITEM] * (facts.FACT_MAX_ACTIVE_ITEMS_PER_OUTCOME + 1)}
++    assert facts._validate_fact_response(payload, max_items=8) == (None, "invalid_items")
++    assert calls == [8]
++
++
++@pytest.mark.parametrize("path", ["fresh", "replay"])
++def test_persisted_warning_identifies_session_and_slice_without_raw_values(
++    cfg, monkeypatch, tmp_path, path,
++):
++    config = replace(cfg, aggregation_nodes_enabled=False, profile_extraction_enabled=False)
++    session_id = "private-session-key\nforged-log-entry"
++    source = "Private source. Nora shipped Cedar."
++    valid = StubLLMClient(default=json.dumps({"facts": [_ITEM]}))
++    with closing(HyMem(config, llm=valid)) as hy:
++        hy.log_message(session_id, "user", source)
++        with db.transaction(hy.conn):
++            materialize_message_coverage(hy.conn, session_id)
++        prior = None
++        if path == "replay":
++            with monkeypatch.context() as old:
++                old.setattr(facts, "FACTS_PROMPT_VERSION", "facts.v2")
++                prior = facts.extract_facts(hy.conn, session_id, valid, config)
++                with db.transaction(hy.conn):
++                    facts.persist_facts(hy.conn, session_id, prior)
++        state_before = tuple(hy.conn.execute(
++            "SELECT * FROM sessions WHERE id=?", (session_id,),
++        ).fetchone())
++        raw = '{"facts": [], "private-response-value": "secret response body"}'
++        bad = StubLLMClient(default=raw)
++        log_path = tmp_path / "benchmark.log"
++        handler = logging.FileHandler(log_path, encoding="utf-8")
++        facts.log.addHandler(handler)
++        try:
++            result = (
++                facts.extract_facts(hy.conn, session_id, bad, config)
++                if prior is None else facts.reextract_fact_outcome(
++                    hy.conn, prior.slice_key, bad, config,
++                )
++            )
++        finally:
++            facts.log.removeHandler(handler)
++            handler.close()
++        assert result.parse_failed and result.failure_reason == "invalid_envelope"
++        assert result.items == []
++        assert tuple(hy.conn.execute(
++            "SELECT * FROM sessions WHERE id=?", (session_id,),
++        ).fetchone()) == state_before
++        encoded = json.dumps(
++            {"version": "fact-diagnostic-session-v1", "session_id": session_id},
++            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
++        ).encode("utf-8")
++        session_key = "sha256:" + hashlib.sha256(encoded).hexdigest()
++        assert facts.fact_diagnostic_session_key(session_id) == session_key
++        assert facts.fact_diagnostic_session_key(session_id + "other") != session_key
++        # A closed handler's retained file is the same normal-log path used by
++        # a benchmark supervisor; attribution survives the extraction call.
++        lines = log_path.read_text().splitlines()
++        assert lines == [
++            "facts.output_rejected reason=invalid_envelope "
++            f"mode={path} session_key={session_key} slice_key={result.slice_key}"
++        ]
++        assert all(secret not in lines[0] for secret in (
++            session_id, "private-session-key", "forged-log-entry", source, raw,
++            "private-response-value", "secret response body",
++        ))
++
++
++@pytest.mark.parametrize("name", [
++    "build_facts_request", "_validate_fact_response", "_log_fact_rejection",
++    "fact_diagnostic_session_key",
++])
++def test_loaded_fact_helper_changes_only_fact_generation(monkeypatch, name):
++    client = StubLLMClient(default="[]")
++    before = {tier: semantic_generation_suffix(tier, client)
++              for tier in ("facts", "digest", "profile")}
++    phase1_before = client.phase1_producer_declaration()
++    original = getattr(facts, name)
++
++    def changed(*args, **kwargs):
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(facts, name, changed)
++    after = {tier: semantic_generation_suffix(tier, client)
++             for tier in before}
++    assert after["facts"] != before["facts"]
++    assert after["digest"] == before["digest"]
++    assert after["profile"] == before["profile"]
++    assert client.phase1_producer_declaration() == phase1_before
++
++
++@pytest.mark.parametrize("name", ["FACTS_SYSTEM", "FACTS_USER_TEMPLATE", "FACTS_CAPACITY_TEMPLATE"])
++def test_loaded_fact_prompt_changes_only_fact_generation(monkeypatch, name):
++    client = StubLLMClient(default="[]")
++    before = {tier: semantic_generation_suffix(tier, client)
++              for tier in ("facts", "digest", "profile")}
++    monkeypatch.setattr(facts, name, getattr(facts, name) + " Changed.")
++    after = {tier: semantic_generation_suffix(tier, client)
++             for tier in before}
++    assert after["facts"] != before["facts"]
++    assert after["digest"] == before["digest"]
++    assert after["profile"] == before["profile"]
+--- a/tests/test_semantic_generation.py
++++ b/tests/test_semantic_generation.py
+@@ -20,7 +20,7 @@
+             "slot": "role", "value": label + " engineer",
+             "evidence_message_id": 1, "confidence": 0.9,
+         }]}),
+-        "Return the JSON array of narrative facts now": json.dumps([{
++        "Return the JSON object of narrative facts now": json.dumps([{
+             "text": label + " attended the engineering meeting.",
+             "date": None, "entities": [label],
+         }]),
+@@ -139,7 +139,7 @@
+         needles = {
+             "digest": "You analyze one conversation session",
+             "profile": "typed user-profile facts",
+-            "facts": "Return the JSON array of narrative facts now",
++            "facts": "Return the JSON object of narrative facts now",
+         }
+         if not self.changed and needles[self.tier] in request.system + request.user:
+             self.changed = True
+

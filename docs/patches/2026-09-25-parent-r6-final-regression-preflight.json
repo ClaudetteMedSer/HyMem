@@ -1,0 +1,77 @@
+{
+  "schema": "r6-parent-regression-preflight-acceptance-v1",
+  "parent_accepted": true,
+  "package_manifest_sha256": "3e227d959ec6e5d55f65d2343787dbe66cfb5ac63de0d033d04fd0641969e484",
+  "source_manifest_sha256": "bd8d0f3a8fb40bd6b77e7ca6579c8e5e8ee78733bea2bb22df71bc4b2c12eaa2",
+  "container": {
+    "id": "51a01ef8125a142bcb1daf13f66b1fcfb4ad15c6054a31d2121bce85b2c45c1a",
+    "status": "exited",
+    "exit_code": 0,
+    "pid": 0,
+    "oom_killed": false,
+    "configuration_verified": true,
+    "network": "none",
+    "credential_mount": false
+  },
+  "proof": {
+    "api_calls": 0,
+    "benchmark_executed": false,
+    "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+    "messages": 532,
+    "per_question_census": [
+      {
+        "messages": 532,
+        "question_id": "gpt4_483dd43c",
+        "sessions": 52,
+        "source_index": 329
+      }
+    ],
+    "question_ids": [
+      "gpt4_483dd43c"
+    ],
+    "raw_data_exported": false,
+    "sample": 1,
+    "seed": 0,
+    "selection_predeclared": true,
+    "sessions": 52,
+    "source_files_verified": 231,
+    "source_indices": [
+      329
+    ],
+    "source_mapping_sha256": "842e856a78809f24c6b38ed566e72d09c1d91d37d5f79acdd75ec21916d9c586",
+    "source_question_count": 500,
+    "startup_probe": {
+      "benchmark_execution_verified": false,
+      "canonical_extra_body_environment_absent": true,
+      "checkpoint_runtime_producer_matches": true,
+      "cleanup_failed": false,
+      "cli_checkpoint_handles_closed": true,
+      "cli_checkpoint_sha256": "ee36150ac8ef875d2c125c212fdbff0c0a0e65d756494ce94d7685f9112c39e1",
+      "cli_checkpoints_observed": 1,
+      "cli_manifest_run_id": "sha256:eecd189081614ec5d625127278df9b8b1d0eeffaeddc24867dc86138ebda7e57",
+      "completed_questions": 0,
+      "endpoint": "https://api.deepseek.com",
+      "expected_question_count": 1,
+      "expected_question_ids": [
+        "gpt4_483dd43c"
+      ],
+      "outbound_operations_blocked": 0,
+      "phase": "complete",
+      "private_home_created": true,
+      "producer_identity_sha256": "sha256:b7dcd2a8a3a5107c9b0d868ecd2f3c96ab7d9f02392e20c9b967c44805673cb5",
+      "provider_completions": 0,
+      "provider_http_attempts": 0,
+      "provider_successful_responses": 0,
+      "real_credentials_loaded": false,
+      "requested_model": "deepseek-flash",
+      "runtime_clients_closed": 1,
+      "runtime_clients_constructed": 1,
+      "runtime_transport_identity_exact": true,
+      "schema": "r6-lme-failed-question-pre-provider-startup-v1",
+      "standalone_producer_identity_exact": true,
+      "status": "passed",
+      "stock_cli_pre_provider_boundary_reached": true
+    },
+    "status": "preflight_only"
+  }
+}

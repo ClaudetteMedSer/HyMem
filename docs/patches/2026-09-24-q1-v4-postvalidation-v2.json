@@ -1,0 +1,104 @@
+{
+  "answer_correct": true,
+  "archive_sha256": "85c7e13f5eb259fbcfc668b348f212141af2e1ec09363cd5faeb5dfc61145c25",
+  "benchmark_completed_without_faults": true,
+  "checkpoint_sha256": "e64b32876078b0a82a004af28fec86fda28f49bcf67b8965a57ff12f7c8dece5",
+  "counts": {
+    "attempted": 1,
+    "completed": 1,
+    "expected": 1,
+    "failed": 0,
+    "missing": 0,
+    "total_attempts": 1,
+    "unique_attempted": 1
+  },
+  "elapsed_s": 1624.3779253959656,
+  "full_500_readiness_verified": false,
+  "global_paid_call_cap": null,
+  "indexing_outcome": "success_with_summary_degradation",
+  "item_indexing_healthy": true,
+  "manifest_sha256": "5cdb8db3213229aed6f140da6747ff2a1048433e75437b3a7feda6521f0b73a3",
+  "new_provider_calls": 0,
+  "official_comparable": false,
+  "per_role_usage": {
+    "judge": {
+      "calls": 1,
+      "calls_available": true,
+      "completion_tokens": 1,
+      "cost_available": false,
+      "cost_usd": null,
+      "prompt_tokens": 197,
+      "request_attempts": 1,
+      "request_attempts_available": true,
+      "successful_responses": 1,
+      "successful_responses_available": true,
+      "token_usage_available": true,
+      "total_tokens": 198
+    },
+    "memory_pipeline": {
+      "calls": 796,
+      "calls_available": true,
+      "completion_tokens": 144919,
+      "cost_available": false,
+      "cost_usd": null,
+      "prompt_tokens": 2424501,
+      "request_attempts": 796,
+      "request_attempts_available": true,
+      "successful_responses": 796,
+      "successful_responses_available": true,
+      "token_usage_available": true,
+      "total_tokens": 2569420
+    },
+    "reader": {
+      "calls": 1,
+      "calls_available": true,
+      "completion_tokens": 71,
+      "cost_available": false,
+      "cost_usd": null,
+      "prompt_tokens": 8972,
+      "request_attempts": 1,
+      "request_attempts_available": true,
+      "successful_responses": 1,
+      "successful_responses_available": true,
+      "token_usage_available": true,
+      "total_tokens": 9043
+    },
+    "retrieval": {
+      "calls": 0,
+      "calls_available": true,
+      "completion_tokens": 0,
+      "cost_available": true,
+      "cost_usd": 0,
+      "prompt_tokens": 0,
+      "request_attempts": 0,
+      "request_attempts_available": true,
+      "successful_responses": 0,
+      "successful_responses_available": true,
+      "token_usage_available": true,
+      "total_tokens": 0
+    }
+  },
+  "physical_checkpoint_bound": true,
+  "process_completed_cleanly": true,
+  "question_id": "09ba9854",
+  "reader_judge_calls_measured": true,
+  "representative_sample": false,
+  "run_id": "sha256:d6253a8c4cb2353c04fb485c30bcd5b8bf61187a58523241db945e3c621172e2",
+  "schema": "stock-q1-postvalidation-v2",
+  "scores": {
+    "OVERALL": {
+      "accuracy": 100,
+      "count": 1
+    },
+    "multi-session": {
+      "accuracy": 100,
+      "count": 1
+    }
+  },
+  "semantic_quality_guaranteed": false,
+  "status": "scored_q1_completed",
+  "strict_scored_artifact_validated": true,
+  "summary_degraded_questions": 1,
+  "summary_degraded_sessions": 10,
+  "summary_healthy": false
+}

@@ -1,0 +1,1177 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="84" failures="0" skipped="0" tests="84" time="0.427" timestamp="2026-09-24T23:06:42.368524+02:00" hostname="MacBook-Pro-2.local"><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_eight_real_checkpoint_rows_accept_wrong_answers_without_infrastructure_failure[None]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ple8_validator.py::test_eight_real_checkpoint_rows_accept_wrong_answers_without_infrastructure_failure[None] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_eight_real_checkpoint_rows_accept_wrong_answers_without_infrastructure_failure[0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...sample8_validator.py::test_eight_real_checkpoint_rows_accept_wrong_answers_without_infrastructure_failure[0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_eight_real_checkpoint_rows_accept_wrong_answers_without_infrastructure_failure[7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...sample8_validator.py::test_eight_real_checkpoint_rows_accept_wrong_answers_without_infrastructure_failure[7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_degradation_is_visible_and_does_not_waive_item_health" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../diagnostics/tests/test_lme_sample8_validator.py::test_degradation_is_visible_and_does_not_waive_item_health (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_failed_question_never_claims_clean_completion[0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tools/diagnostics/tests/test_lme_sample8_validator.py::test_failed_question_never_claims_clean_completion[0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_failed_question_never_claims_clean_completion[4]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tools/diagnostics/tests/test_lme_sample8_validator.py::test_failed_question_never_claims_clean_completion[4] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_failed_question_never_claims_clean_completion[7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tools/diagnostics/tests/test_lme_sample8_validator.py::test_failed_question_never_claims_clean_completion[7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_real_failed_verdict_normalization_remains_failure[True-synthetic]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_real_failed_verdict_normalization_remains_failure[True-synthetic] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_real_failed_verdict_normalization_remains_failure[None-None]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...stics/tests/test_lme_sample8_validator.py::test_real_failed_verdict_normalization_remains_failure[None-None] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_real_failed_verdict_normalization_remains_failure[None-synthetic]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_real_failed_verdict_normalization_remains_failure[None-synthetic] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_consistent_preexisting_derived_flags_are_valid" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ... 'tools/diagnostics/tests/test_lme_sample8_validator.py::test_consistent_preexisting_derived_flags_are_valid (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[answer-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...cs/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[answer-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[answer-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...cs/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[answer-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[answer-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...cs/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[answer-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[correct-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[correct-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[correct-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[correct-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[correct-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[correct-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[indexing-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[indexing-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[indexing-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[indexing-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[indexing-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[indexing-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[score_type-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[score_type-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[score_type-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[score_type-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[score_type-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[score_type-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[extra-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[extra-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[extra-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[extra-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[extra-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[extra-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[missing-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[missing-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[missing-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[missing-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[missing-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[missing-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[qid-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...stics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[qid-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[qid-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...stics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[qid-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[qid-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...stics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[qid-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[flag-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[flag-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[flag-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[flag-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[flag-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tics/tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[flag-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[flag_type-0]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[flag_type-0] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[flag_type-3]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[flag_type-3] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_every_physical_row_is_bound_even_when_history_matches[flag_type-7]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tests/test_lme_sample8_validator.py::test_every_physical_row_is_bound_even_when_history_matches[flag_type-7] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[attempt]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ostics/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[attempt] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[attempt_bool]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[attempt_bool] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[history_empty]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[history_empty] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[history_attempt]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[history_attempt] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[history_attempt_bool]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[history_attempt_bool] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[history_row]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...cs/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[history_row] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[history_status]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[history_status] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[history_extra]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[history_extra] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[entry_extra]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...cs/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[entry_extra] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[extra_entry]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...cs/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[extra_entry] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[missing_entry]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[missing_entry] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[swapped_rows]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[swapped_rows] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[duplicate_row]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[duplicate_row] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[missing_row]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...cs/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[missing_row] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[extra_row]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tics/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[extra_row] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[order]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...gnostics/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[order] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[scored]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...nostics/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[scored] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[verdict_key]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...cs/tests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[verdict_key] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[snapshot_status]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ests/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[snapshot_status] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_ledger_history_inventory_and_order_tampering_fails[archive_flag_type]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ts/test_lme_sample8_validator.py::test_ledger_history_inventory_and_order_tampering_fails[archive_flag_type] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[sample]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...gnostics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[sample] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[seed]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...iagnostics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[seed] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[source_indices]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[source_indices] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[ids]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...diagnostics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[ids] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[ids_duplicate]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...s/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[ids_duplicate] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[ids_order]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...stics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[ids_order] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[recipe]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...gnostics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[recipe] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[recipe_bool]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[recipe_bool] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[model]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...agnostics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[model] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[thinking]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ostics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[thinking] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[attestation]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[attestation] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[counts]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...gnostics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[counts] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[count_bool]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[count_bool] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[segments]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ostics/tests/test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[segments] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_run_identity_recipe_counts_and_attestation_fences[segment_attempt_bool]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../test_lme_sample8_validator.py::test_run_identity_recipe_counts_and_attestation_fences[segment_attempt_bool] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_bad_nonphysical_evidence_never_reports_clean[cleanup]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../diagnostics/tests/test_lme_sample8_validator.py::test_bad_nonphysical_evidence_never_reports_clean[cleanup] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_bad_nonphysical_evidence_never_reports_clean[returncode]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...agnostics/tests/test_lme_sample8_validator.py::test_bad_nonphysical_evidence_never_reports_clean[returncode] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_bad_nonphysical_evidence_never_reports_clean[reader_usage]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...nostics/tests/test_lme_sample8_validator.py::test_bad_nonphysical_evidence_never_reports_clean[reader_usage] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_bad_nonphysical_evidence_never_reports_clean[judge_usage]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...gnostics/tests/test_lme_sample8_validator.py::test_bad_nonphysical_evidence_never_reports_clean[judge_usage] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_bad_nonphysical_evidence_never_reports_clean[instrumentation]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...tics/tests/test_lme_sample8_validator.py::test_bad_nonphysical_evidence_never_reports_clean[instrumentation] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_bad_nonphysical_evidence_never_reports_clean[indexing]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...diagnostics/tests/test_lme_sample8_validator.py::test_bad_nonphysical_evidence_never_reports_clean[indexing] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_unknown_canary_tokens_and_cost_remain_unknown_in_total" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...diagnostics/tests/test_lme_sample8_validator.py::test_unknown_canary_tokens_and_cost_remain_unknown_in_total (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_untrusted_canary_or_usage_cannot_leak_or_pass[status]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../diagnostics/tests/test_lme_sample8_validator.py::test_untrusted_canary_or_usage_cannot_leak_or_pass[status] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_untrusted_canary_or_usage_cannot_leak_or_pass[closed]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': .../diagnostics/tests/test_lme_sample8_validator.py::test_untrusted_canary_or_usage_cannot_leak_or_pass[closed] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_untrusted_canary_or_usage_cannot_leak_or_pass[text]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ls/diagnostics/tests/test_lme_sample8_validator.py::test_untrusted_canary_or_usage_cannot_leak_or_pass[text] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase><testcase classname="tools.diagnostics.tests.test_lme_sample8_validator" name="test_untrusted_canary_or_usage_cannot_leak_or_pass[nan]" time="0.000"><error message="failed on setup with &quot;KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'&quot;">@pytest.fixture(scope='module')
+    def modules():
+&gt;       source = Path(os.environ['HYMEM_Q1_VERIFIER_SOURCE']).resolve()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tools/diagnostics/tests/test_lme_sample8_validator.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = environ({'CODEX_APP_TOOLS_PIPE_PATH': '/tmp/codex-browser-use/1c2acfc3-0f99-43ab-b8cf-a3b6a63e7759.sock', 'CODEX_CI': ...ols/diagnostics/tests/test_lme_sample8_validator.py::test_untrusted_canary_or_usage_cannot_leak_or_pass[nan] (setup)'})
+key = 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&gt;   ???
+E   KeyError: 'HYMEM_Q1_VERIFIER_SOURCE'
+
+&lt;frozen os&gt;:717: KeyError</error></testcase></testsuite></testsuites>

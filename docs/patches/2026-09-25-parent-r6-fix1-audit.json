@@ -1,0 +1,39 @@
+{
+  "schema": "r6-parent-fix1-acceptance-v1",
+  "gate_accepted": true,
+  "scope": "validator-only; original failed run is not repaired or rerun",
+  "baseline_source_manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc",
+  "corrected_validator_sha256": "d39f8409a5bd1f99f3e8564186569573f6d556b6380510c025c6cd30fa5c9d8c",
+  "changed_test_sha256": "3a3a9cba22986c97e10ab682bec5ee6eed592eb945ce92ddb46e35ed19a0f2d9",
+  "parent_test_results": {
+    "old_existing_tests": {"passed": 278, "failed": 0},
+    "new_real_writer_regressions_on_old_code": {"passed": 0, "failed_expected": 2, "error": "LongMemEval indexing failure row fields differ"},
+    "candidate_affected_suites": {"passed": 666, "failed": 0, "errors": 0, "skipped": 0},
+    "preserved_invocation_error": "2026-09-25-parent-r6-fix1.xml: incorrect test filename, exit 4; corrected run is -final.xml"
+  },
+  "saved_run_audit": {
+    "container_id": "21d122a86e5276891dcfad89e3dfa937c1f4717f36383fa8a9ce381ea4a85a07",
+    "artifact_audit_passed": true,
+    "baseline_rejection_reproduced": true,
+    "artifacts_unchanged": true,
+    "archive_sha256": "020e84e99ffb758d8fd97a5fc82a411db2387116ef30ed2bda4b1b7f232168f9",
+    "checkpoint_sha256": "4513fbccc94d6b17dd93309c8051be86d9babf97480f61845c96753dff5b3aba",
+    "physical_checkpoint_bound": true,
+    "strict_scored_artifact_validated": true,
+    "expected": 8,
+    "completed": 7,
+    "failed": 1,
+    "missing": 0,
+    "correct": 5,
+    "ordinary_wrong": 2,
+    "benchmark_completed_without_faults": false,
+    "execution_calls": 5978,
+    "execution_http_attempts": 5982,
+    "execution_total_tokens": null,
+    "execution_cost_usd": null,
+    "completed_questions_summary_degraded_sessions": 69,
+    "failed_question_summary_degraded_sessions": 13,
+    "new_provider_calls": 0,
+    "full_500_readiness_verified": false
+  }
+}

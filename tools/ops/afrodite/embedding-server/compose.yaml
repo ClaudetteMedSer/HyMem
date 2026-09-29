@@ -1,0 +1,96 @@
+services:
+  # Service name is load-bearing: HyMem and the searxng-tavily plugin both
+  # reach this as http://embedding-server:8766 over hermes-net. Renaming the
+  # service breaks both DNS names at once.
+  embedding-server:
+    build: .
+    image: embedding-server:local
+    container_name: embedding-server
+    restart: unless-stopped
+    environment:
+      EMBED_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      EMBED_PORT: "8766"
+      EMBED_DIM: "384"
+      EMBED_CACHE_DIR: /cache
+      # Cross-encoder for /v1/rerank. Multilingual on purpose: the real
+      # workload here is Dutch occupational-medicine material, and the
+      # English-only ms-marco rerankers fastembed also ships score Dutch
+      # close to noise.
+      RERANK_MODEL: jinaai/jina-reranker-v2-base-multilingual
+      # Lazy by default. The reranker is ~1.1 GB resident and only the web
+      # search path uses it, which can idle for days; the embedder is on the
+      # hot path for every HyMem write and still loads at startup. Set true to
+      # move the cost to boot instead of to the first search.
+      RERANK_PRELOAD: "false"
+      # Scoring batch size. NOT a throughput knob — a memory guard. Measured
+      # here: 20 documents in one batch drove onnxruntime's arena allocator to
+      # 3.19 GB anonymous, which it never returns, leaving the container parked
+      # against its own cgroup ceiling. At batch 8 the same work settles at
+      # ~2.1 GB anon. Latency is unchanged; the model is compute-bound.
+      RERANK_BATCH_SIZE: "8"
+      # Per-document char cap applied server-side before scoring. The plugin
+      # sends title + snippet, so this is a backstop against a caller pasting
+      # whole pages in: cost is roughly linear in characters (20 docs x 300
+      # chars = 3.1s, x 800 chars = 8.9s on this CPU).
+      RERANK_MAX_CHARS: "1000"
+    volumes:
+      # One cache volume for BOTH models. The reranker download is the big one
+      # (~1.1 GB); keeping it here is what stops a recreate refetching it.
+      - embedding-model-cache:/cache
+    ports:
+      - "127.0.0.1:8766:8766"
+    networks:
+      - hermes-net
+    # Guard rail, not a target. Measured on this box: 0.61 GB anon idle with
+    # the embedder alone, ~2.1 GB anon with the reranker also resident and
+    # scoring a 20-document pool. The rest of what `docker stats` shows is
+    # reclaimable page cache from reading the 1.3 GB model off /cache, which is
+    # why memory.current touches 3.00 GB while oom_kill stays 0. Normal work
+    # therefore sits near 70% of this; it exists so a runaway rerank cannot eat
+    # the box (~10 GB free). Raise it rather than lowering it — an OOM kill
+    # mid-request looks like a mysterious 503 from the reranker, not like a
+    # memory limit. If you ever raise RERANK_BATCH_SIZE, raise this first.
+    mem_limit: 3g
+    # Equal to mem_limit, which DISABLES swap for this container — Docker
+    # derives the swap allowance as memswap_limit minus mem_limit, so equal
+    # means zero. Left unset, Docker defaults memswap to 2 x mem_limit, i.e. a
+    # 3 GB swap allowance on top of the 3 GB above, and that is what went wrong.
+    #
+    # Measured 12 Sep 2026: memory.swap.current sat at 3072 MB, exactly
+    # memory.swap.max, with `max 3008` and `fail 3008` in memory.swap.events —
+    # the ceiling reached and 3008 swap-outs refused. Once a cgroup's swap is
+    # full the kernel cannot reclaim from it at all, so every reclaim pass took
+    # its pages from OTHER cgroups instead. Host swap went 4.7 -> 9.4 GB in a
+    # day and the stack health check fired MEMORY THRASHING at up to
+    # 234 MB/min. `oom_kill` stayed 0 and PSI stall stayed 0.00% throughout:
+    # nothing was short of memory, this container was simply allowed to hoard
+    # 3 GB of swap it never read back.
+    #
+    # Safe against the numbers already recorded above: 0.61 GB anon idle,
+    # ~2.1 GB anon with the reranker resident and scoring a 20-document pool at
+    # RERANK_BATCH_SIZE 8. That leaves ~0.9 GB of headroom inside the 3 GB cap
+    # with no swap at all, and it keeps the reranker RESIDENT — the first
+    # rerank after an idle spell measured 4.38 s against 0.11 s warm, which was
+    # page-fault I/O re-reading weights the kernel had evicted.
+    #
+    # The warning on mem_limit above still governs, and matters MORE now: if
+    # you raise RERANK_BATCH_SIZE, raise mem_limit FIRST. With swap disabled
+    # there is no slow-and-ugly mode left to absorb an overrun — it goes
+    # straight to an OOM kill, which reads as a mysterious 503 from /v1/rerank.
+    # Rollback: cp -a compose.yaml.pre-memswap compose.yaml && docker compose up -d
+    memswap_limit: 3g
+    healthcheck:
+      # /health reports whether the reranker is loaded but never loads it, so
+      # polling every 10s does not defeat the lazy load above.
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8766/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+volumes:
+  embedding-model-cache:
+
+networks:
+  hermes-net:
+    external: true

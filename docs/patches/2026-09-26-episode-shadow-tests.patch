@@ -1,0 +1,277 @@
+--- a/tests/test_db_shadows.py
++++ b/tests/test_db_shadows.py
+@@ -170,6 +170,22 @@
+         with core_db.transaction(conn):
+             conn.execute("DELETE FROM episodes WHERE id='e0'")
+         assert core_db.vec_episodes_aligned(conn) is False
++        assert core_db.prune_extra_episode_vectors(conn) is True
++        assert core_db.vec_episodes_aligned(conn) is True
++        # A wrong overlapping vector is not surplus-only drift.
++        key = conn.execute("SELECT rowid FROM vec_episodes LIMIT 1").fetchone()[0]
++        with core_db.transaction(conn):
++            conn.execute("DELETE FROM vec_episodes WHERE rowid=?", (key,))
++            conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
++                         (key, core_db._pack_vector([0.0] * dim)))
++            conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
++                         (42, core_db._pack_vector([0.0] * dim)))
++        assert core_db.prune_extra_episode_vectors(conn) is False
++        assert conn.execute("SELECT 1 FROM vec_episodes WHERE rowid=42").fetchone()
++        with core_db.transaction(conn):
++            conn.execute("DELETE FROM vec_episodes WHERE rowid=?", (key,))
++        assert core_db.prune_extra_episode_vectors(conn) is False
++        assert conn.execute("SELECT 1 FROM vec_episodes WHERE rowid=42").fetchone()
+         assert core_db.heal_rowid_shadows(conn) is True
+         assert core_db.vec_episodes_aligned(conn) is True
+     finally:
+--- a/tests/test_indexing_deadlines.py
++++ b/tests/test_indexing_deadlines.py
+@@ -448,9 +448,114 @@
+         assert run["error"] == "deadline_exceeded"
+     finally:
+         hy.conn.set_trace_callback(None)
++        hy.close()
++
++
++def test_bounded_surplus_episode_vectors_are_pruned_before_build(
++    monkeypatch: pytest.MonkeyPatch, tmp_path,
++) -> None:
++    from hymem import StubEmbeddingClient
++    from hymem.dreaming import runner
++    from hymem.dreaming.aggregation_material import embedding_storage_identity
++    from hymem.extraction.llm import StubLLMClient
++
++    pytest.importorskip("sqlite_vec")
++    cfg = _maintenance_config(tmp_path, aggregation_nodes_enabled=True,
++                              vacuum_after_prune=False)
++    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
++    model, dim = embedding_storage_identity(StubEmbeddingClient())
++    core_db.ensure_vec_table(hy.conn, dim, model=model)
++    if not core_db.has_vec_table(hy.conn, table="vec_episodes"):
++        hy.close()
++        pytest.skip("vec extension unavailable")
++    hy.conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
++                    (42, core_db._pack_vector([0.0] * dim)))
++    calls = []
++    original_build = runner.build_aggregation_nodes
++
++    def build(*_args, **_kwargs):
++        assert core_db.vec_episodes_aligned(hy.conn)
++        calls.append(True)
++        return original_build(*_args, **_kwargs)
++
++    monkeypatch.setattr(runner, "build_aggregation_nodes", build)
++    monkeypatch.setattr(core_db, "resync_rowid_shadows",
++                        lambda _conn: pytest.fail("broad resync forbidden"))
++    try:
++        report = hy.dream(deadline=MonotonicDeadline(10.0, clock=FakeClock()))
++        assert calls == [True]
++        assert report.aggregation_build_exceptions == 0
++        assert hy.conn.execute("SELECT count(*) FROM vec_episodes").fetchone()[0] == 0
++    finally:
+         hy.close()
+ 
+ 
++@pytest.mark.parametrize("failure", ["deadline", "lease", "verification", "sql"])
++def test_surplus_episode_repair_rolls_back_at_fenced_boundary(
++    monkeypatch: pytest.MonkeyPatch, tmp_path, failure,
++) -> None:
++    from hymem import StubEmbeddingClient
++    from hymem.dreaming.aggregation_material import embedding_storage_identity
++    from hymem.extraction.llm import StubLLMClient
++    import sqlite3
++
++    pytest.importorskip("sqlite_vec")
++    hy = HyMem(_maintenance_config(tmp_path), llm=StubLLMClient(default="[]"))
++    model, dim = embedding_storage_identity(StubEmbeddingClient())
++    core_db.ensure_vec_table(hy.conn, dim, model=model)
++    if not core_db.has_vec_table(hy.conn, table="vec_episodes"):
++        hy.close()
++        pytest.skip("vec extension unavailable")
++    hy.conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
++                    (42, core_db._pack_vector([0.0] * dim)))
++    clock = FakeClock()
++    fence = None
++    if failure == "lease":
++        hy.conn.execute("INSERT INTO run_lock(name,holder,acquired_at) "
++                        "VALUES ('test','owned',datetime('now'))")
++        fence = core_db.activate_transaction_lease_fence(
++            hy.conn, name="test", holder="owned")
++
++    def after_delete(conn):
++        assert conn.execute("SELECT count(*) FROM vec_episodes").fetchone()[0] == 0
++        if failure == "deadline":
++            clock.advance(1.0)
++        if failure == "lease":
++            conn.execute("UPDATE run_lock SET holder='replacement' WHERE name='test'")
++        return failure != "verification"
++
++    monkeypatch.setattr(core_db, "vec_episodes_aligned", after_delete)
++    signal = {"deadline": DeadlineExceeded, "lease": core_db.LeaseOwnershipLost,
++              "verification": RuntimeError, "sql": sqlite3.OperationalError}[failure]
++    repair_conn = hy.conn
++    if failure == "sql":
++        class FinalReadFault:
++            reads = 0
++
++            def __getattr__(self, name):
++                return getattr(hy.conn, name)
++
++            def execute(self, statement, *args):
++                if statement == "SELECT rowid,embedding FROM vec_episodes":
++                    self.reads += 1
++                    if self.reads == 2:
++                        raise sqlite3.OperationalError("synthetic final read fault")
++                return hy.conn.execute(statement, *args)
++
++        repair_conn = FinalReadFault()
++        monkeypatch.setattr(core_db, "_load_vec_extension", lambda _conn: True)
++    try:
++        with use_deadline(MonotonicDeadline(1.0, clock=clock)):
++            with pytest.raises(signal):
++                core_db.prune_extra_episode_vectors(repair_conn)
++        assert hy.conn.execute("SELECT rowid FROM vec_episodes").fetchone()[0] == 42
++        assert not hy.conn.in_transaction
++    finally:
++        if fence is not None:
++            core_db.deactivate_transaction_lease_fence(fence)
++        hy.close()
++
++
+ def test_bounded_misaligned_rowid_shadows_fail_closed_without_resync(
+     monkeypatch: pytest.MonkeyPatch, tmp_path,
+ ) -> None:
+--- /dev/null
++++ b/tests/test_episode_shadow_root_controls.py
+@@ -0,0 +1,132 @@
++"""Independent root acceptance of surplus-only episode shadow repair."""
++import json
++import sqlite3
++
++import pytest
++
++from hymem import HyMem, StubEmbeddingClient
++from hymem.core import db
++from hymem.dreaming.aggregation_material import embedding_storage_identity
++from hymem.dreaming.embeddings import embedding_text_hash
++from hymem.extraction.llm import StubLLMClient
++from tests.test_db_shadows import _seed_episode
++
++
++@pytest.fixture
++def populated(cfg):
++    pytest.importorskip("sqlite_vec")
++    hy = HyMem(cfg, llm=StubLLMClient(default="[]"))
++    embed = StubEmbeddingClient()
++    model, dim = embedding_storage_identity(embed)
++    conn = hy.conn
++    with db.transaction(conn), db.embedding_mutation(conn):
++        _seed_episode(conn, "root-valid", "Root valid")
++        vector = embed.embed(["Root valid\nsummary of Root valid"])[0]
++        conn.execute(
++            "INSERT INTO episode_embeddings(episode_id,vector_json,model,dim,"
++            "text_hash,embedding_producer_key) VALUES (?,?,?,?,?,?)",
++            ("root-valid", json.dumps(vector), model, dim,
++             embedding_text_hash("Root valid\nsummary of Root valid"), model),
++        )
++    db.ensure_vec_table(conn, dim, model=model)
++    if not db.has_vec_table(conn, table="vec_episodes"):
++        hy.close()
++        pytest.skip("sqlite-vec unavailable")
++    assert db.vec_episodes_aligned(conn)
++    key = db.episode_vector_rowids(["root-valid"])["root-valid"]
++    for extra in (41, 42, 43):
++        assert extra != key
++        conn.execute("INSERT INTO vec_episodes(rowid,embedding) VALUES (?,?)",
++                     (extra, db._pack_vector(vector)))
++    try:
++        yield conn, key, dim
++    finally:
++        hy.close()
++
++
++def snapshot(conn):
++    result = {}
++    for table in ("episodes", "episode_embeddings", "sessions", "messages",
++                  "message_retention_coverage", "episode_message_sources",
++                  "schema_meta", "aggregation_build_health", "run_lock"):
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
++            result[table] = sorted(repr(tuple(row)) for row in conn.execute(
++                'SELECT * FROM "' + table + '"'))
++    return result
++
++
++def test_root_preserves_authoritative_rows_valid_vector_and_repeat(populated):
++    conn, key, _ = populated
++    before = snapshot(conn)
++    vector = bytes(conn.execute("SELECT embedding FROM vec_episodes WHERE rowid=?",
++                                (key,)).fetchone()[0])
++    assert db.prune_extra_episode_vectors(conn)
++    assert snapshot(conn) == before
++    assert [(int(r[0]), bytes(r[1])) for r in conn.execute(
++        "SELECT rowid,embedding FROM vec_episodes")] == [(key, vector)]
++    assert db.prune_extra_episode_vectors(conn) is False
++    assert snapshot(conn) == before
++    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
++    assert not conn.execute("PRAGMA foreign_key_check").fetchall()
++
++
++@pytest.mark.parametrize("dimension", ["0", "bad", "-1"])
++def test_root_unverifiable_dimension_never_deletes(populated, dimension):
++    conn, _, _ = populated
++    conn.execute("UPDATE schema_meta SET value=? WHERE key='vec_dim'", (dimension,))
++    before = [tuple(r) for r in conn.execute("SELECT rowid,embedding FROM vec_episodes")]
++    assert db.prune_extra_episode_vectors(conn) is False
++    assert [tuple(r) for r in conn.execute("SELECT rowid,embedding FROM vec_episodes")] == before
++
++
++def test_root_producer_mismatch_never_promotes_or_deletes(populated):
++    conn, _, _ = populated
++    conn.execute("UPDATE schema_meta SET value=? WHERE key='vec_model'",
++                 ("hymem-embedding-producer-v1:" + "a" * 64,))
++    before = [tuple(r) for r in conn.execute("SELECT rowid,embedding FROM vec_episodes")]
++    assert db.prune_extra_episode_vectors(conn) is False
++    assert [tuple(r) for r in conn.execute("SELECT rowid,embedding FROM vec_episodes")] == before
++
++
++def test_root_commit_failure_rolls_back_all_surplus_deletions(populated):
++    conn, _, _ = populated
++    before = [tuple(r) for r in conn.execute("SELECT rowid,embedding FROM vec_episodes")]
++
++    class CommitFault:
++        def __getattr__(self, name):
++            return getattr(conn, name)
++
++        def execute(self, sql, *args):
++            if sql == "COMMIT":
++                raise sqlite3.OperationalError("synthetic commit failure")
++            return conn.execute(sql, *args)
++
++    with pytest.raises(sqlite3.OperationalError, match="synthetic commit failure"):
++        db.prune_extra_episode_vectors(CommitFault())
++    assert not conn.in_transaction
++    assert [tuple(r) for r in conn.execute("SELECT rowid,embedding FROM vec_episodes")] == before
++    assert db.prune_extra_episode_vectors(conn)
++
++
++def test_root_partial_delete_failure_rolls_back_earlier_deletion(populated):
++    conn, _, _ = populated
++    before = [tuple(r) for r in conn.execute("SELECT rowid,embedding FROM vec_episodes")]
++
++    class DeleteFault:
++        deletes = 0
++
++        def __getattr__(self, name):
++            return getattr(conn, name)
++
++        def execute(self, sql, *args):
++            if sql.startswith("DELETE FROM vec_episodes WHERE"):
++                self.deletes += 1
++                if self.deletes == 2:
++                    raise sqlite3.OperationalError("synthetic second delete failure")
++            return conn.execute(sql, *args)
++
++    proxy = DeleteFault()
++    with pytest.raises(sqlite3.OperationalError, match="synthetic second delete failure"):
++        db.prune_extra_episode_vectors(proxy)
++    assert proxy.deletes == 2 and not conn.in_transaction
++    assert [tuple(r) for r in conn.execute("SELECT rowid,embedding FROM vec_episodes")] == before

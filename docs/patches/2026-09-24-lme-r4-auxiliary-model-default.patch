@@ -1,0 +1,28 @@
+--- a/README.md
++++ b/README.md
+@@ -1036,19 +1036,18 @@
+ 
+ Verification-snapshot caveat: this test-only copy includes surrounding documentation
+ from the newer, uncommitted working tree. The `HYMEM_LLM_MODEL` row below records
+-the frozen independent-summary candidate's executable default and rejection
+-policy, not current provider availability or a recommendation to use an older
+-alias. The separately approved live diagnostic explicitly requests
+-`deepseek-flash` with thinking disabled. Deployment must integrate and verify the
+-current approved model policy and request settings; this candidate does not
+-automatically inherit the newer checkout's model changes.
++the R4 independent-summary candidate's explicitly integrated executable model
++policy. `deepseek-flash` identifies a requested service, not immutable provider
++weights. The earlier R3 snapshot remains unchanged. Deployment must still
++integrate and verify the remaining approved request/transport settings; this
++candidate does not automatically inherit unrelated newer checkout changes.
+ 
+ | Variable | Default | Purpose |
+ |---|---|---|
+ | `HYMEM_ROOT` | `~/.hermes` | Directory for sqlite + markdown files |
+ | `HYMEM_LLM_API_KEY` | provider key for an exact official origin | Purpose-bound LLM key for the configured endpoint; `DEEPSEEK_API_KEY`/`OPENAI_API_KEY` never cross to a custom host |
+ | `HYMEM_LLM_BASE_URL` | `https://api.deepseek.com` | LLM endpoint |
+-| `HYMEM_LLM_MODEL` | `deepseek-v4-flash` | Frozen candidate extraction default; retired `deepseek-chat` and `deepseek-reasoner` are rejected before client construction. This records code behavior, not current provider availability |
++| `HYMEM_LLM_MODEL` | `deepseek-flash` | Requested-service extraction default; retired `deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` are rejected before client construction. Service identity does not attest immutable weights |
+ | `HYMEM_LLM_THINKING` | `auto` | DeepSeek thinking-body policy; `auto` safely disables thinking on identified DeepSeek endpoints/models, while unrelated providers receive no vendor-specific body |
+ | `HYMEM_EMBEDDING_API_KEY` | none | Purpose-bound key for an explicit embedding endpoint; `OPENAI_API_KEY` is inherited only for the exact official HTTPS `api.openai.com` origin, while loopback uses `local` |
+ | `HYMEM_EMBEDDING_BASE_URL` | `local://feature-hash` | Actual OpenAI-compatible API base, including its route prefix (for example `/v1` when served there); no automatic `/v1` suffix. Remote URLs require HTTPS by default; omission selects the deterministic no-network fallback |

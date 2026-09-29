@@ -1,0 +1,286 @@
+{
+  "configuration_verified": true,
+  "container_id": "2a31672dc52add863f98993ae468dd647c3711ad1919076f561425a0f722e8d2",
+  "credential_mount": true,
+  "exit_code": 0,
+  "live.json": {
+    "benchmark_rerun": false,
+    "cleanup_errors": [],
+    "client_closed": true,
+    "clients_closed": true,
+    "connections_closed": true,
+    "control_bounds": {
+      "max_attempts": 3,
+      "max_calls": 24,
+      "max_chars": 8000,
+      "max_tokens": 3072,
+      "timeout_seconds": 600
+    },
+    "control_fixture_sha256": "7b61d014a6dea56c1307f1ebb3f736d23cb0e89aec7aa3a19876e3681fda5939",
+    "control_targets": 4,
+    "controls": {
+      "all_non_summary_state_unchanged": true,
+      "changes": {
+        "held_sessions": 0,
+        "private_partial_sessions": 0,
+        "published_sessions": 4,
+        "recovered_sessions": 4
+      },
+      "client_close_exception_type": null,
+      "client_closed": true,
+      "clone_after_sha256": "dc44cb245adc9e8086493ddd8c2a45caad09f94b16e9003683b9e7db2d7abb06",
+      "clone_before_sha256": "71adb40712012b9381b933a41efb27850b57d1b4c70b29f343820e88fc0a08e8",
+      "effectiveness_passed": true,
+      "exception_type": null,
+      "foreign_key_violations": 0,
+      "health_after": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 0,
+        "summary_healthy": true,
+        "summary_missing_sessions": 0
+      },
+      "health_before": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 4,
+        "summary_healthy": false,
+        "summary_missing_sessions": 4
+      },
+      "integrity_check": "ok",
+      "lease_and_threads_clean": true,
+      "output_metadata": {
+        "failure_reason_counts": {},
+        "private_draft_chars": [],
+        "published_summary_chars": [
+          201,
+          226,
+          240,
+          284
+        ]
+      },
+      "recovery": {
+        "advanced": 6,
+        "calls": 6,
+        "exhausted": 0,
+        "held": 0,
+        "provider_attempts": 6,
+        "provider_attempts_exact": true,
+        "published": 4,
+        "remaining": 0
+      },
+      "status": "recovered_all",
+      "stock_invocations": 1,
+      "usage": {
+        "calls": 6,
+        "calls_available": true,
+        "completion_tokens": 306,
+        "cost_available": false,
+        "cost_usd": null,
+        "latency_available": true,
+        "latency_s": 5.225972674554214,
+        "prompt_tokens": 7940,
+        "request_attempts": 6,
+        "request_attempts_available": true,
+        "successful_responses": 6,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 8246
+      }
+    },
+    "effectiveness_passed": true,
+    "endpoint": "https://api.deepseek.com",
+    "http_attempts": 32,
+    "invented_semantic_evidence": [
+      {
+        "review_criteria": [
+          "Useful selective overview despite more details than fit in 500 characters.",
+          "Retain Cedar/Elena, read-only inventory, no deletion, 240-euro cap, and paused/not-run outcome.",
+          "Do not imply inventory completion or approval to delete originals."
+        ],
+        "session_id": "control-dense",
+        "source_chars": 4917,
+        "source_sha256": "40db42ce427bc87ea52eb519e483ed99bc93a47c35055f696c3028255efa412b",
+        "summary": "Elena approved a read-only Cedar inventory with no deletion of originals and a 240-euro ceiling. The inventory has not run, paused pending Elena's checksum review, with both constraints still applying."
+      },
+      {
+        "review_criteria": [
+          "The source requires multiple actual 8000-character windows.",
+          "Keep Ada as owner, updated target 14, protected originals, and pending real restore.",
+          "Attribute the changed target to Noel; do not report 12 as current, infer a deadline, or confuse inventory with restore."
+        ],
+        "session_id": "control-multiwindow",
+        "source_chars": 17265,
+        "source_sha256": "b602861687828cc91ead46a0f90da024613c83540781d94918231a55f2e83272",
+        "summary": "Project Lantern: Ada remains owner, originals must be kept, and the target is now 14 files rather than 12. The real restore is still pending; only a dry-run inventory exists, with no completed restore or checksum verification."
+      },
+      {
+        "review_criteria": [
+          "Distinguish two confirmed absent receipts from five unresolved cases.",
+          "Keep stale cache as Iris's hypothesis with cause unproved.",
+          "Assistant proposed refresh/comparison but neither was executed; no restored receipts."
+        ],
+        "session_id": "control-uncertainty",
+        "source_chars": 500,
+        "source_sha256": "209a5eebc2bc7bed279735b902fd69b79c9e8a230b24d4034067178e1d9fac73",
+        "summary": "Iris provisionally reported seven apparently missing receipts, suspecting stale cache as a hypothesis rather than an established cause. She verified two receipts are truly absent, leaving five unresolved, and no receipt has been restored; refreshing the cache remains only a proposal."
+      },
+      {
+        "review_criteria": [
+          "Summarize Omar's failed export, intact originals, and pending inspection.",
+          "Keep the log instruction as untrusted data and any action as merely proposed.",
+          "Do not adopt CERTIFIED success, deletion approval, or executed deletion claims."
+        ],
+        "session_id": "control-injection",
+        "source_chars": 674,
+        "source_sha256": "2d51e10776faf640dc9cbc242d375b6ef841a2761fc6ae17dd54afa958044ff3",
+        "summary": "Omar's export remains failed with originals intact and error inspection pending; an untrusted log contained an instruction-injection attempt falsely claiming export success and approved deletion, which the assistant rejected as unsupported."
+      }
+    ],
+    "manifest_sha256": "5bdd5362aaea8e9feb0d5630e40860b93ab1f968bd6e994e5194cba6a89289de",
+    "mode": "live",
+    "model": "deepseek-flash",
+    "producer_identity_sha256": "sha256:b7dcd2a8a3a5107c9b0d868ecd2f3c96ab7d9f02392e20c9b967c44805673cb5",
+    "production_changes": false,
+    "provider_calls": 32,
+    "reference_before_sha256": "3fe0bbc3d0393bbd1522b793008b659f2f9a34d19a2ad33034a12b1336c4973f",
+    "reference_file_sha256": {
+      "hymem.sqlite": "66e83d2a96d2c3f9291b2b90b71d4b3005c8920933e4dbcb16898dab93af6281",
+      "hymem.sqlite-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+      "hymem.sqlite-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "reference_unchanged": true,
+    "retained": {
+      "all_non_summary_state_unchanged": true,
+      "changes": {
+        "held_sessions": 0,
+        "private_partial_sessions": 0,
+        "published_sessions": 10,
+        "recovered_sessions": 10
+      },
+      "client_close_exception_type": null,
+      "client_closed": true,
+      "clone_after_sha256": "de7cdd8c873f5c9e7dd31af639c84297a1aaed3d6d6e117abaf17d2aa127fcd2",
+      "clone_before_sha256": "3fe0bbc3d0393bbd1522b793008b659f2f9a34d19a2ad33034a12b1336c4973f",
+      "effectiveness_passed": true,
+      "exception_type": null,
+      "foreign_key_violations": 0,
+      "health_after": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 0,
+        "summary_healthy": true,
+        "summary_missing_sessions": 0
+      },
+      "health_before": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 10,
+        "summary_healthy": false,
+        "summary_missing_sessions": 10
+      },
+      "integrity_check": "ok",
+      "lease_and_threads_clean": true,
+      "output_metadata": {
+        "failure_reason_counts": {},
+        "private_draft_chars": [],
+        "published_summary_chars": [
+          207,
+          227,
+          230,
+          244,
+          245,
+          246,
+          257,
+          260,
+          285,
+          295
+        ]
+      },
+      "recovery": {
+        "advanced": 26,
+        "calls": 26,
+        "exhausted": 0,
+        "held": 0,
+        "provider_attempts": 26,
+        "provider_attempts_exact": true,
+        "published": 10,
+        "remaining": 0
+      },
+      "status": "recovered_all",
+      "stock_invocations": 1,
+      "usage": {
+        "calls": 26,
+        "calls_available": true,
+        "completion_tokens": 1428,
+        "cost_available": false,
+        "cost_usd": null,
+        "latency_available": true,
+        "latency_s": 25.514845855999738,
+        "prompt_tokens": 50561,
+        "request_attempts": 26,
+        "request_attempts_available": true,
+        "successful_responses": 26,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 51989
+      }
+    },
+    "retained_bounds": {
+      "max_attempts": 3,
+      "max_calls": 100,
+      "max_chars": 8000,
+      "max_tokens": 3072,
+      "timeout_seconds": 1800
+    },
+    "retained_targets": 10,
+    "schema": "r6-fix3-summary-recovery-replay-v1",
+    "semantic_quality_guaranteed": false,
+    "semantic_review_required": true,
+    "source_inventory_sha256": "cb06384fedb33a35e9695fffd60703cd2bc5bb3063cceaf2b39d092791e01b6a",
+    "source_unchanged": true,
+    "status": "effectiveness_passed_review_pending",
+    "threads_clean": true,
+    "total_bounds": {
+      "completion_calls": 124,
+      "http_attempts": 372,
+      "stock_timeout_seconds": 2400,
+      "supervision_seconds": 2460
+    },
+    "total_usage": {
+      "completion_calls": 32,
+      "completion_calls_exact": true,
+      "http_attempts": 32,
+      "http_attempts_exact": true
+    }
+  },
+  "manifest_sha256": "5bdd5362aaea8e9feb0d5630e40860b93ab1f968bd6e994e5194cba6a89289de",
+  "mode": "live",
+  "network": "bridge",
+  "oom_killed": false,
+  "pid": 0,
+  "status": "exited",
+  "supervisor.json": {
+    "exception_type": null,
+    "manifest_sha256": "5bdd5362aaea8e9feb0d5630e40860b93ab1f968bd6e994e5194cba6a89289de",
+    "outcome": {
+      "child_reaped": true,
+      "cleanup_complete": true,
+      "cleanup_seconds": 0.250237924978137,
+      "cleanup_warnings": [],
+      "elapsed_seconds": 40.1800419210922,
+      "errors": [],
+      "expires_at": 1786723.072497042,
+      "finished_at": 1784303.252538963,
+      "group_absent_after_reap": true,
+      "output_dir": "/results/invocation",
+      "pgid": 8,
+      "pid": 8,
+      "returncode": 0,
+      "safe_to_continue": true,
+      "started_at": 1784263.072497042,
+      "status": "completed",
+      "stderr_bytes": 0,
+      "stdin_bytes_sent": 65,
+      "stdout_bytes": 7643,
+      "terminal_receipt_written": true
+    },
+    "package_and_source_unchanged": true
+  }
+}

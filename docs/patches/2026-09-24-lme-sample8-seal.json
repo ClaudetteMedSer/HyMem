@@ -1,0 +1,20 @@
+{
+  "archive": "/private/tmp/hymem-sample8-20260924.iH7YcB/sealed.tgz",
+  "archive_sha256": "082216f9de901bb634f3d7b206759d4df23eb3041abeeb9bb59c708f8459733c",
+  "files_sha256": {
+    "bundle/RUNBOOK.md": "8f52bb915d408e8d15389c099c84f845c3f4d30476b2c909a103d2d75b9c40a7",
+    "bundle/lme_q1_startup_preflight.py": "daf8a845d302597e2c485483f5ef67a882c0a98c3b9435ec12a11ff780da9282",
+    "bundle/manifest.json": "fa471c38440dd70e8527b75171b1af8fc9b48ee98081df9738b45093f41efffc",
+    "bundle/q1_stock_host.py": "eb0681b3818dc154ddce751058ff6bac9cb11aacefa132d4ace2e48970508c8a",
+    "bundle/q1_stock_run.py": "3122395aec7dbb606521847254168ed8dba7864f4aa009bdfa8e2111aba559dc",
+    "bundle/q1_stock_validate.py": "36531f10a6b484482d373bbb7a0c344e2710a737ee80ad2045bbdf542e94a8c8",
+    "bundle/supervised_invocation.py": "9bab7fc77e68cbea050b774791aee94893c7eb54d3cbb87f8b3e7bee33ef85bc",
+    "bundle/transport_common.py": "1c98c73cfb1b607113c726616058862fd6bb16a57901a57c8962ee4a0a2807a0"
+  },
+  "manifest_sha256": "fa471c38440dd70e8527b75171b1af8fc9b48ee98081df9738b45093f41efffc",
+  "output": "/private/tmp/hymem-sample8-20260924.iH7YcB/sealed",
+  "paid_calls": 0,
+  "schema": "lme-sample8-seal-v1",
+  "source_files": 231,
+  "source_manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc"
+}

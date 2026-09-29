@@ -1,0 +1,41 @@
+{
+  "network": "none",
+  "production_changes": false,
+  "provider_calls": 0,
+  "read_only_mount": true,
+  "schema": "r6-final-benchmark-store-audit-v1",
+  "stores": [
+    {
+      "counts": {
+        "chunk_extraction_attempts": 0,
+        "chunks": 797,
+        "dream_runs": 7,
+        "episodes": 222,
+        "knowledge_graph": 613,
+        "messages": 532,
+        "processed_chunks": 265,
+        "sessions": 52,
+        "summary_recovery": 0
+      },
+      "file_sha256": {
+        "hymem.sqlite": "1633c34da4d747b3d2de578cd423d18294026ba9d6597e0f16f363d9f82ab96d",
+        "hymem.sqlite-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+        "hymem.sqlite-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "files_unchanged": true,
+      "foreign_key_violations": 0,
+      "integrity_check": "ok",
+      "original_failing_chunk_processed": true,
+      "quarantined_sessions": {
+        "digest_quarantined": 0,
+        "facts_quarantined": 0,
+        "profile_quarantined": 0
+      },
+      "schema": "63",
+      "store": "hymem-lme-k2n60d2c",
+      "summary_failure_reasons": {
+        "summary_output_cap": 11
+      }
+    }
+  ]
+}

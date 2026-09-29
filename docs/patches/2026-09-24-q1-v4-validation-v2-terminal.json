@@ -1,0 +1,11 @@
+{
+  "configuration_verified": true,
+  "container_id": "2c87f93ef1468223358b5d49411695c9d6b0d2f9910545416604f0f1892c5ecb",
+  "credential_mount": false,
+  "exit_code": 0,
+  "manifest_sha256": "5cdb8db3213229aed6f140da6747ff2a1048433e75437b3a7feda6521f0b73a3",
+  "network": "none",
+  "oom_killed": false,
+  "pid": 0,
+  "status": "exited"
+}

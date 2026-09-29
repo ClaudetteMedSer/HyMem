@@ -1,0 +1,988 @@
+diff --git a/benchmarks/extraction_canary.py b/benchmarks/extraction_canary.py
+index b6a44cb..ec30fce 100644
+--- a/benchmarks/extraction_canary.py
++++ b/benchmarks/extraction_canary.py
+@@ -44,7 +44,7 @@ from hymem.extraction.contract import (
+     validate_effective_config_extraction_contract,
+ )
+ from hymem.extraction.jsonio import loads_exact_or_fenced
+-from hymem.extraction.llm import LLMClient
++from hymem.extraction.llm import LLMClient, LLMOutputTruncatedError
+ from hymem.extraction.retry import DEFAULT_RETRY_ATTEMPTS
+ from hymem.extraction.triples import normalize_combined_triple_item
+ 
+@@ -53,7 +53,7 @@ from hymem.extraction.triples import normalize_combined_triple_item
+ # pass now proves that provider requests carried the exact table-header/prelude
+ # and adjacent-prose contexts needed by two deliberately non-self-contained
+ # claims, while list and fence controls remained atomic.
+-EXTRACTION_CANARY_VERSION = "hymem-phase1-extraction-canary-v17"
++EXTRACTION_CANARY_VERSION = "hymem-phase1-extraction-canary-v18"
+ EXTRACTION_CANARY_TABLE_SOURCE_MESSAGE_ID = 9_271_604_311
+ EXTRACTION_CANARY_PROSE_SOURCE_MESSAGE_ID = 9_271_604_312
+ EXTRACTION_CANARY_SOURCE_MESSAGE_IDS = (
+@@ -253,6 +253,7 @@ _CANARY_EXPECTED_CLAIMS = (
+     ),
+ )
+ _NORMAL_EXECUTION_PATH = {
++    "provider_output_truncations": 0,
+     "primary_requests": 4,
+     "empty_verification_requests": 2,
+     "omission_verification_requests": 2,
+@@ -316,6 +317,7 @@ _EVIDENCE_KEYS = frozenset({
+     "object_properties",
+ })
+ _EXECUTION_PATH_KEYS = frozenset({
++    "provider_output_truncations",
+     "primary_requests",
+     "empty_verification_requests",
+     "omission_verification_requests",
+@@ -598,7 +600,7 @@ def _nonnegative_number(value: object, *, integer: bool = False):
+ 
+ def _validate_usage(
+     value: object, *, completion_calls: int, provider_attempts: int,
+-    passed: bool,
++    passed: bool, provider_output_truncations: int,
+ ) -> None:
+     if not isinstance(value, Mapping) or set(value) != _USAGE_KEYS:
+         raise _integrity("usage shape is invalid")
+@@ -632,9 +634,9 @@ def _validate_usage(
+     if (
+         calls != successes
+         or attempts != provider_attempts
+-        or calls > completion_calls
++        or calls + provider_output_truncations > completion_calls
+         or attempts < completion_calls
+-        or (passed and calls != completion_calls)
++        or (passed and calls + provider_output_truncations != completion_calls)
+     ):
+         raise _integrity("usage counters do not reconcile")
+ 
+@@ -662,10 +664,11 @@ def _validate_execution_path(
+     completion_calls: int,
+     initial_leaves: int,
+     passed: bool,
+-) -> None:
++    policy: Mapping[str, Any],
++) -> int:
+     """Validate bounded evidence derived from the actual provider requests."""
+ 
+-    if not isinstance(value, Mapping) or set(value) != _EXECUTION_PATH_KEYS:
++    if not isinstance(value, Mapping) or set(value) != set(policy["normal_execution_path"]):
+         raise _integrity("execution path shape is invalid")
+     path = dict(value)
+     source_ids = path.pop("source_message_ids_seen")
+@@ -677,7 +680,7 @@ def _validate_execution_path(
+         raise _integrity("execution path structural probes are invalid")
+     if (
+         not isinstance(source_ids, list)
+-        or len(source_ids) > len(EXTRACTION_CANARY_SOURCE_MESSAGE_IDS)
++        or len(source_ids) > len(policy["source_message_ids"])
+         or any(
+             isinstance(item, bool) or not isinstance(item, int) or item < 1
+             for item in source_ids
+@@ -690,6 +693,9 @@ def _validate_execution_path(
+         for item in path.values()
+     ):
+         raise _integrity("execution path counters are invalid")
++    truncations = path.get("provider_output_truncations", 0)
++    if truncations > completion_calls:
++        raise _integrity("truncation count exceeds requests")
+ 
+     primary = path["primary_requests"]
+     empty = path["empty_verification_requests"]
+@@ -739,7 +745,7 @@ def _validate_execution_path(
+         or omission < 2
+         or path["parsed_source_records"] != completion_calls
+         or path["source_record_parse_failures"] != 0
+-        or source_ids != list(EXTRACTION_CANARY_SOURCE_MESSAGE_IDS)
++        or source_ids != policy["source_message_ids"]
+         or path["table_claim_requests"] < 2
+         or path["table_claim_exact_context_requests"]
+         != path["table_claim_requests"]
+@@ -761,10 +767,11 @@ def _validate_execution_path(
+         raise _integrity("passed report did not exercise exact context paths")
+     if (
+         passed
+-        and completion_calls == EXTRACTION_CANARY_NORMAL_PASS_COMPLETION_CALLS
+-        and not _strict_equal(value, _NORMAL_EXECUTION_PATH)
++        and completion_calls == policy["normal_pass_completion_calls"]
++        and not _strict_equal(value, policy["normal_execution_path"])
+     ):
+         raise _integrity("normal execution path differs from exact policy")
++    return truncations
+ 
+ 
+ class _RecordingClient:
+@@ -774,13 +781,18 @@ class _RecordingClient:
+         self.delegate = delegate
+         self.requests: list[Any] = []
+         self.responses: list[tuple[Any, Any]] = []
++        self.provider_output_truncations = 0
+ 
+     def __getattr__(self, name: str) -> Any:
+         return getattr(self.delegate, name)
+ 
+     def complete(self, request: Any) -> str:
+         self.requests.append(request)
+-        response = self.delegate.complete(request)
++        try:
++            response = self.delegate.complete(request)
++        except LLMOutputTruncatedError:
++            self.provider_output_truncations += 1
++            raise
+         self.responses.append((request, response))
+         return response
+ 
+@@ -879,7 +891,8 @@ def _response_expected_claim_indexes(response: object) -> list[int]:
+                 key in normalized and _strict_equal(normalized[key], value)
+                 for key, value in expected.items()
+             ):
+-                indexes.append(index)
++                if index not in indexes:
++                    indexes.append(index)
+     return indexes
+ 
+ 
+@@ -1093,8 +1106,8 @@ def _validate_client(
+             raise _integrity("client differs from memory pipeline")
+ 
+ 
+-def _validate_claim_evidence(value: object) -> list[int]:
+-    if not isinstance(value, list) or len(value) > len(_CANARY_EXPECTED_CLAIMS):
++def _validate_claim_evidence(value: object, expected_claims: list[dict]) -> list[int]:
++    if not isinstance(value, list) or len(value) > len(expected_claims):
+         raise _integrity("claim evidence shape is invalid")
+     indexes: list[int] = []
+     for evidence in value:
+@@ -1103,13 +1116,13 @@ def _validate_claim_evidence(value: object) -> list[int]:
+         index = evidence.get("expected_claim_index")
+         if (
+             isinstance(index, bool) or not isinstance(index, int)
+-            or index < 0 or index >= len(_CANARY_EXPECTED_CLAIMS)
++            or index < 0 or index >= len(expected_claims)
+             or index in indexes
+         ):
+             raise _integrity("claim evidence indexes are invalid")
+         expected = {
+             "expected_claim_index": index,
+-            **extraction_canary_policy()["expected_claims"][index],
++            **expected_claims[index],
+         }
+         if not _strict_equal(dict(evidence), expected):
+             raise _integrity("claim evidence does not match the canary contract")
+@@ -1134,15 +1147,32 @@ def validate_extraction_canary_report(
+     The function intentionally emits structural errors only.
+     """
+ 
++    policy = extraction_canary_policy(prompt_version=expected_prompt_version)
++    return _validate_report_with_policy(
++        value, policy=policy, expected_mode=expected_mode,
++        expected_client=expected_client, require_client_closed=require_client_closed,
++    )
++
++
++def _validate_report_with_policy(
++    value: object, *, policy: Mapping[str, Any], expected_mode: str,
++    expected_client: Mapping[str, Any] | None = None,
++    require_client_closed: bool = False,
++) -> dict[str, Any]:
++    """Private core: policy must come from a strict current/archive validator.
++
++    Historical callers supply a frozen known-version policy with a structurally
++    validated recorded contract, never a reconstructed current producer.
++    """
+     if expected_mode not in _EXPECTED_MODES:
+         raise _integrity("validation mode is unsupported")
+     if not isinstance(value, Mapping):
+         raise _integrity("report is absent")
+     report = dict(value)
+-    validate_extraction_canary_policy(
+-        {key: report[key] for key in _POLICY_KEYS if key in report},
+-        expected_prompt_version=expected_prompt_version,
+-    )
++    if not _strict_equal(
++        {key: report[key] for key in _POLICY_KEYS if key in report}, dict(policy),
++    ):
++        raise _integrity("policy identity is unsupported")
+ 
+     if expected_mode == "pending":
+         if set(report) != _POLICY_KEYS | {"status"} or report.get("status") != "pending":
+@@ -1183,30 +1213,46 @@ def validate_extraction_canary_report(
+     if (
+         type(completion_calls) is not int
+         or completion_calls < (0 if failed else 1)
+-        or completion_calls > EXTRACTION_CANARY_MAX_COMPLETION_CALLS
++        or completion_calls > policy["max_completion_calls"]
+         or type(provider_attempts) is not int
+         or provider_attempts < completion_calls
+-        or provider_attempts > EXTRACTION_CANARY_MAX_PROVIDER_ATTEMPTS
++        or provider_attempts > policy["max_provider_attempts"]
+         or type(initial_leaves) is not int
+         or initial_leaves < 0
+-        or initial_leaves > EXTRACTION_CANARY_EXPECTED_PREPARTITION_LEAVES
++        or initial_leaves > policy["expected_prepartition_leaves"]
+     ):
+         raise _integrity("attempt counters are invalid")
+     if (
+         not failed
+-        and completion_calls < EXTRACTION_CANARY_MIN_PASS_COMPLETION_CALLS
++        and completion_calls < policy["minimum_pass_completion_calls"]
+     ):
+         raise _integrity("passed report lacks omission verification")
+-    _validate_usage(
+-        report.get("usage"), completion_calls=completion_calls,
+-        provider_attempts=provider_attempts, passed=not failed,
+-    )
+-    _validate_execution_path(
++    truncations = _validate_execution_path(
+         report.get("execution_path"),
+         completion_calls=completion_calls,
+         initial_leaves=initial_leaves,
+         passed=not failed,
++        policy=policy,
+     )
++    _validate_usage(
++        report.get("usage"), completion_calls=completion_calls,
++        provider_attempts=provider_attempts, passed=not failed,
++        provider_output_truncations=truncations,
++    )
++    # Emissions require admitted text. A typed truncation contains no response
++    # payload and cannot substantiate a claim, even when its request was valid.
++    admitted = report["usage"]["calls"]
++    path = report["execution_path"]
++    if "provider_output_truncations" in path and (
++        any(path[f"{claim}_claim_exact_context_emissions"]
++            + path[f"{claim}_claim_wrong_context_emissions"] > admitted
++            for claim in ("table", "prose"))
++        or (not failed and (
++            path["table_claim_exact_context_emissions"]
++            + path["prose_claim_exact_context_emissions"] > admitted
++        ))
++    ):
++        raise _integrity("claim emissions exceed admitted responses")
+     _validate_client(report.get("client"), expected_client=expected_client)
+     closed = report.get("client_closed")
+     if closed is not None and not isinstance(closed, bool):
+@@ -1214,14 +1260,15 @@ def validate_extraction_canary_report(
+     if require_client_closed and closed is not True:
+         raise _integrity("configured client was not closed successfully")
+ 
+-    evidence_indexes = _validate_claim_evidence(report.get("claim_evidence"))
++    expected_claims = policy["expected_claims"]
++    evidence_indexes = _validate_claim_evidence(report.get("claim_evidence"), expected_claims)
+     matched = report.get("matched_supported_claims")
+     missing = report.get("missing_expected_claim_indexes")
+     triple_count = report.get("valid_triples_returned")
+     marker_count = report.get("valid_markers_returned")
+     duplicate_count = report.get("duplicate_triples_collapsed")
+     expected_missing = [
+-        index for index in range(len(_CANARY_EXPECTED_CLAIMS))
++        index for index in range(len(expected_claims))
+         if index not in evidence_indexes
+     ]
+     if (
+@@ -1233,12 +1280,12 @@ def validate_extraction_canary_report(
+     ):
+         raise _integrity("claim evidence counts do not reconcile")
+     if not failed and (
+-        evidence_indexes != list(range(len(_CANARY_EXPECTED_CLAIMS)))
+-        or matched != len(_CANARY_EXPECTED_CLAIMS) or missing
+-        or triple_count != len(_CANARY_EXPECTED_CLAIMS)
++        evidence_indexes != list(range(len(expected_claims)))
++        or matched != len(expected_claims) or missing
++        or triple_count != len(expected_claims)
+         or marker_count != 0
+         or duplicate_count != 0
+-        or initial_leaves != EXTRACTION_CANARY_EXPECTED_PREPARTITION_LEAVES
++        or initial_leaves != policy["expected_prepartition_leaves"]
+     ):
+         raise _integrity("passed report is not the exact behavioral canary result")
+     if failed:
+@@ -1346,6 +1393,12 @@ def run_extraction_canary(
+             recording_client.requests, recording_client.responses,
+         ),
+     }
++    base["execution_path"]["provider_output_truncations"] = (
++        recording_client.provider_output_truncations
++    )
++    if (result.completion_calls != len(recording_client.requests)
++            or base["usage"]["calls"] != len(recording_client.responses)):
++        raise _integrity("recorded completion outcomes do not reconcile")
+     if result.failed:
+         report = {
+             **base,
+diff --git a/benchmarks/extraction_canary_archive.py b/benchmarks/extraction_canary_archive.py
+new file mode 100644
+index 0000000..75fcc68
+--- /dev/null
++++ b/benchmarks/extraction_canary_archive.py
+@@ -0,0 +1,143 @@
++"""Archive-only canary commitment validation, never live execution admission.
++
++The v17 template was captured from the genuine synthetic reconstructed-R3
++fixture d9fd6ededba452c29ef039f785c3fb377c6400e18ea3023ebf4f8a328779e6aa.
++Do not reconstruct its extraction hash from current code or relabel its version.
++"""
++from __future__ import annotations
++
++from collections.abc import Mapping
++from copy import deepcopy
++import json
++import re
++
++try:
++    from .extraction_canary import _integrity, _strict_equal, _validate_report_with_policy
++except ImportError:  # direct benchmark scripts
++    from extraction_canary import _integrity, _strict_equal, _validate_report_with_policy
++
++# Literal non-runtime policy; independent of today's fixture builders/hashes.
++_V17_POLICY = json.loads(r'''{
++  "clean_empty_recovery_policy_version": "hymem-terminal-clean-empty-verification-v3",
++  "expected_claims": [
++    {
++      "object": "Fly.io",
++      "object_properties": {},
++      "object_type": "platform",
++      "polarity": 1,
++      "predicate": "deploys_to",
++      "source_message_id": 9271604311,
++      "subject": "HyMem Canary Relay",
++      "subject_properties": {},
++      "subject_type": "service",
++      "temporal_scope": null,
++      "value_numeric": null,
++      "value_text": null,
++      "value_unit": null
++    },
++    {
++      "object": "PostgreSQL",
++      "object_properties": {},
++      "object_type": "database",
++      "polarity": 1,
++      "predicate": "prefers",
++      "source_message_id": 9271604312,
++      "subject": "Avery Boundary Canary",
++      "subject_properties": {},
++      "subject_type": "person",
++      "temporal_scope": null,
++      "value_numeric": null,
++      "value_text": null,
++      "value_unit": null
++    }
++  ],
++  "expected_prepartition_leaves": 4,
++  "fenced_code_control_sha256": "c11d7b0dbbb2492184ec94c43894ca2fc9ee3d2991b2878f296fb834da6db274",
++  "fixture_sha256": "3fedadfbcdf35a013f8f61c5ea3f6ccc3e150aca0d025d8597327704551e94de",
++  "fixture_version": "hymem-phase1-context-paths-four-leaf-v7",
++  "list_control_sha256": "e8f93e21ed6b8ea2df448e4ea2b3c7b09122838a2da3999f7c117ff3257a53e5",
++  "max_completion_calls": 24,
++  "max_provider_attempts": 72,
++  "minimum_pass_completion_calls": 8,
++  "normal_execution_path": {
++    "empty_verification_requests": 2,
++    "fenced_code_control_atomic_requests": 2,
++    "fenced_code_control_probe_atomic": true,
++    "list_control_atomic_requests": 2,
++    "list_control_probe_atomic": true,
++    "omission_verification_requests": 2,
++    "parsed_source_records": 8,
++    "primary_requests": 4,
++    "prose_claim_exact_context_emissions": 1,
++    "prose_claim_exact_context_requests": 2,
++    "prose_claim_requests": 2,
++    "prose_claim_self_contained_requests": 0,
++    "prose_claim_wrong_context_emissions": 0,
++    "protected_control_split_boundaries": 0,
++    "source_message_ids_seen": [
++      9271604311,
++      9271604312
++    ],
++    "source_record_parse_failures": 0,
++    "table_claim_exact_context_emissions": 1,
++    "table_claim_exact_context_requests": 2,
++    "table_claim_requests": 2,
++    "table_claim_self_contained_requests": 0,
++    "table_claim_wrong_context_emissions": 0
++  },
++  "normal_pass_completion_calls": 8,
++  "prose_boundary_claim_sha256": "aeebb66034c889372c5f7a81cabd8891fc0126f9ad286825663ac3a047c4d17a",
++  "required_before_indexing": true,
++  "scope": "once_per_pending_run_configuration",
++  "source_content_chars": 10349,
++  "source_message_ids": [
++    9271604311,
++    9271604312
++  ],
++  "source_split_policy_version": "hymem-source-semantic-split-v10",
++  "store_writes": 0,
++  "structural_control_probe_version": "hymem-phase1-markdown-atom-split-probe-v1",
++  "table_continuation_claim_sha256": "b0101bc38d69ab81541575a131a2d202037f0b8f489b9e07bfa22baf943cc13d",
++  "usage_accounting": "excluded_from_scored_usage_dedicated_memory_pipeline_client",
++  "version": "hymem-phase1-extraction-canary-v17"
++}''')
++_V17 = "hymem-phase1-extraction-canary-v17"
++_V18 = "hymem-phase1-extraction-canary-v18"
++_SCHEMA = "hymem-extraction-contract-sha256-v1"
++
++
++def validate_archived_canary_config(policy: object, effective_config: object) -> dict:
++    """Validate recorded commitments and their cross-links, not their preimages."""
++    if not isinstance(policy, Mapping) or not isinstance(effective_config, Mapping):
++        raise _integrity("archived policy/config is absent")
++    version = policy.get("version")
++    if version not in {_V17, _V18}:
++        raise _integrity("archived policy version is unsupported")
++    prompt = policy.get("prompt_version")
++    binding = policy.get("extraction_contract")
++    if (type(prompt) is not str or not prompt or prompt != prompt.strip()
++            or len(prompt) > 160 or any(ord(char) < 32 or ord(char) == 127 for char in prompt)
++            or not isinstance(binding, Mapping)
++            or set(binding) != {"schema", "prompt_version", "identity"}
++            or binding.get("schema") != _SCHEMA
++            or binding.get("prompt_version") != prompt
++            or type(binding.get("identity")) is not str
++            or re.fullmatch(_SCHEMA + r":[0-9a-f]{64}", binding["identity"]) is None):
++        raise _integrity("archived extraction commitment is malformed")
++    if (effective_config.get("prompt_version") != prompt
++            or not _strict_equal(effective_config.get("extraction_contract"), dict(binding))):
++        raise _integrity("archived extraction commitment cross-link differs")
++    expected = deepcopy(_V17_POLICY)
++    if version == _V18:
++        expected["version"] = _V18
++        expected["normal_execution_path"]["provider_output_truncations"] = 0
++    expected.update(prompt_version=prompt, extraction_contract=dict(binding))
++    if not _strict_equal(dict(policy), expected):
++        raise _integrity("archived policy differs from known version")
++    return expected
++
++
++def validate_archived_canary_report(value: object, *, policy: object,
++                                   effective_config: object, **context) -> dict:
++    expected = validate_archived_canary_config(policy, effective_config)
++    return _validate_report_with_policy(value, policy=expected, **context)
+diff --git a/benchmarks/lme_protocol.py b/benchmarks/lme_protocol.py
+index b7ae496..00366a8 100644
+--- a/benchmarks/lme_protocol.py
++++ b/benchmarks/lme_protocol.py
+@@ -52,6 +52,9 @@ try:
+         validate_extraction_canary_config_binding,
+         validate_extraction_canary_report,
+     )
++    from .extraction_canary_archive import (
++        validate_archived_canary_config, validate_archived_canary_report,
++    )
+     from .strictness import (
+         BENCHMARK_INDEXING_STATUS_VERSION,
+         INDEXING_COMPLETION_POLICY,
+@@ -68,6 +71,9 @@ except (ImportError, ValueError):  # direct benchmark-script import
+         validate_extraction_canary_config_binding,
+         validate_extraction_canary_report,
+     )
++    from extraction_canary_archive import (  # type: ignore
++        validate_archived_canary_config, validate_archived_canary_report,
++    )
+     from strictness import (  # type: ignore
+         BENCHMARK_INDEXING_STATUS_VERSION,
+         INDEXING_COMPLETION_POLICY,
+@@ -784,7 +790,8 @@ def _validate_model(
+ 
+ def _validate_segment_extraction_canary(
+     segment: Mapping[str, Any], *, pipeline: Mapping[str, Any], no_dream: bool,
+-    prompt_version: str,
++    prompt_version: str, archive_policy: Mapping[str, Any] | None = None,
++    archive_effective_config: Mapping[str, Any] | None = None,
+ ) -> None:
+     """Bind every segment probe to its actual work and pipeline posture."""
+ 
+@@ -826,15 +833,22 @@ def _validate_segment_extraction_canary(
+                 "LongMemEval extraction canary endpoint identity is not secret-free"
+             )
+     try:
+-        validate_extraction_canary_report(
+-            report,
++        context = dict(
+             expected_mode=mode,
+             expected_client=(
+                 pipeline if mode in {"required", "failed"} else None
+             ),
+             require_client_closed=mode in {"required", "failed"},
+-            expected_prompt_version=prompt_version,
+         )
++        if archive_policy is not None:
++            validate_archived_canary_report(
++                report, policy=archive_policy,
++                effective_config=archive_effective_config, **context,
++            )
++        else:
++            validate_extraction_canary_report(
++                report, expected_prompt_version=prompt_version, **context,
++            )
+     except BenchmarkIntegrityError as exc:
+         raise BenchmarkIntegrityError(
+             "LongMemEval extraction canary evidence is invalid"
+@@ -2698,7 +2712,11 @@ def _validate_artifact(
+         secret_free_endpoint=True,
+     )
+     try:
+-        validate_extraction_canary_config_binding(
++        canary_validator = (
++            validate_archived_canary_config if archive_only
++            else validate_extraction_canary_config_binding
++        )
++        canary_validator(
+             config.get("extraction_canary"),
+             config.get("effective_hymem_config"),
+         )
+@@ -3170,6 +3188,8 @@ def _validate_artifact(
+         _validate_segment_extraction_canary(
+             segment, pipeline=pipeline, no_dream=config["no_dream"],
+             prompt_version=config["effective_hymem_config"]["prompt_version"],
++            archive_policy=config["extraction_canary"] if archive_only else None,
++            archive_effective_config=config["effective_hymem_config"] if archive_only else None,
+         )
+         if segment.get("model_identities") != models:
+             raise BenchmarkIntegrityError(
+diff --git a/benchmarks/longmemeval_adapter.py b/benchmarks/longmemeval_adapter.py
+index e80f6ef..a826a01 100644
+--- a/benchmarks/longmemeval_adapter.py
++++ b/benchmarks/longmemeval_adapter.py
+@@ -754,6 +754,10 @@ def resolve_model_extra_body(
+ 
+ # ── LLM Client ──────────────────────────────────────────────────────
+ 
++class LLMResponseError(RuntimeError):
++    """A received response failed admission; resubmitting is not a retry."""
++
++
+ class LLMClient:
+     def __init__(self, model: str, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
+                  extra_body: dict | None = None, *, n: int | None = None):
+@@ -800,6 +804,7 @@ class LLMClient:
+         self.total_latency_s = 0.0
+         self.token_usage_available = False
+         self._usage_complete = True
++        self._accounted_response_attempts = 0
+         self.last_error: str | None = None
+         # Guards the two counters so they aggregate correctly when many worker
+         # threads share this client (--workers > 1).
+@@ -811,25 +816,13 @@ class LLMClient:
+         last_exception_type = "Exception"
+         for attempt in range(3):
+             try:
+-                content, usage = self._call(messages, temperature, max_tokens)
+-                with self._lock:
+-                    required = ("prompt_tokens", "completion_tokens", "total_tokens")
+-                    valid = all(
+-                        isinstance(usage.get(key), (int, float))
+-                        and not isinstance(usage.get(key), bool)
+-                        and usage[key] >= 0
+-                        for key in required
+-                    )
+-                    if valid:
+-                        self.prompt_tokens += usage["prompt_tokens"]
+-                        self.completion_tokens += usage["completion_tokens"]
+-                        self.total_tokens += usage["total_tokens"]
+-                    else:
+-                        self._usage_complete = False
+-                    self.token_usage_available = (
+-                        self.successful_responses > 0 and self._usage_complete
+-                    )
++                content, _usage = self._call(messages, temperature, max_tokens)
+                 return content
++            except LLMResponseError as e:
++                # A received response is accounted, then rejected once. A
++                # second paid response cannot be called a transport retry.
++                last_exception_type = _bounded_exception_type(e)
++                break
+             except Exception as e:
+                 last_error = str(e)
+                 last_exception_type = _bounded_exception_type(e)
+@@ -841,12 +834,6 @@ class LLMClient:
+                     self.token_usage_available = False
+                 if "429" in last_error or "rate" in last_error.lower():
+                     time.sleep(15 * (attempt + 1))
+-                elif "null content" in last_error and "finish=length" in last_error:
+-                    # Deterministic truncation: the reasoning model burned the
+-                    # output budget and emitted no answer. Retrying with the SAME
+-                    # cap re-spends the call for the same result — fail fast and
+-                    # let the caller's parse-failure ceiling catch the aggregate.
+-                    break
+                 elif attempt < 2:
+                     time.sleep(3)
+                 else:
+@@ -869,6 +856,7 @@ class LLMClient:
+         started = time.monotonic()
+         with self._lock:
+             self.request_attempts += 1
++            self.token_usage_available = False
+         try:
+             resp = http.post(
+                 f"{self.base_url}/chat/completions",
+@@ -877,31 +865,64 @@ class LLMClient:
+                 timeout=120,
+             )
+             resp.raise_for_status()
+-            data = resp.json()
++        except Exception:
++            with self._lock:
++                self._usage_complete = False
++                self.token_usage_available = False
++            raise
+         finally:
+             with self._lock:
+                 self.total_latency_s += time.monotonic() - started
+-        content = data["choices"][0]["message"].get("content")
+-        if content is None:
+-            # A 200 with content=null. Transient provider behavior should be
+-            # retried like a 429; a null from finish_reason=length is
+-            # deterministic truncation (chat() fails that one fast). Either
+-            # way, returning None used to crash callers (`None.startswith`) —
+-            # raising makes the failure explicit and countable.
+-            raise RuntimeError(
+-                f"null content (finish={data['choices'][0].get('finish_reason')})")
+-        if not isinstance(content, str):
+-            raise RuntimeError(
+-                "non-string content "
+-                f"(finish={data['choices'][0].get('finish_reason')})"
++        try:
++            data = resp.json()
++        except Exception as exc:
++            with self._lock:
++                self._usage_complete = False
++                self.token_usage_available = False
++            raise LLMResponseError("LLM response is not JSON") from exc
++        usage = data.get("usage") if type(data) is dict else None
++        required = ("prompt_tokens", "completion_tokens", "total_tokens")
++        try:
++            valid = type(usage) is dict and all(
++                isinstance(usage.get(key), (int, float))
++                and not isinstance(usage[key], bool)
++                and math.isfinite(float(usage[key]))
++                and usage[key] >= 0 and usage[key] == int(usage[key])
++                for key in required
++            ) and usage["total_tokens"] == (
++                usage["prompt_tokens"] + usage["completion_tokens"]
+             )
++        except (OverflowError, ValueError):
++            valid = False
++        with self._lock:
++            self._accounted_response_attempts += 1
++            if valid:
++                self.prompt_tokens += int(usage["prompt_tokens"])
++                self.completion_tokens += int(usage["completion_tokens"])
++                self.total_tokens += int(usage["total_tokens"])
++            else:
++                self._usage_complete = False
++            self.token_usage_available = (
++                self._usage_complete
++                and self._accounted_response_attempts == self.request_attempts
++            )
++        choices = data.get("choices") if type(data) is dict else None
++        if type(choices) is not list or not choices or type(choices[0]) is not dict:
++            raise LLMResponseError("LLM response has no valid first choice")
++        # Retain the requested n>1 first-choice policy; a later choice cannot
++        # rescue a rejected first one.
++        choice = choices[0]
++        finish = choice.get("finish_reason")
++        if type(finish) is not str or finish != "stop":
++            raise LLMResponseError("LLM response did not finish with stop")
++        message = choice.get("message")
++        content = message.get("content") if type(message) is dict else None
++        if type(content) is not str:
++            raise LLMResponseError("LLM response content is not a string")
+         with self._lock:
+             self.call_count += 1
+             self.successful_responses += 1
+-        return (
+-            content,
+-            data.get("usage", {}),
+-        )
++        return content, usage if type(usage) is dict else {}
+ 
+     def close(self) -> None:
+         """End this wrapper's lifecycle exactly once.
+diff --git a/hymem/contrib/openai_client.py b/hymem/contrib/openai_client.py
+index ef642c9..9b94ae7 100644
+--- a/hymem/contrib/openai_client.py
++++ b/hymem/contrib/openai_client.py
+@@ -28,8 +28,11 @@ from hymem.deadline import DeadlineExceeded, current_deadline
+ from hymem.extraction.llm import (
+     LLMClient,
+     LLMRequest,
++    LLMResponseError,
++    LLMOutputTruncatedError,
+     ProviderAttemptTracker,
+ )
++from hymem.extraction import llm as llm_module
+ from hymem.extraction.retry import (
+     DEFAULT_RETRY_ATTEMPTS,
+     DEFAULT_RETRY_BASE_DELAY_SECONDS,
+@@ -263,6 +266,7 @@ class OpenAICompatibleClient:
+         self.cost_usd = None
+         self.token_usage_available = False
+         self._usage_complete = True
++        self._accounted_response_attempts = 0
+         self._usage_lock = threading.Lock()
+         self._close_lock = threading.Lock()
+         self._close_condition = threading.Condition(self._close_lock)
+@@ -476,6 +480,7 @@ class OpenAICompatibleClient:
+                 and self._helper_guard == (
+                     current_deadline, with_retry, require_active_model,
+                     resolve_llm_api_key, retry_module.retry_support_integrity,
++                    LLMResponseError, LLMOutputTruncatedError,
+                 )
+                 and retry_module.retry_support_integrity()
+                 and tuple(
+@@ -670,8 +675,11 @@ class OpenAICompatibleClient:
+         if request.response_format == "json":
+             kwargs["response_format"] = {"type": "json_object"}
+ 
++        # The caller's absolute deadline owns every attempt and admission,
++        # even if provider code changes ambient context while returning.
++        deadline = _FROZEN_CURRENT_DEADLINE()
++
+         def _attempt():
+-            deadline = _FROZEN_CURRENT_DEADLINE()
+             request_kwargs = dict(kwargs)
+             if deadline is not None:
+                 request_kwargs["timeout"] = deadline.cap_timeout(
+@@ -681,15 +689,10 @@ class OpenAICompatibleClient:
+                 tracker._record()
+             with self._usage_lock:
+                 self.request_attempts += 1
++                self.token_usage_available = False
+             started = time.monotonic()
+             try:
+-                response = config.completion_create(**request_kwargs)
+-                # A custom/OpenAI-compatible transport may ignore its timeout.
+-                # Reject a late response before parsing or publication once it
+-                # eventually hands control back to us.
+-                if deadline is not None:
+-                    deadline.check()
+-                return response
++                return config.completion_create(**request_kwargs)
+             except (Exception, DeadlineExceeded):
+                 with self._usage_lock:
+                     self._usage_complete = False
+@@ -706,35 +709,62 @@ class OpenAICompatibleClient:
+             max_delay=DEFAULT_RETRY_MAX_DELAY_SECONDS,
+             label=f"LLM completion ({config.model})",
+         )
+-        self._verify_transport_integrity()
+-        content = resp.choices[0].message.content
+-        if type(content) is not str:
+-            raise RuntimeError("LLM response content is not a string")
++        # Account received paid replies outside transport retry, before any
++        # deadline, identity or content rejection. Never reroll their admission.
+         usage = getattr(resp, "usage", None)
+         values = {
+             "prompt_tokens": getattr(usage, "prompt_tokens", None),
+             "completion_tokens": getattr(usage, "completion_tokens", None),
+             "total_tokens": getattr(usage, "total_tokens", None),
+         }
+-        valid = all(
+-            isinstance(value, (int, float))
+-            and not isinstance(value, bool)
+-            and math.isfinite(float(value))
+-            and value >= 0
+-            for value in values.values()
+-        )
++        try:
++            valid = all(
++                isinstance(value, (int, float))
++                and not isinstance(value, bool)
++                and math.isfinite(float(value))
++                and value >= 0 and value == int(value)
++                for value in values.values()
++            ) and values["total_tokens"] == (
++                values["prompt_tokens"] + values["completion_tokens"]
++            )
++        except (OverflowError, ValueError):
++            valid = False
+         with self._usage_lock:
+-            self.call_count += 1
+-            self.successful_responses += 1
++            self._accounted_response_attempts += 1
+             if valid:
+-                self.prompt_tokens += values["prompt_tokens"]
+-                self.completion_tokens += values["completion_tokens"]
+-                self.total_tokens += values["total_tokens"]
++                self.prompt_tokens += int(values["prompt_tokens"])
++                self.completion_tokens += int(values["completion_tokens"])
++                self.total_tokens += int(values["total_tokens"])
+             else:
+                 self._usage_complete = False
+             self.token_usage_available = (
+-                self.successful_responses > 0 and self._usage_complete
++                self._usage_complete
++                and self._accounted_response_attempts == self.request_attempts
+             )
++        if deadline is not None:
++            deadline.check()
++        self._verify_transport_integrity()
++        choices = getattr(resp, "choices", None)
++        if type(choices) is not list or len(choices) != 1:
++            raise LLMResponseError("LLM response must contain exactly one choice")
++        choice = choices[0]
++        finish = getattr(choice, "finish_reason", None)
++        message = getattr(choice, "message", None)
++        if message is None or not hasattr(message, "content"):
++            raise LLMResponseError("LLM response message is malformed")
++        content = message.content
++        if type(finish) is str and finish == "length":
++            if content is not None and type(content) is not str:
++                raise LLMResponseError("LLM response content is malformed")
++            raise LLMOutputTruncatedError()
++        if type(finish) is not str or finish != "stop":
++            raise LLMResponseError("LLM response did not finish with stop")
++        if type(content) is not str:
++            raise LLMResponseError("LLM response content is not a string")
++        # These counters represent admitted text, not paid provider replies.
++        with self._usage_lock:
++            self.call_count += 1
++            self.successful_responses += 1
+         return content
+ 
+     def close(self) -> None:
+@@ -765,6 +795,7 @@ _OPENAI_LLM_ORIGINAL_IMPLEMENTATION_GUARD = tuple(
+ _OPENAI_LLM_ORIGINAL_HELPER_GUARD = (
+     current_deadline, with_retry, require_active_model, resolve_llm_api_key,
+     retry_module.retry_support_integrity,
++    LLMResponseError, LLMOutputTruncatedError,
+ )
+ 
+ 
+@@ -932,5 +963,6 @@ OPENAI_LLM_IMPLEMENTATION_SHA256 = compose_import_time_sha256(
+     ENDPOINT_POLICY_IMPLEMENTATION_SHA256,
+     MODEL_POLICY_IMPLEMENTATION_SHA256,
+     retry_module.EXTRACTION_IMPLEMENTATION_SHA256,
++    llm_module.EXTRACTION_IMPLEMENTATION_SHA256,
+     DEADLINE_IMPLEMENTATION_SHA256,
+ )
+diff --git a/hymem/dreaming/digest.py b/hymem/dreaming/digest.py
+index 89e1d5f..d48383c 100644
+--- a/hymem/dreaming/digest.py
++++ b/hymem/dreaming/digest.py
+@@ -18,7 +18,7 @@ from hymem.dreaming.procedures import ProceduresExtraction, validate_procedure_i
+ from hymem.dreaming.summary import clean_summary
+ from hymem.dreaming.summary_state import SUMMARY_FAILURE_REASONS
+ from hymem.extraction.jsonio import is_ceiling_cut, loads_exact_or_fenced
+-from hymem.extraction.llm import LLMClient, LLMRequest
++from hymem.extraction.llm import LLMClient, LLMRequest, LLMOutputTruncatedError
+ from hymem.extraction.prompts import (
+     SESSION_DIGEST_GRANULAR_SYSTEM,
+     SESSION_DIGEST_GRANULAR_USER_TEMPLATE,
+@@ -808,12 +808,14 @@ def extract_session_digest(
+             # only the rejected summary's length informs source-only recovery.
+             with _digest_failure_stage("summary_compaction"):
+                 repair_request = _build_digest_summary_repair_request(request, data["summary"])
+-                # The client interface has no typed provider-error boundary:
+-                # even RuntimeError can signal identity/accounting corruption.
+-                # All completion exceptions therefore remain fatal; only a
+-                # returned provider reply can be a summary-only degradation.
+-                repair_raw = llm.complete(repair_request)
+-                repaired_summary, failure = _validate_digest_summary_repair(repair_raw)
++                try:
++                    repair_raw = llm.complete(repair_request)
++                except LLMOutputTruncatedError:
++                    # Only this bounded provider rejection is summary-local.
++                    # Identity, transport and deadline failures remain fatal.
++                    repaired_summary, failure = None, "output_truncated"
++                else:
++                    repaired_summary, failure = _validate_digest_summary_repair(repair_raw)
+                 if failure is not None:
+                     result = _empty(reason=failure, stage="summary_compaction")
+                 else:
+diff --git a/hymem/dreaming/summary_recovery.py b/hymem/dreaming/summary_recovery.py
+index 8dcb647..fac149a 100644
+--- a/hymem/dreaming/summary_recovery.py
++++ b/hymem/dreaming/summary_recovery.py
+@@ -27,7 +27,7 @@ from hymem.dreaming.lossless import covered_messages_after, lossless_cursor_is_v
+ from hymem.dreaming.summary import clean_summary
+ from hymem.dreaming.summary_state import classify_summary_state, mark_summary_current
+ from hymem.extraction.jsonio import is_ceiling_cut, loads_exact_or_fenced
+-from hymem.extraction.llm import LLMRequest, measure_provider_attempts
++from hymem.extraction.llm import LLMRequest, LLMOutputTruncatedError, measure_provider_attempts
+ from hymem.extraction.producer import (
+     canonical_callable_sha256, canonical_module_sha256, canonical_module_slice_sha256,
+     producer_binding_for_declaration,
+@@ -354,15 +354,20 @@ def run_summary_recovery(
+                     _refresh_lock(conn, holder)
+                     report["calls"] += 1
+                     measurement = None
++                    truncated = False
+                     try:
+                         with measure_provider_attempts(client) as measurement:
+                             raw = client.complete(request)
++                    except LLMOutputTruncatedError:
++                        truncated = True
+                     finally:
+                         if measurement is not None:
+                             report["provider_attempts"] += measurement.attempts
+                             report["provider_attempts_exact"] &= measurement.exact
+                     guard()
+-                    summary, failure = _parse_summary(raw)
++                    summary, failure = (
++                        (None, "output_truncated") if truncated else _parse_summary(raw)
++                    )
+                     with db.transaction(conn):
+                         guard()
+                         _fence_context(conn, job)
+diff --git a/hymem/extraction/chunk.py b/hymem/extraction/chunk.py
+index 5848b37..41e83ae 100644
+--- a/hymem/extraction/chunk.py
++++ b/hymem/extraction/chunk.py
+@@ -24,6 +24,7 @@ from hymem.extraction.jsonio import (
+ from hymem.extraction.llm import (
+     LLMClient,
+     LLMRequest,
++    LLMOutputTruncatedError,
+     measure_provider_attempts,
+ )
+ from hymem.extraction.markers import (
+@@ -2633,6 +2634,10 @@ def extract_chunk(
+         try:
+             with measure_provider_attempts(client) as attempt_measurement:
+                 raw = client.complete(request)
++        except LLMOutputTruncatedError:
++            # Provider-confirmed length exhaustion may subdivide only the
++            # original source. Rejected partial text has no item authority.
++            return _failure("incomplete_response", "provider:finish_length"), None
+         except Exception as exc:
+             log.warning(
+                 "chunk_extraction.call_failure error_type=%s", type(exc).__name__
+diff --git a/hymem/extraction/contract.py b/hymem/extraction/contract.py
+index bba5f32..50b717a 100644
+--- a/hymem/extraction/contract.py
++++ b/hymem/extraction/contract.py
+@@ -355,7 +355,8 @@ def _contract_components(prompt_version: str) -> dict[str, Any]:
+                 "loads_strict_json",
+             ),
+             "llm": _module_source_digest(
+-                llm_module, "LLMRequest", "measure_provider_attempts"
++                llm_module, "LLMRequest", "measure_provider_attempts",
++                "LLMResponseError", "LLMOutputTruncatedError",
+             ),
+             "markers": _module_source_digest(
+                 markers_module,
+diff --git a/hymem/extraction/llm.py b/hymem/extraction/llm.py
+index 2746322..904f6e7 100644
+--- a/hymem/extraction/llm.py
++++ b/hymem/extraction/llm.py
+@@ -29,6 +29,17 @@ class LLMClient(Protocol):
+     def complete(self, request: LLMRequest) -> str: ...
+ 
+ 
++class LLMResponseError(RuntimeError):
++    """A received reply failed admission; resubmitting is not a transport retry."""
++
++
++class LLMOutputTruncatedError(LLMResponseError):
++    """Trusted finish=length evidence with no partial payload or item authority."""
++
++    def __init__(self) -> None:
++        super().__init__("LLM response exceeded its output budget")
++
++
+ class ProviderAttemptTracker:
+     """Exact request-attempt count for one caller-owned completion scope.

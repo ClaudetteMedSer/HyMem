@@ -1,0 +1,25 @@
+--- a/hymem/doctor.py
++++ b/hymem/doctor.py
+@@ -104,8 +104,10 @@
+     except ImportError:
+         return _Result(WARN, "extraction LLM",
+                        "key present; openai package not installed, cannot verify")
+-    # Probe with a minimal chat completion — the capability HyMem actually
+-    # uses. /v1/models is not exposed by every OpenAI-compatible proxy, so a
++    # Probe with a short chat completion — the capability HyMem actually
++    # uses. Leave room for the provider to finish its reply; a one-token
++    # budget can produce finish=length and be correctly rejected as truncated.
++    # /v1/models is not exposed by every OpenAI-compatible proxy, so a
+     # models.list() failure would be a false negative.
+     client = None
+     failure: Exception | None = None
+@@ -114,7 +116,8 @@
+             api_key=cfg.llm_api_key, base_url=cfg.llm_base_url, model=cfg.llm_model,
+         )
+         client.complete(LLMRequest(
+-            system="", user="ping", response_format="text", max_tokens=1,
++            system="", user="Reply with exactly OK.",
++            response_format="text", max_tokens=32,
+         ))
+         result = _Result(OK, "extraction LLM",
+                          f"{cfg.llm_model} @ {display_url} (reachable)")

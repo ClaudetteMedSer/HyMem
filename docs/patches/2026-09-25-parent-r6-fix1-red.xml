@@ -1,0 +1,1437 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="2" skipped="0" tests="2" time="0.960" timestamp="2026-09-25T09:03:51.828610+02:00" hostname="MacBook-Pro-2.local"><testcase classname="tests.test_lme_protocol_hardening" name="test_real_indexing_failure_writer_checkpoint_archive_validates[coverage_integrity_failure]" time="0.451"><failure message="benchmarks.strictness.BenchmarkIntegrityError: LongMemEval indexing failure row fields differ">generated_indexing_failure_archive = {'abstention_diagnostics': {'abstention': {'accuracy': None, 'benchmark_failures': 0, 'conditional_valid_accuracy': No...ample', 'answer_endpoint_sha256': 'sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf', ...}, ...}
+
+    def test_real_indexing_failure_writer_checkpoint_archive_validates(
+        generated_indexing_failure_archive,
+    ):
+        artifact = generated_indexing_failure_archive
+        assert artifact["per_question"][0]["strict_failure"] is True
+        assert artifact["per_question"][0]["benchmark_failure"] == (
+            "indexing_failure:" + artifact["per_question"][0]["indexing"]["failure"]["code"]
+        )
+&gt;       validated = protocol.validate_strict_artifact(artifact)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../../hymem-r6-sequential-20260925.6dSIIq/candidate/tests/test_lme_protocol_hardening.py:2267: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+benchmarks/lme_protocol.py:2318: in validate_strict_artifact
+    return _validate_artifact(data, path=path, require_scored=require_scored,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+data = {'abstention_diagnostics': {'abstention': {'accuracy': None, 'benchmark_failures': 0, 'conditional_valid_accuracy': No...ample', 'answer_endpoint_sha256': 'sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf', ...}, ...}
+
+    def _validate_artifact(
+        data: object, *, path: Path | None,
+        require_scored: bool | None, archive_only: bool,
+    ) -&gt; dict[str, Any]:
+    
+        if not isinstance(data, Mapping):
+            raise BenchmarkIntegrityError("LongMemEval artifact root must be an object")
+        if data.get("version") != "strict-v1":
+            raise BenchmarkIntegrityError("LongMemEval strict version is unsupported")
+        if data.get("benchmark") != "LongMemEval":
+            raise BenchmarkIntegrityError("LongMemEval benchmark identity differs")
+        manifest = data.get("manifest")
+        config = data.get("config")
+        models = data.get("models")
+        execution = data.get("execution")
+        rows_raw = data.get("per_question")
+        if not all(isinstance(value, Mapping) for value in (manifest, config, models, execution)):
+            raise BenchmarkIntegrityError("LongMemEval strict envelope is incomplete")
+        if not isinstance(rows_raw, list):
+            raise BenchmarkIntegrityError("LongMemEval strict rows are absent")
+        result_digest = data.get("result_digest")
+        if (
+            not isinstance(result_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", result_digest) is None
+            or result_digest != content_hash(rows_raw)
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval ordered per-question result digest differs"
+            )
+        if manifest.get("schema") != STRICT_PROTOCOL_VERSION or manifest.get("benchmark") != "LongMemEval":
+            raise BenchmarkIntegrityError("LongMemEval manifest schema/benchmark differs")
+        if manifest.get("run_id") != content_hash({
+            key: value for key, value in manifest.items() if key != "run_id"
+        }):
+            raise BenchmarkIntegrityError("LongMemEval manifest run_id is invalid")
+        if manifest.get("config") != config or manifest.get("models") != models:
+            raise BenchmarkIntegrityError("LongMemEval top-level identity differs from manifest")
+        if manifest.get("config_hash") != content_hash(config):
+            raise BenchmarkIntegrityError("LongMemEval manifest config hash is invalid")
+        if manifest.get("model_hash") != content_hash(models):
+            raise BenchmarkIntegrityError("LongMemEval manifest model hash is invalid")
+        if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+            raise BenchmarkIntegrityError("LongMemEval indexing completion policy differs")
+        for field in ("code_hash", "data_hash", "expected_ids_hash"):
+            value = manifest.get(field)
+            if not isinstance(value, str) or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", value
+            ) is None:
+                raise BenchmarkIntegrityError(f"LongMemEval manifest {field} is malformed")
+        seed = manifest.get("seed")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise BenchmarkIntegrityError("LongMemEval manifest seed is malformed")
+        if config.get("seed") != seed:
+            raise BenchmarkIntegrityError("LongMemEval config/manifest seed differs")
+    
+        scale = config.get("scales", config.get("scale"))
+        if scale not in LME_SUPPORTED_SCALES:
+            raise BenchmarkIntegrityError("LongMemEval strict scale is unsupported")
+        for key in (
+            "label_free_answer_path", "scored_run", "exploratory_label_steering",
+            "exploratory_non_comparable", "subset_run", "official_denominator_validated",
+            "source_order_validated", "indexing_require_healthy",
+            "historical_local_judge_prompts_exact_official", "official_judge_match",
+            "auto_ability", "no_dream", "embeddings", "retrieval_only",
+            "graph_facts_first", "permissive_default", "distill",
+            "aggregation_nodes", "aggregation_broad", "episode_granularity",
+            "value_supersession", "graph_multihop",
+            "official_transport_exact",
+        ):
+            _bool(config.get(key), label=f"LongMemEval config {key}")
+        for key in (
+            "label_free_answer_path", "scored_run", "exploratory_label_steering",
+            "exploratory_non_comparable",
+        ):
+            if manifest.get(key) is not config.get(key):
+                raise BenchmarkIntegrityError(
+                    f"LongMemEval manifest/config posture differs for {key}"
+                )
+        scored_run = config["scored_run"]
+        if require_scored is True and scored_run is not True:
+            raise BenchmarkIntegrityError("LongMemEval artifact is retrieval-only diagnostic evidence")
+        if require_scored is False and scored_run is not False:
+            raise BenchmarkIntegrityError("LongMemEval artifact is not retrieval-only diagnostic evidence")
+        retrieval_only = config.get("retrieval_only")
+        if not isinstance(retrieval_only, bool) or retrieval_only is scored_run:
+            raise BenchmarkIntegrityError("LongMemEval scored/retrieval posture is inconsistent")
+        if config["label_free_answer_path"] is config["exploratory_label_steering"]:
+            raise BenchmarkIntegrityError("LongMemEval routing posture is inconsistent")
+        if config["auto_ability"] is not config["label_free_answer_path"]:
+            raise BenchmarkIntegrityError("LongMemEval auto-routing disclosure is inconsistent")
+        if config["historical_local_judge_prompts_exact_official"] is not (
+            LME_HISTORICAL_LOCAL_JUDGE_PROMPTS_EXACT_OFFICIAL
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval historical local judge-prompt identity is false"
+            )
+        if config.get("evaluator_commit") != LME_EVALUATOR_COMMIT:
+            raise BenchmarkIntegrityError("LongMemEval evaluator commit differs")
+        if config.get("evaluator_sha256") != LME_EVALUATOR_SHA256:
+            raise BenchmarkIntegrityError("LongMemEval evaluator hash differs")
+        if config.get("evaluator_url") != LME_EVALUATOR_URL:
+            raise BenchmarkIntegrityError("LongMemEval evaluator URL differs")
+        dataset_revision = config.get("dataset_revision")
+        if (
+            not isinstance(dataset_revision, str) or not dataset_revision.strip()
+            or dataset_revision != dataset_revision.strip()
+        ):
+            raise BenchmarkIntegrityError("LongMemEval dataset revision is malformed")
+        if config.get("dataset_sha256") != manifest.get("data_hash"):
+            raise BenchmarkIntegrityError("LongMemEval config/manifest data hash differs")
+        dataset_expected_count = config.get("dataset_expected_count")
+        if (
+            isinstance(dataset_expected_count, bool)
+            or not isinstance(dataset_expected_count, int)
+            or dataset_expected_count &lt;= 0
+        ):
+            raise BenchmarkIntegrityError("LongMemEval source dataset count is malformed")
+        source_ids_hash = config.get("source_ids_hash")
+        if not isinstance(source_ids_hash, str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", source_ids_hash
+        ) is None:
+            raise BenchmarkIntegrityError("LongMemEval source ID hash is malformed")
+        source_qtype_counts = config.get("source_qtype_counts")
+        if (
+            not isinstance(source_qtype_counts, Mapping)
+            or not source_qtype_counts
+            or any(key not in LME_BASE_QUESTION_TYPES for key in source_qtype_counts)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value &lt;= 0
+                for value in source_qtype_counts.values()
+            )
+            or sum(source_qtype_counts.values()) != dataset_expected_count
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval source question-type distribution is malformed"
+            )
+        if config["source_order_validated"] and (
+            scale != "S"
+            or config.get("dataset_revision") != LME_S_DATASET_REVISION
+            or manifest.get("data_hash") != LME_S_DATASET_SHA256
+            or config.get("dataset_url") != LME_S_DATASET_URL
+            or config.get("source_ids_hash") != LME_S_SOURCE_IDS_HASH
+            or config.get("source_qtype_counts") != LME_S_QTYPE_COUNTS
+            or config.get("dataset_expected_count") != LME_S_EXPECTED_COUNT
+        ):
+            raise BenchmarkIntegrityError("LongMemEval pinned source identity is inconsistent")
+        if config["official_denominator_validated"] and (
+            scale != "S" or dataset_revision != LME_S_DATASET_REVISION
+            or manifest.get("data_hash") != LME_S_DATASET_SHA256
+            or config.get("dataset_url") != LME_S_DATASET_URL
+            or manifest.get("protocol_split") != "full"
+            or manifest.get("expected_count") != LME_S_EXPECTED_COUNT
+            or config["subset_run"] or config.get("sample") not in (0, None)
+            or config.get("sample_strategy") != "all-source-order"
+            or config["source_order_validated"] is not True
+            or config.get("source_ids_hash") != LME_S_SOURCE_IDS_HASH
+            or config.get("source_qtype_counts") != LME_S_QTYPE_COUNTS
+        ):
+            raise BenchmarkIntegrityError("LongMemEval official denominator claim is inconsistent")
+        sample = config.get("sample")
+        if isinstance(sample, bool) or not isinstance(sample, int) or sample &lt; 0:
+            raise BenchmarkIntegrityError("LongMemEval sample is malformed")
+        if sample &gt; dataset_expected_count:
+            raise BenchmarkIntegrityError("LongMemEval sample exceeds its source dataset")
+        if config["subset_run"] != (sample &gt; 0):
+            raise BenchmarkIntegrityError("LongMemEval subset posture differs from sample")
+        if config["subset_run"] and config.get("sample_strategy") != (
+            "sha256-seed-source-index-preserve-order-v1"
+        ):
+            raise BenchmarkIntegrityError("LongMemEval sample strategy is inconsistent")
+        if config["subset_run"] and not config["exploratory_non_comparable"]:
+            raise BenchmarkIntegrityError("LongMemEval sampled run claims comparability")
+        if not config["subset_run"] and config.get("sample_strategy") != "all-source-order":
+            raise BenchmarkIntegrityError("LongMemEval full-run sample strategy is inconsistent")
+        if config.get("distill_prompt_version") not in {
+            "v1", "v2",
+        }:
+            raise BenchmarkIntegrityError("LongMemEval distillation prompt identity is unsupported")
+        expected_retrieval_owner = (
+            "separate-retrieval-meter"
+            if config["retrieval_only"] and config["distill"]
+            else "reader" if config["distill"] else "none"
+        )
+        if config.get("retrieval_usage_owner") != expected_retrieval_owner:
+            raise BenchmarkIntegrityError(
+                "LongMemEval retrieval usage ownership is inconsistent"
+            )
+        rerank_model = config.get("rerank_model")
+        if rerank_model not in {None, "llm", "cross-encoder"}:
+            raise BenchmarkIntegrityError("LongMemEval rerank model is unsupported")
+        for field in (
+            "rerank_message_hits", "rules", "rules_extraction",
+            "facts", "facts_extraction",
+        ):
+            value = config.get(field)
+            if value is not None and not isinstance(value, bool):
+                raise BenchmarkIntegrityError(f"LongMemEval config {field} is malformed")
+        for field in ("top_k", "workers", "indexing_max_cycles"):
+            value = config.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value &lt;= 0:
+                raise BenchmarkIntegrityError(f"LongMemEval config {field} is malformed")
+        timeout = _finite_number(config.get("indexing_timeout_s"))
+        if timeout is None or timeout &lt;= 0:
+            raise BenchmarkIntegrityError("LongMemEval indexing timeout is malformed")
+        rerank_top_k = config.get("rerank_top_k")
+        if rerank_top_k is not None and (
+            isinstance(rerank_top_k, bool) or not isinstance(rerank_top_k, int)
+            or rerank_top_k &lt;= 0
+        ):
+            raise BenchmarkIntegrityError("LongMemEval rerank_top_k is malformed")
+        max_hops = config.get("graph_multihop_max_hops")
+        if max_hops is not None and (
+            isinstance(max_hops, bool) or not isinstance(max_hops, int) or max_hops &lt;= 0
+        ):
+            raise BenchmarkIntegrityError("LongMemEval graph max hops is malformed")
+        decay = config.get("graph_multihop_decay")
+        if decay is not None and (
+            _finite_number(decay) is None or not 0 &lt; float(decay) &lt;= 1
+        ):
+            raise BenchmarkIntegrityError("LongMemEval graph decay is malformed")
+        min_score = config.get("graph_multihop_min_score")
+        if min_score is not None and (
+            _finite_number(min_score) is None or not 0 &lt;= float(min_score) &lt;= 1
+        ):
+            raise BenchmarkIntegrityError("LongMemEval graph min score is malformed")
+        if not config["graph_multihop"] and any(
+            config.get(field) is not None for field in (
+                "graph_multihop_max_hops", "graph_multihop_decay",
+                "graph_multihop_min_score",
+            )
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval graph parameters are set while graph multihop is disabled"
+            )
+        if config["aggregation_broad"] and not config["aggregation_nodes"]:
+            raise BenchmarkIntegrityError(
+                "LongMemEval broad aggregation is set while aggregation is disabled"
+            )
+        context_policy = config.get("context_policy")
+        expected_context_keys = {
+            "name", "budget_unit", "max_input_tokens", "max_input_bytes",
+            "provider_context_window_tokens", "reserved_output_tokens",
+            "reserved_transport_overhead_tokens",
+            "tokenizer", "tokenizer_failure_policy", "source_boundaries",
+            "raw_evidence_reserve_fraction", "min_semantic_excerpt_alnum",
+            "min_semantic_excerpt_chars", "gold_access",
+        }
+        if not isinstance(context_policy, Mapping) or set(context_policy) != expected_context_keys:
+            raise BenchmarkIntegrityError("LongMemEval context packing policy is malformed")
+        max_input_bytes = context_policy.get("max_input_bytes")
+        provider_ceiling = context_policy.get("provider_context_window_tokens")
+        output_reserve = context_policy.get("reserved_output_tokens")
+        transport_overhead = context_policy.get("reserved_transport_overhead_tokens")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value &lt;= 0
+            for value in (provider_ceiling, output_reserve, transport_overhead)
+        ):
+            raise BenchmarkIntegrityError("LongMemEval byte/context capacity is malformed")
+        if (
+            config.get("max_input_bytes") != max_input_bytes
+            or config.get("provider_context_tokens") != provider_ceiling
+            or context_policy.get("source_boundaries") != [
+                "head", "query-window", "tail",
+            ]
+            or context_policy.get("raw_evidence_reserve_fraction") != 0.60
+            or context_policy.get("min_semantic_excerpt_alnum") != 8
+            or context_policy.get("min_semantic_excerpt_chars") != 12
+            or context_policy.get("gold_access") is not False
+        ):
+            raise BenchmarkIntegrityError("LongMemEval context packing policy is malformed")
+        tokenizer = context_policy.get("tokenizer")
+        if tokenizer is None:
+            if (
+                context_policy.get("name") != "conservative-utf8-byte-query-head-tail-v2"
+                or context_policy.get("budget_unit") != "utf8_bytes"
+                or isinstance(max_input_bytes, bool)
+                or not isinstance(max_input_bytes, int) or max_input_bytes &lt;= 0
+                or max_input_bytes + output_reserve + transport_overhead &gt; provider_ceiling
+                or context_policy.get("max_input_tokens") is not None
+                or config.get("max_input_tokens") is not None
+                or context_policy.get("tokenizer_failure_policy") != "not-applicable"
+            ):
+                raise BenchmarkIntegrityError("LongMemEval byte packing identity is malformed")
+        else:
+            token_budget = context_policy.get("max_input_tokens")
+            if (
+                not isinstance(tokenizer, Mapping)
+                or set(tokenizer) != {
+                    "configured", "backend", "bound_model", "file_sha256", "local_only",
+                }
+                or tokenizer.get("configured") is not True
+                or tokenizer.get("backend") != "huggingface-tokenizers-json"
+                or tokenizer.get("bound_model") != config.get("answer_model")
+                or not isinstance(tokenizer.get("file_sha256"), str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", tokenizer["file_sha256"]) is None
+                or tokenizer.get("local_only") is not True
+                or context_policy.get("name") != "model-bound-tokenizer-query-head-tail-v2"
+                or context_policy.get("budget_unit") != "model_tokens"
+                or context_policy.get("tokenizer_failure_policy") != "fail-closed"
+                or max_input_bytes is not None
+                or isinstance(token_budget, bool) or not isinstance(token_budget, int)
+                or token_budget &lt;= 0
+                or token_budget + output_reserve + transport_overhead &gt; provider_ceiling
+                or config.get("max_input_tokens") != token_budget
+            ):
+                raise BenchmarkIntegrityError("LongMemEval model tokenizer identity is malformed")
+        validate_prereg(
+            config.get("prereg"), required=not config["exploratory_non_comparable"]
+        )
+        requires_exploratory = bool(
+            config.get("prereg") is None
+            or config["subset_run"]
+            or not config["label_free_answer_path"]
+            or not config["indexing_require_healthy"]
+            or config.get("no_dream") is True
+            or not config["source_order_validated"]
+            or not scored_run
+        )
+        if requires_exploratory and not config["exploratory_non_comparable"]:
+            raise BenchmarkIntegrityError("LongMemEval non-comparable posture is understated")
+        protocol_split = manifest.get("protocol_split")
+        calibration_hash = manifest.get("calibration_receipt_hash")
+        if protocol_split == "full":
+            if calibration_hash is not None:
+                raise BenchmarkIntegrityError("LongMemEval full split carries calibration receipt")
+        elif protocol_split in {"dev", "holdout"}:
+            if not isinstance(calibration_hash, str) or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", calibration_hash
+            ) is None:
+                raise BenchmarkIntegrityError("LongMemEval internal split lacks frozen receipt")
+        else:
+            raise BenchmarkIntegrityError("LongMemEval protocol split is malformed")
+        if config.get("judge_protocol") not in {"legacy-custom", "official"}:
+            raise BenchmarkIntegrityError("LongMemEval judge protocol is unsupported")
+        legacy_endpoint_fields = {
+            "answer_base_url", "judge_base_url", "hymem_base_url",
+            "official_judge_base_url",
+        }
+        if legacy_endpoint_fields &amp; set(config):
+            raise BenchmarkIntegrityError(
+                "LongMemEval endpoint identity is not secret-free"
+            )
+        official_endpoint = secret_free_endpoint_identity(
+            LME_OFFICIAL_JUDGE_BASE_URL, label="official judge"
+        )
+        if (
+            config.get("official_judge_endpoint_origin")
+            != official_endpoint["endpoint_origin"]
+            or config.get("official_judge_endpoint_sha256")
+            != official_endpoint["endpoint_sha256"]
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval official judge endpoint identity differs"
+            )
+        if (
+            config.get("judge_transport_retry_policy") != LME_LOCAL_RETRY_POLICY
+            or config.get("official_transport_retry_policy") != LME_UPSTREAM_RETRY_POLICY
+            or config.get("official_transport_exact") is not False
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval judge transport-policy disclosure differs"
+            )
+        observed_official = official_judge_match(config, models)
+        if config["official_judge_match"] is not observed_official:
+            raise BenchmarkIntegrityError("LongMemEval official judge identity flag is false")
+        if config["judge_protocol"] == "legacy-custom" and observed_official:
+            raise BenchmarkIntegrityError("LongMemEval legacy judge claims official identity")
+        if config["judge_protocol"] == "official" and not observed_official:
+            raise BenchmarkIntegrityError(
+                "LongMemEval official protocol lacks the exact pinned judge identity"
+            )
+    
+        if set(models) != {"reader", "judge", "memory_pipeline", "embedding"}:
+            raise BenchmarkIntegrityError("LongMemEval model identity coverage differs")
+        reader = _validate_model(
+            models.get("reader"), label="reader", secret_free_endpoint=True,
+        )
+        judge = _validate_model(
+            models.get("judge"), label="judge", secret_free_endpoint=True,
+        )
+        pipeline = _validate_model(
+            models.get("memory_pipeline"), label="memory pipeline",
+            secret_free_endpoint=True,
+        )
+        try:
+            canary_validator = (
+                _archived_canary_validators()[0] if archive_only
+                else validate_extraction_canary_config_binding
+            )
+            canary_validator(
+                config.get("extraction_canary"),
+                config.get("effective_hymem_config"),
+            )
+        except BenchmarkIntegrityError as exc:
+            raise BenchmarkIntegrityError(
+                "LongMemEval extraction canary policy is invalid"
+            ) from exc
+        expected_model_fields = {
+            "reader": {
+                "provider", "model", "endpoint_origin", "endpoint_sha256",
+                "temperature", "max_tokens", "extra_body",
+            },
+            "judge": {
+                "provider", "model", "endpoint_origin", "endpoint_sha256",
+                "temperature", "max_tokens", "n", "extra_body", "protocol",
+                "evaluator_commit", "evaluator_sha256", "verdict_parser",
+                "prompt_exact_official", "retry_policy",
+            },
+            "memory pipeline": {
+                "provider", "model", "endpoint_origin", "endpoint_sha256",
+                "thinking_mode",
+                "effective_extra_body", "aggregation_producer",
+                "deployment_revision_sha256", "deployment_tenant_sha256",
+                "transport_package_version", "request_timeout_seconds",
+            },
+        }
+        for label, identity in (
+            ("reader", reader), ("judge", judge), ("memory pipeline", pipeline),
+        ):
+            if set(identity) != expected_model_fields[label]:
+                raise BenchmarkIntegrityError(
+                    f"LongMemEval {label} model identity fields differ"
+                )
+        _validated_pipeline_aggregation_producer(pipeline, archive_only=archive_only)
+        def expected_provider(endpoint: str) -&gt; str:
+            official = validate_http_endpoint(
+                endpoint, label="model identity"
+            ).official_provider
+            return official if official is not None else "openai-compatible"
+        for identity, prefix in ((reader, "answer"), (judge, "judge")):
+            if (
+                identity.get("model") != config.get(f"{prefix}_model")
+                or identity.get("endpoint_origin")
+                != config.get(f"{prefix}_endpoint_origin")
+                or identity.get("endpoint_sha256")
+                != config.get(f"{prefix}_endpoint_sha256")
+                or identity.get("provider")
+                != expected_provider(identity["endpoint_origin"])
+                or _finite_number(identity.get("temperature")) != 0.0
+                or identity.get("max_tokens") != (1024 if prefix == "answer" else 10)
+                or (
+                    prefix == "judge"
+                    and identity.get("n") != (
+                        1 if config.get("judge_protocol") == "official" else None
+                    )
+                )
+                or identity.get("extra_body") != config.get(f"{prefix}_extra_body_obj")
+            ):
+                raise BenchmarkIntegrityError(
+                    f"LongMemEval {prefix} effective identity differs from config"
+                )
+        if (
+            pipeline.get("provider") != expected_provider(pipeline["endpoint_origin"])
+            or pipeline.get("model") != config.get("hymem_model")
+            or pipeline.get("endpoint_origin") != config.get("hymem_endpoint_origin")
+            or pipeline.get("endpoint_sha256") != config.get("hymem_endpoint_sha256")
+            or pipeline.get("thinking_mode") != config.get("hymem_thinking")
+        ):
+            raise BenchmarkIntegrityError("LongMemEval memory pipeline identity differs from config")
+        if reader.get("extra_body") != normalize_extra_body(reader.get("extra_body"), label="reader"):
+            raise BenchmarkIntegrityError("LongMemEval reader extra_body is not normalized")
+        if judge.get("extra_body") != normalize_extra_body(judge.get("extra_body"), label="judge"):
+            raise BenchmarkIntegrityError("LongMemEval judge extra_body is not normalized")
+        expected_prompt_exact = config["judge_protocol"] == "official"
+        if judge.get("prompt_exact_official") is not expected_prompt_exact:
+            raise BenchmarkIntegrityError(
+                "LongMemEval selected judge prompt identity differs from its protocol"
+            )
+        if judge.get("retry_policy") != config.get("judge_transport_retry_policy"):
+            raise BenchmarkIntegrityError(
+                "LongMemEval judge retry identity differs from config"
+            )
+        mode = pipeline.get("thinking_mode")
+        if mode not in {"auto", "disabled", "off", "enabled"}:
+            raise BenchmarkIntegrityError("LongMemEval memory pipeline thinking mode is malformed")
+        host = (urlsplit(pipeline["endpoint_origin"]).hostname or "").casefold()
+        sends_thinking = mode == "disabled" or (
+            mode == "auto" and ("deepseek" in host or "deepseek" in pipeline["model"].casefold())
+        )
+        expected_pipeline_extra = {"thinking": {"type": "disabled"}} if sends_thinking else {}
+        if pipeline.get("effective_extra_body") != expected_pipeline_extra:
+            raise BenchmarkIntegrityError("LongMemEval memory pipeline request identity differs")
+        embedding = _validate_embedding_identity(models.get("embedding"))
+        if config.get("embedding_runtime") != embedding:
+            raise BenchmarkIntegrityError("LongMemEval embedding config/model identity differs")
+        if config.get("embeddings") is not embedding.get("configured"):
+            raise BenchmarkIntegrityError("LongMemEval embedding enablement differs")
+        effective = config.get("effective_hymem_config")
+        if not isinstance(effective, Mapping) or not effective:
+            raise BenchmarkIntegrityError("LongMemEval effective HyMem config is absent")
+        expected_effective = {
+            "message_fts_top_k": 15, "fts_top_k": 10, "graph_top_k": 10,
+            "aggregation_nodes_enabled": config.get("aggregation_nodes"),
+            "aggregation_inject_abilities": (
+                [] if config.get("aggregation_broad") else ["TR"]
+            ),
+            "episode_granularity_enabled": config.get("episode_granularity"),
+            "value_supersession_enabled": config.get("value_supersession"),
+            "graph_multihop_enabled": config.get("graph_multihop"),
+            "rerank_top_k": (
+                config.get("rerank_top_k")
+                if config.get("rerank_top_k") is not None else 20
+            ),
+            "rerank_model": config.get("rerank_model") or "llm",
+            "rerank_message_hits": (
+                config.get("rerank_message_hits")
+                if config.get("rerank_message_hits") is not None else True
+            ),
+            "graph_multihop_max_hops": (
+                config.get("graph_multihop_max_hops")
+                if config.get("graph_multihop_max_hops") is not None else 2
+            ),
+            "graph_multihop_decay": (
+                config.get("graph_multihop_decay")
+                if config.get("graph_multihop_decay") is not None else 0.5
+            ),
+            "graph_multihop_min_score": (
+                config.get("graph_multihop_min_score")
+                if config.get("graph_multihop_min_score") is not None else 0.05
+            ),
+            "rules_enabled": (
+                config.get("rules") if config.get("rules") is not None else True
+            ),
+            "rules_extraction_enabled": (
+                config.get("rules_extraction")
+                if config.get("rules_extraction") is not None else False
+            ),
+            "facts_enabled": (
+                config.get("facts") if config.get("facts") is not None else True
+            ),
+            "facts_extraction_enabled": (
+                config.get("facts_extraction")
+                if config.get("facts_extraction") is not None else True
+            ),
+        }
+        for field, expected in expected_effective.items():
+            if effective.get(field) != expected:
+                raise BenchmarkIntegrityError(
+                    f"LongMemEval effective HyMem lever {field} differs"
+                )
+        expected_count = manifest.get("expected_count")
+        if (
+            isinstance(expected_count, bool) or not isinstance(expected_count, int)
+            or expected_count &lt;= 0
+        ):
+            raise BenchmarkIntegrityError("LongMemEval manifest expected_count is malformed")
+        if expected_count &gt; dataset_expected_count:
+            raise BenchmarkIntegrityError(
+                "LongMemEval run denominator exceeds its source dataset"
+            )
+        if protocol_split == "full" and expected_count != (
+            sample if sample &gt; 0 else dataset_expected_count
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval full-run denominator differs from its sample declaration"
+            )
+        if config["official_denominator_validated"] and (
+            manifest.get("expected_ids_hash") != LME_S_SOURCE_IDS_HASH
+        ):
+            raise BenchmarkIntegrityError("LongMemEval official source ID order differs")
+    
+        rows: list[dict[str, Any]] = []
+        ids: list[str] = []
+        completed = failed = missing = 0
+        min_reader_calls = min_judge_calls = 0
+        row_distill_calls = 0
+        successful_indexed_ids: set[str] = set()
+        row_indexing_summaries: dict[str, dict[str, Any]] = {}
+        failed_row_indexing_summaries: dict[str, dict[str, Any]] = {}
+        for index, raw in enumerate(rows_raw):
+            if not isinstance(raw, Mapping):
+                raise BenchmarkIntegrityError(f"LongMemEval strict row {index} is malformed")
+            row = dict(raw)
+            qid = row.get("question_id")
+            qtype = row.get("question_type")
+            if not isinstance(qid, str) or not qid.strip() or qid != qid.strip():
+                raise BenchmarkIntegrityError("LongMemEval strict row id is malformed")
+            if qtype not in LME_BASE_QUESTION_TYPES:
+                raise BenchmarkIntegrityError("LongMemEval strict row question type is malformed")
+            ids.append(qid)
+            failure = row.get("benchmark_failure")
+            if failure is not None and (
+                not isinstance(failure, str) or not failure.strip()
+            ):
+                raise BenchmarkIntegrityError("LongMemEval failure evidence is malformed")
+            verdict = row.get("correct")
+            if scored_run:
+                if row.get("retrieval_only") is True or not isinstance(verdict, bool):
+                    raise BenchmarkIntegrityError("LongMemEval scored row verdict posture is malformed")
+            elif row.get("retrieval_only") is not True or (
+                verdict is not None and not (failure and verdict is False)
+            ):
+                raise BenchmarkIntegrityError("LongMemEval retrieval row verdict posture is malformed")
+    
+            row_indexing = row.get("indexing")
+            row_indexing_complete: bool | None = None
+            if config.get("no_dream") is True:
+                if row_indexing is not None:
+                    raise BenchmarkIntegrityError(
+                        "LongMemEval no-dream row carries indexing evidence"
+                    )
+            elif row_indexing is not None:
+                row_indexing_complete = _validate_indexing(
+                    row_indexing,
+                    require_healthy=config["indexing_require_healthy"],
+                    allow_incomplete=True,
+                )
+                _validate_aggregation_pipeline_binding(
+                    row_indexing.get("final_status"), pipeline,
+                    archive_only=archive_only,
+                )
+                normalized_row_indexing = dict(row_indexing)
+                if normalized_row_indexing.get("schema") != LME_INDEXING_SUMMARY_VERSION:
+                    normalized_row_indexing.pop("question_id", None)
+                if row_indexing_complete:
+                    successful_indexed_ids.add(qid)
+                    row_indexing_summaries[qid] = normalized_row_indexing
+                else:
+                    failed_row_indexing_summaries[qid] = normalized_row_indexing
+    
+            oracle = row.get("oracle_ability")
+            detected = row.get("detected_ability")
+            ability = row.get("ability_used")
+            missing_row = failure == "missing_prediction"
+            distill_fired = row.get("distill_fired")
+            distill_calls = row.get("distill_calls")
+            if missing_row and distill_fired is None and distill_calls is None:
+                distill_fired, distill_calls = False, 0
+            if (
+                not isinstance(distill_fired, bool)
+                or isinstance(distill_calls, bool)
+                or not isinstance(distill_calls, int)
+                or distill_calls &lt; 0
+                or (distill_calls &gt; 0 and not distill_fired)
+                or (
+                    not config["distill"]
+                    and (distill_fired or distill_calls != 0)
+                )
+            ):
+                raise BenchmarkIntegrityError(
+                    "LongMemEval row distillation usage is malformed"
+                )
+            row_distill_calls += distill_calls
+            if not missing_row:
+                if oracle != LME_ABILITY_BY_TYPE[qtype] or detected not in {None, "MR", "TR"}:
+                    raise BenchmarkIntegrityError("LongMemEval row routing evidence is malformed")
+                expected_ability = detected if config["label_free_answer_path"] else oracle
+                if ability != expected_ability:
+                    raise BenchmarkIntegrityError("LongMemEval row routing evidence is inconsistent")
+    
+            if failure:
+                if scored_run and verdict is not False:
+                    raise BenchmarkIntegrityError("LongMemEval failed scored row is inconsistent")
+                failed += 1
+                if missing_row:
+                    missing += 1
+                indexing_failure = re.fullmatch(
+                    r"indexing_failure:([a-z][a-z0-9_]*)", failure
+                )
+                if indexing_failure is not None:
+                    code = indexing_failure.group(1)
+                    if (
+                        row_indexing_complete is not False
+                        or not isinstance(row_indexing, Mapping)
+                        or row_indexing.get("schema") != LME_INDEXING_SUMMARY_VERSION
+                        or row_indexing.get("outcome") != "failure"
+                        or not isinstance(row_indexing.get("failure"), Mapping)
+                        or row_indexing["failure"].get("code") != code
+                    ):
+                        raise BenchmarkIntegrityError(
+                            "LongMemEval indexing failure row/summary differs"
+                        )
+                    forbidden_scoring = {
+                        "question", "answer", "hypothesis", "context_sha",
+                        "judge_raw", "judge_protocol", "judge_error",
+                        "judge_parse_valid", "recall_ceiling", "recall_tier",
+                        "gold_mode", "gold_turns", "gold_turns_in_pool",
+                        "gold_turn_tiers", "n_episodes", "n_agg_nodes",
+                        "n_procedures", "n_facts", "gold_in_episodes",
+                        "gold_in_facts",
+                    }
+                    if forbidden_scoring &amp; set(row):
+                        raise BenchmarkIntegrityError(
+                            "LongMemEval indexing failure carries scoring/retrieval evidence"
+                        )
+                    allowed_failure_fields = {
+                        "question_id", "question_type", "correct",
+                        "benchmark_failure", "retrieval_only", "oracle_ability",
+                        "detected_ability", "ability_used", "distill_fired",
+                        "distill_calls", "indexing", "memory_pipeline_usage",
+                        "embedding_usage", "lifecycle_errors",
+                    }
+                    if not set(row) &lt;= allowed_failure_fields:
+&gt;                       raise BenchmarkIntegrityError(
+                            "LongMemEval indexing failure row fields differ"
+E                           benchmarks.strictness.BenchmarkIntegrityError: LongMemEval indexing failure row fields differ
+
+benchmarks/lme_protocol.py:3032: BenchmarkIntegrityError</failure></testcase><testcase classname="tests.test_lme_protocol_hardening" name="test_real_indexing_failure_writer_checkpoint_archive_validates[quarantined_extraction]" time="0.222"><failure message="benchmarks.strictness.BenchmarkIntegrityError: LongMemEval indexing failure row fields differ">generated_indexing_failure_archive = {'abstention_diagnostics': {'abstention': {'accuracy': None, 'benchmark_failures': 0, 'conditional_valid_accuracy': No...ample', 'answer_endpoint_sha256': 'sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf', ...}, ...}
+
+    def test_real_indexing_failure_writer_checkpoint_archive_validates(
+        generated_indexing_failure_archive,
+    ):
+        artifact = generated_indexing_failure_archive
+        assert artifact["per_question"][0]["strict_failure"] is True
+        assert artifact["per_question"][0]["benchmark_failure"] == (
+            "indexing_failure:" + artifact["per_question"][0]["indexing"]["failure"]["code"]
+        )
+&gt;       validated = protocol.validate_strict_artifact(artifact)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../../hymem-r6-sequential-20260925.6dSIIq/candidate/tests/test_lme_protocol_hardening.py:2267: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+benchmarks/lme_protocol.py:2318: in validate_strict_artifact
+    return _validate_artifact(data, path=path, require_scored=require_scored,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+data = {'abstention_diagnostics': {'abstention': {'accuracy': None, 'benchmark_failures': 0, 'conditional_valid_accuracy': No...ample', 'answer_endpoint_sha256': 'sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf', ...}, ...}
+
+    def _validate_artifact(
+        data: object, *, path: Path | None,
+        require_scored: bool | None, archive_only: bool,
+    ) -&gt; dict[str, Any]:
+    
+        if not isinstance(data, Mapping):
+            raise BenchmarkIntegrityError("LongMemEval artifact root must be an object")
+        if data.get("version") != "strict-v1":
+            raise BenchmarkIntegrityError("LongMemEval strict version is unsupported")
+        if data.get("benchmark") != "LongMemEval":
+            raise BenchmarkIntegrityError("LongMemEval benchmark identity differs")
+        manifest = data.get("manifest")
+        config = data.get("config")
+        models = data.get("models")
+        execution = data.get("execution")
+        rows_raw = data.get("per_question")
+        if not all(isinstance(value, Mapping) for value in (manifest, config, models, execution)):
+            raise BenchmarkIntegrityError("LongMemEval strict envelope is incomplete")
+        if not isinstance(rows_raw, list):
+            raise BenchmarkIntegrityError("LongMemEval strict rows are absent")
+        result_digest = data.get("result_digest")
+        if (
+            not isinstance(result_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", result_digest) is None
+            or result_digest != content_hash(rows_raw)
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval ordered per-question result digest differs"
+            )
+        if manifest.get("schema") != STRICT_PROTOCOL_VERSION or manifest.get("benchmark") != "LongMemEval":
+            raise BenchmarkIntegrityError("LongMemEval manifest schema/benchmark differs")
+        if manifest.get("run_id") != content_hash({
+            key: value for key, value in manifest.items() if key != "run_id"
+        }):
+            raise BenchmarkIntegrityError("LongMemEval manifest run_id is invalid")
+        if manifest.get("config") != config or manifest.get("models") != models:
+            raise BenchmarkIntegrityError("LongMemEval top-level identity differs from manifest")
+        if manifest.get("config_hash") != content_hash(config):
+            raise BenchmarkIntegrityError("LongMemEval manifest config hash is invalid")
+        if manifest.get("model_hash") != content_hash(models):
+            raise BenchmarkIntegrityError("LongMemEval manifest model hash is invalid")
+        if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+            raise BenchmarkIntegrityError("LongMemEval indexing completion policy differs")
+        for field in ("code_hash", "data_hash", "expected_ids_hash"):
+            value = manifest.get(field)
+            if not isinstance(value, str) or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", value
+            ) is None:
+                raise BenchmarkIntegrityError(f"LongMemEval manifest {field} is malformed")
+        seed = manifest.get("seed")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise BenchmarkIntegrityError("LongMemEval manifest seed is malformed")
+        if config.get("seed") != seed:
+            raise BenchmarkIntegrityError("LongMemEval config/manifest seed differs")
+    
+        scale = config.get("scales", config.get("scale"))
+        if scale not in LME_SUPPORTED_SCALES:
+            raise BenchmarkIntegrityError("LongMemEval strict scale is unsupported")
+        for key in (
+            "label_free_answer_path", "scored_run", "exploratory_label_steering",
+            "exploratory_non_comparable", "subset_run", "official_denominator_validated",
+            "source_order_validated", "indexing_require_healthy",
+            "historical_local_judge_prompts_exact_official", "official_judge_match",
+            "auto_ability", "no_dream", "embeddings", "retrieval_only",
+            "graph_facts_first", "permissive_default", "distill",
+            "aggregation_nodes", "aggregation_broad", "episode_granularity",
+            "value_supersession", "graph_multihop",
+            "official_transport_exact",
+        ):
+            _bool(config.get(key), label=f"LongMemEval config {key}")
+        for key in (
+            "label_free_answer_path", "scored_run", "exploratory_label_steering",
+            "exploratory_non_comparable",
+        ):
+            if manifest.get(key) is not config.get(key):
+                raise BenchmarkIntegrityError(
+                    f"LongMemEval manifest/config posture differs for {key}"
+                )
+        scored_run = config["scored_run"]
+        if require_scored is True and scored_run is not True:
+            raise BenchmarkIntegrityError("LongMemEval artifact is retrieval-only diagnostic evidence")
+        if require_scored is False and scored_run is not False:
+            raise BenchmarkIntegrityError("LongMemEval artifact is not retrieval-only diagnostic evidence")
+        retrieval_only = config.get("retrieval_only")
+        if not isinstance(retrieval_only, bool) or retrieval_only is scored_run:
+            raise BenchmarkIntegrityError("LongMemEval scored/retrieval posture is inconsistent")
+        if config["label_free_answer_path"] is config["exploratory_label_steering"]:
+            raise BenchmarkIntegrityError("LongMemEval routing posture is inconsistent")
+        if config["auto_ability"] is not config["label_free_answer_path"]:
+            raise BenchmarkIntegrityError("LongMemEval auto-routing disclosure is inconsistent")
+        if config["historical_local_judge_prompts_exact_official"] is not (
+            LME_HISTORICAL_LOCAL_JUDGE_PROMPTS_EXACT_OFFICIAL
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval historical local judge-prompt identity is false"
+            )
+        if config.get("evaluator_commit") != LME_EVALUATOR_COMMIT:
+            raise BenchmarkIntegrityError("LongMemEval evaluator commit differs")
+        if config.get("evaluator_sha256") != LME_EVALUATOR_SHA256:
+            raise BenchmarkIntegrityError("LongMemEval evaluator hash differs")
+        if config.get("evaluator_url") != LME_EVALUATOR_URL:
+            raise BenchmarkIntegrityError("LongMemEval evaluator URL differs")
+        dataset_revision = config.get("dataset_revision")
+        if (
+            not isinstance(dataset_revision, str) or not dataset_revision.strip()
+            or dataset_revision != dataset_revision.strip()
+        ):
+            raise BenchmarkIntegrityError("LongMemEval dataset revision is malformed")
+        if config.get("dataset_sha256") != manifest.get("data_hash"):
+            raise BenchmarkIntegrityError("LongMemEval config/manifest data hash differs")
+        dataset_expected_count = config.get("dataset_expected_count")
+        if (
+            isinstance(dataset_expected_count, bool)
+            or not isinstance(dataset_expected_count, int)
+            or dataset_expected_count &lt;= 0
+        ):
+            raise BenchmarkIntegrityError("LongMemEval source dataset count is malformed")
+        source_ids_hash = config.get("source_ids_hash")
+        if not isinstance(source_ids_hash, str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", source_ids_hash
+        ) is None:
+            raise BenchmarkIntegrityError("LongMemEval source ID hash is malformed")
+        source_qtype_counts = config.get("source_qtype_counts")
+        if (
+            not isinstance(source_qtype_counts, Mapping)
+            or not source_qtype_counts
+            or any(key not in LME_BASE_QUESTION_TYPES for key in source_qtype_counts)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value &lt;= 0
+                for value in source_qtype_counts.values()
+            )
+            or sum(source_qtype_counts.values()) != dataset_expected_count
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval source question-type distribution is malformed"
+            )
+        if config["source_order_validated"] and (
+            scale != "S"
+            or config.get("dataset_revision") != LME_S_DATASET_REVISION
+            or manifest.get("data_hash") != LME_S_DATASET_SHA256
+            or config.get("dataset_url") != LME_S_DATASET_URL
+            or config.get("source_ids_hash") != LME_S_SOURCE_IDS_HASH
+            or config.get("source_qtype_counts") != LME_S_QTYPE_COUNTS
+            or config.get("dataset_expected_count") != LME_S_EXPECTED_COUNT
+        ):
+            raise BenchmarkIntegrityError("LongMemEval pinned source identity is inconsistent")
+        if config["official_denominator_validated"] and (
+            scale != "S" or dataset_revision != LME_S_DATASET_REVISION
+            or manifest.get("data_hash") != LME_S_DATASET_SHA256
+            or config.get("dataset_url") != LME_S_DATASET_URL
+            or manifest.get("protocol_split") != "full"
+            or manifest.get("expected_count") != LME_S_EXPECTED_COUNT
+            or config["subset_run"] or config.get("sample") not in (0, None)
+            or config.get("sample_strategy") != "all-source-order"
+            or config["source_order_validated"] is not True
+            or config.get("source_ids_hash") != LME_S_SOURCE_IDS_HASH
+            or config.get("source_qtype_counts") != LME_S_QTYPE_COUNTS
+        ):
+            raise BenchmarkIntegrityError("LongMemEval official denominator claim is inconsistent")
+        sample = config.get("sample")
+        if isinstance(sample, bool) or not isinstance(sample, int) or sample &lt; 0:
+            raise BenchmarkIntegrityError("LongMemEval sample is malformed")
+        if sample &gt; dataset_expected_count:
+            raise BenchmarkIntegrityError("LongMemEval sample exceeds its source dataset")
+        if config["subset_run"] != (sample &gt; 0):
+            raise BenchmarkIntegrityError("LongMemEval subset posture differs from sample")
+        if config["subset_run"] and config.get("sample_strategy") != (
+            "sha256-seed-source-index-preserve-order-v1"
+        ):
+            raise BenchmarkIntegrityError("LongMemEval sample strategy is inconsistent")
+        if config["subset_run"] and not config["exploratory_non_comparable"]:
+            raise BenchmarkIntegrityError("LongMemEval sampled run claims comparability")
+        if not config["subset_run"] and config.get("sample_strategy") != "all-source-order":
+            raise BenchmarkIntegrityError("LongMemEval full-run sample strategy is inconsistent")
+        if config.get("distill_prompt_version") not in {
+            "v1", "v2",
+        }:
+            raise BenchmarkIntegrityError("LongMemEval distillation prompt identity is unsupported")
+        expected_retrieval_owner = (
+            "separate-retrieval-meter"
+            if config["retrieval_only"] and config["distill"]
+            else "reader" if config["distill"] else "none"
+        )
+        if config.get("retrieval_usage_owner") != expected_retrieval_owner:
+            raise BenchmarkIntegrityError(
+                "LongMemEval retrieval usage ownership is inconsistent"
+            )
+        rerank_model = config.get("rerank_model")
+        if rerank_model not in {None, "llm", "cross-encoder"}:
+            raise BenchmarkIntegrityError("LongMemEval rerank model is unsupported")
+        for field in (
+            "rerank_message_hits", "rules", "rules_extraction",
+            "facts", "facts_extraction",
+        ):
+            value = config.get(field)
+            if value is not None and not isinstance(value, bool):
+                raise BenchmarkIntegrityError(f"LongMemEval config {field} is malformed")
+        for field in ("top_k", "workers", "indexing_max_cycles"):
+            value = config.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value &lt;= 0:
+                raise BenchmarkIntegrityError(f"LongMemEval config {field} is malformed")
+        timeout = _finite_number(config.get("indexing_timeout_s"))
+        if timeout is None or timeout &lt;= 0:
+            raise BenchmarkIntegrityError("LongMemEval indexing timeout is malformed")
+        rerank_top_k = config.get("rerank_top_k")
+        if rerank_top_k is not None and (
+            isinstance(rerank_top_k, bool) or not isinstance(rerank_top_k, int)
+            or rerank_top_k &lt;= 0
+        ):
+            raise BenchmarkIntegrityError("LongMemEval rerank_top_k is malformed")
+        max_hops = config.get("graph_multihop_max_hops")
+        if max_hops is not None and (
+            isinstance(max_hops, bool) or not isinstance(max_hops, int) or max_hops &lt;= 0
+        ):
+            raise BenchmarkIntegrityError("LongMemEval graph max hops is malformed")
+        decay = config.get("graph_multihop_decay")
+        if decay is not None and (
+            _finite_number(decay) is None or not 0 &lt; float(decay) &lt;= 1
+        ):
+            raise BenchmarkIntegrityError("LongMemEval graph decay is malformed")
+        min_score = config.get("graph_multihop_min_score")
+        if min_score is not None and (
+            _finite_number(min_score) is None or not 0 &lt;= float(min_score) &lt;= 1
+        ):
+            raise BenchmarkIntegrityError("LongMemEval graph min score is malformed")
+        if not config["graph_multihop"] and any(
+            config.get(field) is not None for field in (
+                "graph_multihop_max_hops", "graph_multihop_decay",
+                "graph_multihop_min_score",
+            )
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval graph parameters are set while graph multihop is disabled"
+            )
+        if config["aggregation_broad"] and not config["aggregation_nodes"]:
+            raise BenchmarkIntegrityError(
+                "LongMemEval broad aggregation is set while aggregation is disabled"
+            )
+        context_policy = config.get("context_policy")
+        expected_context_keys = {
+            "name", "budget_unit", "max_input_tokens", "max_input_bytes",
+            "provider_context_window_tokens", "reserved_output_tokens",
+            "reserved_transport_overhead_tokens",
+            "tokenizer", "tokenizer_failure_policy", "source_boundaries",
+            "raw_evidence_reserve_fraction", "min_semantic_excerpt_alnum",
+            "min_semantic_excerpt_chars", "gold_access",
+        }
+        if not isinstance(context_policy, Mapping) or set(context_policy) != expected_context_keys:
+            raise BenchmarkIntegrityError("LongMemEval context packing policy is malformed")
+        max_input_bytes = context_policy.get("max_input_bytes")
+        provider_ceiling = context_policy.get("provider_context_window_tokens")
+        output_reserve = context_policy.get("reserved_output_tokens")
+        transport_overhead = context_policy.get("reserved_transport_overhead_tokens")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value &lt;= 0
+            for value in (provider_ceiling, output_reserve, transport_overhead)
+        ):
+            raise BenchmarkIntegrityError("LongMemEval byte/context capacity is malformed")
+        if (
+            config.get("max_input_bytes") != max_input_bytes
+            or config.get("provider_context_tokens") != provider_ceiling
+            or context_policy.get("source_boundaries") != [
+                "head", "query-window", "tail",
+            ]
+            or context_policy.get("raw_evidence_reserve_fraction") != 0.60
+            or context_policy.get("min_semantic_excerpt_alnum") != 8
+            or context_policy.get("min_semantic_excerpt_chars") != 12
+            or context_policy.get("gold_access") is not False
+        ):
+            raise BenchmarkIntegrityError("LongMemEval context packing policy is malformed")
+        tokenizer = context_policy.get("tokenizer")
+        if tokenizer is None:
+            if (
+                context_policy.get("name") != "conservative-utf8-byte-query-head-tail-v2"
+                or context_policy.get("budget_unit") != "utf8_bytes"
+                or isinstance(max_input_bytes, bool)
+                or not isinstance(max_input_bytes, int) or max_input_bytes &lt;= 0
+                or max_input_bytes + output_reserve + transport_overhead &gt; provider_ceiling
+                or context_policy.get("max_input_tokens") is not None
+                or config.get("max_input_tokens") is not None
+                or context_policy.get("tokenizer_failure_policy") != "not-applicable"
+            ):
+                raise BenchmarkIntegrityError("LongMemEval byte packing identity is malformed")
+        else:
+            token_budget = context_policy.get("max_input_tokens")
+            if (
+                not isinstance(tokenizer, Mapping)
+                or set(tokenizer) != {
+                    "configured", "backend", "bound_model", "file_sha256", "local_only",
+                }
+                or tokenizer.get("configured") is not True
+                or tokenizer.get("backend") != "huggingface-tokenizers-json"
+                or tokenizer.get("bound_model") != config.get("answer_model")
+                or not isinstance(tokenizer.get("file_sha256"), str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", tokenizer["file_sha256"]) is None
+                or tokenizer.get("local_only") is not True
+                or context_policy.get("name") != "model-bound-tokenizer-query-head-tail-v2"
+                or context_policy.get("budget_unit") != "model_tokens"
+                or context_policy.get("tokenizer_failure_policy") != "fail-closed"
+                or max_input_bytes is not None
+                or isinstance(token_budget, bool) or not isinstance(token_budget, int)
+                or token_budget &lt;= 0
+                or token_budget + output_reserve + transport_overhead &gt; provider_ceiling
+                or config.get("max_input_tokens") != token_budget
+            ):
+                raise BenchmarkIntegrityError("LongMemEval model tokenizer identity is malformed")
+        validate_prereg(
+            config.get("prereg"), required=not config["exploratory_non_comparable"]
+        )
+        requires_exploratory = bool(
+            config.get("prereg") is None
+            or config["subset_run"]
+            or not config["label_free_answer_path"]
+            or not config["indexing_require_healthy"]
+            or config.get("no_dream") is True
+            or not config["source_order_validated"]
+            or not scored_run
+        )
+        if requires_exploratory and not config["exploratory_non_comparable"]:
+            raise BenchmarkIntegrityError("LongMemEval non-comparable posture is understated")
+        protocol_split = manifest.get("protocol_split")
+        calibration_hash = manifest.get("calibration_receipt_hash")
+        if protocol_split == "full":
+            if calibration_hash is not None:
+                raise BenchmarkIntegrityError("LongMemEval full split carries calibration receipt")
+        elif protocol_split in {"dev", "holdout"}:
+            if not isinstance(calibration_hash, str) or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", calibration_hash
+            ) is None:
+                raise BenchmarkIntegrityError("LongMemEval internal split lacks frozen receipt")
+        else:
+            raise BenchmarkIntegrityError("LongMemEval protocol split is malformed")
+        if config.get("judge_protocol") not in {"legacy-custom", "official"}:
+            raise BenchmarkIntegrityError("LongMemEval judge protocol is unsupported")
+        legacy_endpoint_fields = {
+            "answer_base_url", "judge_base_url", "hymem_base_url",
+            "official_judge_base_url",
+        }
+        if legacy_endpoint_fields &amp; set(config):
+            raise BenchmarkIntegrityError(
+                "LongMemEval endpoint identity is not secret-free"
+            )
+        official_endpoint = secret_free_endpoint_identity(
+            LME_OFFICIAL_JUDGE_BASE_URL, label="official judge"
+        )
+        if (
+            config.get("official_judge_endpoint_origin")
+            != official_endpoint["endpoint_origin"]
+            or config.get("official_judge_endpoint_sha256")
+            != official_endpoint["endpoint_sha256"]
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval official judge endpoint identity differs"
+            )
+        if (
+            config.get("judge_transport_retry_policy") != LME_LOCAL_RETRY_POLICY
+            or config.get("official_transport_retry_policy") != LME_UPSTREAM_RETRY_POLICY
+            or config.get("official_transport_exact") is not False
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval judge transport-policy disclosure differs"
+            )
+        observed_official = official_judge_match(config, models)
+        if config["official_judge_match"] is not observed_official:
+            raise BenchmarkIntegrityError("LongMemEval official judge identity flag is false")
+        if config["judge_protocol"] == "legacy-custom" and observed_official:
+            raise BenchmarkIntegrityError("LongMemEval legacy judge claims official identity")
+        if config["judge_protocol"] == "official" and not observed_official:
+            raise BenchmarkIntegrityError(
+                "LongMemEval official protocol lacks the exact pinned judge identity"
+            )
+    
+        if set(models) != {"reader", "judge", "memory_pipeline", "embedding"}:
+            raise BenchmarkIntegrityError("LongMemEval model identity coverage differs")
+        reader = _validate_model(
+            models.get("reader"), label="reader", secret_free_endpoint=True,
+        )
+        judge = _validate_model(
+            models.get("judge"), label="judge", secret_free_endpoint=True,
+        )
+        pipeline = _validate_model(
+            models.get("memory_pipeline"), label="memory pipeline",
+            secret_free_endpoint=True,
+        )
+        try:
+            canary_validator = (
+                _archived_canary_validators()[0] if archive_only
+                else validate_extraction_canary_config_binding
+            )
+            canary_validator(
+                config.get("extraction_canary"),
+                config.get("effective_hymem_config"),
+            )
+        except BenchmarkIntegrityError as exc:
+            raise BenchmarkIntegrityError(
+                "LongMemEval extraction canary policy is invalid"
+            ) from exc
+        expected_model_fields = {
+            "reader": {
+                "provider", "model", "endpoint_origin", "endpoint_sha256",
+                "temperature", "max_tokens", "extra_body",
+            },
+            "judge": {
+                "provider", "model", "endpoint_origin", "endpoint_sha256",
+                "temperature", "max_tokens", "n", "extra_body", "protocol",
+                "evaluator_commit", "evaluator_sha256", "verdict_parser",
+                "prompt_exact_official", "retry_policy",
+            },
+            "memory pipeline": {
+                "provider", "model", "endpoint_origin", "endpoint_sha256",
+                "thinking_mode",
+                "effective_extra_body", "aggregation_producer",
+                "deployment_revision_sha256", "deployment_tenant_sha256",
+                "transport_package_version", "request_timeout_seconds",
+            },
+        }
+        for label, identity in (
+            ("reader", reader), ("judge", judge), ("memory pipeline", pipeline),
+        ):
+            if set(identity) != expected_model_fields[label]:
+                raise BenchmarkIntegrityError(
+                    f"LongMemEval {label} model identity fields differ"
+                )
+        _validated_pipeline_aggregation_producer(pipeline, archive_only=archive_only)
+        def expected_provider(endpoint: str) -&gt; str:
+            official = validate_http_endpoint(
+                endpoint, label="model identity"
+            ).official_provider
+            return official if official is not None else "openai-compatible"
+        for identity, prefix in ((reader, "answer"), (judge, "judge")):
+            if (
+                identity.get("model") != config.get(f"{prefix}_model")
+                or identity.get("endpoint_origin")
+                != config.get(f"{prefix}_endpoint_origin")
+                or identity.get("endpoint_sha256")
+                != config.get(f"{prefix}_endpoint_sha256")
+                or identity.get("provider")
+                != expected_provider(identity["endpoint_origin"])
+                or _finite_number(identity.get("temperature")) != 0.0
+                or identity.get("max_tokens") != (1024 if prefix == "answer" else 10)
+                or (
+                    prefix == "judge"
+                    and identity.get("n") != (
+                        1 if config.get("judge_protocol") == "official" else None
+                    )
+                )
+                or identity.get("extra_body") != config.get(f"{prefix}_extra_body_obj")
+            ):
+                raise BenchmarkIntegrityError(
+                    f"LongMemEval {prefix} effective identity differs from config"
+                )
+        if (
+            pipeline.get("provider") != expected_provider(pipeline["endpoint_origin"])
+            or pipeline.get("model") != config.get("hymem_model")
+            or pipeline.get("endpoint_origin") != config.get("hymem_endpoint_origin")
+            or pipeline.get("endpoint_sha256") != config.get("hymem_endpoint_sha256")
+            or pipeline.get("thinking_mode") != config.get("hymem_thinking")
+        ):
+            raise BenchmarkIntegrityError("LongMemEval memory pipeline identity differs from config")
+        if reader.get("extra_body") != normalize_extra_body(reader.get("extra_body"), label="reader"):
+            raise BenchmarkIntegrityError("LongMemEval reader extra_body is not normalized")
+        if judge.get("extra_body") != normalize_extra_body(judge.get("extra_body"), label="judge"):
+            raise BenchmarkIntegrityError("LongMemEval judge extra_body is not normalized")
+        expected_prompt_exact = config["judge_protocol"] == "official"
+        if judge.get("prompt_exact_official") is not expected_prompt_exact:
+            raise BenchmarkIntegrityError(
+                "LongMemEval selected judge prompt identity differs from its protocol"
+            )
+        if judge.get("retry_policy") != config.get("judge_transport_retry_policy"):
+            raise BenchmarkIntegrityError(
+                "LongMemEval judge retry identity differs from config"
+            )
+        mode = pipeline.get("thinking_mode")
+        if mode not in {"auto", "disabled", "off", "enabled"}:
+            raise BenchmarkIntegrityError("LongMemEval memory pipeline thinking mode is malformed")
+        host = (urlsplit(pipeline["endpoint_origin"]).hostname or "").casefold()
+        sends_thinking = mode == "disabled" or (
+            mode == "auto" and ("deepseek" in host or "deepseek" in pipeline["model"].casefold())
+        )
+        expected_pipeline_extra = {"thinking": {"type": "disabled"}} if sends_thinking else {}
+        if pipeline.get("effective_extra_body") != expected_pipeline_extra:
+            raise BenchmarkIntegrityError("LongMemEval memory pipeline request identity differs")
+        embedding = _validate_embedding_identity(models.get("embedding"))
+        if config.get("embedding_runtime") != embedding:
+            raise BenchmarkIntegrityError("LongMemEval embedding config/model identity differs")
+        if config.get("embeddings") is not embedding.get("configured"):
+            raise BenchmarkIntegrityError("LongMemEval embedding enablement differs")
+        effective = config.get("effective_hymem_config")
+        if not isinstance(effective, Mapping) or not effective:
+            raise BenchmarkIntegrityError("LongMemEval effective HyMem config is absent")
+        expected_effective = {
+            "message_fts_top_k": 15, "fts_top_k": 10, "graph_top_k": 10,
+            "aggregation_nodes_enabled": config.get("aggregation_nodes"),
+            "aggregation_inject_abilities": (
+                [] if config.get("aggregation_broad") else ["TR"]
+            ),
+            "episode_granularity_enabled": config.get("episode_granularity"),
+            "value_supersession_enabled": config.get("value_supersession"),
+            "graph_multihop_enabled": config.get("graph_multihop"),
+            "rerank_top_k": (
+                config.get("rerank_top_k")
+                if config.get("rerank_top_k") is not None else 20
+            ),
+            "rerank_model": config.get("rerank_model") or "llm",
+            "rerank_message_hits": (
+                config.get("rerank_message_hits")
+                if config.get("rerank_message_hits") is not None else True
+            ),
+            "graph_multihop_max_hops": (
+                config.get("graph_multihop_max_hops")
+                if config.get("graph_multihop_max_hops") is not None else 2
+            ),
+            "graph_multihop_decay": (
+                config.get("graph_multihop_decay")
+                if config.get("graph_multihop_decay") is not None else 0.5
+            ),
+            "graph_multihop_min_score": (
+                config.get("graph_multihop_min_score")
+                if config.get("graph_multihop_min_score") is not None else 0.05
+            ),
+            "rules_enabled": (
+                config.get("rules") if config.get("rules") is not None else True
+            ),
+            "rules_extraction_enabled": (
+                config.get("rules_extraction")
+                if config.get("rules_extraction") is not None else False
+            ),
+            "facts_enabled": (
+                config.get("facts") if config.get("facts") is not None else True
+            ),
+            "facts_extraction_enabled": (
+                config.get("facts_extraction")
+                if config.get("facts_extraction") is not None else True
+            ),
+        }
+        for field, expected in expected_effective.items():
+            if effective.get(field) != expected:
+                raise BenchmarkIntegrityError(
+                    f"LongMemEval effective HyMem lever {field} differs"
+                )
+        expected_count = manifest.get("expected_count")
+        if (
+            isinstance(expected_count, bool) or not isinstance(expected_count, int)
+            or expected_count &lt;= 0
+        ):
+            raise BenchmarkIntegrityError("LongMemEval manifest expected_count is malformed")
+        if expected_count &gt; dataset_expected_count:
+            raise BenchmarkIntegrityError(
+                "LongMemEval run denominator exceeds its source dataset"
+            )
+        if protocol_split == "full" and expected_count != (
+            sample if sample &gt; 0 else dataset_expected_count
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval full-run denominator differs from its sample declaration"
+            )
+        if config["official_denominator_validated"] and (
+            manifest.get("expected_ids_hash") != LME_S_SOURCE_IDS_HASH
+        ):
+            raise BenchmarkIntegrityError("LongMemEval official source ID order differs")
+    
+        rows: list[dict[str, Any]] = []
+        ids: list[str] = []
+        completed = failed = missing = 0
+        min_reader_calls = min_judge_calls = 0
+        row_distill_calls = 0
+        successful_indexed_ids: set[str] = set()
+        row_indexing_summaries: dict[str, dict[str, Any]] = {}
+        failed_row_indexing_summaries: dict[str, dict[str, Any]] = {}
+        for index, raw in enumerate(rows_raw):
+            if not isinstance(raw, Mapping):
+                raise BenchmarkIntegrityError(f"LongMemEval strict row {index} is malformed")
+            row = dict(raw)
+            qid = row.get("question_id")
+            qtype = row.get("question_type")
+            if not isinstance(qid, str) or not qid.strip() or qid != qid.strip():
+                raise BenchmarkIntegrityError("LongMemEval strict row id is malformed")
+            if qtype not in LME_BASE_QUESTION_TYPES:
+                raise BenchmarkIntegrityError("LongMemEval strict row question type is malformed")
+            ids.append(qid)
+            failure = row.get("benchmark_failure")
+            if failure is not None and (
+                not isinstance(failure, str) or not failure.strip()
+            ):
+                raise BenchmarkIntegrityError("LongMemEval failure evidence is malformed")
+            verdict = row.get("correct")
+            if scored_run:
+                if row.get("retrieval_only") is True or not isinstance(verdict, bool):
+                    raise BenchmarkIntegrityError("LongMemEval scored row verdict posture is malformed")
+            elif row.get("retrieval_only") is not True or (
+                verdict is not None and not (failure and verdict is False)
+            ):
+                raise BenchmarkIntegrityError("LongMemEval retrieval row verdict posture is malformed")
+    
+            row_indexing = row.get("indexing")
+            row_indexing_complete: bool | None = None
+            if config.get("no_dream") is True:
+                if row_indexing is not None:
+                    raise BenchmarkIntegrityError(
+                        "LongMemEval no-dream row carries indexing evidence"
+                    )
+            elif row_indexing is not None:
+                row_indexing_complete = _validate_indexing(
+                    row_indexing,
+                    require_healthy=config["indexing_require_healthy"],
+                    allow_incomplete=True,
+                )
+                _validate_aggregation_pipeline_binding(
+                    row_indexing.get("final_status"), pipeline,
+                    archive_only=archive_only,
+                )
+                normalized_row_indexing = dict(row_indexing)
+                if normalized_row_indexing.get("schema") != LME_INDEXING_SUMMARY_VERSION:
+                    normalized_row_indexing.pop("question_id", None)
+                if row_indexing_complete:
+                    successful_indexed_ids.add(qid)
+                    row_indexing_summaries[qid] = normalized_row_indexing
+                else:
+                    failed_row_indexing_summaries[qid] = normalized_row_indexing
+    
+            oracle = row.get("oracle_ability")
+            detected = row.get("detected_ability")
+            ability = row.get("ability_used")
+            missing_row = failure == "missing_prediction"
+            distill_fired = row.get("distill_fired")
+            distill_calls = row.get("distill_calls")
+            if missing_row and distill_fired is None and distill_calls is None:
+                distill_fired, distill_calls = False, 0
+            if (
+                not isinstance(distill_fired, bool)
+                or isinstance(distill_calls, bool)
+                or not isinstance(distill_calls, int)
+                or distill_calls &lt; 0
+                or (distill_calls &gt; 0 and not distill_fired)
+                or (
+                    not config["distill"]
+                    and (distill_fired or distill_calls != 0)
+                )
+            ):
+                raise BenchmarkIntegrityError(
+                    "LongMemEval row distillation usage is malformed"
+                )
+            row_distill_calls += distill_calls
+            if not missing_row:
+                if oracle != LME_ABILITY_BY_TYPE[qtype] or detected not in {None, "MR", "TR"}:
+                    raise BenchmarkIntegrityError("LongMemEval row routing evidence is malformed")
+                expected_ability = detected if config["label_free_answer_path"] else oracle
+                if ability != expected_ability:
+                    raise BenchmarkIntegrityError("LongMemEval row routing evidence is inconsistent")
+    
+            if failure:
+                if scored_run and verdict is not False:
+                    raise BenchmarkIntegrityError("LongMemEval failed scored row is inconsistent")
+                failed += 1
+                if missing_row:
+                    missing += 1
+                indexing_failure = re.fullmatch(
+                    r"indexing_failure:([a-z][a-z0-9_]*)", failure
+                )
+                if indexing_failure is not None:
+                    code = indexing_failure.group(1)
+                    if (
+                        row_indexing_complete is not False
+                        or not isinstance(row_indexing, Mapping)
+                        or row_indexing.get("schema") != LME_INDEXING_SUMMARY_VERSION
+                        or row_indexing.get("outcome") != "failure"
+                        or not isinstance(row_indexing.get("failure"), Mapping)
+                        or row_indexing["failure"].get("code") != code
+                    ):
+                        raise BenchmarkIntegrityError(
+                            "LongMemEval indexing failure row/summary differs"
+                        )
+                    forbidden_scoring = {
+                        "question", "answer", "hypothesis", "context_sha",
+                        "judge_raw", "judge_protocol", "judge_error",
+                        "judge_parse_valid", "recall_ceiling", "recall_tier",
+                        "gold_mode", "gold_turns", "gold_turns_in_pool",
+                        "gold_turn_tiers", "n_episodes", "n_agg_nodes",
+                        "n_procedures", "n_facts", "gold_in_episodes",
+                        "gold_in_facts",
+                    }
+                    if forbidden_scoring &amp; set(row):
+                        raise BenchmarkIntegrityError(
+                            "LongMemEval indexing failure carries scoring/retrieval evidence"
+                        )
+                    allowed_failure_fields = {
+                        "question_id", "question_type", "correct",
+                        "benchmark_failure", "retrieval_only", "oracle_ability",
+                        "detected_ability", "ability_used", "distill_fired",
+                        "distill_calls", "indexing", "memory_pipeline_usage",
+                        "embedding_usage", "lifecycle_errors",
+                    }
+                    if not set(row) &lt;= allowed_failure_fields:
+&gt;                       raise BenchmarkIntegrityError(
+                            "LongMemEval indexing failure row fields differ"
+E                           benchmarks.strictness.BenchmarkIntegrityError: LongMemEval indexing failure row fields differ
+
+benchmarks/lme_protocol.py:3032: BenchmarkIntegrityError</failure></testcase></testsuite></testsuites>

@@ -1,0 +1,110 @@
+{
+  "clone_files_unchanged": true,
+  "jobs": {
+    "control.sqlite": [
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "control-injection"
+      }
+    ],
+    "hymem.sqlite": [
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "78f9596eb813"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "fb47364af087"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "45b61c2cdbaf"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "56b5fa3acf79"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "a581e370a41e"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "3b948b64d0f7"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "171fa7bcc32d"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "f6d6cf632a7f"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": 77,
+        "cursor_offset": 591,
+        "cursor_partial_message_id": 78,
+        "draft_chars": 494,
+        "failure_reason": "summary_output_cap",
+        "session_id": "c820da783697"
+      },
+      {
+        "attempts": 1,
+        "cursor_message_id": null,
+        "cursor_offset": 0,
+        "cursor_partial_message_id": null,
+        "draft_chars": 0,
+        "failure_reason": "summary_output_cap",
+        "session_id": "7f680952e723"
+      }
+    ]
+  },
+  "metadata_only": true,
+  "paid_calls": 0
+}

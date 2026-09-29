@@ -1,0 +1,151 @@
+{
+  "kind": "root-prelaunch-approval",
+  "authority": "User Approved the bounded live replay; numerical limits predeclared before paid calls",
+  "manifest_sha256": "674e725084db3dea89371490335f13cabb9b16e764bdab4de03e9f6a3b53360a",
+  "max_completions": 72,
+  "max_http_attempts": 72,
+  "per_completion_seconds": 120,
+  "campaign_seconds": 1800,
+  "endpoint": "https://api.deepseek.com",
+  "model": "deepseek-v4-flash",
+  "source_files": 225,
+  "case_counts": {
+    "facts": 10,
+    "digest": 7,
+    "chunk": 3
+  },
+  "all_10_original_hashes_match": true,
+  "all_17_facts_digest_primary_user_hashes_match": true,
+  "all_3_exact_chunk_source_hashes_match": true,
+  "root_tests": {
+    "adapter": 18,
+    "probe": 44,
+    "supervisor": 61
+  },
+  "rehearsals": {
+    "positive": {
+      "cases": 20,
+      "calls": 27,
+      "http": 0,
+      "accepted": 20,
+      "exit": 0
+    },
+    "negative": {
+      "cases": 20,
+      "calls": 27,
+      "http": 0,
+      "rejected": 20,
+      "exit": 0
+    },
+    "root_audited_all_54_worker_reservations_hashes_and_cleanup": true
+  },
+  "helper_pins": {
+    "runner": {
+      "path": "/diag/live_probe.py",
+      "sha256": "8247f6a41822516041a395e8527eb4accc79b7806cd23f7ed5b7d788e2ded39b"
+    },
+    "adapter": {
+      "path": "/diag/retained_live_cases.py",
+      "sha256": "704efe3a34e0735ab5a09618c81507690cd0697f3d77d769ae8f493f8131bec9"
+    },
+    "inventory": {
+      "path": "/diag/inventory.json",
+      "sha256": "ea7c7c1cc44b614224f4482ecd5410067cd8eeefe37db629f165c67fa40bab08"
+    },
+    "transport": {
+      "path": "/diag/transport_common.py",
+      "sha256": "1c98c73cfb1b607113c726616058862fd6bb16a57901a57c8962ee4a0a2807a0"
+    },
+    "supervisor": {
+      "path": "/diag/supervised_invocation.py",
+      "sha256": "9bab7fc77e68cbea050b774791aee94893c7eb54d3cbb87f8b3e7bee33ef85bc"
+    }
+  },
+  "container": {
+    "id": "9a88a1ab54ac8cb58da5809f445cef0f5ac050e48302b45dc51fe4ad90fdb4ac",
+    "status": "created",
+    "image": "sha256:8e0221ce80304b093d8a86a4285c29c2f2d8936ba3bc768a0339f1e92fbedce5",
+    "user": "1000:1000",
+    "network": "bridge",
+    "readonly": true,
+    "init": true,
+    "caps": [
+      "ALL"
+    ],
+    "security": [
+      "no-new-privileges"
+    ],
+    "memory": 2147483648,
+    "cpus": 2000000000,
+    "pids": 128,
+    "entry": [
+      "/home/node/hymem-env/bin/python3"
+    ],
+    "cmd": [
+      "-I",
+      "-B",
+      "/diag/live_probe.py",
+      "live",
+      "--manifest",
+      "/diag/live-manifest.json",
+      "--manifest-sha256",
+      "674e725084db3dea89371490335f13cabb9b16e764bdab4de03e9f6a3b53360a",
+      "--output",
+      "/results/campaign"
+    ],
+    "mounts": [
+      {
+        "Destination": "/home/node/hymem-env",
+        "Mode": "",
+        "Propagation": "rprivate",
+        "RW": false,
+        "Source": "/opt/stacks/hermes/instance1/home/hymem-env",
+        "Type": "bind"
+      },
+      {
+        "Destination": "/candidate",
+        "Mode": "",
+        "Propagation": "rprivate",
+        "RW": false,
+        "Source": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-repair-live-20260919-AvLFBi/source",
+        "Type": "bind"
+      },
+      {
+        "Destination": "/diag",
+        "Mode": "",
+        "Propagation": "rprivate",
+        "RW": false,
+        "Source": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-repair-live-20260919-AvLFBi/diag",
+        "Type": "bind"
+      },
+      {
+        "Destination": "/retained/stores",
+        "Mode": "",
+        "Propagation": "rprivate",
+        "RW": false,
+        "Source": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-full-20260918-5HQ61m/stores",
+        "Type": "bind"
+      },
+      {
+        "Destination": "/results",
+        "Mode": "",
+        "Propagation": "rprivate",
+        "RW": true,
+        "Source": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-repair-live-20260919-AvLFBi/live",
+        "Type": "bind"
+      },
+      {
+        "Destination": "/run/deepseek.env",
+        "Mode": "",
+        "Propagation": "rprivate",
+        "RW": false,
+        "Source": "/opt/stacks/hermes/instance1/home/.hermes/.env",
+        "Type": "bind"
+      }
+    ],
+    "tmpfs": {
+      "/tmp": "rw,mode=1777"
+    }
+  },
+  "paid_started": false
+}

@@ -1,0 +1,138 @@
+{
+  "kind": "current-model-bounded-replay-prelaunch",
+  "authority": "User Approved after being asked for one fresh 20-case replay, up to72 additional completions/HTTP attempts and30minutes; no deployment or fullLME",
+  "date": "2026-09-19",
+  "remote_root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-repair-current-20260919-AKZh09",
+  "manifest_sha256": "8d6f7e89c9e70b910813fe63a3b4fe2500249857fe6e4a838854d7cb6010bbcb",
+  "requested_model": "deepseek-flash",
+  "endpoint": "https://api.deepseek.com",
+  "limits": {
+    "completions": 72,
+    "http_attempts": 72,
+    "invocation_seconds": 120,
+    "campaign_seconds": 1800
+  },
+  "original_spent_paid_calls": 1,
+  "combined_ceiling": 73,
+  "case_counts": {
+    "facts": 10,
+    "digest": 7,
+    "chunk": 3
+  },
+  "root_tests": {
+    "runner": 46,
+    "auditor": 43
+  },
+  "source_hashes_verified": 225,
+  "store_hashes_verified": 10,
+  "rehearsals": {
+    "rehearse-negative": {
+      "audit": {
+        "accepted_empty": {
+          "chunk": 0,
+          "digest": 0,
+          "facts": 0
+        },
+        "case_covered_stores": 9,
+        "cases": 20,
+        "completions": 27,
+        "finish_reasons": {
+          "stop": 27
+        },
+        "http_attempts": 0,
+        "inventory_sha256": "ea7c7c1cc44b614224f4482ecd5410067cd8eeefe37db629f165c67fa40bab08",
+        "lme_readiness_verified": false,
+        "manifest_sha256": "8d6f7e89c9e70b910813fe63a3b4fe2500249857fe6e4a838854d7cb6010bbcb",
+        "mode": "rehearse",
+        "nonstop_gate_failed": false,
+        "outcomes": {
+          "chunk": {
+            "rejected": 3
+          },
+          "digest": {
+            "rejected": 7
+          },
+          "facts": {
+            "rejected": 10
+          }
+        },
+        "planned_completion_cap": 72,
+        "semantic_verified": false,
+        "source_files_hash_verified": 225,
+        "status": "accounting_verified",
+        "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+        "stores_hash_verified": 10,
+        "usage": null
+      },
+      "returncode": 0,
+      "state": {
+        "ExitCode": 0,
+        "OOMKilled": false,
+        "Pid": 0,
+        "Status": "exited"
+      },
+      "stderr_bytes": 0
+    },
+    "rehearse-positive": {
+      "audit": {
+        "accepted_empty": {
+          "chunk": 3,
+          "digest": 0,
+          "facts": 10
+        },
+        "case_covered_stores": 9,
+        "cases": 20,
+        "completions": 27,
+        "finish_reasons": {
+          "stop": 27
+        },
+        "http_attempts": 0,
+        "inventory_sha256": "ea7c7c1cc44b614224f4482ecd5410067cd8eeefe37db629f165c67fa40bab08",
+        "lme_readiness_verified": false,
+        "manifest_sha256": "8d6f7e89c9e70b910813fe63a3b4fe2500249857fe6e4a838854d7cb6010bbcb",
+        "mode": "rehearse",
+        "nonstop_gate_failed": false,
+        "outcomes": {
+          "chunk": {
+            "accepted": 3
+          },
+          "digest": {
+            "accepted": 7
+          },
+          "facts": {
+            "accepted": 10
+          }
+        },
+        "planned_completion_cap": 72,
+        "semantic_verified": false,
+        "source_files_hash_verified": 225,
+        "status": "accounting_verified",
+        "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+        "stores_hash_verified": 10,
+        "usage": null
+      },
+      "returncode": 0,
+      "state": {
+        "ExitCode": 0,
+        "OOMKilled": false,
+        "Pid": 0,
+        "Status": "exited"
+      },
+      "stderr_bytes": 0
+    }
+  },
+  "auditor_sha256": "cec664bc3feef0b0fe76049b008d4f14ba2279a8813943cceac2804b8a9e8e90",
+  "runner_sha256": "94f7a26970d7d333f73e457dffc01ae0afd1b65f04987d2239df38590900f7c7",
+  "container": {
+    "name": "hymem-lme-current-live-AKZh09",
+    "id": "b37ab4ecd3dbef7a5cc9682538669f12317440a3962c17b8c0d2d1afac1451a9",
+    "image": "sha256:8e0221ce80304b093d8a86a4285c29c2f2d8936ba3bc768a0339f1e92fbedce5",
+    "user": "1000:1000",
+    "readonly": true,
+    "network": "bridge",
+    "no_new_privileges": true,
+    "all_caps_dropped": true,
+    "credentials_only_readonly_live_mount": true
+  },
+  "paid_started": false
+}

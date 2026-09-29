@@ -1,0 +1,11 @@
+{
+  "schema": "r7-preservation-acceptance-v1",
+  "unit": "historical-msc-locomo-archive-admission",
+  "parent_review": "Accepted narrow removal of current retirement-policy enforcement from archive reader only; model syntax, endpoint safety, hashes, canary bindings and completion-policy checks retained. CLI bootstrap retained.",
+  "parent_tests": {"passed": 225, "failures": 0, "errors": 0, "skipped": 0, "seconds": 25.95, "receipt": "docs/patches/2026-09-25-parent-r7-historical.xml"},
+  "test_adjustment": "Old tamper control used valid retired deepseek-chat as malformed identity; now uses leading-space malformed name and still proves rejection.",
+  "source_sha256": "571c19c5dd062f15bbdff9c3ed6f64e9102cbaa0d53829cc0aea46a9678c5ea6",
+  "new_test_sha256": "f28c5aeb7394c58fac092979e5eefdb14d0c60c3e20602feb536985c30c39d20",
+  "paid_calls": 0,
+  "production_changes": false
+}

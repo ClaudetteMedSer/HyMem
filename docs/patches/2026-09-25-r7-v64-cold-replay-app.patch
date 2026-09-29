@@ -1,0 +1,171 @@
+--- a/hymem/dreaming/phase1.py
++++ b/hymem/dreaming/phase1.py
+@@ -147,6 +147,156 @@
+     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+ 
+ 
++def _matches_historical_citations(
++    conn: sqlite3.Connection,
++    chunk: Chunk,
++    extraction: ChunkExtraction,
++    *,
++    cfg: HyMemConfig | None,
++    result_hash: str,
++) -> bool:
++    """Match a NULL-proof outcome to its complete durable citation set.
++
++    An imported semantic alias may have no edge embedding to reproduce its
++    original route. The cited evidence already records that route, so match
++    each incoming surface claim uniquely to one observation and rebuild the
++    full portable result hash from those observations. This is read-only and
++    never derives a new local input proof from imported history.
++    """
++    if not extraction.source_validated:
++        return False
++    stored = conn.execute(
++        "SELECT session_id,start_message_id,end_message_id,salience_reason,text "
++        "FROM chunks WHERE id=? AND chunk_kind='extraction'", (chunk.id,),
++    ).fetchone()
++    if stored is None or tuple(stored) != (
++        chunk.session_id, chunk.start_message_id, chunk.end_message_id,
++        chunk.salience_reason, chunk.text,
++    ):
++        return False
++    try:
++        sources = _claim_sources_for_chunk(conn, chunk)
++    except (KeyError, TypeError, ValueError):
++        return False
++    if (
++        not sources
++        or tuple(source.message_id for source in sources)
++        != tuple(chunk.source_message_ids)
++        or {source.message_id: source for source in sources}
++        != extraction.claim_sources
++    ):
++        return False
++    outcome = conn.execute(
++        "SELECT prompt_version,prompt_generation,phase1_generation_key,"
++        "local_replay_proof,result_hash FROM kg_claim_extraction_outcomes "
++        "WHERE chunk_id=?", (chunk.id,),
++    ).fetchone()
++    if (
++        outcome is None or outcome["local_replay_proof"] is not None
++        or outcome["result_hash"] != result_hash
++    ):
++        return False
++    rows = conn.execute(
++        """
++        SELECT observation.edge_id,observation.source_session_id,
++               observation.source_message_id,observation.evidence_kind,
++               observation.polarity,observation.interpretation_key,
++               observation.prompt_version,observation.prompt_generation,
++               observation.phase1_generation_key,
++               kg.subject_canonical,kg.predicate,kg.object_canonical,
++               ev.source_role,ev.evidence_weight,ev.weight_source,
++               ev.surface_subject,ev.surface_object,ev.value_text,
++               ev.value_numeric,ev.value_unit,ev.temporal_scope,
++               ev.source_created_at,ev.source_event_at,ev.source_peer_id,
++               ev.source_workspace_id,ev.source_coverage_chunk_id,
++               ev.source_coverage_version,
++               ev.source_session_id AS evidence_session_id,
++               ev.source_message_id AS evidence_message_id
++        FROM kg_claim_observations observation
++        JOIN kg_evidence ev ON ev.id=observation.evidence_id
++        JOIN knowledge_graph kg ON kg.id=observation.edge_id
++        WHERE observation.chunk_id=?
++        """,
++        (chunk.id,),
++    ).fetchall()
++    if len(rows) != len(extraction.triples):
++        return False
++    role_weights = cfg.evidence_role_weights if cfg is not None else {}
++    used: set[int] = set()
++    semantic_rows: list[tuple[object, ...]] = []
++    try:
++        for triple in extraction.triples:
++            source = extraction.claim_sources.get(int(triple.source_message_id))
++            if source is None:
++                return False
++            weight = role_weights.get(source.role, 1) if cfg is not None else 1
++            weight_source = (
++                f"configured_role:{source.role}"
++                if cfg is not None else "default_weight:1"
++            )
++            interpretation = evidence._interpretation_key(
++                polarity=int(triple.polarity), evidence_weight=weight,
++                weight_source=weight_source, source_role=source.role,
++                surface_subject=triple.subject,
++                surface_object=triple.object,
++                value_text=triple.value_text,
++                value_numeric=triple.value_numeric,
++                value_unit=triple.value_unit,
++                temporal_scope=triple.temporal_scope,
++            )
++            expected_event_at = _normalized_source_event_at(
++                conn, source.source_created_at,
++            )
++            candidates = [index for index, row in enumerate(rows) if (
++                row["prompt_version"] == outcome["prompt_version"]
++                and row["prompt_generation"] == outcome["prompt_generation"]
++                and row["phase1_generation_key"] == outcome["phase1_generation_key"]
++                # A shared immutable evidence revision may have originated
++                # under an older prompt. The observation and outcome own this
++                # chunk's current prompt/generation authority.
++                and row["source_session_id"] == source.session_id
++                and row["source_message_id"] == source.message_id
++                and row["evidence_session_id"] == source.session_id
++                and row["evidence_message_id"] == source.message_id
++                and row["evidence_kind"] == "extraction"
++                and row["predicate"] == triple.predicate
++                and row["polarity"] == int(triple.polarity)
++                and row["interpretation_key"] == interpretation
++                and row["source_role"] == source.role
++                and row["evidence_weight"] == weight
++                and row["weight_source"] == weight_source
++                and row["surface_subject"] == triple.subject
++                and row["surface_object"] == triple.object
++                and row["value_text"] == triple.value_text
++                and row["value_numeric"] == triple.value_numeric
++                and row["value_unit"] == triple.value_unit
++                and row["temporal_scope"] == triple.temporal_scope
++                and row["source_created_at"] == source.source_created_at
++                and row["source_event_at"] == expected_event_at
++                and row["source_peer_id"] == source.source_peer_id
++                and row["source_workspace_id"] == source.source_workspace_id
++                and row["source_coverage_chunk_id"] == source.chunk_id
++                and row["source_coverage_version"] == LOSSLESS_COVERAGE_VERSION
++            )]
++            if len(candidates) != 1 or candidates[0] in used:
++                return False
++            index = candidates[0]
++            used.add(index)
++            row = rows[index]
++            semantic_rows.append((
++                row["subject_canonical"], row["predicate"],
++                row["object_canonical"], row["source_session_id"],
++                row["source_message_id"], row["evidence_kind"],
++                row["polarity"], row["interpretation_key"],
++            ))
++        return (
++            len(used) == len(rows)
++            and evidence.claim_result_hash(semantic_rows) == result_hash
++        )
++    except (KeyError, TypeError, ValueError, OverflowError):
++        return False
++
++
+ def _is_exact_published_replay(
+     conn: sqlite3.Connection,
+     chunk: Chunk,
+@@ -297,6 +447,11 @@
+             and expected_proof == outcome["local_replay_proof"]
+         ):
+             return True
++    elif _matches_historical_citations(
++        conn, chunk, extraction, cfg=cfg,
++        result_hash=str(outcome["result_hash"]),
++    ):
++        return True
+     role_weights = cfg.evidence_role_weights if cfg is not None else {}
+     semantic_rows: list[tuple[object, ...]] = []
+     for triple in extraction.triples:

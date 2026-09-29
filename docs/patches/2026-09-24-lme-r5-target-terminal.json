@@ -1,0 +1,33 @@
+{
+  "artifact_sha256": {
+    "junit.xml": "62edb5220df5e478ea4fb8148067155072fb7c5238a20725dc9598c9ea2db379",
+    "receipt.json": "d9dfcc14501cdc88ad1764aa1992b2f308d86d8a53f248f48d16e02c57c1d3cb",
+    "supervisor.json": "d2ea4266067f9c7fd32f55324a06abe0f190797be8af80710b66ac73080a7d17"
+  },
+  "artifact_transfer_hashes_match": true,
+  "benchmark_completion_claimed": false,
+  "configuration_verified_at_terminal": true,
+  "container_id": "421c0acb36950d1e5fd6f47afc3d6ac3f5c89f8ecda90832c84a848472528d91",
+  "credential_mount": false,
+  "deployment_performed": false,
+  "exit_code": 0,
+  "image": "sha256:8e0221ce80304b093d8a86a4285c29c2f2d8936ba3bc768a0339f1e92fbedce5",
+  "manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc",
+  "network": "none",
+  "oom_killed": false,
+  "pid": 0,
+  "provider_calls": 0,
+  "pytest_counts": {
+    "errors": 0,
+    "failures": 0,
+    "passed": 1040,
+    "skipped": 4,
+    "tests": 1044
+  },
+  "source_test_auxiliary_files_verified_before_and_after": 467,
+  "status": "exited",
+  "supervisor_child_reaped": true,
+  "supervisor_errors": [],
+  "supervisor_group_absent": true,
+  "supervisor_timed_out": false
+}

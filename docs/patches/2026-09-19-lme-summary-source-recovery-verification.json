@@ -1,0 +1,406 @@
+{
+  "schema": "hymem-summary-source-recovery-verification-v1",
+  "date": "2026-09-19",
+  "candidate_status": "unsuccessful_live_recovery_do_not_promote",
+  "application_digest_sha256": "bb58abe4aa193049b317a0ed3cc49b09035fc32a90de1ccd326098ebec6b5d1b",
+  "patch": "2026-09-19-lme-09-source-only-summary-recovery.patch",
+  "patch_sha256": "bc40c3b0e021ab7948fa9c5b588afee3498f87a2054dff051e15323d7cc30909",
+  "source_files": 225,
+  "test_files": 210,
+  "full_repository_suite_run": false,
+  "offline_verification": {
+    "local_original": {
+      "tests": 883,
+      "passed": 882,
+      "failed": 1,
+      "errors": 0,
+      "skipped": 0
+    },
+    "target_original": {
+      "tests": 682,
+      "passed": 681,
+      "failed": 1,
+      "errors": 0,
+      "skipped": 0
+    },
+    "sole_original_failure": "tests/test_summary.py::test_long_summary_holds_cursor_and_heals_on_retry",
+    "failure_kind": "outdated_rejected_draft_field_expectation",
+    "correction": "Remove old envelope field assertion; assert rejected text absent; preserve cursor/retry/healing checks",
+    "local_corrected_file_rerun": {
+      "tests": 9,
+      "passed": 9,
+      "python": "3.13.5"
+    },
+    "target_corrected_file_rerun": {
+      "tests": 9,
+      "passed": 9,
+      "python": "3.11.2"
+    },
+    "unique_local_passing_composite": 883,
+    "unique_target_passing_composite": 682,
+    "target_tests_overlap_local": true,
+    "corrected_full_gate_rerun": false,
+    "unresolved_failures": 0,
+    "application_files_changed_for_test_correction": 0,
+    "other_test_files_unchanged": 209,
+    "root_controls": 36,
+    "agent_focused_gate": 408,
+    "helper_gate": 183,
+    "export_recheck": 37,
+    "source_files_postverified": 225,
+    "test_files_postverified": 210,
+    "patch_chain_count": 10,
+    "patch_chain_reconstructed_files": 42
+  },
+  "live_audit": {
+    "case_details": [
+      {
+        "application_partial": null,
+        "case_type": "retained",
+        "clause_count": 9,
+        "draft_chars": 644,
+        "origin": "old",
+        "repair_response_format": "clauses",
+        "repair_validation_failure": "summary_output_cap",
+        "selected_summary_chars": null,
+        "selected_summary_sha256": null,
+        "selected_variant_indices": null,
+        "status": "rejected",
+        "variant_lengths": [
+          [
+            59,
+            63
+          ],
+          [
+            104,
+            113
+          ],
+          [
+            138,
+            102
+          ],
+          [
+            46,
+            42
+          ],
+          [
+            77,
+            93
+          ],
+          [
+            122,
+            108
+          ],
+          [
+            149,
+            130
+          ],
+          [
+            90,
+            93
+          ],
+          [
+            137,
+            117
+          ]
+        ],
+        "whole_clause_selection_verified": false
+      },
+      {
+        "application_partial": null,
+        "case_type": "retained",
+        "clause_count": 7,
+        "draft_chars": 674,
+        "origin": "latest",
+        "repair_response_format": "clauses",
+        "repair_validation_failure": "summary_output_cap",
+        "selected_summary_chars": null,
+        "selected_summary_sha256": null,
+        "selected_variant_indices": null,
+        "status": "rejected",
+        "variant_lengths": [
+          [
+            59,
+            63
+          ],
+          [
+            104,
+            106
+          ],
+          [
+            201,
+            169
+          ],
+          [
+            122,
+            108
+          ],
+          [
+            149,
+            124
+          ],
+          [
+            93,
+            93
+          ],
+          [
+            127,
+            124
+          ]
+        ],
+        "whole_clause_selection_verified": false
+      },
+      {
+        "application_partial": null,
+        "case_type": "synthetic",
+        "clause_count": 4,
+        "draft_chars": null,
+        "origin": null,
+        "repair_response_format": "clauses",
+        "repair_validation_failure": null,
+        "selected_summary_chars": 211,
+        "selected_summary_sha256": "3c7329f53aac184b932f8a5ad89dea8e7101248de889923af95fe5dc8eaac3ce",
+        "selected_variant_indices": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "accepted",
+        "variant_lengths": [
+          [
+            45,
+            36
+          ],
+          [
+            32,
+            32
+          ],
+          [
+            95,
+            69
+          ],
+          [
+            33,
+            35
+          ]
+        ],
+        "whole_clause_selection_verified": true
+      },
+      {
+        "application_partial": null,
+        "case_type": "synthetic",
+        "clause_count": 5,
+        "draft_chars": null,
+        "origin": null,
+        "repair_response_format": "clauses",
+        "repair_validation_failure": null,
+        "selected_summary_chars": 395,
+        "selected_summary_sha256": "1a32e276a0c5a5a055dda8a0d35c366003a6fff3a4c813976a652d51dd0001c7",
+        "selected_variant_indices": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "accepted",
+        "variant_lengths": [
+          [
+            59,
+            79
+          ],
+          [
+            141,
+            146
+          ],
+          [
+            81,
+            79
+          ],
+          [
+            82,
+            87
+          ],
+          [
+            24
+          ]
+        ],
+        "whole_clause_selection_verified": true
+      },
+      {
+        "application_partial": null,
+        "case_type": "synthetic",
+        "clause_count": 4,
+        "draft_chars": null,
+        "origin": null,
+        "repair_response_format": "clauses",
+        "repair_validation_failure": null,
+        "selected_summary_chars": 283,
+        "selected_summary_sha256": "6b0cfeb6495f8f95f2bf502070d3381990db1951dc6733ff4fa5c68b9c74aa76",
+        "selected_variant_indices": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "accepted",
+        "variant_lengths": [
+          [
+            69,
+            59
+          ],
+          [
+            104,
+            89
+          ],
+          [
+            48,
+            45
+          ],
+          [
+            56,
+            52
+          ]
+        ],
+        "whole_clause_selection_verified": true
+      },
+      {
+        "application_partial": null,
+        "case_type": "synthetic",
+        "clause_count": 4,
+        "draft_chars": null,
+        "origin": null,
+        "repair_response_format": "clauses",
+        "repair_validation_failure": "summary_output_cap",
+        "selected_summary_chars": null,
+        "selected_summary_sha256": null,
+        "selected_variant_indices": null,
+        "status": "rejected",
+        "variant_lengths": [
+          [
+            69,
+            62
+          ],
+          [
+            611,
+            585
+          ],
+          [
+            54,
+            51
+          ],
+          [
+            19,
+            29
+          ]
+        ],
+        "whole_clause_selection_verified": false
+      }
+    ],
+    "cases": 6,
+    "finish_reasons": {
+      "stop": 6
+    },
+    "fresh_primary_calls": 0,
+    "historical_primary_responses_reused": 2,
+    "invented_controls": 4,
+    "lme_readiness_verified": false,
+    "manifest_sha256": "17b6ce5c0ace06247cb38b58aff2e2233ddc4a79a37536edb9b8b48b6133da1f",
+    "mode": "live",
+    "new_completions": 6,
+    "new_http_attempts": 6,
+    "nonstop_gate_failed": false,
+    "offline_replay": {
+      "cases": 6,
+      "fresh_primary_calls": 0,
+      "new_http_attempts": 0,
+      "saved_fresh_responses_consumed": 6,
+      "saved_historical_primaries_reused": 2,
+      "status": "exact_application_replay_verified"
+    },
+    "outcomes": {
+      "accepted": 3,
+      "rejected": 3
+    },
+    "planned_completion_cap": 6,
+    "retained_cases": 2,
+    "semantic_verified": false,
+    "source_files_hash_verified": 225,
+    "status": "accounting_verified",
+    "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+    "stores_hash_verified": 10,
+    "usage": {
+      "completion_tokens": 1775,
+      "prompt_tokens": 6622,
+      "total_tokens": 8397
+    }
+  },
+  "semantic_review": {
+    "response_sha256": ["d06b27c183f61e2b53a624fa4dc8e540bc9e54160b14c3e53f32f1085cb6bbe0","f765da902c901be413177a70c554855605968088ee43db0696a1771532f7526d","4173645911966717d0f49091b124ad105acbceb362a8e14840300f0360c320bf","eb1a2f0c3058d4ca2ce0488426a92b9f1dc7f73e650701afb36efe599933c55a","3004921610605526fc04292b6632b63f1673ef5c5243984afe49a50d6ebf5e0f","d7f3e33567b850ccddf817551f6c0771ac5e71cd7edcf5ec717e90df77ed93f1"],
+    "reviewers": [
+      "root",
+      "independent_agent"
+    ],
+    "variants_reviewed": 65,
+    "retained_distinct_source_cases": 1,
+    "retained_historical_drafts": 2,
+    "retained_minimum_complete_plan_chars": [
+      845,
+      793
+    ],
+    "retained_semantic_pass": [
+      false,
+      false
+    ],
+    "retained_findings": [
+      "Old clause three invents the Russia-China relationship as a cause of war; latest clause three invents causal or temporal connections among prior topic-list items and rising tensions.",
+      "Old plan replaces the prior warship-purpose topic with presence or operation.",
+      "Both short lease variants omit China as lessor; latest short variant also coordinates the lease as a threat rather than its contextual relationship.",
+      "Both retained plans now include the major battles and Korea/East Asia geography, but this does not repair the capacity and unsupported-claim failures."
+    ],
+    "positive_selected_chars": [
+      211,
+      395,
+      283
+    ],
+    "positive_semantic_oracles_passed": 3,
+    "negative_status": "honest_no_fit_with_all_twenty_exact_identifiers",
+    "negative_minimum_plan_chars": 723,
+    "negative_oracle": "Exact-value-retention stress test stronger than ordinary topic continuity",
+    "caveats": [
+      "Some variants use stable cross-clause referents/connective fragments rather than literally independent clauses.",
+      "Negative shortened identifier variant retains all exact values but does not explicitly repeat case-sensitivity.",
+      "Manual source-relative review is not automatic entailment or proof of universal reliability.",
+      "Combined prompt changes and single draws do not identify the causal contribution of draft anchoring."
+    ]
+  },
+  "continuation_total_paid_completions": 12,
+  "continuation_total_http_attempts": 12,
+  "campaign_resume_allowed": false,
+  "rerolls_performed": 0,
+  "production_changed": false,
+  "deployment_performed": false,
+  "restarts_performed": false,
+  "full_lme_run": false,
+  "lme_readiness_verified": false,
+  "cleanup": {
+    "live_container_exit": 0,
+    "live_container_pid": 0,
+    "live_container_oom": false,
+    "audit_exit": 0,
+    "semantic_export_exit": 0
+  },
+  "receipts_sha256": {
+    "local-corrected-verification-summary.json": "92ffbbcf8d43404a239f1b030d8eb198f83f7d16ab5fd1513466d8c1e0837684",
+    "target-runtime-verification.json": "932fda3f50bad0fca15b2fdee4c5c8b9082bec64e9180d1689a639dc945dd1fa",
+    "target-composite-root.json": "29d1eec65beb6bb3bd34353c7b822a4a4d4a58e80d77127dd21d03cddae1dc78",
+    "patch-chain-corrected.json": "32f09a8c304bf353577e1584a0ec64d94a66dae4d862564a71b9f1b288025039",
+    "live-audit.json": "e1f342af6961e1f999b29ff3058c3d48d3326fe177d3c83d91c151f85648e74d",
+    "positive-audit.json": "a08858363edf493cc0937f712b6db9d9f785de3bff42c09b457b2985f507dbcd",
+    "negative-audit.json": "4d6bdbcd27d6258dcb6d8a1d1ae3344b65be26004e5ab1006665c1453c4c3dd2"
+  },
+  "remote_record_root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-summary-source-live-20260919-uy7D9a/live/campaign",
+  "raw_benchmark_text_in_artifact": false,
+  "credentials_in_artifact": false
+}

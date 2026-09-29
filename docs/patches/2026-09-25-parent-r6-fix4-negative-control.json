@@ -1,0 +1,29 @@
+{
+  "schema": "r6-parent-clock-order-negative-control-v1",
+  "cases": [
+    {
+      "recency_removed": false,
+      "cross_second": false,
+      "assertion_rejected": false
+    },
+    {
+      "recency_removed": false,
+      "cross_second": true,
+      "assertion_rejected": false
+    },
+    {
+      "recency_removed": true,
+      "cross_second": false,
+      "assertion_rejected": false
+    },
+    {
+      "recency_removed": true,
+      "cross_second": true,
+      "assertion_rejected": true
+    }
+  ],
+  "provider_calls": 0,
+  "source_edits": false,
+  "method": "Parent called the new parametrized control in four separate synthetic stores, with either the genuine shared ordering helper or an in-memory lexical-only helper that removes recency. Proper ordering passes both cases; broken ordering fails cross-second despite current/fixed consumers sharing the same defect.",
+  "source_test_sha256": "f8e6a3de343bebb5e927a865d96b11c1535596fa1c65335d8fd0db6775961797"
+}

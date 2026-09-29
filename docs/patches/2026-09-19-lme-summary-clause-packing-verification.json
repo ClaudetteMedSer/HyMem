@@ -1,0 +1,382 @@
+{
+  "schema": "hymem-summary-clause-packing-verification-v1",
+  "date": "2026-09-19",
+  "candidate_status": "unsuccessful_live_recovery_do_not_promote",
+  "application_digest_sha256": "03d62f806cd23c065ad3d99f0f317d8c9e7d9d671dc5e546d84c1d112ef06bf6",
+  "patch": "2026-09-19-lme-08-summary-clause-packing.patch",
+  "patch_sha256": "fd19425cbee0563770fbda97b730a0dfaa481479603b3eefd8f2beb65fdb732d",
+  "source_files": 225,
+  "test_files": 208,
+  "local_tests": 822,
+  "target_runtime_tests": 621,
+  "target_python": "3.11.2",
+  "helper_tests_with_export": 179,
+  "offline_failures": 0,
+  "offline_errors": 0,
+  "offline_skips": 0,
+  "target_tests_overlap_local": true,
+  "patch_chain_reconstructed_files": 40,
+  "patch_chain_count": 9,
+  "live_audit": {
+    "case_details": [
+      {
+        "application_partial": null,
+        "case_type": "retained",
+        "clause_count": 9,
+        "draft_chars": 644,
+        "origin": "old",
+        "repair_response_format": "clauses",
+        "repair_validation_failure": "summary_output_cap",
+        "selected_summary_chars": null,
+        "selected_summary_sha256": null,
+        "selected_variant_indices": null,
+        "status": "rejected",
+        "variant_lengths": [
+          [
+            96,
+            59
+          ],
+          [
+            113,
+            106
+          ],
+          [
+            36,
+            36
+          ],
+          [
+            48,
+            48
+          ],
+          [
+            59,
+            59
+          ],
+          [
+            52,
+            52
+          ],
+          [
+            115,
+            126
+          ],
+          [
+            123,
+            111
+          ],
+          [
+            60,
+            60
+          ]
+        ],
+        "whole_clause_selection_verified": false
+      },
+      {
+        "application_partial": null,
+        "case_type": "retained",
+        "clause_count": 9,
+        "draft_chars": 674,
+        "origin": "latest",
+        "repair_response_format": "clauses",
+        "repair_validation_failure": "summary_output_cap",
+        "selected_summary_chars": null,
+        "selected_summary_sha256": null,
+        "selected_variant_indices": null,
+        "status": "rejected",
+        "variant_lengths": [
+          [
+            96,
+            77
+          ],
+          [
+            113,
+            109
+          ],
+          [
+            36,
+            36
+          ],
+          [
+            48,
+            48
+          ],
+          [
+            59,
+            59
+          ],
+          [
+            52,
+            52
+          ],
+          [
+            125,
+            136
+          ],
+          [
+            165,
+            151
+          ],
+          [
+            106,
+            106
+          ]
+        ],
+        "whole_clause_selection_verified": false
+      },
+      {
+        "application_partial": null,
+        "case_type": "synthetic",
+        "clause_count": 4,
+        "draft_chars": null,
+        "origin": null,
+        "repair_response_format": "clauses",
+        "repair_validation_failure": null,
+        "selected_summary_chars": 242,
+        "selected_summary_sha256": "81598343d89f55f48039088404f7287f7bc2d3911f2cce3a049436ee5e441c41",
+        "selected_variant_indices": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "accepted",
+        "variant_lengths": [
+          [
+            43,
+            36
+          ],
+          [
+            28,
+            25
+          ],
+          [
+            132,
+            69
+          ],
+          [
+            33,
+            35
+          ]
+        ],
+        "whole_clause_selection_verified": true
+      },
+      {
+        "application_partial": null,
+        "case_type": "synthetic",
+        "clause_count": 5,
+        "draft_chars": null,
+        "origin": null,
+        "repair_response_format": "clauses",
+        "repair_validation_failure": null,
+        "selected_summary_chars": 426,
+        "selected_summary_sha256": "abd073580a9ceab3d61a2e60540f8045330c83e826bb70066b914f73b00d8636",
+        "selected_variant_indices": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "accepted",
+        "variant_lengths": [
+          [
+            86
+          ],
+          [
+            141
+          ],
+          [
+            81
+          ],
+          [
+            86
+          ],
+          [
+            24
+          ]
+        ],
+        "whole_clause_selection_verified": true
+      },
+      {
+        "application_partial": null,
+        "case_type": "synthetic",
+        "clause_count": 4,
+        "draft_chars": null,
+        "origin": null,
+        "repair_response_format": "clauses",
+        "repair_validation_failure": null,
+        "selected_summary_chars": 265,
+        "selected_summary_sha256": "4e548f40e9968a2664e0c9d1bd2b179e25621fa051fa7f8576b34a4b738525f3",
+        "selected_variant_indices": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "accepted",
+        "variant_lengths": [
+          [
+            66,
+            62
+          ],
+          [
+            89,
+            84
+          ],
+          [
+            48,
+            45
+          ],
+          [
+            56,
+            47
+          ]
+        ],
+        "whole_clause_selection_verified": true
+      },
+      {
+        "application_partial": null,
+        "case_type": "synthetic",
+        "clause_count": 3,
+        "draft_chars": null,
+        "origin": null,
+        "repair_response_format": "clauses",
+        "repair_validation_failure": "summary_output_cap",
+        "selected_summary_chars": null,
+        "selected_summary_sha256": null,
+        "selected_variant_indices": null,
+        "status": "rejected",
+        "variant_lengths": [
+          [
+            86,
+            73
+          ],
+          [
+            52,
+            49
+          ],
+          [
+            628,
+            635
+          ]
+        ],
+        "whole_clause_selection_verified": false
+      }
+    ],
+    "cases": 6,
+    "finish_reasons": {
+      "stop": 6
+    },
+    "fresh_primary_calls": 0,
+    "historical_primary_responses_reused": 2,
+    "invented_controls": 4,
+    "lme_readiness_verified": false,
+    "manifest_sha256": "667c67db4ecde65ad4b0ae81cfec6c8fa8d8d0ffd3ef9ae90bb46ef2b292f424",
+    "mode": "live",
+    "new_completions": 6,
+    "new_http_attempts": 6,
+    "nonstop_gate_failed": false,
+    "offline_replay": {
+      "cases": 6,
+      "fresh_primary_calls": 0,
+      "new_http_attempts": 0,
+      "saved_fresh_responses_consumed": 6,
+      "saved_historical_primaries_reused": 2,
+      "status": "exact_application_replay_verified"
+    },
+    "outcomes": {
+      "accepted": 3,
+      "rejected": 3
+    },
+    "planned_completion_cap": 6,
+    "retained_cases": 2,
+    "semantic_verified": false,
+    "source_files_hash_verified": 225,
+    "status": "accounting_verified",
+    "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+    "stores_hash_verified": 10,
+    "usage": {
+      "completion_tokens": 1619,
+      "prompt_tokens": 6846,
+      "total_tokens": 8465
+    }
+  },
+  "case_summary": [
+    {
+      "case_index": 1,
+      "case_type": "retained",
+      "origin": "old",
+      "status": "rejected",
+      "selected_chars": null,
+      "minimum_clause_assembly_chars": 662
+    },
+    {
+      "case_index": 2,
+      "case_type": "retained",
+      "origin": "latest",
+      "status": "rejected",
+      "selected_chars": null,
+      "minimum_clause_assembly_chars": 779
+    },
+    {
+      "case_index": 3,
+      "case_type": "synthetic",
+      "status": "accepted",
+      "selected_chars": 242,
+      "minimum_clause_assembly_chars": 169
+    },
+    {
+      "case_index": 4,
+      "case_type": "synthetic",
+      "status": "accepted",
+      "selected_chars": 426,
+      "minimum_clause_assembly_chars": 426
+    },
+    {
+      "case_index": 5,
+      "case_type": "synthetic",
+      "status": "accepted",
+      "selected_chars": 265,
+      "minimum_clause_assembly_chars": 244
+    },
+    {
+      "case_index": 6,
+      "case_type": "synthetic",
+      "status": "rejected",
+      "selected_chars": null,
+      "minimum_clause_assembly_chars": 754
+    }
+  ],
+  "semantic_review": {
+    "reviewers": [
+      "root",
+      "independent_review_agent"
+    ],
+    "all_offered_variants_reviewed": 63,
+    "retained_source_cases": 1,
+    "retained_repairs_passed": 0,
+    "positive_synthetic_summaries_passed": 3,
+    "exact_identifier_negative_passed": true,
+    "retained_defects": [
+      "Both omit significant land/naval battles and Korea/East Asia geography.",
+      "Old draft plan conflates naval-expansion threat and lease, omits direct-threat qualifier and lease parties.",
+      "Buildup actors are not explicit; old draft also omits fleets."
+    ],
+    "variant_contract_caveat": "Some clauses depend on stable cross-clause referents; positive assembled meaning passes main-proposition review, but literal independent-clause wording is not fully met.",
+    "negative_caveat": "Exact-identifier oracle is stricter than generic topic retention; both generated identifier variants retain all 20 exact values, but the shorter variant does not explicitly restate case sensitivity.",
+    "causal_status": "Observed over-segmentation and duplicate variants; rejected-draft anchoring not independently isolated."
+  },
+  "campaign_spent": true,
+  "resume_allowed": false,
+  "new_paid_completions": 6,
+  "new_http_attempts": 6,
+  "live_container_exit_code": 0,
+  "live_container_pid": 0,
+  "live_container_oom": false,
+  "deployment_performed": false,
+  "production_mutated": false,
+  "full_lme_run": false,
+  "lme_readiness_verified": false,
+  "evidence_root": "/private/tmp/hymem-summary-clause-packing-20260919.QdTCry",
+  "remote_root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-summary-clauses-live-20260919-ptPzLA"
+}

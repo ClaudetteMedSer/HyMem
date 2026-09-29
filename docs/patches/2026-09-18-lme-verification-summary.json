@@ -1,0 +1,108 @@
+{
+  "completed_utc": "2026-09-18 22:11:34 UTC",
+  "scope": "Offline isolated repair, not deployment or a full/live LME readiness result",
+  "base_commit": "af6a615fa7fd1cf14c4c0a27b9fb236ae264f122",
+  "application_files_changed": 6,
+  "source_manifest_files_verified": 225,
+  "same_867_unique_cases_local_and_target": true,
+  "target_runtime": {
+    "image": "sha256:8e0221ce80304b093d8a86a4285c29c2f2d8936ba3bc768a0339f1e92fbedce5",
+    "python": "3.11",
+    "network": "none",
+    "final_groups": [
+      {
+        "group": "facts",
+        "tests": 169,
+        "exit_code": 0,
+        "oom": false
+      },
+      {
+        "group": "digest",
+        "tests": 261,
+        "exit_code": 0,
+        "oom": false
+      },
+      {
+        "group": "chunks",
+        "tests": 437,
+        "exit_code": 0,
+        "oom": false
+      }
+    ]
+  },
+  "retained_protocol": {
+    "stores": 10,
+    "fact_sessions": 10,
+    "digest_sessions": 7,
+    "failed_chunks": 3,
+    "unchanged_original_files": true,
+    "sqlite_writes": 0,
+    "real_llm_calls": 0,
+    "live_semantic_claim": false
+  },
+  "clone_initialization": {
+    "stores": 10,
+    "opens": 20,
+    "schema": 61,
+    "all_quick_checks_ok": true,
+    "all_foreign_key_checks_ok": true,
+    "protected_source_and_session_and_dream_state_unchanged": true,
+    "original_files_unchanged": true,
+    "original_sidecars_absent": true,
+    "temporary_clones_removed": true,
+    "embedding_clients": 0,
+    "llm_calls": 0,
+    "network_attempts": 0,
+    "exit_code": 0,
+    "oom": false
+  },
+  "receipts": {
+    "combined-chunks-target.xml": {
+      "errors": 0,
+      "failures": 0,
+      "sha256": "9b96527b3eeb461ca9097291e8930bad3562a1783e01df8e72f28ec7405f448b",
+      "skips": 0,
+      "tests": 437
+    },
+    "combined-clone-open.json": {
+      "all_expected_checks_passed": true,
+      "sha256": "11e672e68e97793a051d710fd683ebb168a0c90a882ed484771565abab2cc377"
+    },
+    "combined-digest-target.xml": {
+      "errors": 0,
+      "failures": 0,
+      "sha256": "2656fa2fdc6096de7b939cbb051d651e19eaf39cc5d563e487b6301333f433fb",
+      "skips": 0,
+      "tests": 261
+    },
+    "combined-facts-target.xml": {
+      "errors": 0,
+      "failures": 0,
+      "sha256": "8d4ac39b0593479a9012cf042ada24c3d3832dd0979496c21c7c9f4e9cd9ddeb",
+      "skips": 0,
+      "tests": 169
+    },
+    "combined-retained.json": {
+      "all_expected_checks_passed": true,
+      "sha256": "1908047d617b2474504d6cd388e1243e0611c84756b4947b14c1372352d463ac"
+    },
+    "combined-root.xml": {
+      "errors": 0,
+      "failures": 0,
+      "sha256": "8d55a3c425c1101442059108dd9139a25d2ce040ce9a9bc8376ec6727a630556",
+      "skips": 0,
+      "tests": 867
+    }
+  },
+  "local_receipt_directory": "/private/tmp/hymem-lme-repair-20260918.Nod9S1/receipts",
+  "afrodite_staging_directory": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-sequential-repair-20260918-9zlJ0V",
+  "not_done": [
+    "production deployment",
+    "service restart",
+    "paid provider call",
+    "full benchmark resume",
+    "full repository suite",
+    "live extraction-quality proof"
+  ],
+  "next_gate": "Bounded failure-family live replay using this exact candidate before any deployment or fresh full LME run"
+}

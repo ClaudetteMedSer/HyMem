@@ -1,0 +1,103 @@
+{
+  "schema": "lme-contract-live-preflight-v1",
+  "approved": true,
+  "paid_calls_started": false,
+  "remote_root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-contract-live-20260919-MJTviH",
+  "manifest_sha256": "906309c48b13c15c59ad7fefcf5058ae049a195205f8d21e5a84acc2d7ff27a9",
+  "auditor_sha256": "6ea118a34a9cc7668a26eaa1bda7ef70755f2ad4206c093c88e3e9dfd8e6c29d",
+  "scope": {
+    "cases": 17,
+    "max_completions": 34,
+    "max_http_attempts": 34,
+    "per_call_seconds": 120,
+    "campaign_seconds": 1800,
+    "model": "deepseek-flash",
+    "endpoint": "https://api.deepseek.com"
+  },
+  "gates": {
+    "application_tests_each_runtime": 595,
+    "adapter_tests": 19,
+    "runner_tests": 66,
+    "final_auditor_tests": 79,
+    "primary_request_fingerprints_preserved": 17
+  },
+  "rehearsals": {
+    "positive": {
+      "accepted_empty": {
+        "digest": 0,
+        "facts": 10
+      },
+      "accepted_partial": {
+        "digest": 0,
+        "facts": 10
+      },
+      "case_covered_stores": 9,
+      "cases": 17,
+      "completions": 34,
+      "finish_reasons": {
+        "stop": 34
+      },
+      "http_attempts": 0,
+      "inventory_sha256": "1dc9992776da0d3b2641edbfb07c4746cd41f5736f57446e1adbe85f1f5a6bac",
+      "lme_readiness_verified": false,
+      "manifest_sha256": "906309c48b13c15c59ad7fefcf5058ae049a195205f8d21e5a84acc2d7ff27a9",
+      "mode": "rehearse",
+      "nonstop_gate_failed": false,
+      "outcomes": {
+        "digest": {
+          "accepted": 7
+        },
+        "facts": {
+          "accepted": 10
+        }
+      },
+      "planned_completion_cap": 34,
+      "semantic_verified": false,
+      "source_files_hash_verified": 225,
+      "status": "accounting_verified",
+      "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+      "stores_hash_verified": 10,
+      "usage": null
+    },
+    "negative": {
+      "accepted_empty": {
+        "digest": 0,
+        "facts": 0
+      },
+      "accepted_partial": {},
+      "case_covered_stores": 9,
+      "cases": 17,
+      "completions": 34,
+      "finish_reasons": {
+        "stop": 34
+      },
+      "http_attempts": 0,
+      "inventory_sha256": "1dc9992776da0d3b2641edbfb07c4746cd41f5736f57446e1adbe85f1f5a6bac",
+      "lme_readiness_verified": false,
+      "manifest_sha256": "906309c48b13c15c59ad7fefcf5058ae049a195205f8d21e5a84acc2d7ff27a9",
+      "mode": "rehearse",
+      "nonstop_gate_failed": false,
+      "outcomes": {
+        "digest": {
+          "rejected": 7
+        },
+        "facts": {
+          "rejected": 10
+        }
+      },
+      "planned_completion_cap": 34,
+      "semantic_verified": false,
+      "source_files_hash_verified": 225,
+      "status": "accounting_verified",
+      "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+      "stores_hash_verified": 10,
+      "usage": null
+    }
+  },
+  "preflight_corrections": [
+    "Root first local invocation selected checkout imports; pinned-candidate rerun passed.",
+    "Independent auditor updated for the source-preserving JSON repair envelope.",
+    "Independent auditor corrected fact provenance JSON encoding to UTF-8 and added direct Unicode controls."
+  ],
+  "production_mutated": false
+}

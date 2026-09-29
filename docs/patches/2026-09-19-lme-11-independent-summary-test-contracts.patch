@@ -1,0 +1,601 @@
+--- a/tests/test_coverage_health.py
++++ b/tests/test_coverage_health.py
+@@ -152,7 +152,8 @@
+     monkeypatch.setattr(doctor, "_check_embedding", lambda _: (doctor._Result(doctor.OK, "offline", "ok"), None, None))
+     assert doctor.run_doctor() == 1
+     output = capsys.readouterr().out
+-    assert "[FAIL] lossless coverage integrity" in output and "1 failure(s)" in output
++    assert "[FAIL] lossless coverage integrity" in output
++    assert "[FAIL] summary context health" in output and "2 failure(s)" in output
+     assert "private-source-secret" not in output and "private-session" not in output
+ 
+ 
+--- a/tests/test_digest_bounded_summary_repair.py
++++ b/tests/test_digest_bounded_summary_repair.py
+@@ -1,4 +1,4 @@
+-"""Narrow af6 digest repair: no verifier, summary-policy change or live calls."""
++"""Bounded repair: strict extraction and separated dream-publication contracts."""
+ from __future__ import annotations
+ 
+ import copy
+@@ -444,43 +444,91 @@
+         if request.system.startswith("You compact one rolling conversation summary"):
+             return json.dumps({"summary": "Successfully recorded the exact conversation material."
+                                if self.repair_succeeds else "x" * 684})
++        if request.system.startswith("You regenerate one rolling conversation summary"):
++            return json.dumps({"summary": "Successfully recorded the complete conversation material."
++                               if self.repair_succeeds else "x" * 684})
+         if "single pass" in request.system:
+             return '{"triples":[],"markers":[],"complete":true}'
+         return "[]"
+ 
+ 
+ def test_dream_retry_reopen_status_portability_and_success_reset(cfg, tmp_path):
++    """Summary rejection cannot consume item retries or silently heal on reopen."""
+     config = quiet(cfg, dream_digest_max_chars=12000, digest_extraction_max_attempts=6)
+-    llm = DreamLLM()
++    llm = DreamLLM(repair_succeeds=True)
+     hy = HyMem(config, llm=llm)
+     sid = "six-attempt-digest"
++    summary_fields = (
++        "summary", "summary_source", "auto_summary", "auto_summary_generation",
++        "auto_summary_message_id", "auto_summary_partial_message_id", "auto_summary_message_offset",
++    )
++    item_fields = (
++        "digest_cursor_message_id", "digest_cursor_partial_message_id", "digest_cursor_offset",
++        "digest_cursor_prompt_version", "digest_published_generation", "digest_published_message_id",
++    )
+     try:
+-        hy.log_message(sid, "user", "Source content remains unchanged. " * 450)
++        first = hy.log_message(sid, "user", "Earlier source content remains unchanged.")
++        hy.close_session(sid)
++        assert hy.dream().digest_failures == 0
++        previous = hy.conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
++        published_summary = {name: previous[name] for name in summary_fields}
++        assert previous["auto_summary_message_id"] == first
++        assert hy.dream_status()["summary_healthy"] is True
++
++        llm.repair_succeeds = False
++        last = hy.log_message(sid, "user", "Source content remains unchanged. " * 450)
+         hy.close_session(sid)
+         for _ in range(6):
+             report = hy.dream()
+-            assert report.digest_failures == 1
++            assert report.digest_failures == report.digest_quarantined == 0
++            current = hy.conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
++            assert {name: current[name] for name in summary_fields} == published_summary
+         primary = [r for r in llm.calls if r.system.startswith("You analyze one conversation session")]
+-        assert len(primary) == 6
+-        assert len({r.user for r in primary}) == 1
++        # The long appended message takes multiple advancing slices, not six
++        # identical retries of one rejected summary.
++        assert len(primary) == 3
++        assert len({r.user for r in primary}) == len(primary)
+         row = hy.conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+-        assert row["digest_retry_count"] == 6 and row["digest_quarantined"] == 1
+-        assert row["digest_cursor_message_id"] is None
++        item_state = {name: row[name] for name in item_fields}
++        assert row["digest_retry_count"] == row["digest_quarantined"] == 0
++        assert row["digest_retry_config_version"] is None
++        assert row["digest_cursor_message_id"] == row["digest_published_message_id"] == last
++        assert row["digest_cursor_partial_message_id"] is None
++        assert row["auto_summary_message_id"] == first < last
++        assert row["summary_failure_reason"] == "summary_output_cap"
++        assert row["summary_failure_count"] == 1
+         assert hy.conn.execute("SELECT COUNT(*) FROM digest_staging").fetchone()[0] == 0
+-        assert hy.dream_status()["quarantined_digests"] == 1
+-        assert hy.dream_status()["malformed_digests"] == 0
++        status = hy.dream_status()
++        assert status["pending_digests"] == status["quarantined_digests"] == status["malformed_digests"] == 0
++        assert status["summary_degraded_sessions"] == 1
++        assert status["summary_missing_sessions"] == status["malformed_summaries"] == 0
++        assert status["summary_healthy"] is False
+         archive = tmp_path / "retry-export.jsonl"
+         hy.export(archive)
+         restored = HyMem(replace(config, root=tmp_path / "restored"), llm=llm)
+         try:
+             restored.import_(archive)
+-            # A lossless import preserves a valid held retry budget; it must
+-            # recognize the wrapper without dropping it or reopening work.
++            # Portability preserves the public gap, not a fabricated current
++            # summary or a renewed mandatory item retry budget.
+             restored_row = restored.conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+-            assert restored_row["digest_retry_count"] == 6
+-            assert restored_row["digest_retry_config_version"] == row["digest_retry_config_version"]
+-            assert restored.dream_status()["quarantined_digests"] == 1
++            assert {name: restored_row[name] for name in summary_fields} == published_summary
++            assert {name: restored_row[name] for name in item_fields} == item_state
++            assert restored_row["summary_failure_count"] == 1
++            assert restored_row["summary_failure_reason"] == "summary_output_cap"
++            assert restored_row["digest_retry_count"] == 0
++            assert restored.dream_status()["quarantined_digests"] == 0
+             assert restored.dream_status()["malformed_digests"] == 0
++            assert restored.dream_status()["summary_healthy"] is False
++            summary_calls = lambda: [request for request in llm.calls if request.system.startswith((
++                "You analyze one conversation session", "You re-read one conversation session",
++                "You compact one rolling conversation summary",
++                "You regenerate one rolling conversation summary"))]
++            before = summary_calls()
++            assert restored.dream().digest_failures == 0
++            # Imported phase-1 caches may be rebuilt; completed item digests
++            # and rejected summaries must not be retried as a side effect.
++            assert summary_calls() == before
++            assert restored.dream_status()["summary_degraded_sessions"] == 1
+         finally:
+             restored.close()
+     finally:
+@@ -488,19 +536,42 @@
+     reopened = HyMem(config, llm=llm)
+     try:
+         count = len(llm.calls)
+-        assert reopened.dream().digest_quarantined == 1
++        assert reopened.dream().digest_quarantined == 0
+         assert len(llm.calls) == count
+-        assert reopened.dream_status()["quarantined_digests"] == 1
++        assert reopened.dream_status()["summary_degraded_sessions"] == 1
++        rejected = reopened.recover_summaries(max_calls=1, max_attempts=2, max_chars=30000, session_id=sid)
++        assert rejected["calls"] == rejected["held"] == rejected["remaining"] == 1
++        assert rejected["published"] == rejected["exhausted"] == 0
++        held = reopened.conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
++        assert {name: held[name] for name in summary_fields} == published_summary
++        assert {name: held[name] for name in item_fields} == item_state
++        assert held["summary_failure_count"] == 1
+     finally:
+         reopened.close()
+-    # An explicit different valid configuration reopens the held attempt.
++    # Only separately requested recovery of the full source may reset the gap.
+     llm.repair_succeeds = True
+-    healed = HyMem(replace(config, dream_digest_max_tokens=3073), llm=llm)
++    healed = HyMem(config, llm=llm)
+     try:
++        count = len(llm.calls)
+         assert healed.dream().digest_failures == 0
++        assert len(llm.calls) == count
++        assert healed.dream_status()["summary_healthy"] is False
++        recovered = healed.recover_summaries(max_calls=1, max_attempts=2, max_chars=30000, session_id=sid)
++        assert recovered["calls"] == recovered["published"] == 1
++        assert recovered["held"] == recovered["remaining"] == recovered["exhausted"] == 0
+         row = healed.conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
++        assert {name: row[name] for name in item_fields} == item_state
++        assert row["auto_summary"] == "Successfully recorded the complete conversation material."
++        assert row["auto_summary_message_id"] == last
++        assert row["auto_summary_generation"] == row["digest_published_generation"]
++        assert row["summary_failure_count"] == 0 and row["summary_failure_reason"] is None
+         assert row["digest_retry_count"] == 0 and row["digest_quarantined"] == 0
+         assert row["digest_retry_config_version"] is None
+-        assert row["digest_cursor_partial_message_id"] is not None
++        assert row["digest_cursor_partial_message_id"] is None
++        assert healed.dream_status()["summary_healthy"] is True
++        recovery_calls = [r for r in llm.calls if r.system.startswith("You regenerate one rolling conversation summary")]
++        assert len(recovery_calls) == 2 and recovery_calls[0].user == recovery_calls[1].user
++        assert "Earlier source content remains unchanged." in recovery_calls[1].user
++        assert "Source content remains unchanged. " * 450 in recovery_calls[1].user
+     finally:
+         healed.close()
+--- a/tests/test_digest_summary_alternatives.py
++++ b/tests/test_digest_summary_alternatives.py
+@@ -132,6 +132,9 @@
+         self.succeeds = succeeds
+ 
+     def complete(self, request):
++        if request.system.startswith('You regenerate one rolling conversation summary'):
++            self.calls.append(request)
++            return json.dumps({'summary': GOOD if self.succeeds else 'x' * 674})
+         if request.system.startswith('You compact one rolling conversation summary'):
+             self.calls.append(request)
+             return json.dumps({'summaries': ['x' * 594, 'y' * 501, GOOD if self.succeeds else 'z' * 674]})
+@@ -153,14 +156,31 @@
+         mid = hy.log_message(sid, 'user', 'Built alpha, deployed the service and verified its health.')
+         hy.close_session(sid)
+         if fails_first:
+-            assert hy.dream().digest_failures == 1
++            assert hy.dream().digest_failures == 0
+             held = hy.conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+-            assert held['digest_retry_count'] == 1 and held['digest_quarantined'] == 0
+-            assert held['auto_summary'] is held['digest_cursor_message_id'] is held['digest_published_generation'] is None
+-            for table in ('episodes', 'procedures', 'digest_staging'):
+-                assert hy.conn.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] == 0
++            assert held['digest_retry_count'] == held['digest_quarantined'] == 0
++            assert held['auto_summary'] is held['auto_summary_generation'] is held['auto_summary_message_id'] is None
++            assert held['digest_cursor_message_id'] == held['digest_published_message_id'] == mid
++            assert held['digest_published_generation'] == held['digest_cursor_prompt_version']
++            assert held['summary_failure_reason'] == 'summary_output_cap' and held['summary_failure_count'] == 1
++            indexed = {table: [tuple(row) for row in hy.conn.execute('SELECT * FROM ' + table)]
++                       for table in ('episodes', 'procedures')}
++            assert all(len(rows) == 1 for rows in indexed.values())
++            assert hy.conn.execute('SELECT COUNT(*) FROM digest_staging').fetchone()[0] == 0
++            status = hy.dream_status()
++            assert status['pending_digests'] == status['quarantined_digests'] == status['malformed_summaries'] == 0
++            assert status['summary_degraded_sessions'] == status['summary_missing_sessions'] == 1
++            assert status['summary_healthy'] is False
+             client.succeeds = True
+-        assert hy.dream().digest_failures == 0
++            before = len(client.calls)
++            assert hy.dream().digest_failures == 0
++            assert len(client.calls) == before and hy.dream_status()['summary_healthy'] is False
++            recovered = hy.recover_summaries(max_calls=1, session_id=sid)
++            assert recovered['calls'] == recovered['published'] == 1 and recovered['remaining'] == 0
++            assert {table: [tuple(row) for row in hy.conn.execute('SELECT * FROM ' + table)]
++                    for table in indexed} == indexed
++        else:
++            assert hy.dream().digest_failures == 0
+         published = hy.conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+         assert published['auto_summary'] == GOOD
+         assert published['digest_cursor_message_id'] == published['auto_summary_message_id'] == mid
+@@ -168,19 +188,24 @@
+         assert published['digest_cursor_prompt_version'] == published['digest_published_generation']
+         assert published['digest_retry_count'] == 0 and published['digest_quarantined'] == 0
+         assert published['digest_retry_config_version'] is None
++        assert published['summary_failure_reason'] is None and published['summary_failure_count'] == 0
++        assert published['auto_summary_generation'] == published['digest_published_generation']
++        assert hy.dream_status()['summary_healthy'] is True
+         assert hy.conn.execute('SELECT COUNT(*) FROM episodes').fetchone()[0] == 1
+         assert hy.conn.execute('SELECT COUNT(*) FROM procedures').fetchone()[0] == 1
+         assert hy.conn.execute('SELECT COUNT(*) FROM digest_staging').fetchone()[0] == 0
+         assert hy.conn.execute('PRAGMA foreign_key_check').fetchall() == []
+         assert hy.conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+         digest_calls = [r for r in client.calls if r.system.startswith((
+-            'You compact one rolling conversation summary', 'You analyze one conversation session'))]
+-        assert len(digest_calls) == (4 if fails_first else 2)
++            'You compact one rolling conversation summary', 'You analyze one conversation session',
++            'You regenerate one rolling conversation summary'))]
++        assert len(digest_calls) == (3 if fails_first else 2)
+         hy.close()
+         hy = HyMem(config, llm=client)
+         before = len(client.calls)
+         assert hy.dream().digest_failures == 0
+         assert len(client.calls) == before
++        assert hy.dream_status()['summary_healthy'] is True
+         assert hy.conn.execute('SELECT auto_summary FROM sessions WHERE id=?', (sid,)).fetchone()[0] == GOOD
+     finally:
+         hy.close()
+--- a/tests/test_digest_summary_clause_packing.py
++++ b/tests/test_digest_summary_clause_packing.py
+@@ -266,6 +266,10 @@
+         self.succeeds = succeeds
+ 
+     def complete(self, request):
++        if request.system.startswith('You regenerate one rolling conversation summary'):
++            self.calls.append(request)
++            return json.dumps({'summary': 'Built alpha; Deployed the service and verified its health'
++                               if self.succeeds else 'x' * 674})
+         if request.system.startswith('You compact one rolling conversation summary'):
+             self.calls.append(request)
+             clauses = [['Built alpha'], ['Deployed the service and verified its health']] if self.succeeds else [
+@@ -289,14 +293,31 @@
+         mid = hy.log_message(sid, 'user', 'Built alpha, deployed the service and verified its health.')
+         hy.close_session(sid)
+         if fails_first:
+-            assert hy.dream().digest_failures == 1
++            assert hy.dream().digest_failures == 0
+             held = hy.conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+-            assert held['digest_retry_count'] == 1 and held['digest_quarantined'] == 0
+-            assert held['auto_summary'] is held['digest_cursor_message_id'] is held['digest_published_generation'] is None
+-            for table in ('episodes', 'procedures', 'digest_staging'):
+-                assert hy.conn.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] == 0
++            assert held['digest_retry_count'] == held['digest_quarantined'] == 0
++            assert held['auto_summary'] is held['auto_summary_generation'] is held['auto_summary_message_id'] is None
++            assert held['digest_cursor_message_id'] == held['digest_published_message_id'] == mid
++            assert held['digest_published_generation'] == held['digest_cursor_prompt_version']
++            assert held['summary_failure_reason'] == 'summary_output_cap' and held['summary_failure_count'] == 1
++            indexed = {table: [tuple(row) for row in hy.conn.execute('SELECT * FROM ' + table)]
++                       for table in ('episodes', 'procedures')}
++            assert all(len(rows) == 1 for rows in indexed.values())
++            assert hy.conn.execute('SELECT COUNT(*) FROM digest_staging').fetchone()[0] == 0
++            status = hy.dream_status()
++            assert status['pending_digests'] == status['quarantined_digests'] == status['malformed_summaries'] == 0
++            assert status['summary_degraded_sessions'] == status['summary_missing_sessions'] == 1
++            assert status['summary_healthy'] is False
+             client.succeeds = True
+-        assert hy.dream().digest_failures == 0
++            before = len(client.calls)
++            assert hy.dream().digest_failures == 0
++            assert len(client.calls) == before and hy.dream_status()['summary_healthy'] is False
++            recovered = hy.recover_summaries(max_calls=1, session_id=sid)
++            assert recovered['calls'] == recovered['published'] == 1 and recovered['remaining'] == 0
++            assert {table: [tuple(row) for row in hy.conn.execute('SELECT * FROM ' + table)]
++                    for table in indexed} == indexed
++        else:
++            assert hy.dream().digest_failures == 0
+         published = hy.conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+         assert published['auto_summary'] == 'Built alpha; Deployed the service and verified its health'
+         assert published['digest_cursor_message_id'] == published['auto_summary_message_id'] == mid
+@@ -304,18 +325,23 @@
+         assert published['digest_cursor_prompt_version'] == published['digest_published_generation']
+         assert published['digest_retry_count'] == 0 and published['digest_quarantined'] == 0
+         assert published['digest_retry_config_version'] is None
++        assert published['summary_failure_reason'] is None and published['summary_failure_count'] == 0
++        assert published['auto_summary_generation'] == published['digest_published_generation']
++        assert hy.dream_status()['summary_healthy'] is True
+         assert hy.conn.execute('SELECT COUNT(*) FROM episodes').fetchone()[0] == 1
+         assert hy.conn.execute('SELECT COUNT(*) FROM procedures').fetchone()[0] == 1
+         assert hy.conn.execute('SELECT COUNT(*) FROM digest_staging').fetchone()[0] == 0
+         assert hy.conn.execute('PRAGMA foreign_key_check').fetchall() == []
+         assert hy.conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+         calls = [r for r in client.calls if r.system.startswith((
+-            'You compact one rolling conversation summary', 'You analyze one conversation session'))]
+-        assert len(calls) == (4 if fails_first else 2)
++            'You compact one rolling conversation summary', 'You analyze one conversation session',
++            'You regenerate one rolling conversation summary'))]
++        assert len(calls) == (3 if fails_first else 2)
+         hy.close()
+         hy = HyMem(config, llm=client)
+         before = len(client.calls)
+         assert hy.dream().digest_failures == 0
+         assert len(client.calls) == before
++        assert hy.dream_status()['summary_healthy'] is True
+     finally:
+         hy.close()
+--- a/tests/test_digest_summary_source_recovery.py
++++ b/tests/test_digest_summary_source_recovery.py
+@@ -210,28 +210,53 @@
+     try:
+         mid = hy.log_message(sid, 'user', 'Built alpha, deployed the service and verified its health.')
+         hy.close_session(sid)
+-        assert hy.dream().digest_failures == 1
++        assert hy.dream().digest_failures == 0
+         held = hy.conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+-        assert held['auto_summary'] is held['digest_cursor_message_id'] is held['digest_published_generation'] is None
+-        for table in ('episodes', 'procedures', 'digest_staging'):
+-            assert hy.conn.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] == 0
++        assert held['auto_summary'] is held['auto_summary_generation'] is held['auto_summary_message_id'] is None
++        assert held['digest_cursor_message_id'] == held['digest_published_message_id'] == mid
++        assert held['digest_published_generation'] == held['digest_cursor_prompt_version']
++        assert held['digest_retry_count'] == held['digest_quarantined'] == 0
++        assert held['summary_failure_reason'] == 'summary_output_cap' and held['summary_failure_count'] == 1
++        indexed = {table: [tuple(row) for row in hy.conn.execute('SELECT * FROM ' + table)]
++                   for table in ('episodes', 'procedures')}
++        assert all(len(rows) == 1 for rows in indexed.values())
++        assert hy.conn.execute('SELECT COUNT(*) FROM digest_staging').fetchone()[0] == 0
++        status = hy.dream_status()
++        assert status['pending_digests'] == status['quarantined_digests'] == status['malformed_summaries'] == 0
++        assert status['summary_degraded_sessions'] == status['summary_missing_sessions'] == 1
++        assert status['summary_healthy'] is False
+         client.succeeds = True
++        before = len(client.calls)
+         assert hy.dream().digest_failures == 0
++        assert len(client.calls) == before and hy.dream_status()['summary_healthy'] is False
++        recovered = hy.recover_summaries(max_calls=1, session_id=sid)
++        assert recovered['calls'] == recovered['published'] == 1 and recovered['remaining'] == 0
++        assert {table: [tuple(row) for row in hy.conn.execute('SELECT * FROM ' + table)]
++                for table in indexed} == indexed
+         published = hy.conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+         assert published['auto_summary'] == 'Built alpha; Deployed the service and verified its health'
+         assert published['digest_cursor_message_id'] == published['auto_summary_message_id'] == mid
+         assert published['digest_retry_count'] == 0
++        assert published['summary_failure_count'] == 0 and published['summary_failure_reason'] is None
++        assert published['auto_summary_generation'] == published['digest_published_generation']
++        assert hy.dream_status()['summary_healthy'] is True
+         assert hy.conn.execute('SELECT COUNT(*) FROM episodes').fetchone()[0] == 1
+         assert hy.conn.execute('SELECT COUNT(*) FROM procedures').fetchone()[0] == 1
+         assert hy.conn.execute('SELECT COUNT(*) FROM digest_staging').fetchone()[0] == 0
+         assert hy.conn.execute('PRAGMA foreign_key_check').fetchall() == []
+         assert hy.conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+         digest_calls = [r for r in client.calls if r.system.startswith((
+-            'You compact one rolling conversation summary', 'You analyze one conversation session'))]
+-        assert len(digest_calls) == 4
++            'You compact one rolling conversation summary', 'You analyze one conversation session',
++            'You regenerate one rolling conversation summary'))]
++        assert len(digest_calls) == 3
++        recovery = digest_calls[-1]
++        assert recovery.system.startswith('You regenerate one rolling conversation summary')
++        assert 'POISON_DRAFT_ONLY' not in recovery.user + recovery.system
++        assert 'Built alpha, deployed the service and verified its health.' in recovery.user
+         hy.close()
+         hy = HyMem(config, llm=client)
+         before = len(client.calls)
+         assert hy.dream().digest_failures == 0 and len(client.calls) == before
++        assert hy.dream_status()['summary_healthy'] is True
+     finally:
+         hy.close()
+--- a/tests/test_extraction_audit.py
++++ b/tests/test_extraction_audit.py
+@@ -193,7 +193,7 @@
+     conn.execute("UPDATE schema_meta SET value=? WHERE key='schema_version'", (str(stamp),))
+     original = audit.carrier_record(conn, owner)
+     db.initialize(conn)
+-    assert db.schema_version(conn) == 61
++    assert db.schema_version(conn) == db.EXPECTED_SCHEMA_VERSION
+     assert audit.carrier_record(conn, owner) == original
+     assert conn.execute("SELECT COUNT(*) FROM kg_evidence_extraction_audit").fetchone()[0] == 0
+     with db.evidence_history_mutation(conn):
+--- a/tests/test_honcho_reasoning_semantics.py
++++ b/tests/test_honcho_reasoning_semantics.py
+@@ -314,6 +314,14 @@
+     assert "current sentinel" in directional
+     assert "other sentinel" not in directional
+     assert directional_body["peer_card"] == [directional]
++    assert directional_body["summary_health"] == {
++        "summary_healthy": False, "degraded": True, "missing": True,
++        "malformed": False,
++    }
++    assert directional_body["summary"]["content"] == (
++        "[Automatic summary is stale or missing; preserved historical "
++        "context may omit newer conversation content.]"
++    )
+     expected_directional_tokens = (
+         estimate_tokens(
+             "role:system\ncontent:"
+@@ -325,6 +333,11 @@
+             f"<peer_card>{directional_body['peer_card']}</peer_card>"
+         )
+         + 4
++        + estimate_tokens(
++            "role:system\ncontent:"
++            f"<summary>{directional_body['summary']['content']}</summary>"
++        )
++        + 4
+         + sum(
+             estimate_tokens(
+                 "role:assistant\n"
+@@ -336,6 +349,7 @@
+         )
+     )
+     assert directional_body["context_token_count"] == expected_directional_tokens
++    assert expected_directional_tokens <= directional_body["context_token_budget"]
+ 
+     local_body = dialectic_client.get(
+         "/v3/workspaces/w/sessions/current/context",
+--- a/tests/test_procedure_publication.py
++++ b/tests/test_procedure_publication.py
+@@ -7,7 +7,7 @@
+ 
+ import pytest
+ 
+-from hymem import HyMem
++from hymem import HyMem, portability
+ from hymem.core import db
+ from hymem.dreaming.procedures import ProceduresExtraction, publish_digest_procedures
+ from tests.test_digest_publication import _finish, _initial
+@@ -192,6 +192,12 @@
+                 records[:] = [row for row in records if row["type"] not in newer_kinds]
+                 for kind in newer_kinds:
+                     del records[-1]["counts"][kind]
++                # A v15 archive cannot carry the independent-summary fields
++                # introduced by v18. Keep this a genuine old wire schema.
++                for row in records:
++                    if row["type"] == "session":
++                        for field in portability._V18_SUMMARY_FIELDS:
++                            del row["record"][field]
+             _rewrite_export(path, downgrade)
+         restored = HyMem(replace(hy.config, root=tmp_path / "restored"), llm=llm)
+         try:
+--- a/tests/test_summary.py
++++ b/tests/test_summary.py
+@@ -4,13 +4,15 @@
+     and rejects suspiciously short LLM outputs.
+   * `persist_session_summary` writes to `sessions.summary` so the
+     Honcho context endpoint can prefer it over the MEMORY.md dump.
+-  * Quote-wrapped LLM output is stripped; over-cap output is held for retry
+-  without advancing the durable digest cursor.
++  * Quote-wrapped LLM output is stripped; over-cap output leaves an explicit
++    summary gap without blocking valid item indexing. Only independent,
++    explicitly requested summary recovery can heal that gap.
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
++from dataclasses import replace
+ 
+ import pytest
+ 
+@@ -40,19 +42,26 @@
+ 
+ 
+ class _SequencedSummaryLLM:
+-    def __init__(self, summaries: list[str], *, repair_summaries: list[str] | None = None):
++    def __init__(self, summaries: list[str], *, repair_summaries: list[str] | None = None,
++                 recovery_summaries: list[str] | None = None):
+         self.summaries = list(summaries)
+         self.repair_summaries = list(repair_summaries or [])
++        self.recovery_summaries = list(recovery_summaries or [])
+         self.calls = []
+ 
+     def complete(self, request) -> str:
+         import json
+ 
+         self.calls.append(request)
++        if request.system.startswith("You regenerate one rolling conversation summary"):
++            assert self.recovery_summaries, "unexpected extra independent summary recovery"
++            return json.dumps({"summary": self.recovery_summaries.pop(0)})
+         if request.system.startswith("You compact one rolling conversation summary"):
+             assert self.repair_summaries, "unexpected extra summary-only correction"
+             return json.dumps({"summary": self.repair_summaries.pop(0)})
+         if not request.system.startswith("You analyze one conversation session"):
++            if "single pass" in request.system:
++                return '{"triples":[],"markers":[],"complete":true}'
+             return "[]"
+         assert self.summaries, "unexpected extra digest retry"
+         return json.dumps({
+@@ -180,30 +189,37 @@
+ 
+ 
+ def test_long_summary_holds_cursor_and_heals_on_retry(cfg):
+-    """An over-cap response is a failed outcome, never silent truncation."""
++    """An over-cap response holds only the summary frontier, never truncates."""
+     long = "a" * 1200
+     healed = "Reviewed the deployment runbook and recorded the exact outcome."
+     # First attempt: valid full object except length, then one still-over-cap
+-    # summary-only correction. The following dream receives a healthy primary.
+-    llm = _SequencedSummaryLLM([long, healed], repair_summaries=[long])
+-    hy = HyMem(cfg, llm=llm)
++    # summary-only correction. Item indexing finishes; recovery is a distinct,
++    # explicitly requested source walk rather than another indexing dream.
++    llm = _SequencedSummaryLLM([long], repair_summaries=[long], recovery_summaries=[healed])
++    hy = HyMem(replace(cfg, facts_extraction_enabled=False,
++                       profile_extraction_enabled=False, aggregation_nodes_enabled=False), llm=llm)
+     try:
+         sid = "s_long"
+         _seed_session(hy, sid, [
+             ("assistant", "ok"),
+             ("user", "A user turn long enough to clear the salience minimum threshold for chunking."),
+         ])
+-        failed = hy.dream()
+-        row = hy.conn.execute(
+-            "SELECT summary, digest_cursor_message_id, digest_retry_count, "
+-            "digest_quarantined FROM sessions WHERE id = ?", (sid,),
++        indexed = hy.dream()
++        row = hy.conn.execute(
++            "SELECT * FROM sessions WHERE id = ?", (sid,),
+         ).fetchone()
+         assert row["summary"] is None
+-        assert row["digest_cursor_message_id"] is None
+-        assert row["digest_retry_count"] == 1
++        assert row["auto_summary_message_id"] is row["auto_summary_generation"] is None
++        assert row["digest_cursor_message_id"] == row["digest_published_message_id"] == row["coverage_message_id"]
++        assert row["digest_retry_count"] == 0
+         assert row["digest_quarantined"] == 0
+-        assert failed.digest_failures == 1
+-        assert failed.budget_exhausted is True
++        assert row["summary_failure_count"] == 1 and row["summary_failure_reason"] == "summary_output_cap"
++        assert indexed.digest_failures == 0
++        assert indexed.budget_exhausted is False
++        status = hy.dream_status()
++        assert status["summary_degraded_sessions"] == status["summary_missing_sessions"] == 1
++        assert status["pending_digests"] == status["malformed_summaries"] == 0
++        assert status["summary_healthy"] is False
+         primary_calls = [c for c in llm.calls
+                          if c.system.startswith("You analyze one conversation session")]
+         repair_calls = [c for c in llm.calls
+@@ -214,23 +230,33 @@
+         }
+         assert long not in repair_calls[0].user + repair_calls[0].system
+ 
+-        succeeded = hy.dream()
++        before = len(llm.calls)
++        assert hy.dream().digest_failures == 0
++        assert len(llm.calls) == before
++        assert hy.dream_status()["summary_healthy"] is False
++        succeeded = hy.recover_summaries(max_calls=1, session_id=sid)
+         healed_row = hy.conn.execute(
+-            "SELECT summary, coverage_message_id, digest_cursor_message_id, "
+-            "digest_retry_count, digest_retry_config_version, digest_quarantined "
+-            "FROM sessions WHERE id = ?", (sid,),
++            "SELECT * FROM sessions WHERE id = ?", (sid,),
+         ).fetchone()
+         assert healed_row["summary"] == healed
+         assert healed_row["digest_cursor_message_id"] == healed_row["coverage_message_id"]
+         assert healed_row["digest_retry_count"] == 0
+         assert healed_row["digest_retry_config_version"] is None
+         assert healed_row["digest_quarantined"] == 0
+-        assert succeeded.digest_failures == 0
++        assert healed_row["digest_published_generation"] == row["digest_published_generation"]
++        assert healed_row["digest_published_message_id"] == row["digest_published_message_id"]
++        assert healed_row["auto_summary_message_id"] == healed_row["digest_published_message_id"]
++        assert healed_row["auto_summary_generation"] == healed_row["digest_published_generation"]
++        assert healed_row["summary_failure_reason"] is None and healed_row["summary_failure_count"] == 0
++        assert hy.dream_status()["summary_healthy"] is True
++        assert succeeded["calls"] == succeeded["published"] == 1 and succeeded["remaining"] == 0
+         assert len([c for c in llm.calls
+-                    if c.system.startswith("You analyze one conversation session")]) == 2
++                    if c.system.startswith("You analyze one conversation session")]) == 1
+         assert len([c for c in llm.calls
+                     if c.system.startswith("You compact one rolling conversation summary")]) == 1
+-        assert llm.summaries == llm.repair_summaries == []
++        assert len([c for c in llm.calls
++                    if c.system.startswith("You regenerate one rolling conversation summary")]) == 1
++        assert llm.summaries == llm.repair_summaries == llm.recovery_summaries == []
+     finally:
+         hy.close()
+ 

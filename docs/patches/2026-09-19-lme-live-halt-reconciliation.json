@@ -1,0 +1,223 @@
+{
+  "kind": "halted-one-pass-live-diagnostic-root-reconciliation",
+  "date": "2026-09-19",
+  "remote_root": "/opt/stacks/hermes/instance1/home/.hermes/benchmarks/lme-repair-live-20260919-AvLFBi",
+  "manifest_sha256": "674e725084db3dea89371490335f13cabb9b16e764bdab4de03e9f6a3b53360a",
+  "status": "halted_not_resumable",
+  "paid_completions": 1,
+  "http_attempts": 1,
+  "campaign_cases_completed": 0,
+  "cases_not_started": 19,
+  "diagnosis": "Harness preflight retained a retired requested model label; provider returned the current label, and exact response-model admission halted before parser dispatch.",
+  "official_model_documentation": [
+    "https://api-docs.deepseek.com/",
+    "https://api-docs.deepseek.com/updates/"
+  ],
+  "reconciliation": {
+    "case_receipts": 0,
+    "halt": {
+      "cases_completed": 0,
+      "completions_reserved": 1,
+      "error_code": "worker_or_cleanup_failed",
+      "error_type": "CampaignSafety",
+      "http_attempts_observed": 1,
+      "mode": "live",
+      "resume_allowed": false,
+      "stage": "case_invocation",
+      "status": "halted",
+      "usage_complete": false
+    },
+    "offline_saved_response_replay": {
+      "exact_original_request_match": true,
+      "kind": "offline-replay-of-spent-first-response",
+      "new_http_attempts": 0,
+      "original_campaign_remains_halted": true,
+      "outcome": {
+        "accepted_empty": false,
+        "cursor_advanced": false,
+        "diagnostic_completion_limit": 1,
+        "empty": false,
+        "failed": false,
+        "failure_reason": null,
+        "id": "facts-01cdb2511bb9adb7cd1a1fbe1839a072ef1bebc08782da94a4b3618794542301",
+        "item_counts": {
+          "facts": 5
+        },
+        "kind": "facts",
+        "parse_failed": false,
+        "persisted": false,
+        "production_default_completion_limit": null,
+        "source_sha256": "da1b6e870f11fa27e2781f53155b4fd72d7bfd3c05bd4224a66ff61fda844b69",
+        "status": "accepted"
+      },
+      "saved_responses_consumed": 1,
+      "semantic_verified": false
+    },
+    "request_response_hashes_verified": true,
+    "reservations_verified": 1,
+    "response_metadata": {
+      "finish_reason": "stop",
+      "http_attempts": 1,
+      "model_version_pinned": false,
+      "number": 1,
+      "reasoning_text_retained": false,
+      "requested_model": "deepseek-v4-flash",
+      "response_model": "deepseek-flash",
+      "response_sha256": "98eb398e0521061d473186a0a8c3e9590a64da58040bc7396b0b587fe6254e69",
+      "system_fingerprint": {
+        "state": "known",
+        "value": "aeb56401ca74e127821c4f9126dcb669"
+      },
+      "usage": {
+        "completion_tokens": 300,
+        "prompt_tokens": 1020,
+        "reasoning_tokens": {
+          "locations": [],
+          "state": "missing",
+          "value": null
+        },
+        "total_tokens": 1320
+      },
+      "wire_sha256": "ba99f8807ed3ecb0592759f9ab906ad1df5c9ce399b55133fc0c98bb86439aa5"
+    },
+    "worker_cleanup_verified": true,
+    "worker_errors": [
+      "worker_nonzero_exit"
+    ],
+    "worker_failure": {
+      "error_code": "response_model",
+      "error_type": "CampaignSafety",
+      "http_attempts_observed": 1,
+      "safe_to_continue": false,
+      "stage": "completion_worker",
+      "status": "failed",
+      "usage_complete": false
+    },
+    "worker_returncode": 1
+  },
+  "original_live_container": {
+    "name": "hymem-lme-repair-live-AvLFBi",
+    "status": "exited",
+    "exit_code": 1,
+    "pid": 0,
+    "oom_killed": false
+  },
+  "offline_replay_container": {
+    "name": "hymem-lme-repair-first-response-offline-AvLFBi",
+    "status": "exited",
+    "exit_code": 0,
+    "pid": 0,
+    "oom_killed": false
+  },
+  "rehearsal_audits": {
+    "rehearse-negative": {
+      "audit": {
+        "accepted_empty": {
+          "chunk": 0,
+          "digest": 0,
+          "facts": 0
+        },
+        "case_covered_stores": 9,
+        "cases": 20,
+        "completions": 27,
+        "finish_reasons": {
+          "stop": 27
+        },
+        "http_attempts": 0,
+        "inventory_sha256": "ea7c7c1cc44b614224f4482ecd5410067cd8eeefe37db629f165c67fa40bab08",
+        "lme_readiness_verified": false,
+        "manifest_sha256": "674e725084db3dea89371490335f13cabb9b16e764bdab4de03e9f6a3b53360a",
+        "mode": "rehearse",
+        "nonstop_gate_failed": false,
+        "outcomes": {
+          "chunk": {
+            "rejected": 3
+          },
+          "digest": {
+            "rejected": 7
+          },
+          "facts": {
+            "rejected": 10
+          }
+        },
+        "planned_completion_cap": 72,
+        "semantic_verified": false,
+        "source_files_hash_verified": 225,
+        "status": "accounting_verified",
+        "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+        "stores_hash_verified": 10,
+        "usage": null
+      },
+      "returncode": 0,
+      "stderr_bytes": 0
+    },
+    "rehearse-positive": {
+      "audit": {
+        "accepted_empty": {
+          "chunk": 3,
+          "digest": 0,
+          "facts": 10
+        },
+        "case_covered_stores": 9,
+        "cases": 20,
+        "completions": 27,
+        "finish_reasons": {
+          "stop": 27
+        },
+        "http_attempts": 0,
+        "inventory_sha256": "ea7c7c1cc44b614224f4482ecd5410067cd8eeefe37db629f165c67fa40bab08",
+        "lme_readiness_verified": false,
+        "manifest_sha256": "674e725084db3dea89371490335f13cabb9b16e764bdab4de03e9f6a3b53360a",
+        "mode": "rehearse",
+        "nonstop_gate_failed": false,
+        "outcomes": {
+          "chunk": {
+            "accepted": 3
+          },
+          "digest": {
+            "accepted": 7
+          },
+          "facts": {
+            "accepted": 10
+          }
+        },
+        "planned_completion_cap": 72,
+        "semantic_verified": false,
+        "source_files_hash_verified": 225,
+        "status": "accounting_verified",
+        "store_pins_sha256": "b22562aad695c5cf7d719649a7006c7a72c67e1af18c3bbd29ac8fb4491365f0",
+        "stores_hash_verified": 10,
+        "usage": null
+      },
+      "returncode": 0,
+      "stderr_bytes": 0
+    }
+  },
+  "offline_correction": {
+    "status": "prepared_not_launched",
+    "requested_model": "deepseek-flash",
+    "runner_path": "/private/tmp/hymem-lme-repair-20260918.Nod9S1/live_probe_v2.py",
+    "runner_sha256": "94f7a26970d7d333f73e457dffc01ae0afd1b65f04987d2239df38590900f7c7",
+    "runner_tests_passed_root": 46,
+    "auditor_sha256": "30087f168c494c75321b78db4bcbfbfa25693d56e61182a3b0202790327a5b30",
+    "auditor_tests_passed_root": 28,
+    "original_runner_hash_unchanged": true,
+    "ast_identical_except_docstring_model_schema": true,
+    "strict_response_model_admission_preserved": true,
+    "paid_calls_made": 0,
+    "new_paid_campaign_requires_fresh_approval": true,
+    "additional_proposed_cap": {
+      "completions": 72,
+      "http_attempts": 72,
+      "invocation_seconds": 120,
+      "campaign_seconds": 1800
+    },
+    "combined_proposed_paid_cap_including_stopped_pass": 73
+  },
+  "production_memory_accessed": false,
+  "production_deployment": false,
+  "service_restarts": false,
+  "full_lme_run": false,
+  "semantic_correctness_verified": false,
+  "lme_readiness_verified": false
+}

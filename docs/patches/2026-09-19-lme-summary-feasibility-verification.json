@@ -1,0 +1,181 @@
+{
+  "schema": "lme-summary-feasibility-review-v1",
+  "status": "manual_main_proposition_reference_fits_and_is_accepted",
+  "application_modified": false,
+  "production_modified": false,
+  "paid_completions": 0,
+  "http_attempts": 0,
+  "lme_readiness_verified": false,
+  "automatic_recovery_verified": false,
+  "reference": {
+    "text": "Eulsa (1905) made Korea Japan's protectorate; Russia's failed Korea-alliance/East-Asian warm-water aims (Port Arthur/Dalny), Korean-water warship use, complex China non-alliance; Russo-Japanese tensions rose: Russia's 1903 nonrecognition of Japan's Korea annexation broke diplomacy, Japan saw Russian naval growth as a direct strategic/economic threat notably given Russia's Port Arthur lease from China, and mutual force/fleet buildups led to 1904 war with major land/sea battles in Korea/East Asia.",
+    "codepoints": 500,
+    "sha256": "297d869deb8592ae1056e954c6016db16f6f53489d252b7598d37a322b7dfe25",
+    "authorship": "manual assistant-authored, independently reviewed; not provider-generated",
+    "semantic_scope": "retained source topics and main propositions, not every possible nuance or strict stylistic directive",
+    "source_relative": true,
+    "historical_truth_checked": false,
+    "runtime_fallback": false
+  },
+  "pins": {
+    "generation_input_sha256": "e80f76cdd1804811836174715e29fa290d8fbe8e0c5c9cf73e6c923fe910b227",
+    "request_file_sha256": "79e2e1a1ce75b430dd7b77b5053beb7aa53513310579d509126b435376ff12eb",
+    "reference_file_sha256": "bbc29734e34b5ddcb70b9494016081b0c7b7b9e153798bb8620bcefefe317d51",
+    "verifier_sha256": "2d18d000664d617a960c43b6ed9a869ed12f265cf083e55bf219b3e002acc655"
+  },
+  "offline_verification": {
+    "handcrafted_references": true,
+    "http_attempts": 0,
+    "lme_readiness_verified": false,
+    "manifest_sha256": "7f035601c375ca8d54e52fe64236e7ffff39c4a402afd7d1273d510795737ae1",
+    "model_generation_verified": false,
+    "original_application_changed": false,
+    "production_changed": false,
+    "provider_completions": 0,
+    "reference_file_sha256": "bbc29734e34b5ddcb70b9494016081b0c7b7b9e153798bb8620bcefefe317d51",
+    "retained_stores_verified": 10,
+    "rows": [
+      {
+        "cursor_advanced": false,
+        "failure_reason": null,
+        "http_attempts": 0,
+        "item_counts": {
+          "episodes": 1,
+          "procedures": 0
+        },
+        "origin": "old",
+        "persisted": false,
+        "provider_completions": 0,
+        "reference_chars": 500,
+        "reference_id": "retained-reference-v1",
+        "reference_sha256": "297d869deb8592ae1056e954c6016db16f6f53489d252b7598d37a322b7dfe25",
+        "result_source_sha256": "4db771b8f9ac6546ff857923d7a38801e3474c0be9555196698307ba05d7b10d",
+        "scripted_repair_responses": 1,
+        "selected_candidate_index": 0,
+        "selected_verbatim": true,
+        "shape": "single",
+        "status": "accepted"
+      },
+      {
+        "cursor_advanced": false,
+        "failure_reason": null,
+        "http_attempts": 0,
+        "item_counts": {
+          "episodes": 1,
+          "procedures": 0
+        },
+        "origin": "old",
+        "persisted": false,
+        "provider_completions": 0,
+        "reference_chars": 500,
+        "reference_id": "retained-reference-v1",
+        "reference_sha256": "297d869deb8592ae1056e954c6016db16f6f53489d252b7598d37a322b7dfe25",
+        "result_source_sha256": "4db771b8f9ac6546ff857923d7a38801e3474c0be9555196698307ba05d7b10d",
+        "scripted_repair_responses": 1,
+        "selected_candidate_index": 1,
+        "selected_verbatim": true,
+        "shape": "alternatives",
+        "status": "accepted"
+      },
+      {
+        "cursor_advanced": false,
+        "failure_reason": "summary_output_cap",
+        "http_attempts": 0,
+        "item_counts": {
+          "episodes": 0,
+          "procedures": 0
+        },
+        "origin": "old",
+        "persisted": false,
+        "provider_completions": 0,
+        "reference_chars": 500,
+        "reference_id": "retained-reference-v1",
+        "reference_sha256": "297d869deb8592ae1056e954c6016db16f6f53489d252b7598d37a322b7dfe25",
+        "result_source_sha256": null,
+        "scripted_repair_responses": 1,
+        "selected_candidate_index": null,
+        "selected_verbatim": false,
+        "shape": "overlong_control",
+        "status": "rejected"
+      },
+      {
+        "cursor_advanced": false,
+        "failure_reason": null,
+        "http_attempts": 0,
+        "item_counts": {
+          "episodes": 1,
+          "procedures": 0
+        },
+        "origin": "latest",
+        "persisted": false,
+        "provider_completions": 0,
+        "reference_chars": 500,
+        "reference_id": "retained-reference-v1",
+        "reference_sha256": "297d869deb8592ae1056e954c6016db16f6f53489d252b7598d37a322b7dfe25",
+        "result_source_sha256": "4db771b8f9ac6546ff857923d7a38801e3474c0be9555196698307ba05d7b10d",
+        "scripted_repair_responses": 1,
+        "selected_candidate_index": 0,
+        "selected_verbatim": true,
+        "shape": "single",
+        "status": "accepted"
+      },
+      {
+        "cursor_advanced": false,
+        "failure_reason": null,
+        "http_attempts": 0,
+        "item_counts": {
+          "episodes": 1,
+          "procedures": 0
+        },
+        "origin": "latest",
+        "persisted": false,
+        "provider_completions": 0,
+        "reference_chars": 500,
+        "reference_id": "retained-reference-v1",
+        "reference_sha256": "297d869deb8592ae1056e954c6016db16f6f53489d252b7598d37a322b7dfe25",
+        "result_source_sha256": "4db771b8f9ac6546ff857923d7a38801e3474c0be9555196698307ba05d7b10d",
+        "scripted_repair_responses": 1,
+        "selected_candidate_index": 1,
+        "selected_verbatim": true,
+        "shape": "alternatives",
+        "status": "accepted"
+      },
+      {
+        "cursor_advanced": false,
+        "failure_reason": "summary_output_cap",
+        "http_attempts": 0,
+        "item_counts": {
+          "episodes": 0,
+          "procedures": 0
+        },
+        "origin": "latest",
+        "persisted": false,
+        "provider_completions": 0,
+        "reference_chars": 500,
+        "reference_id": "retained-reference-v1",
+        "reference_sha256": "297d869deb8592ae1056e954c6016db16f6f53489d252b7598d37a322b7dfe25",
+        "result_source_sha256": null,
+        "scripted_repair_responses": 1,
+        "selected_candidate_index": null,
+        "selected_verbatim": false,
+        "shape": "overlong_control",
+        "status": "rejected"
+      }
+    ],
+    "schema": "offline-summary-reference-verification-v1",
+    "semantic_review_automated": false,
+    "source_files_verified": 225,
+    "status": "expected_outcomes_verified"
+  },
+  "container": {
+    "name": "hymem-summary-feasibility-lkCVLI",
+    "status": "exited",
+    "exit_code": 0,
+    "pid": 0,
+    "oom_killed": false,
+    "network": "none",
+    "read_only_root": true,
+    "credential_mount": false
+  },
+  "raw_source_files_copied_into_repository": false
+}

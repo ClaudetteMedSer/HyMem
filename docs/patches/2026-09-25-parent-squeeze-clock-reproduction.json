@@ -1,0 +1,27 @@
+{
+  "schema": "parent-squeeze-clock-reproduction-v1",
+  "sources": [
+    "/private/tmp/hymem-parent-frozen-r5-20260924.dkx3z00n/verification-tree-r5",
+    "/private/tmp/hymem-r6-sequential-20260925.6dSIIq/frozen-r6"
+  ],
+  "both_sources_same_outcome": true,
+  "test": "tests/test_digest_squeeze_probe.py::test_the_fixed_arm_renders_the_same_lines_when_the_cap_binds_nothing",
+  "same_second": {
+    "test_failed": false,
+    "last_seen": ["2026-01-01 00:00:00", "2026-01-01 00:00:00"],
+    "edge_order": ["atta part_of medflow", "medflow uses postgres"]
+  },
+  "cross_second": {
+    "test_failed": true,
+    "last_seen": ["2026-01-01 00:00:00", "2026-01-01 00:00:01"],
+    "edge_order": ["medflow uses postgres", "atta part_of medflow"]
+  },
+  "current_and_fixed_renderers_equal_in_all_four_cases": true,
+  "edges_restored_in_all_four_cases": 0,
+  "provider_calls": 0,
+  "source_edits": false,
+  "method": "Parent independently imported each frozen tree, created separate temporary synthetic stores, overrode SQLite CURRENT_TIMESTAMP, and advanced the clock by one second when the second graph edge was inserted. The original test was called unchanged. No sleeps or application patches.",
+  "full_shard_traceback_still_pending": false,
+  "full_shard_traceback_confirms_exact_same_assertion": true,
+  "full_shard_receipt": "docs/patches/2026-09-25-parent-r6-full-3.xml"
+}

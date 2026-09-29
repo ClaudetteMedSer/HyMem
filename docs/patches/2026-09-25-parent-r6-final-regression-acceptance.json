@@ -1,0 +1,182 @@
+{
+  "schema": "r6-parent-failed-question-regression-acceptance-v1",
+  "accepted": true,
+  "source_manifest_sha256": "bd8d0f3a8fb40bd6b77e7ca6579c8e5e8ee78733bea2bb22df71bc4b2c12eaa2",
+  "package_manifest_sha256": "3e227d959ec6e5d55f65d2343787dbe66cfb5ac63de0d033d04fd0641969e484",
+  "live_container": {
+    "id": "7847e08baa44269b7106528e4a975ef6254ec7c13b0e0ea46b10dd5e03f85b0a",
+    "configuration_verified": true,
+    "status": "exited",
+    "exit_code": 0,
+    "pid": 0,
+    "oom_killed": false
+  },
+  "validation_container": {
+    "id": "d4b833342dfcfd7203581331e43e1910893fd7b0145257f179fbd9072fde5952",
+    "configuration_verified": true,
+    "status": "exited",
+    "exit_code": 0,
+    "pid": 0,
+    "oom_killed": false,
+    "network": "none",
+    "credential_mount": false
+  },
+  "parent_accounting_reconciled": true,
+  "read_only_store_audit": "docs/patches/2026-09-25-parent-r6-final-store-audit.json",
+  "production_changes": false,
+  "rerolls": 0,
+  "resumed_campaign": false,
+  "stock_summary_recovery_injected": false,
+  "scope": "One fresh attempt at the previously failing question, not a representative or full-500 readiness test.",
+  "summary_limit": "Eleven sessions remain missing summaries due to summary_output_cap; item indexing is healthy. The separately tested explicit recovery operation was not invoked in this benchmark.",
+  "validation": {
+    "aggregate_paid_usage": {
+      "calls": 865,
+      "calls_available": true,
+      "completion_tokens": 152171,
+      "cost_available": false,
+      "cost_usd": null,
+      "prompt_tokens": 2616728,
+      "request_attempts": 865,
+      "request_attempts_available": true,
+      "successful_responses": 865,
+      "successful_responses_available": true,
+      "token_usage_available": true,
+      "total_tokens": 2768899
+    },
+    "archive_sha256": "14b5adf7ac080436c491b5c7e894a6f76dbc2ac01fcc136ccb4519544a3c15ae",
+    "benchmark_completed_without_faults": true,
+    "canary_accounted_separately": true,
+    "checkpoint_sha256": "1494929e4e103edd87e6629fcfdbcce7da4798eb74a7c92e7ccb3d9e27c96af4",
+    "counts": {
+      "attempted": 1,
+      "completed": 1,
+      "expected": 1,
+      "failed": 0,
+      "missing": 0,
+      "total_attempts": 1,
+      "unique_attempted": 1
+    },
+    "elapsed_s": 1891.3754756450653,
+    "full_500_readiness_verified": false,
+    "global_paid_call_cap": null,
+    "manifest_sha256": "3e227d959ec6e5d55f65d2343787dbe66cfb5ac63de0d033d04fd0641969e484",
+    "new_provider_calls": 0,
+    "official_comparable": false,
+    "per_question": [
+      {
+        "answer_correct": true,
+        "indexing_complete": true,
+        "indexing_outcome": "success_with_summary_degradation",
+        "item_indexing_healthy": true,
+        "malformed_summaries": 0,
+        "question_id": "gpt4_483dd43c",
+        "strict_failure": false,
+        "summary_degraded_sessions": 11,
+        "summary_healthy": false,
+        "summary_missing_sessions": 11
+      }
+    ],
+    "per_role_usage": {
+      "canary": {
+        "calls": 8,
+        "calls_available": true,
+        "completion_tokens": 208,
+        "cost_available": false,
+        "cost_usd": null,
+        "prompt_tokens": 35588,
+        "request_attempts": 8,
+        "request_attempts_available": true,
+        "successful_responses": 8,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 35796
+      },
+      "judge": {
+        "calls": 1,
+        "calls_available": true,
+        "completion_tokens": 1,
+        "cost_available": false,
+        "cost_usd": null,
+        "prompt_tokens": 379,
+        "request_attempts": 1,
+        "request_attempts_available": true,
+        "successful_responses": 1,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 380
+      },
+      "memory_pipeline": {
+        "calls": 855,
+        "calls_available": true,
+        "completion_tokens": 151778,
+        "cost_available": false,
+        "cost_usd": null,
+        "prompt_tokens": 2574716,
+        "request_attempts": 855,
+        "request_attempts_available": true,
+        "successful_responses": 855,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 2726494
+      },
+      "reader": {
+        "calls": 1,
+        "calls_available": true,
+        "completion_tokens": 184,
+        "cost_available": false,
+        "cost_usd": null,
+        "prompt_tokens": 6045,
+        "request_attempts": 1,
+        "request_attempts_available": true,
+        "successful_responses": 1,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 6229
+      },
+      "retrieval": {
+        "calls": 0,
+        "calls_available": true,
+        "completion_tokens": 0,
+        "cost_available": true,
+        "cost_usd": 0,
+        "prompt_tokens": 0,
+        "request_attempts": 0,
+        "request_attempts_available": true,
+        "successful_responses": 0,
+        "successful_responses_available": true,
+        "token_usage_available": true,
+        "total_tokens": 0
+      }
+    },
+    "physical_checkpoint_bound": true,
+    "process_completed_cleanly": true,
+    "question_ids": [
+      "gpt4_483dd43c"
+    ],
+    "reader_judge_calls_measured": true,
+    "representative_sample": false,
+    "run_id": "sha256:eecd189081614ec5d625127278df9b8b1d0eeffaeddc24867dc86138ebda7e57",
+    "sample": 1,
+    "schema": "r6-lme-failed-question-postvalidation-v1",
+    "scores": {
+      "OVERALL": {
+        "accuracy": 100,
+        "count": 1
+      },
+      "temporal-reasoning": {
+        "accuracy": 100,
+        "count": 1
+      }
+    },
+    "seed": 0,
+    "semantic_quality_guaranteed": false,
+    "source_indices": [
+      329
+    ],
+    "status": "scored_regression_completed",
+    "strict_scored_artifact_validated": true,
+    "summary_degraded_questions": 1,
+    "summary_degraded_sessions": 11
+  }
+}

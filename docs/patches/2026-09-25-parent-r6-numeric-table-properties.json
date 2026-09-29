@@ -1,0 +1,20 @@
+{
+  "schema": "r6-parent-numeric-table-property-check-v1",
+  "source_manifest_sha256": "bd8d0f3a8fb40bd6b77e7ca6579c8e5e8ee78733bea2bb22df71bc4b2c12eaa2",
+  "parent_reproduced": true,
+  "source_edits": false,
+  "model_semantics_claimed": false,
+  "counts": {
+    "call_caps_rejected": 8,
+    "leaf_limits_rejected": 4,
+    "owned_leaves": 323,
+    "ragged_rejected": 24,
+    "valid_tables": 80
+  },
+  "elapsed_seconds": 1.356,
+  "generated_cases": 116,
+  "invariant_failure": null,
+  "network_calls": 0,
+  "paid_calls": 0,
+  "seed": 20260925
+}

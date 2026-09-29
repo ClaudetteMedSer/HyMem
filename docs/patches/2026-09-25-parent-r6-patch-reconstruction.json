@@ -1,0 +1,14 @@
+{
+  "schema": "r6-parent-patch-reconstruction-v1",
+  "patch": "docs/patches/2026-09-25-lme-r6-sequential-fixes.patch",
+  "patch_sha256": "f7578e3e860bbdba5dc381591141d9b2e0688221a085d4353889113fa1d69da0",
+  "baseline_manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc",
+  "final_manifest_sha256": "bd8d0f3a8fb40bd6b77e7ca6579c8e5e8ee78733bea2bb22df71bc4b2c12eaa2",
+  "changed_files": 16,
+  "verified_final_files": 468,
+  "apply_check_passed": true,
+  "exact_reconstruction_passed": true,
+  "verification_copy": "/private/tmp/hymem-r6-patch-reconstruction.ICp4nS",
+  "main_application_checkout_modified": false,
+  "production_changes": false
+}

@@ -1,0 +1,151 @@
+{
+  "kind": "exact-saved-response-offline-replay",
+  "date": "2026-09-19",
+  "inspector_sha256": "6592b4753999f239bb3df9836a1f9b90bb61e3fcd623823902d45068bb02fff2",
+  "inspector_root_tests": {
+    "tests": 6,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "network": "none",
+  "credential_mount": false,
+  "all_mounts_readonly": true,
+  "replay": {
+    "all_outcomes_match": true,
+    "cases": 20,
+    "failures": [
+      {
+        "case_sequence": 4,
+        "kind": "facts",
+        "reason": "output_capacity_exceeded",
+        "validator_checks": [
+          {
+            "explicit_overflow_sentinel": false,
+            "item_cap": 8,
+            "item_count": 9,
+            "item_count_exceeds_cap": true,
+            "items_are_list": true,
+            "reason": "output_capacity_exceeded",
+            "validator": "facts"
+          }
+        ]
+      },
+      {
+        "case_sequence": 5,
+        "kind": "digest",
+        "reason": "summary_output_cap",
+        "validator_checks": [
+          {
+            "object": true,
+            "reason": "summary_output_cap",
+            "summary_is_string": true,
+            "summary_trimmed_codepoints": 644,
+            "validator": "digest_primary"
+          },
+          {
+            "exact_summary_only_object": true,
+            "object": true,
+            "reason": "summary_output_cap",
+            "summary_is_string": true,
+            "summary_trimmed_codepoints": 635,
+            "validator": "digest_summary_repair"
+          }
+        ]
+      },
+      {
+        "case_sequence": 13,
+        "kind": "digest",
+        "reason": "episode_validation_failure",
+        "validator_checks": [
+          {
+            "actual_allowlist_count": 5,
+            "items": [
+              {
+                "actual_single_item_accepted": true,
+                "citations_all_in_actual_allowlist": true,
+                "citations_all_strings": true,
+                "citations_nonempty_list": true,
+                "citations_source_order": true,
+                "citations_unique": true,
+                "conflicting_duplicate_identity": false,
+                "entities_list_of_nonempty_strings": true,
+                "exact_fields": true,
+                "item_index": 0,
+                "object": true,
+                "outcome_allowed": true,
+                "summary_nonempty": true,
+                "title_nonempty": true
+              },
+              {
+                "actual_single_item_accepted": false,
+                "citations_all_in_actual_allowlist": true,
+                "citations_all_strings": true,
+                "citations_nonempty_list": true,
+                "citations_source_order": true,
+                "citations_unique": true,
+                "conflicting_duplicate_identity": false,
+                "entities_list_of_nonempty_strings": true,
+                "exact_fields": false,
+                "item_index": 1,
+                "object": true,
+                "outcome_allowed": true,
+                "summary_nonempty": true,
+                "title_nonempty": false
+              },
+              {
+                "actual_single_item_accepted": true,
+                "citations_all_in_actual_allowlist": true,
+                "citations_all_strings": true,
+                "citations_nonempty_list": true,
+                "citations_source_order": true,
+                "citations_unique": true,
+                "conflicting_duplicate_identity": false,
+                "entities_list_of_nonempty_strings": true,
+                "exact_fields": true,
+                "item_index": 2,
+                "object": true,
+                "outcome_allowed": true,
+                "summary_nonempty": true,
+                "title_nonempty": true
+              }
+            ],
+            "rejected_count": 1,
+            "validator": "digest_episodes"
+          },
+          {
+            "object": true,
+            "reason": "episode_validation_failure",
+            "summary_is_string": true,
+            "summary_trimmed_codepoints": 389,
+            "validator": "digest_primary"
+          }
+        ]
+      }
+    ],
+    "lme_readiness_verified": false,
+    "new_http_attempts": 0,
+    "saved_responses": 30,
+    "semantic_verified": false,
+    "status": "exact_saved_replay_verified"
+  },
+  "additional_metadata": {
+    "episode_item_contract": {
+      "extra_field_count": 1,
+      "missing_contract_fields": [
+        "title"
+      ],
+      "title_is_string": false,
+      "title_present": false
+    },
+    "inspector_container": {
+      "ExitCode": 0,
+      "OOMKilled": false,
+      "Pid": 0,
+      "Status": "exited"
+    },
+    "new_http_attempts": 0
+  },
+  "new_http_attempts": 0,
+  "raw_benchmark_content_exported": false
+}

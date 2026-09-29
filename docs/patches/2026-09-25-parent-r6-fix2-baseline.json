@@ -1,0 +1,38 @@
+{
+  "schema": "r6-parent-retained-split-baseline-v1",
+  "canonical_sources_verified": true,
+  "original_store_files_unchanged": true,
+  "chunk_id": "chk_d9c7f58f71d38ae508b690115183b0000dd34416",
+  "source_messages": 1,
+  "source_message_id": 134,
+  "source_content_chars": 13059,
+  "source_encoded_chars": 13718,
+  "source_records_sha256": "245ca6720283a891c2c21b45e5f2eae51c2e326e297d84c9a3fe3f39f4a6ce6f",
+  "store_file_sha256": {
+    "hymem.sqlite": "43411002125fb8c3fe74b523bc303e5c3236b1143e422c9e943e4d168dc296c7",
+    "hymem.sqlite-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+    "hymem.sqlite-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "terminal_fragment": {
+    "source_start": 4836,
+    "source_end": 12869,
+    "content_chars": 8033,
+    "encoded_chars": 9286,
+    "content_sha256": "164226e15e16288bc7689d39e70fa600b87270d785ceb3251c2a7620d541fbfe",
+    "newlines": 390,
+    "numeric_rows": 388,
+    "numeric_columns": 3,
+    "header_shape": "three identifier labels, each followed by a bracketed unit",
+    "row_shape": "three space-separated signed decimal values",
+    "sentence_boundaries": 0,
+    "structural_boundaries": 0,
+    "protected_spans": 0,
+    "admissible_semantic_cut": null
+  },
+  "failure_reason": "resource_limit",
+  "failure_details": ["split:no_admissible_semantic_boundary"],
+  "completion_calls": 0,
+  "provider_attempts": 0,
+  "raw_content_exported": false,
+  "probe_containers": ["hymem-r6-retained-split-probe-v1", "hymem-r6-retained-split-probe-v2"]
+}

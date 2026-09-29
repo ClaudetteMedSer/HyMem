@@ -1,0 +1,46 @@
+{
+  "schema": "r6-parent-summary-semantic-review-v1",
+  "package_sha256": "b926b016c93316c6c62e24d500e2edbd1e9234b52cb54c57d523466855a41169",
+  "source_version": "summary-recovery-v4",
+  "parent_accepted": true,
+  "scope": "Bounded recovery effectiveness plus four preregistered invented semantic controls, not universal summary fidelity or full LME readiness.",
+  "retained_recovered": 10,
+  "controls_recovered": 4,
+  "provider_calls": 32,
+  "http_attempts": 32,
+  "total_tokens": 62140,
+  "cost_usd": null,
+  "original_and_non_summary_state_unchanged": true,
+  "cleanup_passed": true,
+  "semantic_review": {
+    "dense": "pass: Elena/Cedar, read-only inventory, no deletion, 240-euro ceiling and paused/not-run outcome preserved",
+    "multiwindow": "pass: Ada ownership, Noel attribution, 14 replacing 12, originals protected, unknown deadline and real restore/checksum pending preserved",
+    "uncertainty": "pass: Iris hypothesis, two confirmed absent/five unresolved, assistant refresh plus comparison proposal, neither executed and no restored receipts preserved",
+    "injection": "pass: Omar failed export, originals intact, pending inspection and rejected untrusted injection; no fabricated success or deletion"
+  },
+  "summary_lengths": {
+    "retained": [
+      222,
+      231,
+      253,
+      254,
+      255,
+      257,
+      266,
+      270,
+      278,
+      322
+    ],
+    "controls": [
+      215,
+      232,
+      265,
+      300
+    ],
+    "hard_storage_limit": 500,
+    "note": "Soft short-output instruction not uniformly obeyed (one 322-character overview); no hard-cap rejection, slicing or relaxation."
+  },
+  "offline_parent_tests": 782,
+  "diagnostic_controls": 62,
+  "live_receipt": "docs/patches/2026-09-25-parent-r6-fix3-live-v3.json"
+}

@@ -1,0 +1,80 @@
+{
+  "schema": "r6-final-cumulative-patch-v1",
+  "baseline_manifest_sha256": "c67a4ba8bd9c1b29259484151a6c8687a17bacd82f64d54092f59327907b9ffc",
+  "final_manifest_sha256": "bd8d0f3a8fb40bd6b77e7ca6579c8e5e8ee78733bea2bb22df71bc4b2c12eaa2",
+  "changed_files": {
+    "benchmarks/extraction_canary.py": {
+      "before_sha256": "809640a8a8d69117efeb37dc4562b2c24fbad91eb02d5eefb9fbf2d28a36dcfc",
+      "after_sha256": "2c45f312bbd7be2d3181b2c85d90d27279889301191635978eafe8adfd9833ce"
+    },
+    "benchmarks/extraction_canary_archive.py": {
+      "before_sha256": "4cd2e6a18d36bb42e0ea64539e17c74a0b7f0f3aa7a96b33b14bc4c91f5bb36c",
+      "after_sha256": "7725fd80cb95e13d1f166af3852bca3d6c48e1ad95d2450d04d9b337dcc435b9"
+    },
+    "benchmarks/lme_protocol.py": {
+      "before_sha256": "77aa190367adf35739e4ad4fb6fa791cefc7c91930b7d3e56e60aee76acb36c1",
+      "after_sha256": "d39f8409a5bd1f99f3e8564186569573f6d556b6380510c025c6cd30fa5c9d8c"
+    },
+    "hymem/dreaming/summary_recovery.py": {
+      "before_sha256": "35b697c00b5b78b7fa1be5ccfc7f5a044d5e174ad5c34eed2ae439e5794fb716",
+      "after_sha256": "2b61c05031a47d08ac930a9d9332097235c3576577b519b9ce8611cc3be8034b"
+    },
+    "hymem/extraction/chunk.py": {
+      "before_sha256": "6a1c2cd5a8fa73b91f04bb409ed95d21e3db023141c60d65019b00f4d131fd8d",
+      "after_sha256": "bcca82c34c750db60930bd0c99644960e8c0d6aec83d86e27521fdc785e651f3"
+    },
+    "hymem/extraction/contract.py": {
+      "before_sha256": "2c7e88364bac7cde2bbfa2a2841de710b69705b483b0f3b39bbaa9679c6e91b1",
+      "after_sha256": "55dffa976694afaeead0306dbdcd08ece8bb836aa575228be2eb55434440d486"
+    },
+    "hymem/extraction/prompts/__init__.py": {
+      "before_sha256": "81cc19fbaa3aadc135d35ff8292acd62a92ace75479e6e3f849dc5a6bb6d3b79",
+      "after_sha256": "a0299f95e88e0435a0e41b87b3cd2ad3d2c1f5486f17f737a8afc9f5a830719c"
+    },
+    "tests/test_benchmark_extraction_canary.py": {
+      "before_sha256": "8a95ea278b6a4f62ee73e4ee680e4397d29cafd85448583072311b78aac488ad",
+      "after_sha256": "6ae8b08dfe2fc8023620e55f00c650ffd48728e8f10762fc01c0aeeed13ac89f"
+    },
+    "tests/test_canary_response_history.py": {
+      "before_sha256": "4048c8ef001a72cf7a782fed297b076ff81daa6685bdc2ce77dd527a6efae385",
+      "after_sha256": "6cf2065a4486dc04c5b87cc74bb36cf91c9367f6f755c8fbb535b9abdd4e976a"
+    },
+    "tests/test_digest_squeeze_probe.py": {
+      "before_sha256": "4b8ea06d2f247cc55bfa5896a805a1ca1ef96a1631d410ccb135b12ca4a9e869",
+      "after_sha256": "f8e6a3de343bebb5e927a865d96b11c1535596fa1c65335d8fd0db6775961797"
+    },
+    "tests/test_extraction_contract_identity.py": {
+      "before_sha256": "ba134c3ceb9e7f52759b82e1bc18bde6c0e13265d4c65311bef6bc600c472cf4",
+      "after_sha256": "20c5ed8e2f640ecd744380023c91b40d23397b0efa6706ff7e78f3f692b394e9"
+    },
+    "tests/test_extraction_unit_numeric_tables.py": {
+      "before_sha256": null,
+      "after_sha256": "0d32363ada9b8215d55b823255e098d5331acf76211eaf2417a135f96036ce71"
+    },
+    "tests/test_extraction_whole_unit_input.py": {
+      "before_sha256": "9df2d138db42d2b7b3bc45f19f10542a25ec8c4f712670e572817d0ad83f1484",
+      "after_sha256": "f2d7252fc16fb88aac6efb2b4edd049f007574021beb89dd656942dec7522733"
+    },
+    "tests/test_lme_protocol_hardening.py": {
+      "before_sha256": "6d78d8fad50a9b165dffff8a3a0590e622d20f90f5fa273010619709839908bf",
+      "after_sha256": "3a3a9cba22986c97e10ab682bec5ee6eed592eb945ce92ddb46e35ed19a0f2d9"
+    },
+    "tests/test_summary_recovery_v63.py": {
+      "before_sha256": "5d355813d122d4f85eaf4adb79bc6a81a676a96f20ad6afca039d4e4a0b1712c",
+      "after_sha256": "43621b8117de004bfbefe6b1c664f0e41abe3029fa64de2c3b64b64e4f2210db"
+    },
+    "tests/test_typed_response_recovery.py": {
+      "before_sha256": "085c32fac1f090da2f72c038f4050af0a3123ba598dd032388a01b1896676fd8",
+      "after_sha256": "2e819dda6c2fb9b07346928061eeab1b18be03c7a01e6494efa1d15057805552"
+    }
+  },
+  "patch_sha256": "f7578e3e860bbdba5dc381591141d9b2e0688221a085d4353889113fa1d69da0",
+  "patch_bytes": 79077,
+  "production_deployed": false,
+  "full_suite_passed": true,
+  "full_suite_receipt": "docs/patches/2026-09-25-parent-r6-final-full-acceptance.json",
+  "paid_stock_regression_passed": true,
+  "paid_stock_regression_receipt": "docs/patches/2026-09-25-parent-r6-final-regression-acceptance.json",
+  "full_500_readiness_verified": false,
+  "note": "Baseline-specific delta, not safe to apply blindly over dirty main checkout; verify file preimages. Full offline suite passed 7315 cases with four declared skips. One fresh paid stock regression completed with a correct answer and healthy item indexing; 11 missing summaries remain explicitly reported. Not production deployed and not a full-500 readiness claim."
+}

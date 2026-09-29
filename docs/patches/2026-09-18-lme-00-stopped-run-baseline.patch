@@ -1,0 +1,989 @@
+--- a/benchmarks/beam_adapter.py
++++ b/benchmarks/beam_adapter.py
+@@ -671,9 +671,10 @@
+ # (e.g. "gemini:gemini-2.5-flash"); a bare model name stays on DeepSeek for
+ # backward-compatible parsing of explicitly selected historical model ids.
+ ANSWER_PROVIDERS = {
+-    "deepseek": ("https://api.deepseek.com", ("HYMEM_LLM_API_KEY", "DEEPSEEK_API_KEY")),
+-    "gemini":   ("https://generativelanguage.googleapis.com/v1beta/openai", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
+-    "openai":   ("https://api.openai.com/v1", ("OPENAI_API_KEY",)),
++    "deepseek":  ("https://api.deepseek.com", ("HYMEM_LLM_API_KEY", "DEEPSEEK_API_KEY")),
++    "gemini":    ("https://generativelanguage.googleapis.com/v1beta/openai", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
++    "openai":    ("https://api.openai.com/v1", ("OPENAI_API_KEY",)),
++    "deepinfra": ("https://api.deepinfra.com/v1", ("DEEPINFRA_API_KEY", "HYMEM_LLM_API_KEY")),
+ }
+ 
+ 
+@@ -801,11 +802,11 @@
+         combination; the judge is DeepSeek-only and cannot hit it.
+     """
+     thinking = extra_body.get("thinking")
+-    if provider != "deepseek" and thinking is not None:
++    if provider not in ("deepseek", "deepinfra") and thinking is not None:
+         print(f"ERROR: {role} provider {provider!r} rejects DeepSeek's `thinking` key "
+               f"(HTTP 400). Drop it from --{role}-extra-body.")
+         sys.exit(2)
+-    if provider == "deepseek" and "v4-flash" in model and \
++    if provider in ("deepseek", "deepinfra") and "v4-flash" in model and \
+             (thinking or {}).get("type") != "disabled":
+         print(f"ERROR: {role} model {model!r} requires "
+               f"--{role}-extra-body '{{\"thinking\": {{\"type\": \"disabled\"}}}}'. "
+@@ -3706,6 +3707,11 @@
+                         help="Exploratory run with no pre-registration. Recorded as "
+                              "prereg: null in the artifact, so such a run stays "
+                              "distinguishable from a canonical one.")
++    parser.add_argument("--skip-extraction-canary", action="store_true",
++                        help="Operator override for non-official pipeline providers: "
++                             "record zero-work canary evidence with skip_reason="
++                             "operator_override instead of running the Phase-1 "
++                             "extraction canary. Artifact stays marked non-comparable.")
+     parser.add_argument("--api-key", default="")
+     parser.add_argument("--facts", action=argparse.BooleanOptionalAction, default=None,
+                         help="E1 narrative-facts READ side (cfg.facts_enabled). None = "
+@@ -4334,42 +4340,53 @@
+             # Exercise the exact indexing prompt/parser/validator before the
+             # first conversation store is created. One dedicated client keeps
+             # this once-per-run preflight out of scored pipeline usage.
+-            try:
+-                extraction_canary_report = run_configured_extraction_canary(
+-                    api_key=pipeline_key,
+-                    base_url=args.hymem_base_url,
+-                    model=args.hymem_model,
+-                    thinking=args.hymem_thinking,
++            if args.skip_extraction_canary:
++                print("WARNING: extraction canary SKIPPED (operator override; "
++                      "non-official pipeline provider). Zero-work evidence "
++                      "recorded as skip_reason=operator_override; this run's "
++                      "pipeline evidence is non-comparable with canonical runs.",
++                      flush=True)
++                extraction_canary_report = skipped_extraction_canary(
++                    "operator_override",
+                     prompt_version=extraction_prompt_version,
+                 )
+-                validate_extraction_canary_report(
+-                    extraction_canary_report,
+-                    expected_mode="required",
+-                    expected_client=extraction_canary_client_policy(
++            else:
++                try:
++                    extraction_canary_report = run_configured_extraction_canary(
++                        api_key=pipeline_key,
+                         base_url=args.hymem_base_url,
+                         model=args.hymem_model,
+                         thinking=args.hymem_thinking,
+-                    ),
+-                    require_client_closed=True,
+-                    expected_prompt_version=extraction_prompt_version,
+-                )
+-            except ExtractionCanaryError as exc:
+-                extraction_canary_report = dict(exc.report)
+-                validate_extraction_canary_report(
+-                    extraction_canary_report,
+-                    expected_mode="failed",
+-                    expected_client=extraction_canary_client_policy(
+-                        base_url=args.hymem_base_url,
+-                        model=args.hymem_model,
+-                        thinking=args.hymem_thinking,
+-                    ),
+-                    require_client_closed=True,
+-                    expected_prompt_version=extraction_prompt_version,
+-                )
+-                ledger.update_execution_segment(
+-                    segment_id, _segment("running")
+-                )
+-                raise
++                        prompt_version=extraction_prompt_version,
++                    )
++                    validate_extraction_canary_report(
++                        extraction_canary_report,
++                        expected_mode="required",
++                        expected_client=extraction_canary_client_policy(
++                            base_url=args.hymem_base_url,
++                            model=args.hymem_model,
++                            thinking=args.hymem_thinking,
++                        ),
++                        require_client_closed=True,
++                        expected_prompt_version=extraction_prompt_version,
++                    )
++                except ExtractionCanaryError as exc:
++                    extraction_canary_report = dict(exc.report)
++                    validate_extraction_canary_report(
++                        extraction_canary_report,
++                        expected_mode="failed",
++                        expected_client=extraction_canary_client_policy(
++                            base_url=args.hymem_base_url,
++                            model=args.hymem_model,
++                            thinking=args.hymem_thinking,
++                        ),
++                        require_client_closed=True,
++                        expected_prompt_version=extraction_prompt_version,
++                    )
++                    ledger.update_execution_segment(
++                        segment_id, _segment("running")
++                    )
++                    raise
+             ledger.update_execution_segment(segment_id, _segment("running"))
+             print_extraction_canary(extraction_canary_report)
+ 
+--- a/benchmarks/extraction_canary.py
++++ b/benchmarks/extraction_canary.py
+@@ -361,7 +361,7 @@
+ _SAFE_FAILURE_DETAIL = re.compile(r"^[a-z0-9_.\[\]-]+:[a-z0-9_]+$")
+ _EXPECTED_MODES = frozenset({
+     "required", "failed", "pending", "simulation", "no_dream",
+-    "no_pending_work",
++    "no_pending_work", "operator_override",
+ })
+ 
+ 
+@@ -447,7 +447,8 @@
+ ) -> dict[str, Any]:
+     """Exact zero-work evidence for an intentionally unattempted canary."""
+ 
+-    if reason not in {"simulation", "no_dream", "no_pending_work"}:
++    if reason not in {"simulation", "no_dream", "no_pending_work",
++                      "operator_override"}:
+         raise ValueError("unknown extraction-canary skip reason")
+     report = {
+         **extraction_canary_policy(prompt_version=prompt_version),
+@@ -1148,7 +1149,8 @@
+             raise _integrity("pending report shape is invalid")
+         return report
+ 
+-    if expected_mode in {"simulation", "no_dream", "no_pending_work"}:
++    if expected_mode in {"simulation", "no_dream", "no_pending_work",
++                         "operator_override"}:
+         expected_status = (
+             "not_run_no_pending"
+             if expected_mode == "no_pending_work" else "skipped_non_comparable"
+--- /dev/null
++++ b/benchmarks/lme_canary_watch.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Canary-window watcher for the LME run (operator-approved 2026-09-10: "Do 1").
++
++Probes the official extraction canary on a fixed cadence. Exits the moment a
++probe PASSES (code 0, "WATCH_FIRED") or after the bounded window expires
++(code 4, "WATCH_EXPIRED"). Silent on failures -- every verdict is logged;
++no raw provider content and no credentials are ever written.
++
++On fire, the operator (agent) launches the approved chain:
++    bash benchmarks/lme_canary_retry_run.sh 10 1   # smoke, then (after review)
++    bash benchmarks/lme_canary_retry_run.sh 0 8    # full 500
++
++Run:  cd ~/HyMem && . .hermes env -> /home/node/hymem-env/bin/python3
++      benchmarks/lme_canary_watch.py /tmp/lme-canary-watch-<stamp>.log
++"""
++import datetime
++import os
++import sys
++import time
++
++sys.path.insert(0, "/home/node/HyMem")
++os.chdir("/home/node/HyMem")
++
++from benchmarks.extraction_canary import (
++    ExtractionCanaryError,
++    run_configured_extraction_canary,
++)
++
++INTERVAL_S = 600
++MAX_PROBES = 24          # ~4 h bounded window
++MAX_CONSECUTIVE_ERRORS = 3
++
++log_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/lme-canary-watch.log"
++key = os.environ["DEEPSEEK_API_KEY"]
++
++
++def log(message: str) -> None:
++    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
++    line = f"{stamp} {message}"
++    print(line, flush=True)
++    with open(log_path, "a") as fh:
++        fh.write(line + "\n")
++
++
++log(f"WATCH_START interval={INTERVAL_S}s max_probes={MAX_PROBES} log={log_path}")
++
++consecutive_errors = 0
++for n in range(1, MAX_PROBES + 1):
++    t0 = time.time()
++    verdict = "?"
++    reason = ""
++    try:
++        run_configured_extraction_canary(
++            api_key=key,
++            base_url="https://api.deepseek.com",
++            model="deepseek-v4-flash",
++            thinking="auto",
++        )
++        verdict = "PASS"
++    except ExtractionCanaryError as exc:
++        verdict = "FAIL"
++        report = getattr(exc, "report", None) or {}
++        reason = report.get("failure_reason") or "unknown"
++        path = report.get("execution_path") or {}
++        reason += (
++            f" prose_em={path.get('prose_claim_exact_context_emissions')}"
++            f" table_em={path.get('table_claim_exact_context_emissions')}"
++        )
++    except Exception as exc:  # noqa: BLE001 - watcher must survive probe errors
++        verdict = "ERROR"
++        reason = f"{type(exc).__name__}: {exc}"
++
++    duration = time.time() - t0
++    log(
++        f"PROBE {n}/{MAX_PROBES} {verdict}"
++        + (f" reason={reason}" if reason else "")
++        + f" ({duration:.1f}s)"
++    )
++
++    if verdict == "PASS":
++        log("WATCH_FIRED")
++        sys.exit(0)
++    if verdict == "ERROR":
++        consecutive_errors += 1
++        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
++            log("WATCH_ERROR_STREAK")
++            sys.exit(5)
++    else:
++        consecutive_errors = 0
++
++    if n < MAX_PROBES:
++        time.sleep(INTERVAL_S)
++
++log("WATCH_EXPIRED")
++sys.exit(4)
+--- a/benchmarks/lme_protocol.py
++++ b/benchmarks/lme_protocol.py
+@@ -1682,6 +1682,73 @@
+         )
+ 
+ 
++def _indexing_snapshot_is_mechanically_complete(
++    final: Mapping[str, Any] | None,
++    reports: list[dict[str, Any]],
++    cycles: int,
++) -> bool:
++    """Mirror convergence's drainage predicate, not its usable-health test.
++
++    Arguments have already passed status/report shape validation. Durable
++    quarantine, source loss and malformed-authority findings are not pending
++    work: they make a drained index unhealthy, and may also coexist with work
++    that is still pending or failed in the last cycle.
++    """
++
++    return bool(
++        final is not None and cycles > 0 and len(reports) == cycles
++        and not any(final["pending"].values())
++        and not final["in_progress"]
++        and not any(reports[-1][key] for key in _INDEXING_REPORT_BOOLEAN_FIELDS)
++        and not any(reports[-1][key] for key in _INDEXING_CYCLE_FAILURE_FIELDS)
++    )
++
++
++def _validate_immediate_durable_indexing_failure(
++    code: str,
++    *,
++    complete: bool,
++    final: Mapping[str, Any] | None,
++    reports: list[dict[str, Any]],
++    cycles: int,
++) -> None:
++    """Accept honest early failure without inventing successful drainage.
++
++    These failures stop convergence immediately, even while another tier is
++    pending. Their completion flag must describe the actual last snapshot.
++    Coverage retry exhaustion and deadline failures have different semantics
++    and deliberately do not use this equality check.
++    """
++
++    if code == "quarantined_extraction":
++        if final is None or not any(final["quarantined"].values()):
++            raise BenchmarkIntegrityError(
++                "LongMemEval quarantine failure lacks durable quarantine evidence"
++            )
++    elif code == "terminal_extraction_source_loss":
++        if final is None or final["terminal_loss"]["chunks"] <= 0:
++            raise BenchmarkIntegrityError(
++                "LongMemEval terminal-loss failure lacks durable loss evidence"
++            )
++    elif code == "malformed_durable_state":
++        if final is None or not any(final["malformed"].values()):
++            raise BenchmarkIntegrityError(
++                "LongMemEval malformed-state failure lacks durable evidence"
++            )
++    else:
++        return
++    if cycles <= 0 or len(reports) != cycles:
++        raise BenchmarkIntegrityError(
++            "LongMemEval durable indexing failure lacks a completed cycle"
++        )
++    if complete is not _indexing_snapshot_is_mechanically_complete(
++        final, reports, cycles,
++    ):
++        raise BenchmarkIntegrityError(
++            "LongMemEval durable failure mechanical completion contradicts its work"
++        )
++
++
+ def _validate_versioned_indexing(
+     summary: Mapping[str, Any], *, require_healthy: bool, allow_failure: bool,
+ ) -> bool:
+@@ -1796,44 +1863,15 @@
+         raise BenchmarkIntegrityError(
+             "LongMemEval unavailable producer contradicts its authority evidence"
+         )
+-    if code == "quarantined_extraction" and (
+-        final is None or not any(final["quarantined"].values())
+-    ):
+-        raise BenchmarkIntegrityError(
+-            "LongMemEval quarantine failure lacks durable quarantine evidence"
+-        )
+-    if code == "terminal_extraction_source_loss" and (
+-        final is None or final["terminal_loss"]["chunks"] <= 0
+-    ):
+-        raise BenchmarkIntegrityError(
+-            "LongMemEval terminal-loss failure lacks durable loss evidence"
+-        )
+-    if code == "malformed_durable_state" and (
+-        final is None or not any(final["malformed"].values())
+-    ):
+-        raise BenchmarkIntegrityError(
+-            "LongMemEval malformed-state failure lacks durable evidence"
+-        )
+-    if code in {
+-        "quarantined_extraction", "terminal_extraction_source_loss",
+-        "malformed_durable_state",
+-    } and not complete:
+-        raise BenchmarkIntegrityError(
+-            "LongMemEval extraction-loss failure lacks mechanical completion"
+-        )
+-    if complete:
+-        if (
+-            final is None or cycles <= 0 or sum(final["pending"].values()) != 0
+-            or final["in_progress"]
+-            or any(reports[-1][key] for key in _INDEXING_REPORT_BOOLEAN_FIELDS)
+-            or any(
+-                reports[-1][key] != 0
+-                for key in _INDEXING_CYCLE_FAILURE_FIELDS
+-            )
+-        ):
+-            raise BenchmarkIntegrityError(
+-                "LongMemEval mechanically complete failure has blocking work"
+-            )
++    _validate_immediate_durable_indexing_failure(
++        code, complete=complete, final=final, reports=reports, cycles=cycles,
++    )
++    if complete and not _indexing_snapshot_is_mechanically_complete(
++        final, reports, cycles,
++    ):
++        raise BenchmarkIntegrityError(
++            "LongMemEval mechanically complete failure has blocking work"
++        )
+     if code == "max_cycles_exhausted" and cycles != max_cycles:
+         raise BenchmarkIntegrityError(
+             "LongMemEval max-cycle failure did not exhaust its cycle bound"
+@@ -1924,18 +1962,14 @@
+     )
+     if healthy is not computed_healthy:
+         raise BenchmarkIntegrityError("LongMemEval indexing health flag is inconsistent")
++    # Preserve legacy missing-field defaults, but never ignore a supplied
++    # digest/fact/profile/aggregation failure or malformed budget flag.
++    canonical_reports = [_canonical_indexing_report(report) for report in reports]
+     if healthy:
+         if reason is not None or cycles <= 0 or elapsed > timeout:
+             raise BenchmarkIntegrityError("LongMemEval successful indexing state is inconsistent")
+-        if (
+-            reports[-1].get("budget_exhausted")
+-            or reports[-1].get("skipped_locked")
+-            or _finite_number(
+-                reports[-1].get("aggregation_fusion_failures", 0), integer=True
+-            ) != 0
+-            or _finite_number(
+-                reports[-1].get("aggregation_build_exceptions", 0), integer=True
+-            ) != 0
++        if not _indexing_snapshot_is_mechanically_complete(
++            canonical_final, canonical_reports, cycles,
+         ):
+             raise BenchmarkIntegrityError(
+                 "LongMemEval successful indexing final cycle is not clean"
+@@ -1963,25 +1997,12 @@
+         raise BenchmarkIntegrityError(
+             "LongMemEval coverage failure lacks durable coverage evidence"
+         )
+-    if failure["code"] in {
+-        "quarantined_extraction", "terminal_extraction_source_loss",
+-    } and not complete:
+-        raise BenchmarkIntegrityError(
+-            "LongMemEval extraction-loss failure lacks mechanical completion"
+-        )
+-    if complete and (
+-        canonical_final is None
+-        or cycles <= 0 or sum(canonical_final["pending"].values()) != 0
+-        or sum(canonical_final["malformed"].values()) != 0
+-        or canonical_final["in_progress"]
+-        or reports[-1].get("budget_exhausted") is not False
+-        or reports[-1].get("skipped_locked") is not False
+-        or _finite_number(
+-            reports[-1].get("aggregation_fusion_failures", 0), integer=True
+-        ) != 0
+-        or _finite_number(
+-            reports[-1].get("aggregation_build_exceptions", 0), integer=True
+-        ) != 0
++    _validate_immediate_durable_indexing_failure(
++        failure["code"], complete=complete, final=canonical_final,
++        reports=canonical_reports, cycles=cycles,
++    )
++    if complete and not _indexing_snapshot_is_mechanically_complete(
++        canonical_final, canonical_reports, cycles,
+     ):
+         raise BenchmarkIntegrityError(
+             "LongMemEval mechanically complete failure has blocking work"
+--- a/benchmarks/locomo_adapter.py
++++ b/benchmarks/locomo_adapter.py
+@@ -105,7 +105,7 @@
+     MSCAdapter,
+     _indexing_limits,
+     _lex_match,
+-    model_identity_fields,
++    model_identity_fields as _msc_model_identity_fields,
+     parse_extra_body_arg,
+     prepare_indexing,
+     run_or_record_indexing_failure,
+@@ -687,6 +687,39 @@
+     return {"thinking": {"type": "disabled"}} if send else {}
+ 
+ 
++def _judge_base_url(args, judge_llm=None) -> str:
++    """Resolve legacy callers and actual clients to one validated endpoint.
++
++    Older direct callers do not have the optional CLI field. A real supplied
++    client's endpoint takes precedence over that historical default, but must
++    agree with an explicitly configured endpoint so receipts cannot name a
++    different provider. Rejudging validates this before making any calls.
++    """
++    configured = getattr(args, "judge_base_url", None)
++    actual = getattr(judge_llm, "base_url", None)
++    configured_url = (
++        validate_http_endpoint(configured, label="judge").url
++        if configured is not None else None
++    )
++    actual_url = (
++        validate_http_endpoint(actual, label="judge").url
++        if actual is not None else None
++    )
++    if configured_url and actual_url and configured_url != actual_url:
++        raise BenchmarkIntegrityError("configured judge endpoint differs from client")
++    return actual_url or configured_url or _DEEPSEEK_BASE_URL
++
++
++def model_identity_fields(args, answer_llm, judge_llm, pipeline_llm) -> dict:
++    """Preserve MSC's shared fields while binding LoCoMo's optional judge URL."""
++    identity = _msc_model_identity_fields(
++        args, answer_llm, judge_llm, pipeline_llm
++    )
++    if not getattr(args, "sim", False):
++        identity["judge_base_url"] = _judge_base_url(args, judge_llm)
++    return identity
++
++
+ def _effective_hymem_config(args):
+     """Return the adapter's exact config object and public serialized identity."""
+     from hymem import HyMemConfig
+@@ -762,6 +795,7 @@
+             "embedding": embedding,
+         }
+     else:
++        judge_base_url = _judge_base_url(args)
+         models = {
+             "reader": {
+                 "client_class": "longmemeval_adapter.LLMClient",
+@@ -774,9 +808,9 @@
+             },
+             "judge": {
+                 "client_class": "longmemeval_adapter.LLMClient",
+-                "provider": _provider_for_url(_DEEPSEEK_BASE_URL),
++                "provider": _provider_for_url(judge_base_url),
+                 "model": args.judge_model,
+-                "base_url": _DEEPSEEK_BASE_URL,
++                "base_url": judge_base_url,
+                 "temperature": 0.0,
+                 "max_tokens": 10,
+                 "extra_body": copy.deepcopy(args.judge_extra_body_obj),
+@@ -1561,6 +1595,7 @@
+     """Re-judge a stored `--out` file, writing a flip-compatible copy."""
+     from longmemeval_adapter import is_llm_error, judge_scored
+ 
++    effective_judge_url = _judge_base_url(args, judge_llm)
+     rows = json.loads(Path(args.rejudge).read_text(encoding="utf-8"))
+     if not isinstance(rows, list) or not rows:
+         sys.exit(f"{args.rejudge}: expected a non-empty list of per-question results")
+@@ -1595,7 +1630,7 @@
+                 "judge_raw": judge_raw,
+                 "judge_error": bool(judge_raw) and is_llm_error(judge_raw),
+                 "judge_model": args.judge_model,
+-                "judge_base_url": _DEEPSEEK_BASE_URL,
++                "judge_base_url": effective_judge_url,
+                 "judge_extra_body": copy.deepcopy(effective_judge_body),
+                 "_rejudged": judged}
+ 
+@@ -1703,6 +1738,10 @@
+                          "requests disable thinking automatically")
+     ap.add_argument("--judge-model", default=_JUDGE_MODEL)
+     ap.add_argument(
++        "--judge-base-url", default=_DEEPSEEK_BASE_URL,
++        help="judge endpoint (also used by --rejudge; default: DeepSeek)",
++    )
++    ap.add_argument(
+         "--judge-api-key", default=None,
+         help="judge-specific API key (never inherited from --answer-api-key)",
+     )
+@@ -1782,6 +1821,12 @@
+                          "writes a flip-compatible copy to --out or *.rejudged.json")
+     ap.add_argument("--sim", action="store_true", help="offline: StubLLM, no API")
+     ap.add_argument("--json", action="store_true")
++    ap.add_argument(
++        "--skip-extraction-canary", action="store_true",
++        help="operator override for non-official pipeline providers: record "
++             "zero-work canary evidence with skip_reason=operator_override "
++             "instead of running the Phase-1 extraction canary",
++    )
+     add_strict_run_arguments(ap)
+     args = ap.parse_args()
+ 
+@@ -1799,6 +1844,9 @@
+             )
+         args.answer_base_url = validate_http_endpoint(
+             args.answer_base_url, label="reader"
++        ).url
++        args.judge_base_url = validate_http_endpoint(
++            args.judge_base_url, label="judge"
+         ).url
+         args.hymem_base_url = validate_http_endpoint(
+             args.hymem_base_url, label="memory pipeline"
+@@ -1850,7 +1898,7 @@
+             args.answer_model, args.answer_base_url, parsed_answer_body
+         )
+         args.judge_extra_body_obj, _ = resolve_model_extra_body(
+-            args.judge_model, _DEEPSEEK_BASE_URL, parsed_judge_body
++            args.judge_model, args.judge_base_url, parsed_judge_body
+         )
+     except (BenchmarkIntegrityError, ValueError) as exc:
+         ap.error(str(exc))
+@@ -1884,7 +1932,7 @@
+             sys.exit("--rejudge needs a real judge; drop --sim.")
+         judge_llm = owned_clients.own(
+             _build_llm(
+-                args.judge_model, _DEEPSEEK_BASE_URL,
++                args.judge_model, args.judge_base_url,
+                 args.judge_api_key, args.judge_extra_body_obj,
+             ),
+             label="rejudge client",
+@@ -2415,6 +2463,17 @@
+                 extraction_canary_mode = "simulation"
+             elif args.no_dream:
+                 extraction_canary_mode = "no_dream"
++            elif args.skip_extraction_canary:
++                extraction_canary_mode = "operator_override"
++                print("WARNING: extraction canary SKIPPED (operator override; "
++                      "non-official pipeline provider). Zero-work evidence "
++                      "recorded as skip_reason=operator_override; this run's "
++                      "pipeline evidence is non-comparable with canonical runs.",
++                      flush=True)
++                extraction_canary_report = skipped_extraction_canary(
++                    "operator_override",
++                    prompt_version=extraction_prompt_version,
++                )
+             else:
+                 extraction_canary_mode = "required"
+                 try:
+@@ -2462,7 +2521,7 @@
+                 )
+                 judge_llm = owned_clients.own(
+                     _build_llm(
+-                        args.judge_model, _DEEPSEEK_BASE_URL,
++                        args.judge_model, args.judge_base_url,
+                         args.judge_api_key, args.judge_extra_body_obj,
+                     ),
+                     label="judge client",
+--- a/benchmarks/longmemeval_adapter.py
++++ b/benchmarks/longmemeval_adapter.py
+@@ -4519,6 +4519,12 @@
+     parser.add_argument(
+         "--no-prereg", action="store_true",
+         help="explicitly mark this run exploratory/development-only",
++    )
++    parser.add_argument(
++        "--skip-extraction-canary", action="store_true",
++        help="operator override for non-official pipeline providers: record "
++             "zero-work canary evidence with skip_reason=operator_override "
++             "instead of running the Phase-1 extraction canary",
+     )
+     parser.add_argument("--keep-db", action="store_true")
+     parser.add_argument("--workers", type=int, default=1,
+@@ -5592,7 +5598,22 @@
+ 
+     if work_total:
+         ledger.update_execution_segment(segment_id, _segment("running", 0))
+-        if not args.no_dream:
++        if args.skip_extraction_canary:
++            print("WARNING: extraction canary SKIPPED (operator override; "
++                  "non-official pipeline provider). Zero-work evidence "
++                  "recorded as skip_reason=operator_override; this run's "
++                  "pipeline evidence is non-comparable with canonical runs.",
++                  flush=True)
++            extraction_canary_report = skipped_extraction_canary(
++                "operator_override",
++                prompt_version=extraction_prompt_version,
++            )
++            _validate_pipeline_extraction_canary(
++                extraction_canary_report, args, mode="operator_override",
++            )
++            ledger.update_execution_segment(segment_id, _segment("running", 0))
++            print_extraction_canary(extraction_canary_report)
++        elif not args.no_dream:
+             try:
+                 extraction_canary_report = run_configured_extraction_canary(
+                     api_key=pipeline_key,
+--- a/hymem/api.py
++++ b/hymem/api.py
+@@ -5,6 +5,7 @@
+ import shlex
+ import subprocess
+ import sqlite3
++import threading
+ import time
+ import urllib.error
+ import urllib.request
+@@ -187,6 +188,21 @@
+         return False
+ 
+ 
++def _close_failed_connection(
++    conn: sqlite3.Connection, primary: BaseException,
++) -> None:
++    """Keep a setup fault authoritative even if best-effort cleanup fails."""
++    try:
++        conn.close()
++    except BaseException as cleanup:
++        try:
++            primary.add_note(
++                f"SQLite connection cleanup failed: {type(cleanup).__name__}"
++            )
++        except (AttributeError, TypeError):  # pragma: no cover - custom exception
++            pass
++
++
+ class HyMem:
+     """Public API for the Hermes host.
+ 
+@@ -229,6 +245,11 @@
+         self._conn: sqlite3.Connection | None = None
+         self._read_conn: sqlite3.Connection | None = None
+         self._initialized = False
++        # Honcho's sync endpoints share this instance across worker threads.
++        # Keep connection construction, publication, and lifecycle changes
++        # atomic. This is not a lock around callers' SQL transactions: workers
++        # doing independent writes (for example dreaming) must still fork().
++        self._connection_lock = threading.RLock()
+         # Token-overlap index for entity expansion in augment(). Built lazily
+         # on first augment, invalidated after dreaming since dreaming is the
+         # only thing that mutates the canonical set.
+@@ -238,39 +259,61 @@
+ 
+     @property
+     def conn(self) -> sqlite3.Connection:
+-        if self._conn is None:
+-            self._conn = core_db.connect(self.config.db_path)
+-        if not self._initialized:
+-            core_db.initialize(self._conn)
+-            if self.config.redact_secrets:
+-                with core_db.transaction(self._conn):
+-                    enforce_profile_redaction_policy(self._conn)
++        with self._connection_lock:
++            if self._conn is not None:
++                return self._conn
++            conn = core_db.connect(self.config.db_path)
++            try:
++                core_db.initialize(conn)
++                if self.config.redact_secrets:
++                    with core_db.transaction(conn):
++                        enforce_profile_redaction_policy(conn)
++                self._scope_phase1_reads(conn)
++            except BaseException as exc:
++                _close_failed_connection(conn, exc)
++                raise
++            # Never expose an uninitialized or unscoped connection, even when
++            # initialization fails and a later caller retries.
++            self._conn = conn
+             self._initialized = True
+-            self._scope_phase1_reads(self._conn)
+-        return self._conn
++            return conn
+ 
+     @property
+     def read_conn(self) -> sqlite3.Connection:
+-        if self._read_conn is None:
++        with self._connection_lock:
++            if self._read_conn is not None:
++                return self._read_conn
+             self.conn  # ensure the write connection is initialized first
+-            self._read_conn = core_db.connect(self.config.db_path)
+-            self._scope_phase1_reads(self._read_conn)
+-            # Load optional vec0 acceleration shadows before query_only. Durable
+-            # identity/content-validated vectors remain retrieval authority.
+-            core_db._load_vec_extension(self._read_conn)
+-            self._read_conn.execute("PRAGMA query_only = ON")
+-        return self._read_conn
++            conn = core_db.connect(self.config.db_path)
++            try:
++                self._scope_phase1_reads(conn)
++                # Load optional vec0 acceleration shadows before query_only.
++                # Durable identity/content-validated vectors remain authority.
++                core_db._load_vec_extension(conn)
++                conn.execute("PRAGMA query_only = ON")
++            except BaseException as exc:
++                _close_failed_connection(conn, exc)
++                raise
++            self._read_conn = conn
++            return conn
+ 
+     def close(self) -> None:
+-        if self._read_conn is not None:
+-            self._read_conn.close()
+-            self._read_conn = None
+-        if self._conn is not None:
+-            self._conn.close()
+-            self._conn = None
++        # Hosts must quiesce active operations before close(): the lifecycle
++        # lock protects initialization, not SQL using an already-returned handle.
++        with self._connection_lock:
++            if self._read_conn is not None:
++                self._read_conn.close()
++                self._read_conn = None
++            if self._conn is not None:
++                self._conn.close()
++                self._conn = None
+             self._initialized = False
++            self._token_overlap_index = None
+ 
+     def set_llm(self, llm: LLMClient) -> None:
++        # Like close(), changing an existing connection's SQLite functions
++        # requires the host to quiesce SQL using already-returned handles. The
++        # lifecycle lock only prevents a switch halfway through connection setup.
+         generation = phase1_generation_binding(self.config.prompt_version, llm)
+         aggregation_generation = (
+             aggregation_generation_binding_for_contract(
+@@ -278,13 +321,14 @@
+             )
+             if self._aggregation_contract is not None else None
+         )
+-        self._phase1_generation = generation
+-        self._aggregation_generation = aggregation_generation
+-        self._llm = llm
+-        if self._conn is not None:
+-            self._scope_phase1_reads(self._conn)
+-        if self._read_conn is not None:
+-            self._scope_phase1_reads(self._read_conn)
++        with self._connection_lock:
++            self._phase1_generation = generation
++            self._aggregation_generation = aggregation_generation
++            self._llm = llm
++            if self._conn is not None:
++                self._scope_phase1_reads(self._conn)
++            if self._read_conn is not None:
++                self._scope_phase1_reads(self._read_conn)
+ 
+     def _scope_phase1_reads(self, conn: sqlite3.Connection) -> None:
+         generation_key = (
+@@ -313,7 +357,8 @@
+         return str(current["generation_key"])
+ 
+     def set_embedding_client(self, embedding_client: EmbeddingClient) -> None:
+-        self._embed = embedding_client
++        with self._connection_lock:
++            self._embed = embedding_client
+ 
+     @property
+     def embedding_status(self) -> dict[str, object]:
+@@ -416,7 +461,8 @@
+         Used to run background dreaming on a separate connection so it does
+         not collide with live ingestion on the primary connection.
+         """
+-        return HyMem(self.config, llm=self._llm, embedding_client=self._embed)
++        with self._connection_lock:
++            return HyMem(self.config, llm=self._llm, embedding_client=self._embed)
+ 
+     # ---- session log -------------------------------------------------
+ 
+--- a/hymem/contrib/openai_client.py
++++ b/hymem/contrib/openai_client.py
+@@ -650,6 +650,21 @@
+             {"thinking": {"type": "disabled"}}
+             if config.send_thinking else {}
+         )
++        # Operator extension point (option-a exploratory tooling): a JSON
++        # object in HYMEM_LLM_EXTRA_BODY is merged into the provider request
++        # body, after the thinking switch. Unset => zero effect on request
++        # bytes, so canonical runs are unchanged.
++        env_extra = os.environ.get("HYMEM_LLM_EXTRA_BODY")
++        if env_extra is not None:
++            try:
++                parsed = json.loads(env_extra)
++            except (TypeError, ValueError) as exc:
++                raise RuntimeError(
++                    "HYMEM_LLM_EXTRA_BODY must be a JSON object"
++                ) from exc
++            if not isinstance(parsed, dict):
++                raise RuntimeError("HYMEM_LLM_EXTRA_BODY must be a JSON object")
++            extra_body = {**extra_body, **parsed}
+         if extra_body:
+             kwargs["extra_body"] = extra_body
+         if request.response_format == "json":
+--- a/hymem/core/db.py
++++ b/hymem/core/db.py
+@@ -11,6 +11,7 @@
+ import re
+ import sqlite3
+ import struct
++import sys
+ import threading
+ from importlib.resources import files
+ from pathlib import Path
+@@ -2538,6 +2539,7 @@
+ 
+ 
+ def connect(path: Path) -> sqlite3.Connection:
++    """Open a configured connection that may be used across request threads."""
+     from hymem.dreaming.lossless import coverage_chunk_id
+     from hymem.extraction.producer import (
+         phase1_generation_registry_row_is_valid,
+@@ -2550,7 +2552,18 @@
+     )
+ 
+     path.parent.mkdir(parents=True, exist_ok=True)
+-    conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
++    # CPython 3.12+ can reuse an in-flight cached statement across threads,
++    # corrupting even read-only results (python/cpython#118172). SQLite's own
++    # serialized mode does not protect this Python-side cache. All connections
++    # returned here may be shared; keep caching only on the unaffected 3.11
++    # runtime until an upstream fix gives us a verified safe newer boundary.
++    # Private snapshots and schema-reference connections retain their cache.
++    conn = sqlite3.connect(
++        str(path),
++        isolation_level=None,
++        check_same_thread=False,
++        cached_statements=0 if sys.version_info >= (3, 12) else 128,
++    )
+     conn.row_factory = sqlite3.Row
+     register_read_authority_functions(conn)
+     conn.create_function(
+@@ -2676,7 +2689,9 @@
+     another thread may own its transaction. A dedicated read-only connection
+     gives every multi-query health report one coherent WAL snapshot without
+     acquiring a writer lock. Read-side predicates still receive their pure
+-    timestamp and Phase-1 generation-authorization functions.
++    timestamp and Phase-1 generation-authorization functions. The caller owns
++    this private connection for the context's duration; do not share it across
++    concurrently executing threads.
+     """
+     uri = Path(path).resolve().as_uri() + "?mode=ro"
+     conn = sqlite3.connect(
+--- a/hymem/extraction/chunk.py
++++ b/hymem/extraction/chunk.py
+@@ -134,9 +134,10 @@
+ # A terminal primary-empty result is never authoritative until that exact
+ # source unit has received one direct empty-verification call.  Keeping this
+ # identity separate from prompt wording lets benchmark artifacts reject the
+-# former cue-split policy, which suppressed verification on child leaves.
++# former cue-split policy, which suppressed verification on child leaves, and
++# the cue/length veto on otherwise complete bounded whole-unit empty pairs.
+ CLEAN_EMPTY_RECOVERY_POLICY_VERSION = (
+-    "hymem-terminal-clean-empty-verification-v2"
++    "hymem-terminal-clean-empty-verification-v3"
+ )
+ _NEAR_BALANCED_BOUNDARY_CHARS = 512
+ _MAX_TRIPLES_PER_RESPONSE = 24
+@@ -2364,20 +2365,6 @@
+     return False
+ 
+ 
+-def _unit_semantic_content_chars(unit: _ExtractionUnit) -> int:
+-    """Underlying content length, excluding source-record JSON metadata."""
+-
+-    if unit.source_records is None:
+-        return len(unit.text)
+-    total = 0
+-    for record in unit.source_records:
+-        payload = _source_payload(record)
+-        if payload is None:  # validated at the public boundary
+-            return len(unit.text)
+-        total += len(payload["content"])
+-    return total
+-
+-
+ def _consistent_unique_triples(
+     items: list[dict],
+     allowed_source_message_ids: frozenset[int] | None = None,
+@@ -2844,7 +2831,6 @@
+         result, _raw = attempt(current)
+         if not result.failed:
+             if not result.triples and not result.markers:
+-                unresolved_cue_detail: str | None = None
+                 if _unit_has_explicit_cue(current):
+                     split = (
+                         _split_unit(current)
+@@ -2861,30 +2847,18 @@
+                             return _failed_split_after_left(left)
+                         right = recover(split[1], depth + 1)
+                         return _merge_results(left, right)
+-                    if (
+-                        _unit_semantic_content_chars(current)
+-                        >= 2 * _MIN_FRAGMENT_CONTENT_CHARS
+-                    ):
+-                        unresolved_cue_detail = (
+-                            "split:max_depth_reached"
+-                            if depth >= _MAX_SPLIT_DEPTH
+-                            else "split:no_admissible_semantic_boundary"
+-                        )
+                 # This is a direct, one-shot call rather than a recursive
+                 # ``recover`` invocation.  Its output can receive the standard
+                 # omission pass when non-empty, but can never trigger an
+-                # EMPTY-of-EMPTY loop.  Even an unsplittable suspicious unit
+-                # gets this genuine second look before being held fail-closed.
++                # EMPTY-of-EMPTY loop. This exact whole unit already fits the
++                # hard input ceiling. If safe subdivision is unavailable, a
++                # cue match cannot turn two complete empty responses into an
++                # invented resource failure. Actual response/budget failures
++                # remain failures, including the terminal-retry path below.
+                 result, _verified_raw = attempt(current, verification="empty")
+                 if result.failed:
+-                    if unresolved_cue_detail is not None:
+-                        result.failure_details = _bounded_details(
+-                            result.failure_details, [unresolved_cue_detail]
+-                        )
+                     return result
+                 if not result.triples and not result.markers:
+-                    if unresolved_cue_detail is not None:
+-                        return _failure("resource_limit", unresolved_cue_detail)
+                     return result
+             if result.triples or result.markers:
+                 # A non-empty complete=true response is not, by itself, a
+--- a/hymem/extraction/producer.py
++++ b/hymem/extraction/producer.py
+@@ -122,7 +122,13 @@
+         return self.declaration
+ 
+ 
+-_unknown_lock = threading.Lock()
++# Guard inspection/registry allocation can synchronously collect a different
++# client or proxy. Its weakref cleanup re-enters this same registry lock on the
++# collecting thread; a plain Lock would deadlock real provider dispatch. Keep
++# cross-thread exclusion, but permit that same-thread cleanup. Registry reads
++# retain their entry locally and cleanup checks the exact weakref before
++# deletion; no operation iterates a live registry while callbacks can mutate it.
++_unknown_lock = threading.RLock()
+ # Weak-referenceable clients do not stay alive merely because identity was
+ # requested.  A bounded strong fallback is unavoidable for classes that opt
+ # out of weak references; eviction only makes their old cache fail closed.

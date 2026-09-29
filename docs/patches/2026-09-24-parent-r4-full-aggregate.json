@@ -1,0 +1,34 @@
+{
+  "benchmark_readiness_claimed": false,
+  "full_suite_passed": true,
+  "manifest_sha256": "16cf214451f90ee9c7d2a73151a0b26c5bd9fe04404cc40b7370f03777c916d0",
+  "provider_calls": 0,
+  "schema": "parent-r4-full-suite-aggregate-v1",
+  "shards": [
+    {
+      "elapsed_seconds": 1568.55,
+      "junit_sha256": "f3ff4d3de610cc3caa9917d5cbf3fb80ef4d2e76176fd3ad19c40e3c30b5375e",
+      "receipt": "2026-09-24-parent-r4-full-1.json",
+      "receipt_sha256": "e13e7e94c43ff174e848fb143ba3f31df4be81b8bb07e2d5fbbc0ea0ede910b5"
+    },
+    {
+      "elapsed_seconds": 1785.753,
+      "junit_sha256": "040580284769e631e7bcf5a7dc7f1e79ee61c1fafe40ddadfa0195834f7b8e7c",
+      "receipt": "2026-09-24-parent-r4-full-2.json",
+      "receipt_sha256": "b4ae7c4d30c2ed92cd935fb42f098fe4b38ce402edb39d030c8572d73cfa02b2"
+    },
+    {
+      "elapsed_seconds": 1748.456,
+      "junit_sha256": "a7ec52e909ad474530efa5bd54c6b4acbc31a7042e17db1c927548fb9659f802",
+      "receipt": "2026-09-24-parent-r4-full-3.json",
+      "receipt_sha256": "32f4e911e78922c158619e5d0dc3c2d6f1ddfa28b7dc1c1dd0299339237b583f"
+    }
+  ],
+  "source_files_verified_after": 462,
+  "totals": {
+    "errors": 0,
+    "failures": 0,
+    "skipped": 0,
+    "tests": 7087
+  }
+}

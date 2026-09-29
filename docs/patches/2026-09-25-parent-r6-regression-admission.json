@@ -1,0 +1,23 @@
+{
+  "all_three_fixes_parent_accepted": true,
+  "full_offline_gate_passed": true,
+  "production_changes": false,
+  "receipts": {
+    "gates/2026-09-25-parent-r6-final-full-1.json": "602a75aceefd56bc5d48e3771208483fecc3a84688e18ec55dfb34b2efffba82",
+    "gates/2026-09-25-parent-r6-final-full-2.json": "c6f2c5a1de6cac8112edcae7a2c42687034aa8836cfeb6658329a53a5e44806f",
+    "gates/2026-09-25-parent-r6-final-full-3.json": "1d67a465fc0324a59305a76eb09e275fcd4c4a62217afe953c16e4e3a27760ba",
+    "gates/2026-09-25-parent-r6-final-full-4.json": "9542d28e133138e89d2d316c599691169e99c158c6da62a69b1539fba76631e5",
+    "gates/2026-09-25-parent-r6-final-full-acceptance.json": "d3333d57674f492cb297e902061fa042daeecc0d308191e15e13e000ace4bc57",
+    "gates/2026-09-25-parent-r6-final-regression-preflight.json": "3f1dd9c1e14361861cc861bcb644d6714f2bea1ae60487cb5e856a17ac92ef1f",
+    "gates/2026-09-25-parent-r6-fix1-audit.json": "6214739a8ee5e9c7f6d3d83cffe84210c91cc7b416f29b476af1d8348d1911d3",
+    "gates/2026-09-25-parent-r6-fix2-live.json": "865452a30278d34a40773c138983db69ed758073228f21bb5c5fd73ae3184986",
+    "gates/2026-09-25-parent-r6-fix3-live-v3.json": "b3c828a075aff6dfbfe9fa676dcd036129265e1e92bc16400664e2eb4dd1f351",
+    "gates/2026-09-25-parent-r6-fix3-semantic-review-v3.json": "0c63305437084918a935cc66eb5011bc8f953454bee7ec0148ed74076519e5e0",
+    "gates/2026-09-25-parent-r6-fix4-negative-control.json": "bead2396e4bc40bd3abf25cfad61a886b75765e4cbd3b53faea4763f4b19304c",
+    "gates/2026-09-25-parent-r6-numeric-table-properties.json": "c89d1fa3496edb9993e031cf4075d384c07e198c272d3222785a1b710f14e8be",
+    "gates/2026-09-25-parent-r6-patch-reconstruction.json": "36f6dfc7d773410bc53bb54f46658f28ac6cb410b4d5122f08621c6c1d504478"
+  },
+  "schema": "r6-parent-regression-admission-v1",
+  "semantic_controls_parent_accepted": true,
+  "source_manifest_sha256": "bd8d0f3a8fb40bd6b77e7ca6579c8e5e8ee78733bea2bb22df71bc4b2c12eaa2"
+}

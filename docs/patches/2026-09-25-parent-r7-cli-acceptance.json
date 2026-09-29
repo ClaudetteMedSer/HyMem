@@ -1,0 +1,17 @@
+{
+  "schema": "r7-parent-cli-preservation-v1",
+  "accepted": true,
+  "passed": 34,
+  "failed": 0,
+  "errors": 0,
+  "skipped": 0,
+  "elapsed_seconds": 15.95,
+  "junit": "docs/patches/2026-09-25-parent-r7-cli.xml",
+  "parent_red": "R6 msc_registry.py --help under python -E -s -S -B from unrelated cwd exits 1: ModuleNotFoundError hymem",
+  "parent_green": "Release msc_registry.py --help with same clean interpreter exits 0",
+  "application_delta": "Only checkout-root import bootstraps in strictness.py and msc_registry.py, plus sys import in msc_registry.py",
+  "historical_model_admission_changed_in_this_unit": false,
+  "provider_calls": 0,
+  "production_changes": false,
+  "main_application_changes": false
+}

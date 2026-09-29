@@ -1,0 +1,8 @@
+{
+  "archive_sha256": "082216f9de901bb634f3d7b206759d4df23eb3041abeeb9bb59c708f8459733c",
+  "bundle_files": 8,
+  "manifest_sha256": "fa471c38440dd70e8527b75171b1af8fc9b48ee98081df9738b45093f41efffc",
+  "production_changes": false,
+  "provider_calls": 0,
+  "status": "installed_not_started"
+}

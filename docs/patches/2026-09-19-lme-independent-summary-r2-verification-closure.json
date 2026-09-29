@@ -1,0 +1,88 @@
+{
+  "api_calls": 0,
+  "auxiliary_correction_manifest": "2026-09-19-lme-independent-summary-auxiliary-readme-manifest.json",
+  "auxiliary_correction_manifest_sha256": "e894c893abf139b8e90343d103780fb07424777df7175708a7a823525f9f2cc5",
+  "benchmark_readiness_claimed": false,
+  "corrected_assertions": {
+    "assertions_modified": false,
+    "combined_receipt": "/private/tmp/hymem-summary-index-decoupling-20260919.zeYFpg/receipts/live-v2-launcher-and-aux-default.xml",
+    "combined_receipt_auxiliary_tests": 4,
+    "combined_receipt_sha256": "0c5cf1aaeb5774a95cd172593c8ee5215e0fe79ef64729ad16e02d43069accad",
+    "combined_receipt_total_tests": 62,
+    "failures": 0,
+    "helper_test_sha256": "d3f617c313ce5ba2c6db7515b25a104c649769f284baafcf84911d9e49701cc3",
+    "method": "Executed the three original functions without changing their assertions, using a temporary combined copy of the corrected README and original R2 server/bootstrap/reference bytes; executable imports came from R2. A fourth test checked unchanged original README bytes.",
+    "nodeids": [
+      "tests/test_public_default_contract.py::test_readme_defaults_follow_code",
+      "tests/test_public_default_contract.py::test_unset_env_defers_to_dataclass_and_server_help_matches",
+      "tests/test_public_default_contract.py::test_current_operator_surfaces_only_name_retired_aliases_as_rejected"
+    ],
+    "passed": 3,
+    "separate_original_readme_immutability_check_passed": true
+  },
+  "deployment_performed": false,
+  "deployment_requirement": "Integrate and verify the currently approved model policy and explicit request settings before deployment; this documentation correction does not change application defaults or make the older default a recommended live route.",
+  "fresh_full_suite_6965_pass_claimed": false,
+  "full_suite_r3_executed": false,
+  "live_success_claimed": false,
+  "original_full_suite": {
+    "collected": 6965,
+    "errors": 0,
+    "exact_nodeid_union_verified": true,
+    "failed_nodeids": [
+      "tests/test_public_default_contract.py::test_readme_defaults_follow_code"
+    ],
+    "failures": 1,
+    "passed": 6964,
+    "shards": [
+      {
+        "errors": 0,
+        "failures": 1,
+        "metadata_receipt": "/private/tmp/hymem-summary-index-decoupling-20260919.zeYFpg/receipts/full-r2-shard-1.metadata.json",
+        "metadata_sha256": "5b96955db7cb60e4fde4522fed3f44e5cacf55851449c0234f6708558afe065a",
+        "passed": 2253,
+        "receipt": "/private/tmp/hymem-summary-index-decoupling-20260919.zeYFpg/receipts/full-r2-shard-1.xml",
+        "receipt_sha256": "986a35871a94b7a23923a0e4a7c74563d6187d13f105cd6773b0b7438c972301",
+        "selection_sha256": "9d3866c1bdea00456e04d32f63a1249cda561d53b2247c4ef913d9e2c4e96795",
+        "skipped": 0,
+        "tests": 2254,
+        "tree_verified_before_and_after": true
+      },
+      {
+        "errors": 0,
+        "failures": 0,
+        "metadata_receipt": "/private/tmp/hymem-summary-index-decoupling-20260919.zeYFpg/receipts/full-r2-shard-2.metadata.json",
+        "metadata_sha256": "ddc7931296670dffea1731dd3293de78e4ac380d920f798c054f5dcf35a8c780",
+        "passed": 2341,
+        "receipt": "/private/tmp/hymem-summary-index-decoupling-20260919.zeYFpg/receipts/full-r2-shard-2.xml",
+        "receipt_sha256": "5ccec4c785e13534cd0193403f74a42c0c509abb53c4f4ed85487c445cc02ecc",
+        "selection_sha256": "3722acf51580dbcec437490d99803c42127f0abc0dde1efe3b413f49e4fe9477",
+        "skipped": 0,
+        "tests": 2341,
+        "tree_verified_before_and_after": true
+      },
+      {
+        "errors": 0,
+        "failures": 0,
+        "metadata_receipt": "/private/tmp/hymem-summary-index-decoupling-20260919.zeYFpg/receipts/full-r2-shard-3.metadata.json",
+        "metadata_sha256": "eb956c11a25a98d788ee75805430e6420ee36e7bca9c4debb60003c7de9c58b3",
+        "passed": 2370,
+        "receipt": "/private/tmp/hymem-summary-index-decoupling-20260919.zeYFpg/receipts/full-r2-shard-3.xml",
+        "receipt_sha256": "13d7386f8c066597bcd0ea8bf6ddabe57c913ad867d793b591eec2eb8f6cf5b7",
+        "selection_sha256": "f4caf04ce8bfd3d37baea2481e610ddd83101001ef48745ceca221837f6e459b",
+        "skipped": 0,
+        "tests": 2370,
+        "tree_verified_before_and_after": true
+      }
+    ],
+    "skipped": 0
+  },
+  "original_r2_manifest_sha256": "df94fc65708e43703faba0f3dc60dd4ec4b56de956a2b501b03f7b9ff35df885",
+  "schema": "independent-summary-r2-split-verification-closure-v1",
+  "scope": "Separate evidence: the original R2 full suite passed 6964/6965 with one documentation-default mismatch; three unchanged default assertions pass using a corrected test-only README. This is not a fresh all-green full-suite run. Target-runtime gates and subsequent application corrections are separate evidence.",
+  "source_and_test_bytes_unchanged_by_correction": true,
+  "source_files": 230,
+  "status": "original_full_suite_one_auxiliary_mismatch_then_corrected_assertions_passed",
+  "target_runtime_full_pass_claimed": false,
+  "test_files": 220
+}

@@ -1,0 +1,61 @@
+{
+  "schema": "r6-parent-regression-target-chunk-progress-v1",
+  "package_manifest_sha256": "3e227d959ec6e5d55f65d2343787dbe66cfb5ac63de0d033d04fd0641969e484",
+  "progress_only": true,
+  "benchmark_pass_claimed": false,
+  "first_failure_observation": {
+    "files": {
+      "benchmark/checkpoint.json": {
+        "age_seconds": 1009.2,
+        "bytes": 25107
+      },
+      "invocation/stderr.bin": {
+        "age_seconds": 2.9,
+        "bytes": 4287
+      },
+      "invocation/stdout.bin": {
+        "age_seconds": 1007.1,
+        "bytes": 803
+      }
+    },
+    "instrumentation_error_count": 0,
+    "new_provider_calls": 0,
+    "progress_only": true,
+    "questions": {},
+    "stores": [
+      {
+        "chunk_attempt_rows_at_least_3": 0,
+        "chunk_extraction_attempts": 1,
+        "chunks": 797,
+        "completed_dreams": 1,
+        "dream_runs": 2,
+        "episodes": 213,
+        "episodes_matching_published_generation": 189,
+        "knowledge_graph": 181,
+        "messages": 532,
+        "processed_chunks": 99,
+        "sessions": 52,
+        "sessions_digest_quarantined": 0,
+        "sessions_facts_quarantined": 0,
+        "sessions_profile_quarantined": 0,
+        "sessions_with_published_item_frontier": 47,
+        "sessions_with_summary_failure_marker": 8
+      }
+    ]
+  },
+  "subsequent_failure_census": {
+    "new_provider_calls": 0,
+    "observations": [
+      {
+        "failures": [],
+        "original_failing_chunk_exists": true,
+        "original_failing_chunk_processed": true
+      }
+    ],
+    "read_only": true
+  },
+  "transient_failure_reason": "not captured before the attempt ledger cleared; no cause inferred",
+  "original_retained_failure": "resource_limit/split:no_admissible_semantic_boundary",
+  "original_target_now_processed": true,
+  "production_changes": false
+}

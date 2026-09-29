@@ -1,0 +1,126 @@
+{
+  "configuration_verified": true,
+  "container_id": "d3350e647cd7a257b09b1b59772951a1925dd6ecc70d71d5b3872704fbe099dc",
+  "credential_mount": false,
+  "exit_code": 0,
+  "manifest_sha256": "b926b016c93316c6c62e24d500e2edbd1e9234b52cb54c57d523466855a41169",
+  "mode": "offline",
+  "network": "none",
+  "offline.json": {
+    "benchmark_rerun": false,
+    "cleanup_errors": [],
+    "client_closed": true,
+    "clients_closed": true,
+    "connections_closed": true,
+    "control_bounds": {
+      "max_attempts": 3,
+      "max_calls": 24,
+      "max_chars": 8000,
+      "max_tokens": 3072,
+      "timeout_seconds": 600
+    },
+    "control_fixture_sha256": "7b61d014a6dea56c1307f1ebb3f736d23cb0e89aec7aa3a19876e3681fda5939",
+    "control_targets": 4,
+    "controls": {
+      "client_closed": true,
+      "clone_after_sha256": "c5ae4afa8103ec3bfcc8821740250031bd81ee7088f8ccfe8604630b307cbfb6",
+      "clone_before_sha256": "c5ae4afa8103ec3bfcc8821740250031bd81ee7088f8ccfe8604630b307cbfb6",
+      "health_before": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 4,
+        "summary_healthy": false,
+        "summary_missing_sessions": 4
+      },
+      "stock_invocations": 0,
+      "usage": {
+        "calls": 0,
+        "calls_available": true,
+        "completion_tokens": null,
+        "cost_available": false,
+        "cost_usd": null,
+        "latency_available": true,
+        "latency_s": 0,
+        "prompt_tokens": null,
+        "request_attempts": 0,
+        "request_attempts_available": true,
+        "successful_responses": 0,
+        "successful_responses_available": true,
+        "token_usage_available": false,
+        "total_tokens": null
+      }
+    },
+    "endpoint": "https://api.deepseek.com",
+    "http_attempts": 0,
+    "manifest_sha256": "b926b016c93316c6c62e24d500e2edbd1e9234b52cb54c57d523466855a41169",
+    "mode": "offline",
+    "model": "deepseek-flash",
+    "producer_identity_sha256": "sha256:b7dcd2a8a3a5107c9b0d868ecd2f3c96ab7d9f02392e20c9b967c44805673cb5",
+    "production_changes": false,
+    "provider_calls": 0,
+    "reference_before_sha256": "3fe0bbc3d0393bbd1522b793008b659f2f9a34d19a2ad33034a12b1336c4973f",
+    "reference_file_sha256": {
+      "hymem.sqlite": "66e83d2a96d2c3f9291b2b90b71d4b3005c8920933e4dbcb16898dab93af6281",
+      "hymem.sqlite-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+      "hymem.sqlite-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "reference_unchanged": true,
+    "retained": {
+      "client_closed": true,
+      "clone_after_sha256": "3fe0bbc3d0393bbd1522b793008b659f2f9a34d19a2ad33034a12b1336c4973f",
+      "clone_before_sha256": "3fe0bbc3d0393bbd1522b793008b659f2f9a34d19a2ad33034a12b1336c4973f",
+      "health_before": {
+        "malformed_summaries": 0,
+        "summary_degraded_sessions": 10,
+        "summary_healthy": false,
+        "summary_missing_sessions": 10
+      },
+      "stock_invocations": 0,
+      "usage": {
+        "calls": 0,
+        "calls_available": true,
+        "completion_tokens": null,
+        "cost_available": false,
+        "cost_usd": null,
+        "latency_available": true,
+        "latency_s": 0,
+        "prompt_tokens": null,
+        "request_attempts": 0,
+        "request_attempts_available": true,
+        "successful_responses": 0,
+        "successful_responses_available": true,
+        "token_usage_available": false,
+        "total_tokens": null
+      }
+    },
+    "retained_bounds": {
+      "max_attempts": 3,
+      "max_calls": 100,
+      "max_chars": 8000,
+      "max_tokens": 3072,
+      "timeout_seconds": 1800
+    },
+    "retained_targets": 10,
+    "schema": "r6-fix3-summary-recovery-replay-v1",
+    "semantic_quality_guaranteed": false,
+    "semantic_review_required": true,
+    "source_inventory_sha256": "842e856a78809f24c6b38ed566e72d09c1d91d37d5f79acdd75ec21916d9c586",
+    "source_unchanged": true,
+    "status": "offline_passed",
+    "threads_clean": true,
+    "total_bounds": {
+      "completion_calls": 124,
+      "http_attempts": 372,
+      "stock_timeout_seconds": 2400,
+      "supervision_seconds": 2460
+    },
+    "total_usage": {
+      "completion_calls": 0,
+      "completion_calls_exact": true,
+      "http_attempts": 0,
+      "http_attempts_exact": true
+    }
+  },
+  "oom_killed": false,
+  "pid": 0,
+  "status": "exited"
+}

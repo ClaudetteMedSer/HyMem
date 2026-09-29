@@ -1,0 +1,1 @@
+{"allow_insecure_internal_http":true,"base_url":"http://embedding-server:8766/v1","deployment_revision":"embedding-server-0.2.0/fastembed-0.8.0/onnxruntime-1.28.0","deployment_tenant":"afrodite-hermes-net","dim":384,"model":"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2","timeout":10.0}
