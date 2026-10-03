@@ -250,6 +250,9 @@ class ChunkResult:
     # coalesced, but the count lets strict callers reject a provider that did
     # not follow an exact-output probe contract.
     duplicate_triples_collapsed: int = 0
+    # Diagnostic-only codes for claims withheld by the source-grounding gate.
+    # These contain no model text, source text, or source identifiers.
+    diagnostic_grounding_rejections: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2876,6 +2879,7 @@ def extract_chunk(
     *,
     source_records: tuple[tuple[int, str], ...] | None = None,
     completion_call_limit: int | None = None,
+    diagnostic_grounding_recovery: bool = False,
 ) -> ChunkResult:
     """Extract a complete chunk through bounded source-safe subdivision."""
     if completion_call_limit is None:
@@ -2890,10 +2894,13 @@ def extract_chunk(
             "completion_call_limit must be an integer between 1 and "
             f"{MAX_EXTRACTION_COMPLETION_CALLS_PER_CHUNK}"
         )
+    if type(diagnostic_grounding_recovery) is not bool:
+        raise TypeError("diagnostic_grounding_recovery must be bool")
     system = build_chunk_extraction_system()
     empty_verification_system = build_chunk_empty_verification_system()
     omission_verification_system = build_chunk_omission_verification_system()
     budget = _CallBudget()
+    diagnostic_rejections: list[str] = []
     initial_prepartition_leaves = 0
 
     def finish(result: ChunkResult) -> ChunkResult:
@@ -2907,6 +2914,9 @@ def extract_chunk(
             result.markers = []
             result.entity_type_hints = {}
             result.entity_property_hints = {}
+            result.diagnostic_grounding_rejections = ()
+        else:
+            result.diagnostic_grounding_rejections = tuple(diagnostic_rejections)
         result.initial_prepartition_leaves = initial_prepartition_leaves
         return result
 
@@ -3243,10 +3253,20 @@ def extract_chunk(
         merged = _merge_verified_result(accepted, verified)
         if not merged.failed and merged.triples:
             try:
-                merged.triples = ground_triples(
+                grounded = ground_triples(
                     merged.triples, current.source_records,
                     current.context_records, current.text, grounding_call,
+                    diagnostic_grounding_recovery=diagnostic_grounding_recovery,
+                    rejection_sink=diagnostic_rejections.append,
                 )
+                if grounded != merged.triples:
+                    # Optional type/property hints were derived from the raw
+                    # candidate items before grounding. Once even one claim is
+                    # rejected, their provenance cannot be recovered from
+                    # Triple objects, so none may escape with this leaf.
+                    merged.entity_type_hints = {}
+                    merged.entity_property_hints = {}
+                merged.triples = grounded
             except GroundingGateError as exc:
                 reason = ("resource_limit" if exc.code == "calls:max_exceeded"
                           else "call_failure" if exc.code == "provider:call_failed"

@@ -1473,6 +1473,65 @@ def producer_binding_from_typed_declaration(
     )
 
 
+def validate_phase1_grounding_policy(
+    client: object,
+    *,
+    diagnostic_grounding_recovery: bool,
+    expected_producer: Mapping[str, Any],
+) -> None:
+    """Bind the optional diagnostic extraction policy to producer identity.
+
+    The producer binding stores a digest of effective_request, not its fields.
+    Re-read and validate the typed declaration against that binding before a
+    caller may choose the recovery policy. A client that declares diagnostic
+    recovery can never run the strict policy under the same generation key.
+    """
+    if type(diagnostic_grounding_recovery) is not bool:
+        raise TypeError("diagnostic_grounding_recovery must be bool")
+    source = _phase1_proxy_source(client)
+    if source is not None:
+        return validate_phase1_grounding_policy(
+            source,
+            diagnostic_grounding_recovery=diagnostic_grounding_recovery,
+            expected_producer=expected_producer,
+        )
+    try:
+        inspect.getattr_static(client, "phase1_producer_declaration")
+    except AttributeError:
+        if diagnostic_grounding_recovery:
+            raise ValueError(
+                "diagnostic recovery requires an exact declared Phase-1 producer"
+            )
+        return
+    factory = getattr(client, "phase1_producer_declaration")
+    try:
+        declaration = factory()
+    except NotImplementedError:
+        declaration = None
+    if declaration is None:
+        if diagnostic_grounding_recovery:
+            raise ValueError(
+                "diagnostic recovery requires an exact declared Phase-1 producer"
+            )
+        return
+    if not isinstance(declaration, Phase1ProducerDeclaration):
+        raise ValueError(
+            "phase1_producer_declaration must return Phase1ProducerDeclaration"
+        )
+    actual = producer_binding_from_typed_declaration(
+        declaration, declaration_hook="phase1_producer_declaration"
+    )
+    if actual != expected_producer:
+        raise ValueError("Phase-1 producer declaration changed before dreaming")
+    mode = declaration.effective_request.get("diagnostic_grounding_recovery")
+    if mode is not None and type(mode) is not bool:
+        raise ValueError("diagnostic grounding declaration must be bool")
+    if (mode is True) != diagnostic_grounding_recovery:
+        raise ValueError(
+            "diagnostic grounding policy disagrees with producer identity"
+        )
+
+
 def authorize_inexact_producer_generation(
     client: object, generation_key: str,
 ) -> None:

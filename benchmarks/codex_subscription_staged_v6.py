@@ -36,7 +36,7 @@ _PINS = {
         "4862e4aedba5be756ea877d65a91b515a142b2fb46e2efb6f91c800e5096b3c9"),
     "hymem.extraction.grounding_staged_gate_v1": (
         "hymem/extraction/grounding_staged_gate_v1.py",
-        "e843a3112a2ed0e7900f97b19a944d0a74fa458682c88a9504379c08c07deaa8"),
+        "3c396522eda7bfd39efaf4160eec851dc42337b40e23cf6892b95446fb54acb3"),
 }
 _IDENTITIES = {
     "hymem.extraction.grounding_v2": "sha256:b1f1d191579166b6ed118a116aee353c8cbfe00cc528bf6694e87744b6814927",
@@ -44,7 +44,7 @@ _IDENTITIES = {
     "hymem.extraction.grounding_gate": "sha256:836bc87e80068e2b6a9ce129b96d21d438472824a1bb2e73d773d415f3a6107c",
     "hymem.extraction.grounding_classification_v4": "sha256:ac7307f810d480d3c3037cfe1847b270a5ed1d0af9d83b4adf15340c3ff40fda",
     "hymem.extraction.grounding_staged_v1": "sha256:1d31e61b120ac871826a251c20e473eb36350fafb5c555c3ca47f4031c38153c",
-    "hymem.extraction.grounding_staged_gate_v1": "sha256:5253f0994f42d510d07413bd868c7ddd00b6e72e773aad1c78120e0b65288a0d",
+    "hymem.extraction.grounding_staged_gate_v1": "sha256:3bf8708b29e3bc6967970885bf27e1398da314103b2a71dd77ef8dcf6d79c459",
 }
 
 

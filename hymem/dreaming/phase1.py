@@ -30,6 +30,7 @@ from hymem.extraction.producer import (
     phase1_generation_binding,
     register_phase1_generation,
     validate_current_phase1_generation_binding,
+    validate_phase1_grounding_policy,
 )
 from hymem.extraction.markers import Marker
 from hymem.extraction.triples import Triple
@@ -98,6 +99,7 @@ class ChunkExtraction:
     claim_sources: dict[int, CoveredMessage] = field(default_factory=dict)
     source_validated: bool = False
     phase1_generation: dict[str, object] | None = None
+    diagnostic_grounding_rejections: tuple[str, ...] = ()
 
 
 def _local_replay_proof(
@@ -675,6 +677,7 @@ def extract_chunk_results(
     *,
     prompt_version: str,
     phase1_generation: Mapping[str, object] | None = None,
+    diagnostic_grounding_recovery: bool = False,
 ) -> ChunkExtraction | None:
     """Run phase-1 LLM extraction for a chunk. Returns None if already processed
     under the same prompt and producer generation. No write transaction is
@@ -695,6 +698,11 @@ def extract_chunk_results(
         raise ValueError(
             "supplied Phase-1 generation does not match the effective client"
         )
+    validate_phase1_grounding_policy(
+        llm,
+        diagnostic_grounding_recovery=diagnostic_grounding_recovery,
+        expected_producer=generation["producer"],
+    )
     generation_key = str(generation["generation_key"])
     already = conn.execute(
         "SELECT 1 FROM current_phase1_publications publication "
@@ -738,7 +746,10 @@ def extract_chunk_results(
     source_records = tuple(
         (source.message_id, _claim_source_record(source)) for source in sources
     )
-    result = extract_chunk(llm, chunk.text, source_records=source_records)
+    result = extract_chunk(
+        llm, chunk.text, source_records=source_records,
+        diagnostic_grounding_recovery=diagnostic_grounding_recovery,
+    )
     if phase1_generation_binding(prompt_version, llm) != generation:
         raise Phase1ProducerDriftError(
             "Phase-1 producer identity changed during extraction"
@@ -788,6 +799,7 @@ def extract_chunk_results(
         claim_sources={source.message_id: source for source in sources},
         source_validated=True,
         phase1_generation=generation,
+        diagnostic_grounding_rejections=result.diagnostic_grounding_rejections,
     )
 
 

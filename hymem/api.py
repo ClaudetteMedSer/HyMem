@@ -1033,12 +1033,20 @@ class HyMem:
         *,
         session_ids: Iterable[str] | None = None,
         deadline: MonotonicDeadline | None = None,
+        diagnostic_grounding_recovery: bool = False,
+        diagnostic_rejection_sink: Callable[[tuple[str, ...]], None] | None = None,
     ) -> DreamReport:
         if self._llm is None:
             raise RuntimeError(
                 "HyMem.dream requires an LLMClient. Pass one to the constructor "
                 "or call set_llm() before dreaming."
             )
+        if type(diagnostic_grounding_recovery) is not bool:
+            raise TypeError("diagnostic_grounding_recovery must be bool")
+        if diagnostic_rejection_sink is not None and not callable(diagnostic_rejection_sink):
+            raise TypeError("diagnostic_rejection_sink must be callable")
+        if diagnostic_rejection_sink is not None and not diagnostic_grounding_recovery:
+            raise ValueError("diagnostic_rejection_sink requires diagnostic recovery")
         # Permit intentional in-place configuration changes only by treating
         # them as an explicit producer switch. The runner independently fences
         # against further drift during a provider request.
@@ -1058,6 +1066,8 @@ class HyMem:
                 session_ids=ids,
                 embedding_client=self._embed,
                 deadline=deadline,
+                diagnostic_grounding_recovery=diagnostic_grounding_recovery,
+                diagnostic_rejection_sink=diagnostic_rejection_sink,
             )
         except DreamLeaseLost:
             # Earlier fenced units from this cycle, or the successor process,

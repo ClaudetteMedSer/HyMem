@@ -153,6 +153,7 @@ from hymem.extraction.producer import (
     _register_phase1_producer_proxy,
     phase1_generation_binding,
     validate_current_phase1_generation_binding,
+    validate_phase1_grounding_policy,
 )
 from hymem.extraction.chunk import (
     SHIPPED_MAX_EXTRACTION_PROVIDER_ATTEMPTS_PER_CHUNK,
@@ -688,6 +689,8 @@ def run_dreaming(
     session_ids: list[str] | None = None,
     embedding_client: EmbeddingClient | None = None,
     deadline: MonotonicDeadline | None = None,
+    diagnostic_grounding_recovery: bool = False,
+    diagnostic_rejection_sink: Callable[[tuple[str, ...]], None] | None = None,
 ) -> DreamReport:
     """Run one dream with an optional caller-owned absolute deadline.
 
@@ -697,6 +700,10 @@ def run_dreaming(
     and ensure a provider result returned after expiry is never published.
     """
 
+    if diagnostic_rejection_sink is not None and not callable(diagnostic_rejection_sink):
+        raise TypeError("diagnostic_rejection_sink must be callable")
+    if diagnostic_rejection_sink is not None and not diagnostic_grounding_recovery:
+        raise ValueError("diagnostic_rejection_sink requires diagnostic recovery")
     # Resolve producer identity before transparent deadline/heartbeat/counting
     # wrappers are installed.  Those wrappers change execution control, not the
     # effective provider request, and an unknown wrapper must never invent a
@@ -705,6 +712,11 @@ def run_dreaming(
     phase1_identity_client = llm
     embedding_identity_client = embedding_client
     phase1_generation = phase1_generation_binding(cfg.prompt_version, llm)
+    validate_phase1_grounding_policy(
+        llm,
+        diagnostic_grounding_recovery=diagnostic_grounding_recovery,
+        expected_producer=phase1_generation["producer"],
+    )
     aggregation_generation = (
         aggregation_generation_binding(cfg, llm)
         if cfg.aggregation_nodes_enabled else None
@@ -735,6 +747,8 @@ def run_dreaming(
                 phase1_generation=phase1_generation,
                 phase1_identity_client=phase1_identity_client,
                 aggregation_generation=aggregation_generation,
+                diagnostic_grounding_recovery=diagnostic_grounding_recovery,
+                diagnostic_rejection_sink=diagnostic_rejection_sink,
             )
     except core_db.LeaseOwnershipLost as exc:
         # Keep the BaseException-style sentinel strictly internal: ordinary
@@ -754,6 +768,8 @@ def _run_dreaming(
     phase1_generation: dict[str, object],
     phase1_identity_client: LLMClient,
     aggregation_generation: dict[str, object] | None,
+    diagnostic_grounding_recovery: bool = False,
+    diagnostic_rejection_sink: Callable[[tuple[str, ...]], None] | None = None,
 ) -> DreamReport:
     """Run all three dreaming phases. Holds an advisory lock so concurrent runs
     bail out instead of double-processing.
@@ -1159,6 +1175,7 @@ def _run_dreaming(
                     counting_llm,
                     prompt_version=cfg.prompt_version,
                     phase1_generation=phase1_generation,
+                    diagnostic_grounding_recovery=diagnostic_grounding_recovery,
                 )
             except phase1.Phase1ProducerDriftError:
                 raise
@@ -1261,6 +1278,11 @@ def _run_dreaming(
             if staged_in_cycle_edges is not None:
                 in_cycle_edges[:] = staged_in_cycle_edges
             if not extraction.failed:
+                if (
+                    diagnostic_rejection_sink is not None
+                    and extraction.diagnostic_grounding_rejections
+                ):
+                    diagnostic_rejection_sink(extraction.diagnostic_grounding_rejections)
                 report.chunks_processed += 1
                 report.triples_extracted += len(extraction.triples)
                 report.markers_extracted += len(extraction.markers)

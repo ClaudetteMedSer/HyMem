@@ -10,13 +10,14 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 from collections import Counter
 from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 
 
-MODE = "semantic_diagnostic_v1"
+MODE = "semantic_diagnostic_v2"
 _SEMANTIC_REASONS = frozenset({
     "contract_failure", "incomplete_response", "item_validation_failure",
     "output_limit_exceeded", "parse_failure", "response_conflict",
@@ -349,16 +350,35 @@ def make_diagnostic_adapter_class(
     """Compose with a source-verified candidate adapter; no global patching."""
     class DiagnosticAdapter(base_class):
         diagnostic_indexing: dict[str, Any] | None = None
+        diagnostic_rejection_counts: dict[str, int] | None = None
 
         def dream_and_wait(self, timeout=3600, *, max_cycles=100, require_healthy=True):
             if require_healthy is not True:
                 raise ValueError("diagnostic indexing requires the strict call site")
             dream_hy = self.hy.fork()
             self.diagnostic_indexing = None
+            rejections: Counter[str] = Counter()
+            rejection_lock = threading.Lock()
+
+            def record_rejections(reasons: tuple[str, ...]) -> None:
+                if (type(reasons) is not tuple or len(reasons) > 1_000
+                        or any(type(reason) is not str or re.fullmatch(
+                            r"(?:verdict_(?:unsupported|uncertain)|"
+                            r"recheck_(?:not_established|ambiguous)|"
+                            r"invalid_[a-z0-9_]{1,100})", reason) is None
+                            for reason in reasons)):
+                    raise ValueError("diagnostic_rejection_code_invalid")
+                with rejection_lock:
+                    rejections.update(reasons)
+
+            def diagnostic_dream():
+                return dream_hy.dream(diagnostic_grounding_recovery=True,
+                    diagnostic_rejection_sink=record_rejections)
+
             try:
                 try:
                     raw = lme.converge_indexing(
-                        dream_hy.dream,
+                        diagnostic_dream,
                         status=lambda: lme.durable_indexing_status(
                             dream_hy, getattr(self, "embedding_client", None)),
                         max_cycles=max_cycles, timeout_s=timeout,
@@ -381,6 +401,10 @@ def make_diagnostic_adapter_class(
                         cache_key=observed.get("extraction_cache_key"),
                         generation_key=observed.get("phase1_generation_key"),
                     )
+                    decision["grounding_rejection_reasons"] = dict(sorted(rejections.items()))
+                    decision["grounding_rejected_claims"] = sum(rejections.values())
+                    if decision["admitted"] and rejections and decision["kind"] == "strict_healthy":
+                        decision["kind"] = "grounding_recovery"
                     self.diagnostic_indexing = decision
                     if not decision["admitted"]:
                         raise lme.IndexingConvergenceError(
@@ -395,6 +419,7 @@ def make_diagnostic_adapter_class(
                     exc.summary = self.last_indexing_summary
                     raise
             finally:
+                self.diagnostic_rejection_counts = dict(sorted(rejections.items()))
                 evidence = (self.last_indexing_summary.get("cleanup_errors")
                             if isinstance(self.last_indexing_summary, dict) else None)
                 lme.run_cleanup_actions(

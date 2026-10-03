@@ -460,11 +460,12 @@ def validate_summary_projection(value: Any) -> dict[str, Any]:
 
 
 def validate_pilot_projection(value: Any) -> dict[str, Any]:
-    """Check one canary pair and four question pairs without double-counting views."""
+    """Check one canary pair and a bounded question set without double-counting views."""
     if (type(value) is not dict or value.keys() != {"schema", "canary", "questions", "aggregate"}
             or value["schema"] != "siwc_lme_pilot_projection_v2"
             or type(value["canary"]) is not dict
-            or type(value["questions"]) is not list or len(value["questions"]) != 4):
+            or type(value["questions"]) is not list
+            or not 1 <= len(value["questions"]) <= 4):
         raise ValueError("siwc_pilot_projection_invalid")
     rows = [value["canary"], *value["questions"]]
     ids: set[str] = set()
