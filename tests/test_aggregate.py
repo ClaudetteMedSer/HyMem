@@ -37,6 +37,7 @@ from hymem.dreaming.aggregate import (
     select_clusters,
 )
 from hymem.dreaming.aggregation_provenance import (
+    aggregation_output_is_canonical,
     load_current_aggregation_publication,
     persist_episode_source_manifest,
     resolve_cited_episode_sources,
@@ -1598,6 +1599,26 @@ def test_fusion_returns_none_on_an_unparseable_reply():
     # The leniency must not turn a genuine failure into a fabricated node.
     llm = StubLLMClient(default="I could not summarize these episodes.")
     assert _llm_fuse("prompt", llm, system="sys", kind="rollup") is None
+
+
+@pytest.mark.parametrize(("field", "cap"), [
+    ("summary", 2000),
+    ("title", 300),
+])
+def test_capped_fusion_output_remains_canonical_at_whitespace_boundary(
+    field, cap,
+):
+    # The cap can land on internal whitespace after the original value was
+    # stripped. Such output must pass the same canonical check as a node write.
+    response = {"title": "Title", "summary": "Summary"}
+    response[field] = "x" * (cap - 2) + " \n" + "tail"
+    fused = _llm_fuse(
+        "prompt", StubLLMClient(default=json.dumps(response)),
+        system="sys", kind="rollup",
+    )
+    assert fused is not None
+    assert fused[field] == "x" * (cap - 2)
+    assert aggregation_output_is_canonical(fused["title"], fused["summary"])
 
 
 def test_hymem_expand_node_api(cfg):

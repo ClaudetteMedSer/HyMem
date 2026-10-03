@@ -1321,9 +1321,9 @@ def _llm_fuse(
         if len(summary) > _MAX_FUSION_SUMMARY_CHARS:
             log.warning("aggregate.fusion_summary_capped kind=%s chars=%d->%d",
                         kind, len(summary), _MAX_FUSION_SUMMARY_CHARS)
-            summary = summary[:_MAX_FUSION_SUMMARY_CHARS]
+            summary = summary[:_MAX_FUSION_SUMMARY_CHARS].rstrip()
         if len(title) > _MAX_FUSION_TITLE_CHARS:
-            title = title[:_MAX_FUSION_TITLE_CHARS]
+            title = title[:_MAX_FUSION_TITLE_CHARS].rstrip()
         return {
             "title": title, "summary": summary,
             "_aggregation_request_hash": request_hash,
