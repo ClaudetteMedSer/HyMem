@@ -1,0 +1,49 @@
+-- v34: measure the SIZE of the digest leaf-set shift, not just whether it moved.
+--
+-- Why this supersedes v030's explicit decision (2026-08-27). Migration 030
+-- stored a fingerprint rather than the id list on the stated ground that "the
+-- comparison only ever tests equality". That was true when it was written and
+-- is no longer true. Row #1324 is what changed it: at CONSTANT level0_missed=3
+-- the split rebuild count now forms a monotone ladder across three
+-- leaf_changed populations --
+--
+--     #1318/#1319   leaf_changed=0   rebuilt  8   (level0 3 / rollup 4 / root 1)
+--     #1324         leaf_changed=1   rebuilt 12   (level0 3 / rollup 8 / root 1)
+--     #1183/#1307/#1317
+--                   leaf_changed=1   rebuilt 19-22
+--
+-- with every bit of the variance in the ROLLUP term, which is the term the
+-- leaf-set shift drives. Two rows carrying the same flag value differ by ~8
+-- rebuilds. So `aggregation_leaf_changed` is a binary flag standing in for a
+-- CONTINUOUS quantity, and the v33 split -- which was built to decide the
+-- family -- instead proved the family is not one population. The flag cannot
+-- separate "one leaf rotated out" from "half the leaf set turned over", and
+-- those are the two readings the cost question now turns on.
+--
+-- Nothing currently measures that quantity. This adds it, and adds nothing
+-- else: no threshold, no gate criterion, no behaviour change, no extra pass.
+-- The symmetric difference is computed against the watermark the store already
+-- keeps, in the same transaction, from a set that is already in memory.
+--
+-- SELF-CHECKING, on two independent identities, which is why this is an
+-- observation channel and not a fitted number:
+--
+--   (1) leaf_changed = 1  IFF  added + removed > 0.  The v29 flag and the v34
+--       counts are derived from the same comparison by different routes (hash
+--       equality vs set difference), so a disagreement means one of them is
+--       broken -- exactly the role the "three counts sum to actual" identity
+--       plays for v33.
+--   (2) added - removed = n_leaves - previous n_leaves.  `n_leaves` is already
+--       persisted by v30, so this arm needs no new state either.
+--
+-- Storage: the id list is capped by aggregation_digest_max_leaves (default
+-- 256) and lives in ONE row, so v030's "still large" caveat does not survive
+-- contact with the arithmetic -- a few KB of JSON, once per store.
+--
+-- NULL is unattributed, for the same reason as v29/v31/v33: pre-v34 stores
+-- have no predecessor id list, and a counterfeit 0 would read as "the leaf set
+-- held still" on precisely the rows where nothing is known. The first dream
+-- after this migration therefore reports NULL and the second reports numbers.
+ALTER TABLE aggregation_leaf_state ADD COLUMN leaf_ids TEXT;
+ALTER TABLE dream_runs ADD COLUMN aggregation_leaf_added INTEGER;
+ALTER TABLE dream_runs ADD COLUMN aggregation_leaf_removed INTEGER;

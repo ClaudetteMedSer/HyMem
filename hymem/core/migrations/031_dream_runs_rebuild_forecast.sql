@@ -1,0 +1,31 @@
+-- v31: structural rebuild forecast on dream_runs.
+--
+-- The amplification bound the reuse watch was waiting on cannot be fitted on
+-- this store. The 2026-08-09 dispersion read found level0_missed pinned at 3
+-- for 11 of 13 dreams, with a single 4 and a single 0, so a regression of
+-- rebuilt on level0_missed has effectively one x-value: the slope is
+-- unidentifiable and the intercept absorbs the leaf term by construction.
+-- More dreams do not fix that -- they add rows, not evidence, which is the
+-- same shape that made the third watch a paper pass.
+--
+-- The exit is to stop estimating the constant and compute the quantity
+-- instead. A node must rebuild when its membership is new, so the previous
+-- tree plus this dream's grouping predicts the rebuild exactly, per dream,
+-- with nothing fitted:
+--
+--   predicted = nodes whose (level, member set) is absent from the old tree
+--   actual    = nodes whose id missed the fusion cache
+--   residual  = actual - predicted
+--
+-- Residual 0 means membership change accounts for the whole rebuild. A
+-- positive residual counts nodes that kept their exact membership and still
+-- missed the cache -- same inputs, different id -- which is the fifth-cause
+-- class the gate hunts (salt bump, hash instability, rowid/shadow desync).
+-- It reads on ONE dream, so it needs no bar and no dispersion.
+--
+-- NULL is unattributed here for the same reason as v29: these are only
+-- meaningful for a dream that ran aggregation, and 0/0/0 is a real reading
+-- (a clean fixed point), so pre-v31 history must not be backfilled into it.
+ALTER TABLE dream_runs ADD COLUMN aggregation_predicted_rebuild INTEGER;
+ALTER TABLE dream_runs ADD COLUMN aggregation_keying_residual INTEGER;
+ALTER TABLE dream_runs ADD COLUMN aggregation_facts_rekey INTEGER;

@@ -1,0 +1,36 @@
+-- v24: per-session digest watermark (episode-starvation fix, 2026-07-30).
+--
+-- Two defects starved episode creation on long-lived sessions — found when the
+-- box logged 184 new messages and zero new episodes over six days while the
+-- RAPTOR reuse watch read a tautological 100% on a frozen tree:
+--
+--   1. WINDOW. extract_session_digest joined ALL of a session's chunks in
+--      start_message_id order and truncated with `combined[:max_chars]` — the
+--      OLDEST slice. Once a session exceeds max_chars its tail can never enter
+--      the digest input, so tail episodes are structurally impossible no matter
+--      how often the digest runs.
+--   2. SKIP-GUARD. The runner re-digested only when the session was undigested
+--      or a chunk was freshly extracted this run (`had_new_chunk_work`). New
+--      traffic that produces no fresh extraction (already-processed chunks, or
+--      low-salience turns picked up by the baseline tier) left an
+--      already-digested session permanently skipped.
+--
+-- Fixing (2) alone would spend one LLM call per session per dream and still
+-- produce nothing, because (1) would hand the same oldest-prefix back. The
+-- watermark fixes both: the digest reads only chunks ABOVE it and advances it
+-- to the last message actually covered, so successive dreams walk a growing
+-- session forward instead of re-reading its head.
+--
+-- NULL means "no digest coverage recorded" -> the next dream digests from the
+-- start of the session and records what it covered.
+--
+-- Deliberately a bare ALTER with no backfill. Seeding from
+-- episodes.end_message_id was the obvious move, but a v1-era DB upgraded
+-- through this chain has `episodes(id, title, summary)` only — no migration
+-- ever adds the message-range columns (see tests/test_migrations.py) — and
+-- SQLite resolves column names at prepare time, so referencing it here fails
+-- the whole upgrade. Existing sessions instead self-heal on the next dream:
+-- NULL watermark + already-digested is "not caught up", so the digest re-reads
+-- from the start once (one call per session, UPSERT no-ops the episodes it
+-- already has), records real coverage, and walks the tail forward from there.
+ALTER TABLE sessions ADD COLUMN digested_message_id INTEGER;

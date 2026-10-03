@@ -1,0 +1,1587 @@
+{
+  "abstention_diagnostics": {
+    "abstention": {
+      "accuracy": null,
+      "benchmark_failures": 0,
+      "conditional_valid_accuracy": null,
+      "conditional_valid_count": 0,
+      "count": 0
+    },
+    "answerable": {
+      "accuracy": 0.0,
+      "benchmark_failures": 1,
+      "conditional_valid_accuracy": null,
+      "conditional_valid_count": 0,
+      "count": 1
+    },
+    "by_category": {
+      "multi-session": {
+        "abstention": {
+          "accuracy": null,
+          "benchmark_failures": 0,
+          "conditional_valid_accuracy": null,
+          "conditional_valid_count": 0,
+          "count": 0
+        },
+        "answerable": {
+          "accuracy": 0.0,
+          "benchmark_failures": 1,
+          "conditional_valid_accuracy": null,
+          "conditional_valid_count": 0,
+          "count": 1
+        }
+      }
+    }
+  },
+  "benchmark": "LongMemEval",
+  "conditional_judged_only": {
+    "accuracy": null,
+    "count": 0
+  },
+  "config": {
+    "aggregation_broad": false,
+    "aggregation_nodes": false,
+    "answer_endpoint_origin": "https://reader.example",
+    "answer_endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
+    "answer_extra_body_obj": {},
+    "answer_model": "reader",
+    "auto_ability": true,
+    "context_policy": {
+      "budget_unit": "utf8_bytes",
+      "gold_access": false,
+      "max_input_bytes": 60000,
+      "max_input_tokens": null,
+      "min_semantic_excerpt_alnum": 8,
+      "min_semantic_excerpt_chars": 12,
+      "name": "conservative-utf8-byte-query-head-tail-v2",
+      "provider_context_window_tokens": 65536,
+      "raw_evidence_reserve_fraction": 0.6,
+      "reserved_output_tokens": 1024,
+      "reserved_transport_overhead_tokens": 256,
+      "source_boundaries": [
+        "head",
+        "query-window",
+        "tail"
+      ],
+      "tokenizer": null,
+      "tokenizer_failure_policy": "not-applicable"
+    },
+    "dataset_expected_count": 1,
+    "dataset_revision": "fixture",
+    "dataset_sha256": "sha256:4b42b0f05718d6f739ab7bf97ec8a5c3d8d675a3a436ee56063ed9310a228fae",
+    "distill": false,
+    "distill_prompt_version": "v2",
+    "effective_hymem_config": {
+      "aggregation_inject_abilities": [
+        "TR"
+      ],
+      "aggregation_nodes_enabled": false,
+      "episode_granularity_enabled": false,
+      "extraction_contract": {
+        "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
+        "prompt_version": "v20",
+        "schema": "hymem-extraction-contract-sha256-v1"
+      },
+      "facts_enabled": true,
+      "facts_extraction_enabled": true,
+      "fts_top_k": 10,
+      "graph_multihop_decay": 0.5,
+      "graph_multihop_enabled": false,
+      "graph_multihop_max_hops": 2,
+      "graph_multihop_min_score": 0.05,
+      "graph_top_k": 10,
+      "message_fts_top_k": 15,
+      "prompt_version": "v20",
+      "rerank_message_hits": true,
+      "rerank_model": "llm",
+      "rerank_top_k": 20,
+      "rules_enabled": true,
+      "rules_extraction_enabled": false,
+      "value_supersession_enabled": true
+    },
+    "embedding_runtime": {
+      "backend": "none",
+      "configured": false,
+      "dimension": null,
+      "fallback_policy": "none",
+      "fallback_reason": null,
+      "identity_exact": true,
+      "network_free": true,
+      "producer_binding": {
+        "declaration": {
+          "kind": "disabled"
+        },
+        "identity_exact": true,
+        "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
+        "reuse_scope": "durable",
+        "schema": "hymem-embedding-producer-binding-v1"
+      },
+      "quality": "none",
+      "reuse_scope": "durable",
+      "schema": "hymem-public-embedding-identity-v1",
+      "transport_security": "none",
+      "vector_space_key": null
+    },
+    "embeddings": false,
+    "episode_granularity": false,
+    "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+    "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
+    "evaluator_url": "https://github.com/xiaowu0162/LongMemEval/blob/9e0b455f4ef0e2ab8f2e582289761153549043fc/src/evaluation/evaluate_qa.py",
+    "exploratory_label_steering": false,
+    "exploratory_non_comparable": true,
+    "extraction_canary": {
+      "clean_empty_recovery_policy_version": "hymem-terminal-clean-empty-verification-v3",
+      "expected_claims": [
+        {
+          "object": "Fly.io",
+          "object_properties": {},
+          "object_type": "platform",
+          "polarity": 1,
+          "predicate": "deploys_to",
+          "source_message_id": 9271604311,
+          "subject": "HyMem Canary Relay",
+          "subject_properties": {},
+          "subject_type": "service",
+          "temporal_scope": null,
+          "value_numeric": null,
+          "value_text": null,
+          "value_unit": null
+        },
+        {
+          "object": "PostgreSQL",
+          "object_properties": {},
+          "object_type": "database",
+          "polarity": 1,
+          "predicate": "prefers",
+          "source_message_id": 9271604312,
+          "subject": "Avery Boundary Canary",
+          "subject_properties": {},
+          "subject_type": "person",
+          "temporal_scope": null,
+          "value_numeric": null,
+          "value_text": null,
+          "value_unit": null
+        }
+      ],
+      "expected_prepartition_leaves": 4,
+      "extraction_contract": {
+        "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
+        "prompt_version": "v20",
+        "schema": "hymem-extraction-contract-sha256-v1"
+      },
+      "fenced_code_control_sha256": "c11d7b0dbbb2492184ec94c43894ca2fc9ee3d2991b2878f296fb834da6db274",
+      "fixture_sha256": "3fedadfbcdf35a013f8f61c5ea3f6ccc3e150aca0d025d8597327704551e94de",
+      "fixture_version": "hymem-phase1-context-paths-four-leaf-v7",
+      "list_control_sha256": "e8f93e21ed6b8ea2df448e4ea2b3c7b09122838a2da3999f7c117ff3257a53e5",
+      "max_completion_calls": 24,
+      "max_provider_attempts": 72,
+      "minimum_pass_completion_calls": 8,
+      "normal_execution_path": {
+        "empty_verification_requests": 2,
+        "fenced_code_control_atomic_requests": 2,
+        "fenced_code_control_probe_atomic": true,
+        "list_control_atomic_requests": 2,
+        "list_control_probe_atomic": true,
+        "omission_verification_requests": 2,
+        "parsed_source_records": 8,
+        "primary_requests": 4,
+        "prose_claim_exact_context_emissions": 1,
+        "prose_claim_exact_context_requests": 2,
+        "prose_claim_requests": 2,
+        "prose_claim_self_contained_requests": 0,
+        "prose_claim_wrong_context_emissions": 0,
+        "protected_control_split_boundaries": 0,
+        "source_message_ids_seen": [
+          9271604311,
+          9271604312
+        ],
+        "source_record_parse_failures": 0,
+        "table_claim_exact_context_emissions": 1,
+        "table_claim_exact_context_requests": 2,
+        "table_claim_requests": 2,
+        "table_claim_self_contained_requests": 0,
+        "table_claim_wrong_context_emissions": 0
+      },
+      "normal_pass_completion_calls": 8,
+      "prompt_version": "v20",
+      "prose_boundary_claim_sha256": "aeebb66034c889372c5f7a81cabd8891fc0126f9ad286825663ac3a047c4d17a",
+      "required_before_indexing": true,
+      "scope": "once_per_pending_run_configuration",
+      "source_content_chars": 10349,
+      "source_message_ids": [
+        9271604311,
+        9271604312
+      ],
+      "source_split_policy_version": "hymem-source-semantic-split-v10",
+      "store_writes": 0,
+      "structural_control_probe_version": "hymem-phase1-markdown-atom-split-probe-v1",
+      "table_continuation_claim_sha256": "b0101bc38d69ab81541575a131a2d202037f0b8f489b9e07bfa22baf943cc13d",
+      "usage_accounting": "excluded_from_scored_usage_dedicated_memory_pipeline_client",
+      "version": "hymem-phase1-extraction-canary-v17"
+    },
+    "facts": null,
+    "facts_extraction": null,
+    "graph_facts_first": false,
+    "graph_multihop": false,
+    "graph_multihop_decay": null,
+    "graph_multihop_max_hops": null,
+    "graph_multihop_min_score": null,
+    "historical_local_judge_prompts_exact_official": false,
+    "hymem_endpoint_origin": "https://pipeline.example",
+    "hymem_endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+    "hymem_model": "pipeline",
+    "hymem_thinking": "off",
+    "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1",
+    "indexing_max_cycles": 4,
+    "indexing_require_healthy": true,
+    "indexing_timeout_s": 900.0,
+    "judge_endpoint_origin": "https://judge.example",
+    "judge_endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
+    "judge_extra_body_obj": {},
+    "judge_model": "judge",
+    "judge_protocol": "legacy-custom",
+    "judge_transport_retry_policy": "bounded-three-attempt-backoff-v1",
+    "label_free_answer_path": true,
+    "max_input_bytes": 60000,
+    "max_input_tokens": null,
+    "no_dream": false,
+    "official_denominator_validated": false,
+    "official_judge_endpoint_origin": "https://api.openai.com",
+    "official_judge_endpoint_sha256": "sha256:d9617135d6fdd0a2cde722d637a1dfcc3da37515708b3ea5d66ae607c8ac785e",
+    "official_judge_match": false,
+    "official_transport_exact": false,
+    "official_transport_retry_policy": "unbounded-openai-backoff-v1",
+    "permissive_default": false,
+    "prereg": null,
+    "provider_context_tokens": 65536,
+    "rerank_message_hits": null,
+    "rerank_model": null,
+    "rerank_top_k": null,
+    "retrieval_only": false,
+    "retrieval_usage_owner": "none",
+    "rules": null,
+    "rules_extraction": null,
+    "sample": 1,
+    "sample_strategy": "sha256-seed-source-index-preserve-order-v1",
+    "scales": "S",
+    "scored_run": true,
+    "seed": 7,
+    "source_ids_hash": "sha256:190602be17c532f8704d8cf4cae55a8d11dee659b00d167b26b4c0c41eae1411",
+    "source_order_validated": false,
+    "source_qtype_counts": {
+      "multi-session": 1
+    },
+    "subset_run": true,
+    "top_k": 15,
+    "value_supersession": true,
+    "workers": 1
+  },
+  "date": "2026-09-04T12:00:00+00:00",
+  "execution": {
+    "checkpoint": {
+      "schema": "hymem-benchmark-checkpoint-attestation-v1",
+      "state": {
+        "checkpoint_schema": "hymem-benchmark-checkpoint-v1",
+        "counts": {
+          "attempted": 1,
+          "completed": 0,
+          "expected": 1,
+          "failed": 1,
+          "missing": 0,
+          "total_attempts": 1,
+          "unique_attempted": 1
+        },
+        "entries": [
+          {
+            "attempts": 1,
+            "question_id": "qid",
+            "row_sha256": "sha256:fc877bdf629607499d873c4f6c3950bfaab02546fa2db35e1c05672896cb05aa",
+            "status": "failed"
+          }
+        ],
+        "expected_ids": [
+          "qid"
+        ],
+        "failure_ids": [
+          "qid"
+        ],
+        "manifest_sha256": "sha256:f2cbd290be8932ac0bd80c857a72bc2b94754b7fd09b959bb266a229928cb54b",
+        "rows_sha256": "sha256:edd6248addeab5bcd962e4fd0bf1117ee77bb3cfc23fffd981aa11451e0a837a",
+        "run_id": "sha256:08c4b07aa4525aab02a1d9efd502c7431ea3674467da3b7177705acf621f615e",
+        "scored": true,
+        "segments_sha256": "sha256:57c6cd8e583010b40741e5dc0e02fec8548ef94cd4c21a9b5f73df536962db17",
+        "status": "complete",
+        "verdict_key": "correct"
+      },
+      "state_sha256": "sha256:28adb0c963bf29648f20d61b67c9b79d031b62984952eb09ddd957ea7a0b1273"
+    },
+    "counts": {
+      "attempted": 1,
+      "completed": 0,
+      "expected": 1,
+      "failed": 1,
+      "missing": 0,
+      "total_attempts": 1,
+      "unique_attempted": 1
+    },
+    "segments": [
+      {
+        "attempted_attempts": 1,
+        "elapsed_s": 1.0,
+        "embedding_usage": {
+          "backend": "none",
+          "calls": 0,
+          "calls_available": true,
+          "configured": false,
+          "cost_available": false,
+          "cost_usd": null,
+          "dimension": null,
+          "identity_available": true,
+          "identity_exact": true,
+          "input_characters": 0,
+          "input_characters_available": true,
+          "input_count": 0,
+          "input_count_available": true,
+          "latency_available": true,
+          "latency_s": 0.0,
+          "model": null,
+          "network_free": true,
+          "prompt_tokens": null,
+          "provider_token_usage_available": false,
+          "quality": "none",
+          "request_attempts": 0,
+          "request_attempts_available": true,
+          "reuse_scope": "durable",
+          "successful_responses": 0,
+          "successful_responses_available": true,
+          "total_tokens": null
+        },
+        "extraction_canary": {
+          "claim_evidence": [
+            {
+              "expected_claim_index": 0,
+              "object": "Fly.io",
+              "object_properties": {},
+              "object_type": "platform",
+              "polarity": 1,
+              "predicate": "deploys_to",
+              "source_message_id": 9271604311,
+              "subject": "HyMem Canary Relay",
+              "subject_properties": {},
+              "subject_type": "service",
+              "temporal_scope": null,
+              "value_numeric": null,
+              "value_text": null,
+              "value_unit": null
+            },
+            {
+              "expected_claim_index": 1,
+              "object": "PostgreSQL",
+              "object_properties": {},
+              "object_type": "database",
+              "polarity": 1,
+              "predicate": "prefers",
+              "source_message_id": 9271604312,
+              "subject": "Avery Boundary Canary",
+              "subject_properties": {},
+              "subject_type": "person",
+              "temporal_scope": null,
+              "value_numeric": null,
+              "value_text": null,
+              "value_unit": null
+            }
+          ],
+          "clean_empty_recovery_policy_version": "hymem-terminal-clean-empty-verification-v3",
+          "client": {
+            "client_class": "fixture.CanaryClient",
+            "effective_extra_body": {},
+            "endpoint_origin": "https://pipeline.example",
+            "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+            "model": "pipeline",
+            "thinking_mode": "off"
+          },
+          "client_closed": true,
+          "completion_calls": 8,
+          "duplicate_triples_collapsed": 0,
+          "execution_path": {
+            "empty_verification_requests": 2,
+            "fenced_code_control_atomic_requests": 2,
+            "fenced_code_control_probe_atomic": true,
+            "list_control_atomic_requests": 2,
+            "list_control_probe_atomic": true,
+            "omission_verification_requests": 2,
+            "parsed_source_records": 8,
+            "primary_requests": 4,
+            "prose_claim_exact_context_emissions": 1,
+            "prose_claim_exact_context_requests": 2,
+            "prose_claim_requests": 2,
+            "prose_claim_self_contained_requests": 0,
+            "prose_claim_wrong_context_emissions": 0,
+            "protected_control_split_boundaries": 0,
+            "source_message_ids_seen": [
+              9271604311,
+              9271604312
+            ],
+            "source_record_parse_failures": 0,
+            "table_claim_exact_context_emissions": 1,
+            "table_claim_exact_context_requests": 2,
+            "table_claim_requests": 2,
+            "table_claim_self_contained_requests": 0,
+            "table_claim_wrong_context_emissions": 0
+          },
+          "expected_claims": [
+            {
+              "object": "Fly.io",
+              "object_properties": {},
+              "object_type": "platform",
+              "polarity": 1,
+              "predicate": "deploys_to",
+              "source_message_id": 9271604311,
+              "subject": "HyMem Canary Relay",
+              "subject_properties": {},
+              "subject_type": "service",
+              "temporal_scope": null,
+              "value_numeric": null,
+              "value_text": null,
+              "value_unit": null
+            },
+            {
+              "object": "PostgreSQL",
+              "object_properties": {},
+              "object_type": "database",
+              "polarity": 1,
+              "predicate": "prefers",
+              "source_message_id": 9271604312,
+              "subject": "Avery Boundary Canary",
+              "subject_properties": {},
+              "subject_type": "person",
+              "temporal_scope": null,
+              "value_numeric": null,
+              "value_text": null,
+              "value_unit": null
+            }
+          ],
+          "expected_prepartition_leaves": 4,
+          "extraction_contract": {
+            "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
+            "prompt_version": "v20",
+            "schema": "hymem-extraction-contract-sha256-v1"
+          },
+          "fenced_code_control_sha256": "c11d7b0dbbb2492184ec94c43894ca2fc9ee3d2991b2878f296fb834da6db274",
+          "fixture_sha256": "3fedadfbcdf35a013f8f61c5ea3f6ccc3e150aca0d025d8597327704551e94de",
+          "fixture_version": "hymem-phase1-context-paths-four-leaf-v7",
+          "initial_prepartition_leaves": 4,
+          "list_control_sha256": "e8f93e21ed6b8ea2df448e4ea2b3c7b09122838a2da3999f7c117ff3257a53e5",
+          "matched_supported_claims": 2,
+          "max_completion_calls": 24,
+          "max_provider_attempts": 72,
+          "minimum_pass_completion_calls": 8,
+          "missing_expected_claim_indexes": [],
+          "normal_execution_path": {
+            "empty_verification_requests": 2,
+            "fenced_code_control_atomic_requests": 2,
+            "fenced_code_control_probe_atomic": true,
+            "list_control_atomic_requests": 2,
+            "list_control_probe_atomic": true,
+            "omission_verification_requests": 2,
+            "parsed_source_records": 8,
+            "primary_requests": 4,
+            "prose_claim_exact_context_emissions": 1,
+            "prose_claim_exact_context_requests": 2,
+            "prose_claim_requests": 2,
+            "prose_claim_self_contained_requests": 0,
+            "prose_claim_wrong_context_emissions": 0,
+            "protected_control_split_boundaries": 0,
+            "source_message_ids_seen": [
+              9271604311,
+              9271604312
+            ],
+            "source_record_parse_failures": 0,
+            "table_claim_exact_context_emissions": 1,
+            "table_claim_exact_context_requests": 2,
+            "table_claim_requests": 2,
+            "table_claim_self_contained_requests": 0,
+            "table_claim_wrong_context_emissions": 0
+          },
+          "normal_pass_completion_calls": 8,
+          "prompt_version": "v20",
+          "prose_boundary_claim_sha256": "aeebb66034c889372c5f7a81cabd8891fc0126f9ad286825663ac3a047c4d17a",
+          "provider_attempts": 8,
+          "required_before_indexing": true,
+          "scope": "once_per_pending_run_configuration",
+          "source_content_chars": 10349,
+          "source_message_ids": [
+            9271604311,
+            9271604312
+          ],
+          "source_split_policy_version": "hymem-source-semantic-split-v10",
+          "status": "passed",
+          "store_writes": 0,
+          "structural_control_probe_version": "hymem-phase1-markdown-atom-split-probe-v1",
+          "table_continuation_claim_sha256": "b0101bc38d69ab81541575a131a2d202037f0b8f489b9e07bfa22baf943cc13d",
+          "usage": {
+            "calls": 8,
+            "calls_available": true,
+            "completion_tokens": 0,
+            "cost_available": true,
+            "cost_usd": 0.0,
+            "latency_available": true,
+            "latency_s": 0.0,
+            "prompt_tokens": 20,
+            "request_attempts": 8,
+            "request_attempts_available": true,
+            "successful_responses": 8,
+            "successful_responses_available": true,
+            "token_usage_available": true,
+            "total_tokens": 20
+          },
+          "usage_accounting": "excluded_from_scored_usage_dedicated_memory_pipeline_client",
+          "valid_markers_returned": 0,
+          "valid_triples_returned": 2,
+          "version": "hymem-phase1-extraction-canary-v17"
+        },
+        "indexing_runs": [
+          {
+            "question_id": "qid",
+            "summary": {
+              "cleanup_errors": [],
+              "complete": false,
+              "cycles": 1,
+              "elapsed_s": 1.0,
+              "failure": {
+                "code": "coverage_integrity_failure",
+                "exception_type": null
+              },
+              "final_status": {
+                "aggregation_generation": {
+                  "enabled": false,
+                  "generation_binding": null,
+                  "generation_key": null,
+                  "identity_exact": null,
+                  "producer_identity_sha256": null
+                },
+                "aggregation_material": {
+                  "enabled": false,
+                  "identity_exact": null,
+                  "material_binding": null,
+                  "material_epoch_key": null,
+                  "material_revision": null
+                },
+                "benchmark_indexing_status_schema": "hymem-benchmark-indexing-status-v4",
+                "coverage_integrity": {
+                  "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
+                  "details": [
+                    {
+                      "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
+                      "failure_reason": "source_stream_invalid",
+                      "first_detected_at": "2026-09-05 10:00:00",
+                      "last_detected_at": "2026-09-05 10:01:00",
+                      "occurrences": 2,
+                      "session_id_hash": "sha256:bfa06a6cba57128c60796a31732064556b6a977a6325114dd768c6c79dab01b7"
+                    }
+                  ],
+                  "details_truncated": false,
+                  "failures": 1,
+                  "reasons": {
+                    "source_stream_invalid": 1
+                  }
+                },
+                "dream_status_schema": "hymem-dream-status-v8",
+                "in_progress": false,
+                "malformed": {
+                  "malformed_digests": 0,
+                  "malformed_facts": 0,
+                  "malformed_profiles": 0,
+                  "malformed_source_materialization": 0,
+                  "malformed_summaries": 0
+                },
+                "pending": {
+                  "pending_aggregation": 0,
+                  "pending_chunk_embeddings": 0,
+                  "pending_chunks": 0,
+                  "pending_digests": 0,
+                  "pending_edge_embeddings": 0,
+                  "pending_episode_embeddings": 0,
+                  "pending_fact_embeddings": 0,
+                  "pending_facts": 0,
+                  "pending_message_embeddings": 0,
+                  "pending_profiles": 0,
+                  "pending_source_materialization": 0
+                },
+                "pending_chunks_authoritative": true,
+                "phase1_backlog_status": "current_producer",
+                "phase1_generation_key": "hymem-phase1-generation-v1:1111111111111111111111111111111111111111111111111111111111111111",
+                "quarantined": {
+                  "quarantined_chunks": 0,
+                  "quarantined_digests": 0,
+                  "quarantined_facts": 0,
+                  "quarantined_facts_malformed": 0,
+                  "quarantined_profiles": 0
+                },
+                "summary_health": {
+                  "malformed_summaries": 0,
+                  "summary_degraded_sessions": 0,
+                  "summary_healthy": true,
+                  "summary_missing_sessions": 0
+                },
+                "terminal_loss": {
+                  "chunks": 0,
+                  "reasons": {}
+                }
+              },
+              "healthy": false,
+              "max_cycles": 2,
+              "outcome": "failure",
+              "reports": [
+                {
+                  "aggregation_blocking": "",
+                  "aggregation_build_exceptions": 0,
+                  "aggregation_facts_rekey": null,
+                  "aggregation_fusion_failures": 0,
+                  "aggregation_input_episodes": 0,
+                  "aggregation_keying_residual": null,
+                  "aggregation_leaf_added": null,
+                  "aggregation_leaf_changed": null,
+                  "aggregation_leaf_removed": null,
+                  "aggregation_level0_missed": null,
+                  "aggregation_nodes_built": 0,
+                  "aggregation_nodes_reused": 0,
+                  "aggregation_predicted_rebuild": null,
+                  "aggregation_rebuilt_level0": null,
+                  "aggregation_rebuilt_rollup": null,
+                  "aggregation_rebuilt_root": null,
+                  "budget_exhausted": false,
+                  "chunk_extraction_completion_calls": 0,
+                  "chunk_extraction_failures": 0,
+                  "chunk_extraction_provider_attempts": 0,
+                  "chunks_embedded": 0,
+                  "chunks_embedded_from_cache": 0,
+                  "chunks_processed": 0,
+                  "chunks_seen": 0,
+                  "coverage_integrity_failures": 1,
+                  "digest_failures": 0,
+                  "digest_quarantined": 0,
+                  "edges_embedded": 0,
+                  "edges_embedded_from_cache": 0,
+                  "episodes_created": 0,
+                  "episodes_embedded": 0,
+                  "episodes_embedded_from_cache": 0,
+                  "extraction_provider_attempt_budget_exhausted": false,
+                  "fact_failures": 0,
+                  "facts_embedded": 0,
+                  "facts_embedded_from_cache": 0,
+                  "facts_extracted": 0,
+                  "markers_extracted": 0,
+                  "messages_embedded": 0,
+                  "messages_embedded_from_cache": 0,
+                  "profile_failures": 0,
+                  "profile_items_extracted": 0,
+                  "rules_extracted": 0,
+                  "sessions_processed": 0,
+                  "skipped_locked": false,
+                  "triples_extracted": 0
+                }
+              ],
+              "schema": "hymem-lme-indexing-summary-v6",
+              "summary_healthy": true,
+              "timeout_s": 10.0
+            }
+          }
+        ],
+        "judge_usage": {
+          "calls": 0,
+          "calls_available": true,
+          "completion_tokens": 0,
+          "cost_available": true,
+          "cost_usd": 0.0,
+          "latency_available": true,
+          "latency_s": 0.0,
+          "prompt_tokens": 0,
+          "request_attempts": 0,
+          "request_attempts_available": true,
+          "successful_responses": 0,
+          "successful_responses_available": true,
+          "token_usage_available": true,
+          "total_tokens": 0
+        },
+        "latest_indexing": {
+          "question_id": "qid",
+          "summary": {
+            "cleanup_errors": [],
+            "complete": false,
+            "cycles": 1,
+            "elapsed_s": 1.0,
+            "failure": {
+              "code": "coverage_integrity_failure",
+              "exception_type": null
+            },
+            "final_status": {
+              "aggregation_generation": {
+                "enabled": false,
+                "generation_binding": null,
+                "generation_key": null,
+                "identity_exact": null,
+                "producer_identity_sha256": null
+              },
+              "aggregation_material": {
+                "enabled": false,
+                "identity_exact": null,
+                "material_binding": null,
+                "material_epoch_key": null,
+                "material_revision": null
+              },
+              "benchmark_indexing_status_schema": "hymem-benchmark-indexing-status-v4",
+              "coverage_integrity": {
+                "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
+                "details": [
+                  {
+                    "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
+                    "failure_reason": "source_stream_invalid",
+                    "first_detected_at": "2026-09-05 10:00:00",
+                    "last_detected_at": "2026-09-05 10:01:00",
+                    "occurrences": 2,
+                    "session_id_hash": "sha256:bfa06a6cba57128c60796a31732064556b6a977a6325114dd768c6c79dab01b7"
+                  }
+                ],
+                "details_truncated": false,
+                "failures": 1,
+                "reasons": {
+                  "source_stream_invalid": 1
+                }
+              },
+              "dream_status_schema": "hymem-dream-status-v8",
+              "in_progress": false,
+              "malformed": {
+                "malformed_digests": 0,
+                "malformed_facts": 0,
+                "malformed_profiles": 0,
+                "malformed_source_materialization": 0,
+                "malformed_summaries": 0
+              },
+              "pending": {
+                "pending_aggregation": 0,
+                "pending_chunk_embeddings": 0,
+                "pending_chunks": 0,
+                "pending_digests": 0,
+                "pending_edge_embeddings": 0,
+                "pending_episode_embeddings": 0,
+                "pending_fact_embeddings": 0,
+                "pending_facts": 0,
+                "pending_message_embeddings": 0,
+                "pending_profiles": 0,
+                "pending_source_materialization": 0
+              },
+              "pending_chunks_authoritative": true,
+              "phase1_backlog_status": "current_producer",
+              "phase1_generation_key": "hymem-phase1-generation-v1:1111111111111111111111111111111111111111111111111111111111111111",
+              "quarantined": {
+                "quarantined_chunks": 0,
+                "quarantined_digests": 0,
+                "quarantined_facts": 0,
+                "quarantined_facts_malformed": 0,
+                "quarantined_profiles": 0
+              },
+              "summary_health": {
+                "malformed_summaries": 0,
+                "summary_degraded_sessions": 0,
+                "summary_healthy": true,
+                "summary_missing_sessions": 0
+              },
+              "terminal_loss": {
+                "chunks": 0,
+                "reasons": {}
+              }
+            },
+            "healthy": false,
+            "max_cycles": 2,
+            "outcome": "failure",
+            "reports": [
+              {
+                "aggregation_blocking": "",
+                "aggregation_build_exceptions": 0,
+                "aggregation_facts_rekey": null,
+                "aggregation_fusion_failures": 0,
+                "aggregation_input_episodes": 0,
+                "aggregation_keying_residual": null,
+                "aggregation_leaf_added": null,
+                "aggregation_leaf_changed": null,
+                "aggregation_leaf_removed": null,
+                "aggregation_level0_missed": null,
+                "aggregation_nodes_built": 0,
+                "aggregation_nodes_reused": 0,
+                "aggregation_predicted_rebuild": null,
+                "aggregation_rebuilt_level0": null,
+                "aggregation_rebuilt_rollup": null,
+                "aggregation_rebuilt_root": null,
+                "budget_exhausted": false,
+                "chunk_extraction_completion_calls": 0,
+                "chunk_extraction_failures": 0,
+                "chunk_extraction_provider_attempts": 0,
+                "chunks_embedded": 0,
+                "chunks_embedded_from_cache": 0,
+                "chunks_processed": 0,
+                "chunks_seen": 0,
+                "coverage_integrity_failures": 1,
+                "digest_failures": 0,
+                "digest_quarantined": 0,
+                "edges_embedded": 0,
+                "edges_embedded_from_cache": 0,
+                "episodes_created": 0,
+                "episodes_embedded": 0,
+                "episodes_embedded_from_cache": 0,
+                "extraction_provider_attempt_budget_exhausted": false,
+                "fact_failures": 0,
+                "facts_embedded": 0,
+                "facts_embedded_from_cache": 0,
+                "facts_extracted": 0,
+                "markers_extracted": 0,
+                "messages_embedded": 0,
+                "messages_embedded_from_cache": 0,
+                "profile_failures": 0,
+                "profile_items_extracted": 0,
+                "rules_extracted": 0,
+                "sessions_processed": 0,
+                "skipped_locked": false,
+                "triples_extracted": 0
+              }
+            ],
+            "schema": "hymem-lme-indexing-summary-v6",
+            "summary_healthy": true,
+            "timeout_s": 10.0
+          }
+        },
+        "memory_pipeline_usage": {
+          "calls": 0,
+          "calls_available": true,
+          "completion_tokens": 0,
+          "cost_available": true,
+          "cost_usd": 0.0,
+          "latency_available": true,
+          "latency_s": 0.0,
+          "prompt_tokens": 0,
+          "request_attempts": 0,
+          "request_attempts_available": true,
+          "successful_responses": 0,
+          "successful_responses_available": true,
+          "token_usage_available": true,
+          "total_tokens": 0
+        },
+        "model_identities": {
+          "embedding": {
+            "backend": "none",
+            "configured": false,
+            "dimension": null,
+            "fallback_policy": "none",
+            "fallback_reason": null,
+            "identity_exact": true,
+            "network_free": true,
+            "producer_binding": {
+              "declaration": {
+                "kind": "disabled"
+              },
+              "identity_exact": true,
+              "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
+              "reuse_scope": "durable",
+              "schema": "hymem-embedding-producer-binding-v1"
+            },
+            "quality": "none",
+            "reuse_scope": "durable",
+            "schema": "hymem-public-embedding-identity-v1",
+            "transport_security": "none",
+            "vector_space_key": null
+          },
+          "judge": {
+            "endpoint_origin": "https://judge.example",
+            "endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
+            "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+            "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
+            "extra_body": {},
+            "max_tokens": 10,
+            "model": "judge",
+            "n": null,
+            "prompt_exact_official": false,
+            "protocol": "legacy-custom",
+            "provider": "openai-compatible",
+            "retry_policy": "bounded-three-attempt-backoff-v1",
+            "temperature": 0.0,
+            "verdict_parser": "anchored-exclusive-yes-no-local-v1"
+          },
+          "memory_pipeline": {
+            "aggregation_producer": {
+              "declaration": {
+                "client_id": "hymem.contrib.openai_client.OpenAICompatibleClient",
+                "effective_request": {
+                  "schema": "hymem-phase1-nested-identity-sha256-v1",
+                  "sha256": "sha256:62732fda9c5ed4272f7a2e0af03da9a280ab6347322be3b4b5ecb87e43da7734"
+                },
+                "endpoint_origin": "https://pipeline.example",
+                "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+                "implementation": "sha256:369e75a84adf10ca25b037439f2f61b982433ad851bbe51a80b7c1a601c5e830",
+                "model": "pipeline",
+                "retry_policy": {
+                  "schema": "hymem-phase1-nested-identity-sha256-v1",
+                  "sha256": "sha256:ca0dd0cb7ac4c1c0c4c088e3f494a42460c166533c80ea9e6143206721bc864e"
+                },
+                "schema": "hymem-aggregation-producer-declaration-v1"
+              },
+              "identity_exact": true,
+              "identity_sha256": "sha256:82140a507a09f1d8468a76c26fbd22db33bbb90125a05151f0cd05a89f3d9e66",
+              "reuse_scope": "durable",
+              "schema": "hymem-phase1-producer-binding-v1"
+            },
+            "deployment_revision_sha256": "sha256:bb5e3948036d1e0ec84a33b16b02d8730709c6586fca6433c55c10bcfd682497",
+            "deployment_tenant_sha256": "sha256:3373a114fe3468218a3db97972b38c3f82f9fd098df5d4438e6de6c36b07c937",
+            "effective_extra_body": {},
+            "endpoint_origin": "https://pipeline.example",
+            "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+            "model": "pipeline",
+            "provider": "openai-compatible",
+            "request_timeout_seconds": 120.0,
+            "thinking_mode": "off",
+            "transport_package_version": "test-openai-1"
+          },
+          "reader": {
+            "endpoint_origin": "https://reader.example",
+            "endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
+            "extra_body": {},
+            "max_tokens": 1024,
+            "model": "reader",
+            "provider": "openai-compatible",
+            "temperature": 0.0
+          }
+        },
+        "reader_usage": {
+          "calls": 0,
+          "calls_available": true,
+          "completion_tokens": 0,
+          "cost_available": true,
+          "cost_usd": 0.0,
+          "latency_available": true,
+          "latency_s": 0.0,
+          "prompt_tokens": 0,
+          "request_attempts": 0,
+          "request_attempts_available": true,
+          "successful_responses": 0,
+          "successful_responses_available": true,
+          "token_usage_available": true,
+          "total_tokens": 0
+        },
+        "retrieval_usage": {
+          "calls": 0,
+          "calls_available": true,
+          "completion_tokens": 0,
+          "cost_available": true,
+          "cost_usd": 0.0,
+          "latency_available": true,
+          "latency_s": 0.0,
+          "prompt_tokens": 0,
+          "request_attempts": 0,
+          "request_attempts_available": true,
+          "successful_responses": 0,
+          "successful_responses_available": true,
+          "token_usage_available": true,
+          "total_tokens": 0
+        },
+        "segment_id": "segment-a",
+        "status": "complete"
+      }
+    ]
+  },
+  "manifest": {
+    "benchmark": "LongMemEval",
+    "calibration_receipt_hash": null,
+    "code_hash": "sha256:4a1933b06cf695fcff4acaba1fdbaa7f10ce109d3c7f57bbf62f6bb572658de8",
+    "config": {
+      "aggregation_broad": false,
+      "aggregation_nodes": false,
+      "answer_endpoint_origin": "https://reader.example",
+      "answer_endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
+      "answer_extra_body_obj": {},
+      "answer_model": "reader",
+      "auto_ability": true,
+      "context_policy": {
+        "budget_unit": "utf8_bytes",
+        "gold_access": false,
+        "max_input_bytes": 60000,
+        "max_input_tokens": null,
+        "min_semantic_excerpt_alnum": 8,
+        "min_semantic_excerpt_chars": 12,
+        "name": "conservative-utf8-byte-query-head-tail-v2",
+        "provider_context_window_tokens": 65536,
+        "raw_evidence_reserve_fraction": 0.6,
+        "reserved_output_tokens": 1024,
+        "reserved_transport_overhead_tokens": 256,
+        "source_boundaries": [
+          "head",
+          "query-window",
+          "tail"
+        ],
+        "tokenizer": null,
+        "tokenizer_failure_policy": "not-applicable"
+      },
+      "dataset_expected_count": 1,
+      "dataset_revision": "fixture",
+      "dataset_sha256": "sha256:4b42b0f05718d6f739ab7bf97ec8a5c3d8d675a3a436ee56063ed9310a228fae",
+      "distill": false,
+      "distill_prompt_version": "v2",
+      "effective_hymem_config": {
+        "aggregation_inject_abilities": [
+          "TR"
+        ],
+        "aggregation_nodes_enabled": false,
+        "episode_granularity_enabled": false,
+        "extraction_contract": {
+          "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
+          "prompt_version": "v20",
+          "schema": "hymem-extraction-contract-sha256-v1"
+        },
+        "facts_enabled": true,
+        "facts_extraction_enabled": true,
+        "fts_top_k": 10,
+        "graph_multihop_decay": 0.5,
+        "graph_multihop_enabled": false,
+        "graph_multihop_max_hops": 2,
+        "graph_multihop_min_score": 0.05,
+        "graph_top_k": 10,
+        "message_fts_top_k": 15,
+        "prompt_version": "v20",
+        "rerank_message_hits": true,
+        "rerank_model": "llm",
+        "rerank_top_k": 20,
+        "rules_enabled": true,
+        "rules_extraction_enabled": false,
+        "value_supersession_enabled": true
+      },
+      "embedding_runtime": {
+        "backend": "none",
+        "configured": false,
+        "dimension": null,
+        "fallback_policy": "none",
+        "fallback_reason": null,
+        "identity_exact": true,
+        "network_free": true,
+        "producer_binding": {
+          "declaration": {
+            "kind": "disabled"
+          },
+          "identity_exact": true,
+          "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
+          "reuse_scope": "durable",
+          "schema": "hymem-embedding-producer-binding-v1"
+        },
+        "quality": "none",
+        "reuse_scope": "durable",
+        "schema": "hymem-public-embedding-identity-v1",
+        "transport_security": "none",
+        "vector_space_key": null
+      },
+      "embeddings": false,
+      "episode_granularity": false,
+      "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+      "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
+      "evaluator_url": "https://github.com/xiaowu0162/LongMemEval/blob/9e0b455f4ef0e2ab8f2e582289761153549043fc/src/evaluation/evaluate_qa.py",
+      "exploratory_label_steering": false,
+      "exploratory_non_comparable": true,
+      "extraction_canary": {
+        "clean_empty_recovery_policy_version": "hymem-terminal-clean-empty-verification-v3",
+        "expected_claims": [
+          {
+            "object": "Fly.io",
+            "object_properties": {},
+            "object_type": "platform",
+            "polarity": 1,
+            "predicate": "deploys_to",
+            "source_message_id": 9271604311,
+            "subject": "HyMem Canary Relay",
+            "subject_properties": {},
+            "subject_type": "service",
+            "temporal_scope": null,
+            "value_numeric": null,
+            "value_text": null,
+            "value_unit": null
+          },
+          {
+            "object": "PostgreSQL",
+            "object_properties": {},
+            "object_type": "database",
+            "polarity": 1,
+            "predicate": "prefers",
+            "source_message_id": 9271604312,
+            "subject": "Avery Boundary Canary",
+            "subject_properties": {},
+            "subject_type": "person",
+            "temporal_scope": null,
+            "value_numeric": null,
+            "value_text": null,
+            "value_unit": null
+          }
+        ],
+        "expected_prepartition_leaves": 4,
+        "extraction_contract": {
+          "identity": "hymem-extraction-contract-sha256-v1:3c6ab546c71f005728c9734b92c4b080c6645766028b98c03136c81170cab574",
+          "prompt_version": "v20",
+          "schema": "hymem-extraction-contract-sha256-v1"
+        },
+        "fenced_code_control_sha256": "c11d7b0dbbb2492184ec94c43894ca2fc9ee3d2991b2878f296fb834da6db274",
+        "fixture_sha256": "3fedadfbcdf35a013f8f61c5ea3f6ccc3e150aca0d025d8597327704551e94de",
+        "fixture_version": "hymem-phase1-context-paths-four-leaf-v7",
+        "list_control_sha256": "e8f93e21ed6b8ea2df448e4ea2b3c7b09122838a2da3999f7c117ff3257a53e5",
+        "max_completion_calls": 24,
+        "max_provider_attempts": 72,
+        "minimum_pass_completion_calls": 8,
+        "normal_execution_path": {
+          "empty_verification_requests": 2,
+          "fenced_code_control_atomic_requests": 2,
+          "fenced_code_control_probe_atomic": true,
+          "list_control_atomic_requests": 2,
+          "list_control_probe_atomic": true,
+          "omission_verification_requests": 2,
+          "parsed_source_records": 8,
+          "primary_requests": 4,
+          "prose_claim_exact_context_emissions": 1,
+          "prose_claim_exact_context_requests": 2,
+          "prose_claim_requests": 2,
+          "prose_claim_self_contained_requests": 0,
+          "prose_claim_wrong_context_emissions": 0,
+          "protected_control_split_boundaries": 0,
+          "source_message_ids_seen": [
+            9271604311,
+            9271604312
+          ],
+          "source_record_parse_failures": 0,
+          "table_claim_exact_context_emissions": 1,
+          "table_claim_exact_context_requests": 2,
+          "table_claim_requests": 2,
+          "table_claim_self_contained_requests": 0,
+          "table_claim_wrong_context_emissions": 0
+        },
+        "normal_pass_completion_calls": 8,
+        "prompt_version": "v20",
+        "prose_boundary_claim_sha256": "aeebb66034c889372c5f7a81cabd8891fc0126f9ad286825663ac3a047c4d17a",
+        "required_before_indexing": true,
+        "scope": "once_per_pending_run_configuration",
+        "source_content_chars": 10349,
+        "source_message_ids": [
+          9271604311,
+          9271604312
+        ],
+        "source_split_policy_version": "hymem-source-semantic-split-v10",
+        "store_writes": 0,
+        "structural_control_probe_version": "hymem-phase1-markdown-atom-split-probe-v1",
+        "table_continuation_claim_sha256": "b0101bc38d69ab81541575a131a2d202037f0b8f489b9e07bfa22baf943cc13d",
+        "usage_accounting": "excluded_from_scored_usage_dedicated_memory_pipeline_client",
+        "version": "hymem-phase1-extraction-canary-v17"
+      },
+      "facts": null,
+      "facts_extraction": null,
+      "graph_facts_first": false,
+      "graph_multihop": false,
+      "graph_multihop_decay": null,
+      "graph_multihop_max_hops": null,
+      "graph_multihop_min_score": null,
+      "historical_local_judge_prompts_exact_official": false,
+      "hymem_endpoint_origin": "https://pipeline.example",
+      "hymem_endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+      "hymem_model": "pipeline",
+      "hymem_thinking": "off",
+      "indexing_completion_policy": "source-backed-index-with-explicit-summary-degradation-v1",
+      "indexing_max_cycles": 4,
+      "indexing_require_healthy": true,
+      "indexing_timeout_s": 900.0,
+      "judge_endpoint_origin": "https://judge.example",
+      "judge_endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
+      "judge_extra_body_obj": {},
+      "judge_model": "judge",
+      "judge_protocol": "legacy-custom",
+      "judge_transport_retry_policy": "bounded-three-attempt-backoff-v1",
+      "label_free_answer_path": true,
+      "max_input_bytes": 60000,
+      "max_input_tokens": null,
+      "no_dream": false,
+      "official_denominator_validated": false,
+      "official_judge_endpoint_origin": "https://api.openai.com",
+      "official_judge_endpoint_sha256": "sha256:d9617135d6fdd0a2cde722d637a1dfcc3da37515708b3ea5d66ae607c8ac785e",
+      "official_judge_match": false,
+      "official_transport_exact": false,
+      "official_transport_retry_policy": "unbounded-openai-backoff-v1",
+      "permissive_default": false,
+      "prereg": null,
+      "provider_context_tokens": 65536,
+      "rerank_message_hits": null,
+      "rerank_model": null,
+      "rerank_top_k": null,
+      "retrieval_only": false,
+      "retrieval_usage_owner": "none",
+      "rules": null,
+      "rules_extraction": null,
+      "sample": 1,
+      "sample_strategy": "sha256-seed-source-index-preserve-order-v1",
+      "scales": "S",
+      "scored_run": true,
+      "seed": 7,
+      "source_ids_hash": "sha256:190602be17c532f8704d8cf4cae55a8d11dee659b00d167b26b4c0c41eae1411",
+      "source_order_validated": false,
+      "source_qtype_counts": {
+        "multi-session": 1
+      },
+      "subset_run": true,
+      "top_k": 15,
+      "value_supersession": true,
+      "workers": 1
+    },
+    "config_hash": "sha256:34062fe46b90899827a7ef9fc91f0460048c594b82d761054145fe7c3de9b9f2",
+    "data_hash": "sha256:4b42b0f05718d6f739ab7bf97ec8a5c3d8d675a3a436ee56063ed9310a228fae",
+    "development_only": true,
+    "expected_count": 1,
+    "expected_ids_hash": "sha256:190602be17c532f8704d8cf4cae55a8d11dee659b00d167b26b4c0c41eae1411",
+    "exploratory_label_steering": false,
+    "exploratory_non_comparable": true,
+    "label_free_answer_path": true,
+    "model_hash": "sha256:c615cce042b1658bde43c3576c9c86a1ad497344600563f21455b50b7932d956",
+    "models": {
+      "embedding": {
+        "backend": "none",
+        "configured": false,
+        "dimension": null,
+        "fallback_policy": "none",
+        "fallback_reason": null,
+        "identity_exact": true,
+        "network_free": true,
+        "producer_binding": {
+          "declaration": {
+            "kind": "disabled"
+          },
+          "identity_exact": true,
+          "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
+          "reuse_scope": "durable",
+          "schema": "hymem-embedding-producer-binding-v1"
+        },
+        "quality": "none",
+        "reuse_scope": "durable",
+        "schema": "hymem-public-embedding-identity-v1",
+        "transport_security": "none",
+        "vector_space_key": null
+      },
+      "judge": {
+        "endpoint_origin": "https://judge.example",
+        "endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
+        "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+        "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
+        "extra_body": {},
+        "max_tokens": 10,
+        "model": "judge",
+        "n": null,
+        "prompt_exact_official": false,
+        "protocol": "legacy-custom",
+        "provider": "openai-compatible",
+        "retry_policy": "bounded-three-attempt-backoff-v1",
+        "temperature": 0.0,
+        "verdict_parser": "anchored-exclusive-yes-no-local-v1"
+      },
+      "memory_pipeline": {
+        "aggregation_producer": {
+          "declaration": {
+            "client_id": "hymem.contrib.openai_client.OpenAICompatibleClient",
+            "effective_request": {
+              "schema": "hymem-phase1-nested-identity-sha256-v1",
+              "sha256": "sha256:62732fda9c5ed4272f7a2e0af03da9a280ab6347322be3b4b5ecb87e43da7734"
+            },
+            "endpoint_origin": "https://pipeline.example",
+            "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+            "implementation": "sha256:369e75a84adf10ca25b037439f2f61b982433ad851bbe51a80b7c1a601c5e830",
+            "model": "pipeline",
+            "retry_policy": {
+              "schema": "hymem-phase1-nested-identity-sha256-v1",
+              "sha256": "sha256:ca0dd0cb7ac4c1c0c4c088e3f494a42460c166533c80ea9e6143206721bc864e"
+            },
+            "schema": "hymem-aggregation-producer-declaration-v1"
+          },
+          "identity_exact": true,
+          "identity_sha256": "sha256:82140a507a09f1d8468a76c26fbd22db33bbb90125a05151f0cd05a89f3d9e66",
+          "reuse_scope": "durable",
+          "schema": "hymem-phase1-producer-binding-v1"
+        },
+        "deployment_revision_sha256": "sha256:bb5e3948036d1e0ec84a33b16b02d8730709c6586fca6433c55c10bcfd682497",
+        "deployment_tenant_sha256": "sha256:3373a114fe3468218a3db97972b38c3f82f9fd098df5d4438e6de6c36b07c937",
+        "effective_extra_body": {},
+        "endpoint_origin": "https://pipeline.example",
+        "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+        "model": "pipeline",
+        "provider": "openai-compatible",
+        "request_timeout_seconds": 120.0,
+        "thinking_mode": "off",
+        "transport_package_version": "test-openai-1"
+      },
+      "reader": {
+        "endpoint_origin": "https://reader.example",
+        "endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
+        "extra_body": {},
+        "max_tokens": 1024,
+        "model": "reader",
+        "provider": "openai-compatible",
+        "temperature": 0.0
+      }
+    },
+    "official_comparable": false,
+    "official_split": false,
+    "protocol_limitation": "full-set development evidence; may be test-contaminated",
+    "protocol_split": "full",
+    "run_id": "sha256:08c4b07aa4525aab02a1d9efd502c7431ea3674467da3b7177705acf621f615e",
+    "schema": "hymem-benchmark-strict-v1",
+    "scored_run": true,
+    "seed": 7
+  },
+  "models": {
+    "embedding": {
+      "backend": "none",
+      "configured": false,
+      "dimension": null,
+      "fallback_policy": "none",
+      "fallback_reason": null,
+      "identity_exact": true,
+      "network_free": true,
+      "producer_binding": {
+        "declaration": {
+          "kind": "disabled"
+        },
+        "identity_exact": true,
+        "producer_key": "hymem-embedding-producer-v1:78eaa9b51a728dad980f8858b91361e8e2c382ec4d72ad355d1c4155a5ef9167",
+        "reuse_scope": "durable",
+        "schema": "hymem-embedding-producer-binding-v1"
+      },
+      "quality": "none",
+      "reuse_scope": "durable",
+      "schema": "hymem-public-embedding-identity-v1",
+      "transport_security": "none",
+      "vector_space_key": null
+    },
+    "judge": {
+      "endpoint_origin": "https://judge.example",
+      "endpoint_sha256": "sha256:eba5c4c6002cf109a2c7f5633b356895e2b495ecc0d6ace95f23a1c86033910a",
+      "evaluator_commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+      "evaluator_sha256": "sha256:ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
+      "extra_body": {},
+      "max_tokens": 10,
+      "model": "judge",
+      "n": null,
+      "prompt_exact_official": false,
+      "protocol": "legacy-custom",
+      "provider": "openai-compatible",
+      "retry_policy": "bounded-three-attempt-backoff-v1",
+      "temperature": 0.0,
+      "verdict_parser": "anchored-exclusive-yes-no-local-v1"
+    },
+    "memory_pipeline": {
+      "aggregation_producer": {
+        "declaration": {
+          "client_id": "hymem.contrib.openai_client.OpenAICompatibleClient",
+          "effective_request": {
+            "schema": "hymem-phase1-nested-identity-sha256-v1",
+            "sha256": "sha256:62732fda9c5ed4272f7a2e0af03da9a280ab6347322be3b4b5ecb87e43da7734"
+          },
+          "endpoint_origin": "https://pipeline.example",
+          "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+          "implementation": "sha256:369e75a84adf10ca25b037439f2f61b982433ad851bbe51a80b7c1a601c5e830",
+          "model": "pipeline",
+          "retry_policy": {
+            "schema": "hymem-phase1-nested-identity-sha256-v1",
+            "sha256": "sha256:ca0dd0cb7ac4c1c0c4c088e3f494a42460c166533c80ea9e6143206721bc864e"
+          },
+          "schema": "hymem-aggregation-producer-declaration-v1"
+        },
+        "identity_exact": true,
+        "identity_sha256": "sha256:82140a507a09f1d8468a76c26fbd22db33bbb90125a05151f0cd05a89f3d9e66",
+        "reuse_scope": "durable",
+        "schema": "hymem-phase1-producer-binding-v1"
+      },
+      "deployment_revision_sha256": "sha256:bb5e3948036d1e0ec84a33b16b02d8730709c6586fca6433c55c10bcfd682497",
+      "deployment_tenant_sha256": "sha256:3373a114fe3468218a3db97972b38c3f82f9fd098df5d4438e6de6c36b07c937",
+      "effective_extra_body": {},
+      "endpoint_origin": "https://pipeline.example",
+      "endpoint_sha256": "sha256:55abb75360b653f60d5443a237cc9a832c750667fe73aec01eee7e587902f9f8",
+      "model": "pipeline",
+      "provider": "openai-compatible",
+      "request_timeout_seconds": 120.0,
+      "thinking_mode": "off",
+      "transport_package_version": "test-openai-1"
+    },
+    "reader": {
+      "endpoint_origin": "https://reader.example",
+      "endpoint_sha256": "sha256:93782c788c00f369887b01c0ab36005af4b8f77974ffd10bccb5f128f4463ddf",
+      "extra_body": {},
+      "max_tokens": 1024,
+      "model": "reader",
+      "provider": "openai-compatible",
+      "temperature": 0.0
+    }
+  },
+  "per_question": [
+    {
+      "ability_used": null,
+      "benchmark_failure": "indexing_failure:coverage_integrity_failure",
+      "correct": false,
+      "detected_ability": null,
+      "distill_calls": 0,
+      "distill_fired": false,
+      "indexing": {
+        "cleanup_errors": [],
+        "complete": false,
+        "cycles": 1,
+        "elapsed_s": 1.0,
+        "failure": {
+          "code": "coverage_integrity_failure",
+          "exception_type": null
+        },
+        "final_status": {
+          "aggregation_generation": {
+            "enabled": false,
+            "generation_binding": null,
+            "generation_key": null,
+            "identity_exact": null,
+            "producer_identity_sha256": null
+          },
+          "aggregation_material": {
+            "enabled": false,
+            "identity_exact": null,
+            "material_binding": null,
+            "material_epoch_key": null,
+            "material_revision": null
+          },
+          "benchmark_indexing_status_schema": "hymem-benchmark-indexing-status-v4",
+          "coverage_integrity": {
+            "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
+            "details": [
+              {
+                "config_version": "lossless-coverage-integrity-v1|coverage=dream-lossless-message-v1|hash=sha256-role-content-v1|record=hymem-message-jsonl-v1",
+                "failure_reason": "source_stream_invalid",
+                "first_detected_at": "2026-09-05 10:00:00",
+                "last_detected_at": "2026-09-05 10:01:00",
+                "occurrences": 2,
+                "session_id_hash": "sha256:bfa06a6cba57128c60796a31732064556b6a977a6325114dd768c6c79dab01b7"
+              }
+            ],
+            "details_truncated": false,
+            "failures": 1,
+            "reasons": {
+              "source_stream_invalid": 1
+            }
+          },
+          "dream_status_schema": "hymem-dream-status-v8",
+          "in_progress": false,
+          "malformed": {
+            "malformed_digests": 0,
+            "malformed_facts": 0,
+            "malformed_profiles": 0,
+            "malformed_source_materialization": 0,
+            "malformed_summaries": 0
+          },
+          "pending": {
+            "pending_aggregation": 0,
+            "pending_chunk_embeddings": 0,
+            "pending_chunks": 0,
+            "pending_digests": 0,
+            "pending_edge_embeddings": 0,
+            "pending_episode_embeddings": 0,
+            "pending_fact_embeddings": 0,
+            "pending_facts": 0,
+            "pending_message_embeddings": 0,
+            "pending_profiles": 0,
+            "pending_source_materialization": 0
+          },
+          "pending_chunks_authoritative": true,
+          "phase1_backlog_status": "current_producer",
+          "phase1_generation_key": "hymem-phase1-generation-v1:1111111111111111111111111111111111111111111111111111111111111111",
+          "quarantined": {
+            "quarantined_chunks": 0,
+            "quarantined_digests": 0,
+            "quarantined_facts": 0,
+            "quarantined_facts_malformed": 0,
+            "quarantined_profiles": 0
+          },
+          "summary_health": {
+            "malformed_summaries": 0,
+            "summary_degraded_sessions": 0,
+            "summary_healthy": true,
+            "summary_missing_sessions": 0
+          },
+          "terminal_loss": {
+            "chunks": 0,
+            "reasons": {}
+          }
+        },
+        "healthy": false,
+        "max_cycles": 2,
+        "outcome": "failure",
+        "reports": [
+          {
+            "aggregation_blocking": "",
+            "aggregation_build_exceptions": 0,
+            "aggregation_facts_rekey": null,
+            "aggregation_fusion_failures": 0,
+            "aggregation_input_episodes": 0,
+            "aggregation_keying_residual": null,
+            "aggregation_leaf_added": null,
+            "aggregation_leaf_changed": null,
+            "aggregation_leaf_removed": null,
+            "aggregation_level0_missed": null,
+            "aggregation_nodes_built": 0,
+            "aggregation_nodes_reused": 0,
+            "aggregation_predicted_rebuild": null,
+            "aggregation_rebuilt_level0": null,
+            "aggregation_rebuilt_rollup": null,
+            "aggregation_rebuilt_root": null,
+            "budget_exhausted": false,
+            "chunk_extraction_completion_calls": 0,
+            "chunk_extraction_failures": 0,
+            "chunk_extraction_provider_attempts": 0,
+            "chunks_embedded": 0,
+            "chunks_embedded_from_cache": 0,
+            "chunks_processed": 0,
+            "chunks_seen": 0,
+            "coverage_integrity_failures": 1,
+            "digest_failures": 0,
+            "digest_quarantined": 0,
+            "edges_embedded": 0,
+            "edges_embedded_from_cache": 0,
+            "episodes_created": 0,
+            "episodes_embedded": 0,
+            "episodes_embedded_from_cache": 0,
+            "extraction_provider_attempt_budget_exhausted": false,
+            "fact_failures": 0,
+            "facts_embedded": 0,
+            "facts_embedded_from_cache": 0,
+            "facts_extracted": 0,
+            "markers_extracted": 0,
+            "messages_embedded": 0,
+            "messages_embedded_from_cache": 0,
+            "profile_failures": 0,
+            "profile_items_extracted": 0,
+            "rules_extracted": 0,
+            "sessions_processed": 0,
+            "skipped_locked": false,
+            "triples_extracted": 0
+          }
+        ],
+        "schema": "hymem-lme-indexing-summary-v6",
+        "summary_healthy": true,
+        "timeout_s": 10.0
+      },
+      "oracle_ability": "MR",
+      "question_id": "qid",
+      "question_type": "multi-session",
+      "retrieval_only": false
+    }
+  ],
+  "result_digest": "sha256:edd6248addeab5bcd962e4fd0bf1117ee77bb3cfc23fffd981aa11451e0a837a",
+  "scores": {
+    "OVERALL": {
+      "accuracy": 0.0,
+      "count": 1
+    },
+    "multi-session": {
+      "accuracy": 0.0,
+      "count": 1
+    }
+  },
+  "version": "strict-v1"
+}

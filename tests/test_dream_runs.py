@@ -1,0 +1,508 @@
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+
+from hymem import HyMem, HyMemConfig
+from hymem.dreaming.lossless import coverage_chunk_id
+from hymem.extraction.contract import extraction_cache_key
+from hymem.extraction.llm import LLMRequest, StubLLMClient
+from tests.conftest import make_routed_llm
+
+
+def _seed_session(hy) -> str:
+    sid = "s1"
+    hy.open_session(sid)
+    hy.log_message(sid, "assistant", "I'll set up Docker for the local dev environment.")
+    hy.log_message(
+        sid,
+        "user",
+        "No, actually we don't use Docker for local dev anymore. We switched to uv and system Python.",
+    )
+    hy.close_session(sid)
+    return sid
+
+
+def test_dream_persists_run_report(hy):
+    _seed_session(hy)
+    triples = [
+        {"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1},
+    ]
+    markers = [{"kind": "preference", "statement": "user prefers uv"}]
+    hy.set_llm(make_routed_llm(triples, markers))
+
+    report = hy.dream()
+
+    rows = hy.conn.execute(
+        "SELECT * FROM dream_runs ORDER BY id DESC"
+    ).fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["ended_at"] is not None
+    assert row["error"] is None
+    assert row["skipped_locked"] == 0
+    assert row["sessions_processed"] == report.sessions_processed
+    assert row["chunks_seen"] == report.chunks_seen
+    assert row["chunks_processed"] == report.chunks_processed
+    assert row["chunk_extraction_completion_calls"] == (
+        report.chunk_extraction_completion_calls
+    )
+    assert row["chunk_extraction_provider_attempts"] == (
+        report.chunk_extraction_provider_attempts
+    )
+    assert row["extraction_provider_attempt_budget_exhausted"] == int(
+        report.extraction_provider_attempt_budget_exhausted
+    )
+    assert row["coverage_integrity_failures"] == (
+        report.coverage_integrity_failures
+    )
+    assert row["triples_extracted"] == report.triples_extracted
+    assert row["markers_extracted"] == report.markers_extracted
+
+
+def test_dream_persists_digest_counters(hy):
+    """Schema v25: episode creation and digest failures land in dream_runs.
+
+    The 2026-07-30 starvation bug (long-lived sessions never re-digested, so no
+    episode was created for six days) was invisible here — every run reported
+    success with a rising chunks_seen. `episodes_created` makes the stall a run
+    of zeros in the same row, and `digest_failures` counts the calls the runner
+    logs-and-continues past."""
+    import json
+
+    sid = _seed_session(hy)
+    last_mid = hy.conn.execute(
+        "SELECT MAX(id) FROM messages WHERE session_id = ?", (sid,)
+    ).fetchone()[0]
+    episode = {
+        "title": "Dropped Docker for local dev",
+        "summary": "Switched local development from Docker to uv and system Python.",
+        "outcome": "resolved",
+        "key_entities": ["uv", "docker"],
+        "chunk_ids": [coverage_chunk_id(sid, last_mid)],
+    }
+    hy.set_llm(StubLLMClient(
+        fixtures={"Return the JSON object now": json.dumps(
+            {"episodes": [episode], "summary": "", "procedures": []}
+        )},
+        default="[]",
+    ))
+
+    report = hy.dream()
+    row = hy.conn.execute(
+        "SELECT digest_failures, episodes_created FROM dream_runs "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert report.episodes_created == 1
+    assert row["episodes_created"] == 1
+    assert report.digest_failures == 0
+    assert row["digest_failures"] == 0
+
+
+def test_dream_counts_unparseable_digest_as_failure(hy):
+    """An unparseable digest reply is a failure, not an empty session: the
+    counter must fire so a broken tail is visible without reading the log."""
+    _seed_session(hy)
+    hy.set_llm(StubLLMClient(
+        fixtures={"Return the JSON object now": "definitely not json"},
+        default="[]",
+    ))
+
+    report = hy.dream()
+    row = hy.conn.execute(
+        "SELECT digest_failures, episodes_created FROM dream_runs "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert report.digest_failures == 1
+    assert row["digest_failures"] == 1
+    assert row["episodes_created"] == 0
+
+
+def test_dream_persists_aggregation_counters(hy, monkeypatch):
+    # The RAPTOR flip criteria watch the built/reused split per cycle
+    # (benchmarks/raptor_digest_plan.md Stage 3c). build_aggregation_nodes
+    # computes it; the runner must land it in dream_runs (the log.info() it also
+    # emits is dropped on a server without basicConfig). Stub the builder so the
+    # assertion is on the wiring, not the clustering machinery.
+    import dataclasses
+
+    from hymem.api import HyMem
+    from hymem.dreaming import runner as runner_mod
+    from hymem.dreaming.aggregate import AggregationResult
+
+    monkeypatch.setattr(
+        runner_mod, "build_aggregation_nodes",
+        lambda *a, **kw: AggregationResult(
+            nodes=3, reused=2, fusion_failures=1, input_episodes=41,
+            blocking="exact:no_vec_extension",
+        ),
+    )
+
+    enabled = HyMem(
+        dataclasses.replace(hy.config, aggregation_nodes_enabled=True),
+        llm=hy._llm, embedding_client=hy._embed,
+    )
+    try:
+        _seed_session(enabled)
+        report = enabled.dream()
+        assert report.aggregation_nodes_built == 3
+        assert report.aggregation_nodes_reused == 2
+        assert report.aggregation_fusion_failures == 1
+        assert report.aggregation_input_episodes == 41
+        assert report.aggregation_blocking == "exact:no_vec_extension"
+
+        row = enabled.conn.execute(
+            "SELECT aggregation_nodes_built, aggregation_nodes_reused, "
+            "       aggregation_fusion_failures, aggregation_input_episodes, "
+            "       aggregation_blocking "
+            "FROM dream_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row["aggregation_nodes_built"] == 3
+        assert row["aggregation_nodes_reused"] == 2
+        assert row["aggregation_fusion_failures"] == 1
+        assert row["aggregation_input_episodes"] == 41
+        assert row["aggregation_blocking"] == "exact:no_vec_extension"
+    finally:
+        enabled.close()
+
+
+def test_dream_run_skipped_records_lock_skip(hy):
+    _seed_session(hy)
+    hy.conn.execute(
+        "INSERT INTO run_lock(name, acquired_at, holder) "
+        "VALUES ('dreaming', CURRENT_TIMESTAMP, 'other_proc')"
+    )
+
+    report = hy.dream()
+    assert report.skipped_locked is True
+
+    row = hy.conn.execute(
+        "SELECT * FROM dream_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert row["skipped_locked"] == 1
+    assert row["ended_at"] is not None
+
+
+def test_refresh_lock_advances_acquired_at_for_owner(hy):
+    # Seed a lock owned by us, backdated well past the TTL so any movement is
+    # unambiguous, then heartbeat it.
+    from hymem.dreaming.runner import _refresh_lock
+
+    hy.conn.execute(
+        "INSERT INTO run_lock(name, acquired_at, holder) "
+        "VALUES ('dreaming', datetime('now', '-1 hour'), 'me')"
+    )
+    before = hy.conn.execute(
+        "SELECT acquired_at FROM run_lock WHERE name = 'dreaming'"
+    ).fetchone()["acquired_at"]
+
+    _refresh_lock(hy.conn, "me")
+
+    after = hy.conn.execute(
+        "SELECT acquired_at FROM run_lock WHERE name = 'dreaming'"
+    ).fetchone()["acquired_at"]
+    # CURRENT_TIMESTAMP is strictly newer than an hour ago.
+    assert after > before
+    # And it is no longer stale relative to the TTL.
+    stale = hy.conn.execute(
+        "SELECT 1 FROM run_lock WHERE name = 'dreaming' "
+        "AND acquired_at < datetime('now', '-120 seconds')"
+    ).fetchone()
+    assert stale is None
+
+
+def test_refresh_lock_does_not_touch_other_holders_lock(hy):
+    # The holder guard must prevent one process from heartbeating (and thus
+    # resurrecting/stealing) a lock another process owns.
+    from hymem.dreaming.runner import _refresh_lock
+
+    hy.conn.execute(
+        "INSERT INTO run_lock(name, acquired_at, holder) "
+        "VALUES ('dreaming', datetime('now', '-1 hour'), 'owner_A')"
+    )
+    before = hy.conn.execute(
+        "SELECT acquired_at FROM run_lock WHERE name = 'dreaming'"
+    ).fetchone()["acquired_at"]
+
+    from hymem.core import db as core_db
+
+    with pytest.raises(core_db.LeaseOwnershipLost):
+        _refresh_lock(hy.conn, "intruder_B")
+
+    after = hy.conn.execute(
+        "SELECT acquired_at, holder FROM run_lock WHERE name = 'dreaming'"
+    ).fetchone()
+    assert after["acquired_at"] == before  # untouched
+    assert after["holder"] == "owner_A"    # not stolen
+
+
+def _spy_refresh_lock(monkeypatch):
+    """Install a spy over runner._refresh_lock; returns the list of holder args
+    it was called with."""
+    import hymem.dreaming.runner as runner_mod
+
+    calls: list[str] = []
+    real_refresh = runner_mod._refresh_lock
+
+    def _spy(conn, holder):
+        calls.append(holder)
+        return real_refresh(conn, holder)
+
+    monkeypatch.setattr(runner_mod, "_refresh_lock", _spy)
+    return calls
+
+
+def test_dream_heartbeats_lease_at_least_once(hy, monkeypatch):
+    # A live dream must refresh the lease so a slow run never looks stale. The
+    # heartbeat is throttled (default interval), so a fast test dream fires it
+    # at least once — enough to keep acquired_at fresh.
+    _seed_session(hy)
+    hy.set_llm(make_routed_llm(
+        [{"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1}],
+        [],
+    ))
+
+    calls = _spy_refresh_lock(monkeypatch)
+    report = hy.dream()
+
+    assert report.sessions_processed >= 1
+    assert len(calls) >= 1
+
+
+def test_dream_heartbeats_within_a_session_when_interval_elapses(hy, monkeypatch):
+    # The edge case the throttle guards: a single heavy session must heartbeat
+    # *during* its chunk processing, not only at session start. With the
+    # interval forced to 0, every per-chunk heartbeat fires — so a session that
+    # processes at least one chunk produces strictly more than one refresh
+    # (session-top + per-chunk), proving the lease can't age out mid-session.
+    import hymem.dreaming.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "_LOCK_REFRESH_INTERVAL_SECONDS", 0)
+    _seed_session(hy)
+    hy.set_llm(make_routed_llm(
+        [{"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1}],
+        [],
+    ))
+
+    calls = _spy_refresh_lock(monkeypatch)
+    report = hy.dream()
+
+    assert report.chunks_processed >= 1
+    # Session-top heartbeat + at least one per-chunk heartbeat.
+    assert len(calls) >= 2
+
+
+def test_recent_dream_runs_returns_dicts(hy):
+    _seed_session(hy)
+    hy.dream()
+    hy.dream()
+
+    rows = hy.recent_dream_runs(limit=5)
+    assert isinstance(rows, list)
+    assert len(rows) >= 2
+    assert all(isinstance(r, dict) for r in rows)
+    assert rows[0]["id"] > rows[1]["id"]
+    expected_keys = {
+        "id", "started_at", "ended_at",
+        "sessions_processed", "chunks_seen", "chunks_processed",
+        "chunk_extraction_completion_calls",
+        "chunk_extraction_provider_attempts",
+        "extraction_provider_attempt_budget_exhausted",
+        "coverage_integrity_failures",
+        "chunks_embedded", "triples_extracted", "markers_extracted",
+        "aggregation_nodes_built", "aggregation_nodes_reused",
+        "aggregation_fusion_failures", "aggregation_build_exceptions",
+        "aggregation_config_version",
+        "skipped_locked", "error",
+    }
+    assert expected_keys.issubset(rows[0].keys())
+
+
+def test_dream_status_before_any_dream(hy):
+    # Fresh DB: no chunks yet, no dream has run, no lock held.
+    status = hy.dream_status()
+    assert status["pending_chunks"] == 0
+    assert status["coverage_integrity_failures"] == 0
+    assert status["coverage_integrity_failure_reasons"] == {}
+    assert status["coverage_integrity_failure_details"] == []
+    assert status["coverage_integrity_failure_details_truncated"] is False
+    assert status["pending_aggregation"] == int(
+        hy.config.aggregation_nodes_enabled
+    )
+    assert status["aggregation_active_caught_exceptions"] == 0
+    assert status["aggregation_active_fusion_failures"] == 0
+    assert status["aggregation_total_caught_exceptions"] == 0
+    assert status["aggregation_total_fusion_failures"] == 0
+    assert status["total_chunks"] == 0
+    assert status["prompt_version"] == hy.config.prompt_version
+    assert status["extraction_provider_attempt_budget"] == (
+        hy.config.dream_extraction_provider_attempt_budget
+    )
+    assert status["in_progress"] is False
+    assert status["last_run"] is None
+
+
+def test_dream_status_counts_and_last_run(hy):
+    _seed_session(hy)
+    triples = [
+        {"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1},
+    ]
+    hy.set_llm(make_routed_llm(triples, []))
+
+    hy.dream()
+
+    after = hy.dream_status()
+    # The dream created chunks and processed them all for the current version.
+    assert after["total_chunks"] > 0
+    assert after["pending_chunks"] == 0
+    assert after["prompt_version"] == hy.config.prompt_version
+    assert after["in_progress"] is False
+    # last_run is populated and reflects the completed cycle.
+    assert after["last_run"] is not None
+    assert after["last_run"]["ended_at"] is not None
+    assert after["last_run"]["error"] is None
+
+    # Remove one scheduling marker without changing its exact source manifest:
+    # the source-valid chunk is actionable again for this prompt version.
+    chunk_id = hy.conn.execute(
+        "SELECT id FROM chunks WHERE session_id='s1' "
+        "AND chunk_kind='extraction' LIMIT 1"
+    ).fetchone()[0]
+    hy.conn.execute(
+        "DELETE FROM processed_chunks WHERE chunk_id=? AND prompt_version=?",
+        (chunk_id, extraction_cache_key(hy.config.prompt_version)),
+    )
+    hy.conn.commit()
+    bumped = hy.dream_status()
+    assert bumped["total_chunks"] == after["total_chunks"]
+    assert bumped["pending_chunks"] == 1
+
+
+def test_dream_status_pending_drops_after_dream(hy):
+    _seed_session(hy)
+    hy.set_llm(make_routed_llm([], []))
+
+    # A second session whose chunks are created (and processed) by dreaming.
+    sid = "s2"
+    hy.open_session(sid)
+    hy.log_message(sid, "assistant", "We deploy the api to fly_io for staging.")
+    hy.log_message(sid, "user", "Yes, staging runs on fly_io. Keep it that way.")
+    hy.close_session(sid)
+
+    hy.dream()
+    # Every chunk dreaming creates is processed for the current prompt_version.
+    status = hy.dream_status()
+    assert status["total_chunks"] > 0
+    assert status["pending_chunks"] == 0
+
+    # Simulate a prompt_version bump: a HyMem on the same DB but a newer
+    # prompt_version sees the whole backlog as pending again (the surge this
+    # status surface is meant to make transparent).
+    import dataclasses
+
+    from hymem.api import HyMem
+
+    bumped_cfg = dataclasses.replace(
+        hy.config, prompt_version=hy.config.prompt_version + "-next"
+    )
+    hy2 = HyMem(bumped_cfg, llm=hy._llm, embedding_client=hy._embed)
+    try:
+        bumped = hy2.dream_status()
+        assert bumped["prompt_version"] == bumped_cfg.prompt_version
+        assert bumped["pending_chunks"] == bumped["total_chunks"]
+        assert bumped["pending_chunks"] > 0
+    finally:
+        hy2.close()
+
+
+def test_dream_status_in_progress_reflects_lock(hy):
+    _seed_session(hy)
+    assert hy.dream_status()["in_progress"] is False
+
+    hy.conn.execute(
+        "INSERT INTO run_lock(name, acquired_at, holder) "
+        "VALUES ('dreaming', CURRENT_TIMESTAMP, 'other_proc')"
+    )
+    hy.conn.commit()
+    assert hy.dream_status()["in_progress"] is True
+
+
+class _RaisingLLM:
+    def __init__(self, message: str = "boom_llm_failure") -> None:
+        self.message = message
+
+    def complete(self, request: LLMRequest) -> str:
+        raise RuntimeError(self.message)
+
+
+def test_dream_records_error(hy, monkeypatch):
+    _seed_session(hy)
+
+    # Force an exception outside the per-chunk try/except so it propagates.
+    from hymem.dreaming import phase2
+
+    def _boom(*a, **kw):
+        raise RuntimeError("boom_phase2_failure")
+
+    monkeypatch.setattr(phase2, "consolidate_profile", _boom)
+
+    with pytest.raises(RuntimeError, match="boom_phase2_failure"):
+        hy.dream()
+
+    row = hy.conn.execute(
+        "SELECT * FROM dream_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert row["error"] == "execution_failure:RuntimeError"
+    assert "boom_phase2_failure" not in row["error"]
+    assert row["ended_at"] is not None
+
+
+def test_corrupt_quarantine_flags_cannot_starve_digest_or_profile(tmp_path):
+    cfg = dataclasses.replace(
+        HyMemConfig(root=tmp_path / "retry-corruption"),
+        aggregation_nodes_enabled=False,
+        facts_extraction_enabled=False,
+        profile_extraction_enabled=True,
+    )
+    llm = StubLLMClient(
+        fixtures={
+            "typed user-profile facts": '{"items":[]}',
+            "New, not-yet-digested session material": (
+                '{"episodes":[],"summary":"","procedures":[]}'
+            ),
+        },
+        default='{"triples":[],"markers":[],"complete":true}',
+    )
+    hy = HyMem(cfg, llm=llm)
+    try:
+        hy.log_message("poisoned", "user", "I enjoy ordinary walks.")
+        hy.close_session("poisoned")
+        hy.conn.execute(
+            "UPDATE sessions SET digest_retry_count = 0, "
+            "digest_retry_config_version = NULL, digest_quarantined = 1, "
+            "profile_retry_count = 0, profile_retry_config_version = NULL, "
+            "profile_quarantined = 1 WHERE id = 'poisoned'"
+        )
+        status = hy.dream_status()
+        assert status["quarantined_digests"] == 0
+        assert status["quarantined_profiles"] == 0
+
+        report = hy.dream()
+        assert report.digest_failures == 0
+        assert report.profile_failures == 0
+        assert any(
+            "New, not-yet-digested session material" in call.user
+            for call in llm.calls
+        )
+        assert any("typed user-profile facts" in call.system for call in llm.calls)
+        retry_state = hy.conn.execute(
+            "SELECT digest_retry_count, digest_quarantined, "
+            "profile_retry_count, profile_quarantined FROM sessions "
+            "WHERE id = 'poisoned'"
+        ).fetchone()
+        assert tuple(retry_state) == (0, 0, 0, 0)
+    finally:
+        hy.close()

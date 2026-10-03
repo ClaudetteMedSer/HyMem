@@ -1,0 +1,169 @@
+--- a/plugins/memory/honcho/client.py
++++ b/plugins/memory/honcho/client.py
+@@ -18,6 +18,7 @@
+ import logging
+ import hashlib
+ import ipaddress
++import re
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from urllib.parse import urlparse
+@@ -203,6 +204,45 @@
+     return str(value).strip()
+ 
+ 
++def _unique_config_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
++    """Reject ambiguous JSON without including configuration values in errors."""
++    result: dict[str, Any] = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError("Honcho config contains duplicate JSON keys")
++        result[key] = value
++    return result
++
++
++def _validate_session_key_replacements(value: Any) -> dict[str, str]:
++    """Validate exact physical-ID replacements; never coerce or sanitize them."""
++    if not isinstance(value, dict):
++        raise ValueError("sessionKeyReplacements must be a JSON object")
++    result: dict[str, str] = {}
++    for source, target in value.items():
++        if (
++            not isinstance(source, str)
++            or not isinstance(target, str)
++            or re.fullmatch(r"[A-Za-z0-9_-]+", source) is None
++            or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", target) is None
++        ):
++            raise ValueError("sessionKeyReplacements requires exact safe session IDs; targets must be 1-100 characters")
++        result[source] = target
++    if len(set(result.values())) != len(result):
++        raise ValueError("sessionKeyReplacements targets must be unique")
++    if set(result).intersection(result.values()):
++        raise ValueError("sessionKeyReplacements cannot contain self-maps, chains, or cycles")
++    return result
++
++
++def _parse_session_key_replacements(host_obj: dict, root_obj: dict) -> dict[str, str]:
++    """First non-None map wins; an explicit empty host map overrides the root."""
++    source = host_obj.get("sessionKeyReplacements")
++    if source is None:
++        source = root_obj.get("sessionKeyReplacements")
++    return _validate_session_key_replacements({} if source is None else source)
++
++
+ def _parse_dialectic_depth(host_val, root_val) -> int:
+     """Parse dialecticDepth: host wins, then root, then 1. Clamped to 1-3."""
+     for val in (host_val, root_val):
+@@ -454,6 +494,9 @@
+     session_strategy: str = "per-directory"
+     session_peer_prefix: bool = False
+     sessions: dict[str, str] = field(default_factory=dict)
++    # Exact physical session IDs only. Operators must prove targets are fresh;
++    # source sessions and logical gateway keys are never mutated or rebound.
++    session_key_replacements: dict[str, str] = field(default_factory=dict)
+     # Raw global config for anything else consumers need
+     raw: dict[str, Any] = field(default_factory=dict)
+     # True when Honcho was explicitly configured for this host (hosts.hermes
+@@ -461,6 +504,11 @@
+     # stray HONCHO_API_KEY env var.
+     explicitly_configured: bool = False
+ 
++    def __post_init__(self) -> None:
++        self.session_key_replacements = _validate_session_key_replacements(
++            self.session_key_replacements
++        )
++
+     @classmethod
+     def from_env(
+         cls,
+@@ -501,10 +549,22 @@
+             return cls.from_env(host=resolved_host)
+ 
+         try:
+-            raw = json.loads(path.read_text(encoding="utf-8"))
+-        except (json.JSONDecodeError, OSError) as e:
+-            logger.warning("Failed to read %s: %s, falling back to env", path, e)
+-            return cls.from_env(host=resolved_host)
++            raw = json.loads(
++                path.read_text(encoding="utf-8"),
++                object_pairs_hook=_unique_config_object,
++            )
++        except (ValueError, OSError):
++            # Falling back could discard a persistent session retirement and
++            # resume writing to the old key. Do not log configuration contents.
++            raise ValueError("Existing Honcho config is unreadable or invalid; refusing environment fallback") from None
++
++        if not isinstance(raw, dict):
++            raise ValueError("Honcho config must be a JSON object")
++        hosts = raw.get("hosts")
++        if hosts is not None and not isinstance(hosts, dict):
++            raise ValueError("Honcho config hosts must be a JSON object")
++        if isinstance(hosts, dict) and any(not isinstance(block, dict) for block in hosts.values()):
++            raise ValueError("Honcho config host blocks must be JSON objects")
+ 
+         host_block = _host_block(raw, resolved_host)
+         # A hosts.hermes block or explicit enabled flag means the user
+@@ -730,6 +790,7 @@
+             session_strategy=session_strategy,
+             session_peer_prefix=session_peer_prefix,
+             sessions=raw.get("sessions", {}),
++            session_key_replacements=_parse_session_key_replacements(host_block, raw),
+             raw=raw,
+             explicitly_configured=_explicitly_configured,
+         )
+--- a/plugins/memory/honcho/session.py
++++ b/plugins/memory/honcho/session.py
+@@ -11,7 +11,7 @@
+ from datetime import datetime
+ from typing import Any, TYPE_CHECKING
+ 
+-from plugins.memory.honcho.client import get_honcho_client
++from plugins.memory.honcho.client import get_honcho_client, _validate_session_key_replacements
+ 
+ if TYPE_CHECKING:
+     from honcho import Honcho
+@@ -98,6 +98,11 @@
+         self._honcho = honcho
+         self._context_tokens = context_tokens
+         self._config = config
++        # Snapshot validated operator intent for this manager's lifetime. Reload
++        # the config/manager after edits; never change routing under cached work.
++        self._session_key_replacements = _validate_session_key_replacements(
++            getattr(config, "session_key_replacements", {}) if config is not None else {}
++        )
+         self._runtime_user_peer_name = runtime_user_peer_name
+         self._runtime_user_peer_name_alt = runtime_user_peer_name_alt
+         self._cache: dict[str, HonchoSession] = {}
+@@ -389,6 +394,9 @@
+ 
+         # All expensive I/O outside the lock — Honcho's persistence is source of truth
+         honcho_session_id = self._sanitize_id(key)
++        honcho_session_id = self._session_key_replacements.get(
++            honcho_session_id, honcho_session_id
++        )
+         user_peer = self._get_or_create_peer(user_peer_id)
+         assistant_peer = self._get_or_create_peer(assistant_peer_id)
+         honcho_session, existing_messages = self._get_or_create_honcho_session(
+--- a/plugins/memory/honcho/config_schema.py
++++ b/plugins/memory/honcho/config_schema.py
+@@ -171,6 +171,20 @@
+             placeholder='{"key": "session-id"}',
+             group="Session",
+             scope="root",
++        ),
++        ProviderField(
++            key="sessionKeyReplacements",
++            label="Retired session key replacements",
++            kind=KIND_JSON,
++            description="Exact old Honcho storage session ID to fresh session ID mapping. Preserves logical keys and peer identity; never rebinds or modifies old sessions.",
++            info=(
++                "Operator-only recovery: verify every target is unused before enabling. "
++                "Targets must be unique safe IDs of at most 100 characters, with no chains. "
++                "Keep this mapping across restarts and upgrades; deleting it reactivates old keys. "
++                "A non-null host map replaces the entire root map; an empty host map disables it."
++            ),
++            placeholder='{"retired-storage-id": "fresh-storage-id"}',
++            group="Session",
+         ),
+         # — Message writing —
+         ProviderField(

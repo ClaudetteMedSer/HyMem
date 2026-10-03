@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import json
+
+from hymem.extraction.llm import StubLLMClient
+from tests.conftest import make_routed_llm
+
+
+def _seed_session_with_correction(hy):
+    sid = "s1"
+    hy.open_session(sid)
+    hy.log_message(sid, "assistant", "I'll set up Docker for the local dev environment.")
+    hy.log_message(
+        sid,
+        "user",
+        "No, actually we don't use Docker for local dev anymore. We switched to uv and system Python.",
+    )
+    hy.close_session(sid)
+    return sid
+
+
+def test_phase1_extracts_and_writes_evidence(hy):
+    _seed_session_with_correction(hy)
+    triples = [
+        {"subject": "local_dev", "predicate": "uses", "object": "Docker", "polarity": -1},
+        {"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1},
+    ]
+    markers = [{"kind": "preference", "statement": "user prefers uv for Python tooling"}]
+    hy.set_llm(make_routed_llm(triples, markers))
+
+    report = hy.dream()
+    assert report.chunks_processed >= 1
+
+    rows = hy.conn.execute(
+        "SELECT subject_canonical, predicate, object_canonical, pos_evidence, neg_evidence "
+        "FROM knowledge_graph ORDER BY object_canonical"
+    ).fetchall()
+    by_obj = {r["object_canonical"]: r for r in rows}
+    # Both claims cite the correcting USER message, so role weighting applies
+    # independently to positive and negative evidence.
+    assert by_obj["docker"]["neg_evidence"] == 2
+    assert by_obj["docker"]["pos_evidence"] == 0
+    assert by_obj["uv"]["pos_evidence"] == 2
+
+
+def test_phase1_is_idempotent(hy):
+    _seed_session_with_correction(hy)
+    triples = [{"subject": "local_dev", "predicate": "uses", "object": "uv", "polarity": 1}]
+    hy.set_llm(make_routed_llm(triples, []))
+
+    hy.dream()
+    hy.dream()  # second run must not double-count
+    hy.dream()
+
+    row = hy.conn.execute(
+        "SELECT pos_evidence, neg_evidence FROM knowledge_graph WHERE object_canonical='uv'"
+    ).fetchone()
+    assert row["pos_evidence"] == 2
+
+
+def test_phase2_writes_behavioral_profile_and_insights(hy):
+    _seed_session_with_correction(hy)
+    triples = [
+        {"subject": "local_dev", "predicate": "depends_on", "object": "uv", "polarity": 1},
+        {"subject": "ci_pipeline", "predicate": "depends_on", "object": "uv", "polarity": 1},
+    ]
+    markers = [
+        {"kind": "preference", "statement": "user prefers uv for Python tooling"},
+        {"kind": "rejection", "statement": "user avoids Docker for local development"},
+    ]
+    hy.set_llm(make_routed_llm(triples, markers))
+
+    hy.dream()
+
+    user_md = hy.config.user_md_path.read_text(encoding="utf-8")
+    assert "Behavioral Profile" in user_md
+    assert "uv" in user_md or "Docker" in user_md
+
+    memory_md = hy.config.memory_md_path.read_text(encoding="utf-8")
+    assert "Project Insights" in memory_md
+    # Hub query should fire because uv is depended on by 2 subjects.
+    assert "uv" in memory_md
+
+
+def test_phase3_decay_only_affects_re_mentioned_topics(hy):
+    """Stable facts in dormant topics must NOT decay just because time passed."""
+    conn = hy.conn
+    # Old edge that was never re-mentioned in any chunk.
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES ('app', 'uses', 'postgres', 5, 0, datetime('now', '-90 days'))"
+    )
+    # Old edge whose subject is mentioned in a recent chunk without reinforcement.
+    conn.execute(
+        "INSERT INTO sessions(id) VALUES ('s_decay')"
+    )
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, salience_reason, text) "
+        "VALUES ('c1', 's_decay', 1, 1, 'long_user_turn', 'we redesigned the api but didn t change the database choice')"
+    )
+    _publish_recent_mentions(hy, "c1", ["api"])
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES ('api', 'uses', 'fastapi', 5, 0, datetime('now', '-90 days'))"
+    )
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    rows = {
+        (r["subject_canonical"], r["object_canonical"]): r
+        for r in conn.execute(
+            "SELECT subject_canonical, object_canonical, pos_evidence, neg_evidence, status "
+            "FROM knowledge_graph"
+        ).fetchall()
+    }
+    # postgres edge: subject 'app' not mentioned in recent chunk → unchanged.
+    assert rows[("app", "postgres")]["neg_evidence"] == 0
+    # fastapi edge: subject 'api' mentioned recently without reinforcement → decayed.
+    assert rows[("api", "fastapi")]["neg_evidence"] >= 1
+
+
+def test_phase3_negative_dominance_retracts_gray_zone(hy):
+    """Edges where negatives clearly dominate (e.g. pos=1, neg=4) must retract
+    even though their smoothed confidence (0.33) is above retract_threshold."""
+    conn = hy.conn
+    conn.execute("INSERT INTO sessions(id) VALUES ('phase3_counts')")
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES "
+        "('phase3_counts_chunk', 'phase3_counts', 1, 1, 'test', 'legacy evidence')"
+    )
+    from hymem.dreaming import evidence
+
+    def seed_ledger_edge(obj: str, pos: int, neg: int) -> None:
+        edge_id = conn.execute(
+            "INSERT INTO knowledge_graph(subject_canonical, predicate, "
+            "object_canonical, pos_evidence, neg_evidence, last_reinforced) "
+            "VALUES ('hook', 'uses', ?, 0, 0, datetime('now'))",
+            (obj,),
+        ).lastrowid
+        if pos:
+            evidence.record_chunk_evidence(
+                conn, edge_id=edge_id, chunk_id="phase3_counts_chunk",
+                evidence_kind="test_positive", polarity=1,
+                evidence_weight=pos, weight_source="test_fixture",
+            )
+        if neg:
+            evidence.record_chunk_evidence(
+                conn, edge_id=edge_id, chunk_id="phase3_counts_chunk",
+                evidence_kind="test_negative", polarity=-1,
+                evidence_weight=neg, weight_source="test_fixture",
+            )
+
+    # Classic zombie: pos=0, neg=2 — smoothed 0.25, above 0.15 threshold.
+    seed_ledger_edge("nohup_zombie", 0, 2)
+    # Gray-zone: pos=1, neg=4 — smoothed 0.33, above threshold but neg dominates.
+    seed_ledger_edge("nohup_grayzone", 1, 4)
+    # Mixed but not dominated: pos=2, neg=4 — should NOT retract.
+    seed_ledger_edge("mixed_signal", 2, 4)
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    statuses = {
+        r["object_canonical"]: r["status"]
+        for r in conn.execute(
+            "SELECT object_canonical, status FROM knowledge_graph"
+        ).fetchall()
+    }
+    assert statuses["nohup_zombie"] == "retracted"
+    assert statuses["nohup_grayzone"] == "retracted"
+    assert statuses["mixed_signal"] == "active"
+
+
+def test_phase3_retraction_feedback_falls_back_to_negative_evidence(hy):
+    """Auto-retracted zombie edges only have polarity=-1 evidence rows.
+    The audit row must still retain a source rather than silently disappearing.
+    It remains retention data and is never fed back into extraction prompts."""
+    conn = hy.conn
+    conn.execute("INSERT INTO sessions(id) VALUES ('s_zombie')")
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) "
+        "VALUES ('c_zombie', 's_zombie', 1, 1, 'correction_or_preference_trigger', "
+        "'no, the gateway does not run on pid_77')"
+    )
+    cur = conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES ('gateway', 'runs_on', 'pid_77', 0, 0, datetime('now'))"
+    )
+    edge_id = cur.lastrowid
+    from hymem.dreaming import evidence
+    evidence.record_chunk_evidence(
+        conn, edge_id=edge_id, chunk_id="c_zombie",
+        evidence_kind="test_negative", polarity=-1, evidence_weight=2,
+        weight_source="test_fixture",
+    )
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    row = conn.execute(
+        "SELECT extracted_subject, extracted_predicate, extracted_object, "
+        "       chunk_text_snippet, feedback_type "
+        "FROM extraction_feedback"
+    ).fetchone()
+    assert row is not None
+    assert row["extracted_subject"] == "gateway"
+    assert row["extracted_predicate"] == "runs_on"
+    assert row["extracted_object"] == "pid_77"
+    assert row["feedback_type"] == "retracted"
+    assert "pid_77" in row["chunk_text_snippet"]
+
+
+# --- predicate-aware decay (Feature B) -------------------------------------
+
+
+def _publish_recent_mentions(hy, chunk_id, entities):
+    """Publish a minimal exact Phase-1 mention projection for decay tests."""
+    from hymem.core import db as core_db
+    from hymem.dreaming import evidence
+    from hymem.dreaming.phase1_auxiliary import publish_phase1_auxiliaries
+    from hymem.extraction.producer import register_phase1_generation
+
+    conn = hy.conn
+    binding = hy._phase1_generation
+    assert binding is not None
+    generation_key = binding["generation_key"]
+    cache_key = binding["extraction_cache_key"]
+    with core_db.transaction(conn):
+        register_phase1_generation(conn, binding)
+        with core_db.evidence_mutation(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO kg_claim_extraction_outcomes("
+                "chunk_id,prompt_version,prompt_generation,result_hash,"
+                "phase1_generation_key) VALUES (?,?,?,?,?)",
+                (
+                    chunk_id,
+                    cache_key,
+                    evidence.prompt_generation(cache_key),
+                    evidence.claim_result_hash([]),
+                    generation_key,
+                ),
+            )
+        publish_phase1_auxiliaries(
+            conn,
+            chunk_id=chunk_id,
+            phase1_generation_key=generation_key,
+            extraction_cache_key=cache_key,
+            entity_type_hints={},
+            entity_property_hints={},
+            entity_mentions=entities,
+            markers=[],
+        )
+        conn.execute(
+            "INSERT INTO processed_chunks("
+            "chunk_id,prompt_version,phase1_generation_key) VALUES (?,?,?)",
+            (chunk_id, cache_key, generation_key),
+        )
+
+
+def _seed_aged_edge_with_recent_mention(hy, subject, predicate, obj, days_ago):
+    """Seed an active edge last reinforced `days_ago` days ago plus a fresh
+    chunk that mentions both endpoints (without producing kg_evidence), so the
+    decay recency probe sees a re-mention."""
+    conn = hy.conn
+    conn.execute("INSERT OR IGNORE INTO sessions(id) VALUES ('s_pred')")
+    chunk_id = f"c_{subject}_{obj}"
+    conn.execute(
+        "INSERT INTO chunks(id, session_id, start_message_id, end_message_id, "
+        "salience_reason, text) VALUES (?, 's_pred', 1, 1, 'long_user_turn', "
+        "'still discussing it today')",
+        (chunk_id,),
+    )
+    _publish_recent_mentions(hy, chunk_id, [subject, obj])
+    conn.execute(
+        "INSERT INTO knowledge_graph(subject_canonical, predicate, object_canonical, "
+        "pos_evidence, neg_evidence, last_reinforced) "
+        "VALUES (?, ?, ?, 5, 0, datetime('now', ?))",
+        (subject, predicate, obj, f"-{days_ago} days"),
+    )
+
+
+def _neg_by_pair(conn):
+    return {
+        (r["subject_canonical"], r["object_canonical"]): r["neg_evidence"]
+        for r in conn.execute(
+            "SELECT subject_canonical, object_canonical, neg_evidence "
+            "FROM knowledge_graph"
+        ).fetchall()
+    }
+
+
+def test_phase3_decay_is_predicate_aware(hy):
+    """With both edges reinforced 60 days ago and re-mentioned now, the
+    volatile `uses` edge (30-day window) accrues a negative while the sticky
+    `prefers` edge (90-day window) stays protected."""
+    conn = hy.conn
+    _seed_aged_edge_with_recent_mention(hy, "user", "prefers", "uv", days_ago=60)
+    _seed_aged_edge_with_recent_mention(hy, "gateway", "uses", "ruff", days_ago=60)
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    neg = _neg_by_pair(conn)
+    assert neg[("gateway", "ruff")] >= 1, "volatile 'uses' edge should decay"
+    assert neg[("user", "uv")] == 0, "sticky 'prefers' edge should be protected"
+
+
+def test_phase3_depends_on_protected_longer_than_uses(hy):
+    """Structural `depends_on` (60d window) survives a re-mention at 40 days
+    while volatile `uses` (default 30d) decays — dependencies shouldn't accrue
+    soft-contradiction negatives before they're reinforced."""
+    conn = hy.conn
+    _seed_aged_edge_with_recent_mention(hy, "app", "depends_on", "redis", days_ago=40)
+    _seed_aged_edge_with_recent_mention(hy, "gateway", "uses", "kafka", days_ago=40)
+
+    from hymem.dreaming.phase3 import decay
+    decay(conn, hy.config)
+
+    neg = _neg_by_pair(conn)
+    assert neg[("app", "redis")] == 0, "depends_on should be protected at 40d"
+    assert neg[("gateway", "kafka")] >= 1, "uses should decay at 40d"
+
+
+def test_phase3_decay_falls_back_to_default_window(hy):
+    """An empty predicate_half_life_days map collapses to the single global
+    decay_window_days schedule — `prefers` then decays like any other edge."""
+    import dataclasses
+
+    conn = hy.conn
+    _seed_aged_edge_with_recent_mention(hy, "user", "prefers", "uv", days_ago=60)
+
+    cfg = dataclasses.replace(hy.config, predicate_half_life_days={})
+    from hymem.dreaming.phase3 import decay
+    decay(conn, cfg)
+
+    neg = _neg_by_pair(conn)
+    assert neg[("user", "uv")] >= 1, "with no per-predicate window, prefers decays"

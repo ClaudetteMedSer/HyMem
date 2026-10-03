@@ -1,0 +1,840 @@
+from __future__ import annotations
+
+from hymem.contrib.implementation_identity import import_time_source_sha256
+from hymem.dreaming.summary_policy import SUMMARY_OVERVIEW_POLICY
+
+EXTRACTION_IMPLEMENTATION_SHA256 = import_time_source_sha256(__file__)
+
+# Prompts stay in code and Phase-1 derives its durable cache namespace from the
+# rendered bytes plus validator/recovery behavior. ``prompt_version`` remains a
+# human generation label; bump it for an intentional protocol generation, but
+# an omitted bump can no longer make changed extraction code reuse stale rows.
+
+ALLOWED_PREDICATES = (
+    "uses",
+    "depends_on",
+    "prefers",
+    "rejects",
+    "avoids",
+    "replaces",
+    "conflicts_with",
+    "deploys_to",
+    "part_of",
+    "equivalent_to",
+    "implements",
+    "contains",
+    "configured_with",
+    "requires_version",
+    "runs_on",
+    "connects_to",
+    "generates",
+    "tested_by",
+    # Personal-life value facts (added v9): the KU-coverage gap was that these
+    # classes — possessions, residence, activities/habits, personal metrics —
+    # had no expressible predicate, so the value never reached the graph.
+    "owns",
+    "located_in",
+    "participates_in",
+    "has_attribute",
+)
+
+# Retraction records are durable audit evidence, not prompt instructions.
+# Keeping this policy explicit and contract-bound prevents a future refactor
+# from silently reintroducing store-derived text into a system prompt.
+EXTRACTION_FEEDBACK_PROMPT_POLICY_VERSION = (
+    "hymem-extraction-feedback-audit-only-v1"
+)
+
+_TRIPLE_SYSTEM_TEMPLATE = """You extract structured technical relationships and personal-life facts from conversation excerpts.
+
+Rules:
+- Output a strict JSON array. No prose, no markdown, no code fences.
+- Each item has exactly: subject (string), predicate (string), object (string), polarity (1 or -1).
+- Optional fields (include only when applicable):
+    value_text (string): numeric value, version string, or quantity mentioned
+    value_numeric (number): parsed numeric value if available
+    value_unit (string): unit for numeric values ("seconds", "MB", "rps")
+    temporal_scope (string): time context ("since 2024", "during migration", "temporarily")
+- Optionally include subject_type and object_type (string) to classify entities:
+    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, place, organization, product, vehicle, activity, event, document, or_other_entity
+- Include these types ONLY when you are confident. Skip them otherwise.
+- Optionally include subject_properties and/or object_properties (object of
+  string->string pairs) to capture stable attributes of the entity, e.g.
+  {{"language": "python", "category": "build_tool", "runtime": "node"}}.
+  Keep keys short and lowercase (language, runtime, category, vendor, role).
+  At most 4 properties per entity; skip when not clearly stated.
+- predicate MUST be one of: {predicates}.
+- Predicate meanings:
+    uses: A employs or utilizes B
+    depends_on: A requires B to function
+    prefers: A favors B over alternatives
+    rejects: A explicitly refuses or negates B
+    avoids: A steers clear of B
+    replaces: A supersedes or substitutes B
+    conflicts_with: A is incompatible with B
+    deploys_to: A is deployed or released to B
+    part_of: A is a component or sub-part of B
+    equivalent_to: A is synonymous or interchangeable with B
+    implements: A realizes or fulfills interface/contract/spec B
+    contains: A holds, owns, or includes B as a subcomponent
+    configured_with: A is parameterized or set up using B
+    requires_version: A needs a specific version of B
+    runs_on: A executes or operates on platform/runtime B
+    connects_to: A has a network or data-flow connection to B
+    generates: A produces, outputs, or creates B
+    tested_by: A is tested or verified using B
+    owns: A owns or possesses B (a vehicle, home, device, or other belonging)
+    located_in: A lives in, is located in, or is based in place B
+    participates_in: A does, plays, practices, attends, or is enrolled in activity/event B (put frequency or schedule in temporal_scope)
+    has_attribute: A has the personal attribute or measurement B (age, height, weight, salary, a rate); state the value as the object (e.g. 60_bpm) and also in value_numeric/value_unit when numeric
+- polarity is -1 only when the speaker negates or retracts the relationship
+  ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
+  Mapping for negations: "no longer uses" -> uses with polarity -1.
+  Statements like "we avoid X" use predicate 'avoids' with polarity 1, NOT 'uses' with -1.
+- Skip relationships you are not confident about. An empty array [] is a valid answer.
+- Subject and object should be concrete named things — tools, libraries, services,
+  files, modules, environments, people, teams, projects, or codebases by name, AND
+  the user's personal-life things: possessions, places they live, activities they
+  do, events they attend, and personal attributes.
+  Do not invent abstractions like "the system".
+- When a chunk names a person or team alongside a project, codebase, or artifact
+  they own, work on, or belong to, extract the linking edge explicitly. This is
+  high-priority: identity-to-artifact links are the most underrepresented and
+  most useful triples in the graph. Strong examples (extract eagerly when the
+  chunk supports them):
+    "Atta is working on MedFlow"                   -> (atta, part_of, medflow)
+    "I'm building HyMem"                            -> (atta, part_of, hymem)
+    "We use HyMem for the memory layer"             -> (atta, uses, hymem)
+    "The platform team owns the auth service"       -> (platform_team, contains, auth_service)
+    "Sara maintains the ingest pipeline"            -> (sara, part_of, ingest_pipeline)
+  When the speaker is the user themselves ("I'm working on X", "we shipped Y"),
+  resolve the implicit subject to the user's canonical name when known from
+  context; otherwise use a first-person handle and let canonicalization resolve
+  it. Do NOT skip these just because the speaker is implicit.
+  This makes identity-to-artifact relationships queryable as 1-hop graph edges
+  rather than fuzzy text matches across sibling canonicals.
+- Personal-life facts about the user are EQUALLY high-priority — possessions,
+  where they live, activities and habits, and personal attributes. Extract them
+  with the same eagerness as technical facts, resolving an implicit first-person
+  subject ("I", "we", "my") to the user's canonical name when known:
+    "I drive a Ford F-150"             -> (user, owns, ford_f_150)
+    "We just moved to Austin"           -> (user, located_in, austin)
+    "I play tennis every Tuesday"       -> (user, participates_in, tennis)   [temporal_scope: "every Tuesday"]
+    "My resting heart rate is 60 bpm"   -> (user, has_attribute, 60_bpm)     [value_numeric: 60, value_unit: "bpm"]
+  Updates to these (a new car, a move, a changed metric) are exactly the
+  knowledge-update facts the graph must capture — never skip them as "not technical".
+- Excerpts may be written in languages other than English (e.g. Dutch, German,
+  French, Spanish). Extract relationships regardless; keep subject and object in
+  the original language as they appear in the text.
+"""
+
+
+def build_triple_system() -> str:
+    """Build the deterministic standalone triple-extraction system prompt."""
+    return _TRIPLE_SYSTEM_TEMPLATE.format(
+        predicates=", ".join(ALLOWED_PREDICATES),
+    )
+
+
+TRIPLE_SYSTEM = build_triple_system()
+
+
+TRIPLE_USER_TEMPLATE = """Excerpt:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON array now."""
+
+
+MARKER_SYSTEM = """You identify EXPLICIT behavioral signals from a user in a conversation excerpt.
+
+Only include signals that are stated outright. Do NOT infer mood or sentiment.
+Excerpts may be in languages other than English; identify signals regardless.
+
+Allowed kinds:
+- correction: user told the assistant it was wrong about something specific.
+- preference: user explicitly stated they like / want / use approach X.
+- rejection: user explicitly stated they dislike / refuse / will not use X.
+- style: user explicitly asked for a way of communicating (verbosity, format, tone).
+
+Output a strict JSON array. Each item: {"kind": "...", "statement": "..."}.
+'statement' is a single short factual sentence, not a quote.
+Empty array [] is valid."""
+
+
+MARKER_USER_TEMPLATE = """Excerpt:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON array now."""
+
+
+# --- Combined per-chunk extraction (triples + markers in one call) ----------
+# One contract returns a JSON OBJECT with both "triples" and "markers". The
+# primary and its bounded omission check both use this contract, avoiding
+# separate triple/marker calls within either pass. The rules below are the
+# verbatim triple and marker rules from the separate prompts above; only the
+# output container changes (object with two arrays plus completeness). The
+# distinctive substrings "structured technical relationships" and "EXPLICIT
+# behavioral signals" are preserved for prompt routing in tests.
+
+PREDICATE_GROUNDING_VERSION = "hymem-predicate-grounding-v1"
+
+_CHUNK_EXTRACTION_SYSTEM_TEMPLATE = """You extract structured technical relationships, personal-life facts, and EXPLICIT behavioral signals from a conversation excerpt in a single pass.
+
+Work source record by source record, sentence by sentence:
+1. Identify only explicitly supported candidate relationships and behavioral signals.
+2. Remove alternate phrasings and inferred/transitive claims.
+3. Check that every retained claim cites the one source record that states it.
+4. Set `complete` true only after checking the ENTIRE excerpt and fitting every
+   retained item within the limits below.
+
+Output a strict JSON OBJECT (not an array). No prose, no markdown, no code fences.
+The object has exactly these three keys:
+
+"triples": a JSON array of relationship items. Each item has exactly: subject
+(string), predicate (string), object (string), polarity (1 or -1), and
+source_message_id (integer).
+- The excerpt is a sequence of JSON source-message records. Copy
+  source_message_id exactly from the ONE record that directly states or
+  retracts this claim. Never invent an id and never cite surrounding context.
+- When two different records assert the same claim, emit one item per source
+  record. When different records disagree, preserve both source-specific
+  claims with their respective polarities. Never emit the same claim twice for
+  the same source_message_id.
+- Optional fields (include only when applicable):
+    value_text (string): numeric value, version string, or quantity mentioned
+    value_numeric (number): parsed numeric value if available
+    value_unit (string): unit for numeric values ("seconds", "MB", "rps")
+    temporal_scope (string): time context ("since 2024", "during migration", "temporarily")
+- Optionally include subject_type and object_type (string) to classify entities:
+    language, framework, database, service, tool, library, file, environment, protocol, container, package_manager, api, platform, config_file, testing_framework, ci_tool, monitoring_tool, identity_provider, message_broker, person, team, project, codebase, place, organization, product, vehicle, activity, event, document, or_other_entity
+- Include these types ONLY when you are confident. Skip them otherwise.
+- Optionally include subject_properties and/or object_properties (object of
+  string->string pairs) to capture stable attributes of the entity, e.g.
+  {{"language": "python", "category": "build_tool", "runtime": "node"}}.
+  Keep keys short and lowercase (language, runtime, category, vendor, role).
+  At most 4 properties per entity; skip when not clearly stated.
+- predicate MUST be one of: {predicates}.
+- Predicate meanings:
+    uses: A employs or utilizes B
+    depends_on: A requires B to function
+    prefers: A favors B over alternatives
+    rejects: A explicitly refuses or negates B
+    avoids: A steers clear of B
+    replaces: A supersedes or substitutes B
+    conflicts_with: A is incompatible with B
+    deploys_to: A is deployed or released to B
+    part_of: A is a component or sub-part of B
+    equivalent_to: A is synonymous or interchangeable with B
+    implements: A realizes or fulfills interface/contract/spec B
+    contains: A holds, owns, or includes B as a subcomponent
+    configured_with: A is parameterized or set up using B
+    requires_version: A needs a specific version of B
+    runs_on: A executes or operates on platform/runtime B
+    connects_to: A has a network or data-flow connection to B
+    generates: A produces, outputs, or creates B
+    tested_by: A is tested or verified using B
+    owns: A owns or possesses B (a vehicle, home, device, or other belonging)
+    located_in: A lives in, is located in, or is based in place B
+    participates_in: A does, plays, practices, attends, or is enrolled in activity/event B (put frequency or schedule in temporal_scope)
+    has_attribute: A has the personal attribute or measurement B (age, height, weight, salary, a rate); state the value as the object (e.g. 60_bpm) and also in value_numeric/value_unit when numeric
+- Predicate grounding ({predicate_grounding_version}): support each predicate
+  independently from the cited source record. A preference does not establish
+  use, ownership, or deployment; use does not establish preference. Intent,
+  recommendations, and hypotheses do not establish actual adoption. Preserve
+  both predicates when each is supported, including implicit language that
+  clearly entails the relationship. Preserve exact positive and negative
+  claims from their respective sources.
+- polarity is -1 only when the speaker negates or retracts the relationship
+  ("we don't use X anymore", "we stopped using X", "we replaced X with Y").
+  Mapping for negations: "no longer uses" -> uses with polarity -1.
+  Statements like "we avoid X" use predicate 'avoids' with polarity 1, NOT 'uses' with -1.
+- Skip relationships you are not confident about. If no relationship is
+  supported, return an empty `triples` array inside the exact three-key object;
+  never return a top-level array, and always include the boolean `complete`
+  certificate.
+- Subject and object should be concrete named things — tools, libraries, services,
+  files, modules, environments, people, teams, projects, or codebases by name, AND
+  the user's personal-life things: possessions, places they live, activities they
+  do, events they attend, and personal attributes.
+  Do not invent abstractions like "the system".
+- Extract a person, team, project, or component link when the cited source
+  record supports that specific predicate. Examples with direct support:
+    "Atta uses HyMem to organize notes"             -> (atta, uses, hymem)
+    "Sara is a member of the Atlas team"             -> (sara, part_of, atlas_team)
+    "The parser module is part of Atlas"            -> (parser_module, part_of, atlas)
+    "The Atlas package contains the parser module"  -> (atlas_package, contains, parser_module)
+  Working on, building, or maintaining a project alone does not establish
+  part_of: the source must establish a membership or component relation,
+  including clearly entailed implicit wording. A team's ownership or
+  responsibility for a service alone does not establish contains: the source
+  must establish that A includes B as a subcomponent, including clearly
+  entailed implicit wording.
+  Do not infer either component predicate from mere collaboration or stewardship.
+  Counterexamples: "Sara maintains Atlas as an external contractor" and
+  "I'm building Atlas for a client" do not establish part_of;
+  "The platform team owns the auth service" does not establish contains.
+  When the speaker is the user themselves ("I'm using X", "we use Y"),
+  resolve the implicit subject to the user's canonical name when known from
+  context; otherwise use a first-person handle and let canonicalization resolve
+  it. Do NOT skip these just because the speaker is implicit.
+- Personal-life facts about the user are EQUALLY high-priority — possessions,
+  where they live, activities and habits, and personal attributes. Extract them
+  with the same eagerness as technical facts, resolving an implicit first-person
+  subject ("I", "we", "my") to the user's canonical name when known:
+    "I own a Ford F-150"               -> (user, owns, ford_f_150)
+    "We just moved to Austin"           -> (user, located_in, austin)
+    "I play tennis every Tuesday"       -> (user, participates_in, tennis)   [temporal_scope: "every Tuesday"]
+    "My resting heart rate is 60 bpm"   -> (user, has_attribute, 60_bpm)     [value_numeric: 60, value_unit: "bpm"]
+  Driving a vehicle alone does not establish owns; a driver may not possess it.
+  For example, "I drive a rented Ford F-150" does not establish owns.
+  Updates to these (a new car, a move, a changed metric) are exactly the
+  knowledge-update facts the graph must capture — never skip them as "not technical".
+- Excerpts may be written in languages other than English (e.g. Dutch, German,
+  French, Spanish). Extract relationships regardless; keep subject and object in
+  the original language as they appear in the text.
+
+"markers": a JSON array of EXPLICIT behavioral signals from the user. Each item: {{"kind": "...", "statement": "..."}}.
+- Only include signals that are stated outright. Do NOT infer mood or sentiment.
+- Excerpts may be in languages other than English; identify signals regardless.
+- Allowed kinds:
+    correction: user told the assistant it was wrong about something specific.
+    preference: user explicitly stated they like / want / use approach X.
+    rejection: user explicitly stated they dislike / refuse / will not use X.
+    style: user explicitly asked for a way of communicating (verbosity, format, tone).
+- 'statement' is a single short factual sentence, not a quote.
+
+"complete": a boolean completeness certificate for this exact excerpt.
+- Return true only when every source record was checked and ALL supported items
+  are present in the arrays.
+- Return FEWER THAN 24 triples and FEWER THAN 12 markers. Counts of exactly 24
+  or 12 are reserved saturation signals and the caller will subdivide even if
+  you say complete. If all supported items do not fit below those boundaries,
+  do NOT return a selected/partial subset: return empty arrays and
+  `complete: false`. The caller will safely subdivide the source records.
+- A fragment record carries `source_content_start` and `source_content_end` as
+  absolute character offsets into its original source message. Treat the
+  fragment as the excerpt, but continue to cite its unchanged source_message_id.
+- A table continuation may additionally carry `source_fragment_context`.
+  Its separately labelled `content` is an exact earlier header slice from the
+  same source record: header+delimiter for a canonical Markdown table, or a
+  single header with an explicit bracketed unit for every numeric column when
+  `kind` is `unit_numeric_table_header` or
+  `introduced_unit_numeric_table_header`. Use the labels and units only to
+  interpret owned rows before `applies_through_source_content_end`. The header
+  is context, not fragment evidence: never extract an item supported only by
+  the repeated header. For either `introduced_*` kind, the separately labelled
+  `prelude_content` is an exact earlier ATX/Setext heading or colon-led
+  paragraph from that source. Use it only to interpret covered rows; never
+  extract an item supported only by the repeated prelude.
+- A right-hand prose continuation may carry `source_boundary_context`. Its
+  separately labelled `content` is an exact, bounded suffix immediately before
+  `source_content_start` in the same source message. Use it only to finish a
+  relationship or signal whose support crosses that exact boundary and whose
+  authoritative fragment `content` contributes indispensable support before
+  `applies_through_source_content_end`. The preceding context does not own
+  items: never return a triple or marker stated wholly in it, and never repeat
+  such an item from the preceding fragment. Do not join it to later fragment
+  text beyond the applicability end. A boundary-spanning triple still cites
+  the unchanged source_message_id of this same source message.
+- A preceding conversational turn may appear as a separate JSON record with
+  `source_record_version: hymem-claim-context-v1` and `source_context_only: true`.
+  It is interpretation context, NEVER an owned source or an independent item.
+  Use its exact content, role, and peer only to interpret a confirmation,
+  correction, or reference in the owned `context_for_source_message_id` before
+  `applies_through_source_content_end`. That owned record must contribute
+  indispensable support. Never return a triple or marker stated wholly in a
+  context-only record, even relabelled with an owned ID. Never cite a context
+  record's source_message_id. A question, suggestion, or assistant assertion
+  alone is not a user fact. Cite the owned confirming/correcting record, and
+  check completeness only for owned records. These rules apply equally to
+  primary, empty-verification, and omission-verification passes.
+  A context-only table tail may retain `source_fragment_context`: use its
+  exact header and prelude only to interpret that table tail, still never as
+  independently owned evidence.
+
+Always return all three keys. Empty arrays are valid when the checked excerpt
+contains no supported item. Example shape:
+{{"triples": [], "markers": [], "complete": true}}
+"""
+
+
+def build_chunk_extraction_system() -> str:
+    """Build the deterministic combined triples+markers system prompt."""
+    return _CHUNK_EXTRACTION_SYSTEM_TEMPLATE.format(
+        predicates=", ".join(ALLOWED_PREDICATES),
+        predicate_grounding_version=PREDICATE_GROUNDING_VERSION,
+    )
+
+
+CHUNK_EXTRACTION_SYSTEM = build_chunk_extraction_system()
+
+
+_CHUNK_OMISSION_VERIFICATION_SUFFIX = """
+
+OMISSION VERIFICATION PASS:
+- Re-read the ENTIRE excerpt, source record by source record and sentence by
+  sentence, specifically looking for supported items omitted from the
+  ALREADY ACCEPTED RESULT.
+- Return ONLY missed supported triples and markers. Do not intentionally
+  repeat an already accepted item. The caller will deterministically dedupe an
+  accidental exact repeat, but a contradictory repeat fails the whole unit.
+- The ALREADY ACCEPTED RESULT is comparison context only. It is not evidence.
+  Every returned item must still be explicitly supported by the excerpt, and
+  every triple must cite the exact source_message_id of the record that states
+  it.
+- `complete` certifies this omission check, not the primary pass. Set it true
+  only after checking the entire excerpt and fitting every missed item below
+  the declared array limits. If the check is incomplete or missed items do not
+  fit, return empty arrays with `complete: false`.
+"""
+
+_CHUNK_EMPTY_VERIFICATION_SUFFIX = (
+    "\nEMPTY VERIFICATION PASS: deterministic wording in this excerpt may state "
+    "an explicit relationship or behavioral signal. Re-read every source "
+    "record sentence by sentence. Return a clean empty only if none of the "
+    "allowed items is explicitly supported."
+)
+
+
+def build_chunk_empty_verification_system() -> str:
+    """Build the exact whole-unit clean-empty verification prompt."""
+    return build_chunk_extraction_system() + (
+        _CHUNK_EMPTY_VERIFICATION_SUFFIX
+    )
+
+
+def build_chunk_omission_verification_system() -> str:
+    """Build the one-shot non-empty omission-check prompt."""
+    return (
+        build_chunk_extraction_system()
+        + _CHUNK_OMISSION_VERIFICATION_SUFFIX
+    )
+
+
+CHUNK_EXTRACTION_USER_TEMPLATE = """Excerpt:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object with "triples", "markers", and "complete" now."""
+
+
+CHUNK_OMISSION_VERIFICATION_USER_TEMPLATE = """Excerpt (the exact same source records as the primary pass):
+\"\"\"
+{text}
+\"\"\"
+
+ALREADY ACCEPTED RESULT (comparison context only; return only supported omissions):
+{accepted}
+
+Return the JSON object with only MISSED "triples" and "markers", plus
+"complete", now."""
+
+
+EPISODE_SYSTEM = """You identify distinct episodes within a conversation session.
+
+An episode is a coherent segment focused on one topic, problem, or task. A session may have multiple episodes.
+
+Each chunk in the input is tagged like `[chunk chk_abc123]` — the chunk id appears in square brackets before its text. When you group chunks into an episode you MUST return the exact chunk ids you used; downstream code reads them to look up the message range.
+
+Output a strict JSON array. Each item:
+- title (string): Short descriptive name, max 8 words
+- summary (string): 1-2 sentence narrative of what happened
+- outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear
+- key_entities (list of strings): Named tools, services, files, or concepts discussed
+- chunk_ids (list of strings): The `chk_...` ids you grouped, in conversation order. Must be non-empty and contain only ids that appear in the input.
+
+Empty array [] is valid if the conversation has no clear episodes.
+"""
+
+EPISODE_USER_TEMPLATE = """Conversation session:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON array now."""
+
+
+AGGREGATE_SYSTEM = """You fuse several related episodes — drawn from DIFFERENT conversation sessions but about the same ongoing thread, person, project, or topic — into one cross-session summary.
+
+The point is synthesis: a later question may need facts that are scattered one-per-session ("which of my projects use Postgres?", "how did my budget change over the year?"). Pull the through-line together so it can be answered from this one node instead of re-reading every session.
+
+Output a strict JSON object:
+- title (string): Short name for the shared thread, max 8 words
+- summary (string): 2-4 sentences fusing what these episodes collectively establish. Preserve specific named entities, numbers, dates, and changes-over-time; prefer concrete facts over generic narration. Do NOT invent anything not present in the episodes. Never state a name, employer, role, or location unless an episode literally states it — omit absent identity details, do not fill them in. Do NOT add "The user"/"The assistant" — use passive voice or implicit subject.
+
+Return ONLY the JSON object."""
+
+AGGREGATE_USER_TEMPLATE = """Related episodes from across sessions:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
+ROLLUP_SYSTEM = """You merge several summaries of conversation threads — which may be related or COMPLETELY UNRELATED — into one combined summary that loses no thread.
+
+This is an intermediate node of a summary tree over a user's whole conversation history; your output will be merged again at the next level, so BREADTH beats narrative. The one failure mode to avoid: picking the dominant topic and letting the others fade — a thread dropped here is gone from every level above. Do NOT force a single story line over unrelated topics.
+
+Output a strict JSON object:
+- title (string): Short label naming the main topics (not just one), max 10 words
+- summary (string): 3-8 sentences. Every distinct thread in the inputs must be mentioned at least once; give recurring threads more words, but never zero. Preserve specific named entities, numbers, and dates. Do NOT invent anything not present in the inputs. Never state a name, employer, role, or location unless an input literally states it — omit absent identity details, do not fill them in.
+
+Return ONLY the JSON object."""
+
+ROLLUP_USER_TEMPLATE = """Thread summaries to merge (possibly unrelated):
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
+DIGEST_SYSTEM = """You write the standing digest of everything known about a user from their conversation history — the top of a summary tree whose inputs below are themselves summaries of conversation threads.
+
+This digest answers "what do you know about me?" at a glance and is injected as standing context for an assistant, so it must read like a rounded profile, not a recap of the latest topic: the main recurring activities and projects with their state, preferences and habits, recurring people and places, and notable changes over time. Favor durable facts over one-off details.
+
+Identity is strictly evidence-bound: include the user's name, role, employer, or location ONLY when the VERIFIED FACTS block or a summary literally states them. A profile with no job title is correct; a plausible-sounding invented one ("works at Acme Corp") is the worst possible failure — when an identity detail is absent from the inputs, OMIT it entirely.
+
+The VERIFIED FACTS block holds statements extracted directly from the user's conversations into a knowledge graph. Treat it as ground truth: when a thread summary conflicts with a verified fact, the fact wins and the summary's claim is dropped. Thread summaries are themselves machine-generated and may contain compression errors — be suspicious of identity or preference claims that appear in only one summary and in no verified fact.
+
+Output a strict JSON object:
+- title (string): Short label for the digest, max 8 words
+- summary (string): 6-12 sentences. Cover EVERY distinct thread in the inputs at least briefly — breadth first, then depth on the threads that recur most. Preserve specific named entities, numbers, and dates; prefer concrete facts over generic narration. Unrelated threads get their own sentence rather than a forced story. Do NOT invent anything not present in the inputs.
+
+Return ONLY the JSON object."""
+
+DIGEST_USER_TEMPLATE = """VERIFIED FACTS (knowledge graph — ground truth, trust over the summaries):
+\"\"\"
+{facts}
+\"\"\"
+
+Thread summaries to digest:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
+SESSION_SUMMARY_SYSTEM = """You write a one-sentence summary of a conversation session.
+
+Focus on: what was accomplished, decisions made, problems solved, topics covered.
+Be specific about tools, technologies, and concrete outcomes mentioned.
+Do NOT add "The user" or "The assistant" — use passive voice or implicit subject.
+Output ONLY the summary text, no JSON, no markdown, no quotes.
+"""
+
+SESSION_SUMMARY_USER_TEMPLATE = """Conversation:
+\"\"\"
+{text}
+\"\"\"
+
+One-sentence summary:"""
+
+
+PROCEDURE_SYSTEM = """You identify step-by-step procedures described in a conversation.
+
+A procedure is an ordered sequence of actions needed to accomplish a specific technical task — like deploying, configuring, debugging, setting up, or testing something.
+
+Output a strict JSON array. Each item:
+- name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging", "Set up local dev", "Debug Postgres connection pool"
+- description (string): 1 sentence describing what the procedure accomplishes
+- steps (list of objects): Ordered steps, each with:
+    order (integer): Step number starting at 1
+    action (string): What to do, imperative form
+    tool (string or null): Tool/command/CLI used, if mentioned explicitly
+- triggers (list of strings): Words/phrases someone might use to ask about this procedure. e.g., ["deploy", "ship it", "release", "push to staging"]
+- entities_involved (list of strings): Named tools, services, platforms, files involved
+
+Only extract procedures that are EXPLICITLY described. Do not invent procedures from general discussion. Empty array [] is valid.
+"""
+
+PROCEDURE_USER_TEMPLATE = """Conversation:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON array now."""
+
+
+SESSION_SUMMARY_MAX_CHARS = 500
+SESSION_DIGEST_SUMMARY_LIMIT = (
+    f" The summary must be at most {SESSION_SUMMARY_MAX_CHARS} Unicode code points "
+    "after trimming leading and trailing whitespace, including spaces and "
+    "punctuation; JSON escaping does not add characters. Aim for 350 "
+    "characters to leave headroom. Recompose concisely rather than appending "
+    "to the prior wording."
+)
+
+SESSION_DIGEST_SYSTEM = """You analyze one conversation session and produce three things in a single pass: its episodes, a bounded factual overview, and any step-by-step procedures.
+
+Each input segment is tagged like `[chunk msgcov_abc123]` — copy the exact chunk id shown in square brackets when citing it.
+
+Text labeled `previous context` is boundary-only context that was already digested. It may help complete a phrase, but it must never independently authorize an episode or procedure. Every emitted episode and procedure must cite at least one chunk from the new material, not solely previous context.
+
+Output a strict JSON OBJECT (not an array) with exactly these three keys:
+
+"episodes": a JSON array of episodes. An episode is a coherent segment focused on one topic, problem, or task; a session may have several. Each item:
+- title (string): Short descriptive name, max 8 words
+- summary (string): 1-2 sentence narrative of what happened
+- outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear
+- key_entities (list of strings): Named tools, services, files, or concepts discussed
+- chunk_ids (list of strings): The exact `msgcov_...` ids you grouped, in conversation order. Must be non-empty and contain only ids that appear in the input.
+Empty array [] is valid if there are no clear episodes.
+
+"summary": a single string. Empty string "" is valid only when both inputs contain nothing to summarize. The following policy applies ONLY to this top-level summary, never to episode summaries or procedure details: """ + SUMMARY_OVERVIEW_POLICY + """
+
+"procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
+- name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
+- description (string): 1 sentence describing what the procedure accomplishes
+- steps (list of objects): Ordered steps, each with:
+    order (integer): Step number starting at 1
+    action (string): What to do, imperative form
+    tool (string or null): Tool/command/CLI used, if mentioned explicitly
+- triggers (list of strings): Words/phrases someone might use to ask about this procedure
+- entities_involved (list of strings): Named tools, services, platforms, files involved
+- chunk_ids (list of strings): The exact `msgcov_...` ids from NEW material that support this procedure. Must be non-empty; boundary-only previous context does not count.
+Only extract procedures that are EXPLICITLY described; do not invent them. Empty array [] is valid.
+
+Always return all three keys. Example shape:
+{"episodes": [], "summary": "", "procedures": []}
+"""
+
+SESSION_DIGEST_USER_TEMPLATE = """Prior automatic session summary (may be empty):
+\"\"\"
+{prior_summary}
+\"\"\"
+
+New, not-yet-digested session material (sections labeled `previous context` are boundary-only and already digested):
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object now."""
+
+
+# --- Plan C: decision-grained session digest (default OFF) ------------------
+# A SECOND digest prompt, not an edit of the one above. The shipping prompt
+# stays byte-identical because it is what every existing episode in every store
+# was extracted under, and because Plan C is unmeasured: the granularity claim
+# has no faithfulness number on EPISODE REWRITES yet (G-F1's 1.00 was measured
+# on the narrative-facts extractor — a different generative task on the same
+# turns, and reusing another gate's driver is the trap that has cost this
+# project three times). So this text ships behind
+# `episode_granularity_enabled=False`, pinned by EPISODE_GRANULAR_PROMPT_VERSION
+# in hymem/dreaming/digest.py, and `benchmarks/episode_probe.py` scores THIS
+# wording before any default moves.
+#
+# What changes vs SESSION_DIGEST_SYSTEM, and why:
+#   1. The unit is a DECISION/CHANGE/OUTCOME, not a "coherent segment". The BEAM
+#      EO/SUM post-mortem traced the floor to episodes so abstract ("developed
+#      budget tracker with Flask, added auth") that the rubric's event sequence
+#      could not be recovered from them — one blob per session is a summary of a
+#      summary.
+#   2. Concrete values are mandatory IN THE SUMMARY, because the summary is what
+#      retrieval matches and what ask() renders. An episode that drops the
+#      version number is unretrievable by that version number.
+#   3. The invention ban is stated BEFORE the coverage instruction and the
+#      3-8 target is explicitly NOT a quota — both are the FACTS_PROMPT_V2
+#      lessons, banked from a hand-read where "2 to 8 facts" read as a floor and
+#      the cheapest way to satisfy a floor was to invent (loyalty programmes, a
+#      GPA, named goats — none in the source). This prompt rewrites the artifact
+#      retrieval ALREADY depends on, so the same failure would be worse here.
+#   4. chunk_ids stay REQUIRED and per-episode, because the message range they
+#      resolve to is the episode's identity (see _episode_id) — at this
+#      granularity two episodes citing the same chunks are indistinguishable
+#      downstream, so the prompt asks for the narrowest citation that supports
+#      each one.
+# The summary/procedures halves are deliberately identical in CONTRACT to the
+# blob prompt: only the episode unit is under test, and holding the other two
+# tiers fixed is what makes the probe's arms comparable.
+SESSION_DIGEST_GRANULAR_SYSTEM = """You re-read one conversation session and produce three things in a single pass: decision-grained episodes, a bounded factual overview, and any step-by-step procedures.
+
+Each input segment is tagged like `[chunk msgcov_abc123]` — copy the exact chunk id shown in square brackets when citing it.
+
+Text labeled `previous context` is boundary-only context that was already digested. It may help complete a phrase, but it must never independently authorize an episode or procedure. Every emitted episode and procedure must cite at least one chunk from the new material, not solely previous context.
+
+THE ONLY RULE THAT MATTERS: every name, number, date, version, price and claim you write must ALREADY BE PRESENT in the chunks below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal episode is correct; a rich episode containing one invented detail is a failure. Never record an outcome that was not reached.
+
+Output a strict JSON OBJECT (not an array) with exactly these three keys:
+
+"episodes": a JSON array of episodes. ONE EPISODE PER DECISION, CHANGE OR OUTCOME — not one per session and not one per topic. If the session settled on a library, hit an error, fixed it, and then agreed a deadline, that is four episodes, not one. Each item:
+- title (string): Short descriptive name, max 8 words, naming the specific thing decided or changed
+- summary (string): 1-2 sentences saying what was decided, changed or established — and CARRYING THE CONCRETE VALUES: the names, numbers, dates, versions, file paths and error messages exactly as the chunks state them. "Pinned pandas to 2.1.4 after the 2.2 groupby regression" — not "resolved a dependency issue".
+- outcome (string|null): "resolved", "blocked", "deferred", "informational", or null if unclear. REQUIRED (non-null) when the session actually reached one; null is for genuinely open ends, never a hedge.
+- key_entities (list of strings): Named tools, services, files, or concepts involved, exactly as written
+- chunk_ids (list of strings): The exact `msgcov_...` ids that support THIS episode, in conversation order. Must be non-empty and contain only ids that appear in the input. Cite the narrowest set that supports it — do not attach every chunk to every episode.
+NO QUOTA. A substantive working session usually yields 3 to 8 episodes; a session that decided one thing yields one; small talk yields []. Those numbers describe what such sessions contain, they are not a target to fill, and [] is always available to you.
+
+"summary": a single string. Empty string "" is valid only when both inputs contain nothing to summarize. The following policy applies ONLY to this top-level summary, never to episode summaries or procedure details: """ + SUMMARY_OVERVIEW_POLICY + """
+
+"procedures": a JSON array of procedures. A procedure is an ordered sequence of actions needed to accomplish a specific technical task — deploying, configuring, debugging, setting up, or testing something. Each item:
+- name (string): Short descriptive imperative name, max 8 words. e.g., "Deploy to staging"
+- description (string): 1 sentence describing what the procedure accomplishes
+- steps (list of objects): Ordered steps, each with:
+    order (integer): Step number starting at 1
+    action (string): What to do, imperative form
+    tool (string or null): Tool/command/CLI used, if mentioned explicitly
+- triggers (list of strings): Words/phrases someone might use to ask about this procedure
+- entities_involved (list of strings): Named tools, services, platforms, files involved
+- chunk_ids (list of strings): The exact `msgcov_...` ids from NEW material that support this procedure. Must be non-empty; boundary-only previous context does not count.
+Only extract procedures that are EXPLICITLY described; do not invent them. Empty array [] is valid.
+
+Before writing each episode, check: can I point at the exact words in the chunks that state every value in it? If not, drop the value — or the episode.
+
+Always return all three keys. Example shape:
+{"episodes": [], "summary": "", "procedures": []}
+"""
+
+# The closer is deliberately UNIQUE ("Return the granular digest JSON object
+# now.") — the USER_PROFILE precedent. Test stubs and the probe route on prompt
+# substrings, so a granular call that ended with the blob closer would be
+# indistinguishable from the shipping digest in every fixture and every call
+# count that discriminates on it.
+SESSION_DIGEST_GRANULAR_USER_TEMPLATE = """Prior automatic session summary (may be empty):
+\"\"\"
+{prior_summary}
+\"\"\"
+
+New, not-yet-digested session material (sections labeled `previous context` are boundary-only and already digested):
+\"\"\"
+{text}
+\"\"\"
+
+Return the granular digest JSON object now."""
+
+
+# --- Typed user-profile extraction (Stage 1 / P4, schema v18) ---------------
+# Runs over USER turns only, once per dreamed session, alongside the batched
+# session digest. The slot vocabulary is CLOSED and re-enforced downstream
+# twice (validate_profile_items + the user_profile table CHECK), so a slot the
+# LLM invents can never persist. Pinned by PROFILE_PROMPT_VERSION in
+# hymem/dreaming/user_profile.py — bump it when this wording changes
+# materially. The user-template closer is deliberately unique ("Return the
+# profile JSON object now.") so test stubs keyed on the digest/triple closers
+# never route here; "typed user-profile facts" is the routing substring.
+
+USER_PROFILE_SYSTEM = """You extract typed user-profile facts from the USER's own turns in one conversation session.
+
+Each user turn is tagged like `[msg 42]` — the message id appears in square brackets before its text.
+
+THE ABOUTNESS TEST (apply it to every candidate fact): extract only durable facts about THE USER AS A PERSON. User turns often contain pasted material — memory files, repository lists, agent or config dumps, notes about patients, clients, or other third parties. Facts about projects, repositories, codebases, organizations-as-artifacts, or other people are NOT user facts and must be skipped. But pasted text that explicitly describes the user themselves IS extractable — the test is WHO the fact is about, not what channel it arrived through.
+- "Atta is a bedrijfsarts at O3" inside a pasted memory file → extract role "bedrijfsarts" and employer "O3" (the text is explicitly about the user).
+- "Patient reports chronic back pain since 2024" in the user's clinical notes → extract NOTHING (the fact is about a patient, not the user).
+- "Repos: ClaudetteMedSer/HyMem, ClaudetteMedSer/Hermes" in a pasted dump → extract NOTHING (a GitHub org/username in technical context is not an employer, and repositories are not possessions).
+
+Output a strict JSON object with exactly one key, "items". "items" is an array;
+each item has exactly:
+- slot (string): MUST be one of:
+    role: the user's job or professional role ("bedrijfsarts", "backend engineer")
+    name: the user's own name
+    employer: the organization the user works FOR. Employment must be explicitly stated; GitHub orgs, usernames, and account names appearing in technical context are NOT employers.
+    location: where the user lives or is based
+    language: a language the user speaks or writes
+    relationship: another person in the user's life — requires slot_key
+    possession: a notable durable real-world possession the user owns (a car, a house, an instrument). NEVER code repositories, software artifacts, accounts, or items enumerated in pasted lists.
+    age_birthday: the user's age or birthday
+    health_condition: ONLY the user's OWN health — a condition, allergy, or treatment stated first-person or unambiguously about the user. The user may be a clinician (e.g. a bedrijfsarts): conditions of patients or clients they discuss are NEVER user health facts. Job or work descriptions belong in role, never here.
+    recurring_activity: a habit or recurring activity of the user ("runs every sunday")
+- slot_key (string): ONLY for relationship — the other person's name ("anna"). Omit for every other slot.
+- value (string): the fact itself, short and concrete ("bedrijfsarts", "Amsterdam", "sister").
+- evidence_message_id (integer): the exact `[msg N]` id of the user turn stating the fact. MUST be an id present in the input.
+- confidence (number between 0.0 and 1.0): how explicitly the fact is stated (1.0 = stated outright; lower when hedged or implied).
+
+Rules:
+- The slot list above is CLOSED. Never output any other slot name; skip facts that fit no slot.
+- Only durable facts. Skip questions, hypotheticals, one-off events, and facts about other people (except via relationship).
+- Quality over quantity: prefer a few high-confidence facts over many weak ones. When two candidate values compete for the same slot, keep only the more specific and complete one (e.g. "bedrijfsarts" over "developer" for role). Do not emit near-duplicate recurring_activity items. When in doubt, omit.
+- Turns may be in languages other than English (e.g. Dutch); extract regardless and keep the value in the original language.
+- Skip facts you are not confident about. {"items": []} is a valid answer.
+"""
+
+USER_PROFILE_USER_TEMPLATE = """User turns from one session:
+\"\"\"
+{text}
+\"\"\"
+
+Return the profile JSON object now."""
+
+
+# Narrative-facts extraction (E1; authoritative source/lifecycle schema v46).
+# facts.v4 keeps the v2 factual instructions, aligns the success envelope with
+# JSON-object transport, and advertises the configured output bounds through
+# the shared fresh/historical request builder. Never select a subset to fit.
+# The historical v2 G-F1b verdict does not attest this revised prompt; the
+# production request requires its own extraction-faithfulness validation.
+# The user-template closer ("Return the JSON object of narrative facts now.")
+# is unique so test stubs keyed on the digest/triple/profile closers never
+# route here.
+
+FACTS_SYSTEM = """You extract NARRATIVE FACTS from one conversation session.
+
+A narrative fact is a single, self-contained statement of something that happened, was decided, was preferred, or was true — written so it can be read and understood WITHOUT the conversation around it.
+
+THE ONLY RULE THAT MATTERS: every name, number, date, price, quantity and claim you write must ALREADY BE PRESENT in the turns below. If it is not there, it does not go in. Do not infer it, do not complete it, do not make it plausible. A short, dull, literal fact is correct; a rich fact containing one invented detail is a failure.
+
+Output a strict JSON object with exactly one key, "facts", whose value is an array: {"facts": [...]}. Do not add other top-level keys, prose, markdown, or code fences. Each item in "facts" has exactly:
+- text (string): the fact, one sentence, self-contained. Name the people, things and values explicitly instead of using "he", "it", "that", "the project" — but only names that appear in the turns.
+- date (string or null): use YYYY-MM-DD ONLY when the conversation itself writes that date. If the turns say "recently", "last week", "a few days ago", or say nothing about when — use null. Never derive a date from the session date. Never guess.
+- entities (array of strings): the concrete people, products, places, tools or organizations the fact is about, exactly as written in the turns.
+
+Rules:
+- VERBATIM VALUES. Names, numbers, dates, versions, prices and quantities exactly as the turns state them. Never round, convert, or normalize.
+- NO QUOTA. Extract only what the turns actually establish. A session that establishes one thing yields one fact. A session of small talk, greetings, or generic assistant advice yields {"facts": []} — that is a GOOD answer, not a failure, and {"facts": []} is always available to you.
+- Never extract the assistant's suggestions, recommendations, or hypotheticals as facts about the user. "You could try X" is not "the user uses X".
+- One fact per exchange, decision, event or outcome — not one per turn. Combine a question and its answer into the single fact they establish.
+- Self-contained means resolvable alone: "Atta moved the MedFlow deploy to fly.io" — not "he moved it there".
+- Keep the fact in the language of the conversation.
+
+Before writing each fact, check: can I point at the exact words in the turns that state every value in it? If not, drop it.
+"""
+
+# Deliberately does NOT show the session date (the v1→v2 lesson: the surest way
+# to stop a date being copied is for the model never to see it). Explicit dates
+# written in the turns are still right there in {text}.
+FACTS_USER_TEMPLATE = """Conversation:
+\"\"\"
+{text}
+\"\"\"
+
+Return the JSON object of narrative facts now."""
+
+
+FACTS_CAPACITY_TEMPLATE = """
+Output capacity for this exact conversation excerpt:
+- A complete result may contain at most {max_items} facts. This is a maximum, NOT a target or a quota.
+- Each fact's text must be at most {max_text_chars} characters after trimming outer whitespace. Count Unicode code points, including spaces and punctuation; JSON escaping does not add characters.
+- Each fact may have at most {max_entities} entities, each at most {max_entity_chars} characters after trimming outer whitespace. Do not shorten or alter a source name to fit.
+- Extract the complete set of supported narrative facts under the rules above. Never choose only the first, best, or most important facts to fit a limit. Never omit a supported fact, truncate a value, or merge unrelated facts merely to fit.
+- If that complete set cannot fit any of these limits, do NOT return a partial result or a successful empty result. Instead return exactly {{"facts": [], "complete": false}}. This is the only exception to the one-key success envelope: it signals incomplete extraction and requests retry without claiming any source coverage. Do not include partial facts or extra keys.
+- Otherwise return the complete result as exactly {{"facts": [...]}} without a "complete" key. Use {{"facts": []}} only when this excerpt genuinely establishes no supported narrative facts, never to hide overflow.
+"""
+
+
+RERANK_SYSTEM = """You evaluate the relevance of conversation excerpts to a user query.
+
+For each excerpt, rate its relevance on a scale of 1-5:
+5 - Directly answers or discusses the query's topic
+4 - Highly relevant, close to the topic
+3 - Somewhat relevant, tangentially related
+2 - Marginally relevant, shares keywords but different topic
+1 - Not relevant
+
+Output strict JSON: an object with one "ratings" key holding an array.
+Each array item: {"index": 0, "relevance": 4}
+The index field corresponds to the [0], [1], [2] markers in the input.
+{"ratings": []} is valid if nothing is relevant.
+"""
+
+RERANK_USER_TEMPLATE = """Query: "{query}"
+
+Excerpts:
+{excerpts}
+
+Return the JSON object now."""
