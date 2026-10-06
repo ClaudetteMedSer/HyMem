@@ -104,6 +104,16 @@ need no action, and any other source needs a fresh review/rebase and fresh pins.
 Do not blindly copy the old whole plugin directory into a new image. Config
 alone is ineffective if the integration patch is lost during an image rebuild.
 
+### Rebased artifact sets
+
+`hermes-0.21.5/` holds the rebase onto Hermes Agent 0.21.5 (tag v2026.9.24,
+commit f97608f1), made 2026-10-06 by the procedure above: same installer
+(byte-identical), fresh patch, manifest pins and rebased focused tests. Each
+set is self-contained, because the installer reads the manifest and patch from
+its own directory. A deployment hook should pick the set by the runtime's
+exact source revision and refuse any revision without a reviewed set. See that
+directory's README for the review and test record.
+
 ### Offline pre-start installer
 
 `install_hermes_session_retirement.py` is the maintained POSIX-only companion for
