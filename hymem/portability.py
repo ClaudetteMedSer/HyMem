@@ -154,7 +154,9 @@ log = logging.getLogger("hymem.portability")
 # v16 carries explicit payload-bound digest procedure ownership. Older rows
 # without this declaration remain unknown-origin, never inferred from an id.
 # v17 preserves complete original extraction sets independently of authority.
-EXPORT_VERSION = 17
+# v18 preserves distinct published-item and accepted-summary frontiers.
+# Private summary_recovery work is local-only and never portable authority.
+EXPORT_VERSION = 18
 _MAX_SQLITE_ROWID = 2**63 - 1
 _ROWID_RESERVE_HEADROOM = 1_000_000
 
@@ -486,7 +488,15 @@ _V17_EXPORT_SPEC = [*_V16_EXPORT_SPEC, (
     "edge_evidence_extraction_audit", "kg_evidence_extraction_audit",
     list(extraction_audit.COLUMNS),
 )]
-_EXPORT_SPEC = _V17_EXPORT_SPEC
+_V18_SUMMARY_FIELDS = (
+    "digest_published_message_id", "auto_summary_generation",
+    "summary_failure_reason", "summary_failure_count",
+)
+_V18_EXPORT_SPEC = [
+    (kind, table, [*columns, *_V18_SUMMARY_FIELDS] if kind == "session" else list(columns))
+    for kind, table, columns in _V17_EXPORT_SPEC
+]
+_EXPORT_SPEC = _V18_EXPORT_SPEC
 _V6_TABLE_BY_KIND = {kind: table for kind, table, _ in _V6_EXPORT_SPEC}
 _V6_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V6_EXPORT_SPEC}
 _V7_TABLE_BY_KIND = {kind: table for kind, table, _ in _V7_EXPORT_SPEC}
@@ -509,8 +519,10 @@ _V16_TABLE_BY_KIND = {kind: table for kind, table, _ in _V16_EXPORT_SPEC}
 _V16_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V16_EXPORT_SPEC}
 _V17_TABLE_BY_KIND = {kind: table for kind, table, _ in _V17_EXPORT_SPEC}
 _V17_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V17_EXPORT_SPEC}
-_TABLE_BY_KIND = _V17_TABLE_BY_KIND
-_COLS_BY_KIND = _V17_COLS_BY_KIND
+_V18_TABLE_BY_KIND = {kind: table for kind, table, _ in _V18_EXPORT_SPEC}
+_V18_COLS_BY_KIND = {kind: tuple(cols) for kind, _table, cols in _V18_EXPORT_SPEC}
+_TABLE_BY_KIND = _V18_TABLE_BY_KIND
+_COLS_BY_KIND = _V18_COLS_BY_KIND
 # Sessions must import before rows that FK-reference them.
 _IMPORT_ORDER = [
     "session", "peer", "session_peer", "chunk",
@@ -849,6 +861,81 @@ def _wire_int(value: object, *, minimum: int | None = None) -> bool:
         and not isinstance(value, bool)
         and (minimum is None or value >= minimum)
     )
+
+
+def _upgrade_pre_v18_summary_fields(grouped: dict[str, list[dict]]) -> None:
+    """Recognize only the old atomic summary publication, never an active cursor.
+
+    Proof rows are still untrusted here. The ordinary coverage importer and
+    post-import summary validator prove their bytes in the same transaction;
+    a donor cannot acquire authority by merely naming an occurrence.
+    """
+    covered = {
+        (row.get("source_session_id"), row.get("message_id"))
+        for row in grouped.get("message_retention_coverage", [])
+        if isinstance(row.get("coverage_version"), str)
+        and row["coverage_version"] in LOSSLESS_READ_VERSIONS
+        and isinstance(row.get("source_session_id"), str)
+        and _wire_int(row.get("message_id"), minimum=1)
+    }
+    for record in grouped.get("session", []):
+        record.update(digest_published_message_id=None, auto_summary_generation=None,
+                      summary_failure_reason=None, summary_failure_count=0)
+        generation = record.get("digest_published_generation")
+        frontier = record.get("auto_summary_message_id")
+        text = record.get("auto_summary")
+        if (
+            digest_generation_is_recognized(generation)
+            and isinstance(text, str) and len(text) <= 500
+            and _wire_int(frontier, minimum=1)
+            and record.get("auto_summary_partial_message_id") is None
+            and record.get("auto_summary_message_offset", 0) == 0
+            and isinstance(record.get("id"), str)
+            and (record.get("id"), frontier) in covered
+        ):
+            record["digest_published_message_id"] = frontier
+            record["auto_summary_generation"] = generation
+
+
+def _validate_v18_summary_scalars(grouped: dict[str, list[dict]]) -> None:
+    """Reject invalid public summary markers before any target mutation."""
+    from hymem.dreaming.summary_state import SUMMARY_FAILURE_REASONS
+
+    for record in grouped.get("session", []):
+        frontier = record.get("digest_published_message_id")
+        generation = record.get("auto_summary_generation")
+        reason = record.get("summary_failure_reason")
+        count = record.get("summary_failure_count")
+        if frontier is not None and (
+            not _wire_int(frontier, minimum=1) or frontier > _MAX_SQLITE_ROWID
+        ):
+            raise ValueError("portable session has invalid published item frontier")
+        if generation is not None and not digest_generation_is_recognized(generation):
+            raise ValueError("portable session has invalid automatic summary generation")
+        if (reason is not None and (
+            not isinstance(reason, str) or reason not in SUMMARY_FAILURE_REASONS
+        )) or (
+            not _wire_int(count, minimum=0) or count > _MAX_SQLITE_ROWID
+            or (reason is None) != (count == 0)
+        ):
+            raise ValueError("portable session has invalid summary failure state")
+        if frontier is not None and not digest_generation_is_recognized(
+            record.get("digest_published_generation")
+        ):
+            raise ValueError("portable published item frontier has no recognized generation")
+        if generation is not None and (
+            frontier is None or not isinstance(record.get("auto_summary"), str)
+        ):
+            raise ValueError("portable automatic summary generation has no publication")
+
+
+def _validate_imported_summary_state(conn, session_ids: set[str]) -> None:
+    """Prove public v18 frontiers against imported source before commit."""
+    from hymem.dreaming.summary_state import classify_summary_state
+
+    for session_id in sorted(session_ids):
+        if classify_summary_state(conn, session_id)["malformed"]:
+            raise ValueError("portable session summary frontier lacks exact source proof")
 
 
 def _wire_number(value: object, *, minimum: float, maximum: float) -> bool:
@@ -4951,6 +5038,7 @@ def _redact_portable_records(
         digest_generations = (
             record.get("digest_cursor_prompt_version"),
             record.get("digest_published_generation"),
+            record.get("auto_summary_generation"),
         )
         digest_prompt = record.get("digested_prompt_version")
         episode_prompt = record.get("episodes_prompt_version")
@@ -4993,6 +5081,10 @@ def _redact_portable_records(
                 "digest_cursor_offset": 0,
                 "digest_cursor_prompt_version": None,
                 "digest_published_generation": None,
+                "digest_published_message_id": None,
+                "auto_summary_generation": None,
+                "summary_failure_reason": None,
+                "summary_failure_count": 0,
                 "episodes_prompt_version": None,
             }.items():
                 if field in record:
@@ -5462,6 +5554,10 @@ def _preflight_v7_export(conn) -> dict[str, list[dict]]:
     if mismatches:
         raise ValueError("cannot export knowledge graph with stale evidence counters")
     grouped = _collect_current_records(conn)
+    _validate_v18_summary_scalars(grouped)
+    _validate_imported_summary_state(
+        conn, {record["id"] for record in grouped.get("session", [])},
+    )
     # Virtual originals are read-only and precede the existing wire clock/key
     # normalization. An audited representative contributes no new occurrence.
     audit_rows = grouped["edge_evidence_extraction_audit"]
@@ -6096,6 +6192,15 @@ def _import_v7_claim_state(
                 "WHERE outcome.chunk_id=?",
                 (chunk_id,),
             ).fetchone()
+            # Ordered-input replay proof is earned only by this local writer.
+            # Even an identical imported outcome cannot authenticate the
+            # source response that produced the destination's current graph.
+            if existing is not None:
+                conn.execute(
+                    "UPDATE kg_claim_extraction_outcomes SET "
+                    "local_replay_proof=NULL WHERE chunk_id=?",
+                    (chunk_id,),
+                )
             incoming_generation = int(record["prompt_generation"])
             incoming_key = record.get("phase1_generation_key")
             invalidate_processed = False
@@ -7768,6 +7873,7 @@ def export_jsonl(conn, path: str | Path) -> dict[str, int]:
         # makes export -> import -> re-export byte stable while preserving the
         # exact typed evidence behind every portable manifest.
         _redact_portable_records(grouped, redact_values=False)
+        _validate_v18_summary_scalars(grouped)
         _validate_v16_procedure_ownership(grouped)
         _validate_v7_records(grouped)
         _validate_v13_phase1_records(grouped)
@@ -7940,7 +8046,8 @@ def import_jsonl(
                     if not _wire_int(obj.get("schema_version"), minimum=1):
                         raise ValueError("portable header has invalid schema version")
             elif kind in (
-                _V17_TABLE_BY_KIND if (meta_version or 0) >= 17
+                _V18_TABLE_BY_KIND if (meta_version or 0) >= 18
+                else _V17_TABLE_BY_KIND if (meta_version or 0) >= 17
                 else _V16_TABLE_BY_KIND if (meta_version or 0) >= 16
                 else _V14_TABLE_BY_KIND if (meta_version or 0) >= 14
                 else _V13_TABLE_BY_KIND if (meta_version or 0) >= 13
@@ -7967,7 +8074,8 @@ def import_jsonl(
         raise ValueError("portable export is missing its header")
     if meta_version >= 6:
         version_tables = (
-            _V17_TABLE_BY_KIND if meta_version >= 17
+            _V18_TABLE_BY_KIND if meta_version >= 18
+            else _V17_TABLE_BY_KIND if meta_version >= 17
             else _V16_TABLE_BY_KIND if meta_version >= 16
             else _V14_TABLE_BY_KIND if meta_version >= 14
             else _V13_TABLE_BY_KIND if meta_version >= 13
@@ -7980,7 +8088,8 @@ def import_jsonl(
             else _V6_TABLE_BY_KIND
         )
         version_columns = (
-            _V17_COLS_BY_KIND if meta_version >= 17
+            _V18_COLS_BY_KIND if meta_version >= 18
+            else _V17_COLS_BY_KIND if meta_version >= 17
             else _V16_COLS_BY_KIND if meta_version >= 16
             else _V14_COLS_BY_KIND if meta_version >= 14
             else _V13_COLS_BY_KIND if meta_version >= 13
@@ -8025,6 +8134,9 @@ def import_jsonl(
             _upgrade_pre_v13_phase1_fields(grouped)
         if meta_version < 14:
             _upgrade_pre_v14_auxiliary_fields(grouped)
+        if meta_version < 18:
+            _upgrade_pre_v18_summary_fields(grouped)
+        _validate_v18_summary_scalars(grouped)
         if meta_version >= 17:
             _validate_extraction_audits(grouped)
         elif meta_version >= 7:
@@ -8095,12 +8207,16 @@ def import_jsonl(
         if meta_version == 6:
             _normalize_v6_graph_materialization(grouped)
 
+    if meta_version < 6:
+        _upgrade_pre_v18_summary_fields(grouped)
+        _validate_v18_summary_scalars(grouped)
     if redact_values:
         # This must precede every destination mutation. In addition to keeping
         # durable storage safe, it prevents sqlite trace/error logs from ever
         # observing raw portable secrets. Pure in-memory structural checks,
         # such as the rowid-domain validation above, are safe to run first.
         _redact_portable_records(grouped)
+        _validate_v18_summary_scalars(grouped)
         _validate_v16_procedure_ownership(grouped)
         if meta_version >= 7:
             _validate_v7_records(grouped)
@@ -8945,6 +9061,9 @@ def import_jsonl(
                 )
         if redact_values:
             enforce_profile_redaction_policy(conn)
+        _validate_imported_summary_state(
+            conn, {str(record["id"]) for record in grouped.get("session", [])},
+        )
     inserted.pop("_claim_extraction_outcome_changed", None)
     log.info("import.done path=%s inserted=%s", path, inserted)
     return inserted

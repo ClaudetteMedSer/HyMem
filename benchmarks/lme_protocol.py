@@ -54,6 +54,9 @@ try:
     )
     from .strictness import (
         BENCHMARK_INDEXING_STATUS_VERSION,
+        INDEXING_COMPLETION_POLICY,
+        SUMMARY_STATUS_FIELDS,
+        validated_summary_health,
         BenchmarkIntegrityError,
         STRICT_PROTOCOL_VERSION,
         content_hash,
@@ -67,6 +70,9 @@ except (ImportError, ValueError):  # direct benchmark-script import
     )
     from strictness import (  # type: ignore
         BENCHMARK_INDEXING_STATUS_VERSION,
+        INDEXING_COMPLETION_POLICY,
+        SUMMARY_STATUS_FIELDS,
+        validated_summary_health,
         BenchmarkIntegrityError,
         STRICT_PROTOCOL_VERSION,
         content_hash,
@@ -114,7 +120,7 @@ LME_OFFICIAL_JUDGE_MAX_TOKENS = 10
 LME_OFFICIAL_VERDICT_PARSER = "substring-yes-in-lower-v1"
 LME_UPSTREAM_RETRY_POLICY = "unbounded-openai-backoff-v1"
 LME_LOCAL_RETRY_POLICY = "bounded-three-attempt-backoff-v1"
-LME_INDEXING_SUMMARY_VERSION = "hymem-lme-indexing-summary-v5"
+LME_INDEXING_SUMMARY_VERSION = "hymem-lme-indexing-summary-v6"
 LME_INDEXING_COVERAGE_DETAIL_LIMIT = 100
 LME_HISTORICAL_LOCAL_JUDGE_PROMPTS_EXACT_OFFICIAL = False
 # Compatibility alias for older imports.  Strict evidence uses the longer,
@@ -252,7 +258,7 @@ _INDEXING_AGGREGATION_BLOCKING_VALUES = frozenset({
 })
 _INDEXING_SUMMARY_COMMON_FIELDS = frozenset({
     "schema", "outcome", "cycles", "max_cycles", "timeout_s", "elapsed_s",
-    "complete", "healthy", "reports", "final_status", "cleanup_errors",
+    "complete", "healthy", "summary_healthy", "reports", "final_status", "cleanup_errors",
 })
 _INDEXING_PENDING_FIELDS = frozenset({
     "pending_source_materialization",
@@ -776,9 +782,25 @@ def _validate_model(
     return value
 
 
+def _archived_canary_validators():
+    # Archive-only dependency: live admission and its semantic code identity
+    # neither import nor execute this historical commitment reader. Full source
+    # manifests still pin its bytes for archive review and packaging.
+    if __package__:
+        from .extraction_canary_archive import (
+            validate_archived_canary_config, validate_archived_canary_report,
+        )
+    else:
+        from extraction_canary_archive import (
+            validate_archived_canary_config, validate_archived_canary_report,
+        )
+    return validate_archived_canary_config, validate_archived_canary_report
+
+
 def _validate_segment_extraction_canary(
     segment: Mapping[str, Any], *, pipeline: Mapping[str, Any], no_dream: bool,
-    prompt_version: str,
+    prompt_version: str, archive_policy: Mapping[str, Any] | None = None,
+    archive_effective_config: Mapping[str, Any] | None = None,
 ) -> None:
     """Bind every segment probe to its actual work and pipeline posture."""
 
@@ -820,15 +842,22 @@ def _validate_segment_extraction_canary(
                 "LongMemEval extraction canary endpoint identity is not secret-free"
             )
     try:
-        validate_extraction_canary_report(
-            report,
+        context = dict(
             expected_mode=mode,
             expected_client=(
                 pipeline if mode in {"required", "failed"} else None
             ),
             require_client_closed=mode in {"required", "failed"},
-            expected_prompt_version=prompt_version,
         )
+        if archive_policy is not None:
+            _archived_canary_validators()[1](
+                report, policy=archive_policy,
+                effective_config=archive_effective_config, **context,
+            )
+        else:
+            validate_extraction_canary_report(
+                report, expected_prompt_version=prompt_version, **context,
+            )
     except BenchmarkIntegrityError as exc:
         raise BenchmarkIntegrityError(
             "LongMemEval extraction canary evidence is invalid"
@@ -1062,6 +1091,7 @@ def _canonical_final_indexing_status(value: object) -> dict[str, Any]:
             "LongMemEval indexing final status has an unsupported benchmark schema"
         )
     _require_current_phase1_authority(value)
+    summary_health = validated_summary_health(value)
 
     known_terminal = {"terminal_loss_chunks", "terminal_loss_reasons"}
     known_coverage = {
@@ -1257,6 +1287,7 @@ def _canonical_final_indexing_status(value: object) -> dict[str, Any]:
         "in_progress": in_progress,
         "aggregation_generation": aggregation_generation,
         "aggregation_material": aggregation_material,
+        "summary_health": summary_health,
     }
 
 
@@ -1344,7 +1375,11 @@ def canonicalize_lme_indexing_summary(summary: object) -> dict[str, Any]:
     cycles = _bounded_count(summary.get("cycles"), label="indexing cycle count")
     result: dict[str, Any] = {
         "schema": LME_INDEXING_SUMMARY_VERSION,
-        "outcome": "success" if failure is None else "failure",
+        "outcome": (
+            "failure" if failure is not None
+            else "success" if final_status["summary_health"]["summary_healthy"]
+            else "success_with_summary_degradation"
+        ),
         "cycles": cycles,
         "max_cycles": _bounded_count(
             summary.get("max_cycles"), label="indexing max cycle count", positive=True,
@@ -1353,6 +1388,10 @@ def canonicalize_lme_indexing_summary(summary: object) -> dict[str, Any]:
         "elapsed_s": summary.get("elapsed_s"),
         "complete": complete,
         "healthy": healthy,
+        "summary_healthy": (
+            final_status["summary_health"]["summary_healthy"]
+            if final_status is not None else None
+        ),
         "reports": reports,
         "final_status": final_status,
         "cleanup_errors": [],
@@ -1369,10 +1408,15 @@ def _validate_canonical_final_status(value: object) -> Mapping[str, Any]:
         "pending", "malformed", "quarantined", "terminal_loss",
         "coverage_integrity", "in_progress", "aggregation_generation",
         "aggregation_material",
+        "summary_health",
         *DREAM_STATUS_PHASE1_AUTHORITY_FIELDS,
     }:
         raise BenchmarkIntegrityError("LongMemEval indexing final status is malformed")
     _require_current_phase1_authority(value)
+    summary_health = value.get("summary_health")
+    if not isinstance(summary_health, Mapping) or set(summary_health) != set(SUMMARY_STATUS_FIELDS):
+        raise BenchmarkIntegrityError("LongMemEval summary health fields differ")
+    validated_summary_health(summary_health)
     if (
         value.get("dream_status_schema") != DREAM_STATUS_SCHEMA_VERSION
         or value.get("benchmark_indexing_status_schema")
@@ -1396,6 +1440,8 @@ def _validate_canonical_final_status(value: object) -> Mapping[str, Any]:
             )
         for key, count in counts.items():
             _bounded_count(count, label=f"indexing {label} counter")
+    if value["malformed"]["malformed_summaries"] != summary_health["malformed_summaries"]:
+        raise BenchmarkIntegrityError("LongMemEval malformed summary evidence disagrees")
     terminal = value.get("terminal_loss")
     if not isinstance(terminal, Mapping) or set(terminal) != {"chunks", "reasons"}:
         raise BenchmarkIntegrityError("LongMemEval terminal-loss evidence is malformed")
@@ -1808,7 +1854,7 @@ def _validate_versioned_indexing(
     expected_fields = set(_INDEXING_SUMMARY_COMMON_FIELDS)
     if outcome == "failure":
         expected_fields.add("failure")
-    elif outcome != "success":
+    elif outcome not in {"success", "success_with_summary_degradation"}:
         raise BenchmarkIntegrityError("LongMemEval indexing outcome is malformed")
     if set(summary) != expected_fields:
         raise BenchmarkIntegrityError("LongMemEval indexing summary fields differ")
@@ -1852,14 +1898,24 @@ def _validate_versioned_indexing(
             raise BenchmarkIntegrityError(
                 "LongMemEval indexing cleanup evidence is malformed"
             )
-    if outcome == "success" and cleanup:
+    if outcome != "failure" and cleanup:
         raise BenchmarkIntegrityError(
             "LongMemEval successful indexing cannot contain cleanup failures"
         )
     final = summary.get("final_status")
     if final is not None:
         final = _validate_canonical_final_status(final)
-    if outcome == "success":
+    summary_healthy = summary.get("summary_healthy")
+    if summary_healthy is not (
+        final["summary_health"]["summary_healthy"] if final is not None else None
+    ):
+        raise BenchmarkIntegrityError("LongMemEval summary health disagrees with final status")
+    if outcome != "failure":
+        expected_outcome = (
+            "success" if summary_healthy is True else "success_with_summary_degradation"
+        )
+        if outcome != expected_outcome:
+            raise BenchmarkIntegrityError("LongMemEval indexing outcome hides summary degradation")
         if not complete or not healthy or final is None or cycles <= 0 or elapsed > timeout:
             raise BenchmarkIntegrityError("LongMemEval successful indexing state is inconsistent")
         if any(reports[-1][key] for key in _INDEXING_REPORT_BOOLEAN_FIELDS) or any(
@@ -2014,6 +2070,8 @@ def _validate_legacy_indexing(
     )
     if healthy is not computed_healthy:
         raise BenchmarkIntegrityError("LongMemEval indexing health flag is inconsistent")
+    if healthy and canonical_final["summary_health"]["summary_healthy"] is not True:
+        raise BenchmarkIntegrityError("legacy LongMemEval indexing cannot represent summary degradation")
     # Preserve legacy missing-field defaults, but never ignore a supplied
     # digest/fact/profile/aggregation failure or malformed budget flag.
     canonical_reports = [_canonical_indexing_report(report) for report in reports]
@@ -2251,39 +2309,6 @@ def _router_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def validate_lme_summary_policy_binding(config: Mapping[str, Any]) -> str:
-    """Cross-check explicit treatment without inventing historical disclosure.
-
-    Artifacts predating this lever omit it in both places and can only mean
-    legacy behavior. This interpretation does not add a recorded flag to those
-    artifacts or authorize their reuse under a different current run identity.
-    """
-    from hymem.dreaming.summary_policy import (
-        LEGACY_COMPLETE_V1, validate_summary_policy,
-    )
-
-    if not isinstance(config, Mapping):
-        raise BenchmarkIntegrityError("LongMemEval summary policy config is malformed")
-    effective = config.get("effective_hymem_config")
-    if not isinstance(effective, Mapping):
-        raise BenchmarkIntegrityError("LongMemEval effective HyMem config is absent")
-    field = "digest_summary_policy"
-    recorded = field in config
-    effective_recorded = field in effective
-    if not recorded and not effective_recorded:
-        return LEGACY_COMPLETE_V1
-    if recorded is not effective_recorded:
-        raise BenchmarkIntegrityError("LongMemEval summary policy disclosure is incomplete")
-    try:
-        selected = validate_summary_policy(config[field])
-        actual = validate_summary_policy(effective[field])
-    except ValueError as exc:
-        raise BenchmarkIntegrityError("LongMemEval summary policy is invalid") from exc
-    if selected != actual:
-        raise BenchmarkIntegrityError("LongMemEval effective summary policy differs")
-    return selected
-
-
 def validate_strict_artifact(
     data: object, *, path: Path | None = None,
     require_scored: bool | None = None,
@@ -2300,19 +2325,15 @@ def validate_archived_artifact(
 ) -> dict[str, Any]:
     """Validate historical commitments, not eligibility for new execution.
 
-    All strict envelope, accounting, score, and checkpoint checks still apply.
-    Old request/retry hash preimages are unavailable, so this explicit reader
-    does not reconstruct them from today's runtime. It is not an admission
-    path for current execution, resume, or official prediction export.
+    Envelope, accounting, score, source and checkpoint checks still apply.
+    Historical request/retry preimages are unavailable. This explicit reader
+    does not reconstruct them from today's runtime or admit execution, resume,
+    or official prediction export.
     """
-
     result = _validate_artifact(data, path=path, require_scored=require_scored,
                                 archive_only=True)
-    return {
-        **result,
-        "validation_assurance": "historical_commitment_only",
-        "live_execution_eligible": False,
-    }
+    return {**result, "validation_assurance": "historical_commitment_only",
+            "live_execution_eligible": False}
 
 
 def _validate_artifact(
@@ -2356,6 +2377,8 @@ def _validate_artifact(
         raise BenchmarkIntegrityError("LongMemEval manifest config hash is invalid")
     if manifest.get("model_hash") != content_hash(models):
         raise BenchmarkIntegrityError("LongMemEval manifest model hash is invalid")
+    if config.get("indexing_completion_policy") != INDEXING_COMPLETION_POLICY:
+        raise BenchmarkIntegrityError("LongMemEval indexing completion policy differs")
     for field in ("code_hash", "data_hash", "expected_ids_hash"):
         value = manifest.get(field)
         if not isinstance(value, str) or re.fullmatch(
@@ -2698,7 +2721,11 @@ def _validate_artifact(
         secret_free_endpoint=True,
     )
     try:
-        validate_extraction_canary_config_binding(
+        canary_validator = (
+            _archived_canary_validators()[0] if archive_only
+            else validate_extraction_canary_config_binding
+        )
+        canary_validator(
             config.get("extraction_canary"),
             config.get("effective_hymem_config"),
         )
@@ -2799,7 +2826,6 @@ def _validate_artifact(
     effective = config.get("effective_hymem_config")
     if not isinstance(effective, Mapping) or not effective:
         raise BenchmarkIntegrityError("LongMemEval effective HyMem config is absent")
-    validate_lme_summary_policy_binding(config)
     expected_effective = {
         "message_fts_top_k": 15, "fts_top_k": 10, "graph_top_k": 10,
         "aggregation_nodes_enabled": config.get("aggregation_nodes"),
@@ -2895,6 +2921,16 @@ def _validate_artifact(
             not isinstance(failure, str) or not failure.strip()
         ):
             raise BenchmarkIntegrityError("LongMemEval failure evidence is malformed")
+        # Scored checkpoint reconciliation writes this flag on every row.
+        # Older artifacts may omit it, but a present value must agree exactly
+        # with the failure evidence (bool is required; 0/1 are not flags).
+        if "strict_failure" in row and (
+            type(row["strict_failure"]) is not bool
+            or row["strict_failure"] is not bool(failure)
+        ):
+            raise BenchmarkIntegrityError(
+                "LongMemEval strict failure flag differs from row outcome"
+            )
         verdict = row.get("correct")
         if scored_run:
             if row.get("retrieval_only") is True or not isinstance(verdict, bool):
@@ -2997,7 +3033,7 @@ def _validate_artifact(
                     )
                 allowed_failure_fields = {
                     "question_id", "question_type", "correct",
-                    "benchmark_failure", "retrieval_only", "oracle_ability",
+                    "benchmark_failure", "strict_failure", "retrieval_only", "oracle_ability",
                     "detected_ability", "ability_used", "distill_fired",
                     "distill_calls", "indexing", "memory_pipeline_usage",
                     "embedding_usage", "lifecycle_errors",
@@ -3171,6 +3207,8 @@ def _validate_artifact(
         _validate_segment_extraction_canary(
             segment, pipeline=pipeline, no_dream=config["no_dream"],
             prompt_version=config["effective_hymem_config"]["prompt_version"],
+            archive_policy=config["extraction_canary"] if archive_only else None,
+            archive_effective_config=config["effective_hymem_config"] if archive_only else None,
         )
         if segment.get("model_identities") != models:
             raise BenchmarkIntegrityError(
@@ -3520,6 +3558,16 @@ def _validate_artifact(
         "rows": rows,
         "scores": recomputed,
         "counts": normalized_counts,
+        "summary_degraded_questions": sum(
+            row.get("indexing", {}).get("outcome") == "success_with_summary_degradation"
+            for row in rows if isinstance(row.get("indexing"), Mapping)
+        ),
+        "summary_degraded_sessions": sum(
+            row["indexing"]["final_status"]["summary_health"]["summary_degraded_sessions"]
+            for row in rows
+            if isinstance(row.get("indexing"), Mapping)
+            and row["indexing"].get("outcome") == "success_with_summary_degradation"
+        ),
         "answer_calls": call_totals["reader"] if exact_usage else None,
         "judge_calls": call_totals["judge"] if exact_usage else None,
         "retrieval_calls": call_totals["retrieval"] if exact_usage else None,

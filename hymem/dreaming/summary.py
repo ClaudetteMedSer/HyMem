@@ -4,9 +4,7 @@ import logging
 import sqlite3
 
 from hymem.extraction.llm import LLMClient, LLMRequest
-from hymem.extraction.prompts import (
-    SESSION_SUMMARY_MAX_CHARS, SESSION_SUMMARY_SYSTEM, SESSION_SUMMARY_USER_TEMPLATE,
-)
+from hymem.extraction.prompts import SESSION_SUMMARY_SYSTEM, SESSION_SUMMARY_USER_TEMPLATE
 
 log = logging.getLogger("hymem.dreaming.summary")
 
@@ -70,7 +68,7 @@ def clean_summary(raw: str | None) -> str | None:
     summary = raw.strip().strip('"').strip("'")
     if not summary or len(summary) < 10:
         return None
-    return summary[:SESSION_SUMMARY_MAX_CHARS]
+    return summary[:500]
 
 
 def persist_session_summary(
@@ -142,43 +140,45 @@ def persist_auto_session_summary(
     )
 
 
-def effective_session_summary(row: sqlite3.Row | None) -> str:
-    """Render ownership and the actual published automatic summary policy.
-
-    Old callers selecting only the three summary columns remain unchanged.
-    Configuration or a private staging generation cannot qualify published
-    content, and the label never changes stored text or its 500-character cap.
-    """
+def effective_session_summary(
+    row: sqlite3.Row | None, *, summary_health: dict | None = None,
+) -> str:
+    """Render the operator/legacy and rolling automatic summary coherently."""
     if row is None:
         return ""
     summary = row["summary"] or ""
     auto = row["auto_summary"] or ""
     source = row["summary_source"]
-    bounded_auto = False
-    if auto and "digest_published_generation" in row.keys():
-        # Local import avoids the digest -> summary import cycle. Recognition
-        # checks the complete wire grammar before inspecting an exact token.
-        from hymem.dreaming.digest import digest_generation_is_recognized
-        from hymem.dreaming.summary_policy import BOUNDED_HIGHLIGHTS_V1
-
-        generation = row["digest_published_generation"]
-        bounded_auto = bool(
-            digest_generation_is_recognized(generation)
-            and f"summary-policy={BOUNDED_HIGHLIGHTS_V1}" in generation.split("|")
-        )
-    auto_label = (
-        "Automatic highlights (non-exhaustive)" if bounded_auto
-        else "Automatic rolling summary"
-    )
+    notice = ""
+    if summary_health is not None:
+        required = ("summary_healthy", "degraded", "missing", "malformed")
+        if any(type(summary_health.get(key)) is not bool for key in required):
+            raise ValueError("summary health is unverified")
+        if (summary_health["summary_healthy"] != (
+                not summary_health["degraded"] and not summary_health["malformed"])
+                or (summary_health["missing"] and not summary_health["degraded"])
+                or (summary_health["malformed"] and
+                    (summary_health["degraded"] or summary_health["missing"]))):
+            raise ValueError("summary health is inconsistent")
+        if summary_health["malformed"]:
+            # Unverified automatic text must not be presented as current
+            # context. Operator/legacy text retains its separate attribution.
+            auto = ""
+            if source == "auto":
+                summary = ""
+            notice = "[Automatic summary state is unverified; automatic context withheld.]"
+        elif summary_health["degraded"]:
+            notice = (
+                "[Automatic summary is stale or missing; preserved historical "
+                "context may omit newer conversation content.]"
+            )
+    def render(text: str) -> str:
+        return notice + ("\n" + text if text else "") if notice else text
     if source == "auto":
-        if bounded_auto:
-            return f"{auto_label}: {auto}"
-        return auto or summary
+        return render(auto or summary)
     if summary and auto and summary != auto:
-        return (
+        return render(
             f"Operator/legacy summary: {summary}\n\n"
-            f"{auto_label}: {auto}"
+            f"Automatic rolling summary: {auto}"
         )
-    if summary:
-        return summary
-    return f"{auto_label}: {auto}" if bounded_auto else auto
+    return render(summary or auto)

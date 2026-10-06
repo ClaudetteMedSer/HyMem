@@ -60,17 +60,13 @@ from hymem.contrib.model_policy import (  # noqa: E402
     RECOMMENDED_DEEPSEEK_MODEL,
     require_active_model,
 )
-from hymem.dreaming.summary_policy import (  # noqa: E402
-    LEGACY_COMPLETE_V1 as DEFAULT_SUMMARY_POLICY,
-    SUMMARY_POLICIES,
-    validate_summary_policy,
-)
 
 from benchmarks.strictness import (
     AtomicCheckpoint,
     BenchmarkCleanupError,
     BenchmarkIntegrityError,
     IndexingConvergenceError,
+    INDEXING_COMPLETION_POLICY,
     OwnedResourceScope,
     PythonSourceSlice,
     aggregate_embedding_usage_snapshots,
@@ -132,7 +128,6 @@ from benchmarks.lme_protocol import (
     official_judge_match,
     parse_official_verdict,
     validate_lme_dataset,
-    validate_lme_summary_policy_binding,
     validate_safe_endpoint,
 )
 from benchmarks.extraction_canary import (
@@ -373,21 +368,15 @@ DEFAULT_INDEXING_TIMEOUT_S = 3600.0
 # DeepSeek API
 DEEPSEEK_API_KEY = ""
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-# Public name retained for callers; this pins the requested service, not weights.
 PINNED_DEEPSEEK_MODEL = RECOMMENDED_DEEPSEEK_MODEL
 ANSWER_MODEL = PINNED_DEEPSEEK_MODEL
 JUDGE_MODEL = PINNED_DEEPSEEK_MODEL
 
-# Local embedding server (lever L1) — the FastEmbed ONNX server Hermes runs in
-# production. These endpoint/model/dimension defaults do not start that service
-# or supply its required deployment revision and tenant attestations. Set those
-# with --embedding-deployment-revision / --embedding-deployment-tenant or
-# HYMEM_EMBEDDING_DEPLOYMENT_REVISION / HYMEM_EMBEDDING_DEPLOYMENT_TENANT.
-# The adapter pins the dimension automatically. A service outside the container
-# needs a reachable --embedding-base-url (including /v1 for this FastEmbed service)
-# and HYMEM_EMBEDDING_ALLOW_INSECURE_INTERNAL_HTTP=1 for trusted internal HTTP.
-# DeepSeek has no embeddings API, so this benchmark deliberately points at its
-# own local FastEmbed service. api_key="local" because that service ignores it.
+# Local embedding defaults for lever L1. Enabling --embeddings still requires
+# a running service plus explicit deployment revision and tenant attestation.
+# A container must use a reachable endpoint, including /v1 for this service;
+# trusted non-loopback HTTP also needs an explicit transport opt-in. The adapter
+# pins the dimension; HYMEM_EMBEDDING_* may override these defaults.
 LOCAL_EMBED_BASE_URL = "http://localhost:8766/v1"
 LOCAL_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 LOCAL_EMBED_DIM = 384
@@ -794,7 +783,7 @@ class LLMClient:
         # Extra top-level request-body fields merged into every call — the raw-HTTP
         # equivalent of the OpenAI SDK's `extra_body`. Needed post-2026-07-24:
         # the retired deepseek-chat alias had moved reader/judge to
-        # DeepSeek Flash, whose thinking mode can consume the response budget
+        # deepseek-v4-flash, whose thinking mode can consume the response budget
         # (and corrupt the yes/no judge parse) unless thinking is disabled.
         # ``None`` means no operator body was supplied and activates the safe
         # DeepSeek-only default; an explicit object is validated as-is.
@@ -817,7 +806,7 @@ class LLMClient:
         self._usage_complete = True
         self._accounted_response_attempts = 0
         self.last_error: str | None = None
-        # Guards accounting so it aggregates correctly when many worker
+        # Guards the two counters so they aggregate correctly when many worker
         # threads share this client (--workers > 1).
         self._lock = threading.Lock()
         self._closed = False
@@ -830,8 +819,8 @@ class LLMClient:
                 content, _usage = self._call(messages, temperature, max_tokens)
                 return content
             except LLMResponseError as e:
-                # Usage was accounted before response admission. A received
-                # non-stop/schema failure must not become another paid request.
+                # A received response is accounted, then rejected once. A
+                # second paid response cannot be called a transport retry.
                 last_exception_type = _bounded_exception_type(e)
                 break
             except Exception as e:
@@ -908,9 +897,9 @@ class LLMClient:
         with self._lock:
             self._accounted_response_attempts += 1
             if valid:
-                self.prompt_tokens += usage["prompt_tokens"]
-                self.completion_tokens += usage["completion_tokens"]
-                self.total_tokens += usage["total_tokens"]
+                self.prompt_tokens += int(usage["prompt_tokens"])
+                self.completion_tokens += int(usage["completion_tokens"])
+                self.total_tokens += int(usage["total_tokens"])
             else:
                 self._usage_complete = False
             self.token_usage_available = (
@@ -920,8 +909,8 @@ class LLMClient:
         choices = data.get("choices") if type(data) is dict else None
         if type(choices) is not list or not choices or type(choices[0]) is not dict:
             raise LLMResponseError("LLM response has no valid first choice")
-        # Preserve the existing first-choice policy, including an explicitly
-        # requested n>1. Other choices cannot rescue a rejected first choice.
+        # Retain the requested n>1 first-choice policy; a later choice cannot
+        # rescue a rejected first one.
         choice = choices[0]
         finish = choice.get("finish_reason")
         if type(finish) is not str or finish != "stop":
@@ -1070,8 +1059,7 @@ class HyMemAdapter:
                  embedding_dim: int | None = None,
                  embedding_api_key: str | None = None,
                  embedding_deployment_revision: str | None = None,
-                 embedding_deployment_tenant: str | None = None,
-                 digest_summary_policy: str = DEFAULT_SUMMARY_POLICY):
+                 embedding_deployment_tenant: str | None = None):
         self.db_path = db_path
         self.api_key = api_key
         self.embeddings = embeddings
@@ -1081,7 +1069,6 @@ class HyMemAdapter:
         self.aggregation_nodes = aggregation_nodes
         self.aggregation_broad = aggregation_broad
         self.episode_granularity = episode_granularity
-        self.digest_summary_policy = validate_summary_policy(digest_summary_policy)
         self.value_supersession = value_supersession
         self.graph_multihop = graph_multihop
         self.graph_multihop_max_hops = graph_multihop_max_hops
@@ -1127,7 +1114,6 @@ class HyMemAdapter:
         if self.aggregation_broad:
             overrides["aggregation_inject_abilities"] = ()
         overrides["episode_granularity_enabled"] = self.episode_granularity
-        overrides["digest_summary_policy"] = validate_summary_policy(self.digest_summary_policy)
         overrides["value_supersession_enabled"] = self.value_supersession
         if self.graph_multihop:
             overrides["graph_multihop_enabled"] = True
@@ -1199,9 +1185,6 @@ class HyMemAdapter:
         # consideration, and the day it lands this adapter must not move with
         # it silently.
         overrides["episode_granularity_enabled"] = self.episode_granularity
-        # Pin the write-side summary treatment independently of future library
-        # defaults. Reusing another treatment's store is not the same experiment.
-        overrides["digest_summary_policy"] = validate_summary_policy(self.digest_summary_policy)
         # Bi-temporal KU lever: dream-cycle single-assertion value supersession.
         # Pinned explicitly BOTH ways so a run is reproducible whatever the
         # library default: ON since 2026-07-02 (guard cleared — score-neutral,
@@ -3332,7 +3315,6 @@ def _adapter_for_args(db_path: Path, args, api_key: str) -> HyMemAdapter:
         aggregation_nodes=args.aggregation_nodes,
         aggregation_broad=args.aggregation_broad,
         episode_granularity=args.episode_granularity,
-        digest_summary_policy=getattr(args, "digest_summary_policy", DEFAULT_SUMMARY_POLICY),
         value_supersession=args.value_supersession,
         graph_multihop=args.graph_multihop,
         graph_multihop_max_hops=args.graph_multihop_max_hops,
@@ -4048,8 +4030,6 @@ def _distill_run_one(q_data: dict, args, answer_llm: LLMClient, judge_llm: LLMCl
                           aggregation_broad=args.aggregation_broad,
                           episode_granularity=getattr(
                               args, "episode_granularity", False),
-                          digest_summary_policy=getattr(
-                              args, "digest_summary_policy", DEFAULT_SUMMARY_POLICY),
                           value_supersession=args.value_supersession,
                           facts_enabled=getattr(args, "facts", None),
                           facts_extraction=getattr(args, "facts_extraction", None),
@@ -4527,11 +4507,11 @@ def _run_main(
     parser.add_argument("--answer-extra-body", default=None, metavar="JSON",
                         help="JSON object merged into the ANSWER request body (raw-HTTP "
                              "`extra_body`). When omitted, the pinned DeepSeek "
-                             "Flash default gets thinking disabled automatically; "
+                             "v4-flash default gets thinking disabled automatically; "
                              "custom endpoints are never given a vendor body implicitly.")
     parser.add_argument("--judge-extra-body", default=None, metavar="JSON",
                         help="JSON object merged into the JUDGE request body. When "
-                             "omitted, the DeepSeek Flash requested service gets "
+                             "omitted, the pinned DeepSeek v4-flash default gets "
                              "thinking disabled automatically.")
     parser.add_argument("--rejudge", default=None, metavar="RUN.json",
                         help="Re-judge a stored results JSON under the current "
@@ -4564,6 +4544,12 @@ def _run_main(
     parser.add_argument(
         "--no-prereg", action="store_true",
         help="explicitly mark this run exploratory/development-only",
+    )
+    parser.add_argument(
+        "--skip-extraction-canary", action="store_true",
+        help="operator override for non-official pipeline providers: record "
+             "zero-work canary evidence with skip_reason=operator_override "
+             "instead of running the Phase-1 extraction canary",
     )
     parser.add_argument("--keep-db", action="store_true")
     parser.add_argument("--workers", type=int, default=1,
@@ -4711,14 +4697,6 @@ def _run_main(
                              "G-EP1 PASSED 2026-08-31 (benchmarks/episode_probe.py); this "
                              "flag exists to run the LME non-regression guard the flip "
                              "still owes.")
-    parser.add_argument(
-        "--digest-summary-policy", choices=tuple(SUMMARY_POLICIES),
-        default=DEFAULT_SUMMARY_POLICY,
-        help="Versioned write-side rolling-summary treatment: legacy_complete_v1 "
-             "(default) or opt-in bounded_highlights_v1. Recorded in effective "
-             "config and checkpoint/calibration identity; compare explicitly "
-             "disclosed treatments, not stores built under another policy.",
-    )
     parser.add_argument("--graph-multihop", action="store_true",
                         help="Track A / Idea A lever (cfg.graph_multihop_enabled): enable "
                              "query-time multi-hop graph traversal (Source 4 of _graph_lookup) "
@@ -5065,9 +5043,6 @@ def _run_main(
     ).build_config()
     effective_hymem_config = effective_hymem_config_identity(config_probe)
     strict_config.update({
-        "digest_summary_policy": validate_summary_policy(getattr(
-            args, "digest_summary_policy", DEFAULT_SUMMARY_POLICY,
-        )),
         "label_free_answer_path": bool(args.auto_ability),
         "scored_run": not args.retrieval_only,
         "exploratory_label_steering": not args.auto_ability,
@@ -5113,6 +5088,7 @@ def _run_main(
         ),
         "prereg": args.prereg_obj,
         "indexing_require_healthy": bool(args.indexing_require_healthy),
+        "indexing_completion_policy": INDEXING_COMPLETION_POLICY,
         "embedding_runtime": embedding_identity,
         "context_policy": args.context_policy_obj,
         "extraction_canary": extraction_canary_policy(
@@ -5120,7 +5096,6 @@ def _run_main(
         ),
         "effective_hymem_config": effective_hymem_config,
     })
-    validate_lme_summary_policy_binding(strict_config)
     runtime_extraction_binding = validate_extraction_canary_config_binding(
         strict_config["extraction_canary"], effective_hymem_config
     )
@@ -5660,7 +5635,22 @@ def _run_main(
 
     if work_total:
         ledger.update_execution_segment(segment_id, _segment("running", 0))
-        if not args.no_dream:
+        if args.skip_extraction_canary:
+            print("WARNING: extraction canary SKIPPED (operator override; "
+                  "non-official pipeline provider). Zero-work evidence "
+                  "recorded as skip_reason=operator_override; this run's "
+                  "pipeline evidence is non-comparable with canonical runs.",
+                  flush=True)
+            extraction_canary_report = skipped_extraction_canary(
+                "operator_override",
+                prompt_version=extraction_prompt_version,
+            )
+            _validate_pipeline_extraction_canary(
+                extraction_canary_report, args, mode="operator_override",
+            )
+            ledger.update_execution_segment(segment_id, _segment("running", 0))
+            print_extraction_canary(extraction_canary_report)
+        elif not args.no_dream:
             try:
                 extraction_canary_report = run_configured_extraction_canary(
                     api_key=pipeline_key,

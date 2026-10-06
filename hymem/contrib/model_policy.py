@@ -29,9 +29,8 @@ def deprecated_deepseek_alias(model: object) -> str | None:
     normalization.  The two provider-qualified forms used by this repository
     and common OpenAI-compatible gateways are recognized as well:
     ``deepseek:deepseek-chat`` and ``deepseek/deepseek-chat``.  Versioned model
-    ids such as ``deepseek-chat-v4`` are never rejected by substring inference.
-    Version-looking names are not inherently immutable: the retired v4-flash
-    names are explicitly denied because the provider now reroutes them.
+    ids such as ``deepseek-chat-v4`` are not aliases and are never rejected by
+    substring inference.
     """
 
     if not isinstance(model, str):

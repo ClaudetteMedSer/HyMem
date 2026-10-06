@@ -680,3 +680,22 @@ def merge(
         )
 
         refresh_phase1_auxiliary_outcomes(conn, auxiliary_identities)
+        # A merge can change only auxiliary identity rows while every claim
+        # remains on an existing edge. Those chunks still lose their local
+        # ordered-input replay proof; no historical proof is reconstructed.
+        if "local_replay_proof" in {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(kg_claim_extraction_outcomes)"
+            ).fetchall()
+        }:
+            from hymem.core.db import evidence_mutation
+
+            with evidence_mutation(conn):
+                conn.executemany(
+                    "UPDATE kg_claim_extraction_outcomes SET "
+                    "local_replay_proof=NULL WHERE chunk_id=?",
+                    [(chunk_id,) for chunk_id in sorted({
+                        chunk_id for chunk_id, _ in auxiliary_identities
+                    })],
+                )

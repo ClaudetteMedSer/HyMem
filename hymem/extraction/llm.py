@@ -29,6 +29,17 @@ class LLMClient(Protocol):
     def complete(self, request: LLMRequest) -> str: ...
 
 
+class LLMResponseError(RuntimeError):
+    """A received reply failed admission; resubmitting is not a transport retry."""
+
+
+class LLMOutputTruncatedError(LLMResponseError):
+    """Trusted finish=length evidence with no partial payload or item authority."""
+
+    def __init__(self) -> None:
+        super().__init__("LLM response exceeded its output budget")
+
+
 class ProviderAttemptTracker:
     """Exact request-attempt count for one caller-owned completion scope.
 

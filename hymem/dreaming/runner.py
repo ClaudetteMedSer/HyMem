@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import inspect
 import logging
 import os
@@ -87,6 +88,7 @@ from hymem.dreaming.digest import (
     extract_session_digest,
     load_completed_digest_slices,
     load_digest_staged_summary,
+    load_digest_staged_summary_state,
     stage_digest_extraction,
     record_digest_failure,
 )
@@ -124,6 +126,9 @@ from hymem.dreaming.retention import (
     prune_retracted_edges,
 )
 from hymem.dreaming.summary import persist_auto_session_summary
+from hymem.dreaming.summary_state import (
+    classify_summary_state, mark_summary_current, record_summary_failure,
+)
 from hymem.dreaming.value_supersession import supersede_competing_values
 from hymem.dreaming.user_profile import (
     PROFILE_PROMPT_VERSION,
@@ -745,7 +750,6 @@ def _run_dreaming(
                 max_tokens=cfg.dream_digest_max_tokens,
                 max_episodes=(cfg.dream_max_episodes_per_session
                               if cfg.episode_granularity_enabled else None),
-                summary_policy=cfg.digest_summary_policy,
                 client=phase1_identity_client,
             )
         if tier == "profile":
@@ -1451,6 +1455,7 @@ def _run_dreaming(
                 "SELECT summary, summary_source, auto_summary, "
                 "auto_summary_message_id, auto_summary_partial_message_id, "
                 "auto_summary_message_offset, "
+                "auto_summary_generation, summary_failure_reason, summary_failure_count, "
                 "digested_prompt_version, profile_prompt_version, "
                 "profile_cursor_message_id, "
                 "profile_cursor_partial_message_id, profile_cursor_offset, "
@@ -1460,7 +1465,7 @@ def _run_dreaming(
                 "digested_message_id, episodes_prompt_version, "
                 "coverage_message_id, digest_cursor_message_id, "
                 "digest_cursor_partial_message_id, digest_cursor_offset, "
-                "digest_cursor_prompt_version, digest_published_generation "
+                "digest_cursor_prompt_version, digest_published_generation, digest_published_message_id "
                 ", digest_retry_count, digest_retry_config_version, "
                 "digest_quarantined "
                 "FROM sessions WHERE id = ?",
@@ -1518,10 +1523,11 @@ def _run_dreaming(
             coverage_tail = digested["coverage_message_id"] if digested else None
             digest_cursor_invalid = False
             staged_auto_summary = None
+            staged_summary_failure = None
             staging_valid = True
             if cursor_current:
                 try:
-                    staged_auto_summary = load_digest_staged_summary(
+                    staged_auto_summary, staged_summary_failure = load_digest_staged_summary_state(
                         conn, session_id, stored_digest_generation,
                         (cursor_message_id, partial_message_id, cursor_offset),
                     )
@@ -1554,6 +1560,7 @@ def _run_dreaming(
                 cursor_offset = 0
                 digest_cursor_invalid = True
                 staged_auto_summary = None
+                staged_summary_failure = None
             newest_message_id = conn.execute(
                 "SELECT MAX(id) AS m FROM messages WHERE session_id = ?",
                 (session_id,),
@@ -1587,6 +1594,7 @@ def _run_dreaming(
                 cursor_offset = 0
                 caught_up = False
                 staged_auto_summary = None
+                staged_summary_failure = None
             digest_retry_key = digest_retry_policy_version(
                 digest_config,
                 max_attempts=cfg.digest_extraction_max_attempts,
@@ -1603,27 +1611,18 @@ def _run_dreaming(
                     else None
                 ),
             )
-            digest_retry_malformed = False
-            try:
-                digest_retry_count, digest_input_retry_count = digest_retry_counts_for_policy(
-                    digested["digest_retry_count"] if digested else 0,
-                    digested["digest_retry_config_version"] if digested else None,
-                    retry_key=digest_retry_key,
-                )
-            except ValueError:
-                # A corrupt count/key is not a policy change. Hold it for
-                # diagnosis instead of resetting attempts or spending calls.
-                # A damaged redundant flag alone remains safely recoverable.
-                digest_retry_count = digest_input_retry_count = 0
-                digest_retry_malformed = True
+            digest_retry_count, digest_input_retry_count = digest_retry_counts_for_policy(
+                digested["digest_retry_count"] if digested else 0,
+                digested["digest_retry_config_version"] if digested else None,
+                retry_key=digest_retry_key,
+            )
             digest_quarantined = digest_retry_is_quarantined(
                 digest_retry_count,
                 digested["digest_retry_config_version"] if digested else None,
                 retry_key=digest_retry_key,
                 max_attempts=cfg.digest_extraction_max_attempts,
             )
-            if (coverage_tail is not None and not caught_up
-                    and not digest_quarantined and not digest_retry_malformed):
+            if coverage_tail is not None and not caught_up and not digest_quarantined:
                 _check_deadline()
                 # A new full walk gets a distinct generation even when its
                 # prompt/config is unchanged.  Successful partial slices store
@@ -1640,7 +1639,7 @@ def _run_dreaming(
                 # first v38 walk with it.  Prompt-version rewinds also carry a
                 # prior automatic summary so a partial rebuild never hides the
                 # already-published history.
-                if staged_auto_summary is not None:
+                if staged_auto_summary:
                     prior_auto_summary = staged_auto_summary
                 elif digested["auto_summary"]:
                     # A rewind re-reads the exact source stream, but it must
@@ -1655,6 +1654,16 @@ def _run_dreaming(
                     prior_auto_summary = digested["summary"] or ""
                 else:
                     prior_auto_summary = ""
+                prior_summary_is_stale = bool(
+                    staged_summary_failure is not None
+                    or (
+                        cursor_current
+                        and stored_digest_generation == published_digest_generation
+                        and not classify_summary_state(
+                            conn, session_id, require_source_tail=False,
+                        )["summary_healthy"]
+                    )
+                )
                 slice_key = (
                     f"after={cursor_message_id if cursor_message_id is not None else 'start'};"
                     f"partial={partial_message_id if partial_message_id is not None else 'none'};"
@@ -1676,11 +1685,19 @@ def _run_dreaming(
                             prior_summary=prior_auto_summary,
                             granular=cfg.episode_granularity_enabled,
                             max_episodes=cfg.dream_max_episodes_per_session,
-                            summary_policy=cfg.digest_summary_policy,
+                            separate_summary=True,
+                            prior_summary_is_stale=prior_summary_is_stale,
                         )
                 except Exception as exc:
                     report.digest_failures += 1
-                    log.exception("digest.extraction_failure session_id=%s", session_id)
+                    # Provider/validation exception text can contain source or
+                    # output. The extractor emits bounded stage/source hashes;
+                    # retain only a hashed session and error class here.
+                    log.warning(
+                        "digest.extraction_failure session_sha256=%s error_type=%s",
+                        hashlib.sha256(session_id.encode("utf-8")).hexdigest(),
+                        type(exc).__name__[:80],
+                    )
                     with core_db.transaction(conn):
                         newly_quarantined = record_digest_failure(
                             conn,
@@ -1714,7 +1731,17 @@ def _run_dreaming(
                             report.budget_exhausted = True
                     if digest is not None and not digest.parse_failed:
                         with core_db.transaction(conn), _semantic_boundary("digest"):
-                            summary_to_persist = digest.summary or prior_auto_summary[:500]
+                            # Carry only a complete accepted bounded value in
+                            # private staging. An unbounded legacy summary may
+                            # be the sole surviving history: preserve it in its
+                            # original field, never publish a truncated prefix.
+                            summary_to_persist = digest.summary or prior_auto_summary
+                            if len(summary_to_persist) > 500:
+                                summary_to_persist = ""
+                                digest.summary = None
+                                digest.summary_failure_reason = (
+                                    digest.summary_failure_reason or "summary_output_cap"
+                                )
                             stage_digest_extraction(
                                 conn, session_id, digest_build_generation,
                                 slice_key, digest, summary_to_persist,
@@ -1813,12 +1840,6 @@ def _run_dreaming(
                                     [part["procedures"] for part in completed_slices],
                                     replacing=(digest_build_generation != published_digest_generation),
                                 )
-                                persist_auto_session_summary(
-                                    conn, session_id, completed_slices[-1]["summary"],
-                                    covered_message_id=digest.covered_message_id,
-                                    partial_message_id=digest.partial_message_id,
-                                    covered_message_offset=digest.next_message_offset,
-                                )
                                 # Publish prompt stamps and retire the previous
                                 # complete generation only after the replacement
                                 # walk is wholly durable.  A mid-walk failure
@@ -1838,14 +1859,32 @@ def _run_dreaming(
                                 conn.execute(
                                     "UPDATE sessions SET digested_prompt_version = ?, "
                                     "episodes_prompt_version = ?, "
-                                    "digest_published_generation = ? WHERE id = ?",
+                                    "digest_published_generation = ?, "
+                                    "digest_published_message_id = ? WHERE id = ?",
                                     (
                                         cfg.prompt_version,
                                         episode_prompt_version,
                                         digest_build_generation,
+                                        digest.covered_message_id,
                                         session_id,
                                     ),
                                 )
+                                summary_failure = next((
+                                    part["summary_failure_reason"] for part in completed_slices
+                                    if part["summary_failure_reason"] is not None
+                                ), None)
+                                if summary_failure is None:
+                                    mark_summary_current(
+                                        conn, session_id, completed_slices[-1]["summary"],
+                                        generation=digest_build_generation,
+                                        covered_message_id=digest.covered_message_id,
+                                    )
+                                else:
+                                    # Items are now complete and proven, but an
+                                    # optional rolling summary still has a gap.
+                                    # Leave its last accepted text and actual
+                                    # coverage untouched, with bounded metadata.
+                                    record_summary_failure(conn, session_id, summary_failure)
                                 if replacing_generation:
                                     # Conditional FTS triggers deliberately did
                                     # not index staged rows. The marker and these
@@ -1869,13 +1908,6 @@ def _run_dreaming(
                                 # A bounded digest slice is unfinished work even
                                 # when the Phase-1 chunk budget remains.
                                 report.budget_exhausted = True
-            elif digest_retry_malformed and coverage_tail is not None and not caught_up:
-                report.digest_failures += 1
-                report.budget_exhausted = True
-                log.warning(
-                    "digest.retry_state_malformed session_id=%s action=held_without_call",
-                    session_id,
-                )
             elif digest_quarantined and coverage_tail is not None and not caught_up:
                 report.digest_quarantined += 1
                 log.warning(
@@ -2848,19 +2880,16 @@ def _run_dreaming(
                     if shadows_healed:
                         log.info("aggregate.pre_build_shadow_heal")
                 else:
-                    # Resync is optional maintenance composed of several FTS
-                    # and vector-table writes.  Do not start it in a bounded
-                    # dream: unlike normal semantic transactions it cannot be
-                    # made safe if the deadline lands between those writes.
-                    # A clean read-only probe licenses aggregation; a proven
-                    # mismatch remains pending for an unbounded repair rather
-                    # than building a tree from corrupt rowid shadows.
+                    # Full shadow resync remains unbounded maintenance. A
+                    # surplus-only episode repair is one atomic fenced write;
+                    # missing or changed authoritative vectors still fail closed.
                     shadows_aligned = core_db.vec_episodes_aligned(conn)
                     _check_deadline()
                     if not shadows_aligned:
-                        raise RuntimeError(
-                            "rowid shadow repair requires an unbounded dream"
-                        )
+                        if not core_db.prune_extra_episode_vectors(conn):
+                            raise RuntimeError(
+                                "rowid shadow repair requires an unbounded dream"
+                            )
                 _check_deadline()
                 agg = build_aggregation_nodes(
                     conn, cfg, llm, embedding_client,

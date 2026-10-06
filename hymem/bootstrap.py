@@ -518,9 +518,6 @@ def build_from_env() -> HyMem:
     from hymem.contrib.openai_embedding_client import OpenAICompatibleEmbeddingClient
     from hymem.contrib.model_policy import require_active_model
 
-    # Reject a retired raw environment selection before resolve_env consults
-    # endpoint credentials. Keep the resolved-config check below for injected
-    # configurations and the constructor check for direct library callers.
     require_active_model(
         os.environ.get("HYMEM_LLM_MODEL", DEFAULT_LLM_MODEL),
         role="HyMem server LLM",

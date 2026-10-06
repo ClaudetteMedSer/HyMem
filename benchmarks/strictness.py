@@ -39,11 +39,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-# Direct CLI and sibling-script imports need the checkout on the import path.
 if not __package__:
-    _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
-    if _REPO_ROOT not in sys.path:
-        sys.path.insert(0, _REPO_ROOT)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hymem.deadline import DeadlineExceeded, MonotonicDeadline
 from hymem.dreaming.status import (
@@ -58,7 +55,38 @@ STRICT_PROTOCOL_VERSION = "hymem-benchmark-strict-v1"
 CHECKPOINT_VERSION = "hymem-benchmark-checkpoint-v1"
 CALIBRATION_VERSION = "hymem-benchmark-calibration-v1"
 CODE_IDENTITY_VERSION = "hymem-benchmark-code-v2"
-BENCHMARK_INDEXING_STATUS_VERSION = "hymem-benchmark-indexing-status-v3"
+BENCHMARK_INDEXING_STATUS_VERSION = "hymem-benchmark-indexing-status-v4"
+INDEXING_COMPLETION_POLICY = (
+    "source-backed-index-with-explicit-summary-degradation-v1"
+)
+SUMMARY_STATUS_COUNT_FIELDS = (
+    "summary_degraded_sessions", "summary_missing_sessions", "malformed_summaries",
+)
+SUMMARY_STATUS_FIELDS = (*SUMMARY_STATUS_COUNT_FIELDS, "summary_healthy")
+
+
+def validated_summary_health(status: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the explicit, non-source-bearing summary-health projection.
+
+    Only an honestly unavailable/stale summary is nonblocking. Malformed
+    metadata remains an integrity failure, independently of summary quality.
+    """
+    if any(
+        isinstance(field, str) and field.startswith("summary_")
+        and field not in SUMMARY_STATUS_FIELDS for field in status
+    ):
+        raise BenchmarkIntegrityError("indexing summary health has unknown fields")
+    for field in SUMMARY_STATUS_COUNT_FIELDS:
+        value = status.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2_147_483_647:
+            raise BenchmarkIntegrityError("indexing summary health count is malformed")
+    degraded = status["summary_degraded_sessions"]
+    if status["summary_missing_sessions"] > degraded:
+        raise BenchmarkIntegrityError("indexing missing summaries exceed degraded summaries")
+    expected = degraded == 0 and status["malformed_summaries"] == 0
+    if status.get("summary_healthy") is not expected:
+        raise BenchmarkIntegrityError("indexing summary health is inconsistent")
+    return {field: status[field] for field in SUMMARY_STATUS_FIELDS}
 _EMBEDDING_PENDING_FIELDS = (
     "pending_chunk_embeddings",
     "pending_message_embeddings",
@@ -935,7 +963,11 @@ def converge_indexing(
     require_healthy: bool = True,
     _clock=None,
 ) -> dict[str, Any]:
-    """Run bounded dream cycles until the durable extraction backlog is empty.
+    """Run bounded dream cycles until required source indexing is complete.
+
+    Under status v8, stale/missing summary context is reported separately and
+    never represented as clean summary health. Malformed summary state remains
+    fatal. This versioned policy does not waive any source/item integrity gate.
 
     ``dream`` returns a DreamReport-like dataclass or mapping. ``status`` is an
     optional read-only durable backlog callback. A single non-exhausted report
@@ -1054,19 +1086,26 @@ def converge_indexing(
             and value > 0
         }
         in_progress = latest_status.get("in_progress", False)
+        healthy = bool(
+            complete and not quarantined and not terminal_losses
+            and not malformed and coverage_integrity_failure == 0
+            and in_progress is False
+        )
+        summary_healthy = latest_status.get("summary_healthy")
+        if not isinstance(summary_healthy, bool):
+            summary_healthy = None
         return {
             "cycles": len(reports),
             "max_cycles": max_cycles,
             "timeout_s": float(timeout_s),
             "elapsed_s": elapsed,
             "complete": bool(complete),
-            "healthy": bool(
-                complete
-                and not quarantined
-                and not terminal_losses
-                and not malformed
-                and coverage_integrity_failure == 0
-                and in_progress is False
+            "healthy": healthy,
+            "summary_healthy": summary_healthy,
+            "outcome": (
+                "failure" if not healthy or reason is not None
+                else "success_with_summary_degradation"
+                if summary_healthy is False else "success"
             ),
             "failure_reason": reason,
             "reports": reports,
@@ -1179,6 +1218,13 @@ def converge_indexing(
             )
 
         if current_status:
+            try:
+                validated_summary_health(latest_status)
+            except BenchmarkIntegrityError as exc:
+                current = summary(complete=False, reason="malformed_status_shape")
+                raise IndexingConvergenceError(
+                    "memory indexing summary health is malformed", current,
+                ) from exc
             authority_reason = _phase1_authority_status_reason(latest_status)
             if authority_reason is not None:
                 current = summary(complete=False, reason=authority_reason)
@@ -1495,6 +1541,7 @@ def converge_indexing(
             if deadline.expired:
                 current["complete"] = False
                 current["healthy"] = False
+                current["outcome"] = "failure"
                 current["failure_reason"] = "timeout_after_cycle"
                 raise IndexingConvergenceError(
                     "memory indexing exceeded its timeout", current
@@ -1722,6 +1769,7 @@ def durable_indexing_status(
         raise BenchmarkIntegrityError(
             "memory indexing status has malformed Phase-1 producer authority"
         )
+    validated_summary_health(raw_status)
     required_counts = (
         *DURABLE_PENDING_FIELDS,
         *DURABLE_MALFORMED_FIELDS,

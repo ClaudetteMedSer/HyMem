@@ -24,6 +24,7 @@ hymem-server = "hymem.server:main"
 hymem-honcho = "hymem.honcho.app:main"
 hymem-doctor = "hymem.doctor:main"
 hymem-reembed = "hymem.reembed:main"
+hymem-recover-summaries = "hymem.recover_summaries:main"
 
 [tool.setuptools.packages.find]
 include = ["hymem*"]

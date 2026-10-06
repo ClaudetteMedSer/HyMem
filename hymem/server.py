@@ -26,7 +26,7 @@ hymem/contrib/openai_client.py for the full list).
 Key variables:
     HYMEM_LLM_API_KEY        API key for the extraction LLM (or DEEPSEEK_API_KEY)
     HYMEM_LLM_BASE_URL       Base URL (default: https://api.deepseek.com)
-    HYMEM_LLM_MODEL          Requested model service (default: deepseek-flash)
+    HYMEM_LLM_MODEL          Model name (default: deepseek-flash)
                              Retired deepseek-chat/deepseek-reasoner aliases
                              are rejected before the server opens its store.
     HYMEM_LLM_THINKING       Thinking-body policy (default: auto)
@@ -93,6 +93,7 @@ from hymem.dreaming.status import (
     DREAM_STATUS_HEALTH_DETAIL_FIELDS,
     DREAM_STATUS_RECOGNIZED_HEALTH_FIELDS,
     DREAM_STATUS_SCHEMA_VERSION,
+    summary_health_projection_is_valid,
     is_health_like_dream_status_field,
 )
 from hymem.dreaming.lossless import COVERAGE_INTEGRITY_CONFIG_VERSION
@@ -322,6 +323,8 @@ def _assess_dream_completion(hy, report) -> _DreamCompletionAssessment:
         )
 
     malformed: list[str] = []
+    if not summary_health_projection_is_valid(status):
+        malformed.append("status.summary_health:missing_or_inconsistent")
     status_field_names = {
         name for name in status if isinstance(name, str)
     }
@@ -664,6 +667,8 @@ def _assess_dream_completion(hy, report) -> _DreamCompletionAssessment:
         )
     if blockers:
         return _DreamCompletionAssessment("incomplete", tuple(blockers))
+    if not status["summary_healthy"]:
+        return _DreamCompletionAssessment("complete_with_summary_degradation")
     return _DreamCompletionAssessment("complete")
 
 
@@ -698,6 +703,12 @@ def _format_dream_completion(hy, report, *, targeted: bool) -> str:
             "dreaming cycle finished cleanly — store-wide durable blockers "
             "were clear at the coherent post-run snapshot; later arrivals "
             "may reopen work"
+        )
+    elif assessment.state == "complete_with_summary_degradation":
+        headline = (
+            "source-backed item indexing complete with summary degradation — "
+            "the last accepted summary is preserved at its actual coverage "
+            "frontier; summary context is stale or missing and needs recovery"
         )
     elif assessment.state == "skipped_in_progress":
         headline = (

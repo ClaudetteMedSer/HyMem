@@ -28,8 +28,11 @@ from hymem.deadline import DeadlineExceeded, current_deadline
 from hymem.extraction.llm import (
     LLMClient,
     LLMRequest,
+    LLMResponseError,
+    LLMOutputTruncatedError,
     ProviderAttemptTracker,
 )
+from hymem.extraction import llm as llm_module
 from hymem.extraction.retry import (
     DEFAULT_RETRY_ATTEMPTS,
     DEFAULT_RETRY_BASE_DELAY_SECONDS,
@@ -112,8 +115,7 @@ class OpenAICompatibleClient:
     environment keys are origin-bound: ``DEEPSEEK_API_KEY`` and
     ``OPENAI_API_KEY`` are never sent to a custom host.  Use the purpose-bound
     ``HYMEM_LLM_API_KEY`` (or an explicit constructor key) for a custom HTTPS
-    endpoint. The official DeepSeek producer identifies the requested service
-    and local request implementation; it does not attest immutable model weights.
+    endpoint.
 
     Environment variables (all optional if arguments are passed directly):
         HYMEM_LLM_API_KEY   — purpose-bound API key for the configured endpoint
@@ -206,8 +208,8 @@ class OpenAICompatibleClient:
             else None
         )
 
-        # `thinking` is a DeepSeek-specific body key. Reasoning can consume a
-        # bounded completion budget before producing usable content. But
+        # `thinking` is a DeepSeek-specific body key: deepseek-v4-flash otherwise
+        # spends its whole token budget reasoning and returns empty content. But
         # the OpenAI API rejects unknown body params with a 400, and vLLM's
         # tolerance varies by version — and because every call goes through
         # with_retry(), an unconditional send turns "wrong vendor" into three
@@ -251,9 +253,9 @@ class OpenAICompatibleClient:
         self._official_deployment_contract = official_deployment_contract
 
         # Provider accounting is cumulative and thread-safe because benchmark
-        # workers can share this client. Any unaccounted attempt or response
-        # without a complete usage block makes token totals unavailable rather
-        # than falsely exact, even if later responses are admitted.
+        # workers can share this client. Any failed attempt or response without
+        # a complete usage block makes token totals unavailable rather than
+        # falsely exact.
         self.call_count = 0
         self.request_attempts = 0
         self.successful_responses = 0
@@ -478,6 +480,7 @@ class OpenAICompatibleClient:
                 and self._helper_guard == (
                     current_deadline, with_retry, require_active_model,
                     resolve_llm_api_key, retry_module.retry_support_integrity,
+                    LLMResponseError, LLMOutputTruncatedError,
                 )
                 and retry_module.retry_support_integrity()
                 and tuple(
@@ -652,13 +655,28 @@ class OpenAICompatibleClient:
             {"thinking": {"type": "disabled"}}
             if config.send_thinking else {}
         )
+        # Operator extension point (option-a exploratory tooling): a JSON
+        # object in HYMEM_LLM_EXTRA_BODY is merged into the provider request
+        # body, after the thinking switch. Unset => zero effect on request
+        # bytes, so canonical runs are unchanged.
+        env_extra = os.environ.get("HYMEM_LLM_EXTRA_BODY")
+        if env_extra is not None:
+            try:
+                parsed = json.loads(env_extra)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "HYMEM_LLM_EXTRA_BODY must be a JSON object"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError("HYMEM_LLM_EXTRA_BODY must be a JSON object")
+            extra_body = {**extra_body, **parsed}
         if extra_body:
             kwargs["extra_body"] = extra_body
         if request.response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
-        # Keep the caller's absolute deadline for every attempt and admission;
-        # provider callbacks must not replace it by changing ambient context.
+        # The caller's absolute deadline owns every attempt and admission,
+        # even if provider code changes ambient context while returning.
         deadline = _FROZEN_CURRENT_DEADLINE()
 
         def _attempt():
@@ -691,9 +709,8 @@ class OpenAICompatibleClient:
             max_delay=DEFAULT_RETRY_MAX_DELAY_SECONDS,
             label=f"LLM completion ({config.model})",
         )
-        # A received reply can be paid even when its finish/content is rejected.
-        # Account it outside the transport retry loop, before any admission or
-        # post-return deadline/integrity check. Never reroll a received failure.
+        # Account received paid replies outside transport retry, before any
+        # deadline, identity or content rejection. Never reroll their admission.
         usage = getattr(resp, "usage", None)
         values = {
             "prompt_tokens": getattr(usage, "prompt_tokens", None),
@@ -715,31 +732,36 @@ class OpenAICompatibleClient:
         with self._usage_lock:
             self._accounted_response_attempts += 1
             if valid:
-                self.prompt_tokens += values["prompt_tokens"]
-                self.completion_tokens += values["completion_tokens"]
-                self.total_tokens += values["total_tokens"]
+                self.prompt_tokens += int(values["prompt_tokens"])
+                self.completion_tokens += int(values["completion_tokens"])
+                self.total_tokens += int(values["total_tokens"])
             else:
                 self._usage_complete = False
             self.token_usage_available = (
                 self._usage_complete
                 and self._accounted_response_attempts == self.request_attempts
             )
-        # A transport may ignore its timeout. Keep its observed usage but never
-        # admit a late response, even if its content and finish look usable.
         if deadline is not None:
             deadline.check()
         self._verify_transport_integrity()
         choices = getattr(resp, "choices", None)
         if type(choices) is not list or len(choices) != 1:
-            raise RuntimeError("LLM response must contain exactly one choice")
+            raise LLMResponseError("LLM response must contain exactly one choice")
         choice = choices[0]
         finish = getattr(choice, "finish_reason", None)
+        message = getattr(choice, "message", None)
+        if message is None or not hasattr(message, "content"):
+            raise LLMResponseError("LLM response message is malformed")
+        content = message.content
+        if type(finish) is str and finish == "length":
+            if content is not None and type(content) is not str:
+                raise LLMResponseError("LLM response content is malformed")
+            raise LLMOutputTruncatedError()
         if type(finish) is not str or finish != "stop":
-            raise RuntimeError("LLM response did not finish with stop")
-        content = getattr(getattr(choice, "message", None), "content", None)
+            raise LLMResponseError("LLM response did not finish with stop")
         if type(content) is not str:
-            raise RuntimeError("LLM response content is not a string")
-        # These counters describe admitted text completions, not paid replies.
+            raise LLMResponseError("LLM response content is not a string")
+        # These counters represent admitted text, not paid provider replies.
         with self._usage_lock:
             self.call_count += 1
             self.successful_responses += 1
@@ -773,6 +795,7 @@ _OPENAI_LLM_ORIGINAL_IMPLEMENTATION_GUARD = tuple(
 _OPENAI_LLM_ORIGINAL_HELPER_GUARD = (
     current_deadline, with_retry, require_active_model, resolve_llm_api_key,
     retry_module.retry_support_integrity,
+    LLMResponseError, LLMOutputTruncatedError,
 )
 
 
@@ -810,9 +833,9 @@ def openai_compatible_producer_declaration(
 ):
     """Derive the same safe producer declaration without constructing I/O.
 
-    The official DeepSeek exception identifies the exact request implementation
-    and requested service, not immutable provider weights. A provider-side
-    backend change is not observable from this declaration alone.
+    The official contract identifies a requested service and local request
+    implementation, not immutable provider weights. Provider backend changes
+    are not observable from this declaration alone.
     """
 
     from hymem.contrib.endpoint_policy import ENDPOINT_POLICY_VERSION
@@ -940,5 +963,6 @@ OPENAI_LLM_IMPLEMENTATION_SHA256 = compose_import_time_sha256(
     ENDPOINT_POLICY_IMPLEMENTATION_SHA256,
     MODEL_POLICY_IMPLEMENTATION_SHA256,
     retry_module.EXTRACTION_IMPLEMENTATION_SHA256,
+    llm_module.EXTRACTION_IMPLEMENTATION_SHA256,
     DEADLINE_IMPLEMENTATION_SHA256,
 )

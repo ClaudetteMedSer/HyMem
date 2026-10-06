@@ -1848,13 +1848,17 @@ def get_context(
             detail="representation controls require peer_target",
         )
 
-    session_row = hy.conn.execute(
-        "SELECT summary, auto_summary, summary_source, digest_published_generation "
-        "FROM sessions WHERE id = ?",
-        (session_id,),
-    ).fetchone()
     from hymem.dreaming.summary import effective_session_summary
-    session_summary = effective_session_summary(session_row)
+    from hymem.dreaming.summary_state import classify_summary_state
+    # A concurrent publication must not pair historical text with a newer
+    # healthy frontier. Use one private WAL snapshot for both projections.
+    with core_db.read_snapshot(hy.config.db_path) as summary_conn:
+        session_row = summary_conn.execute(
+            "SELECT summary, auto_summary, summary_source FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        summary_health = classify_summary_state(summary_conn, session_id)
+        session_summary = effective_session_summary(session_row, summary_health=summary_health)
 
     # Session context is local until a peer target is explicitly requested.
     # Process-global MEMORY.md, USER.md, digest/profile, and unowned rules have
@@ -2017,6 +2021,9 @@ def get_context(
     ]
     return {
         "summary": summary_obj,
+        # This metadata is independent of the token budget: omitting summary
+        # text must not hide the fact that its coverage is stale or unverified.
+        "summary_health": summary_health,
         "messages": selected_messages,
         "peer_representation": selected_representation,
         "peer_card": selected_peer_card,

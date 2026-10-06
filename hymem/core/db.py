@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterator
 
 from hymem.deadline import check_current_deadline
+from hymem.core.serialized_sqlite import SerializedConnection, operation_scope
 from hymem.core.message_records import (
     encode_message_record,
     message_content_hash,
@@ -35,7 +36,7 @@ from hymem.core.vectors import decode_vector
 
 log = logging.getLogger("hymem.core.db")
 
-EXPECTED_SCHEMA_VERSION = 61
+EXPECTED_SCHEMA_VERSION = 64
 _EVIDENCE_MUTATION_KEYS: contextvars.ContextVar[
     frozenset[tuple[int, int, int]]
 ] = contextvars.ContextVar("hymem_evidence_mutation_keys", default=frozenset())
@@ -2563,6 +2564,7 @@ def connect(path: Path) -> sqlite3.Connection:
         isolation_level=None,
         check_same_thread=False,
         cached_statements=0 if sys.version_info >= (3, 12) else 128,
+        factory=SerializedConnection,
     )
     conn.row_factory = sqlite3.Row
     register_read_authority_functions(conn)
@@ -2880,6 +2882,10 @@ def initialize(conn: sqlite3.Connection) -> None:
     # Reject an incompatible caller transaction before either can commit it.
     if conn.in_transaction:
         raise RuntimeError("database initialization requires no active transaction")
+    if _table_exists(conn, "schema_meta") and schema_version(conn) >= 62:
+        _validate_summary_frontier_storage(conn)
+    if _table_exists(conn, "schema_meta") and schema_version(conn) >= 63:
+        _validate_summary_recovery_storage(conn)
     if _table_exists(conn, "schema_meta") and schema_version(conn) >= 61:
         with transaction(conn):
             _validate_extraction_audit_storage(conn)
@@ -3503,8 +3509,136 @@ def _ensure_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
         _install_post_migration_runtime_guards(conn)
 
 
+def _summary_frontier_statements() -> list[str]:
+    return list(_split_sql_statements(files("hymem.core.migrations").joinpath(
+        "062_independent_summary_frontier.sql"
+    ).read_text(encoding="utf-8")))
+
+
+def _validate_summary_frontier_storage(conn: sqlite3.Connection) -> None:
+    """Require owned additive constraints before trusting v62 state.
+
+    Table order differs between bootstrap and ALTER lineage, so compare each
+    owned column declaration rather than the entire CREATE TABLE spelling.
+    """
+    if (not _table_exists(conn, "sessions") and not _table_exists(conn, "digest_staging")
+            and conn.execute("SELECT 1 FROM schema_meta WHERE key='summary_frontier_schema'").fetchone() is None):
+        # Supported migration-only fixtures can omit the entire session domain.
+        # Real stores carry the marker, so deleting both tables is not healed.
+        return
+    for statement in _summary_frontier_statements():
+        match = re.match(r"ALTER TABLE (\w+) ADD COLUMN (.+)", statement, re.DOTALL)
+        if match is None:
+            continue
+        table, declaration = match.groups()
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,),
+        ).fetchone()
+        if row is None or _audit_ddl(declaration) not in _audit_ddl(row[0]):
+            raise RuntimeError("schema v62 summary frontier storage is missing or malformed")
+
+
+def _install_summary_frontier_guards(conn: sqlite3.Connection) -> None:
+    for statement in _summary_frontier_statements():
+        match = re.match(r"CREATE TRIGGER IF NOT EXISTS (\w+)\s+BEFORE .*? ON (\w+)\b",
+                         statement, re.DOTALL)
+        if match is None:
+            continue
+        name, table = match.groups()
+        columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        # Historical sparse migration fixtures may not have external ownership
+        # columns. Normal bootstrap supplies them before the reopen healer.
+        required = set(re.findall(r"(?:new|old)\.(\w+)", statement))
+        if not required.issubset(columns):
+            continue
+        current = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,),
+        ).fetchone()
+        if current is not None and _audit_ddl(current[0]) == _audit_ddl(statement):
+            continue
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute(statement)
+
+
+def _backfill_v62_summary_frontier(conn: sqlite3.Connection) -> None:
+    """Recognize only the old atomic publication's source-proved frontier.
+
+    An active replacement/forward partial cursor is never a publication. Old
+    summary text and all item rows remain untouched; uncertain legacy state
+    gets NULL acknowledgement and is replayed by the new consumer.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
+    required = {"id", "coverage_message_id", "digest_published_generation",
+                "auto_summary", "auto_summary_message_id", "auto_summary_partial_message_id",
+                "auto_summary_message_offset", "digest_published_message_id",
+                "auto_summary_generation"}
+    if not required.issubset(columns) or not _table_exists(conn, "message_retention_coverage"):
+        return
+    from hymem.dreaming.digest import digest_generation_is_recognized
+    from hymem.dreaming.lossless import lossless_cursor_is_valid
+
+    for row in conn.execute("SELECT * FROM sessions"):
+        generation = row["digest_published_generation"]
+        message_id = row["auto_summary_message_id"]
+        if (row["digest_published_message_id"] is not None
+                or row["auto_summary_generation"] is not None
+                or row["summary_failure_reason"] is not None
+                or row["summary_failure_count"] != 0
+                or not digest_generation_is_recognized(generation)
+                or not isinstance(row["auto_summary"], str)
+                or len(row["auto_summary"]) > 500
+                or not isinstance(message_id, int) or message_id <= 0
+                or row["auto_summary_partial_message_id"] is not None
+                or row["auto_summary_message_offset"] != 0):
+            continue
+        try:
+            proved = lossless_cursor_is_valid(conn, row["id"], message_id, None, 0)
+        except sqlite3.OperationalError:
+            # Deliberately sparse migration-only fixtures cannot prove source.
+            proved = False
+        if proved:
+            conn.execute(
+                "UPDATE sessions SET digest_published_message_id=?,auto_summary_generation=? WHERE id=?",
+                (message_id, generation, row["id"]),
+            )
+
+
+def _summary_recovery_statements() -> list[str]:
+    return list(_split_sql_statements(files("hymem.core.migrations").joinpath(
+        "063_private_summary_recovery.sql"
+    ).read_text(encoding="utf-8")))
+
+
+def _validate_summary_recovery_storage(conn: sqlite3.Connection) -> None:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='summary_recovery'").fetchone()
+    if row is None or _audit_ddl(row[0]) != _audit_ddl(_summary_recovery_statements()[0]):
+        raise RuntimeError("schema v63 summary recovery storage is missing or malformed")
+    for index in conn.execute("PRAGMA index_list(summary_recovery)"):
+        if index[2] and index[3] != "pk":
+            raise RuntimeError("schema v63 summary recovery has unexpected uniqueness")
+
+
+def _install_summary_recovery_guards(conn: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
+    if not {"id", "source_workspace_id"}.issubset(columns):
+        return
+    statement = _summary_recovery_statements()[1]
+    name = "summary_recovery_workspace_guard"
+    current = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
+    if current is not None and _audit_ddl(current[0]) == _audit_ddl(statement):
+        return
+    conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    conn.execute(statement)
+
+
 def _install_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
     """Install the complete guard boundary inside the caller's repair unit."""
+    if schema_version(conn) >= 63:
+        _validate_summary_recovery_storage(conn)
+        _install_summary_recovery_guards(conn)
+    if schema_version(conn) >= 62:
+        _validate_summary_frontier_storage(conn)
+        _install_summary_frontier_guards(conn)
     if schema_version(conn) >= 61:
         _validate_extraction_audit_storage(conn)
         _install_extraction_audit_guards(conn)
@@ -3738,9 +3872,20 @@ def _install_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
         # replace the durable publication guards unconditionally: this heals a
         # process that created an earlier same-named trigger definition before
         # the final migration contract was installed.
+        proof_guard = (
+            "OR (new.local_replay_proof IS NOT NULL AND ("
+            "length(new.local_replay_proof) <> 71 OR "
+            "substr(new.local_replay_proof, 1, 7) <> 'sha256:' OR "
+            "substr(new.local_replay_proof, 8) GLOB '*[^0-9a-f]*'))"
+            if "local_replay_proof" in {
+                row["name"] for row in conn.execute(
+                    "PRAGMA table_info(kg_claim_extraction_outcomes)"
+                ).fetchall()
+            } else ""
+        )
         _execute_startup_sql(
             conn,
-            """
+            f"""
             DROP TRIGGER IF EXISTS kg_claim_extraction_outcomes_insert_guard;
             DROP TRIGGER IF EXISTS kg_claim_extraction_outcomes_update_guard;
             DROP TRIGGER IF EXISTS kg_claim_extraction_outcomes_delete_guard;
@@ -3753,6 +3898,7 @@ def _install_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
               OR substr(new.result_hash, 1, 7) <> 'sha256:'
               OR length(new.result_hash) <> 71
               OR substr(new.result_hash, 8) GLOB '*[^0-9a-f]*'
+              {proof_guard}
             BEGIN
                 SELECT RAISE(ABORT, 'claim extraction outcomes are internally managed');
             END;
@@ -3764,6 +3910,7 @@ def _install_post_migration_runtime_guards(conn: sqlite3.Connection) -> None:
               OR substr(new.result_hash, 1, 7) <> 'sha256:'
               OR length(new.result_hash) <> 71
               OR substr(new.result_hash, 8) GLOB '*[^0-9a-f]*'
+              {proof_guard}
             BEGIN
                 SELECT RAISE(ABORT, 'claim extraction outcomes are internally managed');
             END;
@@ -4742,6 +4889,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     resumes cleanly. Migrations are idempotent, so a fresh schema.sql database
     (which starts at version 1) runs them all as no-ops up to the latest."""
     cur = schema_version(conn)
+    if cur >= 62:
+        _validate_summary_frontier_storage(conn)
+    if cur >= 63:
+        _validate_summary_recovery_storage(conn)
     if cur >= 61:
         _validate_extraction_audit_storage(conn)
     if cur >= 55 and (
@@ -4838,6 +4989,60 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
                     conn.execute(_extraction_audit_statements()[0])
                 _validate_extraction_audit_storage(conn)
                 _install_extraction_audit_guards(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_meta(key,value) VALUES "
+                    "('schema_version',?)", (str(version),),
+                )
+            log.info("migrated schema to v%d (%s)", version, entry.name)
+            continue
+        if version == 62:
+            with transaction(conn):
+                if _table_exists(conn, "sessions"):
+                    for statement in _summary_frontier_statements():
+                        if not statement.startswith("CREATE TRIGGER"):
+                            _apply_migration_sql(conn, statement)
+                _validate_summary_frontier_storage(conn)
+                _backfill_v62_summary_frontier(conn)
+                _install_summary_frontier_guards(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('schema_version',?)",
+                    (str(version),),
+                )
+            log.info("migrated schema to v%d (%s)", version, entry.name)
+            continue
+        if version == 63:
+            with transaction(conn):
+                statements = _summary_recovery_statements()
+                if not _table_exists(conn, "summary_recovery"):
+                    conn.execute(statements[0])
+                _validate_summary_recovery_storage(conn)
+                _install_summary_recovery_guards(conn)
+                conn.execute(statements[-1])
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('schema_version',?)",
+                    (str(version),),
+                )
+            log.info("migrated schema to v%d (%s)", version, entry.name)
+            continue
+        if version == 64:
+            with transaction(conn):
+                if _table_exists(conn, "kg_claim_extraction_outcomes"):
+                    columns = {
+                        row["name"] for row in conn.execute(
+                            "PRAGMA table_info(kg_claim_extraction_outcomes)"
+                        ).fetchall()
+                    }
+                    if "local_replay_proof" not in columns:
+                        _apply_migration_sql(
+                            conn, entry.read_text(encoding="utf-8")
+                        )
+                    _validate_v64_local_claim_replay_shape(conn)
+                elif _v40_domain_present(conn):
+                    raise RuntimeError(
+                        "schema v64 claim outcome domain is missing"
+                    )
+                # Sparse historical fixtures without the graph domain carry
+                # only the version stamp, as older optional migrations do.
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_meta(key,value) VALUES "
                     "('schema_version',?)", (str(version),),
@@ -5072,6 +5277,8 @@ def _repair_post_migration_schema(conn: sqlite3.Connection) -> None:
     ):
         _ensure_v41_claim_extraction_outcome_shape(conn)
         _refresh_v41_claim_extraction_outcomes(conn)
+        if schema_version(conn) >= 64:
+            _validate_v64_local_claim_replay_shape(conn)
     if schema_version(conn) >= 57 and _v57_domain_present(conn):
         # A dropped v57 view leaves its dependent triggers present but
         # unexecutable.  Restore owned support objects before profile/evidence
@@ -5456,6 +5663,37 @@ def _backfill_v41_claim_extraction_outcomes(conn: sqlite3.Connection) -> None:
             )
 
 
+def _validate_v64_local_claim_replay_shape(conn: sqlite3.Connection) -> None:
+    """Reject a stamped or precreated lookalike without the local proof CHECK."""
+    columns = {
+        str(row["name"]): row
+        for row in conn.execute(
+            "PRAGMA table_info(kg_claim_extraction_outcomes)"
+        ).fetchall()
+    }
+    column = columns.get("local_replay_proof")
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='kg_claim_extraction_outcomes'"
+    ).fetchone()
+    ddl = str(table["sql"] or "") if table else ""
+    ddl = re.sub(r"/\*.*?\*/|--[^\n]*", "", ddl, flags=re.DOTALL)
+    sql = re.sub(r"\s+", "", ddl).lower()
+    expected_clause = (
+        "local_replay_prooftextcheck(local_replay_proofisnullor("
+        "length(local_replay_proof)=71and"
+        "substr(local_replay_proof,1,7)='sha256:'and"
+        "substr(local_replay_proof,8)notglob'*[^0-9a-f]*'))"
+    )
+    if (
+        column is None or str(column["type"]).upper() != "TEXT"
+        or int(column["notnull"]) != 0
+        or column["dflt_value"] is not None
+        or expected_clause not in sql
+    ):
+        raise RuntimeError("schema v64 local claim replay proof shape is malformed")
+
+
 def _ensure_v41_claim_extraction_outcome_shape(conn: sqlite3.Connection) -> None:
     """Heal an early stamped-v41 outcome FK from CASCADE to RESTRICT.
 
@@ -5486,11 +5724,16 @@ def _ensure_v41_claim_extraction_outcome_shape(conn: sqlite3.Connection) -> None
         ).fetchall()
     }
     allowed_columns = {frozenset(base_columns)}
+    allowed_columns.add(frozenset({*base_columns, "local_replay_proof"}))
     if _table_exists(conn, "phase1_generations"):
         allowed_columns.add(frozenset({*base_columns, "phase1_generation_key"}))
+        allowed_columns.add(frozenset({
+            *base_columns, "phase1_generation_key", "local_replay_proof",
+        }))
     if frozenset(actual_columns) not in allowed_columns:
         raise RuntimeError("unsupported claim extraction outcome table shape")
     source_has_phase1_generation = "phase1_generation_key" in actual_columns
+    source_has_local_replay_proof = "local_replay_proof" in actual_columns
     # A stamped v53 store can still carry the released early-v41 CASCADE
     # shape after a partial/manual historical reconstruction.  When the v53
     # registry exists, this repair must converge the rebuilt table to the full
@@ -5499,6 +5742,20 @@ def _ensure_v41_claim_extraction_outcome_shape(conn: sqlite3.Connection) -> None
         source_has_phase1_generation
         or _table_exists(conn, "phase1_generations")
     )
+    target_has_local_replay_proof = (
+        source_has_local_replay_proof or schema_version(conn) >= 64
+    )
+    if target_has_local_replay_proof and not source_has_local_replay_proof:
+        # A historical/reconstructed outcome table can safely regain only
+        # this nullable local field. No old publication earns an input proof.
+        conn.execute(
+            "ALTER TABLE kg_claim_extraction_outcomes ADD COLUMN "
+            "local_replay_proof TEXT CHECK (local_replay_proof IS NULL OR "
+            "(length(local_replay_proof)=71 AND "
+            "substr(local_replay_proof,1,7)='sha256:' AND "
+            "substr(local_replay_proof,8) NOT GLOB '*[^0-9a-f]*'))"
+        )
+        source_has_local_replay_proof = True
     phase1_fk_is_restrict = any(
         row["from"] == "phase1_generation_key"
         and row["table"] == "phase1_generations"
@@ -5570,16 +5827,28 @@ def _ensure_v41_claim_extraction_outcome_shape(conn: sqlite3.Connection) -> None
                 "phase1_generations(generation_key) ON DELETE RESTRICT"
                 if target_has_phase1_generation else ""
             )
+            + (
+                ",local_replay_proof TEXT CHECK (local_replay_proof IS NULL "
+                "OR (length(local_replay_proof)=71 AND "
+                "substr(local_replay_proof,1,7)='sha256:' AND "
+                "substr(local_replay_proof,8) NOT GLOB '*[^0-9a-f]*'))"
+                if target_has_local_replay_proof else ""
+            )
             + ")"
         )
         generation_column = (
             ",phase1_generation_key" if source_has_phase1_generation else ""
         )
+        proof_column = (
+            ",local_replay_proof" if source_has_local_replay_proof else ""
+        )
         conn.execute(
             "INSERT INTO kg_claim_extraction_outcomes("
             "chunk_id,prompt_version,prompt_generation,result_hash,succeeded_at"
-            + generation_column + ") SELECT chunk_id,prompt_version,"
-            "prompt_generation,result_hash,succeeded_at" + generation_column
+            + generation_column + proof_column
+            + ") SELECT chunk_id,prompt_version,"
+            "prompt_generation,result_hash,succeeded_at"
+            + generation_column + proof_column
             + " FROM kg_claim_extraction_outcomes_v41_old"
         )
         conn.execute("DROP TABLE kg_claim_extraction_outcomes_v41_old")
@@ -5603,7 +5872,8 @@ def _refresh_v41_claim_extraction_outcomes(conn: sqlite3.Connection) -> None:
         "SELECT chunk_id FROM kg_claim_extraction_outcomes ORDER BY chunk_id"
     ).fetchall()
     refresh_claim_extraction_outcomes(
-        conn, [str(row["chunk_id"]) for row in rows]
+        conn, [str(row["chunk_id"]) for row in rows],
+        preserve_unchanged_local_proof=True,
     )
 
 
@@ -6343,6 +6613,64 @@ def vec_episodes_aligned(conn: sqlite3.Connection, sample: int = 8) -> bool:
     return True
 
 
+def prune_extra_episode_vectors(conn: sqlite3.Connection) -> bool:
+    """Atomically remove only surplus derived episode keys, or refuse repair.
+
+    Every expected vector must already match the authoritative clusterable
+    mirror. Missing/different vectors require the existing broader repair;
+    an eligible but non-finite vector also conservatively refuses repair.
+    this operation never rebuilds unrelated shadows or changes evidence.
+    The transaction supplies the caller's lexical deadline and lease fences.
+    """
+    with transaction(conn):
+        if not _load_vec_extension(conn) or not has_vec_table(conn, table="vec_episodes"):
+            return False
+        dim_row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='vec_dim'"
+        ).fetchone()
+        model_row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='vec_model'"
+        ).fetchone()
+        try:
+            dim = int(dim_row["value"]) if dim_row is not None else 0
+        except (TypeError, ValueError, OverflowError):
+            return False
+        model = model_row["value"] if model_row is not None else None
+        if dim <= 0 or not isinstance(model, str) or re.fullmatch(
+            r"hymem-embedding-producer-v1:[0-9a-f]{64}", model
+        ) is None:
+            return False
+        from hymem.dreaming.aggregate import load_clusterable_episodes
+
+        expected: dict[int, bytes] = {}
+        for episode in load_clusterable_episodes(
+            conn, max_rowid=None, embedding_model=model, embedding_dim=dim,
+        ):
+            vec = _finite_vec(episode["vector"], dim)
+            if vec is None:
+                return False
+            expected[int(episode["rowid"])] = _pack_vector(vec)
+        actual = {
+            int(row["rowid"]): bytes(row["embedding"])
+            for row in conn.execute("SELECT rowid,embedding FROM vec_episodes")
+        }
+        if any(actual.get(key) != vector for key, vector in expected.items()):
+            return False
+        extras = actual.keys() - expected.keys()
+        if not extras:
+            return False
+        for key in sorted(extras):
+            check_current_deadline()
+            conn.execute("DELETE FROM vec_episodes WHERE rowid=?", (key,))
+        remaining = {
+            int(row["rowid"]): bytes(row["embedding"])
+            for row in conn.execute("SELECT rowid,embedding FROM vec_episodes")
+        }
+        if remaining != expected or not vec_episodes_aligned(conn):
+            raise RuntimeError("episode vector surplus repair verification failed")
+    return True
+
+
 def heal_rowid_shadows(conn: sqlite3.Connection) -> bool:
     """Probe vec_episodes alignment and, on a proven mismatch, resync every
     rowid shadow. Returns True when a repair ran. Called by the dream runner
@@ -6435,35 +6763,36 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     # A benchmark deadline is lexical and absent in ordinary operation.  Check
     # both sides of the transaction so work that crosses the bound rolls back
     # instead of committing late semantic state.
-    check_current_deadline()
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        # The ownership proof is deliberately inside the rollback-protected
-        # writer transaction. A contender cannot replace the row between this
-        # check and COMMIT, and an assertion failure cannot strand BEGIN open.
-        _assert_transaction_lease_owned(conn)
-        yield conn
+    with operation_scope(conn):
         check_current_deadline()
-        _assert_transaction_lease_owned(conn)
-        # Keep COMMIT inside the protected region. SQLite may leave a
-        # transaction open when commit itself faults; that stranded writer
-        # would otherwise absorb a later lease release into the same failed
-        # transaction and block every independent process.
-        conn.execute("COMMIT")
-    except BaseException as primary:
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-        except BaseException as rollback_error:
-            # Cleanup evidence is deliberately bounded to its type so a
-            # provider/custom connection cannot leak text or replace the
-            # original body/deadline/lease/commit exception.
-            with contextlib.suppress(AttributeError, TypeError):
-                primary.add_note(
-                    "transaction rollback failed: "
-                    f"{type(rollback_error).__name__}"
-                )
-        raise
+            # The ownership proof is deliberately inside the rollback-protected
+            # writer transaction. A contender cannot replace the row between this
+            # check and COMMIT, and an assertion failure cannot strand BEGIN open.
+            _assert_transaction_lease_owned(conn)
+            yield conn
+            check_current_deadline()
+            _assert_transaction_lease_owned(conn)
+            # Keep COMMIT inside the protected region. SQLite may leave a
+            # transaction open when commit itself faults; that stranded writer
+            # would otherwise absorb a later lease release into the same failed
+            # transaction and block every independent process.
+            conn.execute("COMMIT")
+        except BaseException as primary:
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except BaseException as rollback_error:
+                # Cleanup evidence is deliberately bounded to its type so a
+                # provider/custom connection cannot leak text or replace the
+                # original body/deadline/lease/commit exception.
+                with contextlib.suppress(AttributeError, TypeError):
+                    primary.add_note(
+                        "transaction rollback failed: "
+                        f"{type(rollback_error).__name__}"
+                    )
+            raise
 
 
 def schema_version(conn: sqlite3.Connection) -> int:

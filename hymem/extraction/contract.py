@@ -303,6 +303,15 @@ def _contract_components(prompt_version: str) -> dict[str, Any]:
             "table_fragment_context": (
                 chunk_module.SOURCE_FRAGMENT_CONTEXT_VERSION
             ),
+            "unit_numeric_table_context": (
+                chunk_module.SOURCE_NUMERIC_TABLE_CONTEXT_VERSION
+            ),
+            "max_unit_numeric_table_header_chars": (
+                chunk_module._MAX_NUMERIC_TABLE_HEADER_CHARS
+            ),
+            "max_unit_numeric_table_prelude_chars": (
+                chunk_module._MAX_NUMERIC_TABLE_PRELUDE_CHARS
+            ),
             "prose_boundary_context": (
                 chunk_module.SOURCE_BOUNDARY_CONTEXT_VERSION
             ),
@@ -315,6 +324,10 @@ def _contract_components(prompt_version: str) -> dict[str, Any]:
             "max_conversation_context_encoded_chars": chunk_module._MAX_CONVERSATION_CONTEXT_ENCODED_CHARS,
             "max_conversation_context_applicability_chars": chunk_module._MAX_CONVERSATION_CONTEXT_APPLICABILITY_CHARS,
             "clean_empty": chunk_module.CLEAN_EMPTY_RECOVERY_POLICY_VERSION,
+            "input_admission": chunk_module.INPUT_ADMISSION_POLICY_VERSION,
+            "max_unsplittable_input_chars": (
+                chunk_module._MAX_UNSPLITTABLE_INPUT_CHARS
+            ),
             "retry_attempts": retry_module.DEFAULT_RETRY_ATTEMPTS,
             "max_completion_calls": (
                 chunk_module.MAX_EXTRACTION_COMPLETION_CALLS_PER_CHUNK
@@ -351,7 +364,8 @@ def _contract_components(prompt_version: str) -> dict[str, Any]:
                 "loads_strict_json",
             ),
             "llm": _module_source_digest(
-                llm_module, "LLMRequest", "measure_provider_attempts"
+                llm_module, "LLMRequest", "measure_provider_attempts",
+                "LLMResponseError", "LLMOutputTruncatedError",
             ),
             "markers": _module_source_digest(
                 markers_module,

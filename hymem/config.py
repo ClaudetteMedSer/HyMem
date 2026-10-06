@@ -7,7 +7,6 @@ from hymem.extraction.contract import (
     ACTIVE_EXTRACTION_PROMPT_VERSION,
     extraction_contract_binding,
 )
-from hymem.dreaming.summary_policy import DEFAULT_SUMMARY_POLICY, validate_summary_policy
 
 
 MAX_FACTS_PER_EXTRACTION_UNIT = 256
@@ -52,7 +51,6 @@ class HyMemConfig:
     """Directory holding hymem.sqlite, MEMORY.md, USER.md."""
 
     def __post_init__(self) -> None:
-        validate_summary_policy(self.digest_summary_policy)
         object.__setattr__(
             self,
             "extraction_contract",
@@ -442,7 +440,7 @@ class HyMemConfig:
     without disabling extraction."""
 
     facts_extraction_enabled: bool = True
-    """Dream-time write side under the versioned narrative-facts prompt. One bounded
+    """Dream-time write side under the gated `facts.v2` prompt. One bounded
     lossless-source slice is processed per session/dream and oversized turns
     resume by exact character offset. Valid empty output advances; malformed,
     lossy, or over-cap output holds and durably retries. Successful replay of
@@ -732,13 +730,6 @@ class HyMemConfig:
     prompt-independent terminal-loss state. Set to 0 to retry provider failures
     indefinitely."""
 
-    digest_summary_policy: str = DEFAULT_SUMMARY_POLICY
-    """Versioned per-session rolling-summary contract. The default preserves
-    legacy prompts; ``bounded_highlights_v1`` explicitly permits selection of
-    grounded highlights instead of exhaustive topic retention. This never
-    changes lossless source coverage, item citation authority, or the failure
-    and quarantine gates. Changing policy starts a new digest generation."""
-
     dream_digest_max_tokens: int = 3072
     """max_tokens for the batched per-session digest call (episodes + summary +
     procedures in one JSON object). Larger than the 1024 LLMRequest default
@@ -751,12 +742,9 @@ class HyMemConfig:
 
     digest_extraction_max_attempts: int = 6
     """Consecutive failures of one digest cursor position before that session
-    is quarantined without advancing or publishing partial output. Only selected
-    primary-extraction failures shrink subsequent exact input windows; summary,
-    verification and format failures keep the current input bound. Recorded
-    failures consume the attempt budget even when they do not shrink input.
-    A prompt/framing/retry-policy change
-    reopens the work; values <= 0 retry indefinitely."""
+    is quarantined without advancing or publishing partial output. Retries use
+    progressively smaller exact input windows. A prompt/framing/retry-policy
+    change reopens the work; values <= 0 retry indefinitely."""
 
     max_chunks: int = 50000
     """Soft cap on retrieval/extraction chunks. Exact per-message coverage
