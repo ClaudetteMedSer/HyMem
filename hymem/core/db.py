@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterator
 
 from hymem.deadline import check_current_deadline
+from hymem.core.serialized_sqlite import SerializedConnection, operation_scope
 from hymem.core.message_records import (
     encode_message_record,
     message_content_hash,
@@ -2563,6 +2564,7 @@ def connect(path: Path) -> sqlite3.Connection:
         isolation_level=None,
         check_same_thread=False,
         cached_statements=0 if sys.version_info >= (3, 12) else 128,
+        factory=SerializedConnection,
     )
     conn.row_factory = sqlite3.Row
     register_read_authority_functions(conn)
@@ -6435,35 +6437,36 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     # A benchmark deadline is lexical and absent in ordinary operation.  Check
     # both sides of the transaction so work that crosses the bound rolls back
     # instead of committing late semantic state.
-    check_current_deadline()
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        # The ownership proof is deliberately inside the rollback-protected
-        # writer transaction. A contender cannot replace the row between this
-        # check and COMMIT, and an assertion failure cannot strand BEGIN open.
-        _assert_transaction_lease_owned(conn)
-        yield conn
+    with operation_scope(conn):
         check_current_deadline()
-        _assert_transaction_lease_owned(conn)
-        # Keep COMMIT inside the protected region. SQLite may leave a
-        # transaction open when commit itself faults; that stranded writer
-        # would otherwise absorb a later lease release into the same failed
-        # transaction and block every independent process.
-        conn.execute("COMMIT")
-    except BaseException as primary:
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-        except BaseException as rollback_error:
-            # Cleanup evidence is deliberately bounded to its type so a
-            # provider/custom connection cannot leak text or replace the
-            # original body/deadline/lease/commit exception.
-            with contextlib.suppress(AttributeError, TypeError):
-                primary.add_note(
-                    "transaction rollback failed: "
-                    f"{type(rollback_error).__name__}"
-                )
-        raise
+            # The ownership proof is deliberately inside the rollback-protected
+            # writer transaction. A contender cannot replace the row between this
+            # check and COMMIT, and an assertion failure cannot strand BEGIN open.
+            _assert_transaction_lease_owned(conn)
+            yield conn
+            check_current_deadline()
+            _assert_transaction_lease_owned(conn)
+            # Keep COMMIT inside the protected region. SQLite may leave a
+            # transaction open when commit itself faults; that stranded writer
+            # would otherwise absorb a later lease release into the same failed
+            # transaction and block every independent process.
+            conn.execute("COMMIT")
+        except BaseException as primary:
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except BaseException as rollback_error:
+                # Cleanup evidence is deliberately bounded to its type so a
+                # provider/custom connection cannot leak text or replace the
+                # original body/deadline/lease/commit exception.
+                with contextlib.suppress(AttributeError, TypeError):
+                    primary.add_note(
+                        "transaction rollback failed: "
+                        f"{type(rollback_error).__name__}"
+                    )
+            raise
 
 
 def schema_version(conn: sqlite3.Connection) -> int:

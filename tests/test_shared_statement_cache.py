@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from hymem.core import db
+from hymem.core.serialized_sqlite import SerializedConnection
 
 
 @pytest.mark.parametrize(
@@ -37,6 +38,7 @@ def test_shared_constructor_selects_cache_by_python_version(
             "isolation_level": None,
             "check_same_thread": False,
             "cached_statements": cache_size,
+            "factory": SerializedConnection,
         })]
         assert conn.row_factory is sqlite3.Row
         for pragma, expected in (

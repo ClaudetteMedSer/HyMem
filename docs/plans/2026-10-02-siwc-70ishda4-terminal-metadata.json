@@ -1,0 +1,521 @@
+{
+  "budget_stop_code": "cleanup_failure",
+  "campaign_stop": "final_accounting_or_dataset_failure",
+  "canary_model_gold_match": false,
+  "canary_structural_valid": true,
+  "completed_diagnostic_and_clean": false,
+  "correct_count": 0,
+  "failed_count": 4,
+  "first_failure": {
+    "code": "cleanup_failure",
+    "phase": "http",
+    "resource_observation": {
+      "current": 14,
+      "denials": 0,
+      "limit": 256,
+      "peak": 18
+    },
+    "turn_admitted": true,
+    "unknown_usage": true
+  },
+  "known_tokens": 68732,
+  "known_turns": 19,
+  "owner_failure": null,
+  "question_failure_codes": [
+    "worker_failure:Exception",
+    "worker_failure:Exception",
+    "worker_failure:Exception",
+    "worker_failure:Exception"
+  ],
+  "resource_fault": null,
+  "resource_observation": {
+    "current": 2,
+    "denials": 0,
+    "limit": 256,
+    "peak": 18
+  },
+  "runtime_cleanup_verified": true,
+  "schema": "siwc-lme-diagnostic-progress-v6",
+  "scored_count": 0,
+  "selected_denominator": 4,
+  "siwc_observations": {
+    "canary.ordinary": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 11,
+        "calls": 8,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 8,
+        "known_tokens": 46626,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 8,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 2.037589,
+          "http": 31.803552,
+          "total": 33.850303
+        },
+        "usage_complete": true
+      }
+    },
+    "canary.structured": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 11,
+        "calls": 3,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 3,
+        "known_tokens": 46626,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 3,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0.098184,
+          "http": 52.668494,
+          "total": 52.770931
+        },
+        "usage_complete": true
+      }
+    },
+    "question.0.ordinary": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 2,
+        "calls": 2,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 2,
+        "known_tokens": 6855,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 2,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0.11986,
+          "http": 13.584517,
+          "total": 13.726725
+        },
+        "usage_complete": true
+      }
+    },
+    "question.0.structured": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 2,
+        "calls": 0,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 0,
+        "known_tokens": 6855,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 0,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0,
+          "http": 0,
+          "total": 0
+        },
+        "usage_complete": true
+      }
+    },
+    "question.1.ordinary": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 2,
+        "calls": 2,
+        "failures": 1,
+        "first_failure": {
+          "code": "cleanup_failure",
+          "phase": "http",
+          "turn_admitted": true,
+          "unknown_usage": true
+        },
+        "internal_http_attempts": 2,
+        "known_tokens": 3158,
+        "last_failure_code": "cleanup_failure",
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 1,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0.052271,
+          "http": 12.027722,
+          "total": 12.101357
+        },
+        "usage_complete": false
+      }
+    },
+    "question.1.structured": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 2,
+        "calls": 0,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 0,
+        "known_tokens": 3158,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 0,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0,
+          "http": 0,
+          "total": 0
+        },
+        "usage_complete": false
+      }
+    },
+    "question.2.ordinary": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 2,
+        "calls": 2,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 2,
+        "known_tokens": 6226,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 2,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0.036962,
+          "http": 12.536331,
+          "total": 12.574625
+        },
+        "usage_complete": true
+      }
+    },
+    "question.2.structured": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 2,
+        "calls": 0,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 0,
+        "known_tokens": 6226,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 0,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0,
+          "http": 0,
+          "total": 0
+        },
+        "usage_complete": true
+      }
+    },
+    "question.3.ordinary": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 2,
+        "calls": 2,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 2,
+        "known_tokens": 5867,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 2,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0.050311,
+          "http": 6.836194,
+          "total": 6.888678
+        },
+        "usage_complete": true
+      }
+    },
+    "question.3.structured": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 2,
+        "calls": 0,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 0,
+        "known_tokens": 5867,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 0,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0,
+          "http": 0,
+          "total": 0
+        },
+        "usage_complete": true
+      }
+    }
+  },
+  "siwc_pilot_projection": {
+    "aggregate": {
+      "admitted_turns": 19,
+      "calls": 19,
+      "failures": 1,
+      "internal_http_attempts": 19,
+      "known_tokens": 68732,
+      "successes": 18
+    },
+    "canary": {
+      "ledger": {
+        "admitted_turns": 11,
+        "known_tokens": 46626,
+        "usage_complete": true
+      },
+      "ordinary": {
+        "admitted_turns": 11,
+        "calls": 8,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 8,
+        "known_tokens": 46626,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 8,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 2.037589,
+          "http": 31.803552,
+          "total": 33.850303
+        },
+        "usage_complete": true
+      },
+      "question_id": "canary",
+      "structured": {
+        "admitted_turns": 11,
+        "calls": 3,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 3,
+        "known_tokens": 46626,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 3,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0.098184,
+          "http": 52.668494,
+          "total": 52.770931
+        },
+        "usage_complete": true
+      }
+    },
+    "questions": [
+      {
+        "ledger": {
+          "admitted_turns": 2,
+          "known_tokens": 6855,
+          "usage_complete": true
+        },
+        "ordinary": {
+          "admitted_turns": 2,
+          "calls": 2,
+          "failures": 0,
+          "first_failure": null,
+          "internal_http_attempts": 2,
+          "known_tokens": 6855,
+          "last_failure_code": null,
+          "provider_internal_retries_known": false,
+          "schema": "siwc_lme_summary_v2",
+          "successes": 2,
+          "timing_saturated": false,
+          "timing_seconds": {
+            "admission": 0.11986,
+            "http": 13.584517,
+            "total": 13.726725
+          },
+          "usage_complete": true
+        },
+        "question_id": "q-0000",
+        "structured": {
+          "admitted_turns": 2,
+          "calls": 0,
+          "failures": 0,
+          "first_failure": null,
+          "internal_http_attempts": 0,
+          "known_tokens": 6855,
+          "last_failure_code": null,
+          "provider_internal_retries_known": false,
+          "schema": "siwc_lme_summary_v2",
+          "successes": 0,
+          "timing_saturated": false,
+          "timing_seconds": {
+            "admission": 0,
+            "http": 0,
+            "total": 0
+          },
+          "usage_complete": true
+        }
+      },
+      {
+        "ledger": {
+          "admitted_turns": 2,
+          "known_tokens": 3158,
+          "usage_complete": false
+        },
+        "ordinary": {
+          "admitted_turns": 2,
+          "calls": 2,
+          "failures": 1,
+          "first_failure": {
+            "code": "cleanup_failure",
+            "phase": "http",
+            "turn_admitted": true,
+            "unknown_usage": true
+          },
+          "internal_http_attempts": 2,
+          "known_tokens": 3158,
+          "last_failure_code": "cleanup_failure",
+          "provider_internal_retries_known": false,
+          "schema": "siwc_lme_summary_v2",
+          "successes": 1,
+          "timing_saturated": false,
+          "timing_seconds": {
+            "admission": 0.052271,
+            "http": 12.027722,
+            "total": 12.101357
+          },
+          "usage_complete": false
+        },
+        "question_id": "q-0001",
+        "structured": {
+          "admitted_turns": 2,
+          "calls": 0,
+          "failures": 0,
+          "first_failure": null,
+          "internal_http_attempts": 0,
+          "known_tokens": 3158,
+          "last_failure_code": null,
+          "provider_internal_retries_known": false,
+          "schema": "siwc_lme_summary_v2",
+          "successes": 0,
+          "timing_saturated": false,
+          "timing_seconds": {
+            "admission": 0,
+            "http": 0,
+            "total": 0
+          },
+          "usage_complete": false
+        }
+      },
+      {
+        "ledger": {
+          "admitted_turns": 2,
+          "known_tokens": 6226,
+          "usage_complete": true
+        },
+        "ordinary": {
+          "admitted_turns": 2,
+          "calls": 2,
+          "failures": 0,
+          "first_failure": null,
+          "internal_http_attempts": 2,
+          "known_tokens": 6226,
+          "last_failure_code": null,
+          "provider_internal_retries_known": false,
+          "schema": "siwc_lme_summary_v2",
+          "successes": 2,
+          "timing_saturated": false,
+          "timing_seconds": {
+            "admission": 0.036962,
+            "http": 12.536331,
+            "total": 12.574625
+          },
+          "usage_complete": true
+        },
+        "question_id": "q-0002",
+        "structured": {
+          "admitted_turns": 2,
+          "calls": 0,
+          "failures": 0,
+          "first_failure": null,
+          "internal_http_attempts": 0,
+          "known_tokens": 6226,
+          "last_failure_code": null,
+          "provider_internal_retries_known": false,
+          "schema": "siwc_lme_summary_v2",
+          "successes": 0,
+          "timing_saturated": false,
+          "timing_seconds": {
+            "admission": 0,
+            "http": 0,
+            "total": 0
+          },
+          "usage_complete": true
+        }
+      },
+      {
+        "ledger": {
+          "admitted_turns": 2,
+          "known_tokens": 5867,
+          "usage_complete": true
+        },
+        "ordinary": {
+          "admitted_turns": 2,
+          "calls": 2,
+          "failures": 0,
+          "first_failure": null,
+          "internal_http_attempts": 2,
+          "known_tokens": 5867,
+          "last_failure_code": null,
+          "provider_internal_retries_known": false,
+          "schema": "siwc_lme_summary_v2",
+          "successes": 2,
+          "timing_saturated": false,
+          "timing_seconds": {
+            "admission": 0.050311,
+            "http": 6.836194,
+            "total": 6.888678
+          },
+          "usage_complete": true
+        },
+        "question_id": "q-0003",
+        "structured": {
+          "admitted_turns": 2,
+          "calls": 0,
+          "failures": 0,
+          "first_failure": null,
+          "internal_http_attempts": 0,
+          "known_tokens": 5867,
+          "last_failure_code": null,
+          "provider_internal_retries_known": false,
+          "schema": "siwc_lme_summary_v2",
+          "successes": 0,
+          "timing_saturated": false,
+          "timing_seconds": {
+            "admission": 0,
+            "http": 0,
+            "total": 0
+          },
+          "usage_complete": true
+        }
+      }
+    ],
+    "schema": "siwc_lme_pilot_projection_v2"
+  },
+  "stage_timing_available": false,
+  "status": "terminal_incomplete_or_unclean",
+  "strict_indexing_healthy_for_all": null,
+  "summary_degraded_sessions_total": 0,
+  "usage_complete": false
+}

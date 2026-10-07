@@ -1,0 +1,122 @@
+{
+  "budget_stop_code": "deadline_exceeded",
+  "campaign_stop": "campaign_failure",
+  "canary_model_gold_match": false,
+  "canary_structural_valid": false,
+  "completed_diagnostic_and_clean": false,
+  "correct_count": 0,
+  "failed_count": 4,
+  "first_failure": {
+    "code": "deadline_exceeded",
+    "phase": "admission",
+    "resource_observation": {
+      "current": 1,
+      "denials": 0,
+      "limit": 256,
+      "peak": 2
+    },
+    "turn_admitted": false,
+    "unknown_usage": false
+  },
+  "known_tokens": 0,
+  "known_turns": 0,
+  "owner_failure": null,
+  "question_failure_codes": [
+    "unspecified_failure",
+    "unspecified_failure",
+    "unspecified_failure",
+    "unspecified_failure"
+  ],
+  "resource_fault": null,
+  "resource_observation": {
+    "current": 1,
+    "denials": 0,
+    "limit": 256,
+    "peak": 2
+  },
+  "runtime_cleanup_verified": true,
+  "schema": "siwc-lme-diagnostic-progress-v11",
+  "scored_count": 0,
+  "selected_denominator": 4,
+  "siwc_observations": {
+    "canary.ordinary": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 0,
+        "calls": 1,
+        "failures": 1,
+        "first_failure": {
+          "code": "deadline_exceeded",
+          "phase": "admission",
+          "turn_admitted": false,
+          "unknown_usage": false
+        },
+        "internal_http_attempts": 0,
+        "known_tokens": 0,
+        "last_failure_code": "deadline_exceeded",
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 0,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0.000817,
+          "http": 0,
+          "total": 0.000818
+        },
+        "usage_complete": true
+      }
+    },
+    "canary.structured": {
+      "status": "observed",
+      "summary": {
+        "admitted_turns": 0,
+        "calls": 0,
+        "failures": 0,
+        "first_failure": null,
+        "internal_http_attempts": 0,
+        "known_tokens": 0,
+        "last_failure_code": null,
+        "provider_internal_retries_known": false,
+        "schema": "siwc_lme_summary_v2",
+        "successes": 0,
+        "timing_saturated": false,
+        "timing_seconds": {
+          "admission": 0,
+          "http": 0,
+          "total": 0
+        },
+        "usage_complete": true
+      }
+    },
+    "question.0.ordinary": {
+      "status": "unknown"
+    },
+    "question.0.structured": {
+      "status": "unknown"
+    },
+    "question.1.ordinary": {
+      "status": "unknown"
+    },
+    "question.1.structured": {
+      "status": "unknown"
+    },
+    "question.2.ordinary": {
+      "status": "unknown"
+    },
+    "question.2.structured": {
+      "status": "unknown"
+    },
+    "question.3.ordinary": {
+      "status": "unknown"
+    },
+    "question.3.structured": {
+      "status": "unknown"
+    }
+  },
+  "siwc_pilot_projection": null,
+  "stage_timing_available": false,
+  "status": "terminal_incomplete_or_unclean",
+  "strict_indexing_healthy_for_all": null,
+  "summary_degraded_sessions_total": 0,
+  "usage_complete": true
+}

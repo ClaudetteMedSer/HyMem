@@ -196,3 +196,62 @@ authorization. No workaround or alternative export was attempted. The accepted
 reader and private replay results above remain valid; a more precise distinction
 between shape, evidence validation and semantic decision failures is unresolved.
 Ask for approval for that narrow metadata-only inspection before continuing.
+
+## Approved finite-metadata diagnosis
+
+The user explicitly answered **“Yes”** to exporting failure codes and
+classification counts into this chat. Root then executed the previously blocked
+read-only inspection, bound to the private-result SHA256 above and the pinned
+classification/v2 sources. No raw response, source text, credentials, additional
+model calls or remote writes were involved.
+
+| Fixed control | Observed failure | Finite classification evidence |
+| --- | --- | --- |
+| 10, supported, two claims | `evidence:unused` | Both original positions `e`; each vector has one `e` and 21 `u`; pools have 3 and 2 entries. The unit-level error does not prove both claims individually fail the unused-evidence check. |
+| 12, correction | `uncertain`, missed recovery | Original `u`, one alternative `e`, 21 total `u`; one evidence entry. |
+| 13, correction | `uncertain`, missed recovery | Original `u`, one alternative `e`, 21 total `u`; one evidence entry. |
+| 19, reject | `evidence:context_scope` | Original `e`, one `e`, 21 `u`, two evidence entries. The scope guard prevented acceptance. |
+| 21, reject, two claims | `evidence:unused` | Both vectors all 22 `u`, but each has a nonempty one-entry evidence pool. |
+| Retained table canary | Semantic non-affirmation | All 22 `u`, no `e`, empty evidence pool. |
+
+Every inspected response parsed as JSON and had 22 citation slots. Thus the
+three control `malformed` classifications here concern evidence consistency or
+scope, not malformed JSON. Control 19 is an essential safety rejection, not a
+reason to relax context ownership. The two claim-level false rejections in the
+aggregate originate in the supported multi-claim unit 10.
+
+The correction selector requires the original to be `n`, exactly one alternative
+to be `e`, and every other alternative to be `n`. The observed one-`e`/21-`u`
+pattern cannot pass. This is stricter than the previous v2 prompt's
+unique-clearly-entailed-alternative rule. The code implements the documented new
+design; the live result exposes that design's recovery limitation, rather than
+a selector implementation bug. These metadata do not identify which alternative
+was entailed, nor why the model chose uncertainty. Do not claim it found the
+correct replacement or silently relabel `u` as `n`.
+
+Root independently reproduced the selector and unused-evidence outcomes with
+invented local responses, and reran **114 passing classification checks**.
+These are mechanical/offline checks, not evidence of semantic reliability.
+A separate read-only GPT-6 Sol review corroborated the source-level distinction
+between evidence validation, correction selection and canary non-affirmation.
+
+## Proposed next repair gates (not a new launch authorization)
+
+1. Specify a simpler versioned evidence/decision contract offline. Separate
+   non-entailment by the supplied evidence from a claim of factual contradiction;
+   preserve genuine ambiguity. Reduce redundant pool/citation bookkeeping by
+   construction, not by silently dropping invalid returned evidence. Explicitly
+   assess whether the 22-predicate certainty requirement is appropriate for
+   correction; do not simply convert existing uncertain outputs into success.
+2. Give a separate Sol the narrow inactive implementation only after settling
+   those semantics. Root independently tests fixed positive/correction controls,
+   explicit contradictions, ambiguous alternatives and all source/quote/prefix/
+   nested-parent protections, unchanged labels and accounting. No production
+   integration or active-path edits on the strength of synthetic success.
+3. Treat the table canary as a separate semantic problem: its all-uncertain
+   response cannot be recovered by formatting or evidence cleanup. Use exact
+   retained request/response replay to verify mechanics; reserve actual model
+   efficacy claims for a justified new, bounded and source-pinned measurement.
+4. Any fresh live measurement needs its own concrete hypothesis, accepted root
+   verification and immutable receipt. Preserve this failed result and both
+   paused monitors. No blind reroll, larger caps, model/auth change or LME launch.
