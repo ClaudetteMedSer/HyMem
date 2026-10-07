@@ -1,0 +1,33 @@
+{
+  "format": "hermes-session-key-retirement-patch-v1",
+  "patch": "hermes-session-key-retirement.patch",
+  "patch_sha256": "2c23b5a4b1286ee5350cfd36f65f77bcca724378446e896aba4eedb1dabaaf30",
+  "tests": "tests/test_hermes_session_key_retirement.py",
+  "tests_sha256": "3e850eecdd034f9a3073f1e4a8d5c3bbc747026e6eee9fc1b2985d8c6a8fe925",
+  "test_contract_patch": "hermes-session-key-retirement-test-contract.patch",
+  "test_contract_patch_sha256": "7ad8f705a45007057f7888298eabba821e077f995563f4283932e05c34769ade",
+  "test_contract_updates": [
+    {
+      "path": "tests/honcho_plugin/test_client.py",
+      "before_sha256": "ba96c503b80332ac934f33bc8117b06e29689024c8316ba79a438614cbb71e77",
+      "after_sha256": "ae800e92f1283b875f9b129e2e23978775a33e1550e41a33ce89645de5afc962"
+    }
+  ],
+  "files": [
+    {
+      "path": "plugins/memory/honcho/client.py",
+      "before_sha256": "4a528c2efe42c2a04b6f597a8b6043583ce7ecfde365bbec510e65aef95e09e1",
+      "after_sha256": "2a02c2b24e75084d1ef4b137806cfc9fde3103774123bf0cb1edc3335214b0e5"
+    },
+    {
+      "path": "plugins/memory/honcho/session.py",
+      "before_sha256": "d6cf68ef8d04fd67a8f60d1ef1dfa1accad4d15103d6ec0eb7490688667b22ee",
+      "after_sha256": "cad3cc7ae0abee3b07036189ef251eeb955738c5ca982883e109a7f172bccf32"
+    },
+    {
+      "path": "plugins/memory/honcho/config_schema.py",
+      "before_sha256": "6d0c99698cf0e9c6cb320f41362daf55cd506ac71928be785f798f0d9b1e957d",
+      "after_sha256": "357f943ece3b75e080f87f2bd5d092340fbca3627783b19654f2e914b6478742"
+    }
+  ]
+}
