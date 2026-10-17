@@ -6,6 +6,7 @@ Synthetic protocol tests only: these do not attest live model faithfulness.
 from contextlib import closing
 from dataclasses import replace
 import json
+import re
 
 import pytest
 
@@ -85,7 +86,28 @@ def test_actual_paths_share_configured_capacity_contract(cfg, monkeypatch, path,
         assert "Never omit a supported fact" in request.system
         assert json.dumps(_OVERFLOW) in request.system
         assert request.response_format == "json" and request.temperature == 0.0
-        assert request.max_tokens == config.dream_digest_max_tokens
+        assert request.max_tokens == config.facts_extraction_max_tokens
+
+
+def test_fact_token_budget_changes_only_fact_producer(cfg):
+    larger = replace(cfg, facts_extraction_max_tokens=6144)
+    digest_only = replace(cfg, dream_digest_max_tokens=6144)
+    llm = StubLLMClient(default=json.dumps({"facts": [_ITEM]}))
+    assert facts.build_facts_request("user: " + _TEXT, larger).max_tokens == 6144
+    assert facts.facts_config_version(larger, client=llm) != (
+        facts.facts_config_version(cfg, client=llm)
+    )
+    assert larger.dream_digest_max_tokens == cfg.dream_digest_max_tokens
+    assert facts.facts_config_version(digest_only, client=llm) == (
+        facts.facts_config_version(cfg, client=llm)
+    )
+    assert facts.build_facts_request("user: " + _TEXT, digest_only).max_tokens == 3072
+
+
+@pytest.mark.parametrize("tokens", [0, -1, False, 32769])
+def test_invalid_fact_token_budget_is_rejected(cfg, tokens):
+    with pytest.raises(ValueError, match="facts_extraction_max_tokens"):
+        replace(cfg, facts_extraction_max_tokens=tokens)
 
 
 @pytest.mark.parametrize("cap", [0, -1, False, 257])
@@ -99,17 +121,17 @@ def test_disabled_or_out_of_range_item_cap_is_not_a_supported_configuration(cfg,
     (_OVERFLOW, "output_capacity_exceeded"),
     ({"facts": [_ITEM] * 9}, "output_capacity_exceeded"),
     ([_ITEM] * 9, "output_capacity_exceeded"),
-    ({"facts": [_ITEM] * 9 + [{"text": "bad", "date": "never"}]}, "invalid_output"),
-    ({"facts": [], "complete": 0}, "invalid_output"),
-    ({"facts": [], "complete": "false"}, "invalid_output"),
-    ({"facts": [], "complete": None}, "invalid_output"),
-    ({"facts": [], "complete": True}, "invalid_output"),
-    ({"facts": {}, "complete": False}, "invalid_output"),
-    ({"facts": [_ITEM], "complete": False}, "invalid_output"),
-    ({"facts": [], "complete": False, "reason": "capacity"}, "invalid_output"),
-    ({"complete": False}, "invalid_output"),
-    ({"facts": [_ITEM, dict(_ITEM, text="x" * 601)]}, "invalid_output"),
-    ('{"facts": [], "complete": fal', "invalid_output"),
+    ({"facts": [_ITEM] * 9 + [{"text": "bad", "date": "never"}]}, "invalid_items"),
+    ({"facts": [], "complete": 0}, "invalid_envelope"),
+    ({"facts": [], "complete": "false"}, "invalid_envelope"),
+    ({"facts": [], "complete": None}, "invalid_envelope"),
+    ({"facts": [], "complete": True}, "invalid_envelope"),
+    ({"facts": {}, "complete": False}, "invalid_envelope"),
+    ({"facts": [_ITEM], "complete": False}, "invalid_envelope"),
+    ({"facts": [], "complete": False, "reason": "capacity"}, "invalid_envelope"),
+    ({"complete": False}, "invalid_envelope"),
+    ({"facts": [_ITEM, dict(_ITEM, text="x" * 601)]}, "invalid_items"),
+    ('{"facts": [], "complete": fal', "invalid_json"),
 ])
 def test_capacity_or_invalid_output_holds_all_authority_atomically(
     cfg, monkeypatch, caplog, path, payload, reason,
@@ -205,7 +227,175 @@ class _CompleteSetClient:
         ]})
 
 
-def test_next_dream_retries_smaller_complete_units_without_skipping_any_tail(cfg):
+class _DenseSourceClient:
+    """Return the complete fact set only when it fits the eight-item cap."""
+
+    def __init__(self):
+        self.delegate = StubLLMClient(default="[]")
+        self.fact_calls = []
+
+    def phase1_producer_declaration(self):
+        return self.delegate.phase1_producer_declaration()
+
+    def memory_producer_declaration(self):
+        return self.delegate.memory_producer_declaration()
+
+    def complete(self, request):
+        if "Return the JSON object of narrative facts now" not in request.user:
+            return self.delegate.complete(request)
+        self.fact_calls.append(request)
+        found = re.findall(r"Nora shipped parcel \d{2}\.", request.user)
+        if len(found) > 8:
+            return json.dumps(_OVERFLOW)
+        return json.dumps({"facts": [
+            {"text": text, "date": None, "entities": ["Nora"]}
+            for text in found
+        ]})
+
+
+class _AlwaysOverflowClient:
+    def __init__(self):
+        self.delegate = StubLLMClient(default="[]")
+        self.fact_calls = []
+
+    def phase1_producer_declaration(self):
+        return self.delegate.phase1_producer_declaration()
+
+    def memory_producer_declaration(self):
+        return self.delegate.memory_producer_declaration()
+
+    def complete(self, request):
+        if "Return the JSON object of narrative facts now" not in request.user:
+            return self.delegate.complete(request)
+        self.fact_calls.append(request)
+        return json.dumps(_OVERFLOW)
+
+
+def test_scheduled_capacity_retry_changes_held_source_and_preserves_all_facts(cfg):
+    llm = _DenseSourceClient()
+    config = _config(cfg, dream_digest_max_chars=12000)
+    source = " ".join(
+        f"Nora shipped parcel {index:02d}. " + "Context " * 12
+        for index in range(20)
+    )
+    with closing(HyMem(config, llm=llm)) as hy:
+        message_id = _seed(hy, source)
+        first = hy.dream()
+        assert first.fact_failures == 1
+        assert len(llm.fact_calls) == 2
+        first_pair = [call.user for call in llm.fact_calls]
+        assert first_pair[0] != first_pair[1]
+        assert hy.conn.execute(
+            "SELECT facts_retry_count,facts_cursor_message_id FROM sessions "
+            "WHERE id='capacity'"
+        ).fetchone()[:] == (1, None)
+
+        second = hy.dream()
+        assert second.fact_failures == 0
+        assert llm.fact_calls[2].user not in first_pair
+        for _ in range(10):
+            state = hy.conn.execute(
+                "SELECT facts_cursor_message_id,facts_cursor_partial_message_id,"
+                "facts_retry_count FROM sessions WHERE id='capacity'"
+            ).fetchone()
+            if state[:] == (message_id, None, 0):
+                break
+            hy.dream()
+        else:
+            pytest.fail("capacity retry did not consume the complete source")
+        expected = {f"Nora shipped parcel {index:02d}." for index in range(20)}
+        actual = {row[0] for row in hy.conn.execute(
+            "SELECT text FROM narrative_facts WHERE lifecycle_status='active'"
+        )}
+        assert actual == expected
+        assert facts.fact_session_authority_is_valid(hy.conn, "capacity")
+        assert hy.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_retry_budget_uses_stable_first_turn_of_many_short_turns(cfg):
+    llm = StubLLMClient(default="[]")
+    with closing(HyMem(_config(cfg), llm=llm)) as hy:
+        texts = [f"turn {index:02d}: " + "context " * 25 for index in range(20)]
+        ids = [_seed(hy, text) for text in texts]
+        first_turn_chars = len("user: " + texts[0])
+        assert len("\n".join("user: " + text for text in texts)) < (
+            hy.config.dream_digest_max_chars
+        )
+        budget = facts.facts_retry_max_chars(
+            hy.conn, "capacity", since_message_id=None,
+            partial_message_id=None, start_offset=0,
+            configured_max=hy.config.dream_digest_max_chars, retry_count=1,
+        )
+        assert budget == first_turn_chars
+        result = facts.extract_facts(
+            hy.conn, "capacity", llm, hy.config, max_chars=budget,
+        )
+        assert result is not None and not result.parse_failed
+        assert result.covered_message_id == ids[0]
+        assert result.partial_message_id is None
+
+
+def test_appended_turn_cannot_expand_held_capacity_retry(cfg):
+    llm = _AlwaysOverflowClient()
+    with closing(HyMem(_config(cfg, dream_digest_max_chars=12000), llm=llm)) as hy:
+        first_id = _seed(hy, "Context " * 120)
+        assert hy.dream().fact_failures == 1
+        assert len(llm.fact_calls) == 2
+        before_retry = [
+            len(call.user.split('"""', 2)[1].strip("\n"))
+            for call in llm.fact_calls
+        ]
+        assert before_retry[0] > before_retry[1] >= 256
+        _seed(hy, "APPENDED_ONLY_MARKER " + "new context " * 1000)
+
+        assert hy.dream().fact_failures == 1
+        assert len(llm.fact_calls) == 3
+        retried = llm.fact_calls[-1].user.split('"""', 2)[1].strip("\n")
+        assert len(retried) <= before_retry[1]
+        assert "APPENDED_ONLY_MARKER" not in retried
+        state = hy.conn.execute(
+            "SELECT facts_cursor_message_id,facts_cursor_partial_message_id,"
+            "facts_retry_count FROM sessions WHERE id='capacity'"
+        ).fetchone()
+        assert state[:] == (None, None, 2)
+        assert first_id is not None
+
+
+def test_changed_fact_generation_resets_retry_before_source_aware_shrink(
+    cfg, monkeypatch,
+):
+    llm = _DenseSourceClient()
+    source = " ".join(
+        f"Nora shipped parcel {index:02d}. " + "Context " * 12
+        for index in range(20)
+    )
+    with closing(HyMem(_config(cfg), llm=llm)) as hy:
+        _seed(hy, source)
+        assert hy.dream().fact_failures == 1
+        assert len(llm.fact_calls) == 2
+        old_key = hy.conn.execute(
+            "SELECT facts_retry_config_version FROM sessions WHERE id='capacity'"
+        ).fetchone()[0]
+        with monkeypatch.context() as changed:
+            changed.setattr(facts, "FACTS_PROMPT_VERSION", "facts.v5")
+            # The old failure cannot be attributed to the new producer. Its
+            # first attempt repeats the full source, then records a new key.
+            assert hy.dream().fact_failures == 1
+            assert [call.user for call in llm.fact_calls[2:4]] == [
+                call.user for call in llm.fact_calls[:2]
+            ]
+            count, new_key = hy.conn.execute(
+                "SELECT facts_retry_count,facts_retry_config_version "
+                "FROM sessions WHERE id='capacity'"
+            ).fetchone()
+            assert count == 1 and new_key != old_key
+            assert hy.dream().fact_failures == 0
+            assert llm.fact_calls[4].user not in [
+                call.user for call in llm.fact_calls[:4]
+            ]
+
+
+def test_capacity_fallback_publishes_smaller_complete_units_without_skipping_tail(cfg):
     texts = [f"Nora shipped package {letter}{'x' * 115}." for letter in "ABCD"]
     llm = _CompleteSetClient(texts)
     config = _config(cfg, dream_digest_max_chars=700, dream_max_facts_per_session=2)
@@ -213,21 +403,12 @@ def test_next_dream_retries_smaller_complete_units_without_skipping_any_tail(cfg
         ids = [_seed(hy, text) for text in texts]
         source_before = tuple(tuple(row) for row in hy.conn.execute("SELECT * FROM messages"))
         first = hy.dream()
-        assert first.fact_failures == 1 and first.facts_extracted == 0
-        state = hy.conn.execute(
-            "SELECT facts_cursor_message_id,facts_cursor_partial_message_id,"
-            "facts_cursor_offset,facts_retry_count,facts_quarantined FROM sessions "
-            "WHERE id='capacity'"
-        ).fetchone()
-        assert tuple(state) == (None, None, 0, 1, 0)
-        assert hy.conn.execute("SELECT COUNT(*) FROM fact_extraction_outcomes").fetchone()[0] == 0
-        second = hy.dream()
-        assert second.fact_failures == 0 and second.facts_extracted == 2
+        assert first.fact_failures == 0 and first.facts_extracted == 2
         assert hy.conn.execute(
             "SELECT facts_cursor_message_id,facts_retry_count FROM sessions WHERE id='capacity'"
         ).fetchone()[:] == (ids[1], 0)
-        third = hy.dream()
-        assert third.fact_failures == 0 and third.facts_extracted == 2
+        second = hy.dream()
+        assert second.fact_failures == 0 and second.facts_extracted == 2
         assert len(llm.fact_calls) == 3
         excerpts = [call.user.split('"""')[1].strip("\n") for call in llm.fact_calls]
         assert excerpts[0] == "\n".join("user: " + text for text in texts)

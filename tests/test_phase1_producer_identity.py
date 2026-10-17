@@ -14,7 +14,7 @@ import pytest
 from hymem import HyMem, HyMemConfig
 from hymem.core import db as core_db
 from hymem.core.graph import live_edge_predicate
-from hymem.dreaming import phase1, phase2
+from hymem.dreaming import evidence as evidence_ledger, phase1, phase2
 from hymem.dreaming.chunks import Chunk, persist_chunks
 from hymem.dreaming.lossless import materialize_message_coverage
 from hymem.extraction.llm import LLMRequest, StubLLMClient
@@ -154,6 +154,136 @@ def _extract_and_persist(
                 cfg=hy.config,
             )
     return result
+
+
+def test_pending_extraction_retires_unpublished_orphan_without_outcome(cfg):
+    hy = HyMem(replace(cfg, aggregation_nodes_enabled=False))
+    try:
+        chunk = _seed_chunk(hy, chunk_id="orphan-pending")
+        client = _DeclaredLLM("model-a", "redis")
+        source = hy.conn.execute(
+            "SELECT message_id,source_session_id,source_role,"
+            "source_created_at,chunk_id,coverage_version "
+            "FROM message_retention_coverage WHERE message_id=?",
+            (chunk.start_message_id,),
+        ).fetchone()
+        assert source is not None
+        orphan_edge = hy.conn.execute(
+            "INSERT INTO knowledge_graph(subject_canonical,predicate,"
+            "object_canonical,pos_evidence,neg_evidence) "
+            "VALUES ('app','contains','orphan',0,0) RETURNING id"
+        ).fetchone()[0]
+        assert hy.conn.execute(
+            "SELECT 1 FROM current_phase1_publications WHERE chunk_id=?",
+            (chunk.id,),
+        ).fetchone() is None
+        assert hy.conn.execute(
+            "SELECT 1 FROM kg_claim_extraction_outcomes WHERE chunk_id=?",
+            (chunk.id,),
+        ).fetchone() is None
+        assert source["source_role"] == "user"
+        assert source["source_created_at"] is not None
+        with core_db.transaction(hy.conn):
+            orphan = evidence_ledger.record_chunk_evidence(
+                hy.conn, edge_id=orphan_edge, chunk_id=chunk.id,
+                evidence_kind="extraction", polarity=1, evidence_weight=1,
+                weight_source="legacy_default", source_role="user",
+                surface_subject="app", surface_object="orphan",
+                source_message_id=int(source["message_id"]),
+                source_session_id=str(source["source_session_id"]),
+                source_created_at=str(source["source_created_at"]),
+                source_event_at=str(source["source_created_at"]),
+                source_coverage_chunk_id=str(source["chunk_id"]),
+                source_coverage_version=str(source["coverage_version"]),
+            )
+        assert orphan.inserted
+        assert hy.conn.execute(
+            "SELECT published_at FROM kg_evidence WHERE id=?",
+            (orphan.evidence_id,),
+        ).fetchone()[0] is None
+
+        fresh = _extract_and_persist(hy, chunk, client)
+        assert fresh is not None and not fresh.failed
+        calls = len(client.calls)
+        assert calls >= 1
+        assert hy.conn.execute(
+            "SELECT is_current FROM kg_evidence WHERE id=?", (orphan.evidence_id,),
+        ).fetchone()[0] == 0
+        assert phase1.extract_chunk_results(
+            hy.conn, chunk, client, prompt_version=cfg.prompt_version,
+        ) is None
+        assert len(client.calls) == calls
+    finally:
+        hy.close()
+
+
+def test_published_chunk_reextracts_to_retire_unpublished_orphan(cfg):
+    hy = HyMem(replace(cfg, aggregation_nodes_enabled=False))
+    try:
+        chunk = _seed_chunk(hy, chunk_id="orphan-published")
+        client = _DeclaredLLM("model-a", "redis")
+        assert _extract_and_persist(hy, chunk, client) is not None
+        assert hy.conn.execute(
+            "SELECT 1 FROM current_phase1_publications WHERE chunk_id=?",
+            (chunk.id,),
+        ).fetchone() is not None
+        source = hy.conn.execute(
+            "SELECT message_id,source_session_id,source_created_at,chunk_id,"
+            "coverage_version FROM message_retention_coverage WHERE message_id=?",
+            (chunk.start_message_id,),
+        ).fetchone()
+        with core_db.transaction(hy.conn):
+            orphan_edge = hy.conn.execute(
+                "INSERT INTO knowledge_graph(subject_canonical,predicate,"
+                "object_canonical,pos_evidence,neg_evidence) "
+                "VALUES ('app','contains','orphan',0,0) RETURNING id"
+            ).fetchone()[0]
+            orphan = evidence_ledger.record_chunk_evidence(
+                hy.conn, edge_id=orphan_edge, chunk_id=chunk.id,
+                evidence_kind="extraction", polarity=1, evidence_weight=1,
+                weight_source="legacy_default", source_role="user",
+                surface_subject="app", surface_object="orphan",
+                source_message_id=int(source["message_id"]),
+                source_session_id=str(source["source_session_id"]),
+                source_created_at=str(source["source_created_at"]),
+                source_event_at=str(source["source_created_at"]),
+                source_coverage_chunk_id=str(source["chunk_id"]),
+                source_coverage_version=str(source["coverage_version"]),
+            )
+        assert orphan.inserted
+        calls = len(client.calls)
+        replay = _extract_and_persist(hy, chunk, client)
+        assert replay is not None and not replay.failed
+        assert len(client.calls) > calls
+        assert hy.conn.execute(
+            "SELECT is_current FROM kg_evidence WHERE id=?",
+            (orphan.evidence_id,),
+        ).fetchone()[0] == 0
+        assert phase1.extract_chunk_results(
+            hy.conn, chunk, client, prompt_version=cfg.prompt_version,
+        ) is None
+    finally:
+        hy.close()
+
+
+def test_explicit_phase1_completion_limit_bounds_failed_chunk(cfg):
+    hy = HyMem(replace(cfg, aggregation_nodes_enabled=False))
+    try:
+        chunk = _seed_chunk(hy, chunk_id="bounded-phase1")
+        client = _DeclaredLLM("model-a", "unused", fail=True)
+        result = phase1.extract_chunk_results(
+            hy.conn, chunk, client, prompt_version=cfg.prompt_version,
+            completion_call_limit=1,
+        )
+        assert result is not None and result.failed
+        assert result.completion_calls == 1
+        assert len(client.calls) == 1
+        assert hy.conn.execute(
+            "SELECT 1 FROM current_phase1_publications WHERE chunk_id=?",
+            (chunk.id,),
+        ).fetchone() is None
+    finally:
+        hy.close()
 
 
 def _current_objects(hy: HyMem) -> set[str]:

@@ -208,6 +208,107 @@ def test_successful_replay_is_exact_and_empty_retires_old_claim(tmp_path: Path):
         conn.close()
 
 
+def test_reextract_reconciles_unpublished_canonical_claims_without_observations(
+    tmp_path: Path,
+):
+    conn = _open(tmp_path)
+    try:
+        [message_id] = _messages(
+            conn, [("user", "The app uses Redis and stores records", "2024-01-01")]
+        )
+        chunk = _chunk(conn, "historical-unpublished", [message_id])
+        cfg = HyMemConfig(root=tmp_path)
+        kept = Triple("app", "uses", "redis", 1, source_message_id=message_id)
+        omitted = Triple(
+            "app", "contains", "records", 1, source_message_id=message_id
+        )
+        _persist(conn, chunk, [kept, omitted], prompt_version="v13", cfg=cfg)
+        evidence_ids = [
+            row[0] for row in conn.execute(
+                "SELECT id FROM kg_evidence WHERE chunk_id=? ORDER BY id",
+                (chunk.id,),
+            )
+        ]
+        assert len(evidence_ids) == 2
+
+        # Recreate a pre-publication historical state: its claims and source
+        # manifests survive, but the old extraction has no observation proof.
+        conn.execute("DROP TRIGGER kg_evidence_published_at_update_guard")
+        with core_db.evidence_history_mutation(conn):
+            conn.execute(
+                "DELETE FROM kg_claim_observations WHERE chunk_id=?",
+                (chunk.id,),
+            )
+            conn.execute(
+                "UPDATE kg_evidence SET published_at=NULL "
+                "WHERE chunk_id=? AND is_current=1",
+                (chunk.id,),
+            )
+        core_db._ensure_post_migration_runtime_guards(conn)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kg_claim_observations WHERE chunk_id=?",
+            (chunk.id,),
+        ).fetchone()[0] == 0
+
+        _persist(conn, chunk, [kept], prompt_version="v14", cfg=cfg)
+
+        current = conn.execute(
+            "SELECT kg.predicate,ev.published_at FROM kg_evidence ev "
+            "JOIN knowledge_graph kg ON kg.id=ev.edge_id "
+            "WHERE ev.chunk_id=? AND ev.is_current=1",
+            (chunk.id,),
+        ).fetchall()
+        assert [(row["predicate"], row["published_at"] is not None)
+                for row in current] == [("uses", True)]
+        retired = conn.execute(
+            "SELECT kg.predicate,ev.superseded_reason FROM kg_evidence ev "
+            "JOIN knowledge_graph kg ON kg.id=ev.edge_id "
+            "WHERE ev.id IN (?,?) AND ev.is_current=0",
+            evidence_ids,
+        ).fetchall()
+        assert len(retired) == 1
+        assert retired[0]["predicate"] == "contains"
+        assert retired[0]["superseded_reason"].startswith(
+            "successful_reextract:"
+        )
+
+        # A later exact replay must also heal a historical orphan beside an
+        # otherwise healthy whole-chunk outcome. The replay fast path must not
+        # skip reconciliation merely because its observations still match.
+        old = conn.execute(
+            "SELECT ev.* FROM kg_evidence ev JOIN knowledge_graph kg "
+            "ON kg.id=ev.edge_id WHERE ev.chunk_id=? "
+            "AND kg.predicate='contains'",
+            (chunk.id,),
+        ).fetchone()
+        fields = (
+            "edge_id", "chunk_id", "evidence_kind", "polarity",
+            "evidence_weight", "weight_source", "source_role",
+            "source_peer_id", "source_workspace_id", "surface_subject",
+            "surface_object", "value_text", "value_numeric", "value_unit",
+            "temporal_scope", "source_message_id", "source_session_id",
+            "source_created_at", "source_event_at",
+            "source_coverage_chunk_id", "source_coverage_version",
+        )
+        with core_db.transaction(conn):
+            orphan = evidence_ledger.record_chunk_evidence(
+                conn,
+                **{key: old[key] for key in fields},
+                prompt_version=old["extraction_prompt_version"],
+            )
+        assert orphan.inserted
+        omitted_id = orphan.evidence_id
+        assert conn.execute(
+            "SELECT published_at FROM kg_evidence WHERE id=?", (omitted_id,)
+        ).fetchone()[0] is None
+        _persist(conn, chunk, [kept], prompt_version="v14", cfg=cfg)
+        assert conn.execute(
+            "SELECT is_current FROM kg_evidence WHERE id=?", (omitted_id,)
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def _overlap_state(tmp_path: Path, order: tuple[str, str]) -> tuple:
     conn = _open(tmp_path)
     try:

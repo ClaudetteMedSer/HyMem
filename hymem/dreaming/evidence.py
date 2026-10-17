@@ -1236,13 +1236,22 @@ def begin_chunk_extraction_reconciliation(
     """Replace one chunk's observation set after a validated success.
 
     Canonical proofs can be shared by overlapping chunks, so deleting this
-    chunk's authority does not retire them yet. Legacy chunk-owned extraction
-    rows cannot be attributed to another authority and are retired immediately.
-    The caller records the replacement observations, then calls
-    :func:`finalize_chunk_extraction_reconciliation` in the same transaction.
+    chunk's authority does not retire them yet. Include its current canonical
+    rows even when an old extraction left no observation: finalization must
+    revisit those rows if the replacement omits their claims. Legacy
+    chunk-owned extraction rows cannot be attributed to another authority and
+    are retired immediately. The caller records the replacement observations,
+    then calls :func:`finalize_chunk_extraction_reconciliation` in the same
+    transaction.
     """
     observation_rows = conn.execute(
         "SELECT DISTINCT edge_id FROM kg_claim_observations WHERE chunk_id = ?",
+        (chunk_id,),
+    ).fetchall()
+    canonical_rows = conn.execute(
+        "SELECT DISTINCT edge_id FROM kg_evidence WHERE chunk_id = ? "
+        "AND evidence_kind = 'extraction' AND is_current = 1 "
+        "AND provenance_status = 'canonical'",
         (chunk_id,),
     ).fetchall()
     legacy_rows = conn.execute(
@@ -1252,7 +1261,8 @@ def begin_chunk_extraction_reconciliation(
         (chunk_id,),
     ).fetchall()
     edge_ids = {
-        int(row["edge_id"]) for row in [*observation_rows, *legacy_rows]
+        int(row["edge_id"])
+        for row in [*observation_rows, *canonical_rows, *legacy_rows]
     }
     from hymem.core.db import evidence_mutation
 

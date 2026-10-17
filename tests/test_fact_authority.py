@@ -347,15 +347,13 @@ def test_adaptive_retry_shrinks_to_semantic_floor_without_skipping(cfg):
         hy.log_message("fact-adaptive", "user", "word " * 500)
         first = hy.dream()
         second = hy.dream()
-        third = hy.dream()
-        assert first.fact_failures == second.fact_failures == 1
-        assert third.fact_failures == 0
+        assert first.fact_failures == 1
+        assert second.fact_failures == 0
         assert [facts.facts_attempt_max_chars(1024, retry) for retry in range(3)] == [
             1024, 512, 256,
         ]
         assert 512 < llm.fact_sizes[0] <= 1024
-        assert 256 < llm.fact_sizes[1] <= 512
-        assert llm.fact_sizes[2] <= 256
+        assert llm.fact_sizes[1] <= 256
         state = hy.conn.execute(
             "SELECT facts_cursor_partial_message_id,facts_cursor_offset,"
             "facts_retry_count,facts_quarantined FROM sessions "
@@ -383,8 +381,7 @@ def test_repeated_failures_never_shred_below_floor_and_quarantine(cfg):
         ]
         assert len(llm.fact_sizes) == 5
         assert 512 < llm.fact_sizes[0] <= 1024
-        assert 256 < llm.fact_sizes[1] <= 512
-        assert all(128 <= size <= 256 for size in llm.fact_sizes[2:])
+        assert all(128 <= size <= 256 for size in llm.fact_sizes[1:])
         state = hy.conn.execute(
             "SELECT facts_cursor_message_id,facts_cursor_partial_message_id,"
             "facts_retry_count,facts_quarantined FROM sessions WHERE id='fact-floor'"

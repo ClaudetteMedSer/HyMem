@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -69,6 +70,10 @@ class EnvConfig:
     # Snapshot of the rejected endpoint's safe policy explanation. Do not
     # reconstruct it from later ambient environment or retain the rejected URL.
     embedding_fallback_detail: str | None = None
+    # Parsed only when constructing HyMem, so resolve_env remains a read-only,
+    # never-raising diagnostic even for a malformed operator override.
+    dream_max_facts_per_session_raw: str | None = None
+    facts_extraction_max_tokens_raw: str | None = None
 
     @property
     def has_llm_key(self) -> bool:
@@ -221,6 +226,38 @@ def _env_positive_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _validated_facts_cap_override(raw: str | None) -> int | None:
+    """Fail closed on a malformed or out-of-contract fact output cap."""
+    if raw is None:
+        return None
+    if re.fullmatch(r"[1-9][0-9]{0,2}", raw) is None:
+        raise RuntimeError(
+            "HYMEM_DREAM_MAX_FACTS_PER_SESSION must be an integer from 1 to 256"
+        )
+    value = int(raw)
+    if value > 256:
+        raise RuntimeError(
+            "HYMEM_DREAM_MAX_FACTS_PER_SESSION must be an integer from 1 to 256"
+        )
+    return value
+
+
+def _validated_facts_tokens_override(raw: str | None) -> int | None:
+    """Fail closed on a malformed fact-only output token budget."""
+    if raw is None:
+        return None
+    if re.fullmatch(r"[1-9][0-9]{0,4}", raw) is None:
+        raise RuntimeError(
+            "HYMEM_FACTS_EXTRACTION_MAX_TOKENS must be an integer from 1 to 32768"
+        )
+    value = int(raw)
+    if value > 32768:
+        raise RuntimeError(
+            "HYMEM_FACTS_EXTRACTION_MAX_TOKENS must be an integer from 1 to 32768"
+        )
+    return value
+
+
 def _embedding_endpoint_rejection_detail(
     base_url: str, error: EndpointPolicyError,
 ) -> str:
@@ -346,6 +383,8 @@ def resolve_env() -> EnvConfig:
         embedding_fallback_detail=embedding_fallback_detail,
         aggregation_nodes_enabled=_env_flag("HYMEM_AGGREGATION_NODES_ENABLED"),
         aggregation_digest_enabled=_env_flag("HYMEM_AGGREGATION_DIGEST_ENABLED"),
+        dream_max_facts_per_session_raw=env("HYMEM_DREAM_MAX_FACTS_PER_SESSION"),
+        facts_extraction_max_tokens_raw=env("HYMEM_FACTS_EXTRACTION_MAX_TOKENS"),
     )
 
 
@@ -523,6 +562,12 @@ def build_from_env() -> HyMem:
         role="HyMem server LLM",
     )
     cfg = resolve_env()
+    facts_cap_override = _validated_facts_cap_override(
+        cfg.dream_max_facts_per_session_raw
+    )
+    facts_tokens_override = _validated_facts_tokens_override(
+        cfg.facts_extraction_max_tokens_raw
+    )
 
     # Surface a retired deployment override as the primary startup fault,
     # before constructing clients or opening the store.  The library client
@@ -616,6 +661,10 @@ def build_from_env() -> HyMem:
             overrides["aggregation_nodes_enabled"] = cfg.aggregation_nodes_enabled
         if cfg.aggregation_digest_enabled is not None:
             overrides["aggregation_digest_enabled"] = cfg.aggregation_digest_enabled
+        if facts_cap_override is not None:
+            overrides["dream_max_facts_per_session"] = facts_cap_override
+        if facts_tokens_override is not None:
+            overrides["facts_extraction_max_tokens"] = facts_tokens_override
 
         mem_cfg = HyMemConfig(root=cfg.root, **overrides)
         if mem_cfg.aggregation_nodes_enabled:

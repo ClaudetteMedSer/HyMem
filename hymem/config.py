@@ -65,6 +65,12 @@ class HyMemConfig:
                 "dream_max_facts_per_session must be between 1 and "
                 f"{MAX_FACTS_PER_EXTRACTION_UNIT}"
             )
+        fact_tokens = self.facts_extraction_max_tokens
+        if (
+            not isinstance(fact_tokens, int) or isinstance(fact_tokens, bool)
+            or not 1 <= fact_tokens <= 32768
+        ):
+            raise ValueError("facts_extraction_max_tokens must be between 1 and 32768")
         call_budget = self.dream_extraction_provider_attempt_budget
         if (
             not isinstance(call_budget, int)
@@ -462,6 +468,11 @@ class HyMemConfig:
     the G-F1b density gate's criterion-3 threshold (median facts/session ≤8,
     measured median 7.0-8.0), so the cap and the gate agree on what a
     reasonable session yields."""
+
+    facts_extraction_max_tokens: int = 3072
+    """Output token budget for a narrative-fact extraction call. This is
+    independent of the digest budget so dense historical fact units can be
+    replayed without changing the episode and procedure producer."""
 
     facts_extraction_max_attempts: int = 6
     """Held failures allowed at one authoritative facts cursor before that

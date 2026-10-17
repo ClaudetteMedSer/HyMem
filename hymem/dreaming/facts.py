@@ -189,7 +189,7 @@ def facts_config_version(cfg: HyMemConfig, *, client: object | None = None) -> s
     return (
         f"facts-lossless-v1|prompt={FACTS_PROMPT_VERSION}|"
         f"chars={int(cfg.dream_digest_max_chars)}|"
-        f"tokens={int(cfg.dream_digest_max_tokens)}|"
+        f"tokens={int(cfg.facts_extraction_max_tokens)}|"
         f"items={int(cfg.dream_max_facts_per_session)}"
     ) + semantic_generation_suffix("facts", client)
 
@@ -251,6 +251,51 @@ def facts_attempt_max_chars(configured_max: int, retry_count: int) -> int:
     # configured cap itself when the caller deliberately chose less).
     floor = min(configured_max, max(256, len("assistant: ") + 1))
     return max(floor, configured_max // (2 ** min(max(0, retry_count), 8)))
+
+
+def facts_retry_max_chars(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    since_message_id: int | None,
+    partial_message_id: int | None,
+    start_offset: int,
+    configured_max: int,
+    retry_count: int,
+) -> int:
+    """Shrink a held fresh unit against a source prefix stable across appends.
+
+    Halving only the configured window can repeat both provider requests when
+    the selected source is shorter than that window. The first eligible turn
+    is fixed at a held cursor, while later turns can arrive after a failure.
+    Bound a scheduled retry by that turn: this may use more dream cycles for
+    many short turns, but an appended tail cannot enlarge the failed unit.
+    The semantic floor applies while the first turn is long enough; a shorter
+    complete turn may be consumed intact. No source bytes are skipped because
+    the cursor advances only after a complete response.
+    """
+    budget = facts_attempt_max_chars(configured_max, retry_count)
+    if retry_count <= 0 or configured_max <= 0:
+        return budget
+    messages = covered_messages_after(
+        conn, session_id, since_message_id, limit=1,
+        roles=frozenset({"user", "assistant"}),
+    )
+    if not messages:
+        return budget
+    if partial_message_id is not None and messages[0].message_id != partial_message_id:
+        raise RuntimeError("facts partial cursor does not name the next source")
+    if not messages[0].content[start_offset:].strip():
+        return budget
+    first_turn, _, _, _, _ = _select_fresh_fact_text(
+        messages, since_message_id=since_message_id,
+        partial_message_id=partial_message_id,
+        start_offset=start_offset, max_chars=configured_max,
+    )
+    source_budget = facts_attempt_max_chars(
+        min(configured_max, len(first_turn)), retry_count + 1,
+    )
+    return min(budget, source_budget, len(first_turn))
 
 
 def _bounded_fact_fragment_end(content: str, offset: int, room: int) -> int:
@@ -730,11 +775,90 @@ def extract_facts(
     stays pending. Historical outcomes use ``reextract_fact_outcome`` instead
     and never change their published boundaries to make output fit.
     """
+    retry = conn.execute(
+        "SELECT facts_retry_count,facts_retry_config_version "
+        "FROM sessions WHERE id=?", (session_id,),
+    ).fetchone()
+    if retry is not None and int(retry["facts_retry_count"] or 0) > 0:
+        retry_key = facts_retry_policy_version(
+            cfg,
+            replay_slice_key=fact_cursor_retry_unit_key(
+                session_id, since_message_id, partial_message_id, start_offset,
+            ),
+            client=llm,
+        )
+        if retry["facts_retry_config_version"] == retry_key:
+            source_budget = facts_retry_max_chars(
+                conn, session_id,
+                since_message_id=since_message_id,
+                partial_message_id=partial_message_id,
+                start_offset=start_offset,
+                configured_max=cfg.dream_digest_max_chars,
+                retry_count=int(retry["facts_retry_count"]),
+            )
+            max_chars = min(
+                cfg.dream_digest_max_chars if max_chars is None else max_chars,
+                source_budget,
+            )
     return _extract_facts_fresh(
         conn, session_id, llm, cfg, since_message_id=since_message_id,
         partial_message_id=partial_message_id, start_offset=start_offset,
         max_chars=max_chars, allow_capacity_retry=True,
     )
+
+
+def _select_fresh_fact_text(
+    messages: Sequence[CoveredMessage],
+    *,
+    since_message_id: int | None,
+    partial_message_id: int | None,
+    start_offset: int,
+    max_chars: int,
+) -> tuple[str, list[CoveredMessage], int | None, int | None, int]:
+    """Select the exact source prefix shared by extraction and retry sizing."""
+    lines: list[str] = []
+    used_messages: list[CoveredMessage] = []
+    covered = since_message_id
+    next_partial = partial_message_id
+    next_offset = start_offset
+    used = 0
+    for message in messages:
+        offset = start_offset if message.message_id == partial_message_id else 0
+        if offset >= len(message.content):
+            raise RuntimeError("facts cursor offset is outside its source turn")
+        prefix = f"{message.role}: "
+        if not lines and max_chars <= len(prefix):
+            raise ValueError("facts max_chars cannot hold source framing")
+        separator_cost = 1 if lines else 0
+        room = max_chars - used - separator_cost - len(prefix)
+        if room <= 0 and lines:
+            break
+        room = max(1, room)
+        remaining = len(message.content) - offset
+        # Once at least one complete turn is present, never spend a leftover
+        # handful of characters by splitting the next turn. It belongs wholly
+        # to the next semantic unit. Only a first/continued oversized turn may
+        # be partitioned.
+        if lines and remaining > room:
+            break
+        fragment_end = (
+            _bounded_fact_fragment_end(message.content, offset, room)
+            if remaining > room else len(message.content)
+        )
+        fragment = message.content[offset:fragment_end]
+        lines.append(prefix + fragment)
+        used += separator_cost + len(prefix) + len(fragment)
+        used_messages.append(message)
+        if offset + len(fragment) < len(message.content):
+            next_partial = message.message_id
+            next_offset = offset + len(fragment)
+            break
+        covered = message.message_id
+        next_partial = None
+        next_offset = 0
+        if used >= max_chars:
+            break
+    return "\n".join(lines), used_messages, covered, next_partial, next_offset
 
 
 def _extract_facts_fresh(
@@ -795,50 +919,13 @@ def _extract_facts_fresh(
         1,
         int(cfg.dream_digest_max_chars if max_chars is None else max_chars),
     )
-    lines: list[str] = []
-    used_messages: list[CoveredMessage] = []
-    covered = since_message_id
-    next_partial = partial_message_id
-    next_offset = start_offset
-    used = 0
-    for message in messages:
-        offset = start_offset if message.message_id == partial_message_id else 0
-        if offset >= len(message.content):
-            raise RuntimeError("facts cursor offset is outside its source turn")
-        prefix = f"{message.role}: "
-        if not lines and max_chars <= len(prefix):
-            raise ValueError("facts max_chars cannot hold source framing")
-        separator_cost = 1 if lines else 0
-        room = max_chars - used - separator_cost - len(prefix)
-        if room <= 0 and lines:
-            break
-        room = max(1, room)
-        remaining = len(message.content) - offset
-        # Once at least one complete turn is present, never spend a leftover
-        # handful of characters by splitting the next turn. It belongs wholly
-        # to the next semantic unit. Only a first/continued oversized turn may
-        # be partitioned.
-        if lines and remaining > room:
-            break
-        fragment_end = (
-            _bounded_fact_fragment_end(message.content, offset, room)
-            if remaining > room else len(message.content)
+    combined, used_messages, covered, next_partial, next_offset = (
+        _select_fresh_fact_text(
+            messages, since_message_id=since_message_id,
+            partial_message_id=partial_message_id,
+            start_offset=start_offset, max_chars=max_chars,
         )
-        fragment = message.content[offset:fragment_end]
-        lines.append(prefix + fragment)
-        used += separator_cost + len(prefix) + len(fragment)
-        used_messages.append(message)
-        if offset + len(fragment) < len(message.content):
-            next_partial = message.message_id
-            next_offset = offset + len(fragment)
-            break
-        covered = message.message_id
-        next_partial = None
-        next_offset = 0
-        if used >= max_chars:
-            break
-
-    combined = "\n".join(lines)
+    )
     occurrences = combine_source_occurrences((
         tuple(_bound_occurrence(conn, message) for message in used_messages),
     ))
@@ -914,7 +1001,7 @@ def build_facts_request(rendered: str, cfg: HyMemConfig) -> LLMRequest:
         ),
         user=FACTS_USER_TEMPLATE.format(text=rendered),
         response_format="json",
-        max_tokens=cfg.dream_digest_max_tokens,
+        max_tokens=cfg.facts_extraction_max_tokens,
     )
 
 

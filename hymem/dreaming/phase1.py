@@ -349,6 +349,16 @@ def _is_exact_published_replay(
         ).fetchone()[0]
     ):
         return False
+    if conn.execute(
+        "SELECT 1 FROM kg_evidence WHERE chunk_id=? "
+        "AND evidence_kind='extraction' AND provenance_status='canonical' "
+        "AND is_current=1 AND published_at IS NULL LIMIT 1",
+        (chunk.id,),
+    ).fetchone() is not None:
+        # A prior extraction can leave canonical evidence outside the current
+        # observation set. Its unpublished rows still exclude their edges from
+        # authoritative reads, so a matching outcome is not a no-op replay.
+        return False
     authority = conn.execute(
         """
         SELECT COUNT(*) AS total,
@@ -675,6 +685,7 @@ def extract_chunk_results(
     *,
     prompt_version: str,
     phase1_generation: Mapping[str, object] | None = None,
+    completion_call_limit: int | None = None,
 ) -> ChunkExtraction | None:
     """Run phase-1 LLM extraction for a chunk. Returns None if already processed
     under the same prompt and producer generation. No write transaction is
@@ -702,7 +713,12 @@ def extract_chunk_results(
         "AND publication.phase1_generation_key=?",
         (chunk.id, prompt_version, generation_key),
     ).fetchone()
-    if already:
+    if already and conn.execute(
+        "SELECT 1 FROM kg_evidence WHERE chunk_id=? "
+        "AND evidence_kind='extraction' AND provenance_status='canonical' "
+        "AND is_current=1 AND published_at IS NULL LIMIT 1",
+        (chunk.id,),
+    ).fetchone() is None:
         return None
 
     if evidence.claim_extraction_prompt_is_stale(
@@ -738,7 +754,10 @@ def extract_chunk_results(
     source_records = tuple(
         (source.message_id, _claim_source_record(source)) for source in sources
     )
-    result = extract_chunk(llm, chunk.text, source_records=source_records)
+    extraction_kwargs: dict[str, object] = {"source_records": source_records}
+    if completion_call_limit is not None:
+        extraction_kwargs["completion_call_limit"] = completion_call_limit
+    result = extract_chunk(llm, chunk.text, **extraction_kwargs)
     if phase1_generation_binding(prompt_version, llm) != generation:
         raise Phase1ProducerDriftError(
             "Phase-1 producer identity changed during extraction"
